@@ -502,3 +502,19 @@ metadata behavior.
   Validation used only Python 3.13: the host-level main suite ran 1,430 tests
   with 5 expected platform skips and no failures, while the deterministic
   independent suite ran 288 tests with zero skips.
+- The final canonical integration merges `origin/master` at
+  `7e8a718c799b7968b45e306cbdcb02d8b5879f57`. It preserves this branch's
+  strict JSON, deadline/RLIMIT, executable/TLS, authentication, and failure
+  classification hardening while adopting descriptor-bound workspace launch,
+  bound attempt output, one-time helper-private cleanup, tracked-context
+  review visibility, and the exact secret-admission state machine. The merged
+  process supervisor carries caller descriptors and descriptor-CWD handoff
+  through both wrappers, then publishes process start only after every exec
+  boundary succeeds. Manual validation used only Python 3.13 as requested: the
+  host-level main suite ran 1,740 tests with 6 expected skips, the provider
+  suite ran 776 tests with 3 expected skips, the state suite ran 169 tests, the
+  common suite ran 93 tests with 1 expected skip, and the deterministic
+  independent suite ran 288 tests with zero skips. Ruff lint, conflict-file
+  formatting, compileall, Bash syntax, ShellCheck, actionlint, strict launcher
+  C syntax, synthetic-token catalog validation, project-journal validation,
+  the official skill validator, and `git diff --check` pass.

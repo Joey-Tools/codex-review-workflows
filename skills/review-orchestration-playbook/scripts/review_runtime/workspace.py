@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import ast
 import base64
+import binascii
 import hashlib
+import io
 import json
 import math
 import os
@@ -15,10 +17,12 @@ import subprocess
 import tempfile
 import time
 import uuid
+from bisect import bisect_left
 from collections import Counter, deque
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
-from typing import Any, BinaryIO, Callable, Iterable, Iterator
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Any, BinaryIO, Callable, Iterable, Iterator, Mapping
 
 from .common import (
     TRUSTED_PATH,
@@ -46,15 +50,17 @@ from .synthetic_tokens import (
 
 
 # Provider patterns with variable-length bodies capture a complete value through 512
-# bytes, then use a 513-byte prefix branch for oversized values. Keeping every event
-# end below this overlap prevents a match start from being discarded at a read boundary.
-STREAM_SCAN_OVERLAP = 8192
+# bytes, then use a 513-byte prefix branch for oversized values. PEM candidates need
+# a larger bounded window so a complete private-key block can be used as an identity;
+# keeping every event end below the overlap preserves its start across read boundaries.
+MAX_PEM_SECRET_BYTES = 32 * 1024
+STREAM_SCAN_OVERLAP = 64 * 1024
 STREAM_SCAN_CHUNK_BYTES = 1024 * 1024
 AWS_SECRET_KEY_NAME_PATTERN = rb"(?i)aws_secret_access_key"
 AWS_SECRET_KEY_PATTERN = re.compile(
     AWS_SECRET_KEY_NAME_PATTERN
     + rb"\s{0,256}[:=]\s{0,256}['\"]?"
-    + rb"[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])"
+    + rb"(?P<aws_secret>[A-Za-z0-9/+=]{40})(?![A-Za-z0-9/+=])"
 )
 OVERSIZED_AWS_SECRET_KEY_GAP = re.compile(
     AWS_SECRET_KEY_NAME_PATTERN + rb"(?:\s{257}|\s{0,256}[:=]\s{257})"
@@ -63,87 +69,172 @@ OVERSIZED_JWT_PATTERN = re.compile(
     rb"\b(?:"
     rb"eyJ[A-Za-z0-9_-]{2049}"
     rb"|eyJ[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{2049}"
-    rb"|eyJ[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{8,2048}\."
+    rb"|eyJ[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{0,2048}\."
     rb"[A-Za-z0-9_-]{2049}"
     rb")"
 )
+JWE_CONTINUATION_PATTERN = re.compile(
+    rb"\beyJ[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{0,2048}\."
+    rb"[A-Za-z0-9_-]{0,2048}\."
+)
+# Complete shared-prefix rules must precede broader overlapping sentinel rules.
 SECRET_PATTERNS = (
     (
-        "pgp-private-key",
-        re.compile(rb"-----BEGIN PGP PRIVATE[ ]KEY BLOCK-----"),
+        "aws-access-key",
+        re.compile(rb"\b(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Z])"),
     ),
-    (
-        "private-key",
-        re.compile(
-            rb"-----BEGIN (?:ENCRYPTED |RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
-        ),
-    ),
-    ("aws-access-key", re.compile(rb"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
     (
         "aws-secret-key",
         AWS_SECRET_KEY_PATTERN,
     ),
     (
         "anthropic-key",
-        re.compile(rb"\bsk-ant-(?:[A-Za-z0-9_-]{32,512}\b|[A-Za-z0-9_-]{513})"),
+        re.compile(
+            rb"\bsk-ant-(?:"
+            rb"[A-Za-z0-9_-]{32,512}(?![A-Za-z0-9_-])|[A-Za-z0-9_-]{513})"
+        ),
     ),
     (
         "openai-key",
-        re.compile(rb"\bsk-(?:proj-)?(?:[A-Za-z0-9_-]{32,512}\b|[A-Za-z0-9_-]{513})"),
+        re.compile(
+            rb"\bsk-(?:proj-)?(?:"
+            rb"[A-Za-z0-9_-]{32,512}(?![A-Za-z0-9_-])|[A-Za-z0-9_-]{513})"
+        ),
     ),
     (
         "github-token",
         re.compile(
             rb"\b(?:"
-            rb"gh[pousr]_(?:[A-Za-z0-9]{36,512}\b|[A-Za-z0-9]{513})"
-            rb"|github_pat_(?:[A-Za-z0-9_]{20,512}\b|[A-Za-z0-9_]{513})"
+            rb"gh[pousr]_(?:"
+            rb"[A-Za-z0-9]{36,512}(?![A-Za-z0-9])|[A-Za-z0-9]{513})"
+            rb"|github_pat_(?:"
+            rb"[A-Za-z0-9_]{20,512}(?![A-Za-z0-9_])|[A-Za-z0-9_]{513})"
             rb")"
         ),
     ),
     (
         "gitlab-token",
-        re.compile(rb"\bglpat-(?:[A-Za-z0-9_-]{20,512}\b|[A-Za-z0-9_-]{513})"),
+        re.compile(
+            rb"\bglpat-(?:"
+            rb"[A-Za-z0-9_-]{20,512}(?![A-Za-z0-9_-])|[A-Za-z0-9_-]{513})"
+        ),
     ),
-    ("google-api-key", re.compile(rb"\bAIza[0-9A-Za-z_-]{35}\b")),
-    ("npm-token", re.compile(rb"\bnpm_[A-Za-z0-9]{36}\b")),
+    (
+        "google-api-key",
+        re.compile(
+            rb"\bAIza(?:"
+            rb"[0-9A-Za-z_-]{35,512}(?![0-9A-Za-z_-])|[0-9A-Za-z_-]{513})"
+        ),
+    ),
+    (
+        "npm-token",
+        re.compile(rb"\bnpm_[A-Za-z0-9]{36}(?![A-Za-z0-9])"),
+    ),
     (
         "pypi-token",
-        re.compile(rb"\bpypi-(?:[A-Za-z0-9_-]{50,512}\b|[A-Za-z0-9_-]{513})"),
+        re.compile(
+            rb"\bpypi-(?:"
+            rb"[A-Za-z0-9_-]{50,512}(?![A-Za-z0-9_-])|[A-Za-z0-9_-]{513})"
+        ),
     ),
     (
         "slack-token",
-        re.compile(rb"\bxox[baprs]-(?:[A-Za-z0-9-]{20,512}\b|[A-Za-z0-9-]{513})"),
+        re.compile(
+            rb"\bxox[baprs]-(?:"
+            rb"[A-Za-z0-9-]{20,512}(?![A-Za-z0-9-])|[A-Za-z0-9-]{513})"
+        ),
     ),
     (
         "stripe-live-key",
-        re.compile(rb"\bsk_live_(?:[A-Za-z0-9]{16,512}\b|[A-Za-z0-9]{513})"),
+        re.compile(
+            rb"\bsk_live_(?:"
+            rb"[A-Za-z0-9]{16,512}(?![A-Za-z0-9])|[A-Za-z0-9]{513})"
+        ),
+    ),
+    (
+        "jwt",
+        re.compile(
+            rb"\beyJ[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{0,2048}\."
+            rb"[A-Za-z0-9_-]{0,2048}\.[A-Za-z0-9_-]{0,2048}\."
+            rb"[A-Za-z0-9_-]{0,2048}(?![A-Za-z0-9_.-])"
+        ),
     ),
     (
         "jwt",
         re.compile(
             rb"\beyJ[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{8,2048}\."
-            rb"[A-Za-z0-9_-]{8,2048}\b"
+            rb"[A-Za-z0-9_-]{8,2048}(?![A-Za-z0-9_.-])"
         ),
     ),
 )
+SECRET_PATTERN_MARKERS: dict[str, tuple[bytes, ...]] = {
+    "aws-access-key": (b"AKIA", b"ASIA"),
+    "aws-secret-key": (b"aws_secret_access_key",),
+    "anthropic-key": (b"sk-ant-",),
+    "openai-key": (b"sk-",),
+    "github-token": (b"ghp_", b"gho_", b"ghu_", b"ghs_", b"ghr_", b"github_pat_"),
+    "gitlab-token": (b"glpat-",),
+    "google-api-key": (b"AIza",),
+    "npm-token": (b"npm_",),
+    "pypi-token": (b"pypi-",),
+    "slack-token": (b"xoxb-", b"xoxa-", b"xoxp-", b"xoxr-", b"xoxs-"),
+    "stripe-live-key": (b"sk_live_",),
+    "jwt": (b"eyJ",),
+}
+PEM_PRIVATE_KEY_LABEL_PATTERN = (
+    rb"PGP PRIVATE KEY BLOCK|(?:ENCRYPTED |RSA |EC |DSA |OPENSSH )?PRIVATE KEY"
+)
+PEM_PRIVATE_KEY_BEGIN = re.compile(
+    rb"-----BEGIN (?P<label>" + PEM_PRIVATE_KEY_LABEL_PATTERN + rb")-----"
+)
+PEM_PRIVATE_KEY_END = re.compile(
+    rb"-----END (?P<label>" + PEM_PRIVATE_KEY_LABEL_PATTERN + rb")-----"
+)
 SECRET_KEY_NAME_PATTERN = (
-    rb"(?i)(?:api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|"
+    rb"(?i)(?:aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key)|"
+    rb"api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|"
     rb"bearer[_-]?token|client[_-]?secret|id[_-]?token|password|passwd|"
     rb"private[_-]?token|"
     rb"refresh[_-]?token|secret[_-]?(?:key|token))['\"]?"
 )
+STRONG_SECRET_KEY_NAME_PATTERN = re.compile(
+    rb"(?i)aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key)"
+)
 SECRET_KEY_PATTERN = SECRET_KEY_NAME_PATTERN + rb"\s{0,256}[:=]\s{0,256}"
+STRING_LITERAL_PREFIX_PATTERN = rb"(?:(?:br|rb|fr|rf|b|f|r|u))?"
+SECRET_ASSIGNMENT_PREFIX = re.compile(SECRET_KEY_PATTERN)
+WRAPPER_CONTEXT_MARKER = re.compile(rb"""[/'"`#()[\]{}]""")
 OVERSIZED_SECRET_ASSIGNMENT_GAP = re.compile(
     SECRET_KEY_NAME_PATTERN + rb"(?:\s{257}|\s{0,256}[:=]\s{257})"
 )
 QUOTED_SECRET_ASSIGNMENT = re.compile(
-    SECRET_KEY_PATTERN + rb"(['\"])([^\r\n'\"]{16,512})\1"
+    SECRET_KEY_PATTERN
+    + STRING_LITERAL_PREFIX_PATTERN
+    + rb"(['\"])([^\r\n'\"]{16,512})\1"
+)
+QUOTED_SECRET_ASSIGNMENT_PREFIX = re.compile(
+    SECRET_KEY_PATTERN + STRING_LITERAL_PREFIX_PATTERN + rb"(['\"])([^\r\n'\"]{16,512})"
 )
 OVERSIZED_QUOTED_SECRET_ASSIGNMENT = re.compile(
-    SECRET_KEY_PATTERN + rb"(['\"])[^\r\n'\"]{513}"
+    SECRET_KEY_PATTERN + STRING_LITERAL_PREFIX_PATTERN + rb"(['\"])[^\r\n'\"]{513}"
 )
 UNQUOTED_SECRET_ASSIGNMENT = re.compile(
-    SECRET_KEY_PATTERN + rb"((?:" + GENERIC_SECRET_VALUE_BYTE_CLASS + rb"){16,512})",
+    SECRET_KEY_PATTERN
+    + rb"((?:"
+    + GENERIC_SECRET_VALUE_BYTE_CLASS
+    + rb"){16,512})(?!"
+    + GENERIC_SECRET_VALUE_BYTE_CLASS
+    + rb")",
+)
+UNQUOTED_SECRET_VALUE = re.compile(
+    rb"((?:"
+    + GENERIC_SECRET_VALUE_BYTE_CLASS
+    + rb"){16,512})(?!"
+    + GENERIC_SECRET_VALUE_BYTE_CLASS
+    + rb")",
+)
+OVERSIZED_UNQUOTED_SECRET_VALUE = re.compile(
+    rb"(?:" + GENERIC_SECRET_VALUE_BYTE_CLASS + rb"){513}"
 )
 OVERSIZED_UNQUOTED_SECRET_ASSIGNMENT = re.compile(
     SECRET_KEY_PATTERN + rb"(?:" + GENERIC_SECRET_VALUE_BYTE_CLASS + rb"){513}"
@@ -190,6 +281,10 @@ MAX_CHANGED_METADATA_BYTES = 128 * 1024 * 1024
 MAX_CHANGED_ENTRIES = 100_000
 MAX_CHANGED_BLOB_SCAN_BYTES = 512 * 1024 * 1024
 MAX_SECRET_SCAN_EVENTS = 1_000_000
+MAX_SECRET_REDUCTION_CANDIDATES = 128
+MAX_SECRET_REDUCTION_CANDIDATE_BYTES = 32 * 1024
+MAX_SECRET_REDUCTION_PROVENANCE_OCCURRENCES = 512
+MAX_SECRET_DELTA_ADDITION_LOCATIONS = 256
 MAX_LEGACY_OCCURRENCE_EVENTS = 1_000_000
 MAX_LEGACY_SEARCH_BYTES = 16 * 1024 * 1024 * 1024
 MAX_LEGACY_CONTAINMENT_CHECKS = 10_000_000
@@ -199,6 +294,11 @@ MAX_SECRET_PREFIX_PROOF_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_REVIEW_PROMPT_BYTES = 64 * 1024
 MAX_SYNTHETIC_EVIDENCE_BYTES = 64 * 1024
 MAX_SYNTHETIC_EVIDENCE_ENTRIES = 512
+MAX_REVIEW_CLEANUP_DEPTH = 256
+REVIEW_CLEANUP_QUARANTINE_PREFIX = ".codex-review-cleanup-"
+REVIEW_CLEANUP_LOCK_NAME = "cleanup.lock"
+REVIEW_RUNNER_LOCK_NAME = "runner.lock"
+REVIEW_STATE_MARKER_NAME = ".isolated-review-state"
 MAX_PREFLIGHT_JSON_BYTES = 128 * 1024
 MAX_BOUNDED_JSON_DEPTH = 64
 GIT_LFS_POINTER_MAX_BYTES = 1024
@@ -209,17 +309,30 @@ GIT_LFS_V1_ALIASES = frozenset(
         b"https://git-lfs.github.com/spec/v1",
     }
 )
-GIT_LFS_OID_PATTERN = re.compile(br"sha256:[0-9a-f]{64}\Z")
-GIT_LFS_EXTENSION_PREFIX_PATTERN = re.compile(br"\Aext-[0-9]{1}-\w+")
-GIT_LFS_SIZE_PATTERN = re.compile(br"[+-]?[0-9]+\Z")
+GIT_LFS_OID_PATTERN = re.compile(rb"sha256:[0-9a-f]{64}\Z")
+GIT_LFS_EXTENSION_PREFIX_PATTERN = re.compile(rb"\Aext-[0-9]{1}-\w+")
+GIT_LFS_SIZE_PATTERN = re.compile(rb"[+-]?[0-9]+\Z")
 SYNTHETIC_MANIFEST_NAME = "synthetic-secret-manifest.json"
 SYNTHETIC_PRIVATE_MANIFEST_NAME = "synthetic-secret-state.json"
 SYNTHETIC_CHANGED_EVIDENCE_NAME = "synthetic-changed-evidence.json"
-SYNTHETIC_MANIFEST_SCHEMA_VERSION = 2
+SYNTHETIC_MANIFEST_SCHEMA_VERSION = 5
+SECRET_REDUCTION_PROVENANCE_SCHEME = "path-surface-offset-sha256-v1"
+PRIVATE_MANIFEST_SHARD_COMMITMENT_PREFIX = (
+    "Complementary helper-private manifest rows are integrity-bound by SHA-256:"
+)
 CONTROL_ARTIFACT_STATE_NAME = "control-artifact-state.json"
-CONTROL_ARTIFACT_SCHEMA_VERSION = 2
+CONTROL_ARTIFACT_SCHEMA_VERSION = 5
+CHANGED_PATH_DIGESTS_NAME = "changed-path-digests.z"
+PRIVATE_CHANGED_PATHS_NAME = "changed-paths-private.z"
+CHANGED_PATH_DIGEST_DOMAIN = b"codex-review-changed-path-v2\0"
+CHANGED_PATH_HEAD_TAG = b"H"
+CHANGED_PATH_BASE_ONLY_TAG = b"B"
+PRIVATE_HELPER_ARTIFACT_NAMES = (
+    SYNTHETIC_PRIVATE_MANIFEST_NAME,
+    PRIVATE_CHANGED_PATHS_NAME,
+)
 CONTROL_ARTIFACT_SPECS: dict[str, tuple[int, int | None]] = {
-    "changed-paths.z": (MAX_CHANGED_METADATA_BYTES, MAX_CHANGED_ENTRIES),
+    CHANGED_PATH_DIGESTS_NAME: (MAX_CHANGED_METADATA_BYTES, MAX_CHANGED_ENTRIES),
     "changed-blob-findings.z": (
         MAX_CHANGED_METADATA_BYTES,
         MAX_CHANGED_ENTRIES * 3,
@@ -231,6 +344,9 @@ CONTROL_ARTIFACT_SPECS: dict[str, tuple[int, int | None]] = {
 }
 LONG_ALPHANUMERIC_SECRET = re.compile(rb"[A-Za-z0-9]{24,512}")
 LONG_NUMERIC_SECRET = re.compile(rb"[0-9]{16,512}")
+UNIFIED_DIFF_HUNK_PATTERN = re.compile(
+    rb"^@@ -[0-9]+(?:,[0-9]+)? \+(?P<head_line>[0-9]+)(?:,[0-9]+)? @@"
+)
 
 
 def symlink_target_stays_within_workspace(
@@ -254,7 +370,197 @@ def symlink_target_stays_within_workspace(
 
 
 @dataclass(frozen=True)
+class CleanupIdentity:
+    device: int
+    inode: int
+
+    def to_json(self) -> dict[str, int]:
+        return {"device": self.device, "inode": self.inode}
+
+
+@dataclass(frozen=True)
+class PrivateCleanupEvidence:
+    container: CleanupIdentity
+    artifacts: Mapping[str, CleanupIdentity]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "artifacts",
+            MappingProxyType(dict(self.artifacts)),
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "artifacts": [
+                {"name": name, **identity.to_json()}
+                for name, identity in sorted(self.artifacts.items())
+            ],
+            "container": self.container.to_json(),
+            "schema_version": 1,
+        }
+
+
+class BoundReviewLock:
+    """Own modern and compatibility cleanup-lock descriptors."""
+
+    def __init__(self, descriptor: int) -> None:
+        self._descriptor: int | None = descriptor
+        self._compatibility_descriptor: int | None = None
+
+    def fileno(self) -> int:
+        if self._descriptor is None:
+            raise ValueError("I/O operation on closed review lock")
+        return self._descriptor
+
+    def filenos(self) -> tuple[int, ...]:
+        descriptors = [self.fileno()]
+        if self._compatibility_descriptor is not None:
+            descriptors.append(self._compatibility_descriptor)
+        return tuple(descriptors)
+
+    def open_compatibility_lock(self, name: str) -> str | None:
+        if name != "cleanup.lock":
+            return "review runtime compatibility lock name is not allowed"
+        if self._compatibility_descriptor is not None:
+            return None
+
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor: int | None = None
+        created = False
+        try:
+            try:
+                descriptor = os.open(
+                    name,
+                    flags | os.O_EXCL,
+                    0o600,
+                    dir_fd=self.fileno(),
+                )
+                created = True
+            except FileExistsError:
+                descriptor = os.open(
+                    name,
+                    flags & ~os.O_CREAT,
+                    dir_fd=self.fileno(),
+                )
+            if created:
+                os.fchmod(descriptor, 0o600)
+            opened = os.fstat(descriptor)
+            current = os.stat(
+                name,
+                dir_fd=self.fileno(),
+                follow_symlinks=False,
+            )
+            for metadata in (opened, current):
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    return "review runtime compatibility lock is not a regular file"
+                if metadata.st_uid != os.geteuid():
+                    return "review runtime compatibility lock has an unexpected owner"
+                if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                    return (
+                        "review runtime compatibility lock must not be group or "
+                        "other writable"
+                    )
+            if _private_cleanup_identity(opened) != _private_cleanup_identity(current):
+                return "review runtime compatibility lock changed while opening"
+            self._compatibility_descriptor = descriptor
+            descriptor = None
+        except OSError as error:
+            if created:
+                try:
+                    os.unlink(name, dir_fd=self.fileno())
+                except OSError:
+                    pass
+            return f"cannot securely open review runtime compatibility lock: {error}"
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        return None
+
+    def close(self) -> None:
+        first_error: OSError | None = None
+        for attribute in ("_compatibility_descriptor", "_descriptor"):
+            descriptor = getattr(self, attribute)
+            if descriptor is None:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                if first_error is None:
+                    first_error = error
+            setattr(self, attribute, None)
+        if first_error is not None:
+            raise first_error
+
+    def __enter__(self) -> BoundReviewLock:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+
+@dataclass(frozen=True)
 class ReviewWorkspace:
+    source_root: pathlib.Path
+    container_dir: pathlib.Path
+    workspace_root: pathlib.Path
+    base_ref: str
+    head_ref: str
+    diff_file: pathlib.Path
+    prompt_file: pathlib.Path
+    private_cleanup: PrivateCleanupEvidence
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "base_ref": self.base_ref,
+            "container_dir": str(self.container_dir),
+            "diff_file": str(self.diff_file),
+            "head_ref": self.head_ref,
+            "private_cleanup": self.private_cleanup.to_json(),
+            "prompt_file": str(self.prompt_file),
+            "source_root": str(self.source_root),
+            "workspace_root": str(self.workspace_root),
+        }
+
+    @classmethod
+    def from_json(cls, value: dict[str, Any]) -> "ReviewWorkspace":
+        expected_fields = {
+            "base_ref",
+            "container_dir",
+            "diff_file",
+            "head_ref",
+            "private_cleanup",
+            "prompt_file",
+            "source_root",
+            "workspace_root",
+        }
+        if set(value) != expected_fields:
+            raise ValueError("workspace fields are invalid")
+        text_fields = expected_fields - {"private_cleanup"}
+        if any(not isinstance(value[field], str) for field in text_fields):
+            raise ValueError("workspace text fields are invalid")
+        return cls(
+            source_root=pathlib.Path(value["source_root"]),
+            container_dir=pathlib.Path(value["container_dir"]),
+            workspace_root=pathlib.Path(value["workspace_root"]),
+            base_ref=value["base_ref"],
+            head_ref=value["head_ref"],
+            diff_file=pathlib.Path(value["diff_file"]),
+            prompt_file=pathlib.Path(value["prompt_file"]),
+            private_cleanup=_parse_private_cleanup_evidence(
+                value["private_cleanup"],
+                require_all=True,
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class LegacyReviewWorkspace:
     source_root: pathlib.Path
     container_dir: pathlib.Path
     workspace_root: pathlib.Path
@@ -264,10 +570,31 @@ class ReviewWorkspace:
     prompt_file: pathlib.Path
 
     def to_json(self) -> dict[str, str]:
-        return {key: str(value) for key, value in asdict(self).items()}
+        return {
+            "base_ref": self.base_ref,
+            "container_dir": str(self.container_dir),
+            "diff_file": str(self.diff_file),
+            "head_ref": self.head_ref,
+            "prompt_file": str(self.prompt_file),
+            "source_root": str(self.source_root),
+            "workspace_root": str(self.workspace_root),
+        }
 
     @classmethod
-    def from_json(cls, value: dict[str, str]) -> "ReviewWorkspace":
+    def from_json(cls, value: dict[str, Any]) -> "LegacyReviewWorkspace":
+        expected_fields = {
+            "base_ref",
+            "container_dir",
+            "diff_file",
+            "head_ref",
+            "prompt_file",
+            "source_root",
+            "workspace_root",
+        }
+        if set(value) != expected_fields:
+            raise ValueError("legacy workspace fields are invalid")
+        if any(not isinstance(value[field], str) for field in expected_fields):
+            raise ValueError("legacy workspace text fields are invalid")
         return cls(
             source_root=pathlib.Path(value["source_root"]),
             container_dir=pathlib.Path(value["container_dir"]),
@@ -286,6 +613,14 @@ class ControlArtifactEvidence:
     size: int
     record_count: int | None
 
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "record_count": self.record_count,
+            "sha256": self.sha256,
+            "size": self.size,
+        }
+
 
 @dataclass(frozen=True)
 class ControlDirectoryEvidence:
@@ -299,41 +634,154 @@ class ControlDirectoryEvidence:
     entry_count: int
     entry_names_sha256: str
 
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "ctime_ns": self.ctime_ns,
+            "device": self.device,
+            "entry_count": self.entry_count,
+            "entry_names_sha256": self.entry_names_sha256,
+            "inode": self.inode,
+            "link_count": self.link_count,
+            "mode": self.mode,
+            "mtime_ns": self.mtime_ns,
+            "uid": self.uid,
+        }
+
 
 @dataclass(frozen=True)
 class ControlArtifactState:
     artifacts: dict[str, ControlArtifactEvidence]
     directory: ControlDirectoryEvidence
+    private_cleanup: PrivateCleanupEvidence
+    private_artifacts_removed: frozenset[str]
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "artifacts": [
+                artifact.to_json()
+                for artifact in sorted(
+                    self.artifacts.values(),
+                    key=lambda item: item.name,
+                )
+            ],
+            "directory": self.directory.to_json(),
+            "private_cleanup": {
+                "binding": self.private_cleanup.to_json(),
+                "removed": sorted(self.private_artifacts_removed),
+                "schema_version": 1,
+            },
+            "schema_version": CONTROL_ARTIFACT_SCHEMA_VERSION,
+        }
 
 
 class _IncompleteSecretScanSuffix(Exception):
-    pass
+    def __init__(self, retention_start: int | None = None) -> None:
+        super().__init__()
+        self.retention_start = retention_start
 
 
 _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE = "__incomplete-secret-scan-suffix__"
+_UNEXTRACTABLE_SECRET_CANDIDATE_END = -1
 
 
 @dataclass
 class SecretScanResult:
     blocking_rule: str | None
+    unextractable_rule: str | None
     accepted_counts: Counter[AcceptedSyntheticValue]
     accepted_candidates: dict[AcceptedSyntheticValue, set[bytes]]
+    blocking_candidates: dict[bytes, set[str]]
     raw_occurrence_counts: Counter[AcceptedSyntheticValue]
     unembedded_occurrence_counts: Counter[AcceptedSyntheticValue]
+    reduction_occurrence_offsets: dict[AcceptedSyntheticValue, set[int]]
+    reduction_unembedded_offsets: dict[AcceptedSyntheticValue, set[int]]
+    reduction_occurrence_identities: dict[AcceptedSyntheticValue, set[str]]
+    reduction_unembedded_identities: dict[AcceptedSyntheticValue, set[str]]
     incomplete_suffix_start: int | None
+    incomplete_suffix_retention_start: int | None
 
     @classmethod
     def empty(cls) -> "SecretScanResult":
-        return cls(None, Counter(), {}, Counter(), Counter(), None)
+        return cls(
+            None,
+            None,
+            Counter(),
+            {},
+            {},
+            Counter(),
+            Counter(),
+            {},
+            {},
+            {},
+            {},
+            None,
+            None,
+        )
 
     def merge(self, other: "SecretScanResult") -> None:
         if self.blocking_rule is None:
             self.blocking_rule = other.blocking_rule
+        if self.unextractable_rule is None:
+            self.unextractable_rule = other.unextractable_rule
         self.accepted_counts.update(other.accepted_counts)
         self.raw_occurrence_counts.update(other.raw_occurrence_counts)
         self.unembedded_occurrence_counts.update(other.unembedded_occurrence_counts)
+        for descriptor, offsets in other.reduction_occurrence_offsets.items():
+            destination = self.reduction_occurrence_offsets.setdefault(
+                descriptor,
+                set(),
+            )
+            destination.update(offsets)
+        for descriptor, offsets in other.reduction_unembedded_offsets.items():
+            destination = self.reduction_unembedded_offsets.setdefault(
+                descriptor,
+                set(),
+            )
+            destination.update(offsets)
+        for descriptor, identities in other.reduction_occurrence_identities.items():
+            destination = self.reduction_occurrence_identities.setdefault(
+                descriptor,
+                set(),
+            )
+            destination.update(identities)
+        for descriptor, identities in other.reduction_unembedded_identities.items():
+            destination = self.reduction_unembedded_identities.setdefault(
+                descriptor,
+                set(),
+            )
+            destination.update(identities)
+        if (
+            sum(map(len, self.reduction_occurrence_offsets.values()))
+            > MAX_SECRET_REDUCTION_PROVENANCE_OCCURRENCES
+            or sum(map(len, self.reduction_unembedded_offsets.values()))
+            > MAX_SECRET_REDUCTION_PROVENANCE_OCCURRENCES
+            or sum(map(len, self.reduction_occurrence_identities.values()))
+            > MAX_SECRET_REDUCTION_PROVENANCE_OCCURRENCES
+            or sum(map(len, self.reduction_unembedded_identities.values()))
+            > MAX_SECRET_REDUCTION_PROVENANCE_OCCURRENCES
+        ):
+            raise ReviewError(
+                "external review secret-reduction occurrence provenance exceeds "
+                "the entry limit"
+            )
         for accepted, values in other.accepted_candidates.items():
             self.accepted_candidates.setdefault(accepted, set()).update(values)
+        for candidate, rules in other.blocking_candidates.items():
+            if (
+                candidate not in self.blocking_candidates
+                and len(self.blocking_candidates) >= MAX_SECRET_REDUCTION_CANDIDATES
+            ):
+                raise ReviewError(
+                    "external review content has too many secret-reduction candidates"
+                )
+            self.blocking_candidates.setdefault(candidate, set()).update(rules)
+        if (
+            sum(map(len, self.blocking_candidates))
+            > MAX_SECRET_REDUCTION_CANDIDATE_BYTES
+        ):
+            raise ReviewError(
+                "external review secret-reduction candidates exceed the byte limit"
+            )
 
 
 @dataclass
@@ -377,9 +825,16 @@ class SecretScanBudget:
         ):
             raise ReviewError("sensitive scanner budget transaction is invalid")
         self.remaining = transaction.remaining
-        self.remaining_prefix_proof_bytes = (
-            transaction.remaining_prefix_proof_bytes
-        )
+        self.remaining_prefix_proof_bytes = transaction.remaining_prefix_proof_bytes
+
+
+@dataclass
+class _AssignmentPrefixContextCache:
+    """Cache the wrapper context shared by one assignment's RHS probes."""
+
+    assignment_prefix_end: int
+    loaded: bool = False
+    context: tuple[tuple[int, ...], bytes | None, tuple[int, ...]] | None = None
 
 
 @dataclass(frozen=True)
@@ -442,7 +897,6 @@ class FileScanByteBudget:
 class AcceptedValueIndex:
     exact: dict[tuple[str, bytes], list[AcceptedSyntheticValue]]
     digests: dict[tuple[str, int], dict[str, list[AcceptedSyntheticValue]]]
-    rules: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -457,6 +911,7 @@ class LegacyPathMatcher:
     transitions: tuple[dict[int, int], ...]
     failures: tuple[int, ...]
     identifiers: tuple[str | None, ...]
+    maximum_length: int
 
     def match(self, raw_path: bytes) -> str | None:
         state = 0
@@ -529,8 +984,9 @@ def _create_sanitized_git_view(
         raise ReviewError(f"unsupported Git object format: {object_format!r}")
 
     git_view = container / "git-view"
-    (git_view / "objects").mkdir(parents=True)
-    (git_view / "refs").mkdir()
+    git_view.mkdir(mode=0o755)
+    (git_view / "objects").mkdir(mode=0o755)
+    (git_view / "refs").mkdir(mode=0o755)
     write_text_atomic(git_view / "HEAD", "ref: refs/heads/unused\n")
     format_version = 1 if object_format == "sha256" else 0
     config = f"[core]\n\trepositoryformatversion = {format_version}\n\tbare = true\n"
@@ -659,94 +1115,1763 @@ def _require_ancestor_range(
     )
 
 
-def _remove_partial_container(container: pathlib.Path) -> str | None:
-    try:
-        shutil.rmtree(container)
-    except FileNotFoundError:
-        return None
-    except OSError as error:
-        return str(error)
+def _private_cleanup_directory_error(
+    metadata: os.stat_result,
+    *,
+    label: str,
+    require_private_mode: bool,
+) -> str | None:
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        return f"{label} is not a real directory"
+    if metadata.st_uid != os.geteuid():
+        return f"{label} has an unexpected owner"
+    mode = stat.S_IMODE(metadata.st_mode)
+    if require_private_mode and mode != 0o700:
+        return f"{label} must have mode 0700"
+    if not require_private_mode and mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return f"{label} must not be group or other writable"
     return None
+
+
+def _private_cleanup_identity(metadata: os.stat_result) -> tuple[int, int]:
+    return metadata.st_dev, metadata.st_ino
+
+
+def _cleanup_identity_evidence(metadata: os.stat_result) -> CleanupIdentity:
+    return CleanupIdentity(device=metadata.st_dev, inode=metadata.st_ino)
+
+
+def _private_artifact_metadata_at(
+    container_descriptor: int,
+    artifact_name: str,
+    *,
+    require_private_mode: bool = True,
+) -> os.stat_result:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        artifact_before = os.stat(
+            artifact_name,
+            dir_fd=container_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise ReviewError(
+            f"cannot inspect helper-private artifact {artifact_name}: {error}"
+        ) from error
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            artifact_name,
+            flags,
+            dir_fd=container_descriptor,
+        )
+        artifact_opened = os.fstat(descriptor)
+        artifact_after = os.stat(
+            artifact_name,
+            dir_fd=container_descriptor,
+            follow_symlinks=False,
+        )
+        for metadata in (artifact_before, artifact_opened, artifact_after):
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise ReviewError(
+                    f"helper-private artifact {artifact_name} is not a "
+                    "regular file with one link"
+                )
+            if metadata.st_uid != os.geteuid():
+                raise ReviewError(
+                    f"helper-private artifact {artifact_name} has an unexpected owner"
+                )
+            mode = stat.S_IMODE(metadata.st_mode)
+            if require_private_mode and mode != 0o600:
+                raise ReviewError(
+                    f"helper-private artifact {artifact_name} must have mode 0600"
+                )
+            if not require_private_mode and mode & (stat.S_IWGRP | stat.S_IWOTH):
+                raise ReviewError(
+                    f"helper-private artifact {artifact_name} must not be "
+                    "group or other writable"
+                )
+        if (
+            len(
+                {
+                    _private_cleanup_identity(artifact_before),
+                    _private_cleanup_identity(artifact_opened),
+                    _private_cleanup_identity(artifact_after),
+                }
+            )
+            != 1
+        ):
+            raise ReviewError(
+                f"helper-private artifact {artifact_name} changed while opening"
+            )
+        return artifact_opened
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise ReviewError(
+            f"cannot securely open helper-private artifact {artifact_name}: {error}"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _private_artifact_identity_at(
+    container_descriptor: int,
+    artifact_name: str,
+) -> CleanupIdentity:
+    return _cleanup_identity_evidence(
+        _private_artifact_metadata_at(container_descriptor, artifact_name)
+    )
+
+
+def _private_cleanup_directory_flags() -> int:
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def _review_cleanup_directory_entry_error(metadata: os.stat_result) -> str | None:
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        return "review cleanup directory entry is not a real directory"
+    if metadata.st_uid != os.geteuid():
+        return "review cleanup directory entry has an unexpected owner"
+    return None
+
+
+def _quarantine_cleanup_entry(
+    parent_descriptor: int,
+    entry_name: str,
+    expected_metadata: os.stat_result,
+    *,
+    label: str,
+    missing_is_error: bool,
+) -> tuple[str | None, os.stat_result | None, list[str]]:
+    quarantine_name = f"{REVIEW_CLEANUP_QUARANTINE_PREFIX}{uuid.uuid4().hex}"
+    try:
+        os.rename(
+            entry_name,
+            quarantine_name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+    except FileNotFoundError:
+        if missing_is_error:
+            return None, None, [f"{label} changed before removal"]
+        return None, None, []
+    except OSError as error:
+        return None, None, [f"cannot quarantine {label}: {error}"]
+
+    try:
+        quarantined_metadata = os.stat(
+            quarantine_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return (
+            quarantine_name,
+            None,
+            [f"{label} quarantine changed before validation"],
+        )
+    except OSError as error:
+        return (
+            quarantine_name,
+            None,
+            [f"cannot inspect {label} quarantine: {error}"],
+        )
+    if _private_cleanup_identity(expected_metadata) != _private_cleanup_identity(
+        quarantined_metadata
+    ):
+        return (
+            quarantine_name,
+            quarantined_metadata,
+            [
+                f"{label} changed before removal; replacement preserved as "
+                f"{quarantine_name}"
+            ],
+        )
+    return quarantine_name, quarantined_metadata, []
+
+
+def _remove_quarantined_cleanup_entry(
+    parent_descriptor: int,
+    quarantine_name: str,
+    expected_metadata: os.stat_result,
+    *,
+    label: str,
+    is_directory: bool,
+) -> list[str]:
+    try:
+        quarantine_final = os.stat(
+            quarantine_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return [f"{label} quarantine changed before removal"]
+    except OSError as error:
+        return [f"cannot revalidate {label} quarantine: {error}"]
+    if _private_cleanup_identity(expected_metadata) != _private_cleanup_identity(
+        quarantine_final
+    ):
+        return [
+            f"{label} quarantine changed before removal; entry preserved as "
+            f"{quarantine_name}"
+        ]
+    try:
+        if is_directory:
+            os.rmdir(quarantine_name, dir_fd=parent_descriptor)
+        else:
+            os.unlink(quarantine_name, dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        return [f"{label} quarantine changed before removal"]
+    except OSError as error:
+        return [f"cannot remove {label} quarantine {quarantine_name}: {error}"]
+    return []
+
+
+def _remove_open_directory_contents(
+    directory_descriptor: int,
+    *,
+    depth: int = 0,
+    excluded_entry_names: frozenset[str] = frozenset(),
+) -> list[str]:
+    if depth >= MAX_REVIEW_CLEANUP_DEPTH:
+        return ["review cleanup directory depth exceeds the safety limit"]
+    cleanup_errors: list[str] = []
+    try:
+        entry_names = os.listdir(directory_descriptor)
+    except OSError as error:
+        return [f"cannot enumerate review cleanup directory: {error}"]
+
+    for entry_name in entry_names:
+        if entry_name in excluded_entry_names:
+            continue
+        if entry_name.startswith(REVIEW_CLEANUP_QUARANTINE_PREFIX):
+            cleanup_errors.append(
+                "pre-existing review cleanup quarantine requires manual recovery"
+            )
+            continue
+        try:
+            entry_before = os.stat(
+                entry_name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            cleanup_errors.append(f"cannot inspect review cleanup entry: {error}")
+            continue
+
+        if not stat.S_ISDIR(entry_before.st_mode):
+            quarantine_name, _, quarantine_errors = _quarantine_cleanup_entry(
+                directory_descriptor,
+                entry_name,
+                entry_before,
+                label="review cleanup entry",
+                missing_is_error=False,
+            )
+            cleanup_errors.extend(quarantine_errors)
+            if quarantine_errors or quarantine_name is None:
+                continue
+            cleanup_errors.extend(
+                _remove_quarantined_cleanup_entry(
+                    directory_descriptor,
+                    quarantine_name,
+                    entry_before,
+                    label="review cleanup entry",
+                    is_directory=False,
+                )
+            )
+            continue
+
+        directory_error = _review_cleanup_directory_entry_error(entry_before)
+        if directory_error:
+            cleanup_errors.append(directory_error)
+            continue
+
+        child_descriptor: int | None = None
+        try:
+            try:
+                child_descriptor = os.open(
+                    entry_name,
+                    _private_cleanup_directory_flags(),
+                    dir_fd=directory_descriptor,
+                )
+            except FileNotFoundError:
+                continue
+            child_opened = os.fstat(child_descriptor)
+            try:
+                child_after = os.stat(
+                    entry_name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                cleanup_errors.append(
+                    "review cleanup directory entry changed while opening"
+                )
+                continue
+            for metadata in (child_opened, child_after):
+                directory_error = _review_cleanup_directory_entry_error(metadata)
+                if directory_error:
+                    cleanup_errors.append(directory_error)
+                    break
+            else:
+                if (
+                    len(
+                        {
+                            _private_cleanup_identity(entry_before),
+                            _private_cleanup_identity(child_opened),
+                            _private_cleanup_identity(child_after),
+                        }
+                    )
+                    != 1
+                ):
+                    cleanup_errors.append(
+                        "review cleanup directory entry changed while opening"
+                    )
+                    continue
+
+                cleanup_errors.extend(
+                    _remove_open_directory_tree(
+                        directory_descriptor,
+                        child_descriptor,
+                        entry_name,
+                        label="review cleanup directory entry",
+                        require_private_mode=False,
+                        depth=depth + 1,
+                        quarantine_before_recursion=True,
+                    )
+                )
+        except OSError as error:
+            cleanup_errors.append(
+                f"cannot securely open review cleanup directory entry: {error}"
+            )
+        finally:
+            if child_descriptor is not None:
+                try:
+                    os.close(child_descriptor)
+                except OSError as error:
+                    cleanup_errors.append(
+                        f"cannot close review cleanup directory entry: {error}"
+                    )
+    return cleanup_errors
+
+
+def _remove_open_directory_tree(
+    parent_descriptor: int,
+    directory_descriptor: int,
+    directory_name: str,
+    *,
+    label: str,
+    require_private_mode: bool,
+    excluded_entry_names: frozenset[str] = frozenset(),
+    final_entry_names: tuple[str, ...] = (),
+    depth: int = 0,
+    quarantine_before_recursion: bool = False,
+    quarantine_before_final_entries: bool = False,
+) -> list[str]:
+    try:
+        directory_opened = os.fstat(directory_descriptor)
+    except OSError as error:
+        return [f"cannot inspect {label} before quarantine: {error}"]
+    directory_error = _private_cleanup_directory_error(
+        directory_opened,
+        label=label,
+        require_private_mode=require_private_mode,
+    )
+    if directory_error:
+        return [directory_error]
+
+    directory_quarantine_name: str | None = None
+    detached_directory_errors: list[str] = []
+    if quarantine_before_recursion:
+        try:
+            parent_opened = os.fstat(parent_descriptor)
+        except OSError as error:
+            return [f"cannot inspect {label} parent before quarantine: {error}"]
+        if directory_opened.st_dev != parent_opened.st_dev:
+            return [f"{label} crosses a filesystem boundary"]
+        (
+            directory_quarantine_name,
+            quarantined,
+            quarantine_errors,
+        ) = _quarantine_cleanup_entry(
+            parent_descriptor,
+            directory_name,
+            directory_opened,
+            label=label,
+            missing_is_error=True,
+        )
+        if (
+            quarantine_errors
+            or directory_quarantine_name is None
+            or quarantined is None
+        ):
+            return quarantine_errors
+        directory_error = _private_cleanup_directory_error(
+            quarantined,
+            label=label,
+            require_private_mode=require_private_mode,
+        )
+        if directory_error:
+            return [directory_error]
+
+    cleanup_errors = _remove_open_directory_contents(
+        directory_descriptor,
+        depth=depth,
+        excluded_entry_names=excluded_entry_names | frozenset(final_entry_names),
+    )
+    if cleanup_errors:
+        return cleanup_errors
+
+    if quarantine_before_final_entries and directory_quarantine_name is None:
+        try:
+            os.fsync(directory_descriptor)
+        except OSError as error:
+            return [f"cannot sync cleaned {label} before quarantine: {error}"]
+        try:
+            directory_before_quarantine = os.fstat(directory_descriptor)
+        except OSError as error:
+            return [f"cannot revalidate {label} before quarantine: {error}"]
+        directory_error = _private_cleanup_directory_error(
+            directory_before_quarantine,
+            label=label,
+            require_private_mode=require_private_mode,
+        )
+        if directory_error:
+            return [directory_error]
+        if _private_cleanup_identity(
+            directory_before_quarantine
+        ) != _private_cleanup_identity(directory_opened):
+            return [f"{label} changed during cleanup"]
+        (
+            directory_quarantine_name,
+            quarantined,
+            quarantine_errors,
+        ) = _quarantine_cleanup_entry(
+            parent_descriptor,
+            directory_name,
+            directory_before_quarantine,
+            label=label,
+            missing_is_error=True,
+        )
+        if quarantine_errors:
+            if directory_quarantine_name is None or quarantined is None:
+                return quarantine_errors
+            if _private_cleanup_identity(quarantined) == _private_cleanup_identity(
+                directory_before_quarantine
+            ):
+                return quarantine_errors
+            # The canonical name was replaced while the original directory
+            # remained bound to our descriptor. Retire only the original's
+            # non-sensitive protocol entries, then report the detached tree.
+            detached_directory_errors.extend(quarantine_errors)
+        elif directory_quarantine_name is None or quarantined is None:
+            return [f"cannot quarantine {label}"]
+        else:
+            directory_error = _private_cleanup_directory_error(
+                quarantined,
+                label=label,
+                require_private_mode=require_private_mode,
+            )
+            if directory_error:
+                return [directory_error]
+    if quarantine_before_final_entries:
+        if directory_quarantine_name is None:
+            return [f"cannot establish {label} quarantine before final cleanup"]
+        try:
+            os.fsync(parent_descriptor)
+        except OSError as error:
+            return detached_directory_errors + [
+                f"cannot sync {label} parent after quarantine: {error}; "
+                "quarantine retained"
+            ]
+
+    for final_entry_name in final_entry_names:
+        try:
+            final_entry_metadata = os.stat(
+                final_entry_name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            return detached_directory_errors + [
+                f"cannot inspect final review cleanup entry: {error}"
+            ]
+        if stat.S_ISDIR(final_entry_metadata.st_mode):
+            return detached_directory_errors + [
+                "final review cleanup entry is unexpectedly a directory"
+            ]
+        final_quarantine_name, _, quarantine_errors = _quarantine_cleanup_entry(
+            directory_descriptor,
+            final_entry_name,
+            final_entry_metadata,
+            label="final review cleanup entry",
+            missing_is_error=True,
+        )
+        if quarantine_errors or final_quarantine_name is None:
+            return detached_directory_errors + quarantine_errors
+        cleanup_errors.extend(
+            _remove_quarantined_cleanup_entry(
+                directory_descriptor,
+                final_quarantine_name,
+                final_entry_metadata,
+                label="final review cleanup entry",
+                is_directory=False,
+            )
+        )
+        if cleanup_errors:
+            return detached_directory_errors + cleanup_errors
+
+    if detached_directory_errors:
+        return detached_directory_errors
+
+    try:
+        remaining_entry_names = os.listdir(directory_descriptor)
+    except OSError as error:
+        return [f"cannot verify empty {label}: {error}"]
+    if remaining_entry_names:
+        return [f"{label} still contains entries after cleanup"]
+
+    try:
+        directory_final = os.fstat(directory_descriptor)
+    except OSError as error:
+        return [f"cannot revalidate {label} before removal: {error}"]
+    directory_error = _private_cleanup_directory_error(
+        directory_final,
+        label=label,
+        require_private_mode=require_private_mode,
+    )
+    if directory_error:
+        return [directory_error]
+    if _private_cleanup_identity(directory_final) != _private_cleanup_identity(
+        directory_opened
+    ):
+        suffix = (
+            "; quarantine preserved" if directory_quarantine_name is not None else ""
+        )
+        return [f"{label} changed during cleanup{suffix}"]
+    if directory_quarantine_name is None:
+        (
+            directory_quarantine_name,
+            quarantined,
+            quarantine_errors,
+        ) = _quarantine_cleanup_entry(
+            parent_descriptor,
+            directory_name,
+            directory_final,
+            label=label,
+            missing_is_error=True,
+        )
+        if (
+            quarantine_errors
+            or directory_quarantine_name is None
+            or quarantined is None
+        ):
+            return quarantine_errors
+        directory_error = _private_cleanup_directory_error(
+            quarantined,
+            label=label,
+            require_private_mode=require_private_mode,
+        )
+        if directory_error:
+            return [directory_error]
+    removal_errors = _remove_quarantined_cleanup_entry(
+        parent_descriptor,
+        directory_quarantine_name,
+        directory_opened,
+        label=label,
+        is_directory=True,
+    )
+    if removal_errors:
+        return removal_errors
+    if not quarantine_before_final_entries:
+        return []
+    try:
+        os.fsync(parent_descriptor)
+    except OSError as error:
+        return [
+            f"cannot sync {label} parent after removal: {error}; "
+            "durable removal is unconfirmed"
+        ]
+    return []
+
+
+def _remove_named_directory_tree(
+    parent_descriptor: int,
+    directory_name: str,
+    *,
+    label: str,
+    require_private_mode: bool,
+) -> list[str]:
+    def preexisting_quarantine_errors() -> list[str]:
+        try:
+            entry_names = os.listdir(parent_descriptor)
+        except OSError as error:
+            return [f"cannot enumerate {label} parent before cleanup: {error}"]
+        if any(
+            entry_name.startswith(REVIEW_CLEANUP_QUARANTINE_PREFIX)
+            for entry_name in entry_names
+        ):
+            return ["pre-existing review cleanup quarantine requires manual recovery"]
+        return []
+
+    quarantine_errors = preexisting_quarantine_errors()
+    if quarantine_errors:
+        return quarantine_errors
+    try:
+        directory_before = os.stat(
+            directory_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return preexisting_quarantine_errors()
+    except OSError as error:
+        return [f"cannot inspect {label}: {error}"]
+    directory_error = _private_cleanup_directory_error(
+        directory_before,
+        label=label,
+        require_private_mode=require_private_mode,
+    )
+    if directory_error:
+        return [directory_error]
+
+    directory_descriptor: int | None = None
+    cleanup_errors: list[str] = []
+    try:
+        try:
+            directory_descriptor = os.open(
+                directory_name,
+                _private_cleanup_directory_flags(),
+                dir_fd=parent_descriptor,
+            )
+        except FileNotFoundError:
+            return []
+        directory_opened = os.fstat(directory_descriptor)
+        try:
+            directory_after = os.stat(
+                directory_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            cleanup_errors.append(f"{label} changed while opening")
+        else:
+            for metadata in (directory_opened, directory_after):
+                directory_error = _private_cleanup_directory_error(
+                    metadata,
+                    label=label,
+                    require_private_mode=require_private_mode,
+                )
+                if directory_error:
+                    cleanup_errors.append(directory_error)
+                    break
+            else:
+                if (
+                    len(
+                        {
+                            _private_cleanup_identity(directory_before),
+                            _private_cleanup_identity(directory_opened),
+                            _private_cleanup_identity(directory_after),
+                        }
+                    )
+                    != 1
+                ):
+                    cleanup_errors.append(f"{label} changed while opening")
+                else:
+                    cleanup_errors.extend(
+                        _remove_open_directory_tree(
+                            parent_descriptor,
+                            directory_descriptor,
+                            directory_name,
+                            label=label,
+                            require_private_mode=require_private_mode,
+                            quarantine_before_recursion=True,
+                        )
+                    )
+    except OSError as error:
+        cleanup_errors.append(f"cannot securely open {label}: {error}")
+    finally:
+        if directory_descriptor is not None:
+            try:
+                os.close(directory_descriptor)
+            except OSError as error:
+                cleanup_errors.append(f"cannot close {label}: {error}")
+    return cleanup_errors
+
+
+def _operate_on_private_review_container(
+    container: pathlib.Path,
+    operation: Callable[[int, int], Iterable[str]],
+) -> str | None:
+    directory_flags = _private_cleanup_directory_flags()
+    parent = container.parent
+    try:
+        parent_before = os.lstat(parent)
+    except FileNotFoundError:
+        return "private artifact parent is missing"
+    except OSError as error:
+        return f"cannot inspect private artifact parent: {error.strerror or error}"
+    parent_error = _private_cleanup_directory_error(
+        parent_before,
+        label="private artifact parent",
+        require_private_mode=False,
+    )
+    if parent_error:
+        return parent_error
+
+    try:
+        parent_descriptor = os.open(parent, directory_flags)
+    except FileNotFoundError:
+        return "private artifact parent changed while opening"
+    except OSError as error:
+        return f"cannot securely open private artifact parent: {error}"
+
+    cleanup_errors: list[str] = []
+    container_descriptor: int | None = None
+    try:
+        parent_opened = os.fstat(parent_descriptor)
+        parent_after = os.lstat(parent)
+        for metadata in (parent_opened, parent_after):
+            parent_error = _private_cleanup_directory_error(
+                metadata,
+                label="private artifact parent",
+                require_private_mode=False,
+            )
+            if parent_error:
+                raise ReviewError(parent_error)
+        if (
+            len(
+                {
+                    _private_cleanup_identity(parent_before),
+                    _private_cleanup_identity(parent_opened),
+                    _private_cleanup_identity(parent_after),
+                }
+            )
+            != 1
+        ):
+            raise ReviewError("private artifact parent changed while opening")
+
+        try:
+            container_before = os.stat(
+                container.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            cleanup_errors.append("private artifact container is missing")
+            container_before = None
+        if container_before is not None:
+            container_error = _private_cleanup_directory_error(
+                container_before,
+                label="private artifact container",
+                require_private_mode=True,
+            )
+            if container_error:
+                raise ReviewError(container_error)
+            container_descriptor = os.open(
+                container.name,
+                directory_flags,
+                dir_fd=parent_descriptor,
+            )
+            container_opened = os.fstat(container_descriptor)
+            container_after = os.stat(
+                container.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            for metadata in (container_opened, container_after):
+                container_error = _private_cleanup_directory_error(
+                    metadata,
+                    label="private artifact container",
+                    require_private_mode=True,
+                )
+                if container_error:
+                    raise ReviewError(container_error)
+            if (
+                len(
+                    {
+                        _private_cleanup_identity(container_before),
+                        _private_cleanup_identity(container_opened),
+                        _private_cleanup_identity(container_after),
+                    }
+                )
+                != 1
+            ):
+                raise ReviewError("private artifact container changed while opening")
+
+        if container_descriptor is not None:
+            cleanup_errors.extend(operation(parent_descriptor, container_descriptor))
+    except (OSError, ReviewError) as error:
+        cleanup_errors.append(str(error))
+    finally:
+        for label, descriptor in (
+            ("private artifact container", container_descriptor),
+            ("private artifact parent", parent_descriptor),
+        ):
+            if descriptor is None:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                cleanup_errors.append(f"cannot close {label}: {error}")
+    return "; ".join(cleanup_errors) or None
+
+
+def _capture_private_cleanup_evidence(
+    container: pathlib.Path,
+    *,
+    expected_container: CleanupIdentity | None = None,
+    require_all: bool,
+) -> PrivateCleanupEvidence:
+    captured: PrivateCleanupEvidence | None = None
+
+    def capture(
+        _parent_descriptor: int,
+        container_descriptor: int,
+    ) -> list[str]:
+        nonlocal captured
+        container_identity = _cleanup_identity_evidence(os.fstat(container_descriptor))
+        if expected_container is not None and container_identity != expected_container:
+            return ["private artifact container does not match preparation identity"]
+        artifacts: dict[str, CleanupIdentity] = {}
+        errors: list[str] = []
+        for artifact_name in PRIVATE_HELPER_ARTIFACT_NAMES:
+            try:
+                artifacts[artifact_name] = _private_artifact_identity_at(
+                    container_descriptor,
+                    artifact_name,
+                )
+            except FileNotFoundError:
+                if require_all:
+                    errors.append(f"helper-private artifact {artifact_name} is missing")
+            except ReviewError as error:
+                errors.append(str(error))
+        if not errors:
+            captured = PrivateCleanupEvidence(
+                container=container_identity,
+                artifacts=artifacts,
+            )
+        return errors
+
+    capture_error = _operate_on_private_review_container(container, capture)
+    if capture_error:
+        raise ReviewError(capture_error)
+    if captured is None:
+        raise ReviewError("private cleanup evidence could not be captured")
+    return captured
+
+
+def _unlink_private_review_artifacts(
+    _parent_descriptor: int,
+    container_descriptor: int,
+    *,
+    expected: PrivateCleanupEvidence,
+    removed: frozenset[str],
+    record_removal: Callable[[str], None] | None,
+    identity_label: str = "preparation",
+) -> list[str]:
+    container_identity = _cleanup_identity_evidence(os.fstat(container_descriptor))
+    if container_identity != expected.container:
+        return [f"private artifact container does not match {identity_label} identity"]
+    cleanup_errors: list[str] = []
+    removable: dict[str, os.stat_result] = {}
+    for artifact_name in PRIVATE_HELPER_ARTIFACT_NAMES:
+        expected_identity = expected.artifacts.get(artifact_name)
+        if artifact_name in removed:
+            try:
+                os.stat(
+                    artifact_name,
+                    dir_fd=container_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                cleanup_errors.append(f"{artifact_name}: {error}")
+            else:
+                cleanup_errors.append(
+                    f"{artifact_name}: helper-private artifact reappeared after "
+                    "its recorded removal"
+                )
+            continue
+        if expected_identity is None:
+            try:
+                os.stat(
+                    artifact_name,
+                    dir_fd=container_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                cleanup_errors.append(f"{artifact_name}: {error}")
+            else:
+                cleanup_errors.append(
+                    f"{artifact_name}: no {identity_label} identity is available"
+                )
+            continue
+        try:
+            current_metadata = _private_artifact_metadata_at(
+                container_descriptor,
+                artifact_name,
+                require_private_mode=False,
+            )
+        except FileNotFoundError:
+            cleanup_errors.append(
+                f"{artifact_name}: expected helper-private artifact is missing"
+            )
+        except ReviewError as error:
+            cleanup_errors.append(str(error))
+        else:
+            if _cleanup_identity_evidence(current_metadata) != expected_identity:
+                cleanup_errors.append(
+                    f"{artifact_name}: helper-private artifact does not match "
+                    f"{identity_label} identity"
+                )
+            else:
+                removable[artifact_name] = current_metadata
+    for artifact_name, artifact_metadata in removable.items():
+        removal_mask = block_forwarded_signals()
+        try:
+            quarantine_name, quarantined, artifact_errors = _quarantine_cleanup_entry(
+                container_descriptor,
+                artifact_name,
+                artifact_metadata,
+                label=f"helper-private artifact {artifact_name}",
+                missing_is_error=True,
+            )
+            if artifact_errors or quarantine_name is None or quarantined is None:
+                cleanup_errors.extend(artifact_errors)
+                continue
+            artifact_errors.extend(
+                _remove_quarantined_cleanup_entry(
+                    container_descriptor,
+                    quarantine_name,
+                    artifact_metadata,
+                    label=f"helper-private artifact {artifact_name}",
+                    is_directory=False,
+                )
+            )
+            cleanup_errors.extend(artifact_errors)
+            if artifact_errors:
+                continue
+            if record_removal is not None:
+                try:
+                    record_removal(artifact_name)
+                except ReviewError as error:
+                    cleanup_errors.append(str(error))
+                    continue
+        finally:
+            restore_signal_mask(removal_mask)
+    return cleanup_errors
+
+
+def _load_bound_private_cleanup_state_at(
+    container_descriptor: int,
+    *,
+    expected: PrivateCleanupEvidence,
+) -> ControlArtifactState:
+    state = _load_control_artifact_state_at(container_descriptor)
+    if state.private_cleanup != expected:
+        raise ReviewError(
+            "helper-private cleanup state does not match preparation identity"
+        )
+    return state
+
+
+def load_bound_private_cleanup_state(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+) -> ControlArtifactState:
+    captured: ControlArtifactState | None = None
+
+    def load_bound_state(
+        _parent_descriptor: int,
+        container_descriptor: int,
+    ) -> list[str]:
+        nonlocal captured
+        if (
+            _cleanup_identity_evidence(os.fstat(container_descriptor))
+            != expected.container
+        ):
+            return ["private artifact container does not match preparation identity"]
+        try:
+            captured = _load_bound_private_cleanup_state_at(
+                container_descriptor,
+                expected=expected,
+            )
+        except ReviewError as error:
+            return [str(error)]
+        return []
+
+    load_error = _operate_on_private_review_container(container, load_bound_state)
+    if load_error:
+        raise ReviewError(load_error)
+    if captured is None:
+        raise ReviewError("helper-private cleanup state could not be loaded")
+    return captured
+
+
+def _record_private_artifact_removal_at(
+    container_descriptor: int,
+    *,
+    expected: PrivateCleanupEvidence,
+    artifact_name: str,
+) -> None:
+    state = _load_bound_private_cleanup_state_at(
+        container_descriptor,
+        expected=expected,
+    )
+    if artifact_name in state.private_artifacts_removed:
+        return
+    removed = frozenset((*state.private_artifacts_removed, artifact_name))
+    _write_control_artifact_state_at(
+        container_descriptor,
+        ControlArtifactState(
+            artifacts=state.artifacts,
+            directory=state.directory,
+            private_cleanup=state.private_cleanup,
+            private_artifacts_removed=removed,
+        ),
+    )
+    persisted = _load_bound_private_cleanup_state_at(
+        container_descriptor,
+        expected=expected,
+    )
+    if persisted.private_artifacts_removed != removed:
+        raise ReviewError("helper-private cleanup receipt did not persist")
+
+
+def remove_private_review_artifacts(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+) -> str | None:
+    def unlink_bound_artifacts(
+        parent_descriptor: int,
+        container_descriptor: int,
+    ) -> list[str]:
+        if (
+            _cleanup_identity_evidence(os.fstat(container_descriptor))
+            != expected.container
+        ):
+            return ["private artifact container does not match preparation identity"]
+        try:
+            cleanup_state = _load_bound_private_cleanup_state_at(
+                container_descriptor,
+                expected=expected,
+            )
+        except ReviewError as error:
+            return [str(error)]
+        removed = set(cleanup_state.private_artifacts_removed)
+
+        def record_removal(artifact_name: str) -> None:
+            _record_private_artifact_removal_at(
+                container_descriptor,
+                expected=expected,
+                artifact_name=artifact_name,
+            )
+            removed.add(artifact_name)
+
+        cleanup_errors = _unlink_private_review_artifacts(
+            parent_descriptor,
+            container_descriptor,
+            expected=expected,
+            removed=frozenset(removed),
+            record_removal=record_removal,
+        )
+        if cleanup_errors:
+            return cleanup_errors
+        try:
+            final_state = _load_bound_private_cleanup_state_at(
+                container_descriptor,
+                expected=expected,
+            )
+        except ReviewError as error:
+            return [str(error)]
+        if final_state.private_artifacts_removed != frozenset(
+            PRIVATE_HELPER_ARTIFACT_NAMES
+        ):
+            return ["helper-private artifact removal receipts are incomplete"]
+        return []
+
+    cleanup_error = _operate_on_private_review_container(
+        container,
+        unlink_bound_artifacts,
+    )
+    if cleanup_error:
+        return cleanup_error
+    try:
+        final_state = load_bound_private_cleanup_state(
+            container,
+            expected=expected,
+        )
+    except ReviewError as error:
+        return str(error)
+    if final_state.private_artifacts_removed != frozenset(
+        PRIVATE_HELPER_ARTIFACT_NAMES
+    ):
+        return "helper-private artifact removal receipts are incomplete"
+    return None
+
+
+BOUND_REVIEW_TEXT_ARTIFACT_NAMES = frozenset(
+    {"cleanup-error.txt", "exit-code", "runner-error.txt"}
+)
+BOUND_REVIEW_JSON_ARTIFACT_NAMES = frozenset(
+    {REVIEW_STATE_MARKER_NAME, "attempts.json"}
+)
+
+
+def _write_bound_review_bytes(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+    name: str,
+    encoded: bytes,
+    artifact_label: str,
+) -> str | None:
+    def persist_bytes(
+        parent_descriptor: int,
+        container_descriptor: int,
+    ) -> list[str]:
+        if (
+            _cleanup_identity_evidence(os.fstat(container_descriptor))
+            != expected.container
+        ):
+            return ["private artifact container does not match preparation identity"]
+
+        target_name = name
+        temporary_name = f".{target_name}.{uuid.uuid4().hex}"
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor: int | None = None
+        handle: BinaryIO | None = None
+        read_descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                temporary_name,
+                flags,
+                0o600,
+                dir_fd=container_descriptor,
+            )
+            os.fchmod(descriptor, 0o600)
+            handle = os.fdopen(descriptor, "wb")
+            descriptor = None
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+            handle.close()
+            handle = None
+            os.replace(
+                temporary_name,
+                target_name,
+                src_dir_fd=container_descriptor,
+                dst_dir_fd=container_descriptor,
+            )
+            read_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+            )
+            read_descriptor = os.open(
+                target_name,
+                read_flags,
+                dir_fd=container_descriptor,
+            )
+            opened = os.fstat(read_descriptor)
+            current = os.stat(
+                target_name,
+                dir_fd=container_descriptor,
+                follow_symlinks=False,
+            )
+            for metadata in (opened, current):
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    return [f"{artifact_label} is not a regular file with one link"]
+                if metadata.st_uid != os.geteuid():
+                    return [f"{artifact_label} has an unexpected owner"]
+                if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                    return [f"{artifact_label} must not be group or other writable"]
+            if _private_cleanup_identity(opened) != _private_cleanup_identity(current):
+                return [f"{artifact_label} changed during persistence"]
+            readback = bytearray()
+            while len(readback) <= len(encoded):
+                chunk = os.read(
+                    read_descriptor,
+                    min(64 * 1024, len(encoded) + 1 - len(readback)),
+                )
+                if not chunk:
+                    break
+                readback.extend(chunk)
+            final = os.fstat(read_descriptor)
+            current_after = os.stat(
+                target_name,
+                dir_fd=container_descriptor,
+                follow_symlinks=False,
+            )
+            artifact_states = {
+                (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_mode,
+                    metadata.st_nlink,
+                    metadata.st_uid,
+                    metadata.st_size,
+                    metadata.st_mtime_ns,
+                    metadata.st_ctime_ns,
+                )
+                for metadata in (opened, current, final, current_after)
+            }
+            if len(artifact_states) != 1 or bytes(readback) != encoded:
+                return [f"{artifact_label} changed during persistence"]
+            os.fsync(container_descriptor)
+            bound_parent = os.fstat(parent_descriptor)
+            canonical_parent = os.lstat(container.parent)
+            for metadata in (bound_parent, canonical_parent):
+                parent_error = _private_cleanup_directory_error(
+                    metadata,
+                    label="private artifact parent",
+                    require_private_mode=False,
+                )
+                if parent_error:
+                    return [parent_error]
+            if _private_cleanup_identity(bound_parent) != _private_cleanup_identity(
+                canonical_parent
+            ):
+                return [
+                    "private artifact parent changed after runtime artifact persistence"
+                ]
+            bound_container = os.stat(
+                container.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            canonical_container = os.lstat(container)
+            for metadata in (bound_container, canonical_container):
+                container_error = _private_cleanup_directory_error(
+                    metadata,
+                    label="private artifact container",
+                    require_private_mode=True,
+                )
+                if container_error:
+                    return [container_error]
+            if any(
+                _cleanup_identity_evidence(metadata) != expected.container
+                for metadata in (bound_container, canonical_container)
+            ):
+                return [
+                    "private artifact container changed after runtime artifact "
+                    "persistence"
+                ]
+        except OSError as error:
+            return [f"cannot persist {artifact_label}: {error}"]
+        finally:
+            if read_descriptor is not None:
+                os.close(read_descriptor)
+            if handle is not None:
+                handle.close()
+            elif descriptor is not None:
+                os.close(descriptor)
+            try:
+                os.unlink(temporary_name, dir_fd=container_descriptor)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        return []
+
+    return _operate_on_private_review_container(container, persist_bytes)
+
+
+def write_bound_review_text(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+    name: str,
+    text: str,
+) -> str | None:
+    """Persist one runtime text artifact inside the preparation-bound container."""
+
+    if name not in BOUND_REVIEW_TEXT_ARTIFACT_NAMES:
+        return "review runtime text artifact name is not allowed"
+
+    try:
+        encoded = text.encode("utf-8")
+    except UnicodeEncodeError as error:
+        return f"cannot encode runner diagnostic: {error}"
+    return _write_bound_review_bytes(
+        container,
+        expected=expected,
+        name=name,
+        encoded=encoded,
+        artifact_label="review runtime text artifact",
+    )
+
+
+def write_bound_review_json(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+    name: str,
+    value: Any,
+) -> str | None:
+    """Persist one runtime JSON artifact inside the preparation-bound container."""
+
+    if name not in BOUND_REVIEW_JSON_ARTIFACT_NAMES:
+        return "review runtime JSON artifact name is not allowed"
+    try:
+        encoded = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
+        return f"cannot encode review runtime JSON artifact: {error}"
+    return _write_bound_review_bytes(
+        container,
+        expected=expected,
+        name=name,
+        encoded=encoded,
+        artifact_label="review runtime JSON artifact",
+    )
+
+
+def write_bound_runner_error(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+    text: str,
+) -> str | None:
+    return write_bound_review_text(
+        container,
+        expected=expected,
+        name="runner-error.txt",
+        text=text,
+    )
+
+
+def remove_bound_review_text(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+    name: str,
+) -> str | None:
+    """Remove one runtime text artifact from the preparation-bound container."""
+
+    if name not in BOUND_REVIEW_TEXT_ARTIFACT_NAMES:
+        return "review runtime text artifact name is not allowed"
+
+    def remove_text(
+        _parent_descriptor: int,
+        container_descriptor: int,
+    ) -> list[str]:
+        if (
+            _cleanup_identity_evidence(os.fstat(container_descriptor))
+            != expected.container
+        ):
+            return ["private artifact container does not match preparation identity"]
+        try:
+            os.unlink(name, dir_fd=container_descriptor)
+        except FileNotFoundError:
+            return []
+        except OSError as error:
+            return [f"cannot remove review runtime text artifact: {error}"]
+        try:
+            os.fsync(container_descriptor)
+        except OSError as error:
+            return [f"cannot sync removed review runtime text artifact: {error}"]
+        return []
+
+    return _operate_on_private_review_container(container, remove_text)
+
+
+def open_bound_review_lock(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+    name: str,
+) -> tuple[BoundReviewLock | None, str | None]:
+    """Duplicate the preparation-bound container descriptor for cleanup locking."""
+
+    if name != "cleanup.lock":
+        return None, "review runtime lock name is not allowed"
+
+    handle: BoundReviewLock | None = None
+
+    def open_lock(
+        _parent_descriptor: int,
+        container_descriptor: int,
+    ) -> list[str]:
+        nonlocal handle
+        if (
+            _cleanup_identity_evidence(os.fstat(container_descriptor))
+            != expected.container
+        ):
+            return ["private artifact container does not match preparation identity"]
+
+        duplicate: int | None = None
+        try:
+            duplicate = os.dup(container_descriptor)
+            duplicate_identity = _cleanup_identity_evidence(os.fstat(duplicate))
+        except OSError as error:
+            if duplicate is not None:
+                os.close(duplicate)
+            return [f"cannot duplicate review runtime lock descriptor: {error}"]
+        if duplicate_identity != expected.container:
+            os.close(duplicate)
+            return ["duplicated review runtime lock changed identity"]
+        handle = BoundReviewLock(duplicate)
+        return []
+
+    lock_error = _operate_on_private_review_container(container, open_lock)
+    if lock_error:
+        if handle is not None:
+            handle.close()
+        return None, lock_error
+    if handle is None:
+        return None, "review runtime lock was not opened"
+    return handle, None
+
+
+def _remove_review_container_tree(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+    use_control_state: bool,
+    identity_label: str = "preparation",
+) -> str | None:
+    if use_control_state:
+        private_cleanup_error = remove_private_review_artifacts(
+            container,
+            expected=expected,
+        )
+        if private_cleanup_error:
+            return private_cleanup_error
+
+    def remove_tree(
+        parent_descriptor: int,
+        container_descriptor: int,
+    ) -> list[str]:
+        if (
+            _cleanup_identity_evidence(os.fstat(container_descriptor))
+            != expected.container
+        ):
+            return [
+                f"private artifact container does not match {identity_label} identity"
+            ]
+        if not use_control_state:
+            private_cleanup_errors = _unlink_private_review_artifacts(
+                parent_descriptor,
+                container_descriptor,
+                expected=expected,
+                removed=frozenset(),
+                record_removal=None,
+                identity_label=identity_label,
+            )
+            if private_cleanup_errors:
+                return private_cleanup_errors
+        cleanup_errors = _remove_open_directory_tree(
+            parent_descriptor,
+            container_descriptor,
+            container.name,
+            label="private artifact container",
+            require_private_mode=True,
+            excluded_entry_names=frozenset(PRIVATE_HELPER_ARTIFACT_NAMES),
+            final_entry_names=(
+                (
+                    CONTROL_ARTIFACT_STATE_NAME,
+                    REVIEW_CLEANUP_LOCK_NAME,
+                    REVIEW_RUNNER_LOCK_NAME,
+                    REVIEW_STATE_MARKER_NAME,
+                )
+                if use_control_state
+                else (
+                    REVIEW_CLEANUP_LOCK_NAME,
+                    REVIEW_RUNNER_LOCK_NAME,
+                    REVIEW_STATE_MARKER_NAME,
+                )
+            ),
+            quarantine_before_final_entries=True,
+        )
+        return cleanup_errors
+
+    return _operate_on_private_review_container(container, remove_tree)
+
+
+def _remove_partial_container(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+) -> str | None:
+    return _remove_review_container_tree(
+        container,
+        expected=expected,
+        use_control_state=False,
+    )
+
+
+def remove_partial_review_container(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+) -> str | None:
+    """Remove a partial container only while its captured identities still match."""
+
+    return _remove_partial_container(container, expected=expected)
+
+
+def remove_ready_review_container(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+) -> str | None:
+    """Remove a ready container using durable private-artifact receipts."""
+
+    return _remove_review_container_tree(
+        container,
+        expected=expected,
+        use_control_state=True,
+    )
+
+
+def _bound_private_cleanup_target(
+    review: ReviewWorkspace | LegacyReviewWorkspace,
+) -> pathlib.Path | None:
+    source_root = review.source_root.expanduser().absolute()
+    container = review.container_dir.expanduser().absolute()
+    if container.parent != source_root / ".codex-tmp" or not container.name.startswith(
+        "isolated-review-"
+    ):
+        return None
+    return container
 
 
 def _retained_container_detail(container: pathlib.Path, cleanup_error: str) -> str:
     return (
-        "review workspace preparation failed and cleanup failed; evidence retained at "
-        f"{container}: {cleanup_error}"
+        "review workspace preparation failed and cleanup failed; evidence may "
+        f"remain near {container}; inspect cleanup state: {cleanup_error}"
     )
 
 
 def _new_container(
     source_root: pathlib.Path,
-) -> tuple[pathlib.Path, set[signal.Signals] | None]:
+) -> tuple[pathlib.Path, int, CleanupIdentity, set[signal.Signals] | None]:
     handoff_mask = block_forwarded_signals()
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     suffix = uuid.uuid4().hex[:10]
     review_root = source_root / ".codex-tmp"
     container: pathlib.Path | None = None
+    container_descriptor: int | None = None
+    container_identity: CleanupIdentity | None = None
+    source_descriptor: int | None = None
+    review_root_descriptor: int | None = None
     try:
         try:
-            os.mkdir(review_root, mode=0o700)
-        except FileExistsError:
-            pass
+            source_before = os.lstat(source_root)
+        except OSError as error:
+            raise ReviewError(
+                f"cannot inspect repository root {source_root}: {error}"
+            ) from error
+        if not stat.S_ISDIR(source_before.st_mode) or stat.S_ISLNK(
+            source_before.st_mode
+        ):
+            raise ReviewError(
+                f"repository root must be a real directory: {source_root}"
+            )
         try:
-            root_status = os.lstat(review_root)
+            source_descriptor = os.open(
+                source_root,
+                _private_cleanup_directory_flags(),
+            )
+        except OSError as error:
+            raise ReviewError(
+                f"cannot securely open repository root {source_root}: {error}"
+            ) from error
+        source_opened = os.fstat(source_descriptor)
+        source_after = os.lstat(source_root)
+        if (
+            any(
+                not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+                for metadata in (source_opened, source_after)
+            )
+            or len(
+                {
+                    _private_cleanup_identity(source_before),
+                    _private_cleanup_identity(source_opened),
+                    _private_cleanup_identity(source_after),
+                }
+            )
+            != 1
+        ):
+            raise ReviewError("repository root changed while opening it securely")
+
+        review_root_initially_missing = False
+        try:
+            root_status = os.stat(
+                ".codex-tmp",
+                dir_fd=source_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            review_root_initially_missing = True
+            if any(
+                metadata.st_uid != os.geteuid()
+                for metadata in (source_before, source_opened, source_after)
+            ):
+                raise ReviewError(
+                    "repository root must be owned by the current user to create "
+                    f"the review root: {source_root}"
+                )
+            try:
+                os.mkdir(".codex-tmp", mode=0o700, dir_fd=source_descriptor)
+            except FileExistsError:
+                pass
+            except OSError as error:
+                raise ReviewError(
+                    f"cannot create review root {review_root}: {error}"
+                ) from error
+            try:
+                root_status = os.stat(
+                    ".codex-tmp",
+                    dir_fd=source_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                raise ReviewError(
+                    f"cannot inspect review root {review_root}: {error}"
+                ) from error
         except OSError as error:
             raise ReviewError(
                 f"cannot inspect review root {review_root}: {error}"
             ) from error
-        if not stat.S_ISDIR(root_status.st_mode) or stat.S_ISLNK(root_status.st_mode):
+        if stat.S_ISLNK(root_status.st_mode):
             raise ReviewError(
                 f"review root must be a real directory, not a symlink: {review_root}"
             )
-        if root_status.st_uid != os.geteuid():
-            raise ReviewError(
-                f"review root must be owned by the current user: {review_root}"
-            )
-        if root_status.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-            raise ReviewError(
-                f"review root must not be group or other writable: {review_root}"
-            )
+        root_error = _private_cleanup_directory_error(
+            root_status,
+            label="review root",
+            require_private_mode=False,
+        )
+        if root_error:
+            raise ReviewError(root_error)
         if review_root.resolve() != review_root.absolute():
             raise ReviewError(
                 f"review root resolves outside the source repository: {review_root}"
             )
-
-        flags = (
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        )
         try:
-            root_fd = os.open(review_root, flags)
+            review_root_descriptor = os.open(
+                ".codex-tmp",
+                _private_cleanup_directory_flags(),
+                dir_fd=source_descriptor,
+            )
         except OSError as error:
             raise ReviewError(
                 f"cannot securely open review root {review_root}: {error}"
             ) from error
-        try:
-            opened_status = os.fstat(root_fd)
-            if (opened_status.st_dev, opened_status.st_ino) != (
-                root_status.st_dev,
-                root_status.st_ino,
-            ):
-                raise ReviewError("review root changed while opening it securely")
-            name = f"isolated-review-{stamp}-{suffix}"
-            container = review_root / name
-            os.mkdir(name, mode=0o700, dir_fd=root_fd)
-            descriptor_status = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
-            path_status = os.lstat(container)
-            if (descriptor_status.st_dev, descriptor_status.st_ino) != (
-                path_status.st_dev,
-                path_status.st_ino,
-            ):
+        root_opened = os.fstat(review_root_descriptor)
+        root_after = os.stat(
+            ".codex-tmp",
+            dir_fd=source_descriptor,
+            follow_symlinks=False,
+        )
+        for metadata in (root_opened, root_after):
+            root_error = _private_cleanup_directory_error(
+                metadata,
+                label="review root",
+                require_private_mode=False,
+            )
+            if root_error:
+                raise ReviewError(root_error)
+        if (
+            len(
+                {
+                    _private_cleanup_identity(root_status),
+                    _private_cleanup_identity(root_opened),
+                    _private_cleanup_identity(root_after),
+                }
+            )
+            != 1
+        ):
+            raise ReviewError("review root changed while opening it securely")
+        if review_root_initially_missing:
+            try:
+                os.fsync(source_descriptor)
+            except OSError as error:
                 raise ReviewError(
-                    "review root changed while creating the private container"
-                )
-        finally:
-            os.close(root_fd)
-        return container, handoff_mask
+                    "cannot persist the repository review-root directory entry: "
+                    f"{error}"
+                ) from error
+
+        name = f"isolated-review-{stamp}-{suffix}"
+        container = review_root / name
+        os.mkdir(name, mode=0o700, dir_fd=review_root_descriptor)
+        descriptor_status = os.stat(
+            name,
+            dir_fd=review_root_descriptor,
+            follow_symlinks=False,
+        )
+        container_descriptor = os.open(
+            name,
+            _private_cleanup_directory_flags(),
+            dir_fd=review_root_descriptor,
+        )
+        opened_status = os.fstat(container_descriptor)
+        if _private_cleanup_identity(descriptor_status) != (
+            _private_cleanup_identity(opened_status)
+        ):
+            raise ReviewError(
+                "private review container changed while opening it securely"
+            )
+        container_identity = _cleanup_identity_evidence(opened_status)
+        path_status = os.lstat(container)
+        if (descriptor_status.st_dev, descriptor_status.st_ino) != (
+            path_status.st_dev,
+            path_status.st_ino,
+        ):
+            raise ReviewError(
+                "review root changed while creating the private container"
+            )
+        try:
+            os.fsync(review_root_descriptor)
+        except OSError as error:
+            raise ReviewError(
+                f"cannot persist the private review container directory entry: {error}"
+            ) from error
+        if container_descriptor is None or container_identity is None:
+            raise ReviewError("private review container identity was not captured")
+        return container, container_descriptor, container_identity, handoff_mask
     except BaseException as error:
         cleanup_error: str | None = None
-        if container is not None:
-            cleanup_error = _remove_partial_container(container)
+        if container_descriptor is not None:
+            os.close(container_descriptor)
+            container_descriptor = None
+        if container is not None and container_identity is not None:
+            cleanup_error = _remove_partial_container(
+                container,
+                expected=PrivateCleanupEvidence(
+                    container=container_identity,
+                    artifacts={},
+                ),
+            )
+        elif container is not None:
+            cleanup_error = "private container identity was not captured"
         cleanup_signal = (
             consume_pending_forwarded_signal() if handoff_mask is not None else None
         )
@@ -769,6 +2894,10 @@ def _new_container(
                 _retained_container_detail(container, cleanup_error)
             ) from error
         raise
+    finally:
+        for descriptor in (review_root_descriptor, source_descriptor):
+            if descriptor is not None:
+                os.close(descriptor)
 
 
 def _iter_nul_records(
@@ -819,20 +2948,15 @@ def _parse_tree_record(record: bytes) -> tuple[str, str, str, pathlib.PurePosixP
     return mode, object_type, object_id, relative
 
 
-def _legacy_path_matcher(
-    legacy_values: Iterable[AcceptedSyntheticValue],
-) -> LegacyPathMatcher:
-    needles: dict[bytes, str] = {}
-    for descriptor in legacy_values:
-        if descriptor.kind != "legacy" or descriptor.value is None:
-            raise ReviewError(
-                "legacy path validation requires exact catalog-backed values"
-            )
-        for needle in (descriptor.value, base64.b64encode(descriptor.value)):
-            previous = needles.get(needle)
-            if previous is None or descriptor.identifier < previous:
-                needles[needle] = descriptor.identifier
+def _uses_review_cleanup_quarantine_namespace(
+    relative: pathlib.PurePosixPath,
+) -> bool:
+    return any(
+        part.startswith(REVIEW_CLEANUP_QUARANTINE_PREFIX) for part in relative.parts
+    )
 
+
+def _exact_path_matcher(needles: dict[bytes, str]) -> LegacyPathMatcher:
     transitions: list[dict[int, int]] = [{}]
     failures = [0]
     identifiers: list[str | None] = [None]
@@ -871,17 +2995,49 @@ def _legacy_path_matcher(
         transitions=tuple(transitions),
         failures=tuple(failures),
         identifiers=tuple(identifiers),
+        maximum_length=max(map(len, needles), default=0),
     )
 
 
-def _reject_legacy_values_in_frozen_tree_paths(
+def _legacy_path_matcher(
+    legacy_values: Iterable[AcceptedSyntheticValue],
+) -> LegacyPathMatcher:
+    needles: dict[bytes, str] = {}
+    for descriptor in legacy_values:
+        if descriptor.kind != "legacy" or descriptor.value is None:
+            raise ReviewError(
+                "legacy path validation requires exact catalog-backed values"
+            )
+        needle = descriptor.value
+        previous = needles.get(needle)
+        if previous is None or descriptor.identifier < previous:
+            needles[needle] = descriptor.identifier
+    return _exact_path_matcher(needles)
+
+
+def _secret_reduction_path_matcher(
+    reduction_values: Iterable[AcceptedSyntheticValue],
+) -> LegacyPathMatcher:
+    needles: dict[bytes, str] = {}
+    for descriptor in reduction_values:
+        if descriptor.kind != "secret-reduction" or descriptor.value is None:
+            raise ReviewError("secret-reduction path validation requires exact values")
+        needle = descriptor.value
+        previous = needles.get(needle)
+        if previous is None or descriptor.identifier < previous:
+            needles[needle] = descriptor.identifier
+    return _exact_path_matcher(needles)
+
+
+def _reject_values_in_frozen_tree_paths(
     *,
     git_view: pathlib.Path,
     object_directory: pathlib.Path,
     commit: str,
-    legacy_values: Iterable[AcceptedSyntheticValue],
+    matcher: LegacyPathMatcher,
+    match_message: str,
+    failure_label: str,
 ) -> None:
-    matcher = _legacy_path_matcher(legacy_values)
     if len(matcher.transitions) == 1:
         return
     with tempfile.TemporaryFile() as tree_stderr:
@@ -910,11 +3066,7 @@ def _reject_legacy_values_in_frozen_tree_paths(
                     raise ReviewError("malformed record from git ls-tree")
                 identifier = matcher.match(raw_path)
                 if identifier is not None:
-                    raise ReviewError(
-                        "legacy synthetic fixture values and storage encodings "
-                        "are not allowed in repository paths: "
-                        f"{identifier}"
-                    )
+                    raise ReviewError(f"{match_message}: {identifier}")
                 _parse_tree_record(record)
             _close_pipe(process.stdout)
             returncode = process.wait()
@@ -924,9 +3076,49 @@ def _reject_legacy_values_in_frozen_tree_paths(
             raise
         if returncode != 0:
             raise ReviewError(
-                "cannot enumerate frozen Git paths for legacy synthetic-token "
+                f"cannot enumerate frozen Git paths for {failure_label} "
                 f"validation: {_process_stderr(tree_stderr)}"
             )
+
+
+def _reject_legacy_values_in_frozen_tree_paths(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    commit: str,
+    legacy_values: Iterable[AcceptedSyntheticValue],
+) -> None:
+    _reject_values_in_frozen_tree_paths(
+        git_view=git_view,
+        object_directory=object_directory,
+        commit=commit,
+        matcher=_legacy_path_matcher(legacy_values),
+        match_message=(
+            "legacy synthetic fixture values and storage encodings are not "
+            "allowed in repository paths"
+        ),
+        failure_label="legacy synthetic-token",
+    )
+
+
+def _reject_secret_reduction_values_in_frozen_tree_paths(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    commit: str,
+    reduction_values: Iterable[AcceptedSyntheticValue],
+) -> None:
+    _reject_values_in_frozen_tree_paths(
+        git_view=git_view,
+        object_directory=object_directory,
+        commit=commit,
+        matcher=_secret_reduction_path_matcher(reduction_values),
+        match_message=(
+            "unregistered secret values and storage encodings are not allowed "
+            "in the frozen head paths"
+        ),
+        failure_label="unregistered secret path",
+    )
 
 
 def _read_exact(stream: BinaryIO, size: int) -> bytes:
@@ -1061,6 +3253,31 @@ def _copy_limited(
     return copied
 
 
+def _mkdir_frozen_tree_parents(
+    workspace_root: pathlib.Path,
+    directory: pathlib.Path,
+) -> None:
+    try:
+        relative = directory.relative_to(workspace_root)
+    except ValueError as error:
+        raise ReviewError("frozen Git tree parent escapes workspace") from error
+    current = workspace_root
+    for component in relative.parts:
+        current /= component
+        try:
+            current.mkdir(mode=0o755)
+        except FileExistsError:
+            pass
+        metadata = os.lstat(current)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise ReviewError("frozen Git tree parent directory is unsafe")
+
+
 def _materialize_blob(
     *,
     cat_input: BinaryIO,
@@ -1111,10 +3328,7 @@ def _materialize_blob(
         )
     buffered_payload: bytes | None = None
     delimiter_consumed = False
-    if (
-        mode in {"100644", "100755"}
-        and 0 < size < GIT_LFS_POINTER_MAX_BYTES
-    ):
+    if mode in {"100644", "100755"} and 0 < size < GIT_LFS_POINTER_MAX_BYTES:
         buffered_payload = _read_exact(cat_output, size)
         if cat_output.read(1) != b"\n":
             raise ReviewError("missing delimiter after git cat-file blob")
@@ -1125,7 +3339,7 @@ def _materialize_blob(
                 f"{destination_display}"
             )
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    _mkdir_frozen_tree_parents(workspace_root, destination.parent)
 
     if mode == "120000":
         if size > 16 * 1024:
@@ -1223,7 +3437,7 @@ def _materialize_frozen_tree(
     workspace_root: pathlib.Path,
     legacy_value_matcher: LegacyPathMatcher,
 ) -> None:
-    workspace_root.mkdir()
+    workspace_root.mkdir(mode=0o755)
     environment = _git_environment(object_directory=object_directory)
     with (
         tempfile.TemporaryFile() as tree_stderr,
@@ -1275,13 +3489,25 @@ def _materialize_frozen_tree(
                         "frozen Git tree exceeds the review entry-count limit"
                     )
                 mode, object_type, object_id, relative = _parse_tree_record(record)
+                if _uses_review_cleanup_quarantine_namespace(relative):
+                    raise ReviewError(
+                        "the frozen head uses a reserved review cleanup "
+                        "quarantine path component"
+                    )
+                is_gitlink = mode == "160000" and object_type == "commit"
+                cleanup_depth = len(relative.parts) + (1 if is_gitlink else 0)
+                if cleanup_depth >= MAX_REVIEW_CLEANUP_DEPTH:
+                    raise ReviewError(
+                        "frozen Git tree path depth exceeds the review cleanup "
+                        "safety limit"
+                    )
                 destination = workspace_root.joinpath(*relative.parts)
                 path_display = _redact_secret_path(
                     os.fspath(relative),
                     "snapshot path",
                 )
                 try:
-                    if mode == "160000" and object_type == "commit":
+                    if is_gitlink:
                         resolved_parent = destination.parent.resolve(strict=False)
                         if not is_relative_to(
                             resolved_parent, workspace_root.resolve(strict=False)
@@ -1290,7 +3516,11 @@ def _materialize_frozen_tree(
                                 "frozen Git tree path escapes workspace: "
                                 f"{path_display}"
                             )
-                        destination.mkdir(parents=True, exist_ok=False)
+                        _mkdir_frozen_tree_parents(
+                            workspace_root,
+                            destination.parent,
+                        )
+                        destination.mkdir(mode=0o755, exist_ok=False)
                         continue
                     if object_type != "blob":
                         raise ReviewError(
@@ -1337,7 +3567,12 @@ def _materialize_frozen_tree(
             )
 
 
-def _open_new_private_binary(path: pathlib.Path) -> BinaryIO:
+def _open_new_private_binary(
+    path: pathlib.Path,
+    *,
+    identity_handoff: Callable[[CleanupIdentity], None] | None = None,
+    parent_descriptor: int | None = None,
+) -> BinaryIO:
     flags = (
         os.O_WRONLY
         | os.O_CREAT
@@ -1345,12 +3580,139 @@ def _open_new_private_binary(path: pathlib.Path) -> BinaryIO:
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
-    descriptor = os.open(path, flags, 0o600)
+    creation_mask = block_forwarded_signals() if identity_handoff is not None else None
+    descriptor: int | None = None
     try:
-        return os.fdopen(descriptor, "wb")
+        target: pathlib.Path | str = (
+            path.name if parent_descriptor is not None else path
+        )
+        descriptor = os.open(
+            target,
+            flags,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        os.fchmod(descriptor, 0o600)
+        if identity_handoff is not None:
+            identity_handoff(_cleanup_identity_evidence(os.fstat(descriptor)))
+        if creation_mask is not None:
+            mask_to_restore = creation_mask
+            creation_mask = None
+            restore_signal_mask(mask_to_restore)
+        handle = os.fdopen(descriptor, "wb")
+        descriptor = None
+        return handle
     except BaseException:
-        os.close(descriptor)
+        if descriptor is not None:
+            os.close(descriptor)
         raise
+    finally:
+        if creation_mask is not None:
+            restore_signal_mask(creation_mask)
+
+
+def _validate_prepared_private_metadata(
+    metadata: os.stat_result,
+    *,
+    artifact_name: str,
+    expected_identity: CleanupIdentity,
+    require_empty: bool,
+) -> None:
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise ReviewError(
+            f"prepared helper-private artifact {artifact_name} is not a "
+            "regular file with one link"
+        )
+    if metadata.st_uid != os.geteuid():
+        raise ReviewError(
+            f"prepared helper-private artifact {artifact_name} has an unexpected owner"
+        )
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise ReviewError(
+            f"prepared helper-private artifact {artifact_name} must have mode 0600"
+        )
+    if require_empty and metadata.st_size != 0:
+        raise ReviewError(
+            f"prepared helper-private artifact {artifact_name} is not empty"
+        )
+    if _cleanup_identity_evidence(metadata) != expected_identity:
+        raise ReviewError(
+            f"prepared helper-private artifact {artifact_name} does not match its "
+            "preparation identity"
+        )
+
+
+@contextmanager
+def _open_prepared_private_binary(
+    path: pathlib.Path,
+    *,
+    expected_identity: CleanupIdentity,
+    parent_descriptor: int,
+) -> Iterator[BinaryIO]:
+    if path.name not in PRIVATE_HELPER_ARTIFACT_NAMES:
+        raise ReviewError("prepared helper-private artifact name is not allowed")
+    flags = (
+        os.O_WRONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor: int | None = None
+    try:
+        before = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+        opened = os.fstat(descriptor)
+        after = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        for metadata in (before, opened, after):
+            _validate_prepared_private_metadata(
+                metadata,
+                artifact_name=path.name,
+                expected_identity=expected_identity,
+                require_empty=True,
+            )
+        handle = os.fdopen(descriptor, "wb")
+        descriptor = None
+        try:
+            yield handle
+            handle.flush()
+            os.fsync(handle.fileno())
+            opened_after_write = os.fstat(handle.fileno())
+            path_after_write = os.stat(
+                path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            for metadata in (opened_after_write, path_after_write):
+                _validate_prepared_private_metadata(
+                    metadata,
+                    artifact_name=path.name,
+                    expected_identity=expected_identity,
+                    require_empty=False,
+                )
+        finally:
+            handle.close()
+    except FileNotFoundError as error:
+        raise ReviewError(
+            f"prepared helper-private artifact {path.name} is missing"
+        ) from error
+    except ReviewError:
+        raise
+    except OSError as error:
+        raise ReviewError(
+            f"cannot securely access prepared helper-private artifact {path.name}: "
+            f"{error}"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _write_frozen_diff(
@@ -1373,7 +3735,7 @@ def _write_frozen_diff(
                     "--no-ext-diff",
                     "--no-textconv",
                     "--binary",
-                    "--submodule=diff",
+                    "--submodule=short",
                     base_sha,
                     head_sha,
                 ),
@@ -1443,6 +3805,14 @@ def _write_limited_diff_metadata(
         raise ReviewError(f"cannot generate {label}: {_process_stderr(error_output)}")
 
 
+def _changed_path_digest(side_tag: bytes, raw_path: bytes) -> bytes:
+    return (
+        hashlib.sha256(CHANGED_PATH_DIGEST_DOMAIN + side_tag + b"\0" + raw_path)
+        .hexdigest()
+        .encode("ascii")
+    )
+
+
 def _write_frozen_changed_paths(
     *,
     git_view: pathlib.Path,
@@ -1450,9 +3820,14 @@ def _write_frozen_changed_paths(
     base_sha: str,
     head_sha: str,
     destination: pathlib.Path,
+    private_destination: pathlib.Path,
+    evidence_sensitive_values: Iterable[AcceptedSyntheticValue],
+    private_expected_identity: CleanupIdentity,
+    private_parent_descriptor: int,
 ) -> None:
+    digest_evidence: list[str] = []
     with (
-        _open_new_private_binary(destination) as output,
+        tempfile.TemporaryFile() as raw_metadata,
         tempfile.TemporaryFile() as error_output,
     ):
         _write_limited_diff_metadata(
@@ -1460,26 +3835,80 @@ def _write_frozen_changed_paths(
             object_directory=object_directory,
             args=(
                 "diff",
-                "--name-only",
+                "--name-status",
                 "-z",
+                # Classify paths by side: renames become D/A and copies remain A.
                 "--no-renames",
+                "--diff-filter=ADMTUXB",
                 base_sha,
                 head_sha,
             ),
-            output=output,
+            output=raw_metadata,
             error_output=error_output,
             label="frozen changed paths",
-            record_limit=MAX_CHANGED_ENTRIES,
+            record_limit=MAX_CHANGED_ENTRIES * 2,
         )
+        raw_metadata.seek(0)
+        metadata_records = _iter_nul_records(
+            raw_metadata,
+            byte_limit=MAX_CHANGED_METADATA_BYTES,
+            record_limit=MAX_CHANGED_ENTRIES * 2,
+            label="frozen changed paths",
+        )
+        logical_record_count = 0
+        private_bytes = 0
+        with (
+            _open_prepared_private_binary(
+                private_destination,
+                expected_identity=private_expected_identity,
+                parent_descriptor=private_parent_descriptor,
+            ) as private_output,
+            _open_new_private_binary(destination) as public_output,
+        ):
+            while (status := next(metadata_records, None)) is not None:
+                raw_path = next(metadata_records, None)
+                if raw_path is None:
+                    raise ReviewError(
+                        "frozen changed path metadata is missing a path record"
+                    )
+                if status == b"D":
+                    side_tag = CHANGED_PATH_BASE_ONLY_TAG
+                elif status in {b"A", b"M", b"T", b"U", b"X", b"B"}:
+                    side_tag = CHANGED_PATH_HEAD_TAG
+                else:
+                    raise ReviewError(
+                        "frozen changed path metadata contains an unknown status"
+                    )
+                if not raw_path:
+                    raise ReviewError("frozen changed paths contain an empty path")
+                logical_record_count += 1
+                if logical_record_count > MAX_CHANGED_ENTRIES:
+                    raise ReviewError(
+                        "frozen changed paths exceed the review entry-count limit"
+                    )
+                private_record = side_tag + raw_path
+                private_bytes += len(private_record) + 1
+                if private_bytes > MAX_CHANGED_METADATA_BYTES:
+                    raise ReviewError(
+                        "frozen changed paths exceed the review byte limit"
+                    )
+                digest = _changed_path_digest(side_tag, raw_path)
+                digest_evidence.append(digest.decode("ascii"))
+                private_output.write(private_record + b"\0")
+                public_output.write(digest + b"\0")
+    _reject_raw_values_in_evidence(
+        digest_evidence,
+        accepted_values=evidence_sensitive_values,
+        label="frozen changed path digest evidence",
+    )
 
 
-def _write_bounded_json(
-    path: pathlib.Path,
+def _bounded_json_bytes(
     value: dict[str, Any],
     *,
     label: str,
     accepted_values: Iterable[AcceptedSyntheticValue] = (),
-) -> None:
+) -> bytes:
     try:
         encoded = (
             json.dumps(
@@ -1493,19 +3922,62 @@ def _write_bounded_json(
         )
     except (TypeError, ValueError) as error:
         raise ReviewError(f"{label} is not safely JSON serializable") from error
-    if len(encoded.encode("utf-8")) > MAX_SYNTHETIC_EVIDENCE_BYTES:
+    encoded_bytes = encoded.encode("utf-8")
+    if len(encoded_bytes) > MAX_SYNTHETIC_EVIDENCE_BYTES:
         raise ReviewError(f"{label} exceeds the audit evidence size limit")
     _reject_raw_values_in_evidence(
         value,
         accepted_values=accepted_values,
         label=label,
     )
-    write_text_atomic(path, encoded)
+    return encoded_bytes
+
+
+def _write_bounded_json(
+    path: pathlib.Path,
+    value: dict[str, Any],
+    *,
+    label: str,
+    accepted_values: Iterable[AcceptedSyntheticValue] = (),
+) -> None:
+    encoded = _bounded_json_bytes(
+        value,
+        label=label,
+        accepted_values=accepted_values,
+    )
+    write_text_atomic(path, encoded.decode("utf-8"))
+
+
+def _write_private_bounded_json(
+    path: pathlib.Path,
+    value: dict[str, Any],
+    *,
+    label: str,
+    accepted_values: Iterable[AcceptedSyntheticValue] = (),
+    expected_identity: CleanupIdentity,
+    parent_descriptor: int,
+) -> None:
+    encoded = _bounded_json_bytes(
+        value,
+        label=label,
+        accepted_values=accepted_values,
+    )
+    with _open_prepared_private_binary(
+        path,
+        expected_identity=expected_identity,
+        parent_descriptor=parent_descriptor,
+    ) as handle:
+        handle.write(encoded)
 
 
 def _iter_evidence_strings(value: Any) -> Iterator[bytes]:
     if isinstance(value, str):
-        yield value.encode("utf-8")
+        try:
+            yield os.fsencode(value)
+        except UnicodeEncodeError as error:
+            raise ReviewError(
+                "synthetic-token evidence contains an invalid string"
+            ) from error
         return
     if isinstance(value, dict):
         for key, item in value.items():
@@ -1536,21 +4008,16 @@ def _reject_raw_values_in_evidence(
     label: str,
 ) -> None:
     exact_values: list[bytes] = []
-    encoded_legacy_values: list[bytes] = []
     digest_values: dict[int, set[str]] = {}
     for accepted in accepted_values:
         if accepted.value is not None:
             exact_values.append(accepted.value)
-            if accepted.kind == "legacy":
-                encoded_legacy_values.append(base64.b64encode(accepted.value))
             continue
         digest_values.setdefault(accepted.value_length, set()).add(
             accepted.value_sha256
         )
     for metadata in set(_iter_evidence_strings(value)):
         if any(raw_value in metadata for raw_value in exact_values):
-            raise ReviewError(f"{label} would expose a raw synthetic value")
-        if any(encoded_value in metadata for encoded_value in encoded_legacy_values):
             raise ReviewError(f"{label} would expose a raw synthetic value")
         for length, digests in digest_values.items():
             if length > len(metadata):
@@ -1612,10 +4079,14 @@ def _scan_batch_blob(
     accepted_values: Iterable[AcceptedSyntheticValue] = (),
     raw_occurrence_values: Iterable[AcceptedSyntheticValue] = (),
     capture_accepted_candidates: bool = False,
+    capture_blocking_candidates: bool = False,
+    capture_reduction_offsets: bool = False,
+    reduced_secret_values: frozenset[bytes] = frozenset(),
     accepted_index: AcceptedValueIndex | None = None,
     event_budget: SecretScanBudget | None = None,
     exact_index: ExactValueIndex | None = None,
     occurrence_budget: LegacyOccurrenceBudget | None = None,
+    exact_only: bool = False,
     _continue_after_blocking: bool = False,
 ) -> tuple[SecretScanResult, int]:
     cat_input.write(object_id.encode("ascii") + b"\n")
@@ -1641,15 +4112,77 @@ def _scan_batch_blob(
         accepted_values=accepted_values,
         raw_occurrence_values=raw_occurrence_values,
         capture_accepted_candidates=capture_accepted_candidates,
+        capture_blocking_candidates=capture_blocking_candidates,
+        capture_reduction_offsets=capture_reduction_offsets,
+        reduced_secret_values=reduced_secret_values,
         _accepted_index=accepted_index,
         _event_budget=event_budget,
         _exact_index=exact_index,
         _occurrence_budget=occurrence_budget,
+        exact_only=exact_only,
         _continue_after_blocking=_continue_after_blocking,
     )
     if cat_output.read(1) != b"\n":
         raise ReviewError("missing delimiter after scanned git cat-file blob")
     return scan, scanned_bytes + size
+
+
+def _secret_reduction_occurrence_identity(
+    *,
+    raw_path: bytes,
+    git_mode: str,
+    offset: int,
+) -> str:
+    if git_mode not in {"100644", "100755", "120000"}:
+        raise ReviewError("secret-reduction occurrence has an unsupported Git mode")
+    if not raw_path or type(offset) is not int or offset < 0:
+        raise ReviewError("secret-reduction occurrence identity is invalid")
+    digest = hashlib.sha256()
+    digest.update(b"codex-secret-reduction-occurrence-v1\0")
+    surface = b"symlink-target" if git_mode == "120000" else b"blob"
+    digest.update(surface)
+    digest.update(len(raw_path).to_bytes(8, "big"))
+    digest.update(raw_path)
+    digest.update(offset.to_bytes(8, "big"))
+    return digest.hexdigest()
+
+
+def _secret_reduction_occurrence_commitment(identities: Iterable[str]) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"codex-secret-reduction-occurrence-set-v1\0")
+    for identity in sorted(identities):
+        if re.fullmatch(r"[0-9a-f]{64}", identity) is None:
+            raise ReviewError("secret-reduction occurrence commitment is invalid")
+        digest.update(bytes.fromhex(identity))
+    return digest.hexdigest()
+
+
+def _secret_reduction_provenance_commitment(
+    raw_identities: dict[AcceptedSyntheticValue, set[str]],
+    unembedded_identities: dict[AcceptedSyntheticValue, set[str]],
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"codex-secret-reduction-provenance-v1\0")
+    descriptors = set(raw_identities) | set(unembedded_identities)
+    for descriptor in sorted(descriptors, key=lambda item: item.value_sha256):
+        if descriptor.kind != "secret-reduction":
+            raise ReviewError(
+                "secret-reduction provenance contains a non-dynamic value"
+            )
+        raw = raw_identities.get(descriptor, set())
+        unembedded = unembedded_identities.get(descriptor, set())
+        if not unembedded.issubset(raw):
+            raise ReviewError(
+                "secret-reduction unembedded provenance is not raw provenance"
+            )
+        digest.update(bytes.fromhex(descriptor.value_sha256))
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(bytes.fromhex(_secret_reduction_occurrence_commitment(raw)))
+        digest.update(len(unembedded).to_bytes(8, "big"))
+        digest.update(
+            bytes.fromhex(_secret_reduction_occurrence_commitment(unembedded))
+        )
+    return digest.hexdigest()
 
 
 def _scan_frozen_tree_values(
@@ -1660,6 +4193,10 @@ def _scan_frozen_tree_values(
     accepted_values: Iterable[AcceptedSyntheticValue],
     raw_occurrence_values: Iterable[AcceptedSyntheticValue] = (),
     capture_accepted_candidates: bool = False,
+    capture_blocking_candidates: bool = False,
+    capture_reduction_identities: bool = False,
+    reduced_secret_values: frozenset[bytes] = frozenset(),
+    exact_only: bool = False,
     _continue_after_blocking: bool = False,
 ) -> SecretScanResult:
     accepted = tuple(accepted_values)
@@ -1718,6 +4255,22 @@ def _scan_frozen_tree_values(
                         "frozen Git tree scan exceeds the review entry-count limit"
                     )
                 mode, object_type, object_id, _relative = _parse_tree_record(record)
+                _metadata, raw_path = record.split(b"\t", 1)
+                path_scan = _scan_secret_value(
+                    raw_path,
+                    accepted_values=accepted,
+                    raw_occurrence_values=raw_occurrences,
+                    capture_accepted_candidates=capture_accepted_candidates,
+                    capture_blocking_candidates=capture_blocking_candidates,
+                    reduced_secret_values=reduced_secret_values,
+                    _accepted_index=accepted_index,
+                    _event_budget=event_budget,
+                    _exact_index=exact_index,
+                    _occurrence_budget=occurrence_budget,
+                    exact_only=exact_only,
+                    _continue_after_blocking=_continue_after_blocking,
+                )
+                result.merge(path_scan)
                 if mode == "160000" and object_type == "commit":
                     continue
                 if object_type != "blob":
@@ -1732,12 +4285,51 @@ def _scan_frozen_tree_values(
                     accepted_values=accepted,
                     raw_occurrence_values=raw_occurrences,
                     capture_accepted_candidates=capture_accepted_candidates,
+                    capture_blocking_candidates=capture_blocking_candidates,
+                    capture_reduction_offsets=capture_reduction_identities,
+                    reduced_secret_values=reduced_secret_values,
                     accepted_index=accepted_index,
                     event_budget=event_budget,
                     exact_index=exact_index,
                     occurrence_budget=occurrence_budget,
+                    exact_only=exact_only,
                     _continue_after_blocking=_continue_after_blocking,
                 )
+                if capture_reduction_identities:
+                    for (
+                        descriptor,
+                        offsets,
+                    ) in scan.reduction_occurrence_offsets.items():
+                        identities = scan.reduction_occurrence_identities.setdefault(
+                            descriptor,
+                            set(),
+                        )
+                        identities.update(
+                            _secret_reduction_occurrence_identity(
+                                raw_path=raw_path,
+                                git_mode=mode,
+                                offset=offset,
+                            )
+                            for offset in offsets
+                        )
+                    for (
+                        descriptor,
+                        offsets,
+                    ) in scan.reduction_unembedded_offsets.items():
+                        identities = scan.reduction_unembedded_identities.setdefault(
+                            descriptor,
+                            set(),
+                        )
+                        identities.update(
+                            _secret_reduction_occurrence_identity(
+                                raw_path=raw_path,
+                                git_mode=mode,
+                                offset=offset,
+                            )
+                            for offset in offsets
+                        )
+                    scan.reduction_occurrence_offsets.clear()
+                    scan.reduction_unembedded_offsets.clear()
                 result.merge(scan)
             _close_pipe(tree_process.stdout)
             tree_returncode = tree_process.wait()
@@ -1764,120 +4356,225 @@ def _scan_frozen_tree_values(
     return result
 
 
-def _legacy_count_manifest(
-    *,
-    git_view: pathlib.Path,
-    object_directory: pathlib.Path,
-    base_sha: str,
-    head_sha: str,
-    catalog: SyntheticTokenCatalog,
-    exemptions: tuple[LegacyExemption, ...],
-) -> dict[str, Any]:
-    legacy_accepted = accepted_legacy_values(catalog, exemptions)
-    authoring_accepted = accepted_authoring_values(catalog)
-    scan_accepted = authoring_accepted + legacy_accepted
-    if legacy_accepted:
-        base_scan = _scan_frozen_tree_values(
-            git_view=git_view,
-            object_directory=object_directory,
-            commit=base_sha,
-            accepted_values=scan_accepted,
-            raw_occurrence_values=legacy_accepted,
-        )
-        head_scan = _scan_frozen_tree_values(
-            git_view=git_view,
-            object_directory=object_directory,
-            commit=head_sha,
-            accepted_values=scan_accepted,
-            raw_occurrence_values=legacy_accepted,
-        )
-    else:
-        base_scan = SecretScanResult.empty()
-        head_scan = SecretScanResult.empty()
-    entries: list[dict[str, Any]] = []
-    for exemption in exemptions:
-        envelope_used = False
-        for token in exemption.values:
-            descriptor = next(
-                item
-                for item in legacy_accepted
-                if item.exemption_id == exemption.identifier
-                and item.identifier == token.identifier
-            )
-            base_count = base_scan.raw_occurrence_counts[descriptor]
-            head_count = head_scan.raw_occurrence_counts[descriptor]
-            base_unembedded_count = base_scan.unembedded_occurrence_counts[descriptor]
-            head_unembedded_count = head_scan.unembedded_occurrence_counts[descriptor]
-            envelope_used = envelope_used or base_count > 0 or head_count > 0
-            if head_count > base_count:
-                raise ReviewError(
-                    "legacy synthetic fixture count increased for "
-                    f"{token.identifier}: base={base_count}, head={head_count}"
-                )
-            if head_unembedded_count > base_unembedded_count:
-                raise ReviewError(
-                    "legacy synthetic fixture unembedded count increased for "
-                    f"{token.identifier}: base={base_unembedded_count}, "
-                    f"head={head_unembedded_count}"
-                )
-            entries.append(
-                {
-                    "base_count": base_count,
-                    "base_unembedded_count": base_unembedded_count,
-                    "exemption_id": exemption.identifier,
-                    "head_count": head_count,
-                    "head_unembedded_count": head_unembedded_count,
-                    "rule": token.rule,
-                    "token_id": token.identifier,
-                    "value_length": token.value_length,
-                    "value_sha256": token.value_sha256,
-                }
-            )
-        if not envelope_used:
-            raise ReviewError(
-                f"selected synthetic secret exemption is unused: {exemption.identifier}"
-            )
-    if len(entries) > MAX_SYNTHETIC_EVIDENCE_ENTRIES:
-        raise ReviewError("legacy synthetic fixture evidence has too many entries")
-    return {
-        "catalog_schema_version": catalog.schema_version,
-        "entries": entries,
-        "pool_version": catalog.pool_version,
-        "schema_version": SYNTHETIC_MANIFEST_SCHEMA_VERSION,
-        "selected_exemptions": [item.identifier for item in exemptions],
-    }
-
-
-def _all_catalog_sensitive_values(
-    catalog: SyntheticTokenCatalog,
-) -> tuple[AcceptedSyntheticValue, ...]:
-    return accepted_authoring_values(catalog) + accepted_legacy_values(
-        catalog,
-        catalog.legacy_exemptions,
+def _secret_reduction_descriptor(
+    candidate: bytes,
+    rules: set[str],
+) -> AcceptedSyntheticValue:
+    digest = hashlib.sha256(candidate).hexdigest()
+    return AcceptedSyntheticValue(
+        kind="secret-reduction",
+        catalog_version="dynamic-v1",
+        identifier=f"secret-reduction-{digest}",
+        rule=sorted(rules)[0],
+        value=candidate,
+        value_sha256=digest,
+        value_length=len(candidate),
     )
 
 
-def _write_changed_blob_findings(
+def _read_frozen_path_diff(
     *,
     git_view: pathlib.Path,
     object_directory: pathlib.Path,
     base_sha: str,
     head_sha: str,
-    destination: pathlib.Path,
-    accepted_destination: pathlib.Path,
-    accepted_values: Iterable[AcceptedSyntheticValue],
-    evidence_sensitive_values: Iterable[AcceptedSyntheticValue],
-) -> None:
-    accepted = tuple(accepted_values)
-    accepted_index = _index_accepted_values(accepted)
-    event_budget = SecretScanBudget.default()
-    accepted_evidence: Counter[tuple[AcceptedSyntheticValue, str, str]] = Counter()
+    raw_path: bytes,
+) -> bytes:
+    output = io.BytesIO()
+    with tempfile.TemporaryFile() as error_output:
+        environment = _git_environment(object_directory=object_directory)
+        environment["GIT_LITERAL_PATHSPECS"] = "1"
+        process = subprocess.Popen(
+            _frozen_command(
+                git_view=git_view,
+                args=(
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-renames",
+                    "--unified=0",
+                    base_sha,
+                    head_sha,
+                    "--",
+                    os.fsdecode(raw_path),
+                ),
+            ),
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=error_output,
+        )
+        if process.stdout is None:
+            _stop_process(process)
+            raise ReviewError("failed to create secret-delta line diff pipe")
+        try:
+            _copy_limited(
+                process.stdout,
+                output,
+                limit=MAX_DIFF_BYTES,
+                label="secret-delta line diff",
+            )
+            _close_pipe(process.stdout)
+            returncode = process.wait()
+        except BaseException:
+            _close_pipe(process.stdout)
+            _stop_process(process)
+            raise
+        if returncode != 0:
+            raise ReviewError(
+                "cannot generate secret-delta line diff: "
+                f"{_process_stderr(error_output)}"
+            )
+    return output.getvalue()
+
+
+def _added_line_occurrences(
+    patch: bytes,
+    descriptors: Iterable[AcceptedSyntheticValue],
+) -> tuple[dict[AcceptedSyntheticValue, Counter[int]], bool]:
+    additions: dict[AcceptedSyntheticValue, Counter[int]] = {}
+    head_line: int | None = None
+    block: list[tuple[int, bytes]] = []
+    saw_hunk = False
+
+    def flush_block() -> None:
+        if not block:
+            return
+        payload = b"".join(content for _line, content in block)
+        boundaries: list[tuple[int, int]] = []
+        consumed = 0
+        for line_number, content in block:
+            consumed += len(content)
+            boundaries.append((consumed, line_number))
+        for descriptor in descriptors:
+            candidate = descriptor.value
+            if not candidate:
+                continue
+            start = 0
+            while True:
+                offset = payload.find(candidate, start)
+                if offset < 0:
+                    break
+                for boundary, line_number in boundaries:
+                    if offset < boundary:
+                        additions.setdefault(descriptor, Counter())[line_number] += 1
+                        break
+                start = offset + 1
+        block.clear()
+
+    for line in patch.splitlines(keepends=True):
+        hunk_match = UNIFIED_DIFF_HUNK_PATTERN.match(line)
+        if hunk_match is not None:
+            flush_block()
+            head_line = int(hunk_match.group("head_line"))
+            saw_hunk = True
+            continue
+        if head_line is None:
+            continue
+        if line.startswith(b"+"):
+            block.append((head_line, line[1:]))
+            head_line += 1
+            continue
+        flush_block()
+        if line.startswith(b" "):
+            head_line += 1
+        elif line.startswith(b"-") or line.startswith(b"\\ No newline"):
+            continue
+        else:
+            head_line = None
+    flush_block()
+    return additions, saw_hunk
+
+
+def _removed_line_occurrence_counts(
+    patch: bytes,
+    descriptors: Iterable[AcceptedSyntheticValue],
+) -> Counter[AcceptedSyntheticValue]:
+    descriptor_values = tuple(
+        (descriptor, descriptor.value) for descriptor in descriptors if descriptor.value
+    )
+    removals: Counter[AcceptedSyntheticValue] = Counter()
+    block: list[bytes] = []
+    saw_hunk = False
+
+    def flush_block() -> None:
+        if not block:
+            return
+        payload = b"".join(block)
+        for descriptor, candidate in descriptor_values:
+            start = 0
+            while True:
+                offset = payload.find(candidate, start)
+                if offset < 0:
+                    break
+                removals[descriptor] += 1
+                start = offset + 1
+        block.clear()
+
+    for line in patch.splitlines(keepends=True):
+        if UNIFIED_DIFF_HUNK_PATTERN.match(line) is not None:
+            flush_block()
+            saw_hunk = True
+            continue
+        if not saw_hunk:
+            continue
+        if line.startswith(b"-"):
+            block.append(line[1:])
+            continue
+        flush_block()
+    flush_block()
+    return removals
+
+
+def _secret_delta_addition_locations(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    base_sha: str,
+    head_sha: str,
+    violations: Mapping[AcceptedSyntheticValue, tuple[int, int]],
+) -> tuple[dict[AcceptedSyntheticValue, dict[str, Any]], bool]:
+    evidence: dict[AcceptedSyntheticValue, dict[str, Any]] = {
+        descriptor: {"locations": {}, "omitted_location_count": 0}
+        for descriptor in violations
+    }
+    if not violations:
+        return evidence, True
+
+    descriptors = tuple(violations)
+    exact_index = _index_exact_values(descriptors)
+    occurrence_budget = LegacyOccurrenceBudget.default()
+    candidate_occurrence_counts: Counter[AcceptedSyntheticValue] = Counter()
+    total_locations = 0
+    location_complete = True
+
+    def record(
+        descriptor: AcceptedSyntheticValue,
+        *,
+        raw_path: bytes,
+        line: int | None,
+        surface: str,
+        occurrence_count: int = 1,
+    ) -> None:
+        nonlocal location_complete, total_locations
+        candidate_occurrence_counts[descriptor] += occurrence_count
+        location = (os.fsdecode(raw_path), line, surface)
+        locations: dict[tuple[str, int | None, str], int] = evidence[descriptor][
+            "locations"
+        ]
+        if location not in locations:
+            if total_locations >= MAX_SECRET_DELTA_ADDITION_LOCATIONS:
+                evidence[descriptor]["omitted_location_count"] += 1
+                location_complete = False
+                return
+            total_locations += 1
+        locations[location] = locations.get(location, 0) + occurrence_count
+
     environment = _git_environment(object_directory=object_directory)
     with (
         tempfile.TemporaryFile() as raw_output,
         tempfile.TemporaryFile() as raw_error,
         tempfile.TemporaryFile() as cat_error,
-        _open_new_private_binary(destination) as findings_output,
     ):
         _write_limited_diff_metadata(
             git_view=git_view,
@@ -1893,7 +4590,7 @@ def _write_changed_blob_findings(
             ),
             output=raw_output,
             error_output=raw_error,
-            label="changed blob metadata",
+            label="secret-delta changed metadata",
             record_limit=MAX_CHANGED_ENTRIES * 2,
         )
         raw_output.seek(0)
@@ -1906,62 +4603,150 @@ def _write_changed_blob_findings(
         )
         if cat_process.stdin is None or cat_process.stdout is None:
             _stop_process(cat_process)
-            raise ReviewError("failed to create pipes for changed Git blob scanning")
+            raise ReviewError("failed to create pipes for secret-delta line evidence")
+        scanned_bytes = 0
         try:
             records = iter(_iter_nul_records(raw_output))
-            scanned_bytes = 0
             for metadata in records:
                 if not metadata.startswith(b":"):
-                    raise ReviewError(f"invalid raw Git diff record: {metadata!r}")
+                    raise ReviewError(
+                        f"invalid secret-delta raw Git record: {metadata!r}"
+                    )
                 fields = metadata[1:].split()
                 if len(fields) != 5:
-                    raise ReviewError(f"invalid raw Git diff metadata: {metadata!r}")
+                    raise ReviewError(
+                        f"invalid secret-delta raw Git metadata: {metadata!r}"
+                    )
                 old_mode, new_mode, old_object, new_object, _status = fields
                 try:
                     raw_path = next(records)
                 except StopIteration as error:
                     raise ReviewError(
-                        "raw Git diff is missing a changed path"
+                        "secret-delta raw Git diff is missing a changed path"
                     ) from error
-                for side, mode, raw_object in (
-                    ("base", old_mode, old_object),
-                    ("head", new_mode, new_object),
-                ):
-                    if mode in {b"000000", b"160000"}:
-                        continue
+
+                if old_mode == b"000000" and new_mode != b"000000":
+                    path_scan = _scan_secret_value(
+                        raw_path,
+                        raw_occurrence_values=descriptors,
+                        _exact_index=exact_index,
+                        _occurrence_budget=occurrence_budget,
+                        exact_only=True,
+                    )
+                    for descriptor, count in path_scan.raw_occurrence_counts.items():
+                        if count:
+                            record(
+                                descriptor,
+                                raw_path=raw_path,
+                                line=None,
+                                surface="path",
+                                occurrence_count=count,
+                            )
+
+                if new_mode in {b"000000", b"160000"}:
+                    continue
+
+                base_counts: Counter[AcceptedSyntheticValue] = Counter()
+                if old_mode not in {b"000000", b"160000"}:
                     try:
-                        object_id = raw_object.decode("ascii")
+                        base_object_id = old_object.decode("ascii")
                     except UnicodeDecodeError as error:
                         raise ReviewError(
-                            f"invalid changed Git object id: {raw_object!r}"
+                            f"invalid secret-delta Git object id: {old_object!r}"
                         ) from error
-                    scan, scanned_bytes = _scan_batch_blob(
+                    base_scan, scanned_bytes = _scan_batch_blob(
                         cat_input=cat_process.stdin,
                         cat_output=cat_process.stdout,
-                        object_id=object_id,
+                        object_id=base_object_id,
                         scanned_bytes=scanned_bytes,
-                        accepted_values=accepted,
-                        accepted_index=accepted_index,
-                        event_budget=event_budget,
+                        raw_occurrence_values=descriptors,
+                        exact_index=exact_index,
+                        occurrence_budget=occurrence_budget,
+                        exact_only=True,
                     )
-                    if scan.blocking_rule:
-                        findings_output.write(
-                            side.encode("ascii")
-                            + b"\0"
-                            + raw_path
-                            + b"\0"
-                            + scan.blocking_rule.encode("ascii")
-                            + b"\0"
+                    base_counts.update(base_scan.raw_occurrence_counts)
+                try:
+                    object_id = new_object.decode("ascii")
+                except UnicodeDecodeError as error:
+                    raise ReviewError(
+                        f"invalid secret-delta Git object id: {new_object!r}"
+                    ) from error
+                scan, scanned_bytes = _scan_batch_blob(
+                    cat_input=cat_process.stdin,
+                    cat_output=cat_process.stdout,
+                    object_id=object_id,
+                    scanned_bytes=scanned_bytes,
+                    raw_occurrence_values=descriptors,
+                    capture_reduction_offsets=True,
+                    exact_index=exact_index,
+                    occurrence_budget=occurrence_budget,
+                    exact_only=True,
+                )
+                present = tuple(
+                    descriptor
+                    for descriptor in descriptors
+                    if scan.raw_occurrence_counts[descriptor] > base_counts[descriptor]
+                )
+                if not present:
+                    continue
+                if new_mode == b"120000":
+                    for descriptor in present:
+                        record(
+                            descriptor,
+                            raw_path=raw_path,
+                            line=1,
+                            surface="symlink-target",
+                            occurrence_count=(
+                                scan.raw_occurrence_counts[descriptor]
+                                - base_counts[descriptor]
+                            ),
                         )
-                    path_sha256 = hashlib.sha256(raw_path).hexdigest()
-                    for accepted_value, count in scan.accepted_counts.items():
-                        _record_bounded_evidence_count(
-                            accepted_evidence,
-                            (accepted_value, side, path_sha256),
-                            count,
-                            reserved_entries=0,
-                            overflow_message=(
-                                "synthetic changed-blob evidence has too many entries"
+                    continue
+
+                patch = _read_frozen_path_diff(
+                    git_view=git_view,
+                    object_directory=object_directory,
+                    base_sha=base_sha,
+                    head_sha=head_sha,
+                    raw_path=raw_path,
+                )
+                line_occurrences, saw_hunk = _added_line_occurrences(patch, present)
+                removed_occurrences = _removed_line_occurrence_counts(patch, present)
+                for descriptor in present:
+                    local_growth = (
+                        scan.raw_occurrence_counts[descriptor] - base_counts[descriptor]
+                    )
+                    line_counts = line_occurrences.get(descriptor, {})
+                    if saw_hunk and (
+                        removed_occurrences[descriptor] > 0
+                        or sum(line_counts.values()) != local_growth
+                    ):
+                        # A retained occurrence on a replaced line or an exact
+                        # value crossing an unchanged/added boundary can make
+                        # an added-block match indistinguishable from retained
+                        # content. Preserve the count violation but do not
+                        # invent a location.
+                        candidate_occurrence_counts[descriptor] += local_growth
+                        location_complete = False
+                        continue
+                    for line_number, occurrence_count in sorted(line_counts.items()):
+                        record(
+                            descriptor,
+                            raw_path=raw_path,
+                            line=line_number,
+                            surface="blob",
+                            occurrence_count=occurrence_count,
+                        )
+                if not saw_hunk and old_object != new_object:
+                    for descriptor in present:
+                        record(
+                            descriptor,
+                            raw_path=raw_path,
+                            line=None,
+                            surface="binary",
+                            occurrence_count=(
+                                scan.raw_occurrence_counts[descriptor]
+                                - base_counts[descriptor]
                             ),
                         )
             _close_pipe(cat_process.stdin)
@@ -1974,28 +4759,493 @@ def _write_changed_blob_findings(
             raise
         if cat_returncode != 0:
             raise ReviewError(
-                f"cannot scan changed Git blobs: {_process_stderr(cat_error)}"
+                f"cannot scan secret-delta changed blobs: {_process_stderr(cat_error)}"
             )
+
+    for descriptor, item in evidence.items():
+        base_count, head_count = violations[descriptor]
+        delta = head_count - base_count
+        candidate_count = candidate_occurrence_counts[descriptor]
+        if candidate_count != delta:
+            location_complete = False
+        if candidate_count > delta:
+            # A complete Git tree records no operation identity. When local
+            # positive growth exceeds the authoritative global delta, one or
+            # more head occurrences were offset by removals or moves, but the
+            # endpoint trees cannot prove which candidate is retained. Do not
+            # arbitrarily label any of them as the new occurrence.
+            item["locations"].clear()
+            item["omitted_location_count"] = 0
+        locations = item["locations"]
+        item["locations"] = [
+            {
+                "line": line,
+                "occurrence_count": count,
+                "path": path,
+                "surface": surface,
+            }
+            for (path, line, surface), count in sorted(
+                locations.items(),
+                key=lambda entry: (
+                    os.fsencode(entry[0][0]),
+                    -1 if entry[0][1] is None else entry[0][1],
+                    entry[0][2],
+                ),
+            )
+        ]
+    return evidence, location_complete
+
+
+def _private_manifest_shard_rows_sha256(
+    manifest: dict[str, Any],
+    raw_reduction_values: list[Any],
+) -> str:
+    try:
+        payload = {
+            "entries": manifest["entries"],
+            "secret_delta_violations": manifest["secret_delta"]["violations"],
+            "secret_reduction_values": raw_reduction_values,
+            "secret_reductions": manifest["secret_reductions"],
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (KeyError, TypeError, ValueError) as error:
+        raise ReviewError(
+            "helper-private manifest shard commitment payload is invalid"
+        ) from error
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _private_manifest_shard_commitment(digest: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ReviewError("helper-private manifest shard commitment is invalid")
+    return f"{PRIVATE_MANIFEST_SHARD_COMMITMENT_PREFIX}{digest}"
+
+
+def _shard_catalog_count_manifest(
+    manifest: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    secret_delta = manifest["secret_delta"]
+    violations = secret_delta["violations"]
+    if (
+        secret_delta["status"] not in {"clean", "violations"}
+        or (secret_delta["status"] == "clean" and violations)
+        or (secret_delta["status"] == "violations" and not violations)
+        or manifest["secret_reductions"]
+    ):
+        raise ReviewError(
+            "synthetic secret manifest cannot represent complete bounded counts"
+        )
+    if any(
+        limitation.startswith(PRIVATE_MANIFEST_SHARD_COMMITMENT_PREFIX)
+        for limitation in secret_delta["limitations"]
+    ):
+        raise ReviewError("synthetic secret manifest shard commitment is duplicated")
+    placeholder_commitment = _private_manifest_shard_commitment("0" * 64)
+    manifest = dict(manifest)
+    secret_delta = dict(secret_delta)
+    secret_delta["limitations"] = [
+        *secret_delta["limitations"],
+        placeholder_commitment,
+    ]
+    manifest["secret_delta"] = secret_delta
+    violation_digests = {violation["value_sha256"] for violation in violations}
+    retained_entries = [
+        entry
+        for entry in manifest["entries"]
+        if entry["value_sha256"] not in violation_digests
+    ]
+
+    def build(
+        entries: list[dict[str, Any]],
+        shard_violations: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        shard = dict(manifest)
+        shard["entries"] = list(entries)
+        shard_delta = dict(secret_delta)
+        shard_delta["violations"] = list(shard_violations)
+        shard["secret_delta"] = shard_delta
+        return shard
+
+    shard_entries: tuple[list[dict[str, Any]], list[dict[str, Any]]] = ([], [])
+    shard_violations: tuple[list[dict[str, Any]], list[dict[str, Any]]] = ([], [])
+    sizes = [
+        len(
+            _bounded_json_bytes(
+                build(shard_entries[index], shard_violations[index]),
+                label="synthetic secret manifest shard",
+            )
+        )
+        for index in range(2)
+    ]
+    records: list[tuple[str, dict[str, Any]]] = [
+        ("violations", violation) for violation in violations
+    ] + [("entries", entry) for entry in retained_entries]
+    records.sort(
+        key=lambda item: len(
+            json.dumps(item[1], separators=(",", ":"), sort_keys=True).encode("utf-8")
+        ),
+        reverse=True,
+    )
+    for kind, record in records:
+        placed = False
+        for index in sorted(range(2), key=lambda candidate: sizes[candidate]):
+            destination = (
+                shard_violations[index]
+                if kind == "violations"
+                else shard_entries[index]
+            )
+            destination.append(record)
+            try:
+                encoded = _bounded_json_bytes(
+                    build(shard_entries[index], shard_violations[index]),
+                    label="synthetic secret manifest shard",
+                )
+            except ReviewError:
+                destination.pop()
+                continue
+            sizes[index] = len(encoded)
+            placed = True
+            break
+        if not placed:
+            raise ReviewError(
+                "synthetic secret manifest cannot represent complete bounded counts"
+            )
+    shards = tuple(
+        build(shard_entries[index], shard_violations[index]) for index in range(2)
+    )
+    private_digest = _private_manifest_shard_rows_sha256(shards[1], [])
+    commitment = _private_manifest_shard_commitment(private_digest)
+    committed_shards: list[dict[str, Any]] = []
+    for shard in shards:
+        committed = dict(shard)
+        committed_delta = dict(shard["secret_delta"])
+        committed_delta["limitations"] = [
+            commitment if item == placeholder_commitment else item
+            for item in committed_delta["limitations"]
+        ]
+        committed["secret_delta"] = committed_delta
+        _bounded_json_bytes(committed, label="synthetic secret manifest shard")
+        committed_shards.append(committed)
+    return committed_shards[0], committed_shards[1]
+
+
+def _secret_count_manifests(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    base_sha: str,
+    head_sha: str,
+    catalog: SyntheticTokenCatalog,
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    tuple[AcceptedSyntheticValue, ...],
+]:
+    # Catalog-backed legacy values are automatic baselines. The deprecated
+    # selection flag no longer changes admission semantics.
+    legacy_accepted = accepted_legacy_values(catalog, catalog.legacy_exemptions)
+    authoring_accepted = accepted_authoring_values(catalog)
+    scan_accepted = authoring_accepted + legacy_accepted
+    legacy_raw_values = frozenset(
+        descriptor.value
+        for descriptor in legacy_accepted
+        if descriptor.value is not None
+    )
+    base_discovery = _scan_frozen_tree_values(
+        git_view=git_view,
+        object_directory=object_directory,
+        commit=base_sha,
+        accepted_values=scan_accepted,
+        capture_blocking_candidates=True,
+        reduced_secret_values=legacy_raw_values,
+        _continue_after_blocking=True,
+    )
+    head_discovery = _scan_frozen_tree_values(
+        git_view=git_view,
+        object_directory=object_directory,
+        commit=head_sha,
+        accepted_values=scan_accepted,
+        capture_blocking_candidates=True,
+        reduced_secret_values=legacy_raw_values,
+        _continue_after_blocking=True,
+    )
+    if head_discovery.unextractable_rule is not None:
+        raise ReviewError("an exact secret candidate could not be extracted completely")
+    discovery = base_discovery
+    discovery.merge(head_discovery)
+    # Non-exact expressions have no stable byte identity and intentionally do
+    # not enter the counter. Scanner resource failures still raise and are
+    # recorded by the caller as an inconclusive merge gate.
+    reduction_descriptors_list: list[AcceptedSyntheticValue] = []
+    for candidate, rules in sorted(
+        discovery.blocking_candidates.items(),
+        key=lambda item: (hashlib.sha256(item[0]).hexdigest(), item[0]),
+    ):
+        # Declared rules still govern accepted-fixture matching. Once an exact
+        # value reaches the count stage, however, raw bytes are its identity:
+        # rediscovery through another rule must not create a second counter.
+        if candidate in legacy_raw_values:
+            continue
+        descriptor = _secret_reduction_descriptor(candidate, rules)
+        reduction_descriptors_list.append(descriptor)
+    reduction_descriptors = tuple(reduction_descriptors_list)
+    count_values = legacy_accepted + reduction_descriptors
+    discovered_values = frozenset(discovery.blocking_candidates)
+    if count_values:
+        base_scan = _scan_frozen_tree_values(
+            git_view=git_view,
+            object_directory=object_directory,
+            commit=base_sha,
+            accepted_values=scan_accepted,
+            raw_occurrence_values=count_values,
+            reduced_secret_values=discovered_values,
+            exact_only=True,
+        )
+        head_scan = _scan_frozen_tree_values(
+            git_view=git_view,
+            object_directory=object_directory,
+            commit=head_sha,
+            accepted_values=scan_accepted,
+            raw_occurrence_values=count_values,
+            reduced_secret_values=discovered_values,
+            exact_only=True,
+        )
+    else:
+        base_scan = SecretScanResult.empty()
+        head_scan = SecretScanResult.empty()
+    entries: list[dict[str, Any]] = []
+    violations: dict[AcceptedSyntheticValue, tuple[int, int]] = {}
+    for exemption in catalog.legacy_exemptions:
+        for token in exemption.values:
+            descriptor = next(
+                item
+                for item in legacy_accepted
+                if item.exemption_id == exemption.identifier
+                and item.identifier == token.identifier
+            )
+            base_count = base_scan.raw_occurrence_counts[descriptor]
+            head_count = head_scan.raw_occurrence_counts[descriptor]
+            if head_count > base_count:
+                violations[descriptor] = (base_count, head_count)
+            entries.append(
+                {
+                    "base_count": base_count,
+                    "exemption_id": exemption.identifier,
+                    "head_count": head_count,
+                    "rule": token.rule,
+                    "token_id": token.identifier,
+                    "value_length": token.value_length,
+                    "value_sha256": token.value_sha256,
+                }
+            )
+    if len(entries) > MAX_SYNTHETIC_EVIDENCE_ENTRIES:
+        raise ReviewError("legacy synthetic fixture evidence has too many entries")
+    reduction_entries: list[dict[str, Any]] = []
+    for descriptor in reduction_descriptors:
+        base_count = base_scan.raw_occurrence_counts[descriptor]
+        head_count = head_scan.raw_occurrence_counts[descriptor]
+        rules = sorted(discovery.blocking_candidates[descriptor.value])
+        if head_count > base_count:
+            violations[descriptor] = (base_count, head_count)
+        reduction_entries.append(
+            {
+                "base_count": base_count,
+                "head_count": head_count,
+                "rules": rules,
+                "value_length": descriptor.value_length,
+                "value_sha256": descriptor.value_sha256,
+            }
+        )
+    if len(entries) + len(reduction_entries) > MAX_SYNTHETIC_EVIDENCE_ENTRIES:
+        raise ReviewError("secret count evidence has too many entries")
+    location_status = "complete"
+    try:
+        addition_evidence, locations_complete = _secret_delta_addition_locations(
+            git_view=git_view,
+            object_directory=object_directory,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            violations=violations,
+        )
+        if not locations_complete:
+            location_status = "inconclusive"
+    except ReviewError:
+        location_status = "inconclusive"
+        addition_evidence = {
+            descriptor: {"locations": [], "omitted_location_count": 0}
+            for descriptor in violations
+        }
+
+    violation_entries: list[dict[str, Any]] = []
+    for descriptor, (base_count, head_count) in sorted(
+        violations.items(),
+        key=lambda item: item[0].value_sha256,
+    ):
+        rules = (
+            [descriptor.rule]
+            if descriptor.kind == "legacy"
+            else sorted(discovery.blocking_candidates[descriptor.value])
+        )
+        violation_entries.append(
+            {
+                "additions": addition_evidence[descriptor]["locations"],
+                "base_count": base_count,
+                "delta": head_count - base_count,
+                "head_count": head_count,
+                "omitted_addition_location_count": addition_evidence[descriptor][
+                    "omitted_location_count"
+                ],
+                "rules": rules,
+                "value_length": descriptor.value_length,
+                "value_sha256": descriptor.value_sha256,
+            }
+        )
+
+    public_manifest = {
+        "base_ref": base_sha,
+        "catalog_schema_version": catalog.schema_version,
+        "entries": entries,
+        "head_ref": head_sha,
+        "pool_version": catalog.pool_version,
+        "schema_version": SYNTHETIC_MANIFEST_SCHEMA_VERSION,
+        "secret_delta": {
+            "location_status": location_status,
+            "status": "violations" if violation_entries else "clean",
+            "limitations": [
+                "Only exact raw byte values are compared; alternate encodings are not derived.",
+                "Dynamic expressions without a stable exact value are not counted.",
+            ],
+            "violations": violation_entries,
+        },
+        "secret_reductions": reduction_entries,
+        "selected_exemptions": [item.identifier for item in catalog.legacy_exemptions],
+    }
+    try:
+        _bounded_json_bytes(public_manifest, label="synthetic secret manifest")
+    except ReviewError:
+        sharded_manifests = None
+        if not reduction_descriptors:
+            try:
+                sharded_manifests = _shard_catalog_count_manifest(public_manifest)
+            except ReviewError:
+                pass
+        if sharded_manifests is not None:
+            public_manifest, private_manifest = sharded_manifests
+        else:
+            if public_manifest["secret_delta"]["violations"]:
+                public_manifest["secret_delta"]["location_status"] = "inconclusive"
+                for violation in public_manifest["secret_delta"]["violations"]:
+                    violation["omitted_addition_location_count"] += len(
+                        violation["additions"]
+                    )
+                    violation["additions"] = []
+            try:
+                _bounded_json_bytes(
+                    public_manifest,
+                    label="synthetic secret manifest",
+                )
+            except ReviewError:
+                if reduction_descriptors:
+                    raise
+                public_manifest, private_manifest = _shard_catalog_count_manifest(
+                    public_manifest
+                )
+            else:
+                private_manifest = dict(public_manifest)
+    else:
+        private_manifest = dict(public_manifest)
+    if reduction_descriptors:
+        private_manifest["secret_reduction_values"] = [
+            {
+                "value_base64": base64.b64encode(descriptor.value).decode("ascii"),
+                "value_sha256": descriptor.value_sha256,
+            }
+            for descriptor in reduction_descriptors
+        ]
+    _bounded_json_bytes(
+        private_manifest,
+        label="synthetic secret helper-private state",
+    )
+    return public_manifest, private_manifest, reduction_descriptors
+
+
+def _all_catalog_sensitive_values(
+    catalog: SyntheticTokenCatalog,
+) -> tuple[AcceptedSyntheticValue, ...]:
+    return accepted_authoring_values(catalog) + accepted_legacy_values(
+        catalog,
+        catalog.legacy_exemptions,
+    )
+
+
+def _inconclusive_secret_count_manifests(
+    *,
+    base_sha: str,
+    head_sha: str,
+    catalog: SyntheticTokenCatalog,
+    failure_class: str,
+) -> tuple[dict[str, Any], dict[str, Any], tuple[AcceptedSyntheticValue, ...]]:
+    if re.fullmatch(r"[a-z][a-z0-9-]{0,63}", failure_class) is None:
+        raise ReviewError("secret scan failure class is invalid")
+    manifest = {
+        "base_ref": base_sha,
+        "catalog_schema_version": catalog.schema_version,
+        "entries": [],
+        "head_ref": head_sha,
+        "pool_version": catalog.pool_version,
+        "schema_version": SYNTHETIC_MANIFEST_SCHEMA_VERSION,
+        "secret_delta": {
+            "failure_class": failure_class,
+            "limitations": [
+                "The exact-value scan did not complete; merge admission is inconclusive."
+            ],
+            "location_status": "inconclusive",
+            "status": "inconclusive",
+            "violations": [],
+        },
+        "secret_reductions": [],
+        "selected_exemptions": [item.identifier for item in catalog.legacy_exemptions],
+    }
+    return manifest, dict(manifest), ()
+
+
+def _write_changed_blob_findings(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    base_sha: str,
+    head_sha: str,
+    destination: pathlib.Path,
+    accepted_destination: pathlib.Path,
+    accepted_values: Iterable[AcceptedSyntheticValue],
+    evidence_sensitive_values: Iterable[AcceptedSyntheticValue],
+    reduced_secret_values: frozenset[bytes] = frozenset(),
+) -> None:
+    # Secret content is not a reviewer-egress gate. The complete base/head
+    # exact-value audit owns admission evidence, so this legacy control surface
+    # remains present only for artifact-layout compatibility and must not run a
+    # second scan that could suppress reviewer launch.
+    _ = (
+        git_view,
+        object_directory,
+        base_sha,
+        head_sha,
+        accepted_values,
+        evidence_sensitive_values,
+        reduced_secret_values,
+    )
+    with _open_new_private_binary(destination):
+        pass
     _write_bounded_json(
         accepted_destination,
         {
-            "entries": [
-                _accepted_evidence_entry(
-                    accepted_value,
-                    surface="changed-blob",
-                    side=side,
-                    path_sha256=path_sha256,
-                    occurrence_count=count,
-                )
-                for (accepted_value, side, path_sha256), count in sorted(
-                    accepted_evidence.items(),
-                    key=lambda item: (
-                        item[0][1],
-                        item[0][2],
-                        item[0][0].identifier,
-                    ),
-                )
-            ],
+            "entries": [],
             "schema_version": 1,
         },
         label="synthetic changed-blob evidence",
@@ -2003,10 +5253,29 @@ def _write_changed_blob_findings(
     )
 
 
-def validate_workspace_layout(review: ReviewWorkspace) -> None:
-    source_root = review.source_root.resolve(strict=False)
-    container_dir = review.container_dir.resolve(strict=False)
-    expected_parent = (source_root / ".codex-tmp").resolve(strict=False)
+def validate_workspace_layout(
+    review: ReviewWorkspace | LegacyReviewWorkspace,
+) -> None:
+    def resolve_path(path: pathlib.Path, *, label: str) -> pathlib.Path:
+        try:
+            return path.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ReviewError(f"review {label} path cannot be resolved") from error
+
+    def canonical_path(path: pathlib.Path, *, label: str) -> pathlib.Path:
+        expanded = path.expanduser()
+        absolute = expanded.absolute()
+        normalized = pathlib.Path(os.path.normpath(os.fspath(absolute)))
+        if absolute != normalized:
+            raise ReviewError(f"review {label} path is not canonical: {absolute}")
+        return resolve_path(expanded, label=label)
+
+    source_root = canonical_path(review.source_root, label="source root")
+    container_dir = canonical_path(review.container_dir, label="container")
+    expected_parent = resolve_path(
+        source_root / ".codex-tmp",
+        label="source review root",
+    )
     if container_dir.parent != expected_parent or not container_dir.name.startswith(
         "isolated-review-"
     ):
@@ -2014,16 +5283,19 @@ def validate_workspace_layout(review: ReviewWorkspace) -> None:
             f"review container is outside the source repository review root: {container_dir}"
         )
     expected_workspace = container_dir / "workspace"
-    if review.workspace_root.resolve(strict=False) != expected_workspace:
+    if canonical_path(review.workspace_root, label="workspace") != expected_workspace:
         raise ReviewError(
             f"review workspace escapes its container: {review.workspace_root}"
         )
     control_dir = expected_workspace / ".codex-review"
-    if review.diff_file.resolve(strict=False) != control_dir / "review.diff":
+    if canonical_path(review.diff_file, label="diff") != control_dir / "review.diff":
         raise ReviewError(
             f"review diff escapes its control directory: {review.diff_file}"
         )
-    if review.prompt_file.resolve(strict=False) != control_dir / "review.prompt":
+    if (
+        canonical_path(review.prompt_file, label="prompt")
+        != control_dir / "review.prompt"
+    ):
         raise ReviewError(
             f"review prompt escapes its control directory: {review.prompt_file}"
         )
@@ -2067,6 +5339,7 @@ def _secure_file_reader(
     label: str,
     max_bytes: int | None = None,
     expected_artifact: ControlArtifactEvidence | None = None,
+    expected_identity: CleanupIdentity | None = None,
 ) -> Iterator[tuple[_DigestingReader, os.stat_result]]:
     flags = (
         os.O_RDONLY
@@ -2087,8 +5360,15 @@ def _secure_file_reader(
             raise ReviewError(f"{label} is not a regular file with one link")
         if initial.st_uid != os.getuid():
             raise ReviewError(f"{label} must be owned by the current user")
+        if expected_identity is not None and stat.S_IMODE(initial.st_mode) != 0o600:
+            raise ReviewError(f"{label} must have mode 0600")
         if initial.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
             raise ReviewError(f"{label} must not be group or other writable")
+        if (
+            expected_identity is not None
+            and _cleanup_identity_evidence(initial) != expected_identity
+        ):
+            raise ReviewError(f"{label} does not match preparation identity")
         if max_bytes is not None and initial.st_size > max_bytes:
             raise ReviewError(f"{label} exceeds its review size limit")
         if expected_artifact is not None:
@@ -2141,6 +5421,7 @@ def _read_bounded_json(
     *,
     label: str,
     expected_artifact: ControlArtifactEvidence | None = None,
+    expected_identity: CleanupIdentity | None = None,
     max_bytes: int = MAX_SYNTHETIC_EVIDENCE_BYTES,
 ) -> dict[str, Any]:
     chunks: list[bytes] = []
@@ -2149,6 +5430,7 @@ def _read_bounded_json(
         label=label,
         max_bytes=max_bytes,
         expected_artifact=expected_artifact,
+        expected_identity=expected_identity,
     ) as (reader, _metadata):
         remaining = max_bytes
         while chunk := reader.read(min(64 * 1024, remaining + 1)):
@@ -2157,6 +5439,85 @@ def _read_bounded_json(
             chunks.append(chunk)
             remaining -= len(chunk)
     encoded = b"".join(chunks)
+    try:
+        value = json.loads(
+            encoded.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_object,
+        )
+    except RecursionError as error:
+        raise ReviewError(f"{label} exceeds the JSON nesting depth limit") from error
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        OverflowError,
+        ValueError,
+    ) as error:
+        raise ReviewError(f"{label} is not valid JSON") from error
+    if not isinstance(value, dict):
+        raise ReviewError(f"{label} must be a JSON object")
+    _validate_bounded_json_depth(value, label=label)
+    return value
+
+
+def _read_bounded_json_at(
+    directory_descriptor: int,
+    name: str,
+    *,
+    label: str,
+    max_bytes: int = MAX_SYNTHETIC_EVIDENCE_BYTES,
+) -> dict[str, Any]:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor: int | None = None
+    handle: BinaryIO | None = None
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_descriptor)
+        initial = os.fstat(descriptor)
+        if not stat.S_ISREG(initial.st_mode) or initial.st_nlink != 1:
+            raise ReviewError(f"{label} is not a regular file with one link")
+        if initial.st_uid != os.geteuid():
+            raise ReviewError(f"{label} has an unexpected owner")
+        if initial.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise ReviewError(f"{label} must not be group or other writable")
+        if initial.st_size > max_bytes:
+            raise ReviewError(f"{label} exceeds its review size limit")
+        handle = os.fdopen(descriptor, "rb")
+        descriptor = None
+        encoded = handle.read(max_bytes + 1)
+        if len(encoded) != initial.st_size:
+            raise ReviewError(f"{label} changed while it was read")
+        final = os.fstat(handle.fileno())
+        if (
+            initial.st_dev,
+            initial.st_ino,
+            initial.st_mode,
+            initial.st_nlink,
+            initial.st_uid,
+            initial.st_size,
+            initial.st_mtime_ns,
+            initial.st_ctime_ns,
+        ) != (
+            final.st_dev,
+            final.st_ino,
+            final.st_mode,
+            final.st_nlink,
+            final.st_uid,
+            final.st_size,
+            final.st_mtime_ns,
+            final.st_ctime_ns,
+        ):
+            raise ReviewError(f"{label} changed while it was read")
+    except OSError as error:
+        raise ReviewError(f"cannot read {label}: {error}") from error
+    finally:
+        if handle is not None:
+            handle.close()
+        elif descriptor is not None:
+            os.close(descriptor)
     try:
         value = json.loads(
             encoded.decode("utf-8"),
@@ -2196,7 +5557,19 @@ def _validate_bounded_json_depth(value: dict[str, Any], *, label: str) -> None:
 
 
 def encode_preflight_json(value: dict[str, Any]) -> str:
-    encoded = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    encoded = (
+        json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if len(encoded) > MAX_PREFLIGHT_JSON_BYTES:
+        encoded = (
+            json.dumps(
+                value,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
     if len(encoded) > MAX_PREFLIGHT_JSON_BYTES:
         raise ReviewError("serialized preflight evidence exceeds the size limit")
     return encoded.decode("utf-8")
@@ -2295,9 +5668,10 @@ def _inspect_control_directory(
 def _build_control_artifact_state(
     *,
     control_dir: pathlib.Path,
+    private_cleanup: PrivateCleanupEvidence,
 ) -> dict[str, Any]:
     directory = _inspect_control_directory(control_dir)
-    entries: list[dict[str, Any]] = []
+    artifacts: dict[str, ControlArtifactEvidence] = {}
     for name in sorted(CONTROL_ARTIFACT_SPECS):
         max_bytes, record_limit = CONTROL_ARTIFACT_SPECS[name]
         record_count: int | None = 0 if record_limit is not None else None
@@ -2326,42 +5700,116 @@ def _build_control_artifact_state(
                 raise ReviewError(
                     "generated changed-blob findings are not complete record triples"
                 )
-        entries.append(
-            {
-                "name": name,
-                "record_count": record_count,
-                "sha256": artifact_sha256,
-                "size": metadata.st_size,
-            }
+        artifacts[name] = ControlArtifactEvidence(
+            name=name,
+            record_count=record_count,
+            sha256=artifact_sha256,
+            size=metadata.st_size,
         )
     _inspect_control_directory(control_dir, expected=directory)
-    return {
-        "artifacts": entries,
-        "directory": {
-            "ctime_ns": directory.ctime_ns,
-            "device": directory.device,
-            "entry_count": directory.entry_count,
-            "entry_names_sha256": directory.entry_names_sha256,
-            "inode": directory.inode,
-            "link_count": directory.link_count,
-            "mode": directory.mode,
-            "mtime_ns": directory.mtime_ns,
-            "uid": directory.uid,
-        },
-        "schema_version": CONTROL_ARTIFACT_SCHEMA_VERSION,
-    }
+    return ControlArtifactState(
+        artifacts=artifacts,
+        directory=directory,
+        private_cleanup=private_cleanup,
+        private_artifacts_removed=frozenset(),
+    ).to_json()
 
 
-def _load_control_artifact_state(
-    *,
-    container_dir: pathlib.Path,
-) -> ControlArtifactState:
-    payload = _read_bounded_json(
-        container_dir / CONTROL_ARTIFACT_STATE_NAME,
-        label="helper-private review control state",
-    )
+def _parse_cleanup_identity(value: Any, *, label: str) -> CleanupIdentity:
     if (
-        set(payload) != {"artifacts", "directory", "schema_version"}
+        not isinstance(value, dict)
+        or set(value) != {"device", "inode"}
+        or type(value["device"]) is not int
+        or type(value["inode"]) is not int
+        or value["device"] < 0
+        or value["inode"] <= 0
+    ):
+        raise ReviewError(f"{label} is invalid")
+    return CleanupIdentity(device=value["device"], inode=value["inode"])
+
+
+def _parse_private_cleanup_evidence(
+    value: Any,
+    *,
+    require_all: bool,
+) -> PrivateCleanupEvidence:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"artifacts", "container", "schema_version"}
+        or type(value.get("schema_version")) is not int
+        or value.get("schema_version") != 1
+        or not isinstance(value["artifacts"], list)
+        or len(value["artifacts"]) > len(PRIVATE_HELPER_ARTIFACT_NAMES)
+    ):
+        raise ReviewError("helper-private cleanup identity state is malformed")
+    container = _parse_cleanup_identity(
+        value["container"],
+        label="helper-private container cleanup identity",
+    )
+    artifacts: dict[str, CleanupIdentity] = {}
+    for raw_artifact in value["artifacts"]:
+        if not isinstance(raw_artifact, dict) or set(raw_artifact) != {
+            "device",
+            "inode",
+            "name",
+        }:
+            raise ReviewError("helper-private artifact cleanup identity is malformed")
+        name = raw_artifact["name"]
+        if (
+            not isinstance(name, str)
+            or name not in PRIVATE_HELPER_ARTIFACT_NAMES
+            or name in artifacts
+        ):
+            raise ReviewError("helper-private artifact cleanup identity is invalid")
+        artifacts[name] = _parse_cleanup_identity(
+            {"device": raw_artifact["device"], "inode": raw_artifact["inode"]},
+            label=f"helper-private artifact cleanup identity {name}",
+        )
+    if require_all and set(artifacts) != set(PRIVATE_HELPER_ARTIFACT_NAMES):
+        raise ReviewError("helper-private artifact cleanup identities are incomplete")
+    return PrivateCleanupEvidence(container=container, artifacts=artifacts)
+
+
+def parse_private_cleanup_evidence(value: Any) -> PrivateCleanupEvidence:
+    return _parse_private_cleanup_evidence(value, require_all=True)
+
+
+def parse_partial_private_cleanup_evidence(value: Any) -> PrivateCleanupEvidence:
+    return _parse_private_cleanup_evidence(value, require_all=False)
+
+
+def _parse_private_cleanup_state(
+    value: Any,
+) -> tuple[PrivateCleanupEvidence, frozenset[str]]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"binding", "removed", "schema_version"}
+        or value.get("schema_version") != 1
+        or not isinstance(value["removed"], list)
+    ):
+        raise ReviewError("helper-private cleanup state is malformed")
+    removed_items = value["removed"]
+    if (
+        any(
+            not isinstance(item, str) or item not in PRIVATE_HELPER_ARTIFACT_NAMES
+            for item in removed_items
+        )
+        or len(set(removed_items)) != len(removed_items)
+        or removed_items != sorted(removed_items)
+    ):
+        raise ReviewError("helper-private cleanup removal receipts are invalid")
+    return (
+        _parse_private_cleanup_evidence(
+            value["binding"],
+            require_all=True,
+        ),
+        frozenset(removed_items),
+    )
+
+
+def _parse_control_artifact_state(payload: dict[str, Any]) -> ControlArtifactState:
+    if (
+        set(payload) != {"artifacts", "directory", "private_cleanup", "schema_version"}
         or payload.get("schema_version") != CONTROL_ARTIFACT_SCHEMA_VERSION
     ):
         raise ReviewError("helper-private review control state fields are invalid")
@@ -2461,7 +5909,396 @@ def _load_control_artifact_state(
         )
     if set(artifacts) != set(CONTROL_ARTIFACT_SPECS):
         raise ReviewError("helper-private review control state is incomplete")
-    return ControlArtifactState(artifacts=artifacts, directory=directory)
+    private_cleanup, private_artifacts_removed = _parse_private_cleanup_state(
+        payload["private_cleanup"]
+    )
+    return ControlArtifactState(
+        artifacts=artifacts,
+        directory=directory,
+        private_cleanup=private_cleanup,
+        private_artifacts_removed=private_artifacts_removed,
+    )
+
+
+def _load_control_artifact_state(
+    *,
+    container_dir: pathlib.Path,
+) -> ControlArtifactState:
+    return _parse_control_artifact_state(
+        _read_bounded_json(
+            container_dir / CONTROL_ARTIFACT_STATE_NAME,
+            label="helper-private review control state",
+        )
+    )
+
+
+def _load_control_artifact_state_at(
+    container_descriptor: int,
+) -> ControlArtifactState:
+    return _parse_control_artifact_state(
+        _read_bounded_json_at(
+            container_descriptor,
+            CONTROL_ARTIFACT_STATE_NAME,
+            label="helper-private review control state",
+        )
+    )
+
+
+def _write_control_artifact_state_at(
+    container_descriptor: int,
+    state: ControlArtifactState,
+) -> None:
+    encoded = _bounded_json_bytes(
+        state.to_json(),
+        label="helper-private review control state",
+    )
+    temporary_name = f".{CONTROL_ARTIFACT_STATE_NAME}.{uuid.uuid4().hex}"
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor: int | None = None
+    handle: BinaryIO | None = None
+    try:
+        descriptor = os.open(
+            temporary_name,
+            flags,
+            0o600,
+            dir_fd=container_descriptor,
+        )
+        os.fchmod(descriptor, 0o600)
+        handle = os.fdopen(descriptor, "wb")
+        descriptor = None
+        handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        handle = None
+        os.replace(
+            temporary_name,
+            CONTROL_ARTIFACT_STATE_NAME,
+            src_dir_fd=container_descriptor,
+            dst_dir_fd=container_descriptor,
+        )
+        os.fsync(container_descriptor)
+    except OSError as error:
+        raise ReviewError(
+            f"cannot persist helper-private cleanup receipt: {error}"
+        ) from error
+    finally:
+        if handle is not None:
+            handle.close()
+        elif descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=container_descriptor)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def validate_secret_delta_summary(
+    value: Any,
+    *,
+    label: str = "secret-delta",
+) -> dict[str, Any]:
+    required_fields = {"limitations", "location_status", "status", "violations"}
+    if (
+        not isinstance(value, dict)
+        or not required_fields.issubset(value)
+        or not set(value).issubset(required_fields | {"failure_class"})
+        or value.get("location_status") not in {"complete", "inconclusive"}
+        or value.get("status") not in {"clean", "violations", "inconclusive"}
+        or not isinstance(value.get("limitations"), list)
+        or not all(isinstance(item, str) for item in value.get("limitations", []))
+        or not isinstance(value.get("violations"), list)
+        or len(value.get("violations", [])) > MAX_SYNTHETIC_EVIDENCE_ENTRIES
+    ):
+        raise ReviewError(f"{label} is invalid")
+
+    allowed_rules = {rule for rule, _pattern in SECRET_PATTERNS} | {
+        "generic-secret-assignment",
+        "pgp-private-key",
+        "private-key",
+    }
+    seen_digests: set[str] = set()
+    total_additions = 0
+    violations = value["violations"]
+    for violation in violations:
+        if not isinstance(violation, dict) or set(violation) != {
+            "additions",
+            "base_count",
+            "delta",
+            "head_count",
+            "omitted_addition_location_count",
+            "rules",
+            "value_length",
+            "value_sha256",
+        }:
+            raise ReviewError(f"{label} violation is malformed")
+        base_count = violation["base_count"]
+        head_count = violation["head_count"]
+        delta = violation["delta"]
+        omitted = violation["omitted_addition_location_count"]
+        rules = violation["rules"]
+        value_length = violation["value_length"]
+        digest = violation["value_sha256"]
+        additions = violation["additions"]
+        if (
+            type(base_count) is not int
+            or type(head_count) is not int
+            or type(delta) is not int
+            or base_count < 0
+            or head_count <= base_count
+            or delta != head_count - base_count
+            or type(omitted) is not int
+            or omitted < 0
+            or not isinstance(rules, list)
+            or not rules
+            or len(rules) > len(allowed_rules)
+            or not all(
+                isinstance(rule, str) and rule in allowed_rules for rule in rules
+            )
+            or rules != sorted(set(rules))
+            or type(value_length) is not int
+            or not 0 < value_length <= MAX_PEM_SECRET_BYTES
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or digest in seen_digests
+            or not isinstance(additions, list)
+            or len(additions) > MAX_SECRET_DELTA_ADDITION_LOCATIONS
+        ):
+            raise ReviewError(f"{label} violation is inconsistent")
+        total_additions += len(additions)
+        if total_additions > MAX_SECRET_DELTA_ADDITION_LOCATIONS:
+            raise ReviewError(f"{label} has too many addition locations")
+        addition_occurrence_count = 0
+        for addition in additions:
+            if not isinstance(addition, dict) or set(addition) != {
+                "line",
+                "occurrence_count",
+                "path",
+                "surface",
+            }:
+                raise ReviewError(f"{label} addition is malformed")
+            line = addition["line"]
+            occurrence_count = addition["occurrence_count"]
+            path = addition["path"]
+            surface = addition["surface"]
+            if (
+                (line is not None and (type(line) is not int or line <= 0))
+                or type(occurrence_count) is not int
+                or occurrence_count <= 0
+                or not isinstance(path, str)
+                or not path
+                or "\x00" in path
+                or not isinstance(surface, str)
+                or surface not in {"binary", "blob", "path", "symlink-target"}
+            ):
+                raise ReviewError(f"{label} addition is inconsistent")
+            addition_occurrence_count += occurrence_count
+        if addition_occurrence_count > delta or (
+            value["location_status"] == "complete"
+            and (addition_occurrence_count != delta or omitted != 0)
+        ):
+            raise ReviewError(f"{label} addition evidence is inconsistent")
+        seen_digests.add(digest)
+
+    status = value["status"]
+    failure_class = value.get("failure_class")
+    if status == "inconclusive":
+        valid_state = (
+            set(value) == required_fields | {"failure_class"}
+            and value["location_status"] == "inconclusive"
+            and violations == []
+            and isinstance(failure_class, str)
+            and re.fullmatch(r"[a-z][a-z0-9-]{0,63}", failure_class) is not None
+        )
+    elif status == "clean":
+        valid_state = (
+            set(value) == required_fields
+            and value["location_status"] == "complete"
+            and violations == []
+        )
+    else:
+        valid_state = set(value) == required_fields and len(violations) > 0
+    if not valid_state:
+        raise ReviewError(f"{label} state is invalid")
+    return dict(value)
+
+
+def _merge_secret_count_manifest_shards(
+    workspace_manifest: dict[str, Any],
+    private_manifest: dict[str, Any],
+) -> tuple[dict[str, Any], bool, list[Any]]:
+    expected_fields = {
+        "base_ref",
+        "catalog_schema_version",
+        "entries",
+        "head_ref",
+        "pool_version",
+        "schema_version",
+        "secret_delta",
+        "secret_reductions",
+        "selected_exemptions",
+    }
+    private_only_fields = {"secret_reduction_values"}
+    private_fields = set(private_manifest)
+    if set(workspace_manifest) != expected_fields or private_fields not in (
+        expected_fields,
+        expected_fields | private_only_fields,
+    ):
+        raise ReviewError(
+            "synthetic secret manifest does not match helper-private state"
+        )
+    raw_reduction_values = private_manifest.get("secret_reduction_values", [])
+    if not isinstance(raw_reduction_values, list):
+        raise ReviewError(
+            "synthetic secret manifest does not match helper-private state"
+        )
+    private_public_fields = dict(private_manifest)
+    private_public_fields.pop("secret_reduction_values", None)
+    if workspace_manifest == private_public_fields:
+        standard_delta = private_public_fields.get("secret_delta")
+        standard_limitations = (
+            standard_delta.get("limitations", [])
+            if isinstance(standard_delta, dict)
+            else []
+        )
+        if any(
+            isinstance(item, str)
+            and item.startswith(PRIVATE_MANIFEST_SHARD_COMMITMENT_PREFIX)
+            for item in standard_limitations
+        ):
+            raise ReviewError(
+                "unsharded synthetic secret manifest has a shard commitment"
+            )
+        return dict(private_public_fields), False, list(raw_reduction_values)
+    varying_fields = {"entries", "secret_delta", "secret_reductions"}
+    if any(
+        workspace_manifest[field] != private_public_fields[field]
+        for field in expected_fields - varying_fields
+    ):
+        raise ReviewError(
+            "synthetic secret manifest does not match helper-private state"
+        )
+    if (
+        raw_reduction_values
+        or workspace_manifest["secret_reductions"]
+        or private_public_fields["secret_reductions"]
+    ):
+        raise ReviewError(
+            "synthetic secret manifest does not match helper-private state"
+        )
+    deltas = (
+        workspace_manifest["secret_delta"],
+        private_public_fields["secret_delta"],
+    )
+    if any(not isinstance(delta, dict) for delta in deltas):
+        raise ReviewError(
+            "synthetic secret manifest does not match helper-private state"
+        )
+    delta_fixed_fields = {"limitations", "location_status", "status"}
+    if any(
+        set(delta) != delta_fixed_fields | {"violations"}
+        or delta.get("status") not in {"clean", "violations"}
+        or not isinstance(delta.get("violations"), list)
+        for delta in deltas
+    ):
+        raise ReviewError(
+            "synthetic secret manifest does not match helper-private state"
+        )
+    if any(deltas[0][field] != deltas[1][field] for field in delta_fixed_fields):
+        raise ReviewError(
+            "synthetic secret manifest does not match helper-private state"
+        )
+    status = deltas[0]["status"]
+    has_violations = any(delta["violations"] for delta in deltas)
+    if (status == "clean" and has_violations) or (
+        status == "violations" and not has_violations
+    ):
+        raise ReviewError(
+            "synthetic secret manifest does not match helper-private state"
+        )
+    limitations = deltas[0]["limitations"]
+    if not isinstance(limitations, list):
+        raise ReviewError("helper-private manifest shard commitment is missing")
+    commitments = [
+        item
+        for item in limitations
+        if isinstance(item, str)
+        and item.startswith(PRIVATE_MANIFEST_SHARD_COMMITMENT_PREFIX)
+    ]
+    if (
+        len(commitments) != 1
+        or re.fullmatch(
+            re.escape(PRIVATE_MANIFEST_SHARD_COMMITMENT_PREFIX) + r"[0-9a-f]{64}",
+            commitments[0],
+        )
+        is None
+    ):
+        raise ReviewError("helper-private manifest shard commitment is invalid")
+    expected_private_digest = commitments[0][
+        len(PRIVATE_MANIFEST_SHARD_COMMITMENT_PREFIX) :
+    ]
+    actual_private_digest = _private_manifest_shard_rows_sha256(
+        private_public_fields,
+        raw_reduction_values,
+    )
+    if expected_private_digest != actual_private_digest:
+        raise ReviewError("helper-private manifest shard commitment does not match")
+    violation_digests: set[str] = set()
+    violations: list[dict[str, Any]] = []
+    for delta in deltas:
+        for violation in delta["violations"]:
+            if not isinstance(violation, dict):
+                raise ReviewError(
+                    "synthetic secret manifest does not match helper-private state"
+                )
+            digest = violation.get("value_sha256")
+            if not isinstance(digest, str) or digest in violation_digests:
+                raise ReviewError(
+                    "synthetic secret manifest does not match helper-private state"
+                )
+            violation_digests.add(digest)
+            violations.append(violation)
+    entries: list[dict[str, Any]] = []
+    entry_keys: set[tuple[str, str]] = set()
+    for shard in (workspace_manifest, private_public_fields):
+        shard_entries = shard["entries"]
+        if not isinstance(shard_entries, list):
+            raise ReviewError(
+                "synthetic secret manifest does not match helper-private state"
+            )
+        for entry in shard_entries:
+            if not isinstance(entry, dict):
+                raise ReviewError(
+                    "synthetic secret manifest does not match helper-private state"
+                )
+            key = (entry.get("exemption_id"), entry.get("token_id"))
+            if not all(isinstance(item, str) for item in key) or key in entry_keys:
+                raise ReviewError(
+                    "synthetic secret manifest does not match helper-private state"
+                )
+            entry_keys.add(key)
+            entries.append(entry)
+    merged = dict(workspace_manifest)
+    merged["entries"] = sorted(
+        entries,
+        key=lambda entry: (entry["exemption_id"], entry["token_id"]),
+    )
+    merged_delta = dict(deltas[0])
+    merged_delta["violations"] = sorted(
+        violations,
+        key=lambda violation: violation["value_sha256"],
+    )
+    merged["secret_delta"] = merged_delta
+    merged["secret_reductions"] = []
+    return merged, True, []
 
 
 def _load_legacy_manifest(
@@ -2470,16 +6307,37 @@ def _load_legacy_manifest(
     container_dir: pathlib.Path,
     catalog: SyntheticTokenCatalog,
     expected_artifact: ControlArtifactEvidence,
+    expected_private_identity: CleanupIdentity,
+    expected_base_ref: str,
+    expected_head_ref: str,
 ) -> tuple[
     tuple[LegacyExemption, ...],
     tuple[AcceptedSyntheticValue, ...],
     dict[AcceptedSyntheticValue, tuple[int, int, int, int]],
     list[dict[str, Any]],
+    tuple[AcceptedSyntheticValue, ...],
+    dict[AcceptedSyntheticValue, tuple[int, int, int, int]],
+    dict[str, Any],
+    list[dict[str, Any]],
 ]:
     manifest_path = control_dir / SYNTHETIC_MANIFEST_NAME
     private_manifest_path = container_dir / SYNTHETIC_PRIVATE_MANIFEST_NAME
     if not manifest_path.exists() and not private_manifest_path.exists():
-        return (), (), {}, []
+        return (
+            (),
+            (),
+            {},
+            [],
+            (),
+            {},
+            {
+                "limitations": [],
+                "location_status": "complete",
+                "status": "clean",
+                "violations": [],
+            },
+            [],
+        )
     if not manifest_path.exists() or not private_manifest_path.exists():
         raise ReviewError("synthetic secret helper-private state is missing")
     workspace_manifest = _read_bounded_json(
@@ -2487,19 +6345,28 @@ def _load_legacy_manifest(
         label="synthetic secret manifest",
         expected_artifact=expected_artifact,
     )
-    manifest = _read_bounded_json(
+    private_manifest = _read_bounded_json(
         private_manifest_path,
         label="synthetic secret helper-private state",
+        expected_identity=expected_private_identity,
     )
-    if workspace_manifest != manifest:
-        raise ReviewError(
-            "synthetic secret manifest does not match helper-private state"
-        )
+    (
+        manifest,
+        manifest_was_sharded,
+        raw_reduction_values,
+    ) = _merge_secret_count_manifest_shards(
+        workspace_manifest,
+        private_manifest,
+    )
     if set(manifest) != {
+        "base_ref",
         "catalog_schema_version",
         "entries",
+        "head_ref",
         "pool_version",
         "schema_version",
+        "secret_delta",
+        "secret_reductions",
         "selected_exemptions",
     }:
         raise ReviewError("synthetic secret manifest fields are invalid")
@@ -2509,14 +6376,25 @@ def _load_legacy_manifest(
         or type(manifest["catalog_schema_version"]) is not int
         or manifest["catalog_schema_version"] != catalog.schema_version
         or manifest["pool_version"] != catalog.pool_version
+        or manifest["base_ref"] != expected_base_ref
+        or manifest["head_ref"] != expected_head_ref
     ):
-        raise ReviewError("synthetic secret manifest catalog version is invalid")
+        raise ReviewError(
+            "synthetic secret manifest version or review range is invalid"
+        )
+    secret_delta = validate_secret_delta_summary(manifest["secret_delta"])
     selected_ids = manifest["selected_exemptions"]
     if not isinstance(selected_ids, list) or not all(
         isinstance(item, str) for item in selected_ids
     ):
         raise ReviewError("synthetic secret manifest selection is invalid")
     exemptions = resolve_legacy_exemptions(catalog, selected_ids)
+    if tuple(item.identifier for item in exemptions) != tuple(
+        item.identifier for item in catalog.legacy_exemptions
+    ):
+        raise ReviewError(
+            "synthetic secret manifest does not cover every catalog legacy value"
+        )
     accepted = accepted_legacy_values(catalog, exemptions)
     expected = {(item.exemption_id, item.identifier): item for item in accepted}
     raw_entries = manifest["entries"]
@@ -2530,10 +6408,8 @@ def _load_legacy_manifest(
     for raw_entry in raw_entries:
         if not isinstance(raw_entry, dict) or set(raw_entry) != {
             "base_count",
-            "base_unembedded_count",
             "exemption_id",
             "head_count",
-            "head_unembedded_count",
             "rule",
             "token_id",
             "value_length",
@@ -2546,21 +6422,11 @@ def _load_legacy_manifest(
             raise ReviewError("synthetic secret manifest entry is unknown or duplicate")
         base_count = raw_entry["base_count"]
         head_count = raw_entry["head_count"]
-        base_unembedded_count = raw_entry["base_unembedded_count"]
-        head_unembedded_count = raw_entry["head_unembedded_count"]
         if (
             type(base_count) is not int
             or type(head_count) is not int
-            or type(base_unembedded_count) is not int
-            or type(head_unembedded_count) is not int
             or base_count < 0
             or head_count < 0
-            or base_unembedded_count < 0
-            or head_unembedded_count < 0
-            or head_count > base_count
-            or head_unembedded_count > base_unembedded_count
-            or base_unembedded_count > base_count
-            or head_unembedded_count > head_count
             or raw_entry["rule"] != descriptor.rule
             or raw_entry["value_sha256"] != descriptor.value_sha256
             or raw_entry["value_length"] != descriptor.value_length
@@ -2569,27 +6435,237 @@ def _load_legacy_manifest(
         counts[descriptor] = (
             base_count,
             head_count,
-            base_unembedded_count,
-            head_unembedded_count,
+            0,
+            0,
         )
         evidence.append(dict(raw_entry))
-    if set(counts) != set(accepted):
-        raise ReviewError("synthetic secret manifest does not cover its selection")
-    for exemption in exemptions:
-        if not any(
-            base_count or head_count
-            for descriptor, (
-                base_count,
-                head_count,
-                _base_unembedded_count,
-                _head_unembedded_count,
-            ) in counts.items()
-            if descriptor.exemption_id == exemption.identifier
-        ):
-            raise ReviewError(
-                f"selected synthetic secret exemption is unused: {exemption.identifier}"
+    if manifest_was_sharded:
+        legacy_by_digest = {item.value_sha256: item for item in accepted}
+        for violation in secret_delta["violations"]:
+            descriptor = legacy_by_digest.get(violation["value_sha256"])
+            if (
+                descriptor is None
+                or descriptor in counts
+                or violation["rules"] != [descriptor.rule]
+                or violation["value_length"] != descriptor.value_length
+            ):
+                raise ReviewError(
+                    "sharded synthetic secret manifest violation is inconsistent"
+                )
+            counts[descriptor] = (
+                violation["base_count"],
+                violation["head_count"],
+                0,
+                0,
             )
-    return exemptions, accepted, counts, evidence
+    if secret_delta["status"] != "inconclusive" and set(counts) != set(accepted):
+        raise ReviewError("synthetic secret manifest does not cover its selection")
+    raw_reductions = manifest["secret_reductions"]
+    if (
+        not isinstance(raw_reductions, list)
+        or len(raw_entries) + len(raw_reductions) > MAX_SYNTHETIC_EVIDENCE_ENTRIES
+        or len(raw_reductions) > MAX_SECRET_REDUCTION_CANDIDATES
+        or not isinstance(raw_reduction_values, list)
+        or len(raw_reduction_values) > MAX_SECRET_REDUCTION_CANDIDATES
+    ):
+        raise ReviewError("secret-reduction manifest entries are invalid")
+    private_values: dict[str, bytes] = {}
+    for raw_private in raw_reduction_values:
+        if not isinstance(raw_private, dict) or set(raw_private) != {
+            "value_base64",
+            "value_sha256",
+        }:
+            raise ReviewError("secret-reduction helper-private entry is malformed")
+        digest = raw_private["value_sha256"]
+        encoded = raw_private["value_base64"]
+        if (
+            not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or not isinstance(encoded, str)
+        ):
+            raise ReviewError("secret-reduction helper-private entry is inconsistent")
+        try:
+            encoded_bytes = encoded.encode("ascii")
+            candidate = base64.b64decode(encoded_bytes, validate=True)
+        except (UnicodeEncodeError, binascii.Error, ValueError) as error:
+            raise ReviewError(
+                "secret-reduction helper-private entry is not canonical Base64"
+            ) from error
+        if (
+            base64.b64encode(candidate) != encoded_bytes
+            or not candidate
+            or len(candidate) > MAX_PEM_SECRET_BYTES
+            or hashlib.sha256(candidate).hexdigest() != digest
+            or digest in private_values
+        ):
+            raise ReviewError("secret-reduction helper-private entry is inconsistent")
+        private_values[digest] = candidate
+    reduction_rules = {rule for rule, _pattern in SECRET_PATTERNS} | {
+        "generic-secret-assignment",
+        "pgp-private-key",
+        "private-key",
+    }
+    reduction_values: list[AcceptedSyntheticValue] = []
+    reduction_counts: dict[AcceptedSyntheticValue, tuple[int, int, int, int]] = {}
+    reduction_evidence: list[dict[str, Any]] = []
+    seen_digests: set[str] = set()
+    for raw_entry in raw_reductions:
+        if not isinstance(raw_entry, dict) or set(raw_entry) != {
+            "base_count",
+            "head_count",
+            "rules",
+            "value_length",
+            "value_sha256",
+        }:
+            raise ReviewError("secret-reduction manifest entry is malformed")
+        digest = raw_entry["value_sha256"]
+        candidate = private_values.get(digest)
+        rules = raw_entry["rules"]
+        base_count = raw_entry["base_count"]
+        head_count = raw_entry["head_count"]
+        if (
+            not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or digest in seen_digests
+            or candidate is None
+            or type(raw_entry["value_length"]) is not int
+            or raw_entry["value_length"] != len(candidate)
+            or not isinstance(rules, list)
+            or not rules
+            or rules != sorted(set(rules))
+            or not all(
+                isinstance(rule, str) and rule in reduction_rules for rule in rules
+            )
+            or type(base_count) is not int
+            or type(head_count) is not int
+            or base_count < 0
+            or head_count < 0
+        ):
+            raise ReviewError("secret-reduction manifest entry is inconsistent")
+        seen_digests.add(digest)
+        descriptor = _secret_reduction_descriptor(candidate, set(rules))
+        reduction_values.append(descriptor)
+        reduction_counts[descriptor] = (
+            base_count,
+            head_count,
+            0,
+            0,
+        )
+        reduction_evidence.append(dict(raw_entry))
+    if seen_digests != set(private_values):
+        raise ReviewError(
+            "secret-reduction manifest does not match helper-private values"
+        )
+    if (
+        sum(len(value) for value in private_values.values())
+        > MAX_SECRET_REDUCTION_CANDIDATE_BYTES
+    ):
+        raise ReviewError(
+            "secret-reduction helper-private values exceed the byte limit"
+        )
+    if secret_delta["status"] == "inconclusive" and (
+        raw_entries
+        or raw_reductions
+        or raw_reduction_values
+        or secret_delta["violations"]
+    ):
+        raise ReviewError("inconclusive secret-delta evidence must not claim counts")
+
+    expected_violations: dict[str, tuple[int, int, list[str], int]] = {}
+    for descriptor, (base_count, head_count, _unused_base, _unused_head) in list(
+        counts.items()
+    ) + list(reduction_counts.items()):
+        if head_count <= base_count:
+            continue
+        rules = [descriptor.rule]
+        if descriptor.kind == "secret-reduction":
+            rules = next(
+                entry["rules"]
+                for entry in reduction_evidence
+                if entry["value_sha256"] == descriptor.value_sha256
+            )
+        expected_violations[descriptor.value_sha256] = (
+            base_count,
+            head_count,
+            rules,
+            descriptor.value_length,
+        )
+    raw_violations = secret_delta["violations"]
+    seen_violation_digests: set[str] = set()
+    for raw_violation in raw_violations:
+        if not isinstance(raw_violation, dict) or set(raw_violation) != {
+            "additions",
+            "base_count",
+            "delta",
+            "head_count",
+            "omitted_addition_location_count",
+            "rules",
+            "value_length",
+            "value_sha256",
+        }:
+            raise ReviewError("secret-delta violation evidence is malformed")
+        digest = raw_violation["value_sha256"]
+        if not isinstance(digest, str):
+            raise ReviewError("secret-delta violation evidence is inconsistent")
+        expected_violation = expected_violations.get(digest)
+        if expected_violation is None or digest in seen_violation_digests:
+            raise ReviewError("secret-delta violation evidence is inconsistent")
+        base_count, head_count, rules, value_length = expected_violation
+        additions = raw_violation["additions"]
+        omitted = raw_violation["omitted_addition_location_count"]
+        if (
+            raw_violation["base_count"] != base_count
+            or raw_violation["head_count"] != head_count
+            or raw_violation["delta"] != head_count - base_count
+            or raw_violation["rules"] != rules
+            or raw_violation["value_length"] != value_length
+            or not isinstance(additions, list)
+            or len(additions) > MAX_SECRET_DELTA_ADDITION_LOCATIONS
+            or type(omitted) is not int
+            or omitted < 0
+        ):
+            raise ReviewError("secret-delta violation evidence is inconsistent")
+        for addition in additions:
+            if not isinstance(addition, dict) or set(addition) != {
+                "line",
+                "occurrence_count",
+                "path",
+                "surface",
+            }:
+                raise ReviewError("secret-delta addition evidence is malformed")
+            line = addition["line"]
+            occurrence_count = addition["occurrence_count"]
+            path = addition["path"]
+            if (
+                (line is not None and (type(line) is not int or line <= 0))
+                or type(occurrence_count) is not int
+                or occurrence_count <= 0
+                or not isinstance(path, str)
+                or not path
+                or "\x00" in path
+                or addition["surface"]
+                not in {"binary", "blob", "path", "symlink-target"}
+            ):
+                raise ReviewError("secret-delta addition evidence is inconsistent")
+        seen_violation_digests.add(digest)
+    if seen_violation_digests != set(expected_violations):
+        raise ReviewError("secret-delta evidence does not cover every violation")
+    expected_status = "violations" if expected_violations else "clean"
+    if (
+        secret_delta["status"] != "inconclusive"
+        and secret_delta["status"] != expected_status
+    ):
+        raise ReviewError("secret-delta status is inconsistent")
+    return (
+        exemptions,
+        accepted,
+        counts,
+        evidence,
+        tuple(reduction_values),
+        reduction_counts,
+        dict(secret_delta),
+        reduction_evidence,
+    )
 
 
 def _load_changed_synthetic_evidence(
@@ -2667,53 +6743,75 @@ def _load_changed_synthetic_evidence(
 
 def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     validate_workspace_layout(review)
+    control_state = load_bound_private_cleanup_state(
+        review.container_dir,
+        expected=review.private_cleanup,
+    )
+    if control_state.private_artifacts_removed:
+        raise ReviewError(
+            "helper-private artifacts were removed before external review validation"
+        )
+    current_private_cleanup = _capture_private_cleanup_evidence(
+        review.container_dir,
+        expected_container=review.private_cleanup.container,
+        require_all=True,
+    )
+    if current_private_cleanup != review.private_cleanup:
+        raise ReviewError(
+            "helper-private artifacts do not match preparation identities"
+        )
     workspace_root = review.workspace_root.resolve(strict=True)
     control_dir = workspace_root / ".codex-review"
     catalog = load_catalog()
     validate_authoring_catalog_scanner_contract(catalog)
-    catalog_legacy_path_matcher = _legacy_path_matcher(
-        accepted_legacy_values(catalog, catalog.legacy_exemptions)
-    )
-    control_state = _load_control_artifact_state(
-        container_dir=review.container_dir,
-    )
     _inspect_control_directory(control_dir, expected=control_state.directory)
     control_artifacts = control_state.artifacts
-    _exemptions, legacy_values, legacy_counts, legacy_evidence = _load_legacy_manifest(
+    (
+        _exemptions,
+        legacy_values,
+        legacy_counts,
+        legacy_evidence,
+        reduction_values,
+        reduction_counts,
+        secret_delta_evidence,
+        reduction_evidence,
+    ) = _load_legacy_manifest(
         control_dir=control_dir,
         container_dir=review.container_dir,
         catalog=catalog,
         expected_artifact=control_artifacts[SYNTHETIC_MANIFEST_NAME],
+        expected_private_identity=review.private_cleanup.artifacts[
+            SYNTHETIC_PRIVATE_MANIFEST_NAME
+        ],
+        expected_base_ref=review.base_ref,
+        expected_head_ref=review.head_ref,
     )
     authoring_values = accepted_authoring_values(catalog)
     accepted_values = authoring_values + legacy_values
-    evidence_sensitive_values = _all_catalog_sensitive_values(catalog)
+    evidence_sensitive_values = (
+        _all_catalog_sensitive_values(catalog) + reduction_values
+    )
+    admission_counts_available = secret_delta_evidence["status"] != "inconclusive"
+    scan_values = (
+        accepted_values + reduction_values if admission_counts_available else ()
+    )
+    expected_counts = dict(legacy_counts) if admission_counts_available else {}
+    if admission_counts_available:
+        expected_counts.update(reduction_counts)
     changed_accepted_evidence = _load_changed_synthetic_evidence(
         control_dir=control_dir,
         accepted_values=accepted_values,
         required=(control_dir / SYNTHETIC_MANIFEST_NAME).exists(),
         expected_artifact=control_artifacts[SYNTHETIC_CHANGED_EVIDENCE_NAME],
     )
-    accepted_index = _index_accepted_values(accepted_values)
-    authoring_index = _index_accepted_values(authoring_values)
-    legacy_exact_index = _index_exact_values(legacy_values)
-    event_budget = SecretScanBudget.default()
+    counted_exact_index = _index_exact_values(scan_values)
     occurrence_budget = LegacyOccurrenceBudget.default()
     snapshot_byte_budget = FileScanByteBudget.snapshot()
 
-    sensitive_findings: list[str] = []
-    sensitive_finding_count = 0
     accepted_evidence_counts: Counter[tuple[AcceptedSyntheticValue, str, str, str]] = (
         Counter()
     )
-    frozen_head_legacy_counts: Counter[AcceptedSyntheticValue] = Counter()
-    frozen_head_legacy_unembedded_counts: Counter[AcceptedSyntheticValue] = Counter()
-
-    def record_finding(value: str) -> None:
-        nonlocal sensitive_finding_count
-        sensitive_finding_count += 1
-        if len(sensitive_findings) < 10:
-            sensitive_findings.append(value)
+    frozen_head_counts: Counter[AcceptedSyntheticValue] = Counter()
 
     def record_scan(
         scan: SecretScanResult,
@@ -2721,14 +6819,12 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         surface: str,
         side: str,
         path_bytes: bytes,
-        finding_label: str,
-        diagnostic_surface: str | None = None,
     ) -> None:
-        if scan.blocking_rule:
-            suffix = f"; {diagnostic_surface}" if diagnostic_surface is not None else ""
-            record_finding(f"{finding_label} ({scan.blocking_rule}{suffix})")
         path_sha256 = hashlib.sha256(path_bytes).hexdigest()
-        for accepted, count in scan.accepted_counts.items():
+        for accepted in accepted_values:
+            count = scan.raw_occurrence_counts[accepted]
+            if not count:
+                continue
             _record_bounded_evidence_count(
                 accepted_evidence_counts,
                 (accepted, surface, side, path_sha256),
@@ -2739,51 +6835,80 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                 ),
             )
 
-    changed_paths_file = review.workspace_root / ".codex-review/changed-paths.z"
+    changed_path_digests_file = (
+        review.workspace_root / ".codex-review" / CHANGED_PATH_DIGESTS_NAME
+    )
+    private_changed_paths_file = review.container_dir / PRIVATE_CHANGED_PATHS_NAME
     changed_path_count = 0
-    changed_path_artifact = control_artifacts["changed-paths.z"]
-    with _secure_file_reader(
-        changed_paths_file,
-        label="external review changed paths",
-        max_bytes=MAX_CHANGED_METADATA_BYTES,
-        expected_artifact=changed_path_artifact,
-    ) as (handle, _metadata):
-        for raw_path in _iter_nul_records(
-            handle,
+    changed_path_digest_evidence: list[str] = []
+    changed_path_artifact = control_artifacts[CHANGED_PATH_DIGESTS_NAME]
+    with (
+        _secure_file_reader(
+            changed_path_digests_file,
+            label="external review changed path digests",
+            max_bytes=MAX_CHANGED_METADATA_BYTES,
+            expected_artifact=changed_path_artifact,
+        ) as (digest_handle, _digest_metadata),
+        _secure_file_reader(
+            private_changed_paths_file,
+            label="helper-private frozen changed paths",
+            max_bytes=MAX_CHANGED_METADATA_BYTES,
+            expected_identity=review.private_cleanup.artifacts[
+                PRIVATE_CHANGED_PATHS_NAME
+            ],
+        ) as (path_handle, _path_metadata),
+    ):
+        digest_records = _iter_nul_records(
+            digest_handle,
             byte_limit=MAX_CHANGED_METADATA_BYTES,
             record_limit=MAX_CHANGED_ENTRIES,
-            label="external review changed paths",
+            label="external review changed path digests",
+        )
+        for private_record in _iter_nul_records(
+            path_handle,
+            byte_limit=MAX_CHANGED_METADATA_BYTES,
+            record_limit=MAX_CHANGED_ENTRIES,
+            label="helper-private frozen changed paths",
         ):
             changed_path_count += 1
-            legacy_path_token_id = catalog_legacy_path_matcher.match(raw_path)
-            if legacy_path_token_id is not None:
-                record_finding(
-                    "<redacted changed path> "
-                    "(legacy-synthetic-value; changed-path-name)"
+            if len(private_record) < 2:
+                raise ReviewError(
+                    "helper-private frozen changed path record is malformed"
                 )
+            side_tag = private_record[:1]
+            raw_path = private_record[1:]
+            if side_tag not in {CHANGED_PATH_HEAD_TAG, CHANGED_PATH_BASE_ONLY_TAG}:
+                raise ReviewError(
+                    "helper-private frozen changed path record has an unknown side"
+                )
+            expected_digest = _changed_path_digest(side_tag, raw_path)
+            if next(digest_records, None) != expected_digest:
+                raise ReviewError(
+                    "external review changed path digests do not match "
+                    "helper-private changed paths"
+                )
+            changed_path_digest_evidence.append(expected_digest.decode("ascii"))
+            if side_tag == CHANGED_PATH_BASE_ONLY_TAG:
                 continue
-            path_secret_rule = _value_secret_rule(
-                raw_path,
-                event_budget=event_budget,
+        if next(digest_records, None) is not None:
+            raise ReviewError(
+                "external review changed path digests do not match "
+                "helper-private changed paths"
             )
-            if path_secret_rule:
-                record_finding(
-                    f"<redacted changed path> ({path_secret_rule}; changed-path-name)"
-                )
-                continue
-            changed_path = os.fsdecode(raw_path)
-            path_rule = _sensitive_path_rule(changed_path)
-            if path_rule:
-                path_display = _redact_secret_path(changed_path, "changed path")
-                record_finding(f"{path_display} ({path_rule}; changed-path)")
     if changed_path_count != changed_path_artifact.record_count:
         raise ReviewError(
             "external review changed paths do not match helper-private record state"
         )
+    _reject_raw_values_in_evidence(
+        changed_path_digest_evidence,
+        accepted_values=evidence_sensitive_values,
+        label="frozen changed path digest evidence",
+    )
     changed_blob_findings = (
         review.workspace_root / ".codex-review/changed-blob-findings.z"
     )
     changed_blob_record_count = 0
+    changed_blob_path_digest_evidence: list[str] = []
     changed_blob_artifact = control_artifacts["changed-blob-findings.z"]
     with _secure_file_reader(
         changed_blob_findings,
@@ -2801,33 +6926,38 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         )
         for raw_side in records:
             try:
-                raw_path = next(records)
+                raw_path_digest = next(records)
                 raw_rule = next(records)
                 side = raw_side.decode("ascii")
+                path_digest = raw_path_digest.decode("ascii")
                 rule = raw_rule.decode("ascii")
             except (StopIteration, UnicodeDecodeError) as error:
                 raise ReviewError(
                     "external review changed-blob findings are malformed"
                 ) from error
+            if re.fullmatch(r"[0-9a-f]{64}", path_digest) is None:
+                raise ReviewError("external review changed-blob findings are malformed")
+            changed_blob_path_digest_evidence.append(path_digest)
             changed_blob_record_count += 3
-            legacy_path_token_id = catalog_legacy_path_matcher.match(raw_path)
-            path_display = (
-                "<redacted changed blob path>"
-                if legacy_path_token_id is not None
-                else _redact_secret_path(
-                    os.fsdecode(raw_path),
-                    "changed blob path",
-                )
-            )
-            record_finding(f"{path_display} ({rule}; {side}-blob)")
+            _ = (rule, side)
     if changed_blob_record_count != changed_blob_artifact.record_count:
         raise ReviewError(
             "external review changed-blob findings do not match "
             "helper-private record state"
         )
+    _reject_raw_values_in_evidence(
+        changed_blob_path_digest_evidence,
+        accepted_values=evidence_sensitive_values,
+        label="changed-blob finding path digest evidence",
+    )
     snapshot_entries = 0
     for candidate in review.workspace_root.rglob("*"):
         relative_path = candidate.relative_to(review.workspace_root)
+        if _uses_review_cleanup_quarantine_namespace(relative_path):
+            raise ReviewError(
+                "external review snapshot uses a reserved review cleanup "
+                "quarantine path component"
+            )
         if relative_path.parts and relative_path.parts[0] == ".codex-review":
             continue
         snapshot_entries += 1
@@ -2835,26 +6965,34 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             raise ReviewError("frozen workspace exceeds the review entry-count limit")
         relative = relative_path.as_posix()
         raw_relative = os.fsencode(relative)
-        legacy_path_token_id = catalog_legacy_path_matcher.match(raw_relative)
-        if legacy_path_token_id is not None:
-            record_finding(
-                "<redacted snapshot path> (legacy-synthetic-value; path-name)"
+        try:
+            candidate_status = os.lstat(candidate)
+        except OSError as error:
+            raise ReviewError(
+                f"cannot inspect external review path {relative}"
+            ) from error
+        is_symlink = stat.S_ISLNK(candidate_status.st_mode)
+        is_directory = stat.S_ISDIR(candidate_status.st_mode)
+        materialized_gitlink = False
+        if is_directory:
+            try:
+                with os.scandir(candidate) as entries:
+                    materialized_gitlink = next(entries, None) is None
+            except OSError as error:
+                raise ReviewError(
+                    f"cannot inspect external review directory {relative}"
+                ) from error
+        if is_symlink or not is_directory or materialized_gitlink:
+            path_count_scan = _scan_secret_value(
+                raw_relative,
+                raw_occurrence_values=scan_values,
+                _exact_index=counted_exact_index,
+                _occurrence_budget=occurrence_budget,
+                exact_only=True,
             )
-        path_secret_rule = _value_secret_rule(
-            raw_relative,
-            event_budget=event_budget,
-        )
-        if path_secret_rule:
-            record_finding(f"<redacted snapshot path> ({path_secret_rule}; path-name)")
-        path_display = (
-            "<redacted snapshot path>"
-            if legacy_path_token_id is not None
-            else _redact_secret_path(relative, "snapshot path")
-        )
-        path_rule = _sensitive_path_rule(relative)
-        if path_rule:
-            record_finding(f"{path_display} ({path_rule})")
-        if candidate.is_symlink():
+            frozen_head_counts.update(path_count_scan.raw_occurrence_counts)
+        path_display = relative
+        if is_symlink:
             try:
                 initial_link = os.lstat(candidate)
                 target = os.readlink(candidate)
@@ -2889,17 +7027,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                     f"cannot inspect external review symlink {path_display}{error_code}"
                 ) from error
             if not is_relative_to(resolved_target, workspace_root):
-                raw_resolved_target = os.fsencode(os.fspath(resolved_target))
-                target_display = (
-                    "<redacted symlink target>"
-                    if catalog_legacy_path_matcher.match(raw_target) is not None
-                    or catalog_legacy_path_matcher.match(raw_resolved_target)
-                    is not None
-                    else _redact_secret_path(
-                        os.fspath(resolved_target),
-                        "symlink target",
-                    )
-                )
+                target_display = os.fspath(resolved_target)
                 raise ReviewError(
                     "external review symlink escapes the frozen workspace: "
                     f"{path_display} -> {target_display}"
@@ -2907,113 +7035,70 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             snapshot_byte_budget.consume(len(raw_target))
             target_scan = _scan_secret_value(
                 raw_target,
-                accepted_values=accepted_values,
-                raw_occurrence_values=legacy_values,
-                _accepted_index=accepted_index,
-                _event_budget=event_budget,
-                _exact_index=legacy_exact_index,
+                raw_occurrence_values=scan_values,
+                _exact_index=counted_exact_index,
                 _occurrence_budget=occurrence_budget,
+                exact_only=True,
             )
             record_scan(
                 target_scan,
                 surface="symlink-target",
                 side="head",
                 path_bytes=raw_relative,
-                finding_label=f"{path_display} -> <redacted symlink target>",
-                diagnostic_surface="symlink-target",
             )
-            frozen_head_legacy_counts.update(target_scan.raw_occurrence_counts)
-            frozen_head_legacy_unembedded_counts.update(
-                target_scan.unembedded_occurrence_counts
-            )
+            frozen_head_counts.update(target_scan.raw_occurrence_counts)
             continue
-        if candidate.is_dir():
+        if is_directory:
             continue
         scan = _file_secret_scan(
             candidate,
-            accepted_values=accepted_values,
-            raw_occurrence_values=legacy_values,
-            accepted_index=accepted_index,
-            event_budget=event_budget,
-            exact_index=legacy_exact_index,
+            raw_occurrence_values=scan_values,
+            exact_index=counted_exact_index,
             occurrence_budget=occurrence_budget,
             max_bytes=MAX_SNAPSHOT_BLOB_BYTES,
             byte_budget=snapshot_byte_budget,
             diagnostic_path=path_display,
+            exact_only=True,
         )
         record_scan(
             scan,
             surface="frozen-head",
             side="head",
             path_bytes=raw_relative,
-            finding_label=path_display,
         )
-        frozen_head_legacy_counts.update(scan.raw_occurrence_counts)
-        frozen_head_legacy_unembedded_counts.update(scan.unembedded_occurrence_counts)
+        frozen_head_counts.update(scan.raw_occurrence_counts)
 
     for accepted, (
         _base_count,
         expected_head_count,
-        _base_unembedded_count,
-        expected_head_unembedded_count,
-    ) in legacy_counts.items():
-        actual_head_count = frozen_head_legacy_counts[accepted]
+        _unused_base,
+        _unused_head,
+    ) in expected_counts.items():
+        actual_head_count = frozen_head_counts[accepted]
         if actual_head_count != expected_head_count:
             raise ReviewError(
-                "frozen head legacy synthetic fixture count changed after preparation "
+                "frozen head secret count changed after preparation "
                 f"for {accepted.identifier}: expected={expected_head_count}, "
                 f"actual={actual_head_count}"
             )
-        actual_head_unembedded_count = frozen_head_legacy_unembedded_counts[accepted]
-        if actual_head_unembedded_count != expected_head_unembedded_count:
-            raise ReviewError(
-                "frozen head legacy synthetic fixture unembedded count changed "
-                f"after preparation for {accepted.identifier}: "
-                f"expected={expected_head_unembedded_count}, "
-                f"actual={actual_head_unembedded_count}"
-            )
 
     primary_diff_artifact = control_artifacts["review.diff"]
-    diff_scan = _file_secret_scan(
+    with _secure_file_reader(
         review.diff_file,
-        accepted_values=accepted_values,
-        diff_surface=True,
-        accepted_index=accepted_index,
-        event_budget=event_budget,
+        label="external review diff",
         max_bytes=MAX_DIFF_BYTES,
         expected_artifact=primary_diff_artifact,
-    )
-    record_scan(
-        diff_scan,
-        surface="frozen-diff",
-        side="range",
-        path_bytes=b".codex-review/review.diff",
-        finding_label="review.diff",
-    )
-    prompt_scan = _file_secret_scan(
+    ) as (diff_handle, _diff_metadata):
+        while diff_handle.read(64 * 1024):
+            pass
+    with _secure_file_reader(
         review.prompt_file,
-        accepted_values=authoring_values,
-        accepted_index=authoring_index,
-        event_budget=event_budget,
+        label="external review prompt",
         max_bytes=MAX_REVIEW_PROMPT_BYTES,
         expected_artifact=control_artifacts["review.prompt"],
-    )
-    record_scan(
-        prompt_scan,
-        surface="review-prompt",
-        side="generated",
-        path_bytes=b".codex-review/review.prompt",
-        finding_label="review.prompt",
-    )
-    if sensitive_finding_count:
-        summary = ", ".join(sensitive_findings)
-        if sensitive_finding_count > len(sensitive_findings):
-            summary += f", and {sensitive_finding_count - len(sensitive_findings)} more"
-        raise ReviewError(
-            "sensitive content preflight blocked external review; remove or narrow "
-            f"these paths before egress: {summary}"
-        )
-
+    ) as (prompt_handle, _prompt_metadata):
+        while prompt_handle.read(64 * 1024):
+            pass
     accepted_evidence = list(changed_accepted_evidence)
     accepted_evidence.extend(
         _accepted_evidence_entry(
@@ -3041,28 +7126,50 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             "sha256": primary_diff_artifact.sha256,
             "size": primary_diff_artifact.size,
         },
+        "secret_delta": secret_delta_evidence,
         "synthetic_tokens": {
             "accepted": accepted_evidence,
             "catalog_schema_version": catalog.schema_version,
             "legacy_counts": legacy_evidence,
             "pool_version": catalog.pool_version,
-        }
+            "secret_reductions": reduction_evidence,
+        },
     }
-    _encode_synthetic_evidence_json(evidence)
-    complete_preflight_evidence = {
-        "review_range": f"{review.base_ref}..{review.head_ref}",
-        "scope": "frozen tracked workspace, diff, and review prompt",
-        "status": "sensitive-content and escaping-symlink checks passed",
-    }
-    complete_preflight_evidence.update(evidence)
+    try:
+        _encode_synthetic_evidence_json(evidence)
+    except ReviewError:
+        # The manifest has already validated every catalog and reduction count.
+        # For large evidence, keep the authoritative secret-delta admission
+        # result and omit its optional secondary audit rows. The 64-KiB bound
+        # applies to that secondary section; the complete preflight is
+        # independently bounded by MAX_PREFLIGHT_JSON_BYTES.
+        synthetic_tokens = dict(evidence["synthetic_tokens"])
+        for field in ("accepted", "legacy_counts", "secret_reductions"):
+            synthetic_tokens[field] = []
+        evidence = dict(evidence)
+        evidence["synthetic_tokens"] = synthetic_tokens
+        _encode_synthetic_evidence_json(synthetic_tokens)
+    complete_preflight_evidence = build_preflight_evidence(review, evidence)
     encode_preflight_json(complete_preflight_evidence)
-    _reject_raw_values_in_evidence(
-        complete_preflight_evidence,
-        accepted_values=evidence_sensitive_values,
-        label="synthetic-token preflight evidence",
-    )
     _inspect_control_directory(control_dir, expected=control_state.directory)
     return evidence
+
+
+def build_preflight_evidence(
+    review: ReviewWorkspace,
+    synthetic_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    fixed_evidence = {
+        "review_range": f"{review.base_ref}..{review.head_ref}",
+        "private_artifacts": "removed",
+        "scope": "frozen tracked workspace, diff, and review prompt",
+        "status": "review workspace containment and integrity checks passed",
+    }
+    overlap = set(fixed_evidence).intersection(synthetic_evidence)
+    if overlap:
+        raise ReviewError("synthetic-token evidence shadows fixed preflight fields")
+    fixed_evidence.update(synthetic_evidence)
+    return fixed_evidence
 
 
 def _redact_secret_path(value: str, label: str) -> str:
@@ -3115,15 +7222,21 @@ def _file_secret_scan(
     accepted_values: Iterable[AcceptedSyntheticValue] = (),
     raw_occurrence_values: Iterable[AcceptedSyntheticValue] = (),
     capture_accepted_candidates: bool = False,
+    capture_blocking_candidates: bool = False,
+    capture_reduction_offsets: bool = False,
+    reduced_secret_values: frozenset[bytes] = frozenset(),
     diff_surface: bool = False,
     accepted_index: AcceptedValueIndex | None = None,
     event_budget: SecretScanBudget | None = None,
     exact_index: ExactValueIndex | None = None,
     occurrence_budget: LegacyOccurrenceBudget | None = None,
+    blocking_exact_matcher: LegacyPathMatcher | None = None,
     max_bytes: int | None = None,
     byte_budget: FileScanByteBudget | None = None,
     expected_artifact: ControlArtifactEvidence | None = None,
     diagnostic_path: str | None = None,
+    exact_only: bool = False,
+    _continue_after_blocking: bool = False,
 ) -> SecretScanResult:
     path_display = (
         diagnostic_path
@@ -3144,11 +7257,17 @@ def _file_secret_scan(
             accepted_values=accepted_values,
             raw_occurrence_values=raw_occurrence_values,
             capture_accepted_candidates=capture_accepted_candidates,
+            capture_blocking_candidates=capture_blocking_candidates,
+            capture_reduction_offsets=capture_reduction_offsets,
+            reduced_secret_values=reduced_secret_values,
             diff_surface=diff_surface,
             _accepted_index=accepted_index,
             _event_budget=event_budget,
             _exact_index=exact_index,
             _occurrence_budget=occurrence_budget,
+            _blocking_exact_matcher=blocking_exact_matcher,
+            exact_only=exact_only,
+            _continue_after_blocking=_continue_after_blocking,
         )
 
 
@@ -3239,26 +7358,575 @@ def _bounded_diff_hunk_context_before(
     )
 
 
+def _assignment_proof_retention_start(
+    value: bytes,
+    *,
+    assignment_start: int,
+    diff_surface: bool,
+    prefix_context_complete: bool,
+) -> int:
+    if not diff_surface:
+        return 0 if prefix_context_complete else assignment_start
+    line_start = (
+        max(
+            value.rfind(b"\n", 0, assignment_start),
+            value.rfind(b"\r", 0, assignment_start),
+        )
+        + 1
+    )
+    hunk_context, lower_bound = _bounded_diff_hunk_context_before(
+        value,
+        line_start,
+        prefix_context_complete=prefix_context_complete,
+    )
+    if hunk_context is not None:
+        return hunk_context.retention_start
+    if prefix_context_complete:
+        return 0
+    return lower_bound
+
+
+def _secret_assignment_rhs_is_closed(
+    value: bytes,
+    *,
+    prefix_proof_start: int = 0,
+    assignment_start: int,
+    assignment_end: int,
+    assignment_line_start: int,
+    proof_end: int,
+    diff_surface: bool,
+    prefix_context_complete: bool,
+    suffix_context_complete: bool,
+    event_budget: SecretScanBudget,
+    closure_recorder: Callable[[int], None] | None = None,
+    literal_rhs_recorder: (
+        Callable[[int, int | None, bytes, bytes, int | None], None] | None
+    ) = None,
+    unquoted_rhs_recorder: Callable[[int, int | None], None] | None = None,
+) -> bool:
+    if not (
+        0
+        <= prefix_proof_start
+        <= assignment_start
+        <= assignment_end
+        <= proof_end
+        <= len(value)
+        and 0 <= assignment_line_start <= assignment_start
+    ):
+        raise ReviewError("sensitive scanner produced an invalid RHS proof range")
+    proof_suffix_context_complete = suffix_context_complete and proof_end == len(value)
+    prefix_context_cache = _AssignmentPrefixContextCache(
+        assignment_prefix_end=assignment_end,
+    )
+    cursor = assignment_end
+    inspected_end = cursor
+    wrapper_closers: list[int] = []
+    wrapper_mismatch = False
+    wrapper_token_seen = False
+    wrapper_closed_before_literal = False
+    pending_expression_continuation = False
+    rhs_prefix_is_wrapper_only = True
+    literal_prefixes = (b"br", b"rb", b"fr", b"rf", b"b", b"f", b"r", b"u")
+    continuation_operators = frozenset(b"+-*/%&|^!=<>?:,.`")
+    has_strong_secret_key = (
+        STRONG_SECRET_KEY_NAME_PATTERN.search(value[assignment_start:assignment_end])
+        is not None
+    )
+
+    def unquoted_candidate_is_sensitive(candidate: bytes) -> bool:
+        return (
+            not _is_placeholder_secret(candidate.lower())
+            and not _is_secret_pattern_marker(candidate)
+            and (_looks_like_unquoted_secret(candidate) or has_strong_secret_key)
+        )
+
+    assignment_diff_side: int | None = None
+    if (
+        diff_surface
+        and assignment_line_start < proof_end
+        and value[assignment_line_start] in (0x2B, 0x2D)
+        and not value.startswith(
+            (b"+++ ", b"--- "),
+            assignment_line_start,
+            proof_end,
+        )
+    ):
+        assignment_diff_side = value[assignment_line_start]
+
+    def record_inspected(end: int) -> None:
+        nonlocal inspected_end
+        inspected_end = max(inspected_end, min(end, proof_end))
+
+    def finish(closed: bool) -> bool:
+        proof_bytes = max(0, inspected_end - assignment_end)
+        if not event_budget.consume_prefix_proof(proof_bytes):
+            raise ReviewError("sensitive scanner exceeded one RHS proof window")
+        if closed and closure_recorder is not None:
+            closure_recorder(inspected_end)
+        return closed
+
+    def tail_is_proven(
+        *,
+        rhs_end: int,
+        required_closers: tuple[int, ...],
+    ) -> bool:
+        def record_tail_inspected(byte_count: int) -> None:
+            record_inspected(rhs_end + byte_count)
+
+        try:
+            return _quoted_assignment_may_accept(
+                value,
+                assignment_start=assignment_start,
+                assignment_end=rhs_end,
+                prefix_proof_start=prefix_proof_start,
+                required_closers=required_closers,
+                diff_surface=diff_surface,
+                prefix_context_complete=prefix_context_complete,
+                suffix_context_complete=proof_suffix_context_complete,
+                event_budget=event_budget,
+                maximum_end=proof_end,
+                inspection_recorder=record_tail_inspected,
+                prefix_context_cache=prefix_context_cache,
+            )
+        except _IncompleteSecretScanSuffix:
+            return False
+
+    def external_closer_is_proven(closer_start: int) -> bool:
+        try:
+            return _quoted_assignment_may_accept(
+                value,
+                assignment_start=assignment_start,
+                assignment_end=closer_start,
+                prefix_proof_start=prefix_proof_start,
+                diff_surface=diff_surface,
+                prefix_context_complete=prefix_context_complete,
+                suffix_context_complete=True,
+                event_budget=event_budget,
+                maximum_end=closer_start + 1,
+                matching_external_closer_only=True,
+                prefix_context_cache=prefix_context_cache,
+            )
+        except _IncompleteSecretScanSuffix:
+            return False
+
+    direct_unquoted_match = UNQUOTED_SECRET_ASSIGNMENT.match(
+        value,
+        assignment_start,
+        proof_end,
+    )
+    if direct_unquoted_match is not None:
+        unquoted_end = direct_unquoted_match.end()
+        record_inspected(unquoted_end)
+        return finish(
+            tail_is_proven(
+                rhs_end=unquoted_end,
+                required_closers=(),
+            )
+        )
+
+    def next_line_content_start(position: int) -> int:
+        nonlocal inspected_end
+        while position < proof_end:
+            record_prefix = value[position]
+            if not diff_surface or record_prefix not in (0x20, 0x2B, 0x2D):
+                break
+            if (
+                assignment_diff_side is not None
+                and record_prefix in (0x2B, 0x2D)
+                and record_prefix != assignment_diff_side
+            ):
+                boundaries = tuple(
+                    boundary
+                    for boundary in (
+                        value.find(b"\n", position, proof_end),
+                        value.find(b"\r", position, proof_end),
+                    )
+                    if boundary >= 0
+                )
+                if not boundaries:
+                    record_inspected(proof_end)
+                    return proof_end
+                boundary = min(boundaries)
+                position = boundary + (
+                    2 if value.startswith(b"\r\n", boundary, proof_end) else 1
+                )
+                record_inspected(position)
+                continue
+            position += 1
+            break
+        while position < proof_end and value[position] in (0x09, 0x20):
+            position += 1
+        record_inspected(position)
+        return position
+
+    while cursor < proof_end:
+        record_inspected(cursor + 1)
+        byte = value[cursor]
+        if rhs_prefix_is_wrapper_only:
+            placeholder_match = PLACEHOLDER_SECRET_PATTERN.match(
+                value,
+                cursor,
+                proof_end,
+            )
+            if placeholder_match is not None:
+                placeholder_end = placeholder_match.end()
+                if placeholder_end == proof_end or value[placeholder_end] in (
+                    0x09,
+                    0x0A,
+                    0x0D,
+                    0x20,
+                    0x29,
+                    0x2C,
+                    0x3B,
+                    0x5D,
+                    0x7D,
+                ):
+                    cursor = placeholder_end
+                    record_inspected(cursor)
+                    if tail_is_proven(
+                        rhs_end=placeholder_end,
+                        required_closers=tuple(reversed(wrapper_closers)),
+                    ):
+                        return finish(True)
+                    rhs_prefix_is_wrapper_only = False
+                    continue
+        lowered_prefix = value[cursor : min(cursor + 3, proof_end)].lower()
+        literal_prefix_length = 0
+        quote = b""
+        if byte in (0x22, 0x27):
+            quote = value[cursor : cursor + 1]
+        elif byte == 0x60:
+            continuation_end = cursor + 1
+            while continuation_end < proof_end and value[continuation_end] in (
+                0x09,
+                0x20,
+            ):
+                continuation_end += 1
+            record_inspected(continuation_end)
+            if continuation_end >= proof_end or value[continuation_end] not in (
+                0x0A,
+                0x0D,
+            ):
+                quote = b"`"
+        else:
+            for prefix in literal_prefixes:
+                if lowered_prefix.startswith(prefix) and value[
+                    cursor + len(prefix) : min(cursor + len(prefix) + 1, proof_end)
+                ] in (b"'", b'"'):
+                    literal_prefix_length = len(prefix)
+                    quote = value[
+                        cursor + literal_prefix_length : cursor
+                        + literal_prefix_length
+                        + 1
+                    ]
+                    break
+        if quote:
+            literal_prefix_is_valid = not wrapper_closed_before_literal and (
+                not wrapper_token_seen or bool(wrapper_closers)
+            )
+            delimiter_start = cursor + literal_prefix_length
+            delimiter = quote * (
+                3
+                if quote != b"`"
+                and value.startswith(quote * 3, delimiter_start, proof_end)
+                else 1
+            )
+            content_start = delimiter_start + len(delimiter)
+            closing_start = _find_unescaped_delimiter(
+                value,
+                delimiter=delimiter,
+                start=content_start,
+                diff_side=assignment_diff_side,
+                maximum_end=proof_end,
+            )
+            if closing_start is None:
+                record_inspected(proof_end)
+                if literal_rhs_recorder is not None:
+                    literal_rhs_recorder(
+                        content_start,
+                        None,
+                        delimiter,
+                        value[cursor:delimiter_start],
+                        assignment_diff_side,
+                    )
+                return finish(False)
+            closing_end = closing_start + len(delimiter)
+            record_inspected(closing_end)
+            if not rhs_prefix_is_wrapper_only:
+                literal_prefix_is_valid = False
+            tail_closed = tail_is_proven(
+                rhs_end=closing_end,
+                required_closers=tuple(reversed(wrapper_closers)),
+            )
+            literal_candidate = value[content_start:closing_start]
+            literal_is_sensitive = (
+                closing_start - content_start >= 16
+                and not _is_placeholder_secret(literal_candidate.lower())
+                and not _is_secret_pattern_marker(literal_candidate)
+                and (
+                    rhs_prefix_is_wrapper_only
+                    or unquoted_candidate_is_sensitive(literal_candidate)
+                )
+            )
+            literal_is_closed = (
+                tail_closed and literal_prefix_is_valid and not wrapper_mismatch
+            )
+            if literal_rhs_recorder is not None and (
+                literal_is_closed or literal_is_sensitive
+            ):
+                literal_rhs_recorder(
+                    content_start,
+                    closing_start,
+                    delimiter,
+                    value[cursor:delimiter_start],
+                    assignment_diff_side,
+                )
+            if literal_is_closed:
+                return finish(True)
+            if literal_is_sensitive:
+                return finish(False)
+            rhs_prefix_is_wrapper_only = False
+            cursor = closing_end
+            continue
+        if byte in (0x09, 0x20):
+            cursor += 1
+            continue
+        if byte in (0x28, 0x5B, 0x7B):
+            wrapper_token_seen = True
+            wrapper_closers.append({0x28: 0x29, 0x5B: 0x5D, 0x7B: 0x7D}[byte])
+            pending_expression_continuation = False
+            cursor += 1
+            continue
+        if byte in (0x29, 0x5D, 0x7D):
+            if (
+                not wrapper_closers
+                and not wrapper_mismatch
+                and not rhs_prefix_is_wrapper_only
+                and external_closer_is_proven(cursor)
+            ):
+                return finish(True)
+            wrapper_token_seen = True
+            wrapper_closed_before_literal = True
+            if wrapper_closers:
+                if byte == wrapper_closers[-1]:
+                    wrapper_closers.pop()
+                else:
+                    wrapper_mismatch = True
+            else:
+                wrapper_mismatch = True
+            pending_expression_continuation = False
+            cursor += 1
+            continue
+        if value.startswith(b"/*", cursor, proof_end):
+            comment_end = value.find(b"*/", cursor + 2, proof_end)
+            if comment_end < 0:
+                record_inspected(proof_end)
+                return finish(False)
+            cursor = comment_end + 2
+            record_inspected(cursor)
+            continue
+        if value.startswith(b"//", cursor, proof_end) or byte == 0x23:
+            boundaries = tuple(
+                boundary
+                for boundary in (
+                    value.find(b"\n", cursor, proof_end),
+                    value.find(b"\r", cursor, proof_end),
+                )
+                if boundary >= 0
+            )
+            if not boundaries:
+                record_inspected(proof_end)
+                return finish(False)
+            cursor = min(boundaries)
+            record_inspected(cursor)
+            continue
+        if byte in (0x0A, 0x0D):
+            previous = cursor - 1
+            while previous >= assignment_end and value[previous] in (0x09, 0x20):
+                previous -= 1
+            next_cursor = cursor + (
+                2 if value.startswith(b"\r\n", cursor, proof_end) else 1
+            )
+            logical_next = next_line_content_start(next_cursor)
+            previous_continues = previous >= assignment_end and (
+                value[previous] == 0x5C or value[previous] in continuation_operators
+            )
+            next_continues = (
+                logical_next < proof_end
+                and value[logical_next] in continuation_operators
+            )
+            line_continues = (
+                bool(wrapper_closers)
+                or wrapper_mismatch
+                or pending_expression_continuation
+                or previous_continues
+                or next_continues
+            )
+            if not line_continues:
+                record_inspected(next_cursor)
+                return finish(
+                    tail_is_proven(
+                        rhs_end=cursor,
+                        required_closers=(),
+                    )
+                )
+            pending_expression_continuation = (
+                pending_expression_continuation or previous_continues or next_continues
+            )
+            cursor = logical_next
+            continue
+        if byte == 0x3B and not wrapper_closers and not wrapper_mismatch:
+            return finish(
+                tail_is_proven(
+                    rhs_end=cursor,
+                    required_closers=(),
+                )
+            )
+        if (
+            byte == 0x2C
+            and not wrapper_mismatch
+            and tail_is_proven(
+                rhs_end=cursor,
+                required_closers=tuple(reversed(wrapper_closers)),
+            )
+        ):
+            return finish(True)
+        oversized_unquoted = OVERSIZED_UNQUOTED_SECRET_VALUE.match(
+            value,
+            cursor,
+            proof_end,
+        )
+        if oversized_unquoted is not None:
+            record_inspected(oversized_unquoted.end())
+            if unquoted_rhs_recorder is not None:
+                unquoted_rhs_recorder(cursor, None)
+            return finish(False)
+        unquoted_match = UNQUOTED_SECRET_VALUE.match(
+            value,
+            cursor,
+            proof_end,
+        )
+        if unquoted_match is not None:
+            candidate_start, candidate_end = unquoted_match.span(1)
+            candidate = value[candidate_start:candidate_end]
+            record_inspected(candidate_end)
+            candidate_is_sensitive = unquoted_candidate_is_sensitive(candidate)
+            candidate_is_closed = (
+                rhs_prefix_is_wrapper_only
+                and wrapper_token_seen
+                and not wrapper_closed_before_literal
+                and not wrapper_mismatch
+                and tail_is_proven(
+                    rhs_end=candidate_end,
+                    required_closers=tuple(reversed(wrapper_closers)),
+                )
+            )
+            if candidate_is_closed or candidate_is_sensitive:
+                if unquoted_rhs_recorder is not None:
+                    unquoted_rhs_recorder(candidate_start, candidate_end)
+                return finish(candidate_is_closed)
+            rhs_prefix_is_wrapper_only = False
+            cursor = candidate_end
+            continue
+        rhs_prefix_is_wrapper_only = False
+        pending_expression_continuation = byte in continuation_operators
+        cursor += 1
+
+    record_inspected(proof_end)
+    return finish(False)
+
+
+def _wrapper_ranges_are_balanced(
+    value: bytes,
+    *,
+    prefix_start: int,
+    prefix_end: int,
+    suffix_start: int,
+    suffix_end: int,
+    require_complete: bool = True,
+) -> bool:
+    if not (
+        0 <= prefix_start <= prefix_end <= suffix_start <= suffix_end <= len(value)
+    ):
+        raise ReviewError("sensitive scanner produced invalid wrapper proof ranges")
+    expected_closers: list[int] = []
+    closer_by_opener = {
+        0x28: 0x29,
+        0x5B: 0x5D,
+        0x7B: 0x7D,
+    }
+    trivia = frozenset((0x09, 0x0A, 0x0D, 0x20))
+    for index in range(prefix_start, prefix_end):
+        byte = value[index]
+        if byte in trivia:
+            continue
+        closer = closer_by_opener.get(byte)
+        if closer is None:
+            return False
+        expected_closers.append(closer)
+    for index in range(suffix_start, suffix_end):
+        byte = value[index]
+        if byte in trivia:
+            continue
+        if not expected_closers or byte != expected_closers.pop():
+            return False
+    return not expected_closers or not require_complete
+
+
 def _quoted_assignment_may_accept(
     value: bytes,
-    match: re.Match[bytes],
     *,
+    prefix_proof_start: int = 0,
+    assignment_start: int,
+    assignment_end: int,
+    required_closers: tuple[int, ...] = (),
     diff_surface: bool = False,
     prefix_context_complete: bool = True,
     suffix_context_complete: bool = True,
     event_budget: SecretScanBudget,
+    maximum_end: int | None = None,
+    inspection_recorder: Callable[[int], None] | None = None,
+    matching_external_closer_only: bool = False,
+    prefix_context_cache: _AssignmentPrefixContextCache | None = None,
 ) -> bool:
-    cursor = match.end()
+    logical_end = len(value) if maximum_end is None else min(len(value), maximum_end)
+    if not (
+        0 <= prefix_proof_start <= assignment_start <= assignment_end <= logical_end
+    ):
+        raise ReviewError(
+            "sensitive scanner produced an invalid assignment proof range"
+        )
+    if prefix_context_cache is not None and not (
+        assignment_start <= prefix_context_cache.assignment_prefix_end <= assignment_end
+    ):
+        raise ReviewError(
+            "sensitive scanner produced an invalid cached assignment prefix"
+        )
+    suffix_context_complete = suffix_context_complete and logical_end == len(value)
+    cursor = assignment_end
     inspected = 0
     crossed_line_boundary = False
     skipped_diff_bytes = 0
+    diff_source_proof_bytes = 0
     match_line_start = (
         max(
-            value.rfind(b"\n", 0, match.start()),
-            value.rfind(b"\r", 0, match.start()),
+            value.rfind(b"\n", 0, assignment_start),
+            value.rfind(b"\r", 0, assignment_start),
         )
         + 1
     )
+    proof_retention_start = _assignment_proof_retention_start(
+        value,
+        assignment_start=assignment_start,
+        diff_surface=diff_surface,
+        prefix_context_complete=prefix_context_complete,
+    )
+
+    def logical_startswith(prefix: bytes | tuple[bytes, ...], start: int) -> bool:
+        return value.startswith(prefix, start, logical_end)
+
+    def logical_find(needle: bytes, start: int) -> int:
+        return value.find(needle, start, logical_end)
 
     def triple_prefix_is_hunk_content() -> bool:
         hunk_context, lower_bound = _bounded_diff_hunk_context_before(
@@ -3266,22 +7934,23 @@ def _quoted_assignment_may_accept(
             match_line_start,
             prefix_context_complete=prefix_context_complete,
         )
-        if not event_budget.consume_prefix_proof(
-            match_line_start - lower_bound
-        ):
+        if not event_budget.consume_prefix_proof(match_line_start - lower_bound):
             return False
         return hunk_context is not None
 
     match_diff_side: int | None = None
     if (
         diff_surface
-        and match_line_start < len(value)
+        and match_line_start < logical_end
         and value[match_line_start] in (0x2B, 0x2D)
     ):
-        if value.startswith(
-            (b"+++ ", b"--- "),
-            match_line_start,
-        ) and not triple_prefix_is_hunk_content():
+        if (
+            logical_startswith(
+                (b"+++ ", b"--- "),
+                match_line_start,
+            )
+            and not triple_prefix_is_hunk_content()
+        ):
             return False
         match_diff_side = value[match_line_start]
 
@@ -3289,75 +7958,81 @@ def _quoted_assignment_may_accept(
         nonlocal crossed_line_boundary, cursor, inspected
         if inspected + count > MAX_SECRET_ASSIGNMENT_TRAILING_BYTES:
             return False
+        if cursor + count > logical_end:
+            if not suffix_context_complete:
+                raise _IncompleteSecretScanSuffix(proof_retention_start)
+            return False
         if (
             b"\n" in value[cursor : cursor + count]
             or b"\r" in value[cursor : cursor + count]
         ):
             crossed_line_boundary = True
         inspected += count
+        if inspection_recorder is not None:
+            inspection_recorder(inspected)
         cursor += count
         return True
 
     def trim_space() -> bool:
-        while cursor < len(value) and value[cursor] in (0x20, 0x09):
+        while cursor < logical_end and value[cursor] in (0x20, 0x09):
             if not advance(1):
                 return False
         return True
 
     def trim_continuation_trivia() -> bool:
-        while cursor < len(value):
+        while cursor < logical_end:
             if not trim_space():
                 return False
-            if value.startswith(b"\r\n", cursor):
+            if logical_startswith(b"\r\n", cursor):
                 if not advance(2):
                     return False
-            elif value.startswith((b"\r", b"\n"), cursor):
+            elif logical_startswith((b"\r", b"\n"), cursor):
                 if not advance(1):
                     return False
-            elif value.startswith(b"#", cursor):
+            elif logical_startswith(b"#", cursor):
                 if not advance(1):
                     return False
-                while cursor < len(value) and value[cursor] not in (0x0A, 0x0D):
+                while cursor < logical_end and value[cursor] not in (0x0A, 0x0D):
                     if not advance(1):
                         return False
-            elif value.startswith(b"/*", cursor):
+            elif logical_startswith(b"/*", cursor):
                 if not advance(2):
                     return False
-                while cursor < len(value) and not value.startswith(b"*/", cursor):
+                while cursor < logical_end and not logical_startswith(b"*/", cursor):
                     if not advance(1):
                         return False
-                if cursor < len(value) and not advance(2):
+                if cursor < logical_end and not advance(2):
                     return False
             else:
                 return True
         return True
 
     def starts_trivia() -> bool:
-        return value.startswith((b"\r", b"\n", b"#", b"/*"), cursor)
+        return logical_startswith((b"\r", b"\n", b"#", b"/*"), cursor)
 
     def starts_literal() -> bool:
-        return _starts_quoted_literal(value[cursor : cursor + 16])
+        return _starts_quoted_literal(value[cursor : min(cursor + 16, logical_end)])
 
     def skip_opposite_diff_records() -> tuple[bool, bool]:
         nonlocal crossed_line_boundary, cursor, skipped_diff_bytes
         skipped = False
         while (
             match_diff_side is not None
-            and cursor < len(value)
+            and cursor < logical_end
             and cursor > 0
             and value[cursor - 1] == 0x0A
             and value[cursor] in (0x2B, 0x2D)
             and value[cursor] != match_diff_side
         ):
-            line_end = value.find(b"\n", cursor)
-            record_end = len(value) if line_end < 0 else line_end + 1
+            line_end = logical_find(b"\n", cursor)
+            record_end = logical_end if line_end < 0 else line_end + 1
             record_size = record_end - cursor
             if skipped_diff_bytes + record_size > MAX_SECRET_PREFIX_PROOF_BYTES:
                 return False, skipped
             if not event_budget.consume_prefix_proof(record_size):
                 return False, skipped
-            if record_end == len(value) and not suffix_context_complete:
-                raise _IncompleteSecretScanSuffix
+            if record_end == logical_end and not suffix_context_complete:
+                raise _IncompleteSecretScanSuffix(proof_retention_start)
             skipped_diff_bytes += record_size
             cursor = record_end
             crossed_line_boundary = True
@@ -3372,7 +8047,7 @@ def _quoted_assignment_may_accept(
             return False
         if (
             diff_surface
-            and cursor < len(value)
+            and cursor < logical_end
             and value[cursor] in (0x2B, 0x2D)
             and cursor > 0
             and value[cursor - 1] == 0x0A
@@ -3392,61 +8067,13 @@ def _quoted_assignment_may_accept(
         )
         return any(
             inspected + len(marker) <= MAX_SECRET_ASSIGNMENT_TRAILING_BYTES
-            and value.startswith(marker, cursor)
+            and logical_startswith(marker, cursor)
             for marker in markers
         )
 
-    def source_literal_quote() -> int | None:
-        start = match.start()
-        lookbehind_start = max(0, start - MAX_SECRET_ASSIGNMENT_TRAILING_BYTES)
-        last_line_break = max(
-            value.rfind(b"\n", lookbehind_start, start),
-            value.rfind(b"\r", lookbehind_start, start),
-        )
-        line_start = max(lookbehind_start, last_line_break + 1)
-        prefix_was_truncated = lookbehind_start > 0 and last_line_break < 0
-        prefix = value[line_start:start]
-        lowered = prefix.lower()
-        for marker in (
-            b"br'",
-            b"rb'",
-            b"fr'",
-            b"rf'",
-            b'br"',
-            b'rb"',
-            b'fr"',
-            b'rf"',
-            b"b'",
-            b"f'",
-            b"r'",
-            b"u'",
-            b'b"',
-            b'f"',
-            b'r"',
-            b'u"',
-            b"'",
-            b'"',
-        ):
-            marker_index = lowered.rfind(marker)
-            if marker_index < 0:
-                continue
-            if len(marker) == 1 and marker_index == 0 and prefix_was_truncated:
-                continue
-            if marker_index > 0 and (
-                lowered[marker_index - 1 : marker_index].isalnum()
-                or lowered[marker_index - 1] == 0x5F
-            ):
-                continue
-            quote = marker[-1]
-            content_prefix = prefix[marker_index + len(marker) :]
-            if bytes((quote,)) in content_prefix or b"\\" in content_prefix:
-                continue
-            return quote
-        return None
-
     def starts_named_assignment() -> bool:
         limit = min(
-            len(value),
+            logical_end,
             cursor + MAX_SECRET_ASSIGNMENT_TRAILING_BYTES - inspected + 1,
         )
         index = cursor
@@ -3522,13 +8149,13 @@ def _quoted_assignment_may_accept(
             index = skip_space(index)
         if index >= limit or value[index] not in (0x3A, 0x3D):
             return False
-        if index + 1 < len(value) and value[index + 1] in (0x3A, 0x3D, 0x3E):
+        if index + 1 < limit and value[index + 1] in (0x3A, 0x3D, 0x3E):
             return False
         return True
 
     def starts_python_call_statement() -> bool:
         limit = min(
-            len(value),
+            logical_end,
             cursor + MAX_SECRET_ASSIGNMENT_TRAILING_BYTES - inspected + 1,
         )
         index = cursor
@@ -3598,7 +8225,7 @@ def _quoted_assignment_may_accept(
             return False
 
         limit = min(
-            len(value),
+            logical_end,
             cursor + MAX_SECRET_ASSIGNMENT_TRAILING_BYTES - inspected + 1,
         )
         index = cursor
@@ -3629,7 +8256,7 @@ def _quoted_assignment_may_accept(
             end = position + len(keyword)
             if (
                 end >= limit
-                or not value.startswith(keyword, position)
+                or not value.startswith(keyword, position, limit)
                 or value[end] not in (0x20, 0x09)
             ):
                 return None
@@ -3638,7 +8265,7 @@ def _quoted_assignment_may_accept(
         async_end = consume_keyword(index, b"async")
         if async_end is not None:
             index = async_end
-        declaration = b"def" if value.startswith(b"def", index) else b"class"
+        declaration = b"def" if value.startswith(b"def", index, limit) else b"class"
         if async_end is not None and declaration != b"def":
             return False
         declaration_end = consume_keyword(index, declaration)
@@ -3652,28 +8279,34 @@ def _quoted_assignment_may_accept(
             return index < limit and value[index] == 0x28
         return index < limit and value[index] in (0x28, 0x3A)
 
-    def diff_source_prefix() -> bytes | None:
+    def diff_source_prefix(*, end: int | None = None) -> bytes | None:
+        nonlocal diff_source_proof_bytes
         hunk_context, lower_bound = _bounded_diff_hunk_context_before(
             value,
             match_line_start,
             prefix_context_complete=prefix_context_complete,
         )
-        if (
-            hunk_context is None
-            and lower_bound == 0
-            and prefix_context_complete
-        ):
+        if hunk_context is None and lower_bound == 0 and prefix_context_complete:
             hunk_start = 0
         elif hunk_context is None:
             return None
         else:
             hunk_start = hunk_context.source_start
-        raw_prefix = value[hunk_start:cursor]
-        source_proof_bytes = len(raw_prefix) - skipped_diff_bytes
-        if source_proof_bytes < 0 or not event_budget.consume_prefix_proof(
-            source_proof_bytes
+        prefix_end = cursor if end is None else end
+        skipped_bytes = skipped_diff_bytes if end is None else 0
+        source_proof_bytes = prefix_end - hunk_start - skipped_bytes
+        if not 0 <= source_proof_bytes <= MAX_SECRET_PREFIX_PROOF_BYTES:
+            return None
+        newly_proved_bytes = source_proof_bytes - diff_source_proof_bytes
+        if newly_proved_bytes > 0 and not event_budget.consume_prefix_proof(
+            newly_proved_bytes
         ):
             return None
+        diff_source_proof_bytes = max(
+            diff_source_proof_bytes,
+            source_proof_bytes,
+        )
+        raw_prefix = value[hunk_start:prefix_end]
         source_side = match_diff_side if match_diff_side is not None else 0x2B
         source_lines: list[bytes] = []
         for line in raw_prefix.splitlines(keepends=True):
@@ -3689,6 +8322,195 @@ def _quoted_assignment_may_accept(
                 return None
         return b"".join(source_lines)
 
+    def wrapper_context_before_assignment() -> (
+        tuple[tuple[int, ...], bytes | None, tuple[int, ...]] | None
+    ):
+        if diff_surface:
+            prefix = diff_source_prefix(end=assignment_start)
+            if prefix is None:
+                return None
+        else:
+            if not prefix_context_complete:
+                return None
+            if not event_budget.consume_prefix_proof(
+                assignment_start - prefix_proof_start
+            ):
+                return None
+            prefix = value[prefix_proof_start:assignment_start]
+
+        closer_by_opener = {
+            0x28: 0x29,
+            0x5B: 0x5D,
+            0x7B: 0x7D,
+        }
+        closers: list[int] = []
+        mapping_key_end = (
+            prefix_context_cache.assignment_prefix_end
+            if prefix_context_cache is not None
+            else assignment_end
+        )
+
+        def quote_starts_mapping_key(
+            prefix_value: bytes,
+            quote_start: int,
+            delimiter: bytes,
+        ) -> bool:
+            backslash_start = quote_start
+            while backslash_start > 0 and prefix_value[backslash_start - 1] == 0x5C:
+                backslash_start -= 1
+            if (quote_start - backslash_start) % 2 != 0:
+                return False
+            key_quote_end = _find_unescaped_delimiter(
+                value,
+                delimiter=delimiter,
+                start=assignment_start,
+                diff_side=match_diff_side,
+                maximum_end=mapping_key_end,
+            )
+            if key_quote_end is None or key_quote_end >= mapping_key_end:
+                return False
+            key_separator = key_quote_end + len(delimiter)
+            while key_separator < mapping_key_end and value[
+                key_separator : key_separator + 1
+            ] in (b" ", b"\t"):
+                key_separator += 1
+            return (
+                key_separator < mapping_key_end
+                and value[key_separator : key_separator + 1] == b":"
+            )
+
+        def logical_wrapper_closers(prefix_value: bytes) -> tuple[int, ...] | None:
+            logical_closers: list[int] = []
+            logical_index = 0
+            while logical_index < len(prefix_value):
+                if prefix_value.startswith(b"/*", logical_index):
+                    comment_end = prefix_value.find(b"*/", logical_index + 2)
+                    if comment_end < 0:
+                        return None
+                    logical_index = comment_end + 2
+                    continue
+                if (
+                    prefix_value.startswith(b"//", logical_index)
+                    or prefix_value[logical_index] == 0x23
+                ):
+                    line_end_candidates = tuple(
+                        boundary
+                        for boundary in (
+                            prefix_value.find(b"\n", logical_index),
+                            prefix_value.find(b"\r", logical_index),
+                        )
+                        if boundary >= 0
+                    )
+                    if not line_end_candidates:
+                        return None
+                    logical_index = min(line_end_candidates)
+                    continue
+                if prefix_value[logical_index] in (0x22, 0x27, 0x60):
+                    quote = prefix_value[logical_index : logical_index + 1]
+                    delimiter = quote * (
+                        3
+                        if quote != b"`"
+                        and prefix_value.startswith(quote * 3, logical_index)
+                        else 1
+                    )
+                    closing_start = _find_unescaped_delimiter(
+                        prefix_value,
+                        delimiter=delimiter,
+                        start=logical_index + len(delimiter),
+                    )
+                    if closing_start is None:
+                        if quote_starts_mapping_key(
+                            prefix_value,
+                            logical_index,
+                            delimiter,
+                        ):
+                            logical_index = len(prefix_value)
+                            continue
+                        if logical_index + len(delimiter) == len(prefix_value):
+                            return tuple(logical_closers)
+                        return None
+                    logical_index = closing_start + len(delimiter)
+                    continue
+                closer = closer_by_opener.get(prefix_value[logical_index])
+                if closer is not None:
+                    logical_closers.append(closer)
+                    logical_index += 1
+                    continue
+                if prefix_value[logical_index] in (0x29, 0x5D, 0x7D):
+                    if (
+                        not logical_closers
+                        or prefix_value[logical_index] != logical_closers.pop()
+                    ):
+                        return None
+                next_marker = WRAPPER_CONTEXT_MARKER.search(
+                    prefix_value,
+                    logical_index + 1,
+                )
+                logical_index = (
+                    next_marker.start()
+                    if next_marker is not None
+                    else len(prefix_value)
+                )
+            return tuple(logical_closers)
+
+        index = 0
+        while index < len(prefix):
+            if prefix.startswith(b"/*", index):
+                comment_end = prefix.find(b"*/", index + 2)
+                if comment_end < 0:
+                    return None
+                index = comment_end + 2
+                continue
+            if prefix.startswith(b"//", index) or prefix[index] == 0x23:
+                line_end_candidates = tuple(
+                    boundary
+                    for boundary in (
+                        prefix.find(b"\n", index),
+                        prefix.find(b"\r", index),
+                    )
+                    if boundary >= 0
+                )
+                if not line_end_candidates:
+                    return None
+                index = min(line_end_candidates)
+                continue
+            if prefix[index] in (0x22, 0x27, 0x60):
+                quote = prefix[index : index + 1]
+                delimiter = quote * (
+                    3 if quote != b"`" and prefix.startswith(quote * 3, index) else 1
+                )
+                closing_start = _find_unescaped_delimiter(
+                    prefix,
+                    delimiter=delimiter,
+                    start=index + len(delimiter),
+                )
+                if closing_start is None:
+                    if quote_starts_mapping_key(prefix, index, delimiter):
+                        index = len(prefix)
+                        continue
+                    if len(prefix) - index >= MAX_SECRET_ASSIGNMENT_TRAILING_BYTES:
+                        return None
+                    content_prefix = prefix[index + len(delimiter) :]
+                    if b"\\" in content_prefix:
+                        return None
+                    logical_closers = logical_wrapper_closers(content_prefix)
+                    if logical_closers is None:
+                        return None
+                    return tuple(closers), delimiter, logical_closers
+                index = closing_start + len(delimiter)
+                continue
+            closer = closer_by_opener.get(prefix[index])
+            if closer is not None:
+                closers.append(closer)
+                index += 1
+                continue
+            if prefix[index] in (0x29, 0x5D, 0x7D):
+                if not closers or prefix[index] != closers.pop():
+                    return None
+            next_marker = WRAPPER_CONTEXT_MARKER.search(prefix, index + 1)
+            index = next_marker.start() if next_marker is not None else len(prefix)
+        return tuple(closers), None, ()
+
     def python_prefix_is_complete() -> bool:
         if diff_surface:
             prefix = diff_source_prefix()
@@ -3697,9 +8519,9 @@ def _quoted_assignment_may_accept(
         else:
             if not prefix_context_complete:
                 return False
-            prefix = value[:cursor]
-            if not event_budget.consume_prefix_proof(len(prefix)):
+            if not event_budget.consume_prefix_proof(cursor - prefix_proof_start):
                 return False
+            prefix = value[prefix_proof_start:cursor]
         try:
             compile(
                 prefix,
@@ -3714,31 +8536,301 @@ def _quoted_assignment_may_accept(
 
     if not trim_space():
         return False
+    source_wrapper_closers: list[int] = []
+    outer_delimiter: bytes | None = None
+    outer_quote_pending = False
     source_literal_wrapper = False
-    outer_quote = source_literal_quote()
-    if outer_quote is not None:
-        if cursor < len(value) and value[cursor] == outer_quote:
-            if not advance(1) or not trim_space():
-                return False
-            source_literal_wrapper = True
     crossed_boundary = False
+    required_closer_index = 0
+    external_wrapper_closers: list[int] | None = None
+    external_wrapper_context_loaded = False
 
     def starts_proven_python_declaration() -> bool:
         return starts_top_level_python_declaration() and python_prefix_is_complete()
 
-    def at_proven_end() -> bool:
-        if cursor != len(value):
+    def load_external_wrapper_context() -> bool:
+        nonlocal external_wrapper_closers, external_wrapper_context_loaded
+        nonlocal outer_delimiter, outer_quote_pending, source_wrapper_closers
+        if external_wrapper_context_loaded:
+            return True
+        if prefix_context_cache is not None and prefix_context_cache.loaded:
+            external_wrapper_context = prefix_context_cache.context
+        else:
+            external_wrapper_context = wrapper_context_before_assignment()
+            if prefix_context_cache is not None:
+                prefix_context_cache.context = external_wrapper_context
+                prefix_context_cache.loaded = True
+        if external_wrapper_context is None:
             return False
-        if diff_surface and crossed_line_boundary and not suffix_context_complete:
-            raise _IncompleteSecretScanSuffix
+        physical_closers, outer_delimiter, logical_closers = external_wrapper_context
+        external_wrapper_closers = list(physical_closers)
+        source_wrapper_closers = list(logical_closers)
+        outer_quote_pending = outer_delimiter is not None
+        external_wrapper_context_loaded = True
         return True
 
-    while True:
-        while value.startswith((b")", b"]", b"}"), cursor):
+    if matching_external_closer_only:
+        if (
+            required_closers
+            or cursor >= logical_end
+            or value[cursor] not in (0x29, 0x5D, 0x7D)
+            or not load_external_wrapper_context()
+        ):
+            return False
+        if source_wrapper_closers:
+            return value[cursor] == source_wrapper_closers[-1]
+        if outer_quote_pending:
+            return False
+        return (
+            bool(external_wrapper_closers)
+            and value[cursor] == (external_wrapper_closers[-1])
+        )
+
+    def external_wrappers_are_closed() -> bool:
+        return (
+            load_external_wrapper_context()
+            and not source_wrapper_closers
+            and not outer_quote_pending
+            and not external_wrapper_closers
+        )
+
+    def at_proven_end() -> bool:
+        if cursor != logical_end:
+            return False
+        if not suffix_context_complete:
+            raise _IncompleteSecretScanSuffix(proof_retention_start)
+        return external_wrappers_are_closed()
+
+    def consume_external_wrapper_closers() -> bool:
+        if source_wrapper_closers or outer_quote_pending:
+            return True
+        while logical_startswith((b")", b"]", b"}"), cursor):
+            if not load_external_wrapper_context():
+                return False
+            if (
+                not external_wrapper_closers
+                or value[cursor] != external_wrapper_closers.pop()
+            ):
+                return False
+            if not advance(1) or not trim_space():
+                return False
+        return True
+
+    def consume_direct_source_context() -> bool:
+        nonlocal outer_quote_pending, source_literal_wrapper
+        if not load_external_wrapper_context():
+            return False
+        while source_wrapper_closers and logical_startswith((b")", b"]", b"}"), cursor):
+            if value[cursor] != source_wrapper_closers.pop():
+                return False
+            if not advance(1) or not trim_space():
+                return False
+        if source_wrapper_closers:
+            return True
+        if (
+            outer_quote_pending
+            and outer_delimiter is not None
+            and logical_startswith(outer_delimiter, cursor)
+        ):
+            if not advance(len(outer_delimiter)) or not trim_space():
+                return False
+            outer_quote_pending = False
+            source_literal_wrapper = True
+        return True
+
+    def consume_nested_literal() -> bool:
+        quote = value[cursor : min(cursor + 1, logical_end)]
+        delimiter = quote * (
+            3 if quote != b"`" and logical_startswith(quote * 3, cursor) else 1
+        )
+        if not advance(len(delimiter)):
+            return False
+        while True:
+            if cursor == logical_end:
+                if not suffix_context_complete:
+                    raise _IncompleteSecretScanSuffix(proof_retention_start)
+                return False
+            if starts_diff_metadata_boundary():
+                return False
+            if (
+                diff_surface
+                and cursor > 0
+                and value[cursor - 1] in (0x0A, 0x0D)
+                and not trim_diff_record_prefix()
+            ):
+                return False
+            if logical_startswith(delimiter, cursor):
+                return advance(len(delimiter))
+            if value[cursor] == 0x5C:
+                if cursor + 1 == logical_end:
+                    if not suffix_context_complete:
+                        raise _IncompleteSecretScanSuffix(proof_retention_start)
+                    return False
+                if not advance(2):
+                    return False
+                continue
             if not advance(1):
+                return False
+
+    def consume_block_comment() -> bool:
+        if not advance(2):
+            return False
+        while not logical_startswith(b"*/", cursor):
+            if cursor == logical_end:
+                if not suffix_context_complete:
+                    raise _IncompleteSecretScanSuffix(proof_retention_start)
+                return False
+            if not advance(1):
+                return False
+        return advance(2)
+
+    def consume_line_comment(prefix_size: int) -> bool:
+        if not advance(prefix_size):
+            return False
+        while cursor < logical_end and value[cursor] not in (0x0A, 0x0D):
+            if not advance(1):
+                return False
+        return True
+
+    def consume_following_wrapper_context() -> bool:
+        nonlocal outer_quote_pending, source_literal_wrapper
+        if not load_external_wrapper_context():
+            return False
+        closer_by_opener = {
+            0x28: 0x29,
+            0x5B: 0x5D,
+            0x7B: 0x7D,
+        }
+        while source_wrapper_closers or outer_quote_pending or external_wrapper_closers:
+            if cursor == logical_end:
+                if not suffix_context_complete:
+                    raise _IncompleteSecretScanSuffix(proof_retention_start)
+                return False
+            if starts_diff_metadata_boundary():
+                return False
+            if (
+                diff_surface
+                and cursor > 0
+                and value[cursor - 1] in (0x0A, 0x0D)
+                and not trim_diff_record_prefix()
+            ):
                 return False
             if not trim_space():
                 return False
+            if cursor == logical_end:
+                if not suffix_context_complete:
+                    raise _IncompleteSecretScanSuffix(proof_retention_start)
+                return False
+            if starts_trivia():
+                if not trim_continuation_trivia():
+                    return False
+                continue
+
+            if not source_wrapper_closers and outer_quote_pending:
+                if outer_delimiter is None or not logical_startswith(
+                    outer_delimiter, cursor
+                ):
+                    return False
+                if not advance(len(outer_delimiter)):
+                    return False
+                outer_quote_pending = False
+                source_literal_wrapper = True
+                continue
+
+            active_closers = (
+                source_wrapper_closers
+                if source_wrapper_closers
+                else external_wrapper_closers
+            )
+            if logical_startswith(b"/*", cursor):
+                if not consume_block_comment():
+                    return False
+                continue
+            if logical_startswith(b"//", cursor):
+                if not consume_line_comment(2):
+                    return False
+                continue
+            if value[cursor] == 0x23:
+                if not consume_line_comment(1):
+                    return False
+                continue
+            if value[cursor] in (0x22, 0x27, 0x60):
+                if not consume_nested_literal():
+                    return False
+                continue
+            closer = closer_by_opener.get(value[cursor])
+            if closer is not None:
+                active_closers.append(closer)
+                if not advance(1):
+                    return False
+                continue
+            if value[cursor] in (0x29, 0x5D, 0x7D):
+                if not active_closers or value[cursor] != active_closers.pop():
+                    return False
+                if not advance(1):
+                    return False
+                continue
+            if not advance(1):
+                return False
+        return True
+
+    def context_tail_is_proven() -> bool:
+        tail_crossed_boundary = False
+        if not trim_space():
+            return False
+        while starts_trivia():
+            tail_crossed_boundary = True
+            if not trim_continuation_trivia():
+                return False
+            if not trim_diff_record_prefix() or not trim_space():
+                return False
+        if at_proven_end():
+            return True
+        if starts_diff_metadata_boundary():
+            return True
+        if logical_startswith(b";", cursor):
+            if not advance(1) or not trim_space():
+                return False
+            while starts_trivia():
+                tail_crossed_boundary = True
+                if not trim_continuation_trivia():
+                    return False
+                if not trim_diff_record_prefix() or not trim_space():
+                    return False
+            if at_proven_end() or starts_diff_metadata_boundary():
+                return True
+            return starts_named_assignment() or starts_proven_python_declaration()
+        return tail_crossed_boundary and (
+            starts_named_assignment() or starts_proven_python_declaration()
+        )
+
+    while required_closer_index < len(required_closers):
+        expected_closer = required_closers[required_closer_index]
+        if cursor < logical_end and value[cursor] == expected_closer:
+            if not advance(1):
+                return False
+            required_closer_index += 1
+            if not trim_space():
+                return False
+            continue
+        if starts_trivia():
+            crossed_boundary = True
+            if not trim_continuation_trivia():
+                return False
+            if not trim_diff_record_prefix():
+                return False
+            continue
+        if cursor == logical_end and not suffix_context_complete:
+            raise _IncompleteSecretScanSuffix(proof_retention_start)
+        return False
+    if not consume_direct_source_context():
+        return False
+
+    while True:
+        if not consume_direct_source_context():
+            return False
+        if not consume_external_wrapper_closers():
+            return False
         if starts_trivia():
             crossed_boundary = True
             if not trim_continuation_trivia():
@@ -3749,32 +8841,34 @@ def _quoted_assignment_may_accept(
         break
     if at_proven_end():
         return True
-    if value.startswith(b";", cursor):
+    if logical_startswith(b";", cursor):
         if not advance(1) or not trim_space():
             return False
         if starts_trivia():
             if not trim_continuation_trivia():
                 return False
-        return (
-            at_proven_end()
-            or starts_diff_metadata_boundary()
+        if at_proven_end():
+            return True
+        return external_wrappers_are_closed() and (
+            starts_diff_metadata_boundary()
             or starts_named_assignment()
             or starts_proven_python_declaration()
         )
-    if value.startswith(b",", cursor):
+    if logical_startswith(b",", cursor):
         if not advance(1) or not trim_space():
             return False
         while True:
-            while value.startswith((b")", b"]", b"}"), cursor):
-                if not advance(1) or not trim_space():
-                    return False
+            if not consume_direct_source_context():
+                return False
+            if not consume_external_wrapper_closers():
+                return False
             if starts_trivia():
                 if not trim_continuation_trivia():
                     return False
                 if not trim_diff_record_prefix():
                     return False
                 continue
-            if value.startswith(b",", cursor):
+            if logical_startswith(b",", cursor):
                 if not advance(1) or not trim_space():
                     return False
                 continue
@@ -3782,20 +8876,29 @@ def _quoted_assignment_may_accept(
         if at_proven_end():
             return True
         if starts_diff_metadata_boundary():
-            return True
-        if value.startswith(b";", cursor):
+            return external_wrappers_are_closed()
+        if logical_startswith(b";", cursor):
             if not advance(1) or not trim_space():
                 return False
             if starts_trivia() and not trim_continuation_trivia():
                 return False
-            return (
-                at_proven_end()
-                or starts_diff_metadata_boundary()
+            if at_proven_end():
+                return True
+            return external_wrappers_are_closed() and (
+                starts_diff_metadata_boundary()
                 or starts_named_assignment()
                 or starts_proven_python_declaration()
             )
-        return starts_named_assignment() or starts_proven_python_declaration()
+        if not (starts_named_assignment() or starts_proven_python_declaration()):
+            return False
+        if external_wrappers_are_closed():
+            return True
+        if not consume_following_wrapper_context():
+            return False
+        return context_tail_is_proven()
     if crossed_boundary:
+        if not external_wrappers_are_closed():
+            return False
         if starts_diff_metadata_boundary():
             return True
         if source_literal_wrapper:
@@ -3810,12 +8913,13 @@ def _quoted_assignment_may_accept(
 
 def _unquoted_assignment_may_accept(
     value: bytes,
-    match: re.Match[bytes],
     *,
+    assignment_start: int,
+    assignment_end: int,
     diff_surface: bool = False,
     allow_inline_hash_comment: bool = False,
 ) -> bool:
-    cursor = match.end()
+    cursor = assignment_end
     inspected = 0
 
     def advance(count: int) -> bool:
@@ -3920,11 +9024,11 @@ def _unquoted_assignment_may_accept(
 
     lookbehind_start = max(
         0,
-        match.start() - MAX_SECRET_ASSIGNMENT_TRAILING_BYTES,
+        assignment_start - MAX_SECRET_ASSIGNMENT_TRAILING_BYTES,
     )
     last_line_break = max(
-        value.rfind(b"\n", lookbehind_start, match.start()),
-        value.rfind(b"\r", lookbehind_start, match.start()),
+        value.rfind(b"\n", lookbehind_start, assignment_start),
+        value.rfind(b"\r", lookbehind_start, assignment_start),
     )
     if last_line_break < 0 and lookbehind_start > 0:
         return False
@@ -3937,19 +9041,19 @@ def _unquoted_assignment_may_accept(
     ):
         content_start += 1
     key_start = content_start
-    while key_start < match.start() and value[key_start] == 0x20:
+    while key_start < assignment_start and value[key_start] == 0x20:
         key_start += 1
-    if key_start < match.start() and value[key_start] == 0x09:
+    if key_start < assignment_start and value[key_start] == 0x09:
         return False
     while (
-        key_start + 1 < match.start()
+        key_start + 1 < assignment_start
         and value[key_start] in (0x2D, 0x3F)
         and value[key_start + 1] in (0x20, 0x09)
     ):
         key_start += 1
-        while key_start < match.start() and value[key_start] == 0x20:
+        while key_start < assignment_start and value[key_start] == 0x20:
             key_start += 1
-        if key_start < match.start() and value[key_start] == 0x09:
+        if key_start < assignment_start and value[key_start] == 0x09:
             return False
     key_indentation = key_start - content_start
 
@@ -4032,6 +9136,180 @@ def _unquoted_assignment_may_accept(
         return starts_named_assignment()
 
 
+def _provider_candidate_is_prefix_only(rule: str, candidate: bytes) -> bool:
+    prefixes = {
+        "anthropic-key": (b"sk-ant-",),
+        "openai-key": (b"sk-", b"sk-proj-"),
+        "github-token": (
+            b"ghp_",
+            b"gho_",
+            b"ghu_",
+            b"ghs_",
+            b"ghr_",
+            b"github_pat_",
+        ),
+        "gitlab-token": (b"glpat-",),
+        "google-api-key": (b"AIza",),
+        "pypi-token": (b"pypi-",),
+        "slack-token": (
+            b"xoxb-",
+            b"xoxa-",
+            b"xoxp-",
+            b"xoxr-",
+            b"xoxs-",
+        ),
+        "stripe-live-key": (b"sk_live_",),
+    }
+    actual_prefix = max(
+        (prefix for prefix in prefixes.get(rule, ()) if candidate.startswith(prefix)),
+        key=len,
+        default=None,
+    )
+    return actual_prefix is not None and len(candidate) - len(actual_prefix) == 513
+
+
+def _find_unescaped_delimiter(
+    value: bytes,
+    *,
+    delimiter: bytes,
+    start: int,
+    diff_side: int | None = None,
+    maximum_end: int | None = None,
+) -> int | None:
+    logical_end = len(value) if maximum_end is None else min(len(value), maximum_end)
+    if not 0 <= start <= logical_end:
+        raise ReviewError("sensitive scanner produced an invalid delimiter proof range")
+    search_start = start
+    while True:
+        delimiter_start = value.find(delimiter, search_start, logical_end)
+        if delimiter_start < 0:
+            return None
+        if diff_side is not None:
+            line_start = (
+                max(
+                    value.rfind(b"\n", 0, delimiter_start),
+                    value.rfind(b"\r", 0, delimiter_start),
+                )
+                + 1
+            )
+            record_prefix = value[line_start : line_start + 1]
+            if record_prefix not in (b" ", bytes((diff_side,))):
+                search_start = delimiter_start + 1
+                continue
+        backslash_start = delimiter_start
+        while backslash_start > start and value[backslash_start - 1] == 0x5C:
+            backslash_start -= 1
+        if (delimiter_start - backslash_start) % 2 == 0:
+            return delimiter_start
+        search_start = delimiter_start + 1
+
+
+def _exact_raw_literal_candidate(
+    value: bytes,
+    *,
+    literal_prefix: bytes,
+    delimiter: bytes,
+    content_start: int,
+    closing_start: int,
+    diff_surface: bool,
+    diff_side: int | None,
+) -> bytes | None:
+    closing_end = closing_start + len(delimiter)
+    if not 0 <= content_start <= closing_start <= closing_end <= len(value):
+        raise ReviewError("sensitive scanner produced an invalid literal proof range")
+    if (
+        _find_unescaped_delimiter(
+            value,
+            delimiter=delimiter,
+            start=content_start,
+            diff_side=diff_side,
+            maximum_end=closing_end,
+        )
+        != closing_start
+    ):
+        raise ReviewError("sensitive scanner lost an exact literal delimiter")
+
+    candidate = value[content_start:closing_start]
+    has_line_break = b"\r" in candidate or b"\n" in candidate
+    # A multi-record diff slice includes record prefixes and possibly the
+    # opposite side, so it is not a raw identity from either source tree.
+    if diff_surface and has_line_break:
+        return None
+    # Escape processing and line continuations normalize the source spelling.
+    # Fail closed even for raw prefixes rather than treating that spelling as
+    # a stable reduction identity.
+    if b"\\" in candidate:
+        return None
+    try:
+        parsed = ast.literal_eval(
+            (literal_prefix + delimiter + candidate + delimiter).decode("ascii")
+        )
+    except (SyntaxError, UnicodeDecodeError, ValueError):
+        return None
+    if isinstance(parsed, str):
+        try:
+            parsed_bytes = parsed.encode("ascii")
+        except UnicodeEncodeError:
+            return None
+    elif isinstance(parsed, bytes):
+        parsed_bytes = parsed
+    else:
+        return None
+    if parsed_bytes != candidate:
+        return None
+    return candidate
+
+
+def _oversized_assignment_is_exact_specific_candidate(
+    value: bytes,
+    *,
+    assignment_start: int,
+    candidate_start: int,
+    prefix_end: int,
+    quote: bytes | None,
+    long_specific_candidate_ends: dict[int, set[int]],
+    diff_surface: bool,
+    prefix_context_complete: bool,
+    suffix_context_complete: bool,
+    event_budget: SecretScanBudget,
+) -> bool:
+    for specific_end in long_specific_candidate_ends.get(candidate_start, ()):
+        if specific_end < prefix_end:
+            continue
+        if quote is not None:
+            if value[specific_end : specific_end + 1] == quote and (
+                _quoted_assignment_may_accept(
+                    value,
+                    assignment_start=assignment_start,
+                    assignment_end=specific_end + 1,
+                    diff_surface=diff_surface,
+                    prefix_context_complete=prefix_context_complete,
+                    suffix_context_complete=suffix_context_complete,
+                    event_budget=event_budget,
+                )
+            ):
+                return True
+            continue
+        if _unquoted_assignment_may_accept(
+            value,
+            assignment_start=assignment_start,
+            assignment_end=specific_end,
+            diff_surface=diff_surface,
+        ):
+            return True
+    return False
+
+
+def _record_long_specific_candidate(
+    long_specific_candidate_ends: dict[int, set[int]],
+    *,
+    start: int,
+    end: int,
+) -> None:
+    if end - start >= 513:
+        long_specific_candidate_ends.setdefault(start, set()).add(end)
+
+
 def _iter_secret_events(
     value: bytes,
     *,
@@ -4041,21 +9319,138 @@ def _iter_secret_events(
     prefix_context_complete: bool = True,
     suffix_context_complete: bool = True,
     _event_budget: SecretScanBudget | None = None,
+    _specific_spans: set[tuple[int, int, bytes]] | None = None,
+    _capture_only_assignment_spans: set[tuple[int, int, bytes]] | None = None,
 ) -> Iterator[tuple[str, bytes | None, int, bool, int | None, int | None]]:
     event_budget = _event_budget or SecretScanBudget.default()
 
-    def match_is_committable(match: re.Match[bytes]) -> bool:
-        return minimum_end < match.end() and (
-            maximum_end is None or match.end() <= maximum_end
-        )
+    def end_is_committable(end: int) -> bool:
+        return minimum_end < end and (maximum_end is None or end <= maximum_end)
 
+    def match_is_committable(match: re.Match[bytes]) -> bool:
+        return end_is_committable(match.end())
+
+    long_specific_candidate_ends: dict[int, set[int]] = {}
+    pem_end_starts: dict[bytes, list[int]] = {}
+    for end_match in PEM_PRIVATE_KEY_END.finditer(value):
+        pem_end_starts.setdefault(end_match.group("label"), []).append(
+            end_match.start()
+        )
+    for match in PEM_PRIVATE_KEY_BEGIN.finditer(value):
+        start = match.start()
+        label = match.group("label")
+        rule = "pgp-private-key" if label == b"PGP PRIVATE KEY BLOCK" else "private-key"
+        end_marker = b"-----END " + label + b"-----"
+        search_end = min(len(value), start + MAX_PEM_SECRET_BYTES)
+        end_starts = pem_end_starts.get(label, ())
+        end_index = bisect_left(end_starts, match.end())
+        end_start = (
+            end_starts[end_index]
+            if end_index < len(end_starts) and end_starts[end_index] < search_end
+            else -1
+        )
+        if end_start >= 0:
+            candidate_end = end_start + len(end_marker)
+            candidate = value[start:candidate_end]
+            _record_long_specific_candidate(
+                long_specific_candidate_ends,
+                start=start,
+                end=candidate_end,
+            )
+            if _specific_spans is not None:
+                _specific_spans.add((start, candidate_end, candidate))
+            if not end_is_committable(candidate_end):
+                continue
+            event_budget.consume()
+            yield (
+                rule,
+                candidate,
+                candidate_end,
+                True,
+                start,
+                candidate_end,
+            )
+            continue
+        event_end = (
+            start + MAX_PEM_SECRET_BYTES
+            if len(value) - start >= MAX_PEM_SECRET_BYTES
+            else len(value)
+        )
+        if not end_is_committable(event_end):
+            continue
+        event_budget.consume()
+        yield (
+            rule,
+            None,
+            event_end,
+            False,
+            None,
+            _UNEXTRACTABLE_SECRET_CANDIDATE_END,
+        )
     for rule, pattern in SECRET_PATTERNS:
+        markers = SECRET_PATTERN_MARKERS.get(rule)
+        marker_surface = value.lower() if rule == "aws-secret-key" else value
+        if markers is not None and not any(
+            marker in marker_surface for marker in markers
+        ):
+            continue
         for match in pattern.finditer(value):
+            candidate_group: str | int = "aws_secret" if rule == "aws-secret-key" else 0
+            start, candidate_end = match.span(candidate_group)
+            candidate = match.group(candidate_group)
+            prefix_only = _provider_candidate_is_prefix_only(rule, candidate)
+            if not prefix_only:
+                _record_long_specific_candidate(
+                    long_specific_candidate_ends,
+                    start=start,
+                    end=candidate_end,
+                )
+                if _specific_spans is not None:
+                    _specific_spans.add((start, candidate_end, candidate))
             if not match_is_committable(match):
                 continue
             event_budget.consume()
-            start, candidate_end = match.span(0)
-            yield rule, match.group(0), match.end(), True, start, candidate_end
+            if prefix_only:
+                if any(
+                    end >= match.end()
+                    for end in long_specific_candidate_ends.get(start, ())
+                ):
+                    continue
+                yield (
+                    rule,
+                    None,
+                    match.end(),
+                    False,
+                    None,
+                    _UNEXTRACTABLE_SECRET_CANDIDATE_END,
+                )
+            else:
+                yield rule, candidate, match.end(), True, start, candidate_end
+    specific_ranges = sorted(
+        {
+            (start, candidate_end)
+            for start, candidate_end, _candidate in (_specific_spans or ())
+        }
+    )
+    specific_max_end_by_start: dict[int, int] = {}
+    for start, candidate_end in specific_ranges:
+        specific_max_end_by_start[start] = candidate_end
+    # A dot-continued three-part prefix is not a stable identity unless the
+    # earlier complete-pattern pass proved one bounded five-part JWE.
+    for match in JWE_CONTINUATION_PATTERN.finditer(value):
+        if not match_is_committable(match):
+            continue
+        if specific_max_end_by_start.get(match.start(), -1) > match.end():
+            continue
+        event_budget.consume()
+        yield (
+            "jwt",
+            None,
+            match.end(),
+            False,
+            None,
+            _UNEXTRACTABLE_SECRET_CANDIDATE_END,
+        )
     for rule, pattern in (
         ("aws-secret-key", OVERSIZED_AWS_SECRET_KEY_GAP),
         ("jwt", OVERSIZED_JWT_PATTERN),
@@ -4065,47 +9460,195 @@ def _iter_secret_events(
             if not match_is_committable(match):
                 continue
             event_budget.consume()
-            yield rule, None, match.end(), False, None, None
-    for pattern in (
-        OVERSIZED_QUOTED_SECRET_ASSIGNMENT,
-        OVERSIZED_UNQUOTED_SECRET_ASSIGNMENT,
+            yield (
+                rule,
+                None,
+                match.end(),
+                False,
+                None,
+                _UNEXTRACTABLE_SECRET_CANDIDATE_END,
+            )
+    for pattern, quoted in (
+        (OVERSIZED_QUOTED_SECRET_ASSIGNMENT, True),
+        (OVERSIZED_UNQUOTED_SECRET_ASSIGNMENT, False),
     ):
         for match in pattern.finditer(value):
             if not match_is_committable(match):
                 continue
             event_budget.consume()
+            candidate_start = match.end() - 513
+            try:
+                exact_specific_candidate = (
+                    _oversized_assignment_is_exact_specific_candidate(
+                        value,
+                        assignment_start=match.start(),
+                        candidate_start=candidate_start,
+                        prefix_end=match.end(),
+                        quote=match.group(1) if quoted else None,
+                        long_specific_candidate_ends=long_specific_candidate_ends,
+                        diff_surface=diff_surface,
+                        prefix_context_complete=prefix_context_complete,
+                        suffix_context_complete=suffix_context_complete,
+                        event_budget=event_budget,
+                    )
+                )
+            except _IncompleteSecretScanSuffix as incomplete:
+                yield (
+                    _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                    None,
+                    match.end(),
+                    False,
+                    match.start(),
+                    incomplete.retention_start
+                    if incomplete.retention_start is not None
+                    else match.start(),
+                )
+                continue
+            if exact_specific_candidate:
+                continue
             yield (
                 "generic-secret-assignment",
                 None,
                 match.end(),
                 False,
                 None,
-                None,
+                _UNEXTRACTABLE_SECRET_CANDIDATE_END,
             )
-    for match in QUOTED_SECRET_ASSIGNMENT.finditer(value):
+    pending_specific_ranges = tuple(
+        specific_range
+        for specific_range in specific_ranges
+        if specific_range[1] > minimum_end
+    )
+
+    def contains_specific_candidate(start: int, candidate_end: int) -> bool:
+        index = bisect_left(specific_ranges, (start, -1))
+        while (
+            index < len(specific_ranges) and specific_ranges[index][0] < candidate_end
+        ):
+            _specific_start, specific_end = specific_ranges[index]
+            if specific_end <= candidate_end:
+                return True
+            index += 1
+        return False
+
+    quoted_assignment_acceptance: dict[tuple[int, int], bool] = {}
+    for match in QUOTED_SECRET_ASSIGNMENT_PREFIX.finditer(value):
+        start, candidate_end = match.span(2)
+        if not contains_specific_candidate(start, candidate_end):
+            continue
+        if value[candidate_end : candidate_end + 1] in (b"'", b'"'):
+            continue
         if not match_is_committable(match):
             continue
         event_budget.consume()
-        candidate = match.group(2)
-        try:
-            may_accept = _quoted_assignment_may_accept(
-                value,
-                match,
-                diff_surface=diff_surface,
-                prefix_context_complete=prefix_context_complete,
-                suffix_context_complete=suffix_context_complete,
-                event_budget=event_budget,
-            )
-        except _IncompleteSecretScanSuffix:
+        if candidate_end == len(value) and not suffix_context_complete:
             yield (
                 _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
                 None,
                 match.end(),
                 False,
                 match.start(),
-                None,
+                match.start(),
             )
             continue
+        yield (
+            "generic-secret-assignment",
+            match.group(2),
+            match.end(),
+            False,
+            start,
+            candidate_end,
+        )
+    for match in QUOTED_SECRET_ASSIGNMENT.finditer(value):
+        if not match_is_committable(match):
+            continue
+        event_budget.consume()
+        candidate = match.group(2)
+        quoted_proof_limit = match.start() + MAX_SECRET_PREFIX_PROOF_BYTES
+        quoted_proof_end = min(len(value), quoted_proof_limit)
+        if match.end() > quoted_proof_end:
+            if end_is_committable(quoted_proof_limit):
+                yield (
+                    "generic-secret-assignment",
+                    None,
+                    quoted_proof_limit,
+                    False,
+                    match.start(),
+                    _UNEXTRACTABLE_SECRET_CANDIDATE_END,
+                )
+            continue
+        closing_start = _find_unescaped_delimiter(
+            value,
+            delimiter=match.group(1),
+            start=match.start(2),
+            maximum_end=match.end(),
+        )
+        try:
+            may_accept = closing_start == match.end() - len(match.group(1)) and (
+                _quoted_assignment_may_accept(
+                    value,
+                    assignment_start=match.start(),
+                    assignment_end=match.end(),
+                    diff_surface=diff_surface,
+                    prefix_context_complete=prefix_context_complete,
+                    suffix_context_complete=suffix_context_complete,
+                    event_budget=event_budget,
+                    maximum_end=quoted_proof_end,
+                )
+            )
+        except _IncompleteSecretScanSuffix as incomplete:
+            if quoted_proof_limit <= len(value) and end_is_committable(
+                quoted_proof_limit
+            ):
+                yield (
+                    "generic-secret-assignment",
+                    None,
+                    quoted_proof_limit,
+                    False,
+                    match.start(),
+                    _UNEXTRACTABLE_SECRET_CANDIDATE_END,
+                )
+                continue
+            yield (
+                _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                None,
+                match.end(),
+                False,
+                match.start(),
+                incomplete.retention_start
+                if incomplete.retention_start is not None
+                else match.start(),
+            )
+            continue
+        if (
+            closing_start == match.end() - len(match.group(1))
+            and not may_accept
+            and _capture_only_assignment_spans is not None
+            and not prefix_context_complete
+            and not diff_surface
+        ):
+            local_end = min(
+                len(value),
+                match.end() + MAX_SECRET_ASSIGNMENT_TRAILING_BYTES + 1,
+            )
+            local_value = value[match.start() : local_end]
+            try:
+                local_may_accept = _quoted_assignment_may_accept(
+                    local_value,
+                    assignment_start=0,
+                    assignment_end=match.end() - match.start(),
+                    prefix_context_complete=True,
+                    suffix_context_complete=(
+                        suffix_context_complete and local_end == len(value)
+                    ),
+                    event_budget=event_budget,
+                )
+            except _IncompleteSecretScanSuffix:
+                local_may_accept = False
+            if local_may_accept:
+                local_start, local_end = match.span(2)
+                _capture_only_assignment_spans.add((local_start, local_end, candidate))
+        quoted_assignment_acceptance[(match.start(), match.end())] = may_accept
         if not may_accept or not _is_placeholder_secret(candidate.lower()):
             start, candidate_end = match.span(2)
             yield (
@@ -4116,6 +9659,936 @@ def _iter_secret_events(
                 start,
                 candidate_end,
             )
+    direct_quoted_assignments = {
+        start: (end, may_accept)
+        for (start, end), may_accept in quoted_assignment_acceptance.items()
+    }
+    literal_prefixes = (b"br", b"rb", b"fr", b"rf", b"b", b"f", b"r", b"u")
+    continuation_operators = frozenset(b"+-*/%&|^!=<>?:,.`")
+    assignment_matches: Iterable[re.Match[bytes]] = (
+        SECRET_ASSIGNMENT_PREFIX.finditer(value) if minimum_end < len(value) else ()
+    )
+    assignment_line_search_start = 0
+    assignment_line_start = 0
+    pending_specific_cursor = 0
+    closed_assignment_proof_frontier: int | None = (
+        0 if prefix_context_complete and not diff_surface else None
+    )
+    for assignment_match in assignment_matches:
+        line_break = max(
+            value.rfind(
+                b"\n",
+                assignment_line_search_start,
+                assignment_match.start(),
+            ),
+            value.rfind(
+                b"\r",
+                assignment_line_search_start,
+                assignment_match.start(),
+            ),
+        )
+        if line_break >= 0:
+            assignment_line_start = line_break + 1
+        assignment_line_search_start = assignment_match.start()
+
+        while (
+            pending_specific_cursor < len(pending_specific_ranges)
+            and pending_specific_ranges[pending_specific_cursor][0]
+            < assignment_match.end()
+        ):
+            pending_specific_cursor += 1
+        if (
+            closed_assignment_proof_frontier is not None
+            and assignment_match.start() < closed_assignment_proof_frontier
+        ):
+            continue
+        if maximum_end is not None and assignment_match.start() >= maximum_end:
+            continue
+        direct_quoted = direct_quoted_assignments.get(assignment_match.start())
+        if direct_quoted is not None:
+            direct_end, direct_may_accept = direct_quoted
+            if direct_may_accept and closed_assignment_proof_frontier is not None:
+                closed_assignment_proof_frontier = max(
+                    closed_assignment_proof_frontier,
+                    direct_end,
+                )
+            continue
+        proof_limit_end = assignment_match.start() + MAX_SECRET_PREFIX_PROOF_BYTES
+        proof_end = min(len(value), proof_limit_end)
+        proof_limit_visible = proof_limit_end <= len(value)
+        proof_suffix_context_complete = suffix_context_complete and proof_end == len(
+            value
+        )
+        pending_specific_within_proof = (
+            pending_specific_cursor < len(pending_specific_ranges)
+            and pending_specific_ranges[pending_specific_cursor][0] < proof_end
+            and pending_specific_ranges[pending_specific_cursor][1] <= proof_end
+        )
+        if not pending_specific_within_proof:
+            prefix_proof_start = 0
+            if (
+                closed_assignment_proof_frontier is not None
+                and closed_assignment_proof_frontier > 0
+                and closed_assignment_proof_frontier <= assignment_match.start()
+                and assignment_match.start() <= MAX_SECRET_PREFIX_PROOF_BYTES
+            ):
+                prefix_proof_start = closed_assignment_proof_frontier
+            recorded_closure_frontiers: list[int] = []
+            recorded_literal_rhs: list[
+                tuple[int, int | None, bytes, bytes, int | None]
+            ] = []
+            recorded_unquoted_rhs: list[tuple[int, int | None]] = []
+            assignment_closed = _secret_assignment_rhs_is_closed(
+                value,
+                prefix_proof_start=prefix_proof_start,
+                assignment_start=assignment_match.start(),
+                assignment_end=assignment_match.end(),
+                assignment_line_start=assignment_line_start,
+                proof_end=proof_end,
+                diff_surface=diff_surface,
+                prefix_context_complete=prefix_context_complete,
+                suffix_context_complete=suffix_context_complete,
+                event_budget=event_budget,
+                closure_recorder=recorded_closure_frontiers.append,
+                literal_rhs_recorder=lambda start, end, delimiter, prefix, diff_side: (
+                    recorded_literal_rhs.append(
+                        (start, end, delimiter, prefix, diff_side)
+                    )
+                ),
+                unquoted_rhs_recorder=lambda start, end: (
+                    recorded_unquoted_rhs.append((start, end))
+                ),
+            )
+            if assignment_closed:
+                if (
+                    closed_assignment_proof_frontier is not None
+                    and recorded_closure_frontiers
+                ):
+                    closure_frontier = recorded_closure_frontiers[-1]
+                    sibling_search_start = assignment_match.end()
+                    if recorded_literal_rhs:
+                        (
+                            _candidate_start,
+                            candidate_end,
+                            delimiter,
+                            _literal_prefix,
+                            _literal_diff_side,
+                        ) = recorded_literal_rhs[-1]
+                        if candidate_end is not None:
+                            sibling_search_start = candidate_end + len(delimiter)
+                    elif recorded_unquoted_rhs:
+                        _candidate_start, candidate_end = recorded_unquoted_rhs[-1]
+                        if candidate_end is not None:
+                            sibling_search_start = candidate_end
+                    else:
+                        direct_unquoted = UNQUOTED_SECRET_ASSIGNMENT.match(
+                            value,
+                            assignment_match.start(),
+                            proof_end,
+                        )
+                        if direct_unquoted is not None:
+                            sibling_search_start = direct_unquoted.end(1)
+                    # Structural closure can cross a sibling assignment without
+                    # classifying its RHS, so only reuse a fully covered frontier.
+                    crossed_sibling = SECRET_ASSIGNMENT_PREFIX.search(
+                        value,
+                        sibling_search_start,
+                        closure_frontier,
+                    )
+                    if crossed_sibling is None:
+                        closed_assignment_proof_frontier = max(
+                            closed_assignment_proof_frontier,
+                            closure_frontier,
+                        )
+                if recorded_literal_rhs:
+                    (
+                        candidate_start,
+                        candidate_end,
+                        delimiter,
+                        literal_prefix,
+                        literal_diff_side,
+                    ) = recorded_literal_rhs[-1]
+                    if candidate_end is None:
+                        raise ReviewError(
+                            "sensitive scanner closed an incomplete literal RHS"
+                        )
+                    raw_candidate = value[candidate_start:candidate_end]
+                    candidate = _exact_raw_literal_candidate(
+                        value,
+                        literal_prefix=literal_prefix,
+                        delimiter=delimiter,
+                        content_start=candidate_start,
+                        closing_start=candidate_end,
+                        diff_surface=diff_surface,
+                        diff_side=literal_diff_side,
+                    )
+                    closure_end = (
+                        recorded_closure_frontiers[-1]
+                        if recorded_closure_frontiers
+                        else candidate_end
+                    )
+                    if len(raw_candidate) >= 16 and not _is_placeholder_secret(
+                        raw_candidate.lower()
+                    ):
+                        candidate_is_supported = (
+                            candidate is not None
+                            and len(candidate) <= 512
+                            and delimiter != b"`"
+                        )
+                        if end_is_committable(closure_end):
+                            event_budget.consume()
+                            yield (
+                                "generic-secret-assignment",
+                                candidate if candidate_is_supported else None,
+                                closure_end,
+                                candidate_is_supported,
+                                candidate_start
+                                if candidate_is_supported
+                                else assignment_match.start(),
+                                candidate_end if candidate_is_supported else None,
+                            )
+                        elif (
+                            maximum_end is not None
+                            and closure_end > maximum_end
+                            and maximum_end > minimum_end
+                        ):
+                            event_budget.consume()
+                            yield (
+                                _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                                None,
+                                maximum_end,
+                                False,
+                                assignment_match.start(),
+                                _assignment_proof_retention_start(
+                                    value,
+                                    assignment_start=assignment_match.start(),
+                                    diff_surface=diff_surface,
+                                    prefix_context_complete=prefix_context_complete,
+                                ),
+                            )
+                elif recorded_unquoted_rhs:
+                    candidate_start, candidate_end = recorded_unquoted_rhs[-1]
+                    if candidate_end is None:
+                        raise ReviewError(
+                            "sensitive scanner closed an incomplete unquoted RHS"
+                        )
+                    candidate = value[candidate_start:candidate_end]
+                    closure_end = (
+                        recorded_closure_frontiers[-1]
+                        if recorded_closure_frontiers
+                        else candidate_end
+                    )
+                    has_strong_secret_key = (
+                        STRONG_SECRET_KEY_NAME_PATTERN.search(
+                            value[assignment_match.start() : candidate_start]
+                        )
+                        is not None
+                    )
+                    if (
+                        not _is_placeholder_secret(candidate.lower())
+                        and not _is_secret_pattern_marker(candidate)
+                        and (
+                            _looks_like_unquoted_secret(candidate)
+                            or has_strong_secret_key
+                        )
+                    ):
+                        if end_is_committable(closure_end):
+                            event_budget.consume()
+                            yield (
+                                "generic-secret-assignment",
+                                candidate,
+                                closure_end,
+                                True,
+                                candidate_start,
+                                candidate_end,
+                            )
+                        elif (
+                            maximum_end is not None
+                            and closure_end > maximum_end
+                            and maximum_end > minimum_end
+                        ):
+                            event_budget.consume()
+                            yield (
+                                _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                                None,
+                                maximum_end,
+                                False,
+                                assignment_match.start(),
+                                _assignment_proof_retention_start(
+                                    value,
+                                    assignment_start=assignment_match.start(),
+                                    diff_surface=diff_surface,
+                                    prefix_context_complete=prefix_context_complete,
+                                ),
+                            )
+                continue
+            if recorded_literal_rhs and proof_suffix_context_complete:
+                (
+                    candidate_start,
+                    candidate_end,
+                    delimiter,
+                    _literal_prefix,
+                    _literal_diff_side,
+                ) = recorded_literal_rhs[-1]
+                candidate = (
+                    value[candidate_start:candidate_end]
+                    if candidate_end is not None
+                    else value[candidate_start:proof_end]
+                )
+                if (
+                    len(candidate) >= 16
+                    and not _is_placeholder_secret(candidate.lower())
+                    and not _is_secret_pattern_marker(candidate)
+                    and end_is_committable(proof_end)
+                ):
+                    event_budget.consume()
+                    yield (
+                        "generic-secret-assignment",
+                        None,
+                        proof_end,
+                        False,
+                        assignment_match.start(),
+                        (
+                            _UNEXTRACTABLE_SECRET_CANDIDATE_END
+                            if candidate_end is None
+                            else None
+                        ),
+                    )
+                continue
+            if recorded_unquoted_rhs and proof_suffix_context_complete:
+                candidate_start, candidate_end = recorded_unquoted_rhs[-1]
+                candidate = (
+                    value[candidate_start:candidate_end]
+                    if candidate_end is not None
+                    else b""
+                )
+                has_strong_secret_key = (
+                    STRONG_SECRET_KEY_NAME_PATTERN.search(
+                        value[assignment_match.start() : candidate_start]
+                    )
+                    is not None
+                )
+                if (
+                    candidate_end is None
+                    or (
+                        not _is_placeholder_secret(candidate.lower())
+                        and not _is_secret_pattern_marker(candidate)
+                        and (
+                            _looks_like_unquoted_secret(candidate)
+                            or has_strong_secret_key
+                        )
+                    )
+                ) and end_is_committable(proof_end):
+                    event_budget.consume()
+                    yield (
+                        "generic-secret-assignment",
+                        None,
+                        proof_end,
+                        False,
+                        assignment_match.start(),
+                        None,
+                    )
+                continue
+            if proof_suffix_context_complete:
+                continue
+            if proof_limit_visible and end_is_committable(proof_limit_end):
+                event_budget.consume()
+                yield (
+                    "generic-secret-assignment",
+                    None,
+                    proof_limit_end,
+                    False,
+                    assignment_match.start(),
+                    None,
+                )
+            elif end_is_committable(assignment_match.end()):
+                event_budget.consume()
+                yield (
+                    _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                    None,
+                    assignment_match.end(),
+                    False,
+                    assignment_match.start(),
+                    _assignment_proof_retention_start(
+                        value,
+                        assignment_start=assignment_match.start(),
+                        diff_surface=diff_surface,
+                        prefix_context_complete=prefix_context_complete,
+                    ),
+                )
+            continue
+        if (
+            maximum_end is not None
+            and pending_specific_ranges[pending_specific_cursor][1] > maximum_end
+        ):
+            if maximum_end > minimum_end:
+                event_budget.consume()
+                yield (
+                    _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                    None,
+                    maximum_end,
+                    False,
+                    assignment_match.start(),
+                    _assignment_proof_retention_start(
+                        value,
+                        assignment_start=assignment_match.start(),
+                        diff_surface=diff_surface,
+                        prefix_context_complete=prefix_context_complete,
+                    ),
+                )
+            continue
+        if maximum_end is not None and assignment_match.end() >= maximum_end:
+            if maximum_end > minimum_end:
+                event_budget.consume()
+                yield (
+                    _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                    None,
+                    maximum_end,
+                    False,
+                    assignment_match.start(),
+                    _assignment_proof_retention_start(
+                        value,
+                        assignment_start=assignment_match.start(),
+                        diff_surface=diff_surface,
+                        prefix_context_complete=prefix_context_complete,
+                    ),
+                )
+            continue
+        event_budget.consume_prefix_proof(proof_end - assignment_match.end())
+        assignment_retention_start = _assignment_proof_retention_start(
+            value,
+            assignment_start=assignment_match.start(),
+            diff_surface=diff_surface,
+            prefix_context_complete=prefix_context_complete,
+        )
+
+        assignment_diff_side: int | None = None
+        if (
+            diff_surface
+            and assignment_line_start < proof_end
+            and value[assignment_line_start] in (0x2B, 0x2D)
+            and not value.startswith(
+                (b"+++ ", b"--- "),
+                assignment_line_start,
+                proof_end,
+            )
+        ):
+            assignment_diff_side = value[assignment_line_start]
+        cursor = assignment_match.end()
+        wrapper_prefix = False
+        wrapper_closers: list[int] = []
+        wrapper_mismatch = False
+        quoted_prefix_wrapper_only = True
+        pending_expression_continuation = False
+        while cursor < proof_end:
+            lowered_prefix = value[cursor : min(cursor + 3, proof_end)].lower()
+            backtick_continuation = False
+            if value[cursor] == 0x60:
+                backtick_suffix = cursor + 1
+                while backtick_suffix < proof_end and value[backtick_suffix] in (
+                    0x09,
+                    0x20,
+                ):
+                    backtick_suffix += 1
+                backtick_continuation = backtick_suffix < proof_end and value[
+                    backtick_suffix
+                ] in (0x0A, 0x0D)
+            if (
+                value[cursor] in (0x22, 0x27)
+                or (value[cursor] == 0x60 and not backtick_continuation)
+                or any(
+                    lowered_prefix.startswith(prefix)
+                    and value[
+                        cursor + len(prefix) : min(cursor + len(prefix) + 1, proof_end)
+                    ]
+                    in (b"'", b'"')
+                    for prefix in literal_prefixes
+                )
+            ):
+                break
+            if value[cursor] in (0x09, 0x20):
+                cursor += 1
+                continue
+            if value[cursor] in (0x28, 0x5B, 0x7B):
+                wrapper_prefix = True
+                wrapper_closers.append(
+                    {
+                        0x28: 0x29,
+                        0x5B: 0x5D,
+                        0x7B: 0x7D,
+                    }[value[cursor]]
+                )
+                pending_expression_continuation = False
+                cursor += 1
+                continue
+            if value[cursor] in (0x29, 0x5D, 0x7D):
+                wrapper_prefix = True
+                quoted_prefix_wrapper_only = False
+                if wrapper_closers and value[cursor] == wrapper_closers[-1]:
+                    wrapper_closers.pop()
+                else:
+                    wrapper_mismatch = True
+                pending_expression_continuation = False
+                cursor += 1
+                continue
+            if value.startswith(b"/*", cursor, proof_end):
+                wrapper_prefix = True
+                quoted_prefix_wrapper_only = False
+                comment_end = value.find(b"*/", cursor + 2, proof_end)
+                if comment_end < 0:
+                    cursor = proof_end
+                    continue
+                cursor = comment_end + 2
+                continue
+            if value.startswith(b"//", cursor, proof_end):
+                quoted_prefix_wrapper_only = False
+                previous = cursor - 1
+                while previous >= assignment_match.end() and value[previous] in (
+                    0x09,
+                    0x20,
+                ):
+                    previous -= 1
+                pending_expression_continuation = (
+                    pending_expression_continuation
+                    or bool(wrapper_closers)
+                    or (
+                        previous >= assignment_match.end()
+                        and value[previous] in continuation_operators
+                    )
+                )
+                line_end_candidates = tuple(
+                    boundary
+                    for boundary in (
+                        value.find(b"\n", cursor, proof_end),
+                        value.find(b"\r", cursor, proof_end),
+                    )
+                    if boundary >= 0
+                )
+                cursor = min(line_end_candidates, default=proof_end)
+                continue
+            if value[cursor] in (0x0A, 0x0D):
+                previous = cursor - 1
+                while previous >= assignment_match.end() and value[previous] in (
+                    0x09,
+                    0x20,
+                ):
+                    previous -= 1
+                next_cursor = cursor + (
+                    2 if value.startswith(b"\r\n", cursor, proof_end) else 1
+                )
+                if (
+                    diff_surface
+                    and next_cursor < proof_end
+                    and value[next_cursor] in (0x20, 0x2B, 0x2D)
+                ):
+                    next_cursor += 1
+                while next_cursor < proof_end and value[next_cursor] in (
+                    0x09,
+                    0x20,
+                ):
+                    next_cursor += 1
+                previous_continues = previous >= assignment_match.end() and (
+                    value[previous] == 0x5C or value[previous] in continuation_operators
+                )
+                next_continues = (
+                    next_cursor < proof_end
+                    and value[next_cursor] in continuation_operators
+                )
+                line_continues = (
+                    bool(wrapper_closers)
+                    or pending_expression_continuation
+                    or previous_continues
+                    or next_continues
+                )
+                if not wrapper_closers and (not line_continues):
+                    break
+                pending_expression_continuation = (
+                    pending_expression_continuation
+                    or previous_continues
+                    or next_continues
+                )
+                cursor += 2 if value.startswith(b"\r\n", cursor, proof_end) else 1
+                continue
+            if value[cursor] == 0x23:
+                quoted_prefix_wrapper_only = False
+                line_end_candidates = tuple(
+                    boundary
+                    for boundary in (
+                        value.find(b"\n", cursor, proof_end),
+                        value.find(b"\r", cursor, proof_end),
+                    )
+                    if boundary >= 0
+                )
+                line_end = min(line_end_candidates, default=proof_end)
+                if not wrapper_closers and not pending_expression_continuation:
+                    cursor = line_end
+                    break
+                cursor = line_end
+                continue
+            if value[cursor] == 0x3B and not wrapper_closers:
+                break
+            if (
+                diff_surface
+                and cursor > 0
+                and value[cursor - 1] in (0x0A, 0x0D)
+                and value[cursor] in (0x2B, 0x2D)
+            ):
+                cursor += 1
+                continue
+            wrapper_prefix = True
+            quoted_prefix_wrapper_only = False
+            pending_expression_continuation = value[cursor] in continuation_operators
+            cursor += 1
+        lowered_suffix = value[cursor : min(cursor + 3, proof_end)].lower()
+        literal_prefix = b""
+        for prefix in literal_prefixes:
+            if lowered_suffix.startswith(prefix) and value[
+                cursor + len(prefix) : min(cursor + len(prefix) + 1, proof_end)
+            ] in (b"'", b'"'):
+                literal_prefix = value[cursor : cursor + len(prefix)]
+                cursor += len(prefix)
+                break
+        quote = value[cursor : min(cursor + 1, proof_end)]
+        if quote not in (b"'", b'"', b"`"):
+            direct_unquoted_match = UNQUOTED_SECRET_ASSIGNMENT.match(
+                value,
+                assignment_match.start(),
+                proof_end,
+            )
+            if direct_unquoted_match is not None:
+                continue
+            range_index = bisect_left(
+                specific_ranges,
+                (assignment_match.end(), -1),
+            )
+            rhs_specific_ranges: list[tuple[int, int]] = []
+            while (
+                range_index < len(specific_ranges)
+                and specific_ranges[range_index][0] < cursor
+            ):
+                specific_start, candidate_end = specific_ranges[range_index]
+                if candidate_end <= cursor:
+                    rhs_specific_ranges.append((specific_start, candidate_end))
+                range_index += 1
+            if rhs_specific_ranges:
+                specific_start, specific_end = rhs_specific_ranges[0]
+                exact_wrapped_candidate = len(
+                    rhs_specific_ranges
+                ) == 1 and _wrapper_ranges_are_balanced(
+                    value,
+                    prefix_start=assignment_match.end(),
+                    prefix_end=specific_start,
+                    suffix_start=specific_end,
+                    suffix_end=cursor,
+                )
+                wrapper_may_complete = len(
+                    rhs_specific_ranges
+                ) == 1 and _wrapper_ranges_are_balanced(
+                    value,
+                    prefix_start=assignment_match.end(),
+                    prefix_end=specific_start,
+                    suffix_start=specific_end,
+                    suffix_end=cursor,
+                    require_complete=False,
+                )
+                if (
+                    not exact_wrapped_candidate
+                    and end_is_committable(specific_end)
+                    and not (
+                        not proof_suffix_context_complete
+                        and cursor == proof_end
+                        and wrapper_may_complete
+                    )
+                ):
+                    event_budget.consume()
+                    yield (
+                        "generic-secret-assignment",
+                        None,
+                        specific_end,
+                        False,
+                        assignment_match.start(),
+                        None,
+                    )
+                    continue
+            if (
+                wrapper_prefix
+                and proof_limit_visible
+                and end_is_committable(proof_limit_end)
+            ):
+                event_budget.consume()
+                yield (
+                    "generic-secret-assignment",
+                    None,
+                    proof_limit_end,
+                    False,
+                    assignment_match.start(),
+                    None,
+                )
+            elif (
+                wrapper_prefix
+                and not proof_suffix_context_complete
+                and end_is_committable(assignment_match.end())
+            ):
+                event_budget.consume()
+                yield (
+                    _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                    None,
+                    assignment_match.end(),
+                    False,
+                    assignment_match.start(),
+                    assignment_retention_start,
+                )
+            continue
+        delimiter = quote * (
+            3 if quote != b"`" and value.startswith(quote * 3, cursor, proof_end) else 1
+        )
+        content_start = cursor + len(delimiter)
+        closing_start = _find_unescaped_delimiter(
+            value,
+            delimiter=delimiter,
+            start=content_start,
+            diff_side=assignment_diff_side,
+            maximum_end=proof_end,
+        )
+        closing_end = None if closing_start is None else closing_start + len(delimiter)
+        if closing_start is None:
+            if proof_limit_visible and end_is_committable(proof_limit_end):
+                event_budget.consume()
+                yield (
+                    "generic-secret-assignment",
+                    None,
+                    proof_limit_end,
+                    False,
+                    assignment_match.start(),
+                    None,
+                )
+                continue
+            range_index = bisect_left(specific_ranges, (content_start, -1))
+            specific_end = (
+                specific_ranges[range_index][1]
+                if range_index < len(specific_ranges)
+                else None
+            )
+            if not proof_suffix_context_complete and end_is_committable(content_start):
+                event_budget.consume()
+                yield (
+                    _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                    None,
+                    content_start,
+                    False,
+                    assignment_match.start(),
+                    assignment_retention_start,
+                )
+                continue
+            if specific_end is None or not end_is_committable(specific_end):
+                continue
+            event_budget.consume()
+            yield (
+                "generic-secret-assignment",
+                None,
+                specific_end,
+                False,
+                assignment_match.start(),
+                None,
+            )
+            continue
+
+        if closing_end is None:
+            raise ReviewError("sensitive scanner lost a quoted delimiter boundary")
+        if maximum_end is not None and closing_end > maximum_end:
+            if proof_limit_visible and end_is_committable(proof_limit_end):
+                event_budget.consume()
+                yield (
+                    "generic-secret-assignment",
+                    None,
+                    proof_limit_end,
+                    False,
+                    assignment_match.start(),
+                    None,
+                )
+                continue
+            if end_is_committable(content_start):
+                event_budget.consume()
+                yield (
+                    _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                    None,
+                    content_start,
+                    False,
+                    assignment_match.start(),
+                    assignment_retention_start,
+                )
+            continue
+
+        assignment_key = (assignment_match.start(), closing_end)
+        assignment_incomplete = False
+        assignment_incomplete_start = assignment_retention_start
+        assignment_closure_frontiers: list[int] = []
+        if wrapper_mismatch:
+            assignment_complete = False
+        elif proof_end == len(value) and assignment_key in quoted_assignment_acceptance:
+            assignment_complete = quoted_assignment_acceptance[assignment_key]
+        else:
+            try:
+                assignment_complete = _quoted_assignment_may_accept(
+                    value,
+                    assignment_start=assignment_match.start(),
+                    assignment_end=closing_end,
+                    required_closers=tuple(reversed(wrapper_closers)),
+                    diff_surface=diff_surface,
+                    prefix_context_complete=prefix_context_complete,
+                    suffix_context_complete=proof_suffix_context_complete,
+                    event_budget=event_budget,
+                    maximum_end=proof_end,
+                    inspection_recorder=lambda inspected: (
+                        assignment_closure_frontiers.append(closing_end + inspected)
+                    ),
+                )
+            except _IncompleteSecretScanSuffix as incomplete:
+                assignment_complete = False
+                assignment_incomplete = True
+                if incomplete.retention_start is not None:
+                    assignment_incomplete_start = incomplete.retention_start
+
+        if (
+            assignment_incomplete
+            and proof_limit_visible
+            and end_is_committable(proof_limit_end)
+        ):
+            event_budget.consume()
+            yield (
+                "generic-secret-assignment",
+                None,
+                proof_limit_end,
+                False,
+                assignment_match.start(),
+                None,
+            )
+            continue
+
+        relevant_end = closing_start if assignment_complete else proof_end
+        range_index = bisect_left(specific_ranges, (content_start, -1))
+        relevant_ranges: list[tuple[int, int]] = []
+        while (
+            range_index < len(specific_ranges)
+            and specific_ranges[range_index][0] < relevant_end
+        ):
+            specific_start, candidate_end = specific_ranges[range_index]
+            if candidate_end <= relevant_end:
+                relevant_ranges.append((specific_start, candidate_end))
+            range_index += 1
+        if not relevant_ranges:
+            if (
+                not assignment_complete
+                and not proof_suffix_context_complete
+                and end_is_committable(content_start)
+            ):
+                event_budget.consume()
+                yield (
+                    _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                    None,
+                    closing_end,
+                    False,
+                    assignment_match.start(),
+                    assignment_incomplete_start,
+                )
+            continue
+
+        exact_specific_candidate = (
+            assignment_complete
+            and quoted_prefix_wrapper_only
+            and all(
+                specific_start == content_start and candidate_end == closing_start
+                for specific_start, candidate_end in relevant_ranges
+            )
+        )
+        if exact_specific_candidate:
+            continue
+        full_literal_candidate = (
+            _exact_raw_literal_candidate(
+                value,
+                literal_prefix=literal_prefix,
+                delimiter=delimiter,
+                content_start=content_start,
+                closing_start=closing_start,
+                diff_surface=diff_surface,
+                diff_side=assignment_diff_side,
+            )
+            if (
+                assignment_complete and quoted_prefix_wrapper_only and delimiter != b"`"
+            )
+            else None
+        )
+        if (
+            full_literal_candidate is not None
+            and 16 <= len(full_literal_candidate) <= 512
+            and not _is_placeholder_secret(full_literal_candidate.lower())
+        ):
+            closure_end = (
+                assignment_closure_frontiers[-1]
+                if assignment_closure_frontiers
+                else closing_end
+            )
+            if end_is_committable(closure_end):
+                event_budget.consume()
+                yield (
+                    "generic-secret-assignment",
+                    full_literal_candidate,
+                    closure_end,
+                    True,
+                    content_start,
+                    closing_start,
+                )
+            elif (
+                maximum_end is not None
+                and closure_end > maximum_end
+                and maximum_end > minimum_end
+            ):
+                event_budget.consume()
+                yield (
+                    _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                    None,
+                    maximum_end,
+                    False,
+                    assignment_match.start(),
+                    assignment_retention_start,
+                )
+            continue
+        if assignment_incomplete and all(
+            specific_start == content_start and candidate_end == closing_start
+            for specific_start, candidate_end in relevant_ranges
+        ):
+            event_budget.consume()
+            yield (
+                _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                None,
+                closing_end,
+                False,
+                assignment_match.start(),
+                assignment_incomplete_start,
+            )
+            continue
+        specific_end = relevant_ranges[0][1]
+        if not end_is_committable(specific_end):
+            if end_is_committable(content_start):
+                event_budget.consume()
+                yield (
+                    _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE,
+                    None,
+                    content_start,
+                    False,
+                    assignment_match.start(),
+                    assignment_retention_start,
+                )
+            continue
+        event_budget.consume()
+        yield (
+            "generic-secret-assignment",
+            None,
+            specific_end,
+            False,
+            assignment_match.start(),
+            None,
+        )
     for match in UNQUOTED_SECRET_ASSIGNMENT.finditer(value):
         if not match_is_committable(match):
             continue
@@ -4123,21 +10596,33 @@ def _iter_secret_events(
         candidate = match.group(1)
         may_accept = _unquoted_assignment_may_accept(
             value,
-            match,
+            assignment_start=match.start(),
+            assignment_end=match.end(),
             diff_surface=diff_surface,
         )
         placeholder = _is_placeholder_secret(candidate.lower())
         if placeholder and not may_accept:
             may_accept = _unquoted_assignment_may_accept(
                 value,
-                match,
+                assignment_start=match.start(),
+                assignment_end=match.end(),
                 diff_surface=diff_surface,
                 allow_inline_hash_comment=True,
             )
-        if (not placeholder and _looks_like_unquoted_secret(candidate)) or (
-            placeholder and not may_accept
-        ):
-            start, candidate_end = match.span(1)
+        start, candidate_end = match.span(1)
+        contains_specific = contains_specific_candidate(start, candidate_end)
+        has_strong_secret_key = (
+            STRONG_SECRET_KEY_NAME_PATTERN.search(value[match.start() : start])
+            is not None
+        )
+        if (
+            not placeholder
+            and (
+                _looks_like_unquoted_secret(candidate)
+                or contains_specific
+                or has_strong_secret_key
+            )
+        ) or (placeholder and not may_accept):
             yield (
                 "generic-secret-assignment",
                 candidate,
@@ -4153,9 +10638,7 @@ def _index_accepted_values(
 ) -> AcceptedValueIndex:
     exact: dict[tuple[str, bytes], list[AcceptedSyntheticValue]] = {}
     digests: dict[tuple[str, int], dict[str, list[AcceptedSyntheticValue]]] = {}
-    rules: set[str] = set()
     for accepted in accepted_values:
-        rules.add(accepted.rule)
         if accepted.value is not None:
             exact.setdefault((accepted.rule, accepted.value), []).append(accepted)
             continue
@@ -4164,7 +10647,7 @@ def _index_accepted_values(
             {},
         )
         by_digest.setdefault(accepted.value_sha256, []).append(accepted)
-    return AcceptedValueIndex(exact=exact, digests=digests, rules=frozenset(rules))
+    return AcceptedValueIndex(exact=exact, digests=digests)
 
 
 def _index_exact_values(
@@ -4184,9 +10667,16 @@ def _index_exact_values(
     if not descriptors:
         return ExactValueIndex((), 0, {})
     containers: dict[bytes, tuple[tuple[bytes, int], ...]] = {}
-    for raw_value in descriptors:
+    for raw_value, raw_descriptor in descriptors.items():
         containing_matches: list[tuple[bytes, int]] = []
-        for longer_value in descriptors:
+        for longer_value, longer_descriptor in descriptors.items():
+            if longer_descriptor.kind != raw_descriptor.kind:
+                continue
+            if (
+                raw_descriptor.kind == "legacy"
+                and longer_descriptor.exemption_id != raw_descriptor.exemption_id
+            ):
+                continue
             if len(longer_value) <= len(raw_value):
                 continue
             offset = longer_value.find(raw_value)
@@ -4211,14 +10701,24 @@ def _count_exact_value_occurrences(
     minimum_start: int,
     maximum_start: int,
     event_budget: LegacyOccurrenceBudget,
+    capture_reduction_offsets: bool = False,
 ) -> tuple[
     Counter[AcceptedSyntheticValue],
     Counter[AcceptedSyntheticValue],
+    dict[AcceptedSyntheticValue, set[int]],
+    dict[AcceptedSyntheticValue, set[int]],
 ]:
     counts: Counter[AcceptedSyntheticValue] = Counter()
     unembedded_counts: Counter[AcceptedSyntheticValue] = Counter()
+    reduction_offsets: dict[AcceptedSyntheticValue, set[int]] = {}
+    reduction_unembedded_offsets: dict[AcceptedSyntheticValue, set[int]] = {}
     if not exact_index.patterns or minimum_start >= maximum_start:
-        return counts, unembedded_counts
+        return (
+            counts,
+            unembedded_counts,
+            reduction_offsets,
+            reduction_unembedded_offsets,
+        )
     event_budget.consume_search(
         len(exact_index.patterns) * max(0, len(value) - minimum_start)
     )
@@ -4230,6 +10730,17 @@ def _count_exact_value_occurrences(
                 break
             event_budget.consume()
             counts[descriptor] += 1
+            if capture_reduction_offsets and descriptor.kind == "secret-reduction":
+                offsets = reduction_offsets.setdefault(descriptor, set())
+                offsets.add(start)
+                if (
+                    sum(map(len, reduction_offsets.values()))
+                    > MAX_SECRET_REDUCTION_PROVENANCE_OCCURRENCES
+                ):
+                    raise ReviewError(
+                        "external review secret-reduction occurrence provenance "
+                        "exceeds the entry limit"
+                    )
             embedded = False
             for longer_value, offset in exact_index.containers[raw_value]:
                 event_budget.consume_containment_check()
@@ -4242,8 +10753,17 @@ def _count_exact_value_occurrences(
                     break
             if not embedded:
                 unembedded_counts[descriptor] += 1
+                if capture_reduction_offsets and descriptor.kind == "secret-reduction":
+                    reduction_unembedded_offsets.setdefault(descriptor, set()).add(
+                        start
+                    )
             next_start = start + 1
-    return counts, unembedded_counts
+    return (
+        counts,
+        unembedded_counts,
+        reduction_offsets,
+        reduction_unembedded_offsets,
+    )
 
 
 def _matching_accepted_values(
@@ -4270,6 +10790,9 @@ def _scan_secret_value(
     minimum_end: int = 0,
     maximum_end: int | None = None,
     capture_accepted_candidates: bool = False,
+    capture_blocking_candidates: bool = False,
+    capture_reduction_offsets: bool = False,
+    reduced_secret_values: frozenset[bytes] = frozenset(),
     diff_surface: bool = False,
     prefix_context_complete: bool = True,
     suffix_context_complete: bool = True,
@@ -4277,51 +10800,53 @@ def _scan_secret_value(
     _event_budget: SecretScanBudget | None = None,
     _exact_index: ExactValueIndex | None = None,
     _occurrence_budget: LegacyOccurrenceBudget | None = None,
+    exact_only: bool = False,
     _continue_after_blocking: bool = False,
+    _capture_only_legacy_evidence: bool = False,
 ) -> SecretScanResult:
-    if _continue_after_blocking and not capture_accepted_candidates:
+    if _continue_after_blocking and not (
+        capture_accepted_candidates or capture_blocking_candidates
+    ):
         raise ReviewError(
-            "exhaustive secret scanning requires accepted-candidate capture"
+            "exhaustive secret scanning requires accepted-candidate capture "
+            "or blocking-candidate capture"
         )
+    if _capture_only_legacy_evidence and not (
+        _continue_after_blocking
+        and capture_accepted_candidates
+        and not prefix_context_complete
+        and not diff_surface
+    ):
+        raise ReviewError("capture-only legacy evidence scope is invalid")
     result = SecretScanResult.empty()
     exact_index = _exact_index or _index_exact_values(raw_occurrence_values)
     occurrence_budget = _occurrence_budget or LegacyOccurrenceBudget.default()
-    raw_counts, unembedded_counts = _count_exact_value_occurrences(
+    (
+        raw_counts,
+        unembedded_counts,
+        reduction_offsets,
+        reduction_unembedded_offsets,
+    ) = _count_exact_value_occurrences(
         value,
         exact_index=exact_index,
         minimum_start=0,
         maximum_start=len(value),
         event_budget=occurrence_budget,
+        capture_reduction_offsets=capture_reduction_offsets,
     )
     result.raw_occurrence_counts.update(raw_counts)
     result.unembedded_occurrence_counts.update(unembedded_counts)
+    result.reduction_occurrence_offsets.update(reduction_offsets)
+    result.reduction_unembedded_offsets.update(reduction_unembedded_offsets)
+    if exact_only:
+        return result
     upper = len(value) if maximum_end is None else maximum_end
     accepted_index = _accepted_index or _index_accepted_values(accepted_values)
     event_budget = _event_budget or SecretScanBudget.default()
-    accepted_specific_spans: set[tuple[int, int, bytes]] = set()
-    accepted_specific_rules = {
-        rule for rule in accepted_index.rules if rule != "generic-secret-assignment"
-    }
-    for rule, pattern in SECRET_PATTERNS:
-        if rule not in accepted_specific_rules:
-            continue
-        for match in pattern.finditer(value):
-            if match.end() > upper:
-                continue
-            # Keep older provider spans available when the corresponding generic
-            # assignment ends across the commit frontier, but charge each
-            # provider event only in its own commit range.
-            if minimum_end < match.end():
-                event_budget.consume()
-            candidate = match.group(0)
-            if _matching_accepted_values(
-                rule=rule,
-                candidate=candidate,
-                accepted_index=accepted_index,
-            ):
-                start, candidate_end = match.span(0)
-                accepted_specific_spans.add((start, candidate_end, candidate))
-
+    specific_spans: set[tuple[int, int, bytes]] = set()
+    capture_only_assignment_spans: set[tuple[int, int, bytes]] | None = (
+        set() if _capture_only_legacy_evidence else None
+    )
     for rule, candidate, end, may_accept, start, candidate_end in _iter_secret_events(
         value,
         minimum_end=minimum_end,
@@ -4330,15 +10855,22 @@ def _scan_secret_value(
         prefix_context_complete=prefix_context_complete,
         suffix_context_complete=suffix_context_complete,
         _event_budget=event_budget,
+        _specific_spans=specific_spans,
+        _capture_only_assignment_spans=capture_only_assignment_spans,
     ):
         if not minimum_end < end <= upper:
             continue
         if rule == _INCOMPLETE_SECRET_SCAN_SUFFIX_RULE:
-            if start is None:
+            if start is None or candidate_end is None:
                 raise ReviewError(
                     "sensitive scanner lost an incomplete diff suffix boundary"
                 )
+            if not 0 <= candidate_end <= start < end:
+                raise ReviewError(
+                    "sensitive scanner produced invalid incomplete suffix boundaries"
+                )
             result.incomplete_suffix_start = start
+            result.incomplete_suffix_retention_start = candidate_end
             return result
         if (
             rule == "generic-secret-assignment"
@@ -4346,25 +10878,62 @@ def _scan_secret_value(
             and candidate is not None
             and start is not None
             and candidate_end is not None
-            and (start, candidate_end, candidate) in accepted_specific_spans
+            and (start, candidate_end, candidate) in specific_spans
         ):
             continue
+        capture_only_accept = (
+            candidate is not None
+            and start is not None
+            and candidate_end is not None
+            and capture_only_assignment_spans is not None
+            and (start, candidate_end, candidate) in capture_only_assignment_spans
+        )
         matches = (
             _matching_accepted_values(
                 rule=rule,
                 candidate=candidate,
                 accepted_index=accepted_index,
             )
-            if may_accept and candidate is not None
+            if (may_accept or capture_only_accept) and candidate is not None
             else []
         )
-        if matches:
-            accepted = matches[0]
+        accepted_match = matches[0] if matches else None
+        if accepted_match is not None and (
+            may_accept or (capture_only_accept and accepted_match.kind == "legacy")
+        ):
+            accepted = accepted_match
             result.accepted_counts[accepted] += 1
             if capture_accepted_candidates:
                 result.accepted_candidates.setdefault(accepted, set()).add(candidate)
-        elif result.blocking_rule is None:
-            result.blocking_rule = rule
+            if may_accept:
+                continue
+        if may_accept and candidate is not None and candidate in reduced_secret_values:
+            continue
+        elif capture_blocking_candidates and may_accept and candidate is not None:
+            if (
+                candidate not in result.blocking_candidates
+                and len(result.blocking_candidates) >= MAX_SECRET_REDUCTION_CANDIDATES
+            ):
+                raise ReviewError(
+                    "external review content has too many secret-reduction candidates"
+                )
+            result.blocking_candidates.setdefault(candidate, set()).add(rule)
+            if (
+                sum(map(len, result.blocking_candidates))
+                > MAX_SECRET_REDUCTION_CANDIDATE_BYTES
+            ):
+                raise ReviewError(
+                    "external review secret-reduction candidates exceed the byte limit"
+                )
+        else:
+            if (
+                candidate is None
+                and candidate_end == _UNEXTRACTABLE_SECRET_CANDIDATE_END
+                and result.unextractable_rule is None
+            ):
+                result.unextractable_rule = rule
+            if result.blocking_rule is None:
+                result.blocking_rule = rule
             if not _continue_after_blocking:
                 return result
     return result
@@ -4402,11 +10971,16 @@ def _stream_secret_scan(
     accepted_values: Iterable[AcceptedSyntheticValue] = (),
     raw_occurrence_values: Iterable[AcceptedSyntheticValue] = (),
     capture_accepted_candidates: bool = False,
+    capture_blocking_candidates: bool = False,
+    capture_reduction_offsets: bool = False,
+    reduced_secret_values: frozenset[bytes] = frozenset(),
     diff_surface: bool = False,
     _accepted_index: AcceptedValueIndex | None = None,
     _event_budget: SecretScanBudget | None = None,
     _exact_index: ExactValueIndex | None = None,
     _occurrence_budget: LegacyOccurrenceBudget | None = None,
+    _blocking_exact_matcher: LegacyPathMatcher | None = None,
+    exact_only: bool = False,
     _continue_after_blocking: bool = False,
 ) -> SecretScanResult:
     if size is not None and size < 0:
@@ -4417,6 +10991,14 @@ def _stream_secret_scan(
     event_budget = _event_budget or SecretScanBudget.default()
     exact_values = tuple(raw_occurrence_values)
     exact_index = _exact_index or _index_exact_values(exact_values)
+    exact_retention_length = max(
+        exact_index.maximum_length,
+        (
+            _blocking_exact_matcher.maximum_length
+            if _blocking_exact_matcher is not None
+            else 0
+        ),
+    )
     occurrence_budget = _occurrence_budget or LegacyOccurrenceBudget.default()
     pending = b""
     pending_offset = 0
@@ -4466,28 +11048,67 @@ def _stream_secret_scan(
         total_read += len(chunk)
         at_end = reached_eof or remaining == 0
         exact_pending += chunk
+        if (
+            _blocking_exact_matcher is not None
+            and result.blocking_rule is None
+            and _blocking_exact_matcher.match(exact_pending) is not None
+        ):
+            result.blocking_rule = "base-only-path-secret-retained"
+            blocked = True
         next_committed_start = (
             total_read
             if at_end
-            else max(0, total_read - max(0, exact_index.maximum_length - 1))
+            else max(0, total_read - max(0, exact_retention_length - 1))
         )
-        raw_counts, unembedded_counts = _count_exact_value_occurrences(
+        (
+            raw_counts,
+            unembedded_counts,
+            reduction_offsets,
+            reduction_unembedded_offsets,
+        ) = _count_exact_value_occurrences(
             exact_pending,
             exact_index=exact_index,
             minimum_start=max(0, committed_start - exact_pending_offset),
             maximum_start=max(0, next_committed_start - exact_pending_offset),
             event_budget=occurrence_budget,
+            capture_reduction_offsets=capture_reduction_offsets,
         )
         result.raw_occurrence_counts.update(raw_counts)
         result.unembedded_occurrence_counts.update(unembedded_counts)
+        for descriptor, offsets in reduction_offsets.items():
+            destination = result.reduction_occurrence_offsets.setdefault(
+                descriptor,
+                set(),
+            )
+            destination.update(exact_pending_offset + offset for offset in offsets)
+        for descriptor, offsets in reduction_unembedded_offsets.items():
+            destination = result.reduction_unembedded_offsets.setdefault(
+                descriptor,
+                set(),
+            )
+            destination.update(exact_pending_offset + offset for offset in offsets)
+        if (
+            sum(map(len, result.reduction_occurrence_offsets.values()))
+            > MAX_SECRET_REDUCTION_PROVENANCE_OCCURRENCES
+            or sum(map(len, result.reduction_unembedded_offsets.values()))
+            > MAX_SECRET_REDUCTION_PROVENANCE_OCCURRENCES
+        ):
+            raise ReviewError(
+                "external review secret-reduction occurrence provenance exceeds "
+                "the entry limit"
+            )
         committed_start = next_committed_start
         if not at_end:
             retain_exact_from = max(
                 exact_pending_offset,
-                committed_start - max(0, exact_index.maximum_length - 1),
+                committed_start - max(0, exact_retention_length - 1),
             )
             exact_pending = exact_pending[retain_exact_from - exact_pending_offset :]
             exact_pending_offset = retain_exact_from
+        if exact_only:
+            if at_end:
+                break
+            continue
         if blocked:
             if at_end:
                 break
@@ -4506,20 +11127,38 @@ def _stream_secret_scan(
         # Only the complete scan, or its safe-prefix replay, may spend the
         # caller-visible logical budget.
         pending_budget = event_budget.clone()
+        capture_only_legacy_evidence = (
+            _continue_after_blocking
+            and capture_accepted_candidates
+            and result.blocking_rule is not None
+            and pending_offset != 0
+            and not diff_surface
+        )
         pending_scan = _scan_secret_value(
             pending,
             accepted_values=accepted,
             minimum_end=local_minimum,
             maximum_end=local_maximum,
             capture_accepted_candidates=capture_accepted_candidates,
+            capture_blocking_candidates=capture_blocking_candidates,
+            reduced_secret_values=reduced_secret_values,
             diff_surface=diff_surface,
             prefix_context_complete=pending_offset == 0,
             suffix_context_complete=at_end,
             _accepted_index=accepted_index,
             _event_budget=pending_budget,
             _continue_after_blocking=_continue_after_blocking,
+            _capture_only_legacy_evidence=capture_only_legacy_evidence,
         )
+        incomplete_retention_start: int | None = None
         if pending_scan.incomplete_suffix_start is not None:
+            if pending_scan.incomplete_suffix_retention_start is None:
+                raise ReviewError(
+                    "sensitive scanner lost an incomplete retention boundary"
+                )
+            incomplete_retention_start = (
+                pending_offset + pending_scan.incomplete_suffix_retention_start
+            )
             safe_local_maximum = max(
                 local_minimum,
                 min(local_maximum, pending_scan.incomplete_suffix_start),
@@ -4532,17 +11171,19 @@ def _stream_secret_scan(
                     minimum_end=local_minimum,
                     maximum_end=safe_local_maximum,
                     capture_accepted_candidates=capture_accepted_candidates,
+                    capture_blocking_candidates=capture_blocking_candidates,
+                    reduced_secret_values=reduced_secret_values,
                     diff_surface=diff_surface,
                     prefix_context_complete=pending_offset == 0,
                     suffix_context_complete=at_end,
                     _accepted_index=accepted_index,
                     _event_budget=committed_budget,
                     _continue_after_blocking=_continue_after_blocking,
+                    _capture_only_legacy_evidence=capture_only_legacy_evidence,
                 )
                 if committed_scan.incomplete_suffix_start is not None:
                     raise ReviewError(
-                        "sensitive scanner could not establish a complete diff "
-                        "prefix"
+                        "sensitive scanner could not establish a complete diff prefix"
                     )
                 event_budget.commit_from(committed_budget)
                 result.merge(committed_scan)
@@ -4578,6 +11219,8 @@ def _stream_secret_scan(
                     retain_from,
                     pending_offset + hunk_context.retention_start,
                 )
+        if incomplete_retention_start is not None:
+            retain_from = min(retain_from, incomplete_retention_start)
         pending = pending[retain_from - pending_offset :]
         pending_offset = retain_from
     return result
@@ -4597,6 +11240,15 @@ def _value_secret_rule(
 
 def _is_placeholder_secret(candidate: bytes) -> bool:
     return PLACEHOLDER_SECRET_PATTERN.fullmatch(candidate.strip()) is not None
+
+
+def _is_secret_pattern_marker(candidate: bytes) -> bool:
+    normalized = candidate.strip().lower()
+    return any(
+        normalized == marker.lower()
+        for markers in SECRET_PATTERN_MARKERS.values()
+        for marker in markers
+    )
 
 
 def _looks_like_unquoted_secret(candidate: bytes) -> bool:
@@ -4697,10 +11349,6 @@ def audit_legacy_exemption(
     if catalog.legacy_exemption(exemption.identifier) != exemption:
         raise ReviewError("legacy exemption changed while the audit was prepared")
     accepted = accepted_legacy_values(catalog, (exemption,))
-    catalog_legacy_values = accepted_legacy_values(
-        catalog,
-        catalog.legacy_exemptions,
-    )
     authoring_accepted = accepted_authoring_values(catalog)
     scan_accepted = authoring_accepted + accepted
     descriptors = {item.identifier: item for item in accepted}
@@ -4729,13 +11377,6 @@ def audit_legacy_exemption(
                 )
             by_commit.setdefault(token.containing_commit, []).append(
                 descriptors[token.identifier]
-            )
-        for commit in sorted({tip, *by_commit}):
-            _reject_legacy_values_in_frozen_tree_paths(
-                git_view=git_view,
-                object_directory=object_directory,
-                commit=commit,
-                legacy_values=catalog_legacy_values,
             )
         for commit, commit_descriptors in sorted(by_commit.items()):
             scan = _scan_frozen_tree_values(
@@ -4806,6 +11447,9 @@ def prepare_workspace(
     base_ref: str,
     head_ref: str,
     ownership_handoff: Callable[[ReviewWorkspace], None],
+    preparation_cleanup_handoff: (
+        Callable[[pathlib.Path, PrivateCleanupEvidence], None] | None
+    ) = None,
     synthetic_secret_exemptions: tuple[str, ...] = (),
     prompt_override: pathlib.Path | None = None,
 ) -> ReviewWorkspace:
@@ -4819,24 +11463,70 @@ def prepare_workspace(
     )
     catalog = load_catalog()
     validate_authoring_catalog_scanner_contract(catalog)
-    selected_exemptions = resolve_legacy_exemptions(
-        catalog,
-        synthetic_secret_exemptions,
-    )
+    # Keep validating the deprecated option for typo detection, but every
+    # catalog legacy value now participates automatically.
+    resolve_legacy_exemptions(catalog, synthetic_secret_exemptions)
+    selected_exemptions = catalog.legacy_exemptions
     accepted_values = accepted_authoring_values(catalog) + accepted_legacy_values(
         catalog,
         selected_exemptions,
     )
-    catalog_legacy_values = accepted_legacy_values(
-        catalog,
-        catalog.legacy_exemptions,
-    )
-    catalog_legacy_value_matcher = _legacy_path_matcher(catalog_legacy_values)
+    catalog_legacy_value_matcher = _exact_path_matcher({})
     evidence_sensitive_values = _all_catalog_sensitive_values(catalog)
-    container, handoff_mask = _new_container(source_root)
+    (
+        container,
+        container_descriptor,
+        container_identity,
+        handoff_mask,
+    ) = _new_container(source_root)
+    private_artifact_identities: dict[str, CleanupIdentity] = {}
+
+    def capture_private_identity(
+        artifact_name: str,
+        identity: CleanupIdentity,
+    ) -> None:
+        if artifact_name in private_artifact_identities:
+            raise ReviewError(
+                f"helper-private artifact identity was captured twice: {artifact_name}"
+            )
+        private_artifact_identities[artifact_name] = identity
+
     ownership_transferred = False
 
     try:
+        for artifact_name in PRIVATE_HELPER_ARTIFACT_NAMES:
+            with _open_new_private_binary(
+                container / artifact_name,
+                parent_descriptor=container_descriptor,
+            ) as empty_private_artifact:
+                os.fchmod(empty_private_artifact.fileno(), 0o600)
+                metadata = os.fstat(empty_private_artifact.fileno())
+                identity = _cleanup_identity_evidence(metadata)
+                _validate_prepared_private_metadata(
+                    metadata,
+                    artifact_name=artifact_name,
+                    expected_identity=identity,
+                    require_empty=True,
+                )
+                capture_private_identity(artifact_name, identity)
+                empty_private_artifact.flush()
+                os.fsync(empty_private_artifact.fileno())
+        if set(private_artifact_identities) != set(PRIVATE_HELPER_ARTIFACT_NAMES):
+            raise ReviewError("helper-private preparation identities are incomplete")
+        try:
+            os.fsync(container_descriptor)
+        except OSError as error:
+            raise ReviewError(
+                f"cannot persist prepared helper-private artifact entries: {error}"
+            ) from error
+        if preparation_cleanup_handoff is not None:
+            preparation_cleanup_handoff(
+                container,
+                PrivateCleanupEvidence(
+                    container=container_identity,
+                    artifacts=private_artifact_identities,
+                ),
+            )
         restore_signal_mask(handoff_mask)
         handoff_mask = None
         workspace_root = container / "workspace"
@@ -4854,12 +11544,30 @@ def prepare_workspace(
                 raise ReviewError(
                     f"the frozen {label} uses the reserved top-level .codex-review path"
                 )
-            _reject_legacy_values_in_frozen_tree_paths(
+        try:
+            (
+                synthetic_manifest,
+                private_synthetic_manifest,
+                secret_reductions,
+            ) = _secret_count_manifests(
                 git_view=git_view,
                 object_directory=object_directory,
-                commit=commit,
-                legacy_values=catalog_legacy_values,
+                base_sha=base_sha,
+                head_sha=head_sha,
+                catalog=catalog,
             )
+        except (OSError, ReviewError):
+            (
+                synthetic_manifest,
+                private_synthetic_manifest,
+                secret_reductions,
+            ) = _inconclusive_secret_count_manifests(
+                base_sha=base_sha,
+                head_sha=head_sha,
+                catalog=catalog,
+                failure_class="exact-value-scan-incomplete",
+            )
+        manifest_sensitive_values = evidence_sensitive_values + secret_reductions
         _materialize_frozen_tree(
             git_view=git_view,
             object_directory=object_directory,
@@ -4874,33 +11582,41 @@ def prepare_workspace(
                 "the frozen head uses the reserved top-level .codex-review path"
             )
         control_dir.mkdir(mode=0o700)
-        synthetic_manifest = _legacy_count_manifest(
+        diff_file = control_dir / "review.diff"
+        _write_frozen_diff(
             git_view=git_view,
             object_directory=object_directory,
             base_sha=base_sha,
             head_sha=head_sha,
-            catalog=catalog,
-            exemptions=selected_exemptions,
+            destination=diff_file,
         )
         _write_bounded_json(
             control_dir / SYNTHETIC_MANIFEST_NAME,
             synthetic_manifest,
             label="synthetic secret manifest",
-            accepted_values=evidence_sensitive_values,
         )
-        _write_bounded_json(
+        _write_private_bounded_json(
             container / SYNTHETIC_PRIVATE_MANIFEST_NAME,
-            synthetic_manifest,
+            private_synthetic_manifest,
             label="synthetic secret helper-private state",
-            accepted_values=evidence_sensitive_values,
+            expected_identity=private_artifact_identities[
+                SYNTHETIC_PRIVATE_MANIFEST_NAME
+            ],
+            parent_descriptor=container_descriptor,
         )
-        changed_paths_file = control_dir / "changed-paths.z"
+        changed_path_digests_file = control_dir / CHANGED_PATH_DIGESTS_NAME
         _write_frozen_changed_paths(
             git_view=git_view,
             object_directory=object_directory,
             base_sha=base_sha,
             head_sha=head_sha,
-            destination=changed_paths_file,
+            destination=changed_path_digests_file,
+            private_destination=container / PRIVATE_CHANGED_PATHS_NAME,
+            evidence_sensitive_values=manifest_sensitive_values,
+            private_expected_identity=private_artifact_identities[
+                PRIVATE_CHANGED_PATHS_NAME
+            ],
+            private_parent_descriptor=container_descriptor,
         )
         changed_blob_findings = control_dir / "changed-blob-findings.z"
         _write_changed_blob_findings(
@@ -4911,15 +11627,12 @@ def prepare_workspace(
             destination=changed_blob_findings,
             accepted_destination=control_dir / SYNTHETIC_CHANGED_EVIDENCE_NAME,
             accepted_values=accepted_values,
-            evidence_sensitive_values=evidence_sensitive_values,
-        )
-        diff_file = control_dir / "review.diff"
-        _write_frozen_diff(
-            git_view=git_view,
-            object_directory=object_directory,
-            base_sha=base_sha,
-            head_sha=head_sha,
-            destination=diff_file,
+            evidence_sensitive_values=manifest_sensitive_values,
+            reduced_secret_values=frozenset(
+                descriptor.value
+                for descriptor in secret_reductions
+                if descriptor.value is not None
+            ),
         )
         shutil.rmtree(git_view)
 
@@ -4947,14 +11660,21 @@ def prepare_workspace(
             )
         _validate_prompt_size(prompt)
         write_text_atomic(prompt_file, prompt)
+        if set(private_artifact_identities) != set(PRIVATE_HELPER_ARTIFACT_NAMES):
+            raise ReviewError("helper-private preparation identities are incomplete")
+        private_cleanup = PrivateCleanupEvidence(
+            container=container_identity,
+            artifacts=private_artifact_identities,
+        )
         control_artifact_state = _build_control_artifact_state(
             control_dir=control_dir,
+            private_cleanup=private_cleanup,
         )
         _write_bounded_json(
             container / CONTROL_ARTIFACT_STATE_NAME,
             control_artifact_state,
             label="helper-private review control state",
-            accepted_values=evidence_sensitive_values,
+            accepted_values=manifest_sensitive_values,
         )
         review = ReviewWorkspace(
             source_root=source_root,
@@ -4964,6 +11684,7 @@ def prepare_workspace(
             head_ref=head_sha,
             diff_file=diff_file,
             prompt_file=prompt_file,
+            private_cleanup=private_cleanup,
         )
         validate_workspace_layout(review)
         ownership_mask = block_forwarded_signals()
@@ -4980,7 +11701,16 @@ def prepare_workspace(
         cleanup_signal: signal.Signals | None = None
         cleanup_error: str | None = None
         try:
-            cleanup_error = _remove_partial_container(container)
+            if container_descriptor is not None:
+                os.close(container_descriptor)
+                container_descriptor = None
+            cleanup_error = _remove_partial_container(
+                container,
+                expected=PrivateCleanupEvidence(
+                    container=container_identity,
+                    artifacts=private_artifact_identities,
+                ),
+            )
             if cleanup_mask is not None:
                 cleanup_signal = consume_pending_forwarded_signal()
         finally:
@@ -5004,17 +11734,171 @@ def prepare_workspace(
             ) from error
         raise
     finally:
+        if container_descriptor is not None:
+            os.close(container_descriptor)
         if handoff_mask is not None:
             restore_signal_mask(handoff_mask)
 
 
-def cleanup_workspace(review: ReviewWorkspace, *, keep_container: bool) -> str | None:
+def _validated_legacy_cleanup_binding(
+    review: LegacyReviewWorkspace,
+) -> tuple[pathlib.Path, PrivateCleanupEvidence]:
     validate_workspace_layout(review)
+    target = _bound_private_cleanup_target(review)
+    if target is None:
+        raise ReviewError(
+            "legacy review container is not lexically bound to its source-root "
+            "review directory"
+        )
+    # Legacy v1 state has no preparation-time identities. Capture current identities
+    # only after the complete canonical layout has been validated.
+    return target, _capture_private_cleanup_evidence(target, require_all=False)
+
+
+def _remove_legacy_private_artifacts(
+    container: pathlib.Path,
+    *,
+    expected: PrivateCleanupEvidence,
+) -> str | None:
+    def unlink_captured_artifacts(
+        _parent_descriptor: int,
+        container_descriptor: int,
+    ) -> list[str]:
+        if (
+            _cleanup_identity_evidence(os.fstat(container_descriptor))
+            != expected.container
+        ):
+            return [
+                "private artifact container does not match validated cleanup identity"
+            ]
+        return _unlink_private_review_artifacts(
+            _parent_descriptor,
+            container_descriptor,
+            expected=expected,
+            removed=frozenset(),
+            record_removal=None,
+            identity_label="validated cleanup",
+        )
+
+    return _operate_on_private_review_container(
+        container,
+        unlink_captured_artifacts,
+    )
+
+
+def remove_legacy_private_review_artifacts(
+    review: LegacyReviewWorkspace,
+) -> str | None:
+    container, current_cleanup = _validated_legacy_cleanup_binding(review)
+    return _remove_legacy_private_artifacts(
+        container,
+        expected=current_cleanup,
+    )
+
+
+def cleanup_legacy_workspace(
+    review: LegacyReviewWorkspace,
+    *,
+    keep_container: bool,
+) -> str | None:
+    container, current_cleanup = _validated_legacy_cleanup_binding(review)
+    if not keep_container:
+        return _remove_review_container_tree(
+            container,
+            expected=current_cleanup,
+            use_control_state=False,
+            identity_label="validated cleanup",
+        )
+
+    private_cleanup_error = _remove_legacy_private_artifacts(
+        container,
+        expected=current_cleanup,
+    )
+    if private_cleanup_error is not None:
+        return private_cleanup_error
+
+    def remove_workspace(
+        _parent_descriptor: int,
+        container_descriptor: int,
+    ) -> list[str]:
+        if (
+            _cleanup_identity_evidence(os.fstat(container_descriptor))
+            != current_cleanup.container
+        ):
+            return [
+                "private artifact container does not match validated cleanup identity"
+            ]
+        return _remove_named_directory_tree(
+            container_descriptor,
+            "workspace",
+            label="legacy review workspace",
+            require_private_mode=False,
+        )
+
+    return _operate_on_private_review_container(container, remove_workspace)
+
+
+def cleanup_workspace(review: ReviewWorkspace, *, keep_container: bool) -> str | None:
+    cleanup_errors: list[str] = []
+    validation_error: ReviewError | None = None
+    private_cleanup_target = _bound_private_cleanup_target(review)
     try:
-        if review.workspace_root.exists():
-            shutil.rmtree(review.workspace_root)
-        if not keep_container:
-            shutil.rmtree(review.container_dir)
-    except OSError as error:
-        return str(error)
-    return None
+        validate_workspace_layout(review)
+    except ReviewError as error:
+        validation_error = error
+    if validation_error is None and private_cleanup_target is None:
+        validation_error = ReviewError(
+            "review container is not lexically bound to its source-root review directory"
+        )
+
+    if private_cleanup_target is not None:
+        if validation_error is not None:
+            private_cleanup_error = remove_private_review_artifacts(
+                private_cleanup_target,
+                expected=review.private_cleanup,
+            )
+        elif keep_container:
+            private_cleanup_error = remove_private_review_artifacts(
+                private_cleanup_target,
+                expected=review.private_cleanup,
+            )
+
+            def remove_workspace(
+                _parent_descriptor: int,
+                container_descriptor: int,
+            ) -> list[str]:
+                if (
+                    _cleanup_identity_evidence(os.fstat(container_descriptor))
+                    != review.private_cleanup.container
+                ):
+                    return [
+                        "private artifact container does not match preparation identity"
+                    ]
+                return _remove_named_directory_tree(
+                    container_descriptor,
+                    "workspace",
+                    label="review workspace",
+                    require_private_mode=False,
+                )
+
+            if private_cleanup_error is None:
+                private_cleanup_error = _operate_on_private_review_container(
+                    private_cleanup_target,
+                    remove_workspace,
+                )
+        else:
+            private_cleanup_error = _remove_review_container_tree(
+                private_cleanup_target,
+                expected=review.private_cleanup,
+                use_control_state=True,
+            )
+        if private_cleanup_error:
+            cleanup_errors.append(private_cleanup_error)
+    if validation_error is not None:
+        if cleanup_errors:
+            raise ReviewError(
+                f"{validation_error}; private artifact cleanup failed: "
+                + "; ".join(cleanup_errors)
+            ) from validation_error
+        raise validation_error
+    return "; ".join(cleanup_errors) or None

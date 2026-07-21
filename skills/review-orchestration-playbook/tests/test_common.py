@@ -103,6 +103,57 @@ class ChildEnvironmentTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "nesting exceeds"):
             common.strict_json_loads(payload)
 
+    def test_atomic_writers_force_owner_mode_under_restrictive_umask(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            path_artifact = root / "path-artifact.txt"
+            directory_descriptor = os.open(root, os.O_RDONLY)
+            previous_umask = os.umask(0o777)
+            try:
+                common.write_text_atomic(path_artifact, "path artifact\n")
+                common.write_bytes_atomic_at(
+                    directory_descriptor,
+                    "bound-artifact.txt",
+                    b"bound artifact\n",
+                )
+            finally:
+                os.umask(previous_umask)
+                os.close(directory_descriptor)
+
+            self.assertEqual(
+                path_artifact.read_text(encoding="utf-8"), "path artifact\n"
+            )
+            self.assertEqual(
+                (root / "bound-artifact.txt").read_bytes(),
+                b"bound artifact\n",
+            )
+            self.assertEqual(path_artifact.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(
+                (root / "bound-artifact.txt").stat().st_mode & 0o777,
+                0o600,
+            )
+
+    def test_path_atomic_writer_closes_descriptor_when_fchmod_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            descriptor = -1
+
+            def fail_fchmod(fd: int, _mode: int) -> None:
+                nonlocal descriptor
+                descriptor = fd
+                raise OSError("forced fchmod failure")
+
+            with (
+                mock.patch.object(common.os, "fchmod", side_effect=fail_fchmod),
+                self.assertRaisesRegex(OSError, "forced fchmod failure"),
+            ):
+                common.write_text_atomic(root / "artifact.txt", "artifact\n")
+
+            self.assertGreaterEqual(descriptor, 0)
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+            self.assertEqual(list(root.iterdir()), [])
+
     def test_tail_text_reads_only_a_bounded_suffix(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = pathlib.Path(temporary) / "review.log"
@@ -155,6 +206,45 @@ class ChildEnvironmentTest(unittest.TestCase):
             output_size = stdout_path.stat().st_size
 
         self.assertLessEqual(output_size, 4096)
+
+    def test_logged_command_reads_held_files_after_path_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            attempts = root / "attempts"
+            attempts.mkdir()
+            retained = root / "attempts-retained"
+            stdout_path = attempts / "stdout.log"
+            stderr_path = attempts / "stderr.log"
+            with (
+                stdout_path.open("w+b") as stdout_file,
+                stderr_path.open("w+b") as stderr_file,
+            ):
+
+                def replace_paths() -> None:
+                    attempts.rename(retained)
+                    attempts.mkdir()
+                    stdout_path.write_bytes(b"forged clean verdict")
+                    stderr_path.write_bytes(b"")
+
+                completed = common.run(
+                    (
+                        sys.executable,
+                        "-c",
+                        "import os; os.write(1, b'real finding')",
+                    ),
+                    stdout_file=stdout_file,
+                    stderr_file=stderr_file,
+                    timeout_seconds=5,
+                    output_file_limit_bytes=4096,
+                    on_process_started=replace_paths,
+                )
+
+            self.assertEqual(completed.stdout, b"real finding")
+            self.assertEqual(stdout_path.read_bytes(), b"forged clean verdict")
+            self.assertEqual(
+                (retained / "stdout.log").read_bytes(),
+                b"real finding",
+            )
 
     def test_bounded_capture_enforces_independent_stream_limits(self) -> None:
         with self.assertRaises(common.ReviewOutputLimitError) as raised:
