@@ -26877,11 +26877,6 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
             mock.patch.object(
                 providers,
-                "_allocate_claude_keychain_identity_directory",
-                return_value=self.claude_identity_socket.parent,
-            ),
-            mock.patch.object(
-                providers,
                 "block_forwarded_signals",
                 return_value=set(),
             ),
@@ -27191,6 +27186,11 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
             mock.patch.object(
                 providers,
+                "_allocate_claude_keychain_identity_directory",
+                return_value=self.claude_identity_socket.parent,
+            ) as identity_allocator,
+            mock.patch.object(
+                providers,
                 "block_forwarded_signals",
                 return_value=set(),
             ),
@@ -27212,6 +27212,7 @@ class ProviderPolicyTest(unittest.TestCase):
             ):
                 pass
 
+        identity_allocator.assert_called_once_with(self.review)
         lease.abandon.assert_called_once_with(
             "reviewer process-start state was not tracked"
         )

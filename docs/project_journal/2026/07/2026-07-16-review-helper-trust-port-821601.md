@@ -613,6 +613,14 @@ metadata behavior.
   without the non-Darwin identity-directory fixture used by neighboring tests.
   The regression now injects its existing private `0700` identity directory,
   preserving the production allocator and the terminal fail-closed assertion.
-  The exact targeted test and the complete Python 3.13 main suite pass; the
-  latter ran all 2,257 tests with 6 host-gated skips. No local Python 3.10 run
-  was performed; the replacement GitHub Actions head remains its platform gate.
+  Run 29860285900 showed that the first placement matched an adjacent success
+  regression; the final correction moves the mock into the named failing test
+  and asserts that its allocator was called. The exact targeted test and the
+  complete Python 3.13 main suite pass; the latter ran all 2,257 tests with 6
+  host-gated skips. No local Python 3.10 run was performed; the replacement
+  GitHub Actions head remains its platform gate.
+- The first final-suite attempt hit one unrelated one-second cleanup-lock
+  timeout. The exact regression then passed alone, all 169 `test_state.py`
+  tests passed in module order, and a second complete Python 3.13 run passed
+  all 2,257 tests with 6 host-gated skips. No production change was made for
+  the non-reproducing timing failure.
