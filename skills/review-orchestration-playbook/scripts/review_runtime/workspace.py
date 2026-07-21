@@ -3469,13 +3469,20 @@ def _materialize_frozen_tree(
                         "the frozen head uses a reserved review cleanup "
                         "quarantine path component"
                     )
+                is_gitlink = mode == "160000" and object_type == "commit"
+                cleanup_depth = len(relative.parts) + (1 if is_gitlink else 0)
+                if cleanup_depth >= MAX_REVIEW_CLEANUP_DEPTH:
+                    raise ReviewError(
+                        "frozen Git tree path depth exceeds the review cleanup "
+                        "safety limit"
+                    )
                 destination = workspace_root.joinpath(*relative.parts)
                 path_display = _redact_secret_path(
                     os.fspath(relative),
                     "snapshot path",
                 )
                 try:
-                    if mode == "160000" and object_type == "commit":
+                    if is_gitlink:
                         resolved_parent = destination.parent.resolve(strict=False)
                         if not is_relative_to(
                             resolved_parent, workspace_root.resolve(strict=False)
@@ -3939,7 +3946,12 @@ def _write_private_bounded_json(
 
 def _iter_evidence_strings(value: Any) -> Iterator[bytes]:
     if isinstance(value, str):
-        yield value.encode("utf-8")
+        try:
+            yield os.fsencode(value)
+        except UnicodeEncodeError as error:
+            raise ReviewError(
+                "synthetic-token evidence contains an invalid string"
+            ) from error
         return
     if isinstance(value, dict):
         for key, item in value.items():

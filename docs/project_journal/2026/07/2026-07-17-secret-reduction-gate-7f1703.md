@@ -122,6 +122,8 @@ Implementation and final combined code validation now match this decision, inclu
 - A schema-v5 runner-sealed receipt binds admission to the exact bounded `preflight.json` bytes; replacement, mutation, terminal non-sealing, malformed receipt, and schema-v4 admission all fail closed, while schema-v4 `status` / `wait` / `final` / cleanup remain compatible.
 - Terminal child argv binds the reviewer and egress consent independently of path-loaded state, and the documented same-euid host-TCB limitation remains explicit.
 - Frozen workspace/control creation and runner-lock cleanup fail closed under permissive umasks, symlinks/FIFOs, path swaps, and identity/mode/link-count/owner mismatches.
+- Frozen head paths that exceed the cleanup recursion capacity are rejected before materialization, including the additional directory level created for gitlinks.
+- Non-UTF-8 Git path bytes remain reversible in bounded violation evidence and still participate in raw-value leak checks; invalid non-filesystem surrogate strings fail as typed review errors.
 - Reviewer cwd, frozen prompt, Linux sandbox workspace mount, attempt output, and terminal verdict/control artifacts remain bound to the prepared container across pathname swaps; descriptor handoff and close failures surface before a result is accepted.
 - Skill and journal validation pass.
 
@@ -166,6 +168,8 @@ The remaining unchecked items are post-commit delivery operations. They are inte
 - Admission/final follow-up review: one malformed-JSON fail-closed finding was fixed; follow-up result `No findings.`.
 - Latest `master` cleanup-directory identity fix `202ef98` was merged; the stable directory identity and descriptor-bound runtime-artifact contracts were both retained, and their focused concurrency/path-replacement regressions passed.
 - Ruff checks, changed-file format checks, and `git diff --check`: passed.
+- Python 3.13 final candidate discovery: `1336 tests` in 375.442 seconds with `23 skipped`; the only three errors were subtests of one loopback-bind case denied by the desktop sandbox, and that exact test passed `1/1` outside the sandbox.
+- Final-review boundary regressions: deepest cleanable blob path passed and cleaned completely, the next depth and equivalent gitlink depth failed before materialization without residue, reversible non-UTF-8 evidence serialization passed, and the APFS-incompatible raw-filename end-to-end case skipped explicitly on macOS.
 - Official skill validator: `Skill is valid!`.
 - Project journal validator: `Project journal validation passed.`.
 - The final immutable whole-range review result is recorded in PR #60 after the signed implementation anchor exists; it is not pre-claimed by this commit.

@@ -3470,6 +3470,98 @@ class WorkspaceTest(unittest.TestCase):
         review_root = self.repo / ".codex-tmp"
         self.assertEqual(list(review_root.glob("isolated-review-*")), [])
 
+    def test_frozen_tree_depth_matches_cleanup_safety_boundary(self) -> None:
+        accepted_relative = "/".join(["d"] * 254 + ["accepted.txt"])
+        accepted_head = self.commit_bytes(
+            accepted_relative,
+            b"accepted\n",
+            "Add deepest cleanable frozen path",
+        )
+
+        review = self.prepare_range(self.head, accepted_head)
+        self.assertEqual(
+            (review.workspace_root / accepted_relative).read_bytes(),
+            b"accepted\n",
+        )
+        self.assertIsNone(cleanup_workspace(review, keep_container=False))
+        self.assertFalse(review.container_dir.exists())
+
+        rejected_relative = "/".join(["d"] * 255 + ["rejected.txt"])
+        rejected_head = self.commit_bytes(
+            rejected_relative,
+            b"rejected\n",
+            "Add frozen path beyond cleanup depth",
+        )
+        captured = []
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "frozen Git tree path depth exceeds the review cleanup safety limit",
+        ):
+            _prepare_workspace(
+                repo=self.repo,
+                base_ref=accepted_head,
+                head_ref=rejected_head,
+                ownership_handoff=captured.append,
+            )
+
+        self.assertEqual(captured, [])
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
+    def test_gitlink_depth_accounts_for_materialized_directory(self) -> None:
+        accepted_relative = "nested/deeper/accepted.txt"
+        accepted_head = self.commit_bytes(
+            accepted_relative,
+            b"accepted\n",
+            "Add cleanable blob path",
+        )
+        with mock.patch.object(
+            workspace_runtime,
+            "MAX_REVIEW_CLEANUP_DEPTH",
+            4,
+        ):
+            review = self.prepare_range(self.head, accepted_head)
+            self.assertIsNone(cleanup_workspace(review, keep_container=False))
+
+        rejected_gitlink = "nested/deeper/external"
+        git(
+            self.repo,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{self.head},{rejected_gitlink}",
+        )
+        git(self.repo, "commit", "-m", "Add gitlink beyond cleanup depth")
+        rejected_head = git(self.repo, "rev-parse", "HEAD")
+        captured = []
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_REVIEW_CLEANUP_DEPTH",
+                4,
+            ),
+            self.assertRaisesRegex(
+                ReviewError,
+                "frozen Git tree path depth exceeds the review cleanup safety limit",
+            ),
+        ):
+            _prepare_workspace(
+                repo=self.repo,
+                base_ref=accepted_head,
+                head_ref=rejected_head,
+                ownership_handoff=captured.append,
+            )
+
+        self.assertEqual(captured, [])
+        self.assertEqual(
+            list((self.repo / ".codex-tmp").glob("isolated-review-*")),
+            [],
+        )
+
     def test_external_workspace_rejects_symlinks_that_escape_frozen_root(self) -> None:
         review = prepare_workspace(
             repo=self.repo,
@@ -3692,6 +3784,97 @@ class WorkspaceTest(unittest.TestCase):
         self.assertIn(file_secret.encode(), diff)
         self.assertIn(link_secret.encode(), diff)
         self.assertNotIn(b"<redacted", diff)
+
+    def test_secret_addition_in_non_utf8_path_has_reversible_location(self) -> None:
+        raw_value = unregistered_generic_credential()
+        raw_path = b"non-utf8-\xff-secret.txt"
+        relative = os.fsdecode(raw_path)
+        payload = b'password = "' + raw_value + b'"\n'
+        destination = self.repo / relative
+        try:
+            destination.write_bytes(payload)
+        except OSError as error:
+            if error.errno not in {errno.EILSEQ, errno.EINVAL, errno.EPERM}:
+                raise
+            self.skipTest("filesystem rejects non-UTF-8 path names")
+        git(self.repo, "add", relative)
+        git(self.repo, "commit", "-m", "Add credential under non-UTF-8 path")
+        secret_head = git(self.repo, "rev-parse", "HEAD")
+
+        review = self.prepare_range(self.head, secret_head)
+        violation = self.assert_secret_violation(
+            review,
+            raw_value,
+            base_count=0,
+            head_count=1,
+        )
+
+        self.assertEqual(violation["additions"][0]["surface"], "blob")
+        self.assertEqual(
+            os.fsencode(violation["additions"][0]["path"]),
+            raw_path,
+        )
+        self.assertEqual(
+            (review.workspace_root / relative).read_bytes(),
+            payload,
+        )
+        self.assertIn(raw_value, review.diff_file.read_bytes())
+        self.assert_control_evidence_omits(review, raw_value)
+
+        manifest_payload = (
+            review.workspace_root
+            / ".codex-review"
+            / workspace_runtime.SYNTHETIC_MANIFEST_NAME
+        ).read_bytes()
+        self.assertNotIn(b"\xff", manifest_payload)
+        self.assertIn(b"non-utf8-\\udcff-secret.txt", manifest_payload)
+
+    def test_non_utf8_path_evidence_serialization_is_reversible(self) -> None:
+        raw_path = b"non-utf8-\xff-secret.txt"
+        path = os.fsdecode(raw_path)
+        evidence = {
+            "secret_delta": {
+                "violations": [
+                    {
+                        "additions": [
+                            {
+                                "line": 1,
+                                "occurrence_count": 1,
+                                "path": path,
+                                "surface": "blob",
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+
+        encoded = workspace_runtime._bounded_json_bytes(
+            evidence,
+            label="test evidence",
+        )
+        decoded_path = json.loads(encoded)["secret_delta"]["violations"][0][
+            "additions"
+        ][0]["path"]
+
+        self.assertEqual(os.fsencode(decoded_path), raw_path)
+        self.assertNotIn(b"\xff", encoded)
+        self.assertIn(b"non-utf8-\\udcff-secret.txt", encoded)
+        with self.assertRaisesRegex(ReviewError, "contains an invalid string"):
+            list(workspace_runtime._iter_evidence_strings("\ud800"))
+
+        raw_value = unregistered_generic_credential()
+        descriptor = workspace_runtime._secret_reduction_descriptor(
+            raw_value,
+            {"generic-secret-assignment"},
+        )
+        leaking_path = os.fsdecode(b"non-utf8-\xff-" + raw_value)
+        with self.assertRaisesRegex(ReviewError, "would expose a raw synthetic value"):
+            workspace_runtime._bounded_json_bytes(
+                {"path": leaking_path},
+                label="test evidence",
+                accepted_values=(descriptor,),
+            )
 
     def test_deleted_binary_secret_is_allowed_without_control_evidence_leak(
         self,
