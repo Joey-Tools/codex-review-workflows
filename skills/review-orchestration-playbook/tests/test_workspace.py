@@ -949,12 +949,18 @@ class WorkspaceTest(unittest.TestCase):
             "surface": "binary",
         }
         too_many = workspace_runtime.MAX_SECRET_DELTA_ADDITION_LOCATIONS
+        oversized_location_set = violation(
+            "a" * 64,
+            [dict(addition) for _ in range(too_many)],
+        )
+        oversized_location_set["delta"] = too_many
+        oversized_location_set["head_count"] = too_many
         summary = {
             "limitations": [],
             "location_status": "inconclusive",
             "status": "violations",
             "violations": [
-                violation("a" * 64, [dict(addition) for _ in range(too_many)]),
+                oversized_location_set,
                 violation("b" * 64, [dict(addition)]),
             ],
         }
@@ -966,6 +972,18 @@ class WorkspaceTest(unittest.TestCase):
         summary["violations"] = [malformed]
         with self.assertRaisesRegex(ReviewError, "violation is inconsistent"):
             workspace_runtime.validate_secret_delta_summary(summary)
+
+        excessive_addition = dict(addition)
+        excessive_addition["occurrence_count"] = 2
+        summary["violations"] = [violation("c" * 64, [excessive_addition])]
+        with self.assertRaisesRegex(ReviewError, "addition evidence is inconsistent"):
+            workspace_runtime.validate_secret_delta_summary(summary)
+
+        summary["location_status"] = "complete"
+        summary["violations"] = [violation("c" * 64, [])]
+        with self.assertRaisesRegex(ReviewError, "addition evidence is inconsistent"):
+            workspace_runtime.validate_secret_delta_summary(summary)
+        summary["location_status"] = "inconclusive"
 
         unhashable_rules = dict(violation("d" * 64, [dict(addition)]))
         unhashable_rules["rules"] = [{}, "generic-secret-assignment"]
@@ -988,7 +1006,7 @@ class WorkspaceTest(unittest.TestCase):
         ]
         bounded_summary = {
             "limitations": [],
-            "location_status": "complete",
+            "location_status": "inconclusive",
             "status": "violations",
             "violations": bounded_violations,
         }
@@ -5332,6 +5350,64 @@ class WorkspaceTest(unittest.TestCase):
         self.assertIn(
             raw_value,
             (review.workspace_root / new_path).read_bytes(),
+        )
+
+    def test_moved_secret_plus_copy_does_not_invent_addition_location(self) -> None:
+        raw_value = unregistered_generic_credential()
+        rendered = b'password = "' + raw_value + b'"\n'
+        secret_base = self.commit_bytes(
+            "old-secret.txt",
+            rendered,
+            "Add credential before move and copy",
+        )
+        git(self.repo, "mv", "old-secret.txt", "new-secret.txt")
+        (self.repo / "copied-secret.txt").write_bytes(rendered)
+        git(self.repo, "add", "copied-secret.txt")
+        git(self.repo, "commit", "-m", "Move and copy credential")
+        copied_head = git(self.repo, "rev-parse", "HEAD")
+
+        review = self.prepare_range(secret_base, copied_head)
+        violation = self.assert_secret_violation(
+            review,
+            raw_value,
+            base_count=1,
+            head_count=2,
+        )
+        self.assertEqual(violation["delta"], 1)
+        self.assertEqual(violation["additions"], [])
+        self.assertEqual(violation["omitted_addition_location_count"], 0)
+        self.assertEqual(
+            self.assert_secret_delta_status(review, "violations")["location_status"],
+            "inconclusive",
+        )
+
+    def test_cross_surface_move_plus_copy_does_not_invent_location(self) -> None:
+        raw_value = unregistered_generic_credential()
+        rendered = b'password = "' + raw_value + b'"\n'
+        secret_base = self.commit_bytes(
+            "old-secret.txt",
+            rendered,
+            "Add credential before cross-surface move",
+        )
+        git(self.repo, "rm", "old-secret.txt")
+        (self.repo / "copied-secret.txt").write_bytes(rendered)
+        (self.repo / "moved-secret-link").symlink_to(os.fsdecode(raw_value))
+        git(self.repo, "add", "copied-secret.txt", "moved-secret-link")
+        git(self.repo, "commit", "-m", "Move and copy credential across surfaces")
+        copied_head = git(self.repo, "rev-parse", "HEAD")
+
+        review = self.prepare_range(secret_base, copied_head)
+        violation = self.assert_secret_violation(
+            review,
+            raw_value,
+            base_count=1,
+            head_count=2,
+        )
+        self.assertEqual(violation["delta"], 1)
+        self.assertEqual(violation["additions"], [])
+        self.assertEqual(
+            self.assert_secret_delta_status(review, "violations")["location_status"],
+            "inconclusive",
         )
 
     def test_copied_unregistered_secret_count_increase_is_raw_violation(self) -> None:

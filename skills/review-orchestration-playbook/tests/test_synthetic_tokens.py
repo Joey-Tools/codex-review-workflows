@@ -6819,7 +6819,9 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         evidence = self.validate(review, catalog=catalog)
         self.assertEqual(evidence["secret_delta"], delta)
 
-    def test_secret_delta_paths_only_report_new_tracked_paths(self) -> None:
+    def test_secret_delta_paths_do_not_guess_when_deletion_offsets_growth(
+        self,
+    ) -> None:
         catalog = legacy_catalog(values=(LEGACY_A,))
         deleted_path = f"deleted-{LEGACY_A}.txt"
         modified_path = f"modified-{LEGACY_A}.txt"
@@ -6850,29 +6852,11 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             (2, 4),
         )
         violation = manifest["secret_delta"]["violations"][0]
+        self.assertEqual(violation["delta"], 2)
+        self.assertEqual(violation["additions"], [])
         self.assertEqual(
-            violation["additions"],
-            [
-                {
-                    "line": 2,
-                    "occurrence_count": 1,
-                    "path": "blob.txt",
-                    "surface": "blob",
-                },
-                {
-                    "line": None,
-                    "occurrence_count": 2,
-                    "path": added_path,
-                    "surface": "path",
-                },
-            ],
-        )
-        self.assertFalse(
-            any(
-                item["surface"] == "path"
-                and item["path"] in {deleted_path, modified_path}
-                for item in violation["additions"]
-            )
+            manifest["secret_delta"]["location_status"],
+            "inconclusive",
         )
         evidence = self.validate(review, catalog=catalog)
         self.assertEqual(evidence["secret_delta"], manifest["secret_delta"])

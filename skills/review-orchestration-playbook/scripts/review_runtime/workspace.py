@@ -4544,6 +4544,7 @@ def _secret_delta_addition_locations(
     descriptors = tuple(violations)
     exact_index = _index_exact_values(descriptors)
     occurrence_budget = LegacyOccurrenceBudget.default()
+    candidate_occurrence_counts: Counter[AcceptedSyntheticValue] = Counter()
     total_locations = 0
     location_complete = True
 
@@ -4556,6 +4557,7 @@ def _secret_delta_addition_locations(
         occurrence_count: int = 1,
     ) -> None:
         nonlocal location_complete, total_locations
+        candidate_occurrence_counts[descriptor] += occurrence_count
         location = (os.fsdecode(raw_path), line, surface)
         locations: dict[tuple[str, int | None, str], int] = evidence[descriptor][
             "locations"
@@ -4724,6 +4726,7 @@ def _secret_delta_addition_locations(
                         # an added-block match indistinguishable from retained
                         # content. Preserve the count violation but do not
                         # invent a location.
+                        candidate_occurrence_counts[descriptor] += local_growth
                         location_complete = False
                         continue
                     for line_number, occurrence_count in sorted(line_counts.items()):
@@ -4760,6 +4763,19 @@ def _secret_delta_addition_locations(
             )
 
     for descriptor, item in evidence.items():
+        base_count, head_count = violations[descriptor]
+        delta = head_count - base_count
+        candidate_count = candidate_occurrence_counts[descriptor]
+        if candidate_count != delta:
+            location_complete = False
+        if candidate_count > delta:
+            # A complete Git tree records no operation identity. When local
+            # positive growth exceeds the authoritative global delta, one or
+            # more head occurrences were offset by removals or moves, but the
+            # endpoint trees cannot prove which candidate is retained. Do not
+            # arbitrarily label any of them as the new occurrence.
+            item["locations"].clear()
+            item["omitted_location_count"] = 0
         locations = item["locations"]
         item["locations"] = [
             {
@@ -6060,6 +6076,7 @@ def validate_secret_delta_summary(
         total_additions += len(additions)
         if total_additions > MAX_SECRET_DELTA_ADDITION_LOCATIONS:
             raise ReviewError(f"{label} has too many addition locations")
+        addition_occurrence_count = 0
         for addition in additions:
             if not isinstance(addition, dict) or set(addition) != {
                 "line",
@@ -6083,6 +6100,12 @@ def validate_secret_delta_summary(
                 or surface not in {"binary", "blob", "path", "symlink-target"}
             ):
                 raise ReviewError(f"{label} addition is inconsistent")
+            addition_occurrence_count += occurrence_count
+        if addition_occurrence_count > delta or (
+            value["location_status"] == "complete"
+            and (addition_occurrence_count != delta or omitted != 0)
+        ):
+            raise ReviewError(f"{label} addition evidence is inconsistent")
         seen_digests.add(digest)
 
     status = value["status"]

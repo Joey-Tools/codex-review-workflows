@@ -66,7 +66,7 @@ A dynamic expression that cannot produce one stable exact byte value does not en
 
 ### Violation Reporting
 
-A violation report contains only detectable additions for a candidate whose global count grows. Text evidence carries raw path plus one-based head line; new tracked paths and binary fallbacks use `line: null`; symlink targets use line `1`. It does not enumerate unchanged residual or base-only occurrences. If bounded diff evidence cannot map every detected local growth to a line, `location_status` is `inconclusive` rather than inventing one.
+A violation report contains only detectable additions for a candidate whose global count grows. Text evidence carries raw path plus one-based head line; new tracked paths and binary fallbacks use `line: null`; symlink targets use line `1`. It does not enumerate unchanged residual or base-only occurrences. If bounded diff evidence cannot map every detected local growth to a line, `location_status` is `inconclusive` rather than inventing one. Git endpoint trees do not preserve `git mv` operation identity, so a move plus an identical copy is deliberately reported with ambiguous locations omitted when the local positive candidates exceed the authoritative global delta; heuristic rename attribution is not admission evidence.
 
 The authoritative violation list retains every positive-delta candidate that fits the bounded catalog and complete-preflight capacity. If optional secondary accepted/legacy/reduction audit rows would make the public evidence exceed its fixed byte limit, those rows may be removed after the underlying manifest has been completely validated; the complete digest and base/head/delta proof plus bounded additions remain `violations` and admission remains blocked. Location omission likewise does not weaken a proved global-count violation. The secondary synthetic-token section retains its 64 KiB compact bound. The complete preflight retains a separate 128 KiB bound and switches from pretty to equivalent compact JSON only when required by that limit.
 
@@ -123,6 +123,7 @@ Implementation and final combined code validation now match this decision, inclu
 - Non-exact dynamic expressions are excluded from the counter.
 - Base-only unextractable shapes may be deleted, while head-side or otherwise genuinely incomplete scans report `inconclusive`.
 - Violation diagnostics include only newly added `path:line` locations.
+- Ambiguous move-plus-copy or cross-surface endpoint mappings never overstate addition locations; they retain the proved global violation while reporting location evidence as `inconclusive`.
 - Single/double/triple review counting remains Codex / Codex+Claude / Codex+Claude+GitHub Codex, each local named lane using its own clean Git worktree without an injected full diff.
 - The low-level supplied-diff helper is never counted as a named lane, and PR readiness has no additional offline/independent Codex double gate.
 - PR/master/merge-ready requires low-level `stateful final` followed by same-state, current-head `stateful admission`; only receipt-bound admission exit `0` is permitting.
@@ -179,6 +180,7 @@ The remaining unchecked items are post-commit delivery operations. They are inte
 - Latest `master` cleanup-directory identity fix `202ef98` was merged; the stable directory identity and descriptor-bound runtime-artifact contracts were both retained, and their focused concurrency/path-replacement regressions passed.
 - Ruff checks, changed-file format checks, and `git diff --check`: passed.
 - Python 3.13 final pre-commit discovery after integrating master `3134c1c`: `1359 tests` in 409.464 seconds, `OK (skipped=5)`, in the narrow environment that permits the loopback-bind lifecycle test.
+- Python 3.13 post-review location-evidence discovery: `1361 tests` in 337.678 seconds, `OK (skipped=5)`, in the loopback-capable environment. Move-plus-copy and cross-surface cancellation retain the authoritative global violation while omitting ambiguous locations, and the summary validator rejects any reported occurrence total above `delta` or an incomplete `location_status=complete` claim.
 - Final focused Python 3.13 suites: state `163 tests` in 174.817 seconds; workspace `145 tests` in 139.507 seconds with one platform skip; contracts `41 tests`; all passed.
 - Ubuntu CI exposed an inode-reuse race in one runner-lock replacement fixture; retaining the original inode via rename makes the replacement identity deterministic without changing production behavior.
 - Final-review boundary regressions: deepest cleanable blob path passed and cleaned completely, the next depth and equivalent gitlink depth failed before materialization without residue, reversible non-UTF-8 evidence serialization passed, and the APFS-incompatible raw-filename end-to-end case skipped explicitly on macOS.
