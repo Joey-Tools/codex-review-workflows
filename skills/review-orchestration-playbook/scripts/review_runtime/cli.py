@@ -39,7 +39,10 @@ def _add_review_arguments(parser: argparse.ArgumentParser) -> None:
         "--reviewer",
         choices=("codex", "claude"),
         default="codex",
-        help="Logical local reviewer lane.",
+        help=(
+            "Low-level supplied-diff helper reviewer; this does not satisfy "
+            "a canonical named review shape."
+        ),
     )
     parser.add_argument("--base-ref", required=True, help="Frozen base commit-ish.")
     parser.add_argument("--head-ref", required=True, help="Frozen head commit-ish.")
@@ -56,8 +59,9 @@ def _add_review_arguments(parser: argparse.ArgumentParser) -> None:
         "--egress-consent",
         choices=CLAUDE_EGRESS_CONSENTS,
         help=(
-            "Required for the Claude-family lane; records the user's explicit "
-            "external-review authorization."
+            "Required for the low-level Claude helper; records explicit "
+            "Anthropic-only consent or separately requested Anthropic-plus-Copilot "
+            "compatibility-fallback consent."
         ),
     )
     parser.add_argument(
@@ -84,8 +88,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="isolated_review",
         description=(
-            "Run a pinned Codex or Claude-family reviewer against one frozen Git range "
-            "inside a detached read-only review workspace."
+            "Run a pinned Codex or low-level Claude helper against one frozen Git range "
+            "inside a detached read-only review workspace. Results are diagnostic and "
+            "ineligible for named review lanes; the foreground command prints only the "
+            "raw helper artifact, so automation that needs machine metadata must use "
+            "the stateful interface."
         ),
     )
     _add_review_arguments(parser)
@@ -93,7 +100,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _build_stateful_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="isolated_review stateful")
+    parser = argparse.ArgumentParser(
+        prog="isolated_review stateful",
+        description=(
+            "Manage a low-level supplied-diff helper run; its status is always "
+            "named_lane_eligible=false."
+        ),
+    )
     actions = parser.add_subparsers(dest="action", required=True)
     start_parser = actions.add_parser("start")
     _add_review_arguments(start_parser)

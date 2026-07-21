@@ -12,6 +12,12 @@ superseded_by: 20260717-c17a11
 
 # Claude OAuth Per-Model-Attempt Freshness
 
+> Historical helper record: `20260717-c17a11`, then `20260720-7f2001`,
+> superseded this workstream. The implementation details below describe the
+> low-level `isolated_review` helper at that point in time. They do not define
+> named single, double, or triple review and do not apply to the canonical
+> direct Claude lane.
+
 ## Summary
 
 Claude local-login preflight previously required one OAuth credential to cover
@@ -19,11 +25,11 @@ both candidate models: `2 * (1800 + 120) = 3840` seconds. A newly refreshed
 credential with an approximately one-hour lifetime therefore could not satisfy
 the gate even though it safely covered the current bounded model attempt.
 
-This workstream replaces only that aggregate-lifetime rule. It preserves the
-runtime and isolation design established by the Claude local-login and platform
-capabilities workstreams.
+This workstream replaced only that aggregate-lifetime rule. It preserved the
+then-current helper runtime and isolation design established by the Claude
+local-login and platform-capabilities workstreams.
 
-## Current State
+## Historical Helper State
 
 - Credential freshness is defined once as the current model-attempt timeout plus
   its safety margin: `1800 + 120 = 1920` seconds.
@@ -40,9 +46,10 @@ capabilities workstreams.
   earlier model-attempt evidence. This remains true if the warmup happened to
   refresh the credential before returning a transient result, and it never
   enters Copilot fallback.
-- Explicit authentication unavailability and model entitlement keep the
-  existing fallback policy: only prior `double-review` or `triple-review`
-  consent may authorize Copilot.
+- Historical helper-only authentication or model fallback required separate
+  explicit Copilot consent. Named-review wording alone never authorizes that
+  provider substitution, and a Copilot result never satisfies named double or
+  triple review under the superseding `20260720-7f2001` policy.
 - A fixed-input warmup's explicit entitlement becomes model-chain evidence only
   when strict structured output verifies the exact requested effective model.
   It has no final text, does not start the final broker or repository-review

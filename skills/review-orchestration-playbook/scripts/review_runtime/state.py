@@ -33,7 +33,12 @@ from .common import (
     write_json,
     write_text_atomic,
 )
-from .providers import CLAUDE_EGRESS_CONSENTS, run_review
+from .providers import (
+    CLAUDE_EGRESS_CONSENTS,
+    LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+    NAMED_LANE_ELIGIBLE,
+    run_review,
+)
 from .workspace import (
     MAX_PREFLIGHT_JSON_BYTES,
     PRIVATE_HELPER_ARTIFACT_NAMES,
@@ -1762,6 +1767,8 @@ def start(
         state: dict[str, Any] = {
             "version": STATE_SCHEMA_VERSION,
             "reviewer": reviewer,
+            "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+            "named_lane_eligible": NAMED_LANE_ELIGIBLE,
             "workspace": review.to_json(),
             "keep_workspace": keep_workspace,
             "egress_consent": egress_consent,
@@ -2127,6 +2134,8 @@ def status(state_dir: pathlib.Path) -> dict[str, Any]:
     return {
         "state_dir": str(state_dir),
         "reviewer": state.get("reviewer"),
+        "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+        "named_lane_eligible": NAMED_LANE_ELIGIBLE,
         "egress_consent": state.get("egress_consent"),
         "pid": pid or None,
         "runner_lock_held": process_running,
@@ -2947,7 +2956,7 @@ def final(state_dir: pathlib.Path) -> tuple[int, str]:
     )
     if summary.get("fallback_workspace_retained"):
         details = (
-            f"{details}\nfrozen workspace retained for clean-context fallback: "
+            f"{details}\nlegacy helper workspace retained for diagnosis only: "
             f"{summary['fallback_workspace']}"
         )
     return int(wait_code or exit_code or 1), str(details)

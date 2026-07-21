@@ -108,7 +108,7 @@ class ForegroundCleanupTest(unittest.TestCase):
                     "--reviewer",
                     "claude",
                     "--egress-consent",
-                    "double-review",
+                    "explicit-claude-with-copilot-fallback",
                 ]
             )
 
@@ -118,7 +118,7 @@ class ForegroundCleanupTest(unittest.TestCase):
             lock_fd=41,
             terminal_process=True,
             expected_reviewer="claude",
-            expected_egress_consent="double-review",
+            expected_egress_consent="explicit-claude-with-copilot-fallback",
         )
 
     def test_stateful_cleanup_dispatches_bounded_cleanup(self) -> None:

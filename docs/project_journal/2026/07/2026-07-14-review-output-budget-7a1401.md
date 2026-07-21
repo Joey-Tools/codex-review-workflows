@@ -12,18 +12,22 @@ superseded_by: 20260719-7f1901
 
 # Bound Independent Codex Review Output
 
+> Historical implementation record. Review policy migration `20260720-7f2001`
+> supersedes this workflow; none of the gate descriptions below defines or
+> satisfies a current named single, double, or triple lane.
+
 ## Summary
 
-- Independent Codex PR reviews now keep complete process output in task-scoped files and expose only bounded status probes plus a separate final-message artifact to the parent workflow.
+- This retired independent-review gate kept complete process output in task-scoped files and exposed only bounded status probes plus a separate final-message artifact to the parent workflow.
 
-## Current State
+## Historical State
 
-- The PR-readiness gate requires stdout and stderr capture instead of streaming reviewer traces into the parent transcript.
+- The retired PR-readiness gate required stdout and stderr capture instead of streaming reviewer traces into the parent transcript.
 - The Codex CLI invocation writes its terminal artifact with `--output-last-message` so the final result never has to be recovered from stdout.
 - A missing final-message file permits one bounded stderr tail so deterministic authentication, permission, configuration, or runtime-verification failures remain classified as blocked.
 - Every attempt uses a fresh final-message path and accepts it only after a zero exit with a newly created nonempty file, preventing stale or partial clean results from crossing retries.
 - The shared review-lane contract limits polling to process state, counts, or a short error tail and classifies a missing terminal artifact as inconclusive.
-- Independent review attempts default to a 30-minute wall-clock deadline and 16 MiB per stdout/stderr file; hitting either limit terminates the process, rejects its final-message artifact, and retains only bounded diagnostics.
+- Independent review attempts used a 30-minute wall-clock deadline and 16 MiB per stdout/stderr file; hitting either limit terminated the process, rejected its final-message artifact, and retained only bounded diagnostics.
 - The final-message artifact has a separate 64 KiB limit checked before reading; an oversized artifact is rejected as inconclusive and removed after recording only its byte count.
 - Deadline expiry follows the same TERM/grace/KILL path as a process-log limit, and both logs are statted again after exit so a final-write race cannot bypass the caps.
 - The reviewer runs in a dedicated process group with write-time log enforcement; acceptance waits for every group member and inherited sink to close, preventing descendant writers from escaping cleanup.

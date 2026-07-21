@@ -3,7 +3,7 @@ id: 20260717-7f1703
 title: Trust Reviewers and Gate Exact-Secret Growth
 status: completed
 created: 2026-07-17
-updated: 2026-07-20
+updated: 2026-07-21
 branch: codex/secret-reduction-review
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/60
 supersedes: []
@@ -17,8 +17,8 @@ superseded_by:
 - Codex, Claude Code, and the consent-gated Copilot fallback are trusted processors for the frozen tracked review scope.
 - Tracked secret deltas do not block reviewer launch or trigger reviewer-input rewriting.
 - PR/master admission allows every existing exact raw secret whose global tracked count does not grow and blocks only first appearance or growth.
-- Stateful review evidence and secret admission are separate current-head checks: harvest `stateful final` first, then run `stateful admission` on the same state.
-- The frozen reviewer launch boundary uses safe modes, prepared runner-lock identity checks, and descriptor-bound workspace, prompt, sandbox, attempt-output, and verdict/control I/O.
+- Stateful review evidence and secret admission are separate current-head checks: harvest `stateful final` first, then run `stateful admission` on the same state and require its schema-v5 runner-sealed preflight receipt.
+- The frozen reviewer launch boundary uses safe modes, prepared runner-lock identity checks, trusted child argv for reviewer/egress policy, and descriptor-bound workspace, prompt, sandbox, attempt-output, and verdict/control I/O.
 
 ## Decision
 
@@ -76,27 +76,33 @@ Historical `legacy_exemptions` no longer select a different admission policy. Th
 
 ### Review Lanes
 
-The fresh local Codex CLI review is the independent local lane:
+Canonical named lanes use separate clean Git worktrees, clear reviewer context, and no injected full diff:
 
 - single review: fresh local Codex;
 - double review: fresh local Codex plus one Claude-family lane;
 - triple review: double review plus current-head GitHub Codex.
 
-PR readiness reuses that Codex artifact. It does not add separate `offline-frozen-diff-review` or `independent-codex-pr-review` gates. Retries, helper implementations, and the clean-context fallback remain one logical Codex lane.
+The stateful supplied-diff/no-Git helper remains a low-level compatibility, security-maintenance, and admission-audit tool. Its reviewer artifact is trusted but never satisfies or replaces a named lane. PR readiness does not add the former `offline-frozen-diff-review` or `independent-codex-pr-review` lanes; the explicit low-level helper final/admission pair is a non-lane merge gate.
 
 ### Stateful Admission Evidence
 
-PR/master/merge-ready evaluation first harvests the terminal reviewer artifact with `stateful final --state-dir <state_dir>`, then evaluates the bounded public secret summary with `stateful admission --state-dir <state_dir>` on that same current-head state. Admission exit `0` means `clean` and is the only permitting result; exit `1` means violations, exit `3` means pending, and exit `75` means inconclusive. The reviewer final is independent and may remain successful when admission blocks or is inconclusive. Foreground review never supplies admission evidence. A head change invalidates both checks and requires a new frozen current-head state. None of these admission outcomes may delay, suppress, or redact the trusted reviewer launch.
+PR/master/merge-ready evaluation first harvests the terminal reviewer artifact with `stateful final --state-dir <state_dir>`, then evaluates the bounded public secret summary with `stateful admission --state-dir <state_dir>` on that same current-head state. Before releasing its inherited lock, the stateful runner exact-reads and validates `preflight.json` through the preparation-bound container and advances the schema-v5 marker with the artifact's exact size and SHA-256. Admission re-reads the artifact under the same bounded no-follow rules and trusts it only when those bytes match the runner-sealed receipt. Admission exit `0` means receipt-bound `clean` and is the only permitting result; exit `1` means violations, exit `3` means pending, and exit `75` means inconclusive. A terminal unsealed state, malformed or mismatched receipt, replaced preflight, or schema-v4 marker is inconclusive. Schema v4 remains compatible with `status`, `wait`, `final`, and cleanup; it simply cannot authorize admission. The reviewer final is independent and may remain successful when admission blocks or is inconclusive. Foreground review never supplies admission evidence. A head change invalidates both checks and requires a new frozen current-head state. None of these admission outcomes may delay, suppress, or redact the trusted reviewer launch.
+
+### Runner Policy Binding And Host Boundary
+
+The trusted parent passes the selected reviewer and exact optional egress-consent value to the terminal child as argv alongside the inherited runner-lock descriptor. The child validates the lock before loading state, requires the path-loaded reviewer and consent to match those argv values exactly, and launches only with the argv-bound policy. A replacement `state.json` therefore cannot switch a Codex-only run into Claude or Copilot egress.
+
+The receipt and argv bindings close helper-controlled path-replacement and cooperative-writer races; they do not claim hostile same-euid isolation. A malicious process running as the same account can mutate owner-private namespaces and is part of the host trusted computing base (host TCB, meaning software with equivalent host-account authority). This limitation also applies to cleanup identity binding and is not broadened into a container/security redesign in this delivery.
 
 ### Workspace Scope
 
-Targeted launch-boundary hardening is part of this delivery: frozen workspace and control artifacts use safe owner-only modes, cleanup is bound to the prepared runner-lock identity, and reviewer workspace, prompt, sandbox mount, attempt output, and verdict/control I/O remain attached to validated descriptors. This does not adopt a detached-worktree or reflinked-snapshot architecture; that broader redesign remains deferred.
+Targeted launch-boundary hardening is part of this delivery: frozen workspace and control artifacts use safe owner-only modes, cleanup is bound to the prepared runner-lock identity, reviewer/egress policy is child-argv-bound, and reviewer workspace, prompt, sandbox mount, attempt output, preflight receipt, and verdict/control I/O remain attached to validated descriptors or exact digests. Canonical named lanes now use #68's separate clean Git worktree contract. This delivery does not redesign the low-level helper's `.git`-free frozen snapshot into a detached worktree or reflinked snapshot; that separate architecture decision remains deferred.
 
 ## Current State
 
 This note supersedes its earlier strict-reduction design, which required raw-count decrease, unembedded non-growth, same-location provenance, encoded-variant denial, and two extra Codex PR-readiness gates. Those requirements are no longer the target contract.
 
-Implementation and final combined code validation now match this decision, including the explicit stateful final-then-admission split. This tracked implementation workstream is `completed`; the final fixed-range Codex review, PR merge, private-overlay release, installation sync, and remote-task notification remain delivery operations tracked by the active PR/task rather than transient project state. Historical test counts and prior fixed-range review claims in earlier revisions of this note are not validation evidence for the new semantics.
+Implementation and final combined code validation now match this decision, including the explicit stateful final-then-admission split, schema-v5 runner-sealed preflight receipt, reviewer/egress child-argv binding, and #68 named-lane/low-level-helper separation. This tracked implementation workstream is `completed`; the final fixed-range Codex review, PR merge, private-overlay release, installation sync, and remote-task notification remain delivery operations tracked by the active PR/task rather than transient project state. Historical test counts and prior fixed-range review claims in earlier revisions of this note are not validation evidence for the new semantics.
 
 ## Validation Criteria
 
@@ -109,10 +115,12 @@ Implementation and final combined code validation now match this decision, inclu
 - Non-exact dynamic expressions are excluded from the counter.
 - Base-only unextractable shapes may be deleted, while head-side or otherwise genuinely incomplete scans report `inconclusive`.
 - Violation diagnostics include only newly added `path:line` locations.
-- Single/double/triple review counting remains Codex / Codex+Claude / Codex+Claude+GitHub Codex.
-- PR readiness has no additional offline/independent Codex double gate.
-- PR/master/merge-ready requires `stateful final` followed by same-state, current-head `stateful admission`; only admission exit `0` is permitting.
+- Single/double/triple review counting remains Codex / Codex+Claude / Codex+Claude+GitHub Codex, each local named lane using its own clean Git worktree without an injected full diff.
+- The low-level supplied-diff helper is never counted as a named lane, and PR readiness has no additional offline/independent Codex double gate.
+- PR/master/merge-ready requires low-level `stateful final` followed by same-state, current-head `stateful admission`; only receipt-bound admission exit `0` is permitting.
 - Admission exits `1`, `3`, and `75` remain distinct violations, pending, and inconclusive outcomes; reviewer final success is independent, foreground output is insufficient, and a head change invalidates both checks.
+- A schema-v5 runner-sealed receipt binds admission to the exact bounded `preflight.json` bytes; replacement, mutation, terminal non-sealing, malformed receipt, and schema-v4 admission all fail closed, while schema-v4 `status` / `wait` / `final` / cleanup remain compatible.
+- Terminal child argv binds the reviewer and egress consent independently of path-loaded state, and the documented same-euid host-TCB limitation remains explicit.
 - Frozen workspace/control creation and runner-lock cleanup fail closed under permissive umasks, symlinks/FIFOs, path swaps, and identity/mode/link-count/owner mismatches.
 - Reviewer cwd, frozen prompt, Linux sandbox workspace mount, attempt output, and terminal verdict/control artifacts remain bound to the prepared container across pathname swaps; descriptor handoff and close failures surface before a result is accepted.
 - Skill and journal validation pass.
@@ -129,7 +137,7 @@ Implementation and final combined code validation now match this decision, inclu
 - [x] Finish the exact raw counter, added-line evidence, and reviewer-egress separation.
 - [x] Harden frozen review launch modes, runner-lock cleanup identity, and descriptor-bound workspace, sandbox, prompt, attempt, and verdict I/O.
 - [x] Update focused scanner, workspace, provider, state, CLI, descriptor-launch, and contract tests.
-- [x] Separate current-head reviewer final evidence from the explicit stateful secret-admission decision and document its exit-code contract.
+- [x] Separate current-head reviewer final evidence from the explicit stateful secret-admission decision, bind admission to a schema-v5 runner-sealed preflight receipt, bind reviewer/egress policy to trusted child argv, and document compatibility plus host-TCB limits.
 - [x] Run Python 3.13 validation, contract checks, skill validation, and journal validation.
 - [ ] Run one fresh local Codex review over the final signed fixed range and resolve actionable findings.
 - [ ] Push the branch, update PR #60, and wait for current-head CI and review completion.
