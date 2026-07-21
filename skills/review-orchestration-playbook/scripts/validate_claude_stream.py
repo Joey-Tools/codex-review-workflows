@@ -4,27 +4,54 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
+import os
 import re
+import stat
 import sys
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, BinaryIO, Mapping
 
+from review_runtime.claude_capabilities import (
+    CLAUDE_REQUIRED_OPTIONS,
+    ClaudeCapabilities,
+)
+from review_runtime.claude_provenance import (
+    CLAUDE_RELEASE_KEY_FINGERPRINT,
+    CLAUDE_SUPPORTED_PLATFORM_BINARIES,
+    VerifiedClaudeExecutable,
+    release_artifact_urls,
+)
+from review_runtime.claude_version_policy import (
+    CLAUDE_COMPATIBILITY_SPEC,
+    ClaudeVersionPolicyError,
+    parse_compatible_release_version,
+)
+from review_runtime import claude_stream_contract
 
-CLAUDE_CODE_MINIMUM_VERSION = (2, 1, 211)
-CLAUDE_CODE_MAXIMUM_VERSION = (3, 0, 0)
 CLAUDE_CODE_VERSION_CONTRACT = {
     "rule": "strict_release_semver_range",
     "minimum_inclusive": "2.1.211",
     "maximum_exclusive": "3.0.0",
 }
-_CLAUDE_CODE_VERSION = re.compile(
-    r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z"
-)
-EXPECTED_TOOLS = frozenset(("Read", "Grep", "Glob", "Bash"))
+LAUNCH_PROFILES = {
+    "named-direct": {
+        "permission_mode": "dontAsk",
+        "tools": frozenset(("Read", "Grep", "Glob", "Bash")),
+    },
+    "helper-linux": {
+        "permission_mode": "dontAsk",
+        "tools": frozenset(("Read",)),
+    },
+    "helper-darwin": {
+        "permission_mode": "default",
+        "tools": frozenset(("Read", "Grep", "Glob")),
+    },
+}
 EMPTY_INIT_SURFACES = ("mcp_servers", "slash_commands", "skills", "plugins")
 AUTHENTICATION_SOURCE_TO_API_KEY_SOURCE = {
     "api-key": "ANTHROPIC_API_KEY",
@@ -51,10 +78,41 @@ PROCESS_RETURNCODE_CONTRACT = {
         },
     },
 }
-SCHEMA_PATH = (
-    Path(__file__).resolve().parent.parent / "references" / "claude-stream-schema.json"
-)
+SCHEMA_PATH = claude_stream_contract.PROFILE_PATH
+COMPATIBILITY_PATH = claude_stream_contract.COMPATIBILITY_PATH
 MAX_SCHEMA_BYTES = 256 * 1024
+MAX_PREFLIGHT_EVIDENCE_BYTES = 16 * 1024
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_PREFLIGHT_IDENTITY_FIELDS = frozenset(
+    (
+        "device",
+        "inode",
+        "file_type",
+        "mode",
+        "nlink",
+        "uid",
+        "gid",
+        "size",
+        "mtime_ns",
+        "ctime_ns",
+    )
+)
+_PREFLIGHT_FIELDS = frozenset(
+    (
+        "capability_contract",
+        "classification",
+        "compatible_version_range",
+        "declared_version",
+        "identity",
+        "observed_version",
+        "publisher_verification",
+        "reason",
+        "resolved_path",
+        "selected_version",
+        "source",
+        "stream_contract",
+    )
+)
 MAX_JSON_INTEGER_DIGITS = 128
 MAX_JSON_FLOAT_CHARACTERS = 256
 MAX_JSON_FLOAT_SIGNIFICAND_DIGITS = 128
@@ -345,8 +403,7 @@ INTERMEDIATE_EVENT_CONTRACT = {
                                     "id": "nonempty_string",
                                     "input": "object",
                                     "name": {
-                                        "rule": "enum",
-                                        "values": sorted(EXPECTED_TOOLS),
+                                        "rule": ("runtime_binding_launch_profile_set"),
                                     },
                                 },
                             },
@@ -477,6 +534,21 @@ class StreamLimits:
 DEFAULT_STREAM_LIMITS = StreamLimits()
 
 
+@dataclass(frozen=True)
+class ClaudeRuntimeBinding:
+    """Trusted parent-selected runtime facts bound to one Claude invocation."""
+
+    selected_version: str
+    api_key_source: str
+    launch_profile: str
+    trust_source: str
+    publisher_checksum: str
+    artifact_size: int
+    runtime_identity: tuple[int, ...]
+    required_options: tuple[str, ...]
+    stream_contract: claude_stream_contract.ClaudeStreamContractBinding
+
+
 class _DuplicateKeyError(ValueError):
     pass
 
@@ -509,15 +581,12 @@ class _MachineArgumentParser(argparse.ArgumentParser):
 def _parse_supported_claude_code_version(
     value: object,
 ) -> tuple[int, int, int] | None:
-    if type(value) is not str or len(value) > 32:
+    if type(value) is not str:
         return None
-    match = _CLAUDE_CODE_VERSION.fullmatch(value)
-    if match is None:
+    try:
+        return parse_compatible_release_version(value)
+    except ClaudeVersionPolicyError:
         return None
-    parsed = tuple(int(component) for component in match.groups())
-    if not CLAUDE_CODE_MINIMUM_VERSION <= parsed < CLAUDE_CODE_MAXIMUM_VERSION:
-        return None
-    return parsed
 
 
 def _is_supported_claude_code_version(value: object) -> bool:
@@ -635,11 +704,16 @@ def _unique_string_set(value: Any, *, label: str) -> frozenset[str]:
     return frozenset(value)
 
 
-def _load_contract() -> dict[str, Any]:
+def _load_contract_with_binding() -> tuple[
+    dict[str, Any],
+    claude_stream_contract.ClaudeStreamContractBinding,
+]:
     try:
-        with SCHEMA_PATH.open("rb") as stream:
-            raw = stream.read(MAX_SCHEMA_BYTES + 1)
-    except OSError as error:
+        binding, _compatibility_raw, raw = claude_stream_contract.load_stream_contract(
+            compatibility_path=COMPATIBILITY_PATH,
+            profile_path=SCHEMA_PATH,
+        )
+    except claude_stream_contract.ClaudeStreamContractError as error:
         raise _ContractError("schema is unreadable") from error
     if len(raw) > MAX_SCHEMA_BYTES:
         raise _ContractError("schema exceeds its size bound")
@@ -652,10 +726,36 @@ def _load_contract() -> dict[str, Any]:
         raise _ContractError("schema contains an unpaired Unicode surrogate")
     if type(contract) is not dict:
         raise _ContractError("schema root must be an object")
+    expected_root_fields = {
+        "claude_code_version",
+        "process_returncode",
+        "stream_contract",
+        "launch_profiles",
+        "init_event",
+        "intermediate_events",
+        "model_identity",
+        "accepted_auxiliary_model_usage_keys",
+        "terminal_result",
+        "contract_cases",
+    }
+    if (
+        set(contract) != expected_root_fields
+        or type(contract["contract_cases"]) is not list
+    ):
+        raise _ContractError("schema root fields do not match the validator")
     if contract.get("claude_code_version") != CLAUDE_CODE_VERSION_CONTRACT:
         raise _ContractError("schema version range does not match")
     if contract.get("process_returncode") != PROCESS_RETURNCODE_CONTRACT:
         raise _ContractError("process return-code contract does not match")
+    expected_launch_profiles = {
+        name: {
+            "permission_mode": profile["permission_mode"],
+            "tools": sorted(profile["tools"]),
+        }
+        for name, profile in LAUNCH_PROFILES.items()
+    }
+    if contract.get("launch_profiles") != expected_launch_profiles:
+        raise _ContractError("launch profiles do not match the validator")
 
     stream_contract = contract.get("stream_contract")
     if type(stream_contract) is not dict:
@@ -712,14 +812,19 @@ def _load_contract() -> dict[str, Any]:
         or frozenset(field_contracts) != INIT_REQUIRED_FIELDS
     ):
         raise _ContractError("init field contracts are incomplete")
-    if field_contracts.get("permissionMode", {}).get("value") != "dontAsk":
+    if field_contracts.get("permissionMode") != {
+        "rule": "exact_runtime_binding_launch_profile",
+        "profile_field": "permission_mode",
+        "malformed_failure": "inconclusive",
+        "mismatch_failure": "blocked",
+    }:
         raise _ContractError("permission mode contract does not match")
-    if (
-        _unique_string_set(
-            field_contracts.get("tools", {}).get("values"), label="init tools"
-        )
-        != EXPECTED_TOOLS
-    ):
+    if field_contracts.get("tools") != {
+        "rule": "duplicate_free_exact_runtime_binding_launch_profile_set",
+        "profile_field": "tools",
+        "malformed_failure": "inconclusive",
+        "mismatch_failure": "blocked",
+    }:
         raise _ContractError("tool contract does not match")
     if field_contracts.get("claude_code_version") != {
         "rule": "exact_cli_argument",
@@ -729,9 +834,9 @@ def _load_contract() -> dict[str, Any]:
     }:
         raise _ContractError("init version contract does not match")
     if field_contracts.get("apiKeySource") != {
-        "rule": "exact_mapped_cli_argument",
-        "argument": "authentication_source",
-        "mapping": AUTHENTICATION_SOURCE_TO_API_KEY_SOURCE,
+        "rule": "exact_runtime_binding",
+        "binding_field": "api_key_source",
+        "accepted_values": ["ANTHROPIC_API_KEY", "none"],
         "malformed_failure": "inconclusive",
         "mismatch_failure": "blocked",
     }:
@@ -854,7 +959,430 @@ def _load_contract() -> dict[str, Any]:
         "claude-haiku-4-5-20251001"
     ]:
         raise _ContractError("auxiliary model identities do not match")
+    return contract, binding
+
+
+def _load_contract() -> dict[str, Any]:
+    contract, _binding = _load_contract_with_binding()
     return contract
+
+
+def _validate_preflight_evidence(
+    evidence: Mapping[str, Any],
+    binding: claude_stream_contract.ClaudeStreamContractBinding,
+) -> str:
+    if type(evidence) is not dict or frozenset(evidence) != _PREFLIGHT_FIELDS:
+        raise _ContractError("preflight evidence fields do not match")
+    if evidence.get("classification") != "accepted":
+        raise _ContractError("preflight evidence is not accepted")
+    if evidence.get("reason") != "compatible-version-selected":
+        raise _ContractError("preflight reason does not match")
+    if evidence.get("compatible_version_range") != CLAUDE_COMPATIBILITY_SPEC:
+        raise _ContractError("preflight version policy does not match")
+    selected_version = evidence.get("selected_version")
+    if type(selected_version) is not str:
+        raise _ContractError("preflight selected version is missing")
+    try:
+        parse_compatible_release_version(selected_version)
+    except ClaudeVersionPolicyError as error:
+        raise _ContractError("preflight selected version is unsupported") from error
+    if evidence.get("declared_version") != selected_version:
+        raise _ContractError("preflight declared version does not match")
+    if evidence.get("observed_version") != selected_version:
+        raise _ContractError("preflight observed version does not match")
+    if evidence.get("source") not in {
+        "active-installed",
+        "explicit-override",
+        "side-by-side-compatible",
+    }:
+        raise _ContractError("preflight candidate source does not match")
+    resolved_path = evidence.get("resolved_path")
+    if (
+        type(resolved_path) is not str
+        or not resolved_path
+        or "\0" in resolved_path
+        or not Path(resolved_path).is_absolute()
+    ):
+        raise _ContractError("preflight resolved path is invalid")
+
+    identity = evidence.get("identity")
+    if type(identity) is not dict or frozenset(identity) != _PREFLIGHT_IDENTITY_FIELDS:
+        raise _ContractError("preflight identity fields do not match")
+    if any(type(value) is not int or value < 0 for value in identity.values()):
+        raise _ContractError("preflight identity values are invalid")
+    if identity["file_type"] != stat.S_IFREG or not identity["mode"] & 0o111:
+        raise _ContractError("preflight identity is not an executable regular file")
+
+    publisher = evidence.get("publisher_verification")
+    expected_publisher_fields = {
+        "artifact_size",
+        "binary",
+        "checksum",
+        "manifest_url",
+        "platform",
+        "release_version",
+        "signature_url",
+        "signer_fingerprint",
+    }
+    if type(publisher) is not dict or set(publisher) != expected_publisher_fields:
+        raise _ContractError("preflight publisher fields do not match")
+    platform = publisher.get("platform")
+    binary = publisher.get("binary")
+    if (
+        type(platform) is not str
+        or type(binary) is not str
+        or CLAUDE_SUPPORTED_PLATFORM_BINARIES.get(platform) != binary
+    ):
+        raise _ContractError("preflight publisher platform does not match")
+    if publisher.get("release_version") != selected_version:
+        raise _ContractError("preflight publisher version does not match")
+    checksum = publisher.get("checksum")
+    if type(checksum) is not str or _SHA256.fullmatch(checksum) is None:
+        raise _ContractError("preflight publisher digest is invalid")
+    artifact_size = publisher.get("artifact_size")
+    if (
+        type(artifact_size) is not int
+        or artifact_size <= 0
+        or artifact_size != identity["size"]
+    ):
+        raise _ContractError("preflight publisher size does not match identity")
+    manifest_url, signature_url = release_artifact_urls(selected_version)
+    if publisher.get("manifest_url") != manifest_url:
+        raise _ContractError("preflight manifest URL does not match")
+    if publisher.get("signature_url") != signature_url:
+        raise _ContractError("preflight signature URL does not match")
+    if publisher.get("signer_fingerprint") != CLAUDE_RELEASE_KEY_FINGERPRINT:
+        raise _ContractError("preflight signer identity does not match")
+
+    capability = evidence.get("capability_contract")
+    if capability != {
+        "required_options": list(CLAUDE_REQUIRED_OPTIONS),
+        "status": "accepted",
+    }:
+        raise _ContractError("preflight capability contract does not match")
+    stream_binding = evidence.get("stream_contract")
+    if stream_binding != {
+        "baseline_digest": binding.baseline_digest,
+        "capability_digest": binding.capability_digest,
+        "compatibility_digest": binding.compatibility_digest,
+        "digest": binding.digest,
+        "schema_id": binding.schema_id,
+    }:
+        raise _ContractError("preflight stream contract does not match")
+    return selected_version
+
+
+def _read_preflight_evidence(
+    path: Path,
+    *,
+    reviewer_cwd: Path,
+) -> dict[str, Any]:
+    if not path.is_absolute():
+        raise _ContractError("preflight evidence path must be absolute")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor = -1
+    try:
+        canonical_parent = path.parent.resolve(strict=True)
+        canonical_path = canonical_parent / path.name
+        if canonical_path == reviewer_cwd or canonical_path.is_relative_to(
+            reviewer_cwd
+        ):
+            raise _ContractError(
+                "preflight evidence must be outside the reviewer workspace"
+            )
+        before = canonical_path.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size > MAX_PREFLIGHT_EVIDENCE_BYTES
+            or before.st_nlink != 1
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) & 0o077
+        ):
+            raise _ContractError(
+                "preflight evidence is not a parent-private single-link regular file"
+            )
+        descriptor = os.open(canonical_path, flags)
+        opened_before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened_before.st_mode)
+            or opened_before.st_size > MAX_PREFLIGHT_EVIDENCE_BYTES
+            or opened_before.st_nlink != 1
+            or opened_before.st_uid != os.geteuid()
+            or stat.S_IMODE(opened_before.st_mode) & 0o077
+        ):
+            raise _ContractError(
+                "preflight evidence descriptor is not parent-private and bounded"
+            )
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(4096, MAX_PREFLIGHT_EVIDENCE_BYTES + 1 - total),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > MAX_PREFLIGHT_EVIDENCE_BYTES:
+                raise _ContractError("preflight evidence exceeds its size bound")
+        opened_after = os.fstat(descriptor)
+        after = canonical_path.stat(follow_symlinks=False)
+    except _ContractError:
+        raise
+    except OSError as error:
+        raise _ContractError("preflight evidence is unreadable") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    identities = {
+        (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_nlink,
+            value.st_uid,
+            value.st_gid,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+        for value in (before, opened_before, opened_after, after)
+    }
+    if (
+        len(identities) != 1
+        or not stat.S_ISREG(opened_before.st_mode)
+        or opened_before.st_nlink != 1
+    ):
+        raise _ContractError("preflight evidence identity changed while reading")
+    if (
+        opened_before.st_uid != os.geteuid()
+        or stat.S_IMODE(opened_before.st_mode) & 0o077
+    ):
+        raise _ContractError("preflight evidence permissions are not parent-private")
+    try:
+        value = _strict_json_loads(b"".join(chunks).decode("utf-8", errors="strict"))
+    except Exception as error:
+        raise _ContractError("preflight evidence is not strict JSON") from error
+    if _contains_unpaired_surrogate(value) or type(value) is not dict:
+        raise _ContractError("preflight evidence structure is invalid")
+    return value
+
+
+def _preflight_identity_tuple(identity: Mapping[str, Any]) -> tuple[int, ...]:
+    return tuple(
+        identity[field]
+        for field in (
+            "device",
+            "inode",
+            "file_type",
+            "mode",
+            "nlink",
+            "uid",
+            "gid",
+            "size",
+            "mtime_ns",
+            "ctime_ns",
+        )
+    )
+
+
+def _runtime_binding_is_valid(
+    runtime_binding: object,
+    *,
+    contract_binding: claude_stream_contract.ClaudeStreamContractBinding,
+) -> bool:
+    if type(runtime_binding) is not ClaudeRuntimeBinding:
+        return False
+    try:
+        parse_compatible_release_version(runtime_binding.selected_version)
+    except ClaudeVersionPolicyError:
+        return False
+    return (
+        runtime_binding.api_key_source in {"none", "ANTHROPIC_API_KEY"}
+        and runtime_binding.launch_profile in LAUNCH_PROFILES
+        and runtime_binding.trust_source
+        in {"low-level-helper", "named-parent-private-preflight"}
+        and type(runtime_binding.publisher_checksum) is str
+        and _SHA256.fullmatch(runtime_binding.publisher_checksum) is not None
+        and type(runtime_binding.artifact_size) is int
+        and runtime_binding.artifact_size > 0
+        and type(runtime_binding.runtime_identity) is tuple
+        and len(runtime_binding.runtime_identity) == 10
+        and all(
+            type(value) is int and value >= 0
+            for value in runtime_binding.runtime_identity
+        )
+        and runtime_binding.runtime_identity[2] == stat.S_IFREG
+        and bool(runtime_binding.runtime_identity[3] & 0o111)
+        and runtime_binding.runtime_identity[7] == runtime_binding.artifact_size
+        and runtime_binding.required_options == CLAUDE_REQUIRED_OPTIONS
+        and runtime_binding.stream_contract == contract_binding
+    )
+
+
+def runtime_binding_from_preflight_result(
+    preflight_result: str | Path,
+    *,
+    reviewer_cwd: str | Path,
+    api_key_source: str,
+) -> ClaudeRuntimeBinding:
+    """Build the named-direct binding from parent-private preflight evidence."""
+
+    _contract, contract_binding = _load_contract_with_binding()
+    resolved_cwd = Path(reviewer_cwd).resolve(strict=True)
+    if not resolved_cwd.is_dir():
+        raise _ContractError("reviewer cwd is not a directory")
+    if api_key_source not in {"none", "ANTHROPIC_API_KEY"}:
+        raise _ContractError("api key source is invalid")
+    evidence = _read_preflight_evidence(
+        Path(preflight_result),
+        reviewer_cwd=resolved_cwd,
+    )
+    selected_version = _validate_preflight_evidence(evidence, contract_binding)
+    identity = evidence["identity"]
+    publisher = evidence["publisher_verification"]
+    runtime_binding = ClaudeRuntimeBinding(
+        selected_version=selected_version,
+        api_key_source=api_key_source,
+        launch_profile="named-direct",
+        trust_source="named-parent-private-preflight",
+        publisher_checksum=publisher["checksum"],
+        artifact_size=publisher["artifact_size"],
+        runtime_identity=_preflight_identity_tuple(identity),
+        required_options=tuple(CLAUDE_REQUIRED_OPTIONS),
+        stream_contract=contract_binding,
+    )
+    if not _runtime_binding_is_valid(
+        runtime_binding,
+        contract_binding=contract_binding,
+    ):
+        raise _ContractError("preflight runtime binding is invalid")
+    return runtime_binding
+
+
+def _stable_verified_executable_identity(
+    verified: VerifiedClaudeExecutable,
+) -> tuple[int, ...]:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise _ContractError("verified executable no-follow support is unavailable")
+    path = verified.executable
+    if not path.is_absolute():
+        raise _ContractError("verified executable path is not absolute")
+    descriptor = -1
+    digest = hashlib.sha256()
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NONBLOCK | no_follow
+    try:
+        before = path.stat(follow_symlinks=False)
+        descriptor = os.open(path, flags)
+        opened_before = os.fstat(descriptor)
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        opened_after = os.fstat(descriptor)
+        after = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise _ContractError("verified executable identity is unavailable") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    identities = {
+        (
+            value.st_dev,
+            value.st_ino,
+            stat.S_IFMT(value.st_mode),
+            value.st_mode,
+            value.st_nlink,
+            value.st_uid,
+            value.st_gid,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+        for value in (before, opened_before, opened_after, after)
+    }
+    if len(identities) != 1:
+        raise _ContractError("verified executable identity changed while hashing")
+    identity = identities.pop()
+    if (
+        identity[2] != stat.S_IFREG
+        or not identity[3] & 0o111
+        or identity[7] != verified.artifact.size
+        or digest.hexdigest() != verified.artifact.checksum
+    ):
+        raise _ContractError("verified executable does not match signed artifact")
+    return identity
+
+
+def runtime_binding_from_verified_executable(
+    verified: VerifiedClaudeExecutable,
+    *,
+    capabilities: ClaudeCapabilities,
+    authentication_source: str,
+    launch_profile: str,
+) -> ClaudeRuntimeBinding:
+    """Build a low-level-helper binding from its verified executable snapshot."""
+
+    if type(verified) is not VerifiedClaudeExecutable:
+        raise _ContractError("verified executable evidence is invalid")
+    if type(capabilities) is not ClaudeCapabilities:
+        raise _ContractError("Claude capability evidence is invalid")
+    api_key_source = AUTHENTICATION_SOURCE_TO_API_KEY_SOURCE.get(authentication_source)
+    if api_key_source is None or launch_profile not in {
+        "helper-linux",
+        "helper-darwin",
+    }:
+        raise _ContractError("helper runtime selection is invalid")
+    version = verified.artifact.version
+    try:
+        parse_compatible_release_version(version)
+    except ClaudeVersionPolicyError as error:
+        raise _ContractError("verified executable version is unsupported") from error
+    if (
+        capabilities.version.text != version
+        or capabilities.required_options != CLAUDE_REQUIRED_OPTIONS
+        or not capabilities.safe_mode_summary.strip()
+    ):
+        raise _ContractError("Claude capability evidence does not match the runtime")
+    artifact = verified.artifact
+    if (
+        CLAUDE_SUPPORTED_PLATFORM_BINARIES.get(artifact.platform_key) != artifact.binary
+        or type(artifact.checksum) is not str
+        or _SHA256.fullmatch(artifact.checksum) is None
+        or type(artifact.size) is not int
+        or artifact.size <= 0
+    ):
+        raise _ContractError("verified publisher artifact evidence is invalid")
+    manifest_url, signature_url = release_artifact_urls(version)
+    if verified.manifest_url != manifest_url or verified.signature_url != signature_url:
+        raise _ContractError("verified publisher artifact URLs do not match")
+    runtime_identity = _stable_verified_executable_identity(verified)
+    _contract, contract_binding = _load_contract_with_binding()
+    runtime_binding = ClaudeRuntimeBinding(
+        selected_version=version,
+        api_key_source=api_key_source,
+        launch_profile=launch_profile,
+        trust_source="low-level-helper",
+        publisher_checksum=artifact.checksum,
+        artifact_size=artifact.size,
+        runtime_identity=runtime_identity,
+        required_options=tuple(capabilities.required_options),
+        stream_contract=contract_binding,
+    )
+    if not _runtime_binding_is_valid(
+        runtime_binding,
+        contract_binding=contract_binding,
+    ):
+        raise _ContractError("helper runtime binding is invalid")
+    return runtime_binding
 
 
 @dataclass
@@ -1052,6 +1580,7 @@ def _validate_init(
     requested_model: str,
     claude_code_version: str,
     api_key_source: str,
+    launch_profile: str,
     evidence: _Evidence,
 ) -> None:
     profile_name = _init_profile_name(claude_code_version)
@@ -1068,8 +1597,17 @@ def _validate_init(
     missing = required_fields - frozenset(event)
     for field_name in missing:
         evidence.inconclusive.add(f"init.{field_name}.missing")
+    profile = LAUNCH_PROFILES.get(launch_profile)
+    if profile is None:
+        evidence.inconclusive.add("validator.launch-profile-invalid")
+        return
     _validate_exact_string(event, "cwd", expected_cwd, evidence)
-    _validate_exact_string(event, "permissionMode", "dontAsk", evidence)
+    _validate_exact_string(
+        event,
+        "permissionMode",
+        profile["permission_mode"],
+        evidence,
+    )
     _validate_exact_string(event, "model", requested_model, evidence)
     _validate_exact_string(
         event,
@@ -1086,7 +1624,7 @@ def _validate_init(
         else:
             if len(tools) != len(set(tools)):
                 evidence.inconclusive.add("init.tools.duplicate")
-            if frozenset(tools) != EXPECTED_TOOLS:
+            if frozenset(tools) != profile["tools"]:
                 evidence.blocked.add("init.tools.mismatch")
 
     for field_name in EMPTY_INIT_SURFACES:
@@ -1273,6 +1811,7 @@ def _validate_thinking_tokens_event(
 def _validate_assistant_content_block(
     value: Any,
     *,
+    allowed_tools: frozenset[str],
     evidence: _Evidence,
 ) -> None:
     label = "intermediate.assistant.message.content"
@@ -1326,7 +1865,7 @@ def _validate_assistant_content_block(
             name = block["name"]
             if type(name) is not str:
                 evidence.inconclusive.add(f"{block_label}.name.malformed")
-            elif name not in EXPECTED_TOOLS:
+            elif name not in allowed_tools:
                 evidence.inconclusive.add(f"{block_label}.name.unknown-tool")
 
 
@@ -1335,6 +1874,7 @@ def _validate_assistant_event(
     *,
     init_session_id: str | None,
     requested_model: str,
+    allowed_tools: frozenset[str],
     evidence: _Evidence,
 ) -> None:
     label = "intermediate.assistant"
@@ -1398,7 +1938,11 @@ def _validate_assistant_event(
         message, "usage", label=message_label, evidence=evidence
     )
     if "content" in message:
-        _validate_assistant_content_block(message["content"], evidence=evidence)
+        _validate_assistant_content_block(
+            message["content"],
+            allowed_tools=allowed_tools,
+            evidence=evidence,
+        )
 
 
 def _validate_user_tool_result_block(value: Any, evidence: _Evidence) -> None:
@@ -1556,12 +2100,18 @@ def _validate_intermediate_events(
     claude_code_version: str,
     init_session_id: str | None,
     requested_model: str,
+    launch_profile: str,
     evidence: _Evidence,
 ) -> None:
     profile_name = _init_profile_name(claude_code_version)
     if profile_name is None:
         evidence.inconclusive.add("validator.claude-code-version-invalid")
         return
+    profile = LAUNCH_PROFILES.get(launch_profile)
+    if profile is None:
+        evidence.inconclusive.add("validator.launch-profile-invalid")
+        return
+    allowed_tools = profile["tools"]
     for event in events:
         event_type = event.get("type")
         if event_type == "system":
@@ -1578,6 +2128,7 @@ def _validate_intermediate_events(
                 event,
                 init_session_id=init_session_id,
                 requested_model=requested_model,
+                allowed_tools=allowed_tools,
                 evidence=evidence,
             )
         elif event_type == "user":
@@ -2022,8 +2573,7 @@ def validate_claude_stream(
     *,
     expected_cwd: str | Path,
     requested_model: str,
-    claude_code_version: str,
-    authentication_source: str,
+    runtime_binding: ClaudeRuntimeBinding,
     process_returncode: object = None,
     limits: StreamLimits | None = None,
 ) -> dict[str, Any]:
@@ -2032,7 +2582,7 @@ def validate_claude_stream(
     if type(process_returncode) is not int:
         return _failure("inconclusive", {"process.returncode.invalid"})
     try:
-        contract = _load_contract()
+        contract, contract_binding = _load_contract_with_binding()
     except (_ContractError, AttributeError, KeyError, TypeError):
         return _apply_process_returncode_precedence(
             _failure("inconclusive", {"validator.contract-invalid"}),
@@ -2047,6 +2597,14 @@ def validate_claude_stream(
             _failure("inconclusive", {"validator.expected-cwd-invalid"}),
             process_returncode,
         )
+    if not _runtime_binding_is_valid(
+        runtime_binding,
+        contract_binding=contract_binding,
+    ):
+        return _apply_process_returncode_precedence(
+            _failure("inconclusive", {"validator.runtime-binding-invalid"}),
+            process_returncode,
+        )
     if (
         type(requested_model) is not str
         or requested_model not in contract["model_identity"]
@@ -2055,22 +2613,7 @@ def validate_claude_stream(
             _failure("inconclusive", {"validator.requested-model-invalid"}),
             process_returncode,
         )
-    if not _is_supported_claude_code_version(claude_code_version):
-        return _apply_process_returncode_precedence(
-            _failure(
-                "inconclusive",
-                {"validator.claude-code-version-invalid"},
-            ),
-            process_returncode,
-        )
-    if (
-        type(authentication_source) is not str
-        or authentication_source not in AUTHENTICATION_SOURCE_TO_API_KEY_SOURCE
-    ):
-        return _apply_process_returncode_precedence(
-            _failure("inconclusive", {"validator.authentication-source-invalid"}),
-            process_returncode,
-        )
+    claude_code_version = runtime_binding.selected_version
 
     selected_limits = limits or DEFAULT_STREAM_LIMITS
     if type(selected_limits) is not StreamLimits:
@@ -2119,7 +2662,8 @@ def validate_claude_stream(
         expected_cwd=str(resolved_cwd),
         requested_model=requested_model,
         claude_code_version=claude_code_version,
-        api_key_source=AUTHENTICATION_SOURCE_TO_API_KEY_SOURCE[authentication_source],
+        api_key_source=runtime_binding.api_key_source,
+        launch_profile=runtime_binding.launch_profile,
         evidence=evidence,
     )
     raw_init_session_id = envelope.first.get("session_id")
@@ -2133,6 +2677,7 @@ def validate_claude_stream(
         claude_code_version=claude_code_version,
         init_session_id=init_session_id,
         requested_model=requested_model,
+        launch_profile=runtime_binding.launch_profile,
         evidence=evidence,
     )
     terminal_session_id = envelope.last.get("session_id")
@@ -2160,8 +2705,7 @@ def validate_claude_stream_bytes(
     *,
     expected_cwd: str | Path,
     requested_model: str,
-    claude_code_version: str,
-    authentication_source: str,
+    runtime_binding: ClaudeRuntimeBinding,
     process_returncode: object = None,
     limits: StreamLimits | None = None,
 ) -> dict[str, Any]:
@@ -2173,8 +2717,7 @@ def validate_claude_stream_bytes(
         io.BytesIO(raw_stream),
         expected_cwd=expected_cwd,
         requested_model=requested_model,
-        claude_code_version=claude_code_version,
-        authentication_source=authentication_source,
+        runtime_binding=runtime_binding,
         process_returncode=process_returncode,
         limits=limits,
     )
@@ -2200,16 +2743,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Concrete model passed to Claude Code",
     )
     parser.add_argument(
-        "--claude-code-version",
+        "--preflight-result",
         required=True,
-        type=_parse_claude_code_version_argument,
-        help="Publisher-verified Claude Code version used for the child process",
+        help="Parent-private accepted named_claude_preflight JSON evidence",
     )
     parser.add_argument(
         "--authentication-source",
         required=True,
-        choices=("api-key", "oauth-token", "local-login"),
-        help="Authentication source selected before launch",
+        choices=tuple(AUTHENTICATION_SOURCE_TO_API_KEY_SOURCE),
+        help="Authentication source selected by the parent before launch",
     )
     parser.add_argument(
         "--process-returncode",
@@ -2234,6 +2776,18 @@ def main(argv: list[str] | None = None) -> int:
         result = _failure("inconclusive", {"validator.arguments-invalid"})
         print(json.dumps(result, ensure_ascii=True, separators=(",", ":")))
         return 3
+    try:
+        runtime_binding = runtime_binding_from_preflight_result(
+            args.preflight_result,
+            reviewer_cwd=args.cwd,
+            api_key_source=AUTHENTICATION_SOURCE_TO_API_KEY_SOURCE[
+                args.authentication_source
+            ],
+        )
+    except (_ContractError, OSError, RuntimeError, TypeError, ValueError):
+        result = _failure("inconclusive", {"validator.preflight-evidence-invalid"})
+        print(json.dumps(result, ensure_ascii=True, separators=(",", ":")))
+        return 3
     stream: BinaryIO
     close_stream = False
     if args.input == "-":
@@ -2251,8 +2805,7 @@ def main(argv: list[str] | None = None) -> int:
             stream,
             expected_cwd=args.cwd,
             requested_model=args.model,
-            claude_code_version=args.claude_code_version,
-            authentication_source=args.authentication_source,
+            runtime_binding=runtime_binding,
             process_returncode=args.process_returncode,
         )
     finally:

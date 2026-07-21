@@ -1229,9 +1229,7 @@ def _validate_v3_marker_layout(
     )
     if marker_version == STATE_MARKER_SCHEMA_VERSION and phase == "preparing":
         canonical_base = _canonical_review_root_base()
-        expected_user_root = (
-            canonical_base / f"{REVIEW_USER_ROOT_PREFIX}{os.geteuid()}"
-        )
+        expected_user_root = canonical_base / f"{REVIEW_USER_ROOT_PREFIX}{os.geteuid()}"
         expected_parent = container.parent
         if (
             source_root != expected_user_root
@@ -2532,14 +2530,10 @@ def run_state(
                 "legacy v1 review state cannot be resumed; start a new review"
             )
         state_reviewer = state.get("reviewer")
-        selected_reviewer = (
-            expected_reviewer if terminal_process else state_reviewer
-        )
+        selected_reviewer = expected_reviewer if terminal_process else state_reviewer
         redact_values = _freeze_claude_redactions(
             reviewer=(
-                selected_reviewer
-                if isinstance(selected_reviewer, str)
-                else None
+                selected_reviewer if isinstance(selected_reviewer, str) else None
             ),
         )
         _redact_claude_text("", redact_values)
@@ -3418,17 +3412,13 @@ def _cleanup_terminal_workspace(
                     state_dir,
                     review,
                     name="runner-error.txt",
-                    text=(
-                        "review runner exited without recording a terminal result\n"
-                    ),
+                    text=("review runner exited without recording a terminal result\n"),
                 )
                 if exit_error or diagnostic_error:
                     raise ReviewError(
                         "cannot persist missing runner terminal state: "
                         + "; ".join(
-                            error
-                            for error in (exit_error, diagnostic_error)
-                            if error
+                            error for error in (exit_error, diagnostic_error) if error
                         )
                     )
                 exit_code = 1

@@ -597,6 +597,7 @@ class ReviewWorkspace:
             content_variant=self.content_variant,
             snapshot_tree_sha=self.snapshot_tree_sha,
         )
+
     @classmethod
     def from_json(cls, value: dict[str, Any]) -> "ReviewWorkspace":
         required_fields = {
@@ -4223,8 +4224,7 @@ def _open_or_create_private_review_directory(
                 os.fsync(parent_fd)
             except OSError as error:
                 raise ReviewError(
-                    "cannot persist private review directory entry for "
-                    f"{path}: {error}"
+                    f"cannot persist private review directory entry for {path}: {error}"
                 ) from error
     except BaseException:
         os.close(descriptor)
@@ -4269,7 +4269,10 @@ def _new_container(
                 not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
                 for metadata in (base_before, base_opened, base_after)
             )
-            or any(metadata.st_uid != 0 for metadata in (base_before, base_opened, base_after))
+            or any(
+                metadata.st_uid != 0
+                for metadata in (base_before, base_opened, base_after)
+            )
             or any(
                 stat.S_IMODE(metadata.st_mode) != 0o1777
                 for metadata in (base_before, base_opened, base_after)
@@ -4298,9 +4301,7 @@ def _new_container(
             )
         )
         if source_review_root != review_root:
-            raise ReviewError(
-                "private review namespace resolved to an unexpected path"
-            )
+            raise ReviewError("private review namespace resolved to an unexpected path")
 
         name = f"isolated-review-{stamp}-{suffix}"
         container = review_root / name
@@ -5030,8 +5031,7 @@ def _materialize_frozen_tree(
             cleanup_depth = len(relative.parts) + (1 if is_gitlink else 0)
             if cleanup_depth >= MAX_REVIEW_CLEANUP_DEPTH:
                 raise ReviewError(
-                    "frozen Git tree path depth exceeds the review cleanup safety "
-                    "limit"
+                    "frozen Git tree path depth exceeds the review cleanup safety limit"
                 )
             destination = workspace_root.joinpath(*relative.parts)
             path_display = _redact_secret_path(
@@ -9038,9 +9038,7 @@ def _load_legacy_manifest(
         source_head_count = raw_entry["source_head_count"]
         base_unembedded_count = raw_entry["base_unembedded_count"]
         head_unembedded_count = raw_entry["head_unembedded_count"]
-        source_head_unembedded_count = raw_entry[
-            "source_head_unembedded_count"
-        ]
+        source_head_unembedded_count = raw_entry["source_head_unembedded_count"]
         if (
             type(base_count) is not int
             or type(head_count) is not int
@@ -9606,8 +9604,7 @@ def _validate_external_workspace(
         raise ReviewError("synthetic secret manifest head counts are inconsistent")
     if review.content_variant == "source-wip" and any(
         count_state.source_head_count > count_state.base_count
-        or count_state.source_head_unembedded_count
-        > count_state.base_unembedded_count
+        or count_state.source_head_unembedded_count > count_state.base_unembedded_count
         for count_state in legacy_counts.values()
     ):
         raise ReviewError(
@@ -9667,9 +9664,7 @@ def _validate_external_workspace(
         path_bytes: bytes,
     ) -> None:
         side_tag = (
-            CHANGED_PATH_HEAD_TAG
-            if side == "head"
-            else CHANGED_PATH_BASE_ONLY_TAG
+            CHANGED_PATH_HEAD_TAG if side == "head" else CHANGED_PATH_BASE_ONLY_TAG
         )
         path_sha256 = _changed_path_digest(side_tag, path_bytes).decode("ascii")
         for accepted in accepted_values:
@@ -9730,9 +9725,7 @@ def _validate_external_workspace(
                 rule = _sensitive_path_rule(path)
             if rule is not None:
                 path_display = _redact_secret_path(path, "source HEAD path")
-                record_source_head_finding(
-                    f"{path_display} ({rule}; source-head-path)"
-                )
+                record_source_head_finding(f"{path_display} ({rule}; source-head-path)")
 
         def inspect_source_head_blob(
             raw_path: bytes,
@@ -14871,10 +14864,7 @@ def _clear_materialized_workspace(workspace_root: pathlib.Path) -> None:
     try:
         opened = os.fstat(workspace_descriptor)
         path_status = os.lstat(workspace_root)
-        if (
-            _private_cleanup_identity(opened)
-            != _private_cleanup_identity(path_status)
-        ):
+        if _private_cleanup_identity(opened) != _private_cleanup_identity(path_status):
             raise ReviewError(
                 "detached review worktree changed while opening it for rematerialization"
             )
@@ -15297,6 +15287,7 @@ def prepare_workspace(
                 f"helper-private artifact identity was captured twice: {artifact_name}"
             )
         private_artifact_identities[artifact_name] = identity
+
     ownership_transferred = False
 
     try:
@@ -15855,9 +15846,7 @@ def validate_retained_cleanup_postcondition(review: ReviewWorkspace) -> str | No
         errors: list[str] = []
         opened_identity = _cleanup_identity_evidence(os.fstat(container_descriptor))
         if opened_identity != review.private_cleanup.container:
-            return [
-                "retained review container does not match preparation identity"
-            ]
+            return ["retained review container does not match preparation identity"]
         for entry_name in ("workspace", "review.git"):
             try:
                 os.stat(

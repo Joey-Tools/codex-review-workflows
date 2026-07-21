@@ -24,6 +24,31 @@
       }
     }
   },
+  "launch_profiles": {
+    "named-direct": {
+      "permission_mode": "dontAsk",
+      "tools": [
+        "Bash",
+        "Glob",
+        "Grep",
+        "Read"
+      ]
+    },
+    "helper-linux": {
+      "permission_mode": "dontAsk",
+      "tools": [
+        "Read"
+      ]
+    },
+    "helper-darwin": {
+      "permission_mode": "default",
+      "tools": [
+        "Glob",
+        "Grep",
+        "Read"
+      ]
+    }
+  },
   "stream_contract": {
     "encoding": "utf-8",
     "format": "jsonl",
@@ -90,19 +115,14 @@
         "mismatch_failure": "blocked"
       },
       "permissionMode": {
-        "rule": "constant",
-        "value": "dontAsk",
+        "rule": "exact_runtime_binding_launch_profile",
+        "profile_field": "permission_mode",
         "malformed_failure": "inconclusive",
         "mismatch_failure": "blocked"
       },
       "tools": {
-        "rule": "duplicate_free_exact_set",
-        "values": [
-          "Read",
-          "Grep",
-          "Glob",
-          "Bash"
-        ],
+        "rule": "duplicate_free_exact_runtime_binding_launch_profile_set",
+        "profile_field": "tools",
         "malformed_failure": "inconclusive",
         "mismatch_failure": "blocked"
       },
@@ -139,13 +159,12 @@
         "mismatch_failure": "blocked"
       },
       "apiKeySource": {
-        "rule": "exact_mapped_cli_argument",
-        "argument": "authentication_source",
-        "mapping": {
-          "api-key": "ANTHROPIC_API_KEY",
-          "oauth-token": "none",
-          "local-login": "none"
-        },
+        "rule": "exact_runtime_binding",
+        "binding_field": "api_key_source",
+        "accepted_values": [
+          "ANTHROPIC_API_KEY",
+          "none"
+        ],
         "malformed_failure": "inconclusive",
         "mismatch_failure": "blocked"
       }
@@ -366,13 +385,7 @@
                       "id": "nonempty_string",
                       "input": "object",
                       "name": {
-                        "rule": "enum",
-                        "values": [
-                          "Bash",
-                          "Glob",
-                          "Grep",
-                          "Read"
-                        ]
+                        "rule": "runtime_binding_launch_profile_set"
                       }
                     }
                   }

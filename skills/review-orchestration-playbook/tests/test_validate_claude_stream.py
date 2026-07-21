@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -19,15 +21,32 @@ SCHEMA = SKILL_ROOT / "references/claude-stream-schema.json"
 sys.path.insert(0, str(SCRIPTS))
 
 import validate_claude_stream as validator  # noqa: E402
-from review_runtime import claude_provenance  # noqa: E402
+from review_runtime import (  # noqa: E402
+    claude_capabilities,
+    claude_provenance,
+    claude_stream_contract,
+    claude_version_policy,
+)
 
 
 class ClaudeStreamValidatorTest(unittest.TestCase):
     def setUp(self) -> None:
         temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(temporary_directory.cleanup)
-        self.cwd = Path(temporary_directory.name).resolve()
+        self.temporary_root = Path(temporary_directory.name).resolve()
+        self.cwd = self.temporary_root / "review-workspace"
+        self.cwd.mkdir(mode=0o700)
+        self.parent_state = self.temporary_root / "parent-state"
+        self.parent_state.mkdir(mode=0o700)
         self.claude_code_version = "2.1.216"
+        self.preflight_path = self.parent_state / "named-claude-preflight.json"
+        self._write_preflight_evidence(
+            self.preflight_path,
+            version=self.claude_code_version,
+        )
+        _contract, self.stream_contract_binding = (
+            validator._load_contract_with_binding()
+        )
         self.init_event = {
             "type": "system",
             "subtype": "init",
@@ -95,6 +114,78 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "ttft_ms": 2,
             "ttft_stream_ms": 3,
         }
+
+    @staticmethod
+    def _preflight_evidence(version: str) -> dict[str, object]:
+        binding, _compatibility_raw, _profile_raw = (
+            claude_stream_contract.load_stream_contract()
+        )
+        manifest_url, signature_url = claude_provenance.release_artifact_urls(version)
+        artifact_size = 128
+        return {
+            "capability_contract": {
+                "required_options": list(claude_capabilities.CLAUDE_REQUIRED_OPTIONS),
+                "status": "accepted",
+            },
+            "classification": "accepted",
+            "compatible_version_range": (
+                claude_version_policy.CLAUDE_COMPATIBILITY_SPEC
+            ),
+            "declared_version": version,
+            "identity": {
+                "device": 1,
+                "inode": 2,
+                "file_type": stat.S_IFREG,
+                "mode": stat.S_IFREG | 0o500,
+                "nlink": 1,
+                "uid": os.geteuid(),
+                "gid": os.getegid(),
+                "size": artifact_size,
+                "mtime_ns": 3,
+                "ctime_ns": 4,
+            },
+            "observed_version": version,
+            "publisher_verification": {
+                "artifact_size": artifact_size,
+                "binary": "claude",
+                "checksum": "a" * 64,
+                "manifest_url": manifest_url,
+                "platform": "darwin-arm64",
+                "release_version": version,
+                "signature_url": signature_url,
+                "signer_fingerprint": (
+                    claude_provenance.CLAUDE_RELEASE_KEY_FINGERPRINT
+                ),
+            },
+            "reason": "compatible-version-selected",
+            "resolved_path": "/trusted/claude",
+            "selected_version": version,
+            "source": "side-by-side-compatible",
+            "stream_contract": {
+                "baseline_digest": binding.baseline_digest,
+                "capability_digest": binding.capability_digest,
+                "compatibility_digest": binding.compatibility_digest,
+                "digest": binding.digest,
+                "schema_id": binding.schema_id,
+            },
+        }
+
+    def _write_preflight_evidence(
+        self,
+        path: Path,
+        *,
+        version: str,
+        evidence: dict[str, object] | None = None,
+    ) -> None:
+        path.write_text(
+            json.dumps(
+                evidence if evidence is not None else self._preflight_evidence(version),
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
 
     @staticmethod
     def _raw(events: list[object], *, blank_edges: bool = False) -> bytes:
@@ -194,6 +285,36 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             del events[-1][field_name]
         return events
 
+    def _valid_runtime_binding_fields(
+        self,
+        *,
+        selected_version: str | None = None,
+        api_key_source: str = "none",
+        launch_profile: str = "named-direct",
+    ) -> dict[str, object]:
+        return {
+            "selected_version": selected_version or self.claude_code_version,
+            "api_key_source": api_key_source,
+            "launch_profile": launch_profile,
+            "trust_source": "named-parent-private-preflight",
+            "publisher_checksum": "a" * 64,
+            "artifact_size": 128,
+            "runtime_identity": (
+                1,
+                2,
+                stat.S_IFREG,
+                stat.S_IFREG | 0o500,
+                1,
+                os.geteuid(),
+                os.getegid(),
+                128,
+                3,
+                4,
+            ),
+            "required_options": claude_capabilities.CLAUDE_REQUIRED_OPTIONS,
+            "stream_contract": self.stream_contract_binding,
+        }
+
     def _validate(
         self,
         events: list[object] | None = None,
@@ -202,21 +323,33 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         requested_model: str = "claude-opus-4-8",
         claude_code_version: str | None = None,
         authentication_source: str = "local-login",
+        launch_profile: str = "named-direct",
         process_returncode: object = 0,
         limits: validator.StreamLimits | None = None,
     ) -> dict[str, object]:
         if raw is None:
             raw = self._raw(events if events is not None else self._full_events())
+        selected_version = (
+            self.claude_code_version
+            if claude_code_version is None
+            else claude_code_version
+        )
+        api_key_source = validator.AUTHENTICATION_SOURCE_TO_API_KEY_SOURCE.get(
+            authentication_source,
+            "__invalid__",
+        )
+        runtime_binding = validator.ClaudeRuntimeBinding(
+            **self._valid_runtime_binding_fields(
+                selected_version=selected_version,
+                api_key_source=api_key_source,
+                launch_profile=launch_profile,
+            )
+        )
         return validator.validate_claude_stream_bytes(
             raw,
             expected_cwd=self.cwd,
             requested_model=requested_model,
-            claude_code_version=(
-                self.claude_code_version
-                if claude_code_version is None
-                else claude_code_version
-            ),
-            authentication_source=authentication_source,
+            runtime_binding=runtime_binding,
             process_returncode=process_returncode,
             limits=limits,
         )
@@ -334,17 +467,107 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
 
         self.assertEqual(
-            validator.CLAUDE_CODE_MINIMUM_VERSION,
-            claude_provenance.CLAUDE_MINIMUM_RELEASE,
+            schema["claude_code_version"]["minimum_inclusive"],
+            ".".join(map(str, claude_version_policy.CLAUDE_MINIMUM_VERSION)),
         )
         self.assertEqual(
-            validator.CLAUDE_CODE_MAXIMUM_VERSION,
-            claude_provenance.CLAUDE_MAXIMUM_RELEASE,
+            schema["claude_code_version"]["maximum_exclusive"],
+            ".".join(map(str, claude_version_policy.CLAUDE_MAXIMUM_VERSION)),
         )
         self.assertEqual(
             schema["claude_code_version"],
             validator.CLAUDE_CODE_VERSION_CONTRACT,
         )
+
+    def test_named_preflight_factory_binds_private_evidence_and_rejects_tamper(
+        self,
+    ) -> None:
+        runtime_binding = validator.runtime_binding_from_preflight_result(
+            self.preflight_path,
+            reviewer_cwd=self.cwd,
+            api_key_source="none",
+        )
+        self.assertEqual(runtime_binding.selected_version, "2.1.216")
+        self.assertEqual(runtime_binding.launch_profile, "named-direct")
+        self.assertEqual(
+            runtime_binding.trust_source,
+            "named-parent-private-preflight",
+        )
+
+        tampered = self._preflight_evidence(self.claude_code_version)
+        stream_contract = tampered["stream_contract"]
+        assert isinstance(stream_contract, dict)
+        stream_contract["digest"] = "0" * 64
+        tampered_path = self.parent_state / "tampered-preflight.json"
+        self._write_preflight_evidence(
+            tampered_path,
+            version=self.claude_code_version,
+            evidence=tampered,
+        )
+        with self.assertRaises(validator._ContractError):
+            validator.runtime_binding_from_preflight_result(
+                tampered_path,
+                reviewer_cwd=self.cwd,
+                api_key_source="none",
+            )
+
+        symlink_path = self.parent_state / "preflight-link.json"
+        symlink_path.symlink_to(self.preflight_path)
+        with self.assertRaises(validator._ContractError):
+            validator.runtime_binding_from_preflight_result(
+                symlink_path,
+                reviewer_cwd=self.cwd,
+                api_key_source="none",
+            )
+
+    def test_helper_factory_binds_verified_snapshot_capabilities_and_auth(self) -> None:
+        executable = self.parent_state / "claude-verified"
+        executable.write_bytes(b"synthetic verified Claude executable")
+        executable.chmod(0o700)
+        raw = executable.read_bytes()
+        version = "2.1.216"
+        manifest_url, signature_url = claude_provenance.release_artifact_urls(version)
+        artifact = claude_provenance.ClaudeReleaseArtifact(
+            version=version,
+            platform_key="darwin-arm64",
+            binary="claude",
+            checksum=hashlib.sha256(raw).hexdigest(),
+            size=len(raw),
+        )
+        verified = claude_provenance.VerifiedClaudeExecutable(
+            executable=executable,
+            artifact=artifact,
+            manifest_url=manifest_url,
+            signature_url=signature_url,
+            gpg_path=Path("/usr/bin/gpg"),
+        )
+        capabilities = claude_capabilities.ClaudeCapabilities(
+            version=claude_capabilities.ClaudeVersion(version, (2, 1, 216)),
+            required_options=claude_capabilities.CLAUDE_REQUIRED_OPTIONS,
+            safe_mode_summary="synthetic accepted safe-mode contract",
+        )
+        runtime_binding = validator.runtime_binding_from_verified_executable(
+            verified,
+            capabilities=capabilities,
+            authentication_source="oauth-token",
+            launch_profile="helper-darwin",
+        )
+        self.assertEqual(runtime_binding.api_key_source, "none")
+        self.assertEqual(runtime_binding.launch_profile, "helper-darwin")
+        self.assertEqual(runtime_binding.trust_source, "low-level-helper")
+
+        invalid_artifact = claude_provenance.ClaudeReleaseArtifact(
+            **{**artifact.__dict__, "checksum": "0" * 64}
+        )
+        with self.assertRaises(validator._ContractError):
+            validator.runtime_binding_from_verified_executable(
+                claude_provenance.VerifiedClaudeExecutable(
+                    **{**verified.__dict__, "artifact": invalid_artifact}
+                ),
+                capabilities=capabilities,
+                authentication_source="oauth-token",
+                launch_profile="helper-darwin",
+            )
 
     def test_loader_accepts_current_contract_and_rejects_profile_drift(self) -> None:
         self.assertEqual(
@@ -418,6 +641,45 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             {"classification": "accepted", "findings": "\nNo findings.\n"},
         )
 
+    def test_runtime_launch_profiles_bind_exact_permission_and_tool_surfaces(
+        self,
+    ) -> None:
+        cases = {
+            "named-direct": ("dontAsk", ["Read", "Grep", "Glob", "Bash"]),
+            "helper-linux": ("dontAsk", ["Read"]),
+            "helper-darwin": ("default", ["Read", "Grep", "Glob"]),
+        }
+        for launch_profile, (permission_mode, tools) in cases.items():
+            with self.subTest(launch_profile=launch_profile):
+                events = self._full_events()
+                events[0]["permissionMode"] = permission_mode
+                events[0]["tools"] = tools
+                self.assertEqual(
+                    self._validate(events, launch_profile=launch_profile)[
+                        "classification"
+                    ],
+                    "accepted",
+                )
+
+        events = self._full_events()
+        events[0]["tools"] = ["Read"]
+        events.insert(
+            -1,
+            self._assistant_event(
+                {
+                    "type": "tool_use",
+                    "caller": {"type": "direct"},
+                    "id": "toolu-forbidden",
+                    "input": {},
+                    "name": "Bash",
+                }
+            ),
+        )
+        self.assert_fail_closed(
+            self._validate(events, launch_profile="helper-linux"),
+            "inconclusive",
+        )
+
     def test_accepts_all_reviewed_intermediate_shapes_for_supported_2x(self) -> None:
         for version in ("2.1.211", "2.1.216", "2.9.999"):
             with self.subTest(version=version):
@@ -438,7 +700,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 )
 
     def test_accepts_each_reviewed_tool_and_tool_result_representation(self) -> None:
-        for tool_name in validator.EXPECTED_TOOLS:
+        for tool_name in validator.LAUNCH_PROFILES["named-direct"]["tools"]:
             with self.subTest(tool_name=tool_name):
                 tool_event = self._assistant_event(
                     {
@@ -500,7 +762,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                     self._validate(claude_code_version=version),
                     {
                         "classification": "inconclusive",
-                        "reasons": ["validator.claude-code-version-invalid"],
+                        "reasons": ["validator.runtime-binding-invalid"],
                     },
                 )
 
@@ -745,8 +1007,11 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 self._raw(self._full_events()),
                 expected_cwd=self.cwd,
                 requested_model="claude-opus-4-8",
-                claude_code_version=self.claude_code_version,
-                authentication_source="local-login",
+                runtime_binding=validator.ClaudeRuntimeBinding(
+                    **{
+                        **self._valid_runtime_binding_fields(),
+                    }
+                ),
             ),
             {
                 "classification": "inconclusive",
@@ -853,7 +1118,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             self._validate(authentication_source="none"),
             {
                 "classification": "inconclusive",
-                "reasons": ["validator.authentication-source-invalid"],
+                "reasons": ["validator.runtime-binding-invalid"],
             },
         )
 
@@ -884,8 +1149,9 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             io.StringIO("not binary"),
             expected_cwd=self.cwd,
             requested_model="claude-opus-4-8",
-            claude_code_version=self.claude_code_version,
-            authentication_source="local-login",
+            runtime_binding=validator.ClaudeRuntimeBinding(
+                **self._valid_runtime_binding_fields()
+            ),
             process_returncode=0,
         )
         self.assert_fail_closed(outcome, "inconclusive")
@@ -902,7 +1168,9 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             with self.subTest(error=type(error).__name__):
                 with (
                     mock.patch.object(
-                        validator, "_load_contract", return_value=contract
+                        validator,
+                        "_load_contract_with_binding",
+                        return_value=(contract, self.stream_contract_binding),
                     ),
                     mock.patch.object(
                         validator, "_strict_json_loads", side_effect=error
@@ -1667,8 +1935,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                         str(self.cwd),
                         "--model",
                         "claude-opus-4-8",
-                        "--claude-code-version",
-                        self.claude_code_version,
+                        "--preflight-result",
+                        str(self.preflight_path),
                         "--authentication-source",
                         "local-login",
                         "--process-returncode",
@@ -1704,8 +1972,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 str(self.cwd),
                 "--model",
                 "claude-opus-4-8",
-                "--claude-code-version",
-                self.claude_code_version,
+                "--preflight-result",
+                str(self.preflight_path),
                 "--authentication-source",
                 "local-login",
                 "--process-returncode",
@@ -1728,6 +1996,48 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         )
         self.assertEqual(completed.stderr, b"")
 
+    def test_cli_maps_each_authentication_source_to_api_key_source(self) -> None:
+        for authentication_source, api_key_source in (
+            ("api-key", "ANTHROPIC_API_KEY"),
+            ("oauth-token", "none"),
+            ("local-login", "none"),
+        ):
+            with self.subTest(authentication_source=authentication_source):
+                events = self._full_events()
+                events[0]["apiKeySource"] = api_key_source
+                input_path = self.cwd / f"{authentication_source}-stream.jsonl"
+                input_path.write_bytes(self._raw(events))
+
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(VALIDATOR),
+                        "--cwd",
+                        str(self.cwd),
+                        "--model",
+                        "claude-opus-4-8",
+                        "--preflight-result",
+                        str(self.preflight_path),
+                        "--authentication-source",
+                        authentication_source,
+                        "--process-returncode",
+                        "0",
+                        "--input",
+                        str(input_path),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=5,
+                )
+
+                self.assertEqual(completed.returncode, 0)
+                self.assertEqual(completed.stderr, b"")
+                self.assertEqual(
+                    json.loads(completed.stdout),
+                    {"classification": "accepted", "findings": "\nNo findings.\n"},
+                )
+
     def test_cli_rejects_success_stdout_when_process_returncode_is_nonzero(
         self,
     ) -> None:
@@ -1742,8 +2052,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 str(self.cwd),
                 "--model",
                 "claude-opus-4-8",
-                "--claude-code-version",
-                self.claude_code_version,
+                "--preflight-result",
+                str(self.preflight_path),
                 "--authentication-source",
                 "local-login",
                 "--process-returncode",
@@ -1799,8 +2109,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                         str(self.cwd),
                         "--model",
                         "claude-opus-4-8",
-                        "--claude-code-version",
-                        self.claude_code_version,
+                        "--preflight-result",
+                        str(self.preflight_path),
                         "--authentication-source",
                         "local-login",
                         "--process-returncode",
@@ -1831,14 +2141,14 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "missing-cwd": [
                 "--model",
                 "claude-opus-4-8",
-                "--claude-code-version",
-                self.claude_code_version,
+                "--preflight-result",
+                str(self.preflight_path),
                 "--authentication-source",
                 "local-login",
                 "--process-returncode",
                 "0",
             ],
-            "missing-claude-code-version": [
+            "missing-preflight-result": [
                 "--cwd",
                 str(self.cwd),
                 "--model",
@@ -1853,8 +2163,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 str(self.cwd),
                 "--model",
                 "claude-opus-4-8",
-                "--claude-code-version",
-                self.claude_code_version,
+                "--preflight-result",
+                str(self.preflight_path),
                 "--authentication-source",
                 "local-login",
             ],
@@ -1863,8 +2173,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 str(self.cwd),
                 "--model",
                 "claude-opus-4-8",
-                "--claude-code-version",
-                self.claude_code_version,
+                "--preflight-result",
+                str(self.preflight_path),
                 "--authentication-source",
                 "local-login",
                 "--process-returncode",
@@ -1875,34 +2185,22 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 str(self.cwd),
                 "--model",
                 "claude-future",
-                "--claude-code-version",
-                self.claude_code_version,
+                "--preflight-result",
+                str(self.preflight_path),
                 "--authentication-source",
                 "local-login",
                 "--process-returncode",
                 "0",
             ],
-            "version-below-range": [
+            "invalid-authentication-source": [
                 "--cwd",
                 str(self.cwd),
                 "--model",
                 "claude-opus-4-8",
-                "--claude-code-version",
-                "2.1.210",
+                "--preflight-result",
+                str(self.preflight_path),
                 "--authentication-source",
-                "local-login",
-                "--process-returncode",
-                "0",
-            ],
-            "version-at-upper-bound": [
-                "--cwd",
-                str(self.cwd),
-                "--model",
-                "claude-opus-4-8",
-                "--claude-code-version",
-                "3.0.0",
-                "--authentication-source",
-                "local-login",
+                "future-auth-source",
                 "--process-returncode",
                 "0",
             ],
@@ -1911,8 +2209,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 str(self.cwd),
                 "--model",
                 "claude-opus-4-8",
-                "--claude-code-version",
-                self.claude_code_version,
+                "--preflight-result",
+                str(self.preflight_path),
                 "--authentication-source",
                 "local-login",
                 "--process-returncode",
@@ -1959,8 +2257,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 str(self.cwd),
                 "--model",
                 "claude-opus-4-8",
-                "--claude-code-version",
-                self.claude_code_version,
+                "--preflight-result",
+                str(self.preflight_path),
                 "--authentication-source",
                 "local-login",
                 "--process-returncode",
@@ -2003,8 +2301,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 str(self.cwd),
                 "--model",
                 "claude-opus-4-8",
-                "--claude-code-version",
-                self.claude_code_version,
+                "--preflight-result",
+                str(self.preflight_path),
                 "--authentication-source",
                 "local-login",
                 "--process-returncode",
