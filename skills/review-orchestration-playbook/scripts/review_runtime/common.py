@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import pathlib
@@ -7,6 +8,7 @@ import re
 import select
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -125,6 +127,8 @@ BASE_ENV_KEYS = (
 PROCESS_GROUP_TERM_GRACE_SECONDS = 0.5
 PROCESS_GROUP_EXIT_GRACE_SECONDS = 0.5
 PROCESS_GROUP_POLL_SECONDS = 0.05
+DESCRIPTOR_CWD_HANDOFF_TIMEOUT_SECONDS = 10.0
+FD_EXEC_ERROR_PREFIX = b"fd_exec.py: launch-error:"
 
 
 def write_text_atomic(path: pathlib.Path, text: str) -> None:
@@ -132,13 +136,87 @@ def write_text_atomic(path: pathlib.Path, text: str) -> None:
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary_path = pathlib.Path(temporary)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        os.fchmod(fd, 0o600)
+        handle = os.fdopen(fd, "w", encoding="utf-8")
+        fd = -1
+        with handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
     finally:
+        if fd >= 0:
+            os.close(fd)
         temporary_path.unlink(missing_ok=True)
+
+
+def write_bytes_atomic_at(directory_fd: int, name: str, payload: bytes) -> None:
+    """Atomically persist a private file relative to an already-bound directory."""
+
+    if not name or pathlib.PurePath(name).name != name or name in {".", ".."}:
+        raise ReviewError("bound runtime artifact name is invalid")
+    temporary_name = f".{name}.{os.urandom(12).hex()}"
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor: int | None = None
+    handle: BinaryIO | None = None
+    try:
+        descriptor = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+        os.fchmod(descriptor, 0o600)
+        handle = os.fdopen(descriptor, "wb")
+        descriptor = None
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        handle = None
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    except OSError as error:
+        raise ReviewError(
+            f"cannot persist bound runtime artifact {name}: {error}"
+        ) from error
+    finally:
+        if handle is not None:
+            handle.close()
+        elif descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def write_text_atomic_at(directory_fd: int, name: str, text: str) -> None:
+    try:
+        payload = text.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ReviewError(
+            f"cannot encode bound runtime artifact {name}: {error}"
+        ) from error
+    write_bytes_atomic_at(directory_fd, name, payload)
+
+
+def write_json_atomic_at(directory_fd: int, name: str, value: Any) -> None:
+    try:
+        text = json.dumps(value, indent=2, sort_keys=True) + "\n"
+    except (TypeError, ValueError) as error:
+        raise ReviewError(
+            f"cannot encode bound runtime JSON artifact {name}: {error}"
+        ) from error
+    write_text_atomic_at(directory_fd, name, text)
 
 
 def write_json(path: pathlib.Path, value: Any) -> None:
@@ -182,57 +260,77 @@ def run(
     argv: Iterable[str],
     *,
     cwd: pathlib.Path | None = None,
+    cwd_fd: int | None = None,
+    pass_fds: Iterable[int] = (),
     env: dict[str, str] | None = None,
     stdin: bytes | None = None,
     check: bool = False,
     stdout_path: pathlib.Path | None = None,
     stderr_path: pathlib.Path | None = None,
+    stdout_file: BinaryIO | None = None,
+    stderr_file: BinaryIO | None = None,
     capture_limit_bytes: int = 4 * 1024 * 1024,
     timeout_seconds: float | None = None,
     output_file_limit_bytes: int | None = None,
     on_process_started: Callable[[], None] | None = None,
 ) -> Completed:
     command = tuple(str(item) for item in argv)
+    inherited_fds = _validate_pass_fds(pass_fds)
+    if cwd is not None and cwd_fd is not None:
+        raise ReviewError("cwd and cwd_fd are mutually exclusive")
+    path_logging = stdout_path is not None or stderr_path is not None
+    handle_logging = stdout_file is not None or stderr_file is not None
     if (stdout_path is None) != (stderr_path is None):
         raise ReviewError("stdout_path and stderr_path must be provided together")
-    if output_file_limit_bytes is not None and (
-        stdout_path is None or stderr_path is None
-    ):
+    if (stdout_file is None) != (stderr_file is None):
+        raise ReviewError("stdout_file and stderr_file must be provided together")
+    if path_logging and handle_logging:
+        raise ReviewError("logged output paths and files are mutually exclusive")
+    logged_output = path_logging or handle_logging
+    if output_file_limit_bytes is not None and (not logged_output):
         raise ReviewError("output_file_limit_bytes requires logged output paths")
     if output_file_limit_bytes is not None and timeout_seconds is None:
         raise ReviewError("output_file_limit_bytes requires timeout_seconds")
-    if timeout_seconds is not None and (stdout_path is None or stderr_path is None):
+    if timeout_seconds is not None and not logged_output:
         raise ReviewError("timeout_seconds requires logged output paths")
-    if on_process_started is not None and (
-        stdout_path is None or stderr_path is None
-    ):
+    if on_process_started is not None and not logged_output:
         raise ReviewError("on_process_started requires logged output paths")
     if output_file_limit_bytes is not None and output_file_limit_bytes <= 0:
         raise ReviewError("output_file_limit_bytes must be positive")
     try:
-        if stdout_path is None or stderr_path is None:
-            completed = subprocess.run(
+        if not logged_output:
+            spawn_command, cwd_pass_fds = _descriptor_cwd_command(
                 command,
+                cwd_fd,
+            )
+            completed = subprocess.run(
+                spawn_command,
                 cwd=cwd,
                 env=env,
                 input=stdin,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
+                pass_fds=_merge_pass_fds(inherited_fds, cwd_pass_fds),
             )
             result = Completed(
                 command, completed.returncode, completed.stdout, completed.stderr
             )
-        else:
+            _raise_descriptor_exec_failure(result, enabled=cwd_fd is not None)
+        elif path_logging:
+            assert stdout_path is not None
+            assert stderr_path is not None
             stdout_path.parent.mkdir(parents=True, exist_ok=True)
             stderr_path.parent.mkdir(parents=True, exist_ok=True)
             with (
-                stdout_path.open("wb") as stdout_handle,
-                stderr_path.open("wb") as stderr_handle,
+                stdout_path.open("w+b") as stdout_handle,
+                stderr_path.open("w+b") as stderr_handle,
             ):
                 returncode = _run_logged_process(
                     command,
                     cwd=cwd,
+                    cwd_fd=cwd_fd,
+                    pass_fds=inherited_fds,
                     env=env,
                     stdin=stdin,
                     stdout_handle=stdout_handle,
@@ -242,11 +340,36 @@ def run(
                     stderr_file_limit_bytes=output_file_limit_bytes,
                     on_process_started=on_process_started,
                 )
+                result = Completed(
+                    command,
+                    returncode,
+                    _read_bounded_handle(stdout_handle, capture_limit_bytes),
+                    _read_bounded_handle(stderr_handle, capture_limit_bytes),
+                )
+        else:
+            assert stdout_file is not None
+            assert stderr_file is not None
+            _prepare_capture_handle(stdout_file)
+            _prepare_capture_handle(stderr_file)
+            returncode = _run_logged_process(
+                command,
+                cwd=cwd,
+                cwd_fd=cwd_fd,
+                pass_fds=inherited_fds,
+                env=env,
+                stdin=stdin,
+                stdout_handle=stdout_file,
+                stderr_handle=stderr_file,
+                timeout_seconds=timeout_seconds,
+                stdout_file_limit_bytes=output_file_limit_bytes,
+                stderr_file_limit_bytes=output_file_limit_bytes,
+                on_process_started=on_process_started,
+            )
             result = Completed(
                 command,
                 returncode,
-                _read_bounded_bytes(stdout_path, capture_limit_bytes),
-                _read_bounded_bytes(stderr_path, capture_limit_bytes),
+                _read_bounded_handle(stdout_file, capture_limit_bytes),
+                _read_bounded_handle(stderr_file, capture_limit_bytes),
             )
     except subprocess.TimeoutExpired as error:
         raise ReviewTimeoutError(
@@ -262,17 +385,129 @@ def run(
     return result
 
 
+def _prepare_capture_handle(handle: BinaryIO) -> None:
+    try:
+        metadata = os.fstat(handle.fileno())
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ReviewError("logged output handle is not a regular file")
+        handle.seek(0)
+        handle.truncate(0)
+        handle.flush()
+    except OSError as error:
+        raise ReviewError(f"cannot prepare logged output handle: {error}") from error
+
+
+def _validate_pass_fds(descriptors: Iterable[int]) -> tuple[int, ...]:
+    result: list[int] = []
+    for descriptor in descriptors:
+        if isinstance(descriptor, bool) or not isinstance(descriptor, int):
+            raise ReviewError("inherited file descriptors must be integers")
+        if descriptor < 0:
+            raise ReviewError("inherited file descriptors must be non-negative")
+        try:
+            os.fstat(descriptor)
+        except OSError as error:
+            raise ReviewError(
+                f"cannot inspect inherited file descriptor {descriptor}: {error}"
+            ) from error
+        if descriptor not in result:
+            result.append(descriptor)
+    if result and os.name != "posix":
+        raise ReviewError("inherited file descriptors require a POSIX runtime")
+    return tuple(result)
+
+
+def _merge_pass_fds(*groups: Iterable[int]) -> tuple[int, ...]:
+    return tuple(dict.fromkeys(descriptor for group in groups for descriptor in group))
+
+
+def _read_bounded_handle(handle: BinaryIO, limit: int) -> bytes:
+    if limit <= 0:
+        raise ReviewError("capture_limit_bytes must be positive")
+    try:
+        handle.flush()
+        size = os.fstat(handle.fileno()).st_size
+        handle.seek(0)
+        if size <= limit:
+            return handle.read()
+        head_size = limit // 2
+        tail_size = limit - head_size
+        head = handle.read(head_size)
+        handle.seek(size - tail_size)
+        tail = handle.read(tail_size)
+    except OSError as error:
+        raise ReviewError(f"cannot read bounded command output: {error}") from error
+    return head + b"\n... bounded capture omitted middle bytes ...\n" + tail
+
+
+def _descriptor_cwd_command(
+    command: tuple[str, ...],
+    cwd_fd: int | None,
+    *,
+    status_fd: int | None = None,
+) -> tuple[tuple[str, ...], tuple[int, ...]]:
+    if cwd_fd is None:
+        return command, ()
+    if os.name != "posix":
+        raise ReviewError("descriptor-backed cwd requires a POSIX runtime")
+    try:
+        metadata = os.fstat(cwd_fd)
+    except OSError as error:
+        raise ReviewError(f"cannot inspect descriptor-backed cwd: {error}") from error
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ReviewError("descriptor-backed cwd is not a directory")
+    launcher = pathlib.Path(__file__).with_name("fd_exec.py")
+    if not launcher.is_file():
+        raise ReviewError("descriptor-backed cwd launcher is unavailable")
+    return (
+        (
+            sys.executable,
+            str(launcher),
+            str(cwd_fd),
+            str(status_fd) if status_fd is not None else "-",
+            *command,
+        ),
+        (cwd_fd,) + ((status_fd,) if status_fd is not None else ()),
+    )
+
+
+def _descriptor_exec_error(payload: bytes, command: tuple[str, ...]) -> OSError:
+    encoded_errno, separator, encoded_detail = payload.partition(b"\n")
+    try:
+        error_number = int(encoded_errno.decode("ascii"))
+    except (UnicodeDecodeError, ValueError):
+        error_number = errno.EIO
+        encoded_detail = payload
+    detail = encoded_detail.decode("utf-8", errors="replace").strip()
+    if not separator or not detail:
+        detail = "descriptor-backed reviewer launch failed"
+    if error_number == errno.ENOENT:
+        return FileNotFoundError(error_number, detail, command[0])
+    return OSError(error_number, detail, command[0])
+
+
+def _raise_descriptor_exec_failure(result: Completed, *, enabled: bool) -> None:
+    if not enabled or result.returncode != 126:
+        return
+    if not result.stderr.startswith(FD_EXEC_ERROR_PREFIX):
+        return
+    payload = result.stderr[len(FD_EXEC_ERROR_PREFIX) :].lstrip()
+    raise _descriptor_exec_error(payload, result.argv)
+
+
 def run_bounded_capture(
     argv: Iterable[str],
     *,
     cwd: pathlib.Path | None = None,
     env: dict[str, str] | None = None,
+    pass_fds: Iterable[int] = (),
     stdin: bytes | bytearray | None = None,
     timeout_seconds: float,
     stdout_limit_bytes: int,
     stderr_limit_bytes: int,
 ) -> BoundedCapture:
     command = tuple(str(item) for item in argv)
+    inherited_fds = _validate_pass_fds(pass_fds)
     if stdout_limit_bytes <= 0 or stderr_limit_bytes <= 0:
         raise ReviewError("bounded capture limits must be positive")
     stdout = _BytearrayWriter()
@@ -281,6 +516,7 @@ def run_bounded_capture(
         returncode = _run_logged_process(
             command,
             cwd=cwd,
+            pass_fds=inherited_fds,
             env=env,
             stdin=stdin,
             stdout_handle=stdout,
@@ -450,10 +686,47 @@ def terminate_process_group(
         pass
 
 
+def _await_descriptor_exec_handoff(
+    process: subprocess.Popen[bytes],
+    descriptor: int,
+    *,
+    command: tuple[str, ...],
+) -> None:
+    deadline = time.monotonic() + DESCRIPTOR_CWD_HANDOFF_TIMEOUT_SECONDS
+    payload = bytearray()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReviewTimeoutError(
+                "descriptor-backed reviewer exec handoff timed out: "
+                f"{' '.join(command)}"
+            )
+        try:
+            readable, _, _ = select.select((descriptor,), (), (), remaining)
+        except InterruptedError:
+            continue
+        if not readable:
+            continue
+        chunk = os.read(descriptor, 4096)
+        if not chunk:
+            break
+        payload.extend(chunk)
+        if len(payload) > 4096:
+            raise ReviewError("descriptor-backed reviewer exec handoff overflowed")
+    if payload:
+        try:
+            process.wait(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        raise _descriptor_exec_error(bytes(payload), command)
+
+
 def _run_logged_process(
     command: tuple[str, ...],
     *,
     cwd: pathlib.Path | None,
+    cwd_fd: int | None = None,
+    pass_fds: tuple[int, ...] = (),
     env: dict[str, str] | None,
     stdin: bytes | bytearray | None,
     stdout_handle: BinaryIO,
@@ -469,6 +742,8 @@ def _run_logged_process(
     spawn_handoff_complete = False
     io_threads: list[threading.Thread] = []
     stop_io = threading.Event()
+    handoff_read_descriptor: int | None = None
+    handoff_write_descriptor: int | None = None
 
     def forward_signal(signum: int, _frame: object) -> None:
         nonlocal forwarded_signal_sent, pending_signal
@@ -490,9 +765,17 @@ def _run_logged_process(
     try:
         if pending_signal is not None:
             raise ForwardedSignal(pending_signal)
-        process = subprocess.Popen(
+        if cwd_fd is not None:
+            handoff_read_descriptor, handoff_write_descriptor = os.pipe()
+        spawn_command, cwd_pass_fds = _descriptor_cwd_command(
             command,
+            cwd_fd,
+            status_fd=handoff_write_descriptor,
+        )
+        process = subprocess.Popen(
+            spawn_command,
             cwd=cwd,
+            pass_fds=_merge_pass_fds(pass_fds, cwd_pass_fds),
             env=env,
             stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
             stdout=(
@@ -507,6 +790,17 @@ def _run_logged_process(
             ),
             start_new_session=os.name == "posix",
         )
+        if handoff_write_descriptor is not None:
+            os.close(handoff_write_descriptor)
+            handoff_write_descriptor = None
+        if handoff_read_descriptor is not None:
+            _await_descriptor_exec_handoff(
+                process,
+                handoff_read_descriptor,
+                command=command,
+            )
+            os.close(handoff_read_descriptor)
+            handoff_read_descriptor = None
         if on_process_started is not None:
             on_process_started()
         spawn_handoff_complete = True
@@ -630,8 +924,7 @@ def _run_logged_process(
         if leftover_process_group:
             exit_deadline = time.monotonic() + PROCESS_GROUP_EXIT_GRACE_SECONDS
             while (
-                _process_group_exists(process.pid)
-                and time.monotonic() < exit_deadline
+                _process_group_exists(process.pid) and time.monotonic() < exit_deadline
             ):
                 time.sleep(PROCESS_GROUP_POLL_SECONDS)
             leftover_process_group = _process_group_exists(process.pid)
@@ -653,8 +946,7 @@ def _run_logged_process(
             ) from drain_errors[0]
         if output_overflow.is_set():
             raise ReviewOutputLimitError(
-                "command output exceeded its bounded stream limit: "
-                f"{' '.join(command)}"
+                f"command output exceeded its bounded stream limit: {' '.join(command)}"
             )
         if leftover_process_group:
             raise ReviewProcessLeakError(
@@ -668,6 +960,16 @@ def _run_logged_process(
         previous_mask = block_forwarded_signals()
         pending_cleanup_signal: signal.Signals | None = None
         try:
+            for descriptor in (
+                handoff_write_descriptor,
+                handoff_read_descriptor,
+            ):
+                if descriptor is None:
+                    continue
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
             if process is not None:
                 terminate_process_group(
                     process,

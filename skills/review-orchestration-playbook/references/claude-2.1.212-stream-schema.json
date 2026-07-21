@@ -304,6 +304,24 @@
             "failure": "classify"
           }
         },
+        "recognized_failure_classes": {
+          "authentication": {
+            "classification": "blocked-authentication",
+            "reason": "terminal.authentication-error"
+          },
+          "model_entitlement": {
+            "classification": "blocked",
+            "reason": "terminal.model-entitlement-denial"
+          },
+          "organization_policy": {
+            "classification": "blocked",
+            "reason": "terminal.organization-policy-denial"
+          },
+          "mixed_or_ambiguous": {
+            "classification": "inconclusive",
+            "reason": "terminal.unclassified-error"
+          }
+        },
         "unclassified_failure": "inconclusive"
       }
     }

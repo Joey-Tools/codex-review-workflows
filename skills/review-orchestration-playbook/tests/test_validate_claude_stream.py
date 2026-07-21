@@ -734,6 +734,15 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "token usage error",
             "token budget failure",
             "token limit error",
+            "API key usage limit error",
+            "API key rate limit error",
+            "OAuth capacity error",
+            "OAuth rate limit error",
+            "authentication budget failure",
+            "authentication quota failure",
+            "error reading credentials file",
+            "credential I/O error",
+            "credentials file read error",
         )
         for message in non_authentication_messages:
             with self.subTest(non_authentication_message=message):
@@ -788,6 +797,87 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                             "reasons": ["terminal.authentication-error"],
                         },
                     )
+
+    def test_classifies_only_strict_model_fallback_denials(self) -> None:
+        def failure_with(messages: list[str]) -> list[dict[str, object]]:
+            return [
+                copy.deepcopy(self.init_event),
+                {
+                    "type": "result",
+                    "subtype": "error",
+                    "is_error": True,
+                    "errors": messages,
+                },
+            ]
+
+        accepted = {
+            "Model entitlement denied": "terminal.model-entitlement-denial",
+            "Not entitled to use model": "terminal.model-entitlement-denial",
+            "Model access is denied": "terminal.model-entitlement-denial",
+            "Organization policy denied model": ("terminal.organization-policy-denial"),
+            "Model is disallowed by organizational policy": (
+                "terminal.organization-policy-denial"
+            ),
+        }
+        for message, reason in accepted.items():
+            with self.subTest(message=message):
+                self.assertEqual(
+                    self._validate(failure_with([message]), process_returncode=1),
+                    {"classification": "blocked", "reasons": [reason]},
+                )
+
+        self.assertEqual(
+            self._validate(
+                failure_with(
+                    [
+                        "Model entitlement denied",
+                        "Organization policy denied model",
+                    ]
+                )
+            ),
+            {
+                "classification": "blocked",
+                "reasons": [
+                    "terminal.model-entitlement-denial",
+                    "terminal.organization-policy-denial",
+                ],
+            },
+        )
+        for messages in (
+            ["Model entitlement denied", "upstream request failed"],
+            ["Organization policy denied model", "HTTP 401 Unauthorized"],
+            ["Policy error"],
+            ["Model unavailable"],
+        ):
+            with self.subTest(mixed_or_ambiguous=messages):
+                self.assert_fail_closed(
+                    self._validate(failure_with(messages)), "inconclusive"
+                )
+
+    def test_non_success_preserves_deterministic_init_blockers(self) -> None:
+        terminal = {
+            "type": "result",
+            "subtype": "error",
+            "is_error": True,
+        }
+        cases = {
+            "permission-mode": (
+                {"permissionMode": "default"},
+                ["init.permissionMode.mismatch"],
+            ),
+            "tool-set": (
+                {"tools": ["Read", "Grep", "Glob", "Bash", "Write"]},
+                ["init.tools.mismatch"],
+            ),
+        }
+        for name, (init_update, reasons) in cases.items():
+            with self.subTest(case=name):
+                init = copy.deepcopy(self.init_event)
+                init.update(init_update)
+                self.assertEqual(
+                    self._validate([init, copy.deepcopy(terminal)]),
+                    {"classification": "blocked", "reasons": reasons},
+                )
 
     def test_non_success_model_mismatch_is_blocked_without_unclassified_reason(
         self,

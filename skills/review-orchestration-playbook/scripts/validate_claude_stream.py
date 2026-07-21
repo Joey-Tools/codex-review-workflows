@@ -387,6 +387,24 @@ def _load_contract() -> dict[str, Any]:
                     "failure": "classify",
                 },
             },
+            "recognized_failure_classes": {
+                "authentication": {
+                    "classification": "blocked-authentication",
+                    "reason": "terminal.authentication-error",
+                },
+                "model_entitlement": {
+                    "classification": "blocked",
+                    "reason": "terminal.model-entitlement-denial",
+                },
+                "organization_policy": {
+                    "classification": "blocked",
+                    "reason": "terminal.organization-policy-denial",
+                },
+                "mixed_or_ambiguous": {
+                    "classification": "inconclusive",
+                    "reason": "terminal.unclassified-error",
+                },
+            },
             "unclassified_failure": "inconclusive",
         },
     }
@@ -636,17 +654,33 @@ _HTTP_401 = re.compile(
     r"|status(?:[\s_-]+code)?"
     r")\b\s*[:=]?\s*401\b"
 )
-_AUTH_CONTEXT = r"(?:oauth|auth(?:entication)?|credentials?|login|api[\s_-]+keys?)"
-_REFRESH_ACTION = r"refresh(?:ed|ing)?"
-_FAILURE_SIGNAL = r"(?:fail(?:ed|ing|ure)?|error|expired|invalid|unauthorized|unable)"
-_TOKEN_REFRESH_CONTEXT = (
-    rf"(?:tokens?(?:[\s_-]+[a-z0-9]+){{0,3}}[\s_-]+{_REFRESH_ACTION}"
-    rf"|{_REFRESH_ACTION}(?:[\s_-]+[a-z0-9]+){{0,3}}[\s_-]+tokens?)"
+_AUTH_STATE_CONTEXT = (
+    r"(?:oauth|auth(?:entication)?|credentials?|login|api[\s_-]+keys?)"
 )
-_AUTH_REFRESH_CONTEXT = (
-    rf"(?:{_AUTH_CONTEXT}(?:[\s_-]+[a-z0-9]+){{0,3}}[\s_-]+{_REFRESH_ACTION}"
-    rf"|{_REFRESH_ACTION}(?:[\s_-]+[a-z0-9]+){{0,3}}[\s_-]+{_AUTH_CONTEXT}"
-    rf"|{_TOKEN_REFRESH_CONTEXT})"
+_AUTH_ERROR_CONTEXT = r"(?:oauth|auth(?:entication)?|login)"
+_AUTH_STATE_SIGNAL = r"(?:expired|invalid|unauthorized)"
+_AUTH_ERROR_SIGNAL = r"(?:fail(?:ed|ure)?|error)"
+_REFRESH_TARGET = (
+    r"(?:oauth|auth(?:entication)?|credentials?|login(?:[\s_-]+tokens?)?"
+    r"|api[\s_-]+keys?|tokens?)"
+)
+_EXPLICIT_REFRESH_FAILURE = re.compile(
+    rf"\b(?:"
+    rf"{_REFRESH_TARGET}[\s_-]+refresh(?:ed|ing)?[\s,:;_-]+"
+    rf"(?:{_AUTH_ERROR_SIGNAL}|{_AUTH_STATE_SIGNAL})"
+    rf"|refresh(?:ed|ing)?[\s_-]+{_REFRESH_TARGET}[\s,:;_-]+"
+    rf"(?:{_AUTH_ERROR_SIGNAL}|{_AUTH_STATE_SIGNAL})"
+    rf"|(?:{_AUTH_ERROR_SIGNAL}|{_AUTH_STATE_SIGNAL})[\s_-]+to[\s_-]+"
+    rf"refresh[\s_-]+{_REFRESH_TARGET}"
+    rf")\b"
+)
+_DIRECT_AUTHENTICATION_FAILURE = re.compile(
+    rf"\b(?:"
+    rf"{_AUTH_STATE_CONTEXT}[\s,:;_-]+{_AUTH_STATE_SIGNAL}"
+    rf"|{_AUTH_STATE_SIGNAL}[\s,:;_-]+{_AUTH_STATE_CONTEXT}"
+    rf"|{_AUTH_ERROR_CONTEXT}[\s,:;_-]+{_AUTH_ERROR_SIGNAL}"
+    rf"|{_AUTH_ERROR_SIGNAL}[\s,:;_-]+{_AUTH_ERROR_CONTEXT}"
+    rf")\b"
 )
 _TOKEN_AUTHENTICATION_STATE = re.compile(
     r"\b(?:"
@@ -656,14 +690,25 @@ _TOKEN_AUTHENTICATION_STATE = re.compile(
     r"(?:access[\s_-]+|api[\s_-]+|bearer[\s_-]+|session[\s_-]+)?tokens?"
     r")\b"
 )
-_AUTHENTICATION_FAILURE = re.compile(
-    rf"\b(?:"
-    rf"(?:{_AUTH_CONTEXT}|{_AUTH_REFRESH_CONTEXT})\b"
-    rf"(?:[\s,:;_-]+[a-z0-9]+){{0,4}}"
-    rf"[\s,:;_-]+{_FAILURE_SIGNAL}"
-    rf"|{_FAILURE_SIGNAL}\b(?:[\s,:;_-]+[a-z0-9]+){{0,4}}"
-    rf"[\s,:;_-]+(?:{_AUTH_CONTEXT}|{_AUTH_REFRESH_CONTEXT})"
-    rf")\b"
+_MODEL_ENTITLEMENT_DENIALS = (
+    re.compile(r"\bmodel[\s_-]+entitlement[\s_-]+(?:denied|missing|required)\b"),
+    re.compile(
+        r"\bnot[\s_-]+entitled[\s_-]+to[\s_-]+(?:use|access)"
+        r"[\s_-]+(?:the[\s_-]+)?model\b"
+    ),
+    re.compile(r"\bmodel[\s_-]+access[\s_-]+(?:is[\s_-]+)?denied\b"),
+)
+_ORGANIZATION_POLICY_DENIALS = (
+    re.compile(
+        r"\borganization(?:al)?[\s_-]+policy[\s_-]+"
+        r"(?:denies|denied|disallows?|prohibits?|blocks?)"
+        r"[\s_-]+(?:access[\s_-]+to[\s_-]+)?(?:the[\s_-]+)?model\b"
+    ),
+    re.compile(
+        r"\bmodel[\s_-]+(?:is[\s_-]+)?"
+        r"(?:denied|disallowed|prohibited|blocked)[\s_-]+by"
+        r"[\s_-]+organization(?:al)?[\s_-]+policy\b"
+    ),
 )
 
 
@@ -673,8 +718,19 @@ def _is_authentication_error(message: str) -> bool:
         "login expired" in normalized
         or _HTTP_401.search(normalized)
         or _TOKEN_AUTHENTICATION_STATE.search(normalized)
-        or _AUTHENTICATION_FAILURE.search(normalized)
+        or _EXPLICIT_REFRESH_FAILURE.search(normalized)
+        or _DIRECT_AUTHENTICATION_FAILURE.search(normalized)
     )
+
+
+def _is_model_entitlement_denial(message: str) -> bool:
+    normalized = " ".join(message.casefold().split())
+    return any(pattern.search(normalized) for pattern in _MODEL_ENTITLEMENT_DENIALS)
+
+
+def _is_organization_policy_denial(message: str) -> bool:
+    normalized = " ".join(message.casefold().split())
+    return any(pattern.search(normalized) for pattern in _ORGANIZATION_POLICY_DENIALS)
 
 
 def _collect_error_messages(event: Mapping[str, Any], evidence: _Evidence) -> list[str]:
@@ -758,7 +814,6 @@ def _validate_terminal(
     contract: Mapping[str, Any],
     evidence: _Evidence,
 ) -> str | None:
-    blocked_before_terminal = set(evidence.blocked)
     allowed_fields = (
         TERMINAL_REQUIRED_FIELDS | TERMINAL_VARIANT_FIELDS | TERMINAL_OPTIONAL_FIELDS
     )
@@ -809,15 +864,32 @@ def _validate_terminal(
     if success_claim and messages:
         evidence.inconclusive.add("terminal.success-with-error")
     elif failure_claim:
-        authentication_messages = [
-            message for message in messages if _is_authentication_error(message)
+        message_categories = [
+            (
+                "authentication"
+                if _is_authentication_error(message)
+                else "model-entitlement"
+                if _is_model_entitlement_denial(message)
+                else "organization-policy"
+                if _is_organization_policy_denial(message)
+                else "unclassified"
+            )
+            for message in messages
         ]
-        if authentication_messages and len(authentication_messages) == len(messages):
+        category_set = set(message_categories)
+        if category_set == {"authentication"}:
             evidence.authentication.add("terminal.authentication-error")
+        elif category_set and category_set <= {
+            "model-entitlement",
+            "organization-policy",
+        }:
+            if "model-entitlement" in category_set:
+                evidence.blocked.add("terminal.model-entitlement-denial")
+            if "organization-policy" in category_set:
+                evidence.blocked.add("terminal.organization-policy-denial")
         elif messages:
             evidence.inconclusive.add("terminal.unclassified-error")
-        terminal_blocked = evidence.blocked - blocked_before_terminal
-        if not messages and not terminal_blocked:
+        if not messages and not evidence.blocked:
             evidence.inconclusive.add("terminal.non-success-unclassified")
     return findings
 

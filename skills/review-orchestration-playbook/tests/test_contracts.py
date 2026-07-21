@@ -24,7 +24,9 @@ from review_runtime import (  # noqa: E402
     claude_capabilities,
     claude_linux,
     claude_refresh_lock,
+    cli,
     providers,
+    state,
 )
 
 
@@ -125,6 +127,27 @@ def _claude_auth_repository_policy_files(
                 repo_root
                 / "docs/project_journal/2026/07/"
                 / "2026-07-17-claude-auth-carriers-c17a11.md"
+            ),
+        }
+    elif profile != "private":
+        raise AssertionError(f"unsupported repository policy profile: {profile}")
+    return {
+        name: path.read_text(encoding="utf-8") for name, path in policy_paths.items()
+    }
+
+
+def _secret_admission_repository_policy_files(
+    repo_root: pathlib.Path,
+    profile: str,
+) -> dict[str, str]:
+    policy_paths: dict[str, pathlib.Path] = {}
+    if profile == "canonical":
+        policy_paths = {
+            "AGENTS.md": _repository_agents_path(repo_root, profile),
+            "project journal": (
+                repo_root
+                / "docs/project_journal/2026/07/"
+                / "2026-07-17-secret-reduction-gate-7f1703.md"
             ),
         }
     elif profile != "private":
@@ -270,6 +293,195 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertIn("Stop after bounded retries", readiness)
 
+    def test_secret_delta_is_admission_only_for_trusted_reviewer_input(
+        self,
+    ) -> None:
+        repository_policy = _secret_admission_repository_policy_files(
+            REPO_ROOT,
+            CI_PROFILE,
+        )
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
+            encoding="utf-8"
+        )
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("including repository secrets", skill)
+        self.assertIn("including tracked repository secrets", helper_contract)
+        self.assertIn(
+            "tracked `.codex`, `.agents`, and environment files are intentionally readable",
+            helper_contract,
+        )
+        self.assertIn(
+            "do not redact, rewrite, or suppress reviewer-visible tracked content",
+            skill,
+        )
+        self.assertIn(
+            "Secret admission never delays, suppresses, redacts, or gates reviewer launch",
+            helper_contract,
+        )
+        self.assertIn(
+            "does not suppress this trusted reviewer",
+            readiness,
+        )
+        if "AGENTS.md" in repository_policy:
+            agents = repository_policy["AGENTS.md"]
+            self.assertIn("including tracked repository secrets", agents)
+            self.assertIn(
+                "Secret-delta analysis never blocks a named reviewer launch",
+                agents,
+            )
+        if "project journal" in repository_policy:
+            journal = repository_policy["project journal"]
+            self.assertIn("including repository secrets", journal)
+            self.assertIn(
+                "including tracked `.env`, `.agents`, and `.codex` paths",
+                journal,
+            )
+            self.assertIn(
+                "must not prevent the reviewer from starting",
+                journal,
+            )
+
+    def test_exact_raw_secret_growth_is_the_only_admission_violation(
+        self,
+    ) -> None:
+        repository_policy = _secret_admission_repository_policy_files(
+            REPO_ROOT,
+            CI_PROFILE,
+        )
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
+            encoding="utf-8"
+        )
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+
+        policy = {
+            **repository_policy,
+            "SKILL.md": skill,
+            "helper-contract.md": helper_contract,
+            "pr-readiness.md": readiness,
+        }
+        for name, content in policy.items():
+            with self.subTest(policy=name):
+                self.assertIn("head_count <= base_count", content)
+
+        self.assertIn("Only a first appearance or global count growth blocks", skill)
+        self.assertIn("A first appearance or any growth blocks", helper_contract)
+        self.assertIn("Do not derive Base64, hex, URL-encoded", skill)
+        self.assertIn("No unembedded counter", helper_contract)
+        self.assertIn("do not derive Base64 or other encodings", readiness)
+        self.assertIn(
+            "Report only head-side added locations",
+            skill,
+        )
+        self.assertIn("Unchanged occurrences are omitted", helper_contract)
+        self.assertIn("positive-delta candidates", readiness)
+        if "AGENTS.md" in repository_policy:
+            agents = repository_policy["AGENTS.md"]
+            self.assertIn("Only a first appearance or count growth blocks", agents)
+            self.assertIn("Do not derive Base64, hex, URL-encoded", agents)
+        if "project journal" in repository_policy:
+            journal = repository_policy["project journal"]
+            self.assertIn("blocks only first appearance or growth", journal)
+            self.assertIn(
+                "does not derive canonical Base64, URL encoding, hexadecimal",
+                journal,
+            )
+            self.assertIn(
+                "only detectable additions for a candidate whose global count grows",
+                journal,
+            )
+
+    def test_stateful_secret_admission_is_a_separate_current_head_gate(self) -> None:
+        repository_policy = _secret_admission_repository_policy_files(
+            REPO_ROOT,
+            CI_PROFILE,
+        )
+        policy = {
+            **repository_policy,
+            "SKILL.md": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"),
+            "helper-contract.md": (
+                SKILL_ROOT / "references/helper-contract.md"
+            ).read_text(encoding="utf-8"),
+            "pr-readiness.md": (SKILL_ROOT / "references/pr-readiness.md").read_text(
+                encoding="utf-8"
+            ),
+        }
+        for name, text in policy.items():
+            with self.subTest(policy=name):
+                self.assertIn("stateful final", text)
+                self.assertIn("stateful admission", text)
+                self.assertLess(
+                    text.index("stateful final"),
+                    text.index("stateful admission"),
+                )
+        exit_code_policy = ["helper-contract.md", "pr-readiness.md"]
+        if "AGENTS.md" in policy:
+            exit_code_policy.append("AGENTS.md")
+        if "project journal" in policy:
+            exit_code_policy.append("project journal")
+        for name in exit_code_policy:
+            with self.subTest(exit_code_policy=name):
+                for exit_code in ("0", "1", "3", "75"):
+                    self.assertIn(f"exit `{exit_code}`", policy[name])
+
+        self.assertIn("Admission exit `0` is `clean`", policy["SKILL.md"])
+        self.assertIn(
+            "the only status that permits PR/master/merge-ready",
+            policy["helper-contract.md"],
+        )
+        self.assertIn(
+            "the only result that permits PR/master/merge-ready",
+            policy["pr-readiness.md"],
+        )
+        self.assertIn("These checks are independent", policy["SKILL.md"])
+        self.assertIn("final may succeed when admission", policy["helper-contract.md"])
+        self.assertIn("`stateful final` remains independent", policy["pr-readiness.md"])
+        if "project journal" in policy:
+            journal = policy["project journal"]
+            self.assertIn("is the only permitting result", journal)
+            self.assertIn("reviewer final is independent", journal)
+
+    def test_admission_receipt_and_runner_policy_are_bound_to_the_launch(
+        self,
+    ) -> None:
+        seal_source = inspect.getsource(state._seal_preflight_receipt)
+        admission_source = inspect.getsource(state._admission_status_for_loaded_state)
+        read_preflight_source = inspect.getsource(state._read_bound_preflight)
+        start_source = inspect.getsource(state.start)
+        run_state_source = inspect.getsource(state.run_state)
+        cli_source = inspect.getsource(cli.main)
+
+        self.assertEqual(state.BOUND_STATE_MARKER_SCHEMA_VERSION, 4)
+        self.assertEqual(state.STATE_MARKER_SCHEMA_VERSION, 5)
+        self.assertEqual(state.PREFLIGHT_RECEIPT_SCHEMA_VERSION, 1)
+        self.assertLess(
+            seal_source.index("validate_inherited_runner_lock_lease"),
+            seal_source.index("_read_modern_bound_state_artifact"),
+        )
+        self.assertIn("hashlib.sha256(payload).hexdigest()", seal_source)
+        self.assertIn("receipt = marker.preflight_receipt", read_preflight_source)
+        self.assertIn("len(payload) != receipt.size", read_preflight_source)
+        self.assertIn("runner-sealed", read_preflight_source)
+        self.assertIn("legacy-state-no-preflight-receipt", admission_source)
+        self.assertIn("preflight-unsealed", admission_source)
+
+        for source in (start_source, cli_source):
+            self.assertIn('"--reviewer"', source)
+            self.assertIn('"--egress-consent"', source)
+        self.assertIn("expected_reviewer=parsed.reviewer", cli_source)
+        self.assertIn("expected_egress_consent=parsed.egress_consent", cli_source)
+        self.assertIn("state_reviewer != expected_reviewer", run_state_source)
+        self.assertIn(
+            "state_egress_consent != expected_egress_consent",
+            run_state_source,
+        )
+
     def test_claude_runtime_and_clear_context_codex_agent_models_are_pinned(
         self,
     ) -> None:
@@ -381,7 +593,9 @@ class RepositoryContractTest(unittest.TestCase):
             hasattr(providers, "CLAUDE_ATTEMPT_CREDENTIAL_VALIDITY_SECONDS")
         )
 
-        attempt_source = inspect.getsource(providers._claude_attempt)
+        attempt_source = inspect.getsource(
+            providers._claude_attempt
+        ) + inspect.getsource(providers._claude_attempt_with_output)
         pwd_home_source = inspect.getsource(providers._claude_pwd_home)
         select_source = inspect.getsource(providers._select_claude_macos_credential)
         validate_source = inspect.getsource(providers._validate_claude_local_credential)
@@ -589,8 +803,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("_finish_claude_auth_required", run_review_source)
         self.assertIn("validate_external_workspace", run_review_source)
         self.assertIn(
-            "sensitive-content and escaping-symlink checks passed", run_review_source
+            "review workspace containment and integrity checks passed",
+            run_review_source,
         )
+        self.assertIn("secret-delta status is evaluated separately", run_review_source)
 
         current_policy = "\n".join(
             (
@@ -815,6 +1031,22 @@ class RepositoryContractTest(unittest.TestCase):
                 "unsupported repository policy profile",
             ):
                 _claude_auth_repository_policy_files(repo_root, "unknown")
+
+    def test_secret_admission_policy_files_match_distribution_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = pathlib.Path(temp_dir)
+
+            self.assertEqual(
+                _secret_admission_repository_policy_files(repo_root, "private"),
+                {},
+            )
+            with self.assertRaises(FileNotFoundError):
+                _secret_admission_repository_policy_files(repo_root, "canonical")
+            with self.assertRaisesRegex(
+                AssertionError,
+                "unsupported repository policy profile",
+            ):
+                _secret_admission_repository_policy_files(repo_root, "unknown")
 
     def test_reviewed_ci_snapshots_keep_the_intended_status_guards(self) -> None:
         canonical = (CI_FIXTURE_ROOT / "canonical.yml").read_text(encoding="utf-8")
@@ -1402,8 +1634,9 @@ class RepositoryContractTest(unittest.TestCase):
                 normalized = content.lower()
                 self.assertIn(priority_anchor, normalized)
                 self.assertIn("caller-supplied", content)
-                self.assertIn("parent-derived", content)
-                self.assertIn("explicitly supplied current range", content)
+                self.assertIn("pr-derived", content)
+                self.assertIn("range_origin", content)
+                self.assertIn("base-only-retarget-state-machine.json", content)
                 self.assertIn("base-changed-same-head", content)
 
         workflow = skill.split("## Workflow", 1)[1].lower()
@@ -1417,10 +1650,7 @@ class RepositoryContractTest(unittest.TestCase):
             "Reserve `blocked-authorization`", 1
         )[0].lower()
         self.assertLess(
-            selected_pr_preflight.index(
-                "apply the post-request base-only transition before the generic "
-                "same-head/different-base `scope-mismatch` branch"
-            ),
+            selected_pr_preflight.index("base-only-retarget-state-machine.json"),
             selected_pr_preflight.index("otherwise require exact equality"),
         )
 
@@ -1436,13 +1666,125 @@ class RepositoryContractTest(unittest.TestCase):
             probe_classification.index("any other selected pr"),
         )
         self.assertIn(
-            "start or count no pr-specific lane from it",
+            "stops before local lanes",
             selected_pr_preflight,
         )
         self.assertIn(
-            "do not fall through to `scope-mismatch`",
+            "a recovery pass proceeds to the local lanes",
             selected_pr_preflight,
         )
+
+    def test_base_only_retarget_state_machine_allows_only_authorized_recovery(
+        self,
+    ) -> None:
+        machine_path = SKILL_ROOT / "references/base-only-retarget-state-machine.json"
+        machine = json.loads(machine_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(machine["version"], 1)
+        self.assertEqual(
+            machine["event"],
+            "request-time-merge-base-changed-with-same-head",
+        )
+        self.assertEqual(
+            machine["range_origin"],
+            {
+                "record_location": "parent-owned-audit",
+                "required_fields": ["kind", "base_sha", "head_sha"],
+                "allowed_kinds": ["caller-supplied", "pr-derived"],
+                "original_caller_endpoints_are_immutable": True,
+            },
+        )
+        self.assertEqual(
+            machine["github_lane"],
+            {
+                "action": "never-post-replacement-same-head",
+                "status": "triple-inconclusive",
+            },
+        )
+
+        transitions = {entry["name"]: entry for entry in machine["transitions"]}
+        self.assertEqual(
+            set(transitions),
+            {
+                "missing-range-origin",
+                "stale-caller-range",
+                "forbidden-parent-rewrite-of-caller-range",
+                "caller-supplied-current-recovery",
+                "stale-pr-derived-range",
+                "pr-derived-current-recovery",
+            },
+        )
+        expected_actions = {
+            "missing-range-origin": (
+                "unknown",
+                "any",
+                "any",
+                "stop-before-local-lanes",
+                "range-origin-unverified",
+            ),
+            "stale-caller-range": (
+                "caller-supplied",
+                "inherited-stale",
+                False,
+                "stop-before-local-lanes",
+                "base-changed-same-head",
+            ),
+            "forbidden-parent-rewrite-of-caller-range": (
+                "caller-supplied",
+                "parent-rederived-current",
+                True,
+                "stop-before-local-lanes",
+                "caller-authority-required",
+            ),
+            "caller-supplied-current-recovery": (
+                "caller-supplied",
+                "caller-supplied-current",
+                True,
+                "run-local-lanes",
+                "local-recovery-authorized",
+            ),
+            "stale-pr-derived-range": (
+                "pr-derived",
+                "inherited-stale",
+                False,
+                "stop-before-local-lanes",
+                "base-changed-same-head",
+            ),
+            "pr-derived-current-recovery": (
+                "pr-derived",
+                "normally-rederived-current",
+                True,
+                "run-local-lanes",
+                "local-recovery-authorized",
+            ),
+        }
+        for name, expected in expected_actions.items():
+            transition = transitions[name]
+            actual = (
+                transition["invalidated_origin"],
+                transition["recovery_source"],
+                transition["current_range_equals_current_pr"],
+                transition["local_action"],
+                transition["reason"],
+            )
+            with self.subTest(transition=name):
+                self.assertEqual(actual, expected)
+
+        for path in (
+            SKILL_ROOT / "SKILL.md",
+            SKILL_ROOT / "references/pr-readiness.md",
+            SKILL_ROOT / "references/review-lane-contracts.md",
+            SKILL_ROOT / "references/github-pr-probes.md",
+            SKILL_ROOT / "references/review-prompt-templates.md",
+        ):
+            content = path.read_text(encoding="utf-8")
+            with self.subTest(state_machine_reference=str(path)):
+                self.assertIn("base-only-retarget-state-machine.json", content)
+                self.assertIn("range_origin", content)
+                self.assertIn("caller-supplied", content)
+                self.assertIn("pr-derived", content)
+                self.assertIn("run", content.lower())
+                self.assertIn("local lane", content.lower())
 
     def test_named_single_prompt_uses_clear_context_codex_without_a_full_diff(
         self,
@@ -1751,7 +2093,10 @@ class RepositoryContractTest(unittest.TestCase):
             "Exit status zero is reserved for `accepted` output",
             "A bare child exit code 401",
             "non-authentication refresh failure",
-            "Generic token counting, usage, budget, or limit failures are not authentication evidence",
+            "Generic token counting, usage, budget, quota, capacity, rate-limit, or limit failures are not authentication evidence",
+            "credential-file or other ambiguous credential I/O",
+            "terminal.model-entitlement-denial",
+            "terminal.organization-policy-denial",
         ):
             self.assertIn(anchor, canonical)
         for content in (skill, contracts, runtime):
@@ -1836,16 +2181,18 @@ class RepositoryContractTest(unittest.TestCase):
         envelope_anchor = "A missing, duplicate, malformed, out-of-order, or trailing contract event makes the lane `inconclusive`"
         classifier_anchor = "A structurally valid terminal event that fails the success acceptance schema is passed to the failure classifier below"
         permission_anchor = "Classify a structurally valid permission denial, output truncation/abnormal stop, exact-model mismatch, or configuration/policy mismatch as `blocked`"
-        authentication_anchor = "Classify only a structurally valid recognized `Login expired`, explicit HTTP/status 401, OAuth/credential/login/authentication refresh error, token refresh error, or expired/invalid/unauthorized authentication-token state as `blocked-authentication`"
-        token_non_authentication_anchor = (
-            "Generic token counting, usage, budget, or limit errors"
-        )
+        authentication_anchor = "Classify only a structurally valid recognized `Login expired`, explicit HTTP/status 401, explicit OAuth/credential/login/authentication/token refresh error, or directly adjacent expired/invalid/unauthorized authentication state as `blocked-authentication`"
+        token_non_authentication_anchor = "Generic token counting, usage, budget, quota, capacity, rate-limit, or limit errors"
+        init_blocker_anchor = "When a non-success terminal follows any deterministic init or terminal blocker, absence of error prose preserves `blocked`"
+        fallback_anchor = "The validator emits `classification: blocked` with machine reason `terminal.model-entitlement-denial` or `terminal.organization-policy-denial`"
         for anchor in (
             envelope_anchor,
             classifier_anchor,
             permission_anchor,
             authentication_anchor,
             token_non_authentication_anchor,
+            init_blocker_anchor,
+            fallback_anchor,
         ):
             self.assertIn(anchor, canonical)
         self.assertNotIn("out-of-order, error-bearing, or trailing", canonical)
