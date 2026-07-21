@@ -33,6 +33,7 @@ superseded_by:
 
 - Fresh-context review of `Joey-Tools/codex-private-workflows#128` found the three boundary gaps before merge.
 - Fourteen focused guard tests cover safe and escaping symlinks, safe symlink ancestors versus a replaced leaf, guidance regular-file enforcement, exact frozen-head and clean-worktree checks, bounded Claude process outcomes, TERM-resistant timeout cleanup, and the documented detached-descendant boundary.
+- The detached-boundary regression atomically publishes its child PID from the supervised leader before exit, so its `finally` path always has an exact process to clean up.
 - Thirty-nine canonical-profile contract tests cover current-request GitHub evidence correlation, the narrow guard boundary, and direct-Claude process limits; private-profile coverage runs again after source sync.
 - The final 1,074-test review-policy suite exercised the complete test surface with four environment-limited errors across two loopback-dependent methods; both exact methods passed when rerun with loopback access.
 - Both modified skills passed the installed OpenAI quick validator. Python compilation, Ruff lint/format checks, project-journal validation, and `git diff --check` passed.

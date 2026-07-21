@@ -280,7 +280,6 @@ class NamedLaneGuardTest(unittest.TestCase):
             "pid = os.fork()\n"
             "if pid == 0:\n"
             "    os.setsid()\n"
-            "    pathlib.Path(sys.argv[1]).write_text(str(os.getpid()), encoding='ascii')\n"
             "    for descriptor in (0, 1, 2):\n"
             "        try:\n"
             "            os.close(descriptor)\n"
@@ -288,6 +287,10 @@ class NamedLaneGuardTest(unittest.TestCase):
             "            pass\n"
             "    time.sleep(30)\n"
             "    os._exit(0)\n"
+            "pid_path = pathlib.Path(sys.argv[1])\n"
+            "temporary_path = pid_path.with_suffix('.tmp')\n"
+            "temporary_path.write_text(str(pid), encoding='ascii')\n"
+            "os.replace(temporary_path, pid_path)\n"
             "os._exit(0)\n"
         )
         detached_pid: int | None = None
@@ -301,9 +304,6 @@ class NamedLaneGuardTest(unittest.TestCase):
                 timeout_seconds=2.0,
                 stream_limit_bytes=64,
             )
-            deadline = time.monotonic() + 2.0
-            while not pid_path.exists() and time.monotonic() < deadline:
-                time.sleep(0.01)
             self.assertTrue(pid_path.exists())
             detached_pid = int(pid_path.read_text(encoding="ascii"))
             os.kill(detached_pid, 0)
