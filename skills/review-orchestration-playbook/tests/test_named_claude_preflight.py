@@ -137,18 +137,24 @@ class NamedClaudePreflightTest(unittest.TestCase):
                 if calls == 1:
                     before = path.stat(follow_symlinks=False)
                     payload = path.read_bytes()
-                    path.write_bytes(payload)
+                    replacement = path.with_name(f"{path.name}.replacement")
+                    replacement.write_bytes(payload)
+                    replacement.chmod(before.st_mode & 0o7777)
                     os.utime(
-                        path,
+                        replacement,
                         ns=(before.st_atime_ns, before.st_mtime_ns),
                         follow_symlinks=False,
                     )
-                    after = preflight_module._identity(path)
-                    self.assertEqual(
-                        tuple(after.values())[:-1],
-                        tuple(identity.values())[:-1],
+                    replacement_identity = preflight_module._identity(replacement)
+                    self.assertNotEqual(
+                        replacement_identity["inode"],
+                        identity["inode"],
                     )
-                    self.assertNotEqual(after["ctime_ns"], identity["ctime_ns"])
+                    os.replace(replacement, path)
+                    after = preflight_module._identity(path)
+                    self.assertEqual(after["size"], identity["size"])
+                    self.assertEqual(after["mtime_ns"], identity["mtime_ns"])
+                    self.assertNotEqual(after["inode"], identity["inode"])
                 return identity
 
             with mock.patch.object(
