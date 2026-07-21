@@ -37,5 +37,5 @@ superseded_by:
 - A repository contract test preserves the per-toolchain version resolution order, matrix scope, and isolation requirements.
 - `uv run --isolated --with pyyaml python3 .../quick_validate.py skills/change-delivery-workflow` passed.
 - `project_journal.py validate --repo ...` passed.
-- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -q` passed 1,056 tests with 4 skips under the single resolved Python 3.13.0 runtime; loopback-binding tests ran outside the sandbox.
+- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -q` passed 1,057 tests with 4 skips under the single resolved Python 3.13.0 runtime; loopback-binding tests ran outside the sandbox.
 - `git diff --check` passed.
