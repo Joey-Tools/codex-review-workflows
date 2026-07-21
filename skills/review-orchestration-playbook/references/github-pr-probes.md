@@ -2,6 +2,47 @@
 
 Use these recipes when `$review-orchestration-playbook` needs PR metadata, review threads, branch protection, rules, check status, or merge state.
 
+## GitHub Codex Availability And Current-Head Evidence
+
+Before requesting the third lane, record the PR URL, host, authenticated/operating identity, and `headRefOid`.
+
+- The lane is supported only on GitHub Cloud when the Codex review integration is available for the active identity.
+- Treat host `sqbu-github.cisco.com` and any operating identity in `{hoteng, hoteng_cisco}` as unsupported.
+- When no PR or an unsupported host/identity is directly known, record `requested: triple`, `effective: double`, and the exact reason without posting a request. Treat missing integration/service as unavailable only when authenticated provider evidence proves it; absence, timeout, permission error, or generic HTTP/network failure is inconclusive.
+- On a supported PR, post the exact `@codex review` comment after the frozen head becomes current.
+
+Use typed metadata before and after the request:
+
+```sh
+gh auth status --hostname <host>
+gh api --hostname <host> user --jq .login
+
+gh pr view <number> --repo <owner>/<repo> \
+  --json number,url,headRefOid,comments,reviews \
+  --jq '{number,url,headRefOid,comments,reviews}'
+
+gh pr comment <number> --repo <owner>/<repo> --body '@codex review'
+
+gh api --hostname <host> repos/<owner>/<repo>/pulls/<number>/reviews \
+  --paginate \
+  --jq '[.[] | {id,user:.user.login,commit_id,submitted_at,state,html_url}]'
+
+gh api --hostname <host> repos/<owner>/<repo>/issues/<number>/comments \
+  --paginate \
+  --jq '[.[] | {id,user:.user.login,created_at,updated_at,html_url,body}]'
+```
+
+Treat `gh api --hostname <host> user --jq .login` as the operating identity for this invocation; `gh auth status` is supporting account/host context, not the identity value by itself. Keep the request URL/time, accepted terminal result URL/time/author, and exact `headRefOid`. Prefer a review whose `commit_id` equals `headRefOid`. If Codex answers only through an issue comment, require that the request and response both post after the head became current, that the author is the expected Codex integration identity, and that `headRefOid` stayed unchanged through acceptance. Re-read `headRefOid` before accepting the result. Any push invalidates earlier GitHub Codex evidence and requires a fresh request on the new head.
+
+Posting `@codex review` is request transport, not completion or proof that the service started. An authenticated response from the expected GitHub/Codex identity, bound to the unchanged current head, may prove no-start unavailability when it explicitly rejects the request because the integration is missing/unsupported or the service is unavailable. An acknowledgement, run/check identity, or review activity proves service start. No response, unknown author, absent review/comment, request-comment failure, rate limit, permission error, timeout, or generic HTTP/network failure proves neither unavailable nor clean; report `triple-inconclusive`.
+
+Classify precisely:
+
+- No PR, unsupported host/identity, or authenticated no-start missing-integration/service-unavailable evidence: third lane unavailable; effective double.
+- Service ran and returned findings: available lane with findings; fix and rerequest after the new head.
+- Missing or ambiguous evidence that proves neither unavailable nor started: `requested: triple`, `effective: triple-inconclusive`.
+- A started service with ambiguous authorship, stale head, malformed result, or transiently incomplete evidence: `requested: triple`, `effective: triple-inconclusive`; do not reinterpret it as effective double or clean evidence.
+
 ## Prefer Typed `gh`
 
 Start with stable typed `gh` forms:

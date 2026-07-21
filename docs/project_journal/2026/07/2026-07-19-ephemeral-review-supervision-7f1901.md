@@ -8,20 +8,24 @@ branch: codex/ephemeral-review-supervision
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/64
 supersedes:
   - 20260714-7a1401
-superseded_by:
+superseded_by: 20260720-7f2001
 ---
 
 # Lightweight Ephemeral Independent Codex Review
 
+> Historical implementation record. Review policy migration `20260720-7f2001`
+> supersedes this workflow; none of the helper or gate descriptions below
+> defines or satisfies a current named single, double, or triple lane.
+
 ## Summary
 
-- Independent Codex PR review now uses a clean detached worktree and a fresh `codex exec --ephemeral` process while preserving the normal Codex user environment and tracked project instructions.
-- A lightweight process-group supervisor replaces the mandatory container/job/cgroup boundary for this lane.
+- This historical detached-Codex helper used a clean worktree and fresh `codex exec --ephemeral` process while preserving the normal Codex user environment and tracked project instructions.
+- A lightweight process-group supervisor replaced the then-mandatory container/job/cgroup boundary for that retired lane.
 - Diagnostic log health and process cleanup health no longer invalidate a separately sealed review artifact.
 
-## Current State
+## Historical State
 
-- `independent-codex-pr-review` starts a new read-only ephemeral Codex process and never resumes an earlier session or creates a temporary `CODEX_HOME`.
+- The superseded ephemeral helper started a new read-only Codex process and never resumed an earlier session or created a temporary `CODEX_HOME`. It is historical implementation detail only and no longer defines a required PR gate or named review lane.
 - Normal user configuration, Rules, MCP servers, Plugins, and tracked `AGENTS.md` / `.codex/**` instructions remain available to the reviewer. The exact frozen diff still includes tracked instruction changes.
 - The reviewer leader owns a recorded PGID. Deadline or hard-cap termination uses bounded `TERM` / grace / `KILL`; descendant inventory and cross-`setsid` containment are intentionally not required for this accepted-risk lane.
 - Stdout and stderr rotate at 4 MiB of uncompressed input into ordered lossless archives. Each stream admits at most 128 MiB, and all active, temporary, and archived process logs share a 256 MiB on-disk hard limit.
@@ -37,7 +41,7 @@ superseded_by:
 - Each ephemeral invocation directly passes byte-stable argv overrides for table-valued worktree trust, `.git` as the project-root marker, `features.hooks=false`, and `notify=[]` without mutating the user's configuration. Dotted project keys remain forbidden because dots in absolute paths are parsed as key separators. Normal local and organization-managed configuration is part of the explicitly trusted reviewer environment rather than a separately pinned isolation layer; a higher-priority managed policy may prevail. The lane performs no JWT parsing, executable allowlist, feature pre-probe, app-server configuration handshake, or secondary `CODEX_HOME`. `codex debug prompt-input` remains prohibited because it starts an extra Session and configured MCP startup instead of validating the actual reviewer invocation.
 - Prelaunch state is durable in one single-source record from reservation through worktree creation, validation, spawn intent, and launch. A fixed PID-first native trampoline plus owned-helper post-exec ready records keep every child observable. After prompt publication but while the attempt is still `reserved`, one small native attempt supervisor receives the exact prompt bytes and ownership through `pending -> accepted -> outer publication quiescence -> authenticated start ACK -> complete`; no checkout worker, phase helper, FIFO reader, or reviewer may start before the durable complete generation. Before complete, outer EOF, malformed control, or deadline cancellation makes the supervisor reap its helpers, close its publication/source-cleanup leases, and exit so recovery cannot be permanently lock-starved. The supervisor then becomes every later child's common direct parent and sole state writer. It owns separate 30-second source-custody/ownership-handoff, 10-minute checkout, 30-second reader/reviewer launch, and 30-minute reviewer deadlines. Codex CLOEXEC EOF counts as exec only while the anchored child is still verified live. `prelaunch-aborted` is reserved for proven no-Codex paths; ambiguous exec or failed `launched` persistence remains `launch-uncertain`. An exhaustive matrix covers same-boot supervisor-owner closure and verified boot-change exact settlement for every nonterminal phase without coupling process settlement to checkout cleanup.
 - A clean terminal review re-proves exact ownership, force-removes its raw detached checkout in the sanitized Git environment, and verifies that both its path and Git registration disappear. An authenticated mixed checkout/registration state may use bounded descriptor-relative cleanup only while the original owner or a live guardian continuously retains the exact parent/root descriptors and lock lease. If that custody chain dies mid-removal, recovery records `manual-recovery-required`, keeps the non-TTL `retained-worktree` and full checkout charge, and performs no successor unlink. Any other removal uncertainty likewise remains `blocked-worktree-capacity` and prevents a later independent review from creating another checkout.
-- The helper-backed Codex lane is unchanged and continues to require persisted-rollout model and effort verification. The independent ephemeral lane records requested model/effort and any observed effective values; a difference is reportable but is not itself a blocker because trusted higher-priority managed policy may prevail. Absent effective metadata is reported as unobserved because no rollout is persisted.
+- The then-current helper-backed Codex lane required persisted-rollout model and effort verification. The independent ephemeral lane recorded requested model/effort and any observed effective values; a difference was reportable but was not itself a blocker because trusted higher-priority managed policy could prevail. Absent effective metadata was reported as unobserved because no rollout was persisted.
 
 ## Accepted Tradeoff
 

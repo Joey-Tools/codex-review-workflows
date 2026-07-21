@@ -16,7 +16,7 @@ description: "Run a local pre-commit delivery gate for non-trivial repo changes:
 ## Workflow
 
 1. 确认本地门禁范围。
-- 如果 the user 只是要求 probe workflow readiness，先检查构建/测试、e2e、文档同步、签名 commit、内部 review helper 是否可用。
+- 如果 the user 只是要求 probe workflow readiness，先检查构建/测试、e2e、文档同步、签名 commit、Codex reviewer lane 是否可用。
 - 如果 the user 要求 full workflow、merge-ready、`在合并前停止`、`stop before merge`，先记录需要 PR readiness handoff。该措辞只在 `$review-orchestration-playbook` 的 PR target authorization preflight 通过后，允许后续创建/更新 review-ready PR 和等待 review/CI；不允许 merge。
 - 只修复当前门禁直接需要的 blocker。需要 token、登录、TCC、设备授权或人工审批时，停在清晰 handoff 点。
 - 对 reviewable work，优先在 `wip/<topic>` 分支上做临时 commits，用固定 `base_sha..head_sha` 冻结 review range；最终目标分支 commit 仍在全部门禁通过后形成。
@@ -38,9 +38,10 @@ description: "Run a local pre-commit delivery gate for non-trivial repo changes:
 - squash-merge repo 的 PR-bound journal 应写成目标分支合并后的稳定状态；临时 `ready for review` / `waiting for merge` 放 PR body 或 comments。
 
 5. 运行本地/internal review。
-- 默认用 `$review-orchestration-playbook` 的 stateful `--reviewer codex` lane，并绑定固定 `base_sha..head_sha`。
-- 如果本地 Codex helper lane unavailable / blocked / inconclusive，而当前门禁仍需要 Codex-lane fallback，只能启动 clean-context `reviewer` agent，并在 prompt 中提供完整 review scope、diff/range、evidence-budget contract 和 output contract；不要用普通 coding subagent、inherited-context subagent 或 parent-thread continuation 代替 internal review。
-- clean-context `reviewer` fallback 必须使用最新配置的 Codex model 和最高配置 reasoning effort；如果该形态不可用，报告 blocked/inconclusive，不要静默降级。
+- 默认且唯一可计为 named single review 的本地门禁是用 `fork_turns="none"`（或平台等价的零继承上下文启动方式）启动的 Codex `reviewer` agent；不要用普通 coding subagent、inherited-context subagent 或 parent-thread continuation 代替。
+- 为 reviewer 创建独立 clean Git worktree，固定 `base_sha..head_sha`，并保持整个 lane read-only。Prompt 只提供 review-control metadata：worktree、两个 SHA、instruction-loading order、read-only/evidence limits、review focus/non-goals 和 output contract；不要预先生成、粘贴或附加 full diff、changed-file content、suspected finding 或另一 reviewer 的结果。Reviewer 先加载 review skill 与 repo-wide `AGENTS.md`，取得 changed-path metadata 后再加载适用的 path-scoped `AGENTS.md`、domain skills 与 project guidance，最后自行用 bounded Git/tool calls 获取和审查该 range。
+- `reviewer` agent 必须使用 skill 配置的 Codex model、最高配置 reasoning effort 和 read-only sandbox；如果该形态不可用，报告 blocked/inconclusive，不要静默降级或用旧 helper 补位。
+- 旧 `isolated_review` Codex helper 如仍用于低层 compatibility/diagnostics，不计入 named single、double 或 triple review。
 - 对 reviewable `wip/<topic>` range，把 reviewer 绑定到固定 `base_sha..head_sha`，不要审 live working tree。
 - 如果本地/internal review 发现问题，修复后回到测试和文档步骤。
 
@@ -65,6 +66,8 @@ description: "Run a local pre-commit delivery gate for non-trivial repo changes:
 - 这个 skill 是本地 pre-commit gate，不是 PR merge gate。
 - `在合并前停止` / `stop before merge` 的终点是 PR readiness 的 merge-ready 报告，不是本地 commit。
 - PR creation/update 仍受 `$review-orchestration-playbook` 的 PR target authorization preflight 约束；不要把 local handoff 记录当作对任意 target repository 的授权。
-- Claude-family review 只在 the user 明确要求 double/triple review 或等价 opt-in 时运行。
+- Named double review 只在 the user 明确 opt in 后运行，且必须由上述 single lane 加上在另一独立只读 worktree 中直接启动的 actual Claude Code process、绑定同一 frozen range；supplied-diff `isolated_review` helper 与另行显式请求的 Copilot diagnostic 都不计入或满足 named double。
+- Named triple review 必须再包含 supported GitHub Cloud PR 当前 head 上的 exact `@codex review` 请求及可信 terminal GitHub Codex result。无 PR、integration/host/identity 不受支持、host `sqbu-github.cisco.com` 或 operating identity in `{hoteng, hoteng_cisco}` 时，明确报告 `effective double`，不得声称 triple；已启动但证据 malformed/stale/ambiguous/incomplete 时报告 `triple-inconclusive`，不得降成 double。
+- PR readiness 不再强制已退役的额外 Codex gates。
 - Review progress、file-read trace、keepalive output 都不是 final review artifact。
 - 如果 gate 持续 inconclusive，停在有证据的决策点，不要无限重试。
