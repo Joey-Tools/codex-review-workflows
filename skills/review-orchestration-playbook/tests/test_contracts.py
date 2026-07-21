@@ -87,6 +87,14 @@ def _ci_contract_context(skill_root: pathlib.Path) -> tuple[pathlib.Path, str]:
 REPO_ROOT, CI_PROFILE = _ci_contract_context(SKILL_ROOT)
 
 
+def _repository_agents_path(repo_root: pathlib.Path, profile: str) -> pathlib.Path:
+    if profile == "canonical":
+        return repo_root / "AGENTS.md"
+    if profile == "private":
+        return repo_root / "personal_codex/AGENTS.md"
+    raise AssertionError(f"unsupported repository policy profile: {profile}")
+
+
 def _claude_auth_repository_policy_files(
     repo_root: pathlib.Path,
     profile: str,
@@ -1001,11 +1009,13 @@ class RepositoryContractTest(unittest.TestCase):
             )
 
     def test_canonical_claude_auth_control_plane_is_not_helper_broker(self) -> None:
-        agents = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        agents = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
+            encoding="utf-8"
+        )
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
-        lane_contracts = (
-            SKILL_ROOT / "references/review-lane-contracts.md"
-        ).read_text(encoding="utf-8")
+        lane_contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
         canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
             encoding="utf-8"
         )
@@ -1030,7 +1040,11 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("Apply **Canonical Executable Provenance**", lane_contracts)
         self.assertIn("recovery rules do not apply to this direct lane", lane_contracts)
         self.assertNotIn("authentication, credential-recovery", lane_contracts)
-        self.assertIn("Those guarantees do not apply", agents)
+        if CI_PROFILE == "canonical":
+            self.assertIn("Those guarantees do not apply", agents)
+        else:
+            self.assertIn("supplied-diff helper", agents)
+            self.assertIn("actual Claude Code", agents)
         for retired_global_detail in (
             "Local-login writeback requires",
             "broker `W` generation",
@@ -1067,6 +1081,8 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("Follow **Canonical Executable Provenance**", skill)
 
     def test_all_superseded_auth_journals_are_historical_helper_only(self) -> None:
+        if CI_PROFILE != "canonical":
+            self.skipTest("public project journals are not packaged in private overlay")
         journal_names = (
             "2026-07-03-claude-local-login-b4e9d1.md",
             "2026-07-15-claude-cli-platform-capabilities-7c1501.md",
@@ -1094,6 +1110,8 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertNotIn("## Current State", journal)
 
     def test_migration_journal_requires_zero_inherited_turns_for_single(self) -> None:
+        if CI_PROFILE != "canonical":
+            self.skipTest("public project journals are not packaged in private overlay")
         journal = (
             REPO_ROOT
             / "docs/project_journal/2026/07/"
@@ -1105,6 +1123,8 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("fresh or otherwise clear-context", journal)
 
     def test_readme_separates_canonical_claude_from_helper_only_details(self) -> None:
+        if CI_PROFILE != "canonical":
+            self.skipTest("public README is not packaged in private overlay")
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         boundary = readme.index("## Low-Level `isolated_review` Helper Only")
 
@@ -1124,11 +1144,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("cannot satisfy named double or triple review", readme)
 
     def test_core_active_policy_has_no_retired_codex_pr_gate_names(self) -> None:
-        active_policy = (
-            REPO_ROOT / "AGENTS.md",
-            REPO_ROOT / "README.md",
-            REPO_ROOT / "agents/reviewer.toml",
-            REPO_ROOT / "skills/change-delivery-workflow/SKILL.md",
+        active_policy = [
+            _repository_agents_path(REPO_ROOT, CI_PROFILE),
+            SKILL_SCOPE_ROOT / "agents/reviewer.toml",
+            SKILL_SCOPE_ROOT / "skills/change-delivery-workflow/SKILL.md",
             SKILL_ROOT / "SKILL.md",
             SKILL_ROOT / "agents/openai.yaml",
             SKILL_ROOT / "references/canonical-claude-lane.md",
@@ -1137,7 +1156,9 @@ class RepositoryContractTest(unittest.TestCase):
             SKILL_ROOT / "references/pr-readiness.md",
             SKILL_ROOT / "references/review-lane-contracts.md",
             SKILL_ROOT / "references/review-prompt-templates.md",
-        )
+        ]
+        if CI_PROFILE == "canonical":
+            active_policy.append(REPO_ROOT / "README.md")
         retired = (
             "independent-codex-pr-review",
             "offline-frozen-diff-review",
@@ -1152,11 +1173,10 @@ class RepositoryContractTest(unittest.TestCase):
     def test_active_named_lane_policy_has_no_unimplemented_overstrict_contracts(
         self,
     ) -> None:
-        active_policy = (
-            REPO_ROOT / "AGENTS.md",
-            REPO_ROOT / "README.md",
-            REPO_ROOT / "agents/reviewer.toml",
-            REPO_ROOT / "skills/change-delivery-workflow/SKILL.md",
+        active_policy = [
+            _repository_agents_path(REPO_ROOT, CI_PROFILE),
+            SKILL_SCOPE_ROOT / "agents/reviewer.toml",
+            SKILL_SCOPE_ROOT / "skills/change-delivery-workflow/SKILL.md",
             SKILL_ROOT / "SKILL.md",
             SKILL_ROOT / "agents/openai.yaml",
             SKILL_ROOT / "references/canonical-claude-lane.md",
@@ -1164,7 +1184,9 @@ class RepositoryContractTest(unittest.TestCase):
             SKILL_ROOT / "references/pr-readiness.md",
             SKILL_ROOT / "references/review-lane-contracts.md",
             SKILL_ROOT / "references/review-prompt-templates.md",
-        )
+        ]
+        if CI_PROFILE == "canonical":
+            active_policy.append(REPO_ROOT / "README.md")
         retired_overstrict_terms = (
             "raw-object-equivalent",
             "range-scoped endpoint object closure",
