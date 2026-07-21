@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-21
 updated: 2026-07-21
 branch: codex/daily-skill-friction-20260721-codex-review-workflows-review-policy-final-review-fixes
-pr:
+pr: https://github.com/Joey-Tools/codex-review-workflows/pull/72
 supersedes: []
 superseded_by:
 ---
