@@ -271,10 +271,14 @@ metadata behavior.
   inconclusive credential reinspection. Only a strict request/model-bound
   result envelope can establish `blocked-authentication`; partial result text
   and loose stderr fragments remain non-authoritative.
-- The final current-head GitHub review found two executable-discovery regressions.
-  Automatic discovery now proves and skips a stable dangling leaf symlink so a
-  stale shim cannot hide a later valid reviewer, while an explicit dangling
-  override remains inspection-inconclusive. A regular file with execute bits is
+- An earlier current-head GitHub review found two executable-discovery regressions.
+  Automatic discovery initially proved and skipped a stable dangling leaf
+  symlink, while an explicit dangling override remained
+  inspection-inconclusive. A later current-head review correctly identified
+  that the automatic exception could misclassify Claude as unavailable and
+  authorize a forbidden fallback. Both automatic and explicit dangling leaf
+  symlinks are now inspection-inconclusive; a truly missing stable path remains
+  absent. A regular file with execute bits is
   accepted only when the current user also has effective execute access; stable
   inaccessible candidates are skipped after the same metadata recheck. Focused
   Python 3.13 tests cover dangling-leaf replacement, inaccessible-candidate
@@ -384,3 +388,9 @@ metadata behavior.
   canonical CI fixture equality, project-journal validation, the official
   skill validator, broker developer byte reproduction, and `git diff --check`
   all pass.
+- The final current-head GitHub Codex finding removed the automatic-reviewer
+  dangling-leaf exception, so a stale Claude symlink cannot authorize Copilot
+  fallback even when a later valid candidate exists. The two focused Python
+  3.13 dangling-symlink tests and all 90 common tests passed. The complete
+  host-level Python 3.13 suite then ran 1,428 tests with 5 skips and no failures;
+  Ruff lint and format checks pass for the changed Python files.

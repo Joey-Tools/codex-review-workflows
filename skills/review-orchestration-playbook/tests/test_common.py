@@ -1990,7 +1990,7 @@ class ChildEnvironmentTest(unittest.TestCase):
         os.name == "posix" and hasattr(os, "O_NOFOLLOW"),
         "requires POSIX no-follow path inspection",
     )
-    def test_automatic_dangling_final_symlink_is_skipped(self) -> None:
+    def test_automatic_dangling_final_symlink_is_inconclusive(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary).resolve()
             candidate = root / "claude"
@@ -2025,15 +2025,18 @@ class ChildEnvironmentTest(unittest.TestCase):
                     "_reviewer_candidate_is_executable",
                     side_effect=inspect_only_candidate,
                 ),
+                self.assertRaisesRegex(
+                    CandidateInspectionInconclusive,
+                    "ENOENT involves a symlink",
+                ),
             ):
-                resolved = common.resolve_reviewer_executable(
+                common.resolve_reviewer_executable(
                     "claude",
                     candidate_validator=candidate_validator,
                     inspection_error=CandidateInspectionInconclusive,
                 )
 
-        self.assertEqual(resolved, valid.absolute())
-        candidate_validator.assert_called_once_with(valid.absolute())
+        candidate_validator.assert_not_called()
 
     @unittest.skipUnless(
         os.name == "posix" and hasattr(os, "O_NOFOLLOW"),

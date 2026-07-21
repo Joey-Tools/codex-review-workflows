@@ -1935,7 +1935,6 @@ def resolve_reviewer_executable(
         if not _reviewer_candidate_is_executable(
             candidate,
             inspection_error=inspection_error,
-            allow_dangling_leaf_symlink=True,
         ):
             continue
         absolute = candidate.absolute()
