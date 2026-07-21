@@ -50,9 +50,9 @@ This direct lane does not call `snapshot_verified_claude_executable`, copy the C
 
 The canonical direct lane uses the ordinary Claude CLI authentication selected by the user: local login in real `HOME`, or an explicitly supplied API key. It does not use the low-level helper's credential broker, staged carrier, credential-lock catalog, guarded writeback, or recovery journal, and it must not claim those helper-only guarantees.
 
-Real `HOME` is a trusted control plane. The Claude CLI may read and refresh its own ordinary authentication there; that narrowly scoped CLI authentication side effect is not a model-authorized review mutation and is the only planned host write outside the lane workspace. The model prompt still forbids direct reads of real-`HOME` content, and the native sandbox must deny model-visible credential/configuration roots. Do not inspect, copy, print, or place credential contents in review state.
+Real `HOME` is a trusted control plane. The publisher-verified Claude CLI may update ordinary CLI-owned authentication and runtime state there, including credential refresh and possible cache or tool-result artifacts. These are accepted CLI control-plane side effects, not model-authorized review mutations; they do not authorize model/tool writes or deliberate host mutations. This contract does not enumerate or attest every CLI-owned `HOME` write. The model prompt still forbids direct reads of real-`HOME` content, and the native sandbox must deny model-visible credential/configuration roots. Do not inspect, copy, print, or place credential contents in review state.
 
-If organization policy forbids ordinary CLI credential refresh, use an explicitly authorized API key or report the lane blocked; do not silently introduce the helper credential wrapper. A reported `Login expired`, HTTP 401, or refresh failure is `blocked-authentication`: ask Joey to run `claude auth login` on that host and wait for an explicit retry. Ambiguous credential I/O or persistence state is `inconclusive`. Neither condition authorizes provider fallback, and post-run worktree cleanliness does not attest what the trusted authentication control plane changed.
+If organization policy forbids ordinary CLI control-plane writes, use an explicitly authorized API key only when that mode satisfies the same policy, or report the lane blocked; do not silently introduce the helper credential wrapper. A reported `Login expired`, HTTP 401, or refresh failure is `blocked-authentication`: ask Joey to run `claude auth login` on that host and wait for an explicit retry. Ambiguous credential I/O or persistence state is `inconclusive`. Neither condition authorizes provider fallback. `--no-session-persistence` disables resumable session persistence; it does not make the CLI process or real `HOME` immutable. The lane does not take or verify a complete real-`HOME` diff, so cache or tool-result artifacts may retain review-derived data according to upstream CLI behavior. Post-run worktree cleanliness does not attest what the trusted control plane changed or prove that no transient control-plane write occurred.
 
 ## Native Sandbox Contract
 
@@ -107,6 +107,24 @@ Claude Code 2.1.212 `system/init` or capability output cannot attest the final m
 
 If the required native sandbox, global write deny, sensitive-root denies, tool restrictions, actual Claude executable, or structured-output verification cannot be established, report the lane as `blocked` or `inconclusive` under the failure contract. Never weaken the boundary or substitute Copilot.
 
+## Structured Init And Terminal Evidence
+
+Parse `stream-json` as bounded strict UTF-8 JSONL. Every nonblank line must be one JSON object; reject duplicate keys, nonstandard constants, undecodable text, or non-JSON output. The first nonblank record must be the sole event with `type: system` and `subtype: init`; the last nonblank record must be the sole event with `type: result`. The terminal result must report `subtype: success`, `is_error: false`, nonempty findings text, `modelUsage` containing the requested/effective primary model, and no explicit error, failure status, or permission denial. A missing, duplicate, malformed, out-of-order, error-bearing, or trailing contract event makes the lane `inconclusive`; partial findings do not count.
+
+Before accepting the result, compare the leading init against a reviewed, version-specific expected-init contract for the publisher-verified installed CLI. For Claude Code 2.1.212, require all of these observable fields:
+
+- `cwd` equals the resolved lane-unique clean worktree exactly;
+- `permissionMode` equals `dontAsk`;
+- `tools` is a duplicate-free set exactly equal to `Read`, `Grep`, `Glob`, and `Bash`;
+- `mcp_servers`, `slash_commands`, `skills`, and `plugins` are present and exactly empty arrays;
+- `model` matches the requested concrete model without silent substitution;
+- `claude_code_version` equals the publisher-verified preflight version; and
+- `apiKeySource` matches the parent-selected and preflight-verified authentication source (`ANTHROPIC_API_KEY` for the explicit API-key mode, otherwise the documented local-login value).
+
+Missing, malformed, or conflicting required fields fail closed as `inconclusive` and cannot count as the Claude lane. A well-formed required field that mismatches the frozen launch is a deterministic `blocked` configuration/policy mismatch. A verified CLI version with no reviewed expected-init schema is also inconclusive. Additive metadata may be recorded only when it does not alter a required field or widen the observable runtime surface.
+
+This evidence verifies only what the CLI reports about that invocation. It does not prove the final merged native sandbox, merged admin-managed permission arrays, path-rule evaluation, or absence of unreported CLI control-plane side effects. Capability output and init evidence must never be promoted into such proof.
+
 ## Guidance And Evidence
 
 The control prompt must require Claude to:
@@ -119,4 +137,4 @@ The control prompt must require Claude to:
 6. avoid direct reads outside the logical review workspace and every mutation;
 7. return findings only, or exactly `No findings.` when clean.
 
-Accept only a complete structured terminal success from the actual Claude process. Verify the requested/effective model when the runtime reports it, extract the findings verbatim, and bind them to the frozen range in the parent-owned lane record. Progress, tool traces, partial JSON, silent model substitution, and helper output do not count.
+Accept only the strict init/result evidence above from the actual Claude process. Extract the terminal findings verbatim and bind them to the frozen range in the parent-owned lane record. Progress, tool traces, partial JSON, silent model substitution, and helper output do not count.

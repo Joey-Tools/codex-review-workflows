@@ -40,10 +40,17 @@ helper-owned outer sandboxes remain helper-only and cannot make an
 `isolated_review` artifact count as the canonical lane.
 
 The canonical lane uses ordinary Claude CLI authentication in trusted real
-`HOME`, or an explicitly authorized API key. The CLI may perform its own normal
-credential refresh in that control plane. The canonical lane does not use or
-claim the helper's credential-lock catalog, broker, staged carrier, guarded
-writeback, or recovery guarantees. Authentication rejection is still
+`HOME`, or an explicitly authorized API key. The publisher-verified CLI may
+update ordinary CLI-owned authentication and runtime state in that control
+plane, including credential refresh and possible cache or tool-result
+artifacts. Those accepted CLI side effects are not model-authorized review
+mutations and do not authorize model/tool writes or deliberate host mutations.
+The canonical lane does not enumerate or attest every CLI-owned `HOME` write,
+take a complete real-`HOME` diff, or use or claim the helper's credential-lock
+catalog, broker, staged carrier, guarded writeback, or recovery guarantees.
+`--no-session-persistence` does not make the CLI process or real `HOME`
+immutable, and cache or tool-result artifacts may retain review-derived data
+according to upstream CLI behavior. Authentication rejection is still
 `blocked-authentication`, ambiguous credential persistence is inconclusive, and
 neither condition authorizes another provider.
 
@@ -56,6 +63,7 @@ For the accepted real-`HOME` native-sandbox review design, keep these layers dis
 - Launch must request global `denyWrite` and critical-sensitive-root `denyRead` for credential/configuration roots, the original source checkout, other review-state roots, `/proc`, and `/dev`; those requested controls define the native-sandbox enforcement boundary. A canonical worktree's registered Git metadata/object paths remain part of its logical read-only scope even when their physical storage is outside the worktree directory.
 - Native-sandbox `allowRead` entries are exceptions within a selected-deny policy, not a global host-read whitelist. Sandboxed Bash can technically read a host path that is outside the detached worktree when that path is not covered by `denyRead`. The prompt/model scope therefore explicitly forbids all outside-workspace reads; do not describe the selected-deny policy as re-opening only the current workspace or private Git view.
 - Claude Code 2.1.212 capability probes and the first `system/init` event report only their documented fields. They do not prove the final merged native-sandbox configuration, merged admin-managed permission arrays, or path-rule evaluation. Persist sandbox controls as requested configuration and do not promote init/capability output into independent evidence of effective enforcement.
+- For the canonical direct lane, require exactly one leading `system/init` and one trailing terminal `result`, plus the exact version-specific init fields defined in `canonical-claude-lane.md`. Missing, duplicate, malformed, misordered, or mismatched observable evidence must fail closed. This strict envelope proves only reported invocation fields and still does not attest the merged sandbox, managed permission arrays, or path evaluation.
 - Post-attempt worktree validation can prove the inspected worktree and private Git state are unchanged at validation time. It cannot prove that no transient write or outside-workspace read/side effect occurred.
 
 This boundary is an accepted model-behavior tradeoff, not full host-read isolation. A stronger outer sandbox may add protection, but must not be inferred from selected `denyRead` / `allowRead` settings or init output.

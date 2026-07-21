@@ -843,7 +843,7 @@ class RepositoryContractTest(unittest.TestCase):
             "It never adds a hidden local Codex review",
             "Each lane gets its own clean Git worktree, clear reviewer context, and read-only access",
             "Never generate or inject a full diff for the reviewer",
-            "persist `requested: triple`, `effective: double`, and a concrete reason",
+            "Persist `requested: triple`, `effective: double`, and a concrete reason",
             "exact `@codex review` comment",
             "effective: triple-inconclusive",
         ):
@@ -857,13 +857,7 @@ class RepositoryContractTest(unittest.TestCase):
             "with GitHub lane status `blocked-authorization`",
             contracts,
         )
-        exact_head_documents = (
-            agents_policy,
-            skill,
-            contracts,
-            readiness,
-            templates,
-        )
+        exact_head_documents = (agents_policy, skill, contracts, templates)
         for document in exact_head_documents:
             self.assertIn("`headRefOid` does not equal", document)
         self.assertIn("`headRefOid != head_sha`", probes)
@@ -872,37 +866,49 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertNotIn("does not contain the frozen head", document)
             self.assertNotIn("does not contain the intended frozen head", document)
         intended_range_anchor = "Preserve any parent-provided frozen `base_sha..head_sha` as the intended range"
-        availability_anchor = (
-            "classify GitHub Codex availability before any PR-head comparison"
-        )
-        supported_candidate_anchor = (
-            "Only for an existing supported third-lane candidate"
-        )
-        separate_pr_head_anchor = "record the PR's current `headRefOid` separately as `pr_head_oid`; never overwrite the intended `head_sha` with it"
-        compare_anchor = "Compare `pr_head_oid` with the intended `head_sha` before running local lanes or posting `@codex review`"
+        separate_pr_head_anchor = "record the current `headRefOid` separately as `pr_head_oid`; never overwrite the intended `head_sha` with it"
+        compare_anchor = "Compare `pr_head_oid` with the intended `head_sha` before running local lanes or consuming PR CI, conversation, or readiness state"
         run_lanes_anchor = "Run the requested local lanes"
+        classify_anchor = (
+            "make only the pre-request classifications that available evidence can prove"
+        )
+        eligible_anchor = (
+            "Unknown pre-request integration/service status does not block the request"
+        )
         for anchor in (
             intended_range_anchor,
-            availability_anchor,
-            supported_candidate_anchor,
             separate_pr_head_anchor,
             compare_anchor,
+            classify_anchor,
+            eligible_anchor,
         ):
             self.assertIn(anchor, readiness)
         self.assertLess(
-            readiness.index(availability_anchor), readiness.index(compare_anchor)
-        )
-        self.assertLess(
             readiness.index(intended_range_anchor), readiness.index(compare_anchor)
-        )
-        self.assertLess(
-            readiness.index(supported_candidate_anchor), readiness.index(compare_anchor)
         )
         self.assertLess(
             readiness.index(separate_pr_head_anchor), readiness.index(compare_anchor)
         )
         self.assertLess(
             readiness.index(compare_anchor), readiness.index(run_lanes_anchor)
+        )
+        self.assertLess(
+            readiness.index(run_lanes_anchor), readiness.index(classify_anchor)
+        )
+        for scenario in (
+            "single, double, triple, and triple already reduced to effective double",
+            "Skip this comparison only on the no-PR path",
+            "an authenticated provider rejection may prove no-start integration/service unavailability",
+            "acknowledgement or run/review activity proves start",
+        ):
+            self.assertIn(scenario, readiness)
+        self.assertNotIn(
+            "Only for an existing supported third-lane candidate",
+            readiness,
+        )
+        self.assertNotIn(
+            "Supported: a GitHub Cloud PR where the Codex review integration is available",
+            readiness,
         )
         self.assertIn("do not require PR-only fields on the no-PR path", readiness)
         self.assertIn(
@@ -1060,6 +1066,46 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn(anchor, contract)
         self.assertNotIn("Primary diff:", contract)
 
+    def test_canonical_claude_stream_evidence_is_unique_exact_and_fail_closed(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        runtime = (SKILL_ROOT / "references/claude-runtime-trust.md").read_text(
+            encoding="utf-8"
+        )
+
+        for anchor in (
+            "## Structured Init And Terminal Evidence",
+            "first nonblank record",
+            "sole event with `type: system` and `subtype: init`",
+            "last nonblank record",
+            "sole event with `type: result`",
+            "`subtype: success`",
+            "`is_error: false`",
+            "`cwd` equals the resolved lane-unique clean worktree exactly",
+            "`permissionMode` equals `dontAsk`",
+            "duplicate-free set exactly equal to `Read`, `Grep`, `Glob`, and `Bash`",
+            "`mcp_servers`, `slash_commands`, `skills`, and `plugins`",
+            "`claude_code_version` equals the publisher-verified preflight version",
+            "`apiKeySource` matches the parent-selected and preflight-verified authentication source",
+            "A verified CLI version with no reviewed expected-init schema is also inconclusive",
+            "does not prove the final merged native sandbox",
+            "merged admin-managed permission arrays",
+            "path-rule evaluation",
+        ):
+            self.assertIn(anchor, canonical)
+        for content in (skill, contracts, runtime):
+            self.assertIn("exactly one leading `system/init`", content)
+            self.assertIn("one trailing terminal `result`", content)
+            self.assertIn("fail closed", content.lower())
+        self.assertNotIn("when the runtime reports it", canonical)
+
     def test_named_lanes_block_lazy_fetch_before_reviewer_launch(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
@@ -1182,17 +1228,39 @@ class RepositoryContractTest(unittest.TestCase):
         for anchor in (
             "ordinary Claude CLI authentication",
             "trusted control plane",
-            "own ordinary authentication",
+            "ordinary CLI-owned authentication and runtime state",
+            "credential refresh and possible cache or tool-result artifacts",
+            "not model-authorized review mutations",
             "does not use the low-level helper's credential broker",
             "blocked-authentication",
             "claude auth login",
+            "`--no-session-persistence` disables resumable session persistence",
+            "does not make the CLI process or real `HOME` immutable",
+            "does not take or verify a complete real-`HOME` diff",
         ):
             self.assertIn(anchor, canonical)
-        self.assertIn("The canonical lane does not use or", runtime)
-        self.assertIn("helper's credential-lock catalog", runtime)
+        self.assertIn(
+            "The canonical lane does not enumerate or attest every CLI-owned `HOME` write",
+            runtime,
+        )
+        self.assertIn("helper's credential-lock", runtime)
         self.assertIn("Do not apply its catalog, broker, carrier, lock", runtime)
         self.assertIn("do not apply to this direct real-`HOME` lane", skill)
-        self.assertIn("a narrow CLI control-plane exception", skill)
+        for content in (skill, lane_contracts, canonical, runtime):
+            self.assertIn(
+                "ordinary CLI-owned authentication and runtime state",
+                content,
+            )
+            self.assertIn("credential refresh", content)
+            self.assertIn("cache or tool-result artifacts", content)
+            self.assertIn("not model-authorized", content)
+            for overclaim in (
+                "only planned host write",
+                "only planned host-write exception",
+                "does not authorize any other host write",
+                "a narrow CLI control-plane exception",
+            ):
+                self.assertNotIn(overclaim, content)
         self.assertIn("Apply **Canonical Executable Provenance**", lane_contracts)
         self.assertIn("recovery rules do not apply to this direct lane", lane_contracts)
         self.assertNotIn("authentication, credential-recovery", lane_contracts)
