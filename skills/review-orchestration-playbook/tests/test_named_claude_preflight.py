@@ -695,6 +695,40 @@ class NamedClaudePreflightTest(unittest.TestCase):
             self.assertEqual(value["classification"], "inconclusive")
             self.assertEqual(value["reason"], "executable-identity-drift")
 
+    def test_invalid_publisher_provenance_is_not_reported_as_version_mismatch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            home = root / "home"
+            exact = home / ".local/share/claude/versions/2.1.212"
+            self._write_candidate(exact)
+            probe_called = False
+
+            def invalid_publisher_provenance(
+                _path: pathlib.Path,
+                _version_probe: preflight_module.VersionProbe,
+            ) -> preflight_module.VerifiedCandidate:
+                raise claude_provenance.ClaudeProvenanceInvalid(
+                    "synthetic invalid signature"
+                )
+
+            def forbidden_probe(_path: pathlib.Path) -> preflight_module.ProbeResult:
+                nonlocal probe_called
+                probe_called = True
+                raise AssertionError("probe must not run")
+
+            value = preflight_module.preflight(
+                home=home,
+                verifier=invalid_publisher_provenance,
+                version_probe=forbidden_probe,
+            )
+
+            self.assertFalse(probe_called)
+            self.assertEqual(value["classification"], "blocked")
+            self.assertEqual(value["reason"], "publisher-verification-failed")
+            self.assertNotEqual(value["reason"], "exact-version-mismatch")
+
     def test_unexpected_verifier_error_is_bounded_inconclusive_without_probe(
         self,
     ) -> None:

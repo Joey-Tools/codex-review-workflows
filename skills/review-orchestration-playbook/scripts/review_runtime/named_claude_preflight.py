@@ -500,7 +500,7 @@ def preflight(
     except ClaudeProvenanceInvalid:
         return _result(
             "blocked",
-            "exact-version-mismatch",
+            "publisher-verification-failed",
             candidate=candidate,
             resolved_path=resolved,
         )

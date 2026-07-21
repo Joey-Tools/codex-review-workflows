@@ -116,6 +116,8 @@ Record the accepted request comment's API ID and server `created_at`. Server tim
 
 Before counting either local lane for a selected PR, independently read authenticated `baseRefName`, `baseRefOid`, and `headRefOid`, require locally complete base/head commits with lazy fetching disabled, and require `git merge-base --all pr_base_oid pr_head_oid` to produce exactly one full `pr_merge_base`. A selected PR's explicit frozen range satisfies PR-specific readiness or triple completion only when `base_sha == pr_merge_base` and `head_sha == pr_head_oid`. A same-head/different-base range is `blocked-input` (`scope-mismatch`): preserve the caller's range, do not silently rewrite it, and never describe its local review results as whole-PR coverage. Explicit-range-only standalone single/double with no selected PR is unaffected.
 
+If the merge base changes after the accepted request while the head stays unchanged, invalidate the old whole-PR artifacts but do not post a replacement same-head request. Report readiness `blocked-input` (`base-changed-same-head`) and `requested: triple`, `effective: triple-inconclusive`; do not create an empty or anchor commit to manufacture a new head epoch.
+
 After both local lanes are terminal on that exact whole-PR frozen range, post the exact comment below only when complete authenticated history proves that no accepted exact request exists for the unchanged head of the exact-host `github.com` PR corresponding to `{head_sha}`. Otherwise reuse the one recorded request and do not post another:
 
 ```text

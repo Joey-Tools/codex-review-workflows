@@ -1334,6 +1334,8 @@ class RepositoryContractTest(unittest.TestCase):
             with self.subTest(request_isolation_document=name):
                 self.assertIn("at most one", normalized)
                 self.assertIn("never post a second", normalized)
+                self.assertIn("base-changed-same-head", normalized)
+                self.assertIn("empty or anchor commit", normalized)
                 self.assertIn(
                     "timestamps prove ordering, not request/run lineage",
                     normalized,
@@ -1540,6 +1542,7 @@ class RepositoryContractTest(unittest.TestCase):
                 "$HOME/.local/share/claude/versions/2.1.212",
                 "exact-version-unavailable",
                 "exact-version-mismatch",
+                "publisher-verification-failed",
                 "candidate-inspection-inconclusive",
                 "fixed credential-free environment",
                 "never downloads",
@@ -1599,6 +1602,7 @@ class RepositoryContractTest(unittest.TestCase):
             '"classification": classification',
             '"exact-version-unavailable"',
             '"exact-version-mismatch"',
+            '"publisher-verification-failed"',
             "verify_claude_release(",
             "materialize_verified_executable(",
             "version_probe(snapshot.executable)",
