@@ -524,12 +524,16 @@ class RepositoryContractTest(unittest.TestCase):
             "sole lane that satisfies a named single review",
             "separate clean Git worktree",
             "Keep the workspace read-only",
-            "authoritative review-skill path/version",
-            "load that review skill",
+            "independently trusted control-plane bundle path/version/digest",
+            "load the trusted review skill",
             "domain skill",
             "AGENTS.md",
             "project-guidance document",
             "exact base_sha and head_sha",
+            "exact sanitized Git argv prefix",
+            "/usr/bin/env -i",
+            "never run bare `git`",
+            "--no-ext-diff --no-textconv",
             "not a prebuilt or injected full diff",
             "obtain base_sha..head_sha metadata, changed paths, hunks",
             "state-changing MCP, Plugin, connector, GitHub",
@@ -543,7 +547,10 @@ class RepositoryContractTest(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("ordinary local Claude login by default", skill)
+        self.assertIn(
+            "ordinary local Claude login in trusted real `HOME` as the only authentication interface",
+            skill,
+        )
         self.assertIn("runs in safe mode", helper_contract)
         self.assertIn(
             "hardening-compatible `default` permission mode",
@@ -1043,11 +1050,11 @@ class RepositoryContractTest(unittest.TestCase):
             "Enforce read-only reviewer behavior",
             '`fork_turns="none"`',
             "review-control metadata",
-            "authoritative active playbook version before launch",
+            "independently trusted control-plane bundle before launch",
             "Both local lanes follow the same discovery order",
             "path-scoped `AGENTS.md`, repo-local domain skills, tracked project guidance, then hunks",
-            "Codex first loads the authoritative active playbook",
-            "Do not prepare, paste, attach, or point it to a full diff",
+            "Codex first loads the trusted playbook",
+            "Do not prepare, paste, attach, or point",
             "existing frozen-diff Codex helper is not this lane and does not satisfy single review",
             "actual Claude Code process in a second clean Git worktree",
             "A Copilot, Cursor, OpenCode, or other model-family result does not satisfy the Claude Code lane",
@@ -1063,7 +1070,7 @@ class RepositoryContractTest(unittest.TestCase):
             "instruction-loading order, read-only and evidence limits",
             "for both local lanes, the same discovery order",
             "path-scoped `AGENTS.md`, repo-local domain skills, tracked project guidance, then hunks",
-            "load the authoritative active playbook",
+            "load the trusted playbook from the external bundle",
             "compute or persist a reviewer-visible full diff",
             '`fork_turns="none"`',
             "Use an actual Claude Code process in a second lane-unique clean Git worktree",
@@ -1197,14 +1204,19 @@ class RepositoryContractTest(unittest.TestCase):
             "Base SHA: {base_sha}",
             "Head SHA: {head_sha}",
             "Frozen review range: {base_sha}..{head_sha}",
-            "Authoritative review instruction source/version: {review_skill_path_or_version}",
+            "Trusted control-plane bundle absolute source: {trusted_bundle_absolute_path}",
+            "Trusted control-plane bundle version: {trusted_bundle_version}",
+            "Trusted control-plane bundle SHA-256: {trusted_bundle_sha256}",
+            "Sanitized Git argv prefix (exact token sequence): {sanitized_git_argv_prefix}",
             "clean, independent, read-only Git worktree",
             "does not include a prebuilt full diff",
             "obtain range metadata, changed paths, hunks",
-            "load the review skill",
+            "load the trusted review skill",
             "domain skill",
             "AGENTS.md",
             "project-guidance document",
+            "Do not run bare `git`",
+            "--no-ext-diff --no-textconv",
             '`fork_turns="none"`',
         ):
             self.assertIn(anchor, single)
@@ -1371,6 +1383,164 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("16 KiB", content)
             self.assertIn("64 MiB", content)
 
+    def test_self_policy_migration_uses_an_external_trusted_control_plane(
+        self,
+    ) -> None:
+        policy_scope_root = _repository_policy_scope_root(REPO_ROOT, CI_PROFILE)
+        agents = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
+            encoding="utf-8"
+        )
+        reviewer = (policy_scope_root / "agents/reviewer.toml").read_text(
+            encoding="utf-8"
+        )
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
+            encoding="utf-8"
+        )
+
+        for content in (agents, reviewer, skill, contracts, templates):
+            self.assertIn("candidate-head Markdown", content)
+            self.assertIn("review subject", content)
+            self.assertIn("candidate-head Python", content)
+            self.assertIn("trusted", content)
+        for content in (agents, skill, contracts, templates):
+            self.assertIn("absolute", content)
+            self.assertIn("version", content)
+            self.assertIn("SHA-256", content)
+        self.assertIn("independently trusted bundle pinned outside", agents)
+        self.assertIn("prior trusted policy", agents)
+        self.assertIn("merge and release", contracts)
+        self.assertIn("activate the new guard", contracts)
+        self.assertIn("Ordinary implementation tests", contracts)
+        for anchor in (
+            "publisher-provided release identifier or frozen commit ID",
+            "canonical UTF-8 manifest",
+            "<lowercase-file-sha256><two ASCII spaces><relative-path><LF>",
+            "contains both `agents/` and `skills/` as the single bundle root",
+            "agents/reviewer.toml",
+            "skills/review-orchestration-playbook/SKILL.md",
+            "skills/review-orchestration-playbook/references/review-lane-contracts.md",
+            "skills/review-orchestration-playbook/references/review-prompt-templates.md",
+            "skills/review-orchestration-playbook/references/canonical-claude-lane.md",
+            "skills/review-orchestration-playbook/references/claude-runtime-trust.md",
+            "skills/review-orchestration-playbook/scripts/named_lane_guard",
+            "skills/review-orchestration-playbook/scripts/review_runtime/__init__.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/named_lane.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/common.py",
+            "immediately before each guard/launcher use and Codex spawn",
+            "Recompute it after each lane",
+            "exact bytes must match the manifest entry",
+        ):
+            self.assertIn(anchor, contracts)
+        self.assertNotIn(
+            "use the repo-local playbook from the frozen review head",
+            agents,
+        )
+
+    def test_repo_visible_git_includes_are_blocked_without_expansion(self) -> None:
+        agents = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
+            encoding="utf-8"
+        )
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(encoding="utf-8")
+
+        for content in (agents, skill, contracts, canonical):
+            self.assertIn("`include.path`", content)
+            self.assertIn("`includeIf.*.path`", content)
+            self.assertIn("`blocked-safety`", content)
+            lowered = content.lower()
+            self.assertTrue(
+                "includes disabled" in lowered or "includes stay disabled" in lowered
+            )
+        self.assertIn("even when its condition is inactive", contracts)
+        self.assertIn(
+            "never accepts included values as safety configuration", contracts
+        )
+        self.assertIn("not a no-read guarantee", contracts)
+        self.assertIn("every raw gitlink", contracts)
+        self.assertIn("global pathspecs apply", contracts)
+        for retired_included_config_contract in (
+            "effective included Git configuration",
+            "effective included `core.fsmonitor`",
+            "earlier included path overridden",
+        ):
+            for content in (skill, contracts, canonical):
+                self.assertNotIn(retired_included_config_contract, content)
+        for anchor in (
+            "_validate_git_config_includes",
+            'lower_key == b"include.path"',
+            'lower_key.startswith(b"includeif.")',
+            '"--no-includes"',
+        ):
+            self.assertIn(anchor, runtime)
+
+    def test_codex_reviewer_git_is_bound_to_the_sanitized_prefix(self) -> None:
+        policy_scope_root = _repository_policy_scope_root(REPO_ROOT, CI_PROFILE)
+        reviewer = (policy_scope_root / "agents/reviewer.toml").read_text(
+            encoding="utf-8"
+        )
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
+            encoding="utf-8"
+        )
+
+        for content in (reviewer, skill, contracts, templates):
+            self.assertIn("exact sanitized Git argv prefix", content)
+            self.assertIn("`/usr/bin/env -i`", content)
+            self.assertIn("trusted `PATH`", content)
+            self.assertIn("`LANG`/`LC_*`", content)
+            self.assertIn("`PAGER`", content)
+            self.assertIn("`GIT_*`", content)
+            self.assertIn("resolved trusted Git executable", content)
+            self.assertIn("safe `-c` flags", content)
+            self.assertIn("-C", content)
+            self.assertIn("--no-ext-diff --no-textconv", content)
+        self.assertIn("never run bare `git`", reviewer)
+        self.assertIn("forbid bare `git`", templates)
+        self.assertIn("another worktree are forbidden", skill)
+        exact_prefix_contract = contracts[
+            contracts.index(
+                "for Codex, the exact sanitized Git argv prefix"
+            ) : contracts.index("The parent must not:")
+        ]
+        for anchor in (
+            "`/usr/bin/env -i`",
+            "recorded trusted `PATH`",
+            "fixed `LANG`/`LC_ALL`",
+            "`GIT_ASKPASS=/usr/bin/false`",
+            "`GIT_ATTR_NOSYSTEM=1`",
+            "`GIT_CONFIG_GLOBAL=/dev/null`",
+            "`GIT_CONFIG_SYSTEM=/dev/null`",
+            "`GIT_CONFIG_NOSYSTEM=1`",
+            "`GIT_NO_LAZY_FETCH=1`",
+            "`GIT_TERMINAL_PROMPT=0`",
+            "`GIT_NO_REPLACE_OBJECTS=1`",
+            "`GIT_OPTIONAL_LOCKS=0`",
+            "`PAGER=cat`",
+            "`GIT_PAGER=cat`",
+            "`--no-pager",
+            "core.fsmonitor=false",
+            "core.fileMode=true",
+            "core.hooksPath=/dev/null",
+            "core.attributesFile=/dev/null",
+            "diff.external=",
+            "color.ui=false",
+            "-C <absolute-clean-worktree>",
+        ):
+            self.assertIn(anchor, exact_prefix_contract)
+
     def test_named_lane_pristine_guard_covers_hidden_ignored_and_gitlinks(
         self,
     ) -> None:
@@ -1400,8 +1570,8 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("every materialized or initialized submodule", canonical)
         self.assertIn("per-name boolean precedence", canonical)
         self.assertIn("repeated `submodule.active` pathspec", contracts)
-        self.assertIn("explicit per-name false", contracts)
-        self.assertIn("raw gitlink has no tracked `.gitmodules`", contracts)
+        self.assertIn("explicit per-name false", contracts.lower())
+        self.assertIn("global pathspecs apply to every raw gitlink", contracts)
         self.assertIn("forces `core.fileMode=true`", contracts)
         self.assertIn("`diff.external`", contracts)
         self.assertIn("`diff.<driver>.command`", contracts)
@@ -1476,13 +1646,16 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("reviewer Git", content)
         self.assertIn("A built-in daemon (`true`)", contracts)
         self.assertIn("a no-value declaration", contracts)
-        self.assertIn("Only the effective final value is authoritative", contracts)
-        self.assertIn("an earlier included path overridden by a later", contracts)
+        self.assertIn(
+            "direct local/per-worktree precedence remains effective", contracts
+        )
+        self.assertNotIn("effective included `core.fsmonitor`", contracts)
+        self.assertNotIn("an earlier included path overridden by a later", contracts)
         for anchor in (
             "_validate_core_fsmonitor_config",
             '"core.fsmonitor=false"',
             "neutralize_fsmonitor=False",
-            '"config", "--includes", "--null", "--get", "core.fsmonitor"',
+            '"config", "--no-includes", "--null", "--get", "core.fsmonitor"',
         ):
             self.assertIn(anchor, runtime)
 
@@ -1619,7 +1792,7 @@ class RepositoryContractTest(unittest.TestCase):
         runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(encoding="utf-8")
 
         for content in (skill, contracts, canonical):
-            self.assertIn("scripts/named_lane_guard run-claude", content)
+            self.assertIn("run-claude", content)
             self.assertIn("1,800-second monotonic deadline", content)
             self.assertIn("64 MiB", content)
             self.assertIn("128 MiB aggregate", content)
@@ -1789,14 +1962,36 @@ class RepositoryContractTest(unittest.TestCase):
         )
 
         for anchor in (
-            "ordinary Claude CLI authentication",
+            "ordinary local Claude CLI login",
+            "only authentication interface",
             "trusted control plane",
             "own ordinary authentication",
+            "accepts no API key",
+            "OAuth-token environment interface",
             "does not use the low-level helper's credential broker",
             "blocked-authentication",
             "claude auth login",
         ):
             self.assertIn(anchor, canonical)
+        canonical_runtime = runtime[
+            runtime.index("### Canonical Lane Applicability") : runtime.index(
+                "### Native Selected-Deny Read Boundary"
+            )
+        ]
+        canonical_runtime_normalized = " ".join(canonical_runtime.split())
+        for anchor in (
+            "only authentication interface",
+            "ordinary local Claude CLI login",
+            "accepts no API key",
+            "OAuth-token environment interface",
+            "blocked-authentication",
+        ):
+            self.assertIn(anchor, canonical_runtime_normalized)
+        self.assertNotIn("explicitly authorized API key", canonical_runtime)
+        self.assertIn("only API-key/OAuth-token credentials", canonical)
+        self.assertIn(
+            "organization policy forbids ordinary CLI credential refresh", canonical
+        )
         self.assertIn("The canonical lane does not use or", runtime)
         self.assertIn("helper's credential-lock catalog", runtime)
         self.assertIn("Do not apply its catalog, broker, carrier, lock", runtime)
@@ -1820,6 +2015,25 @@ class RepositoryContractTest(unittest.TestCase):
             "last generation and 1 MiB",
         ):
             self.assertNotIn(retired_global_detail, agents)
+
+    def test_canonical_claude_provenance_rejects_npm_nvm_shims(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+
+        for content in (skill, contracts, canonical):
+            self.assertIn("npm/NVM", content)
+            self.assertIn("shebang shims", content)
+            self.assertIn("script", content)
+            self.assertIn("interpreter wrapper", content)
+            self.assertIn("trusted `PATH`", content)
+            self.assertIn("does not establish", content)
+        self.assertIn("user-writable npm/NVM directory", canonical)
+        self.assertIn("does not establish publisher provenance", canonical)
 
     def test_canonical_claude_provenance_is_direct_not_helper_snapshot(self) -> None:
         canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(

@@ -450,7 +450,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
             validate_worktree(self.repo.resolve(), head)
 
-    def test_global_submodule_active_reads_worktree_and_included_config(
+    def test_global_submodule_active_reads_worktree_and_blocks_included_config(
         self,
     ) -> None:
         head = self.add_deinitialized_gitlink()
@@ -469,7 +469,10 @@ class NamedLaneGuardTest(unittest.TestCase):
         included = self.root / "included-submodule-active.config"
         included.write_text("[submodule]\n\tactive = vendor\n", encoding="utf-8")
         git(self.repo, "config", "include.path", str(included))
-        with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "Git config include directives are not allowed",
+        ):
             validate_worktree(self.repo.resolve(), head)
 
     def test_raw_gitlink_effective_path_uses_registration_and_activation(
@@ -529,7 +532,25 @@ class NamedLaneGuardTest(unittest.TestCase):
         with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
             validate_worktree(self.repo.resolve(), head)
 
-    def test_raw_gitlink_reads_included_submodule_path_config(self) -> None:
+    def test_raw_gitlink_without_mapping_honors_global_submodule_active(
+        self,
+    ) -> None:
+        head = self.add_gitlink()
+
+        git(self.repo, "config", "submodule.active", "vendor")
+        with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
+            validate_worktree(self.repo.resolve(), head)
+
+        git(self.repo, "config", "--replace-all", "submodule.active", "unrelated")
+        clean = validate_worktree(self.repo.resolve(), head)
+        self.assertEqual(clean.head_sha, head)
+
+        git(self.repo, "config", "--replace-all", "submodule.active", "*")
+        git(self.repo, "config", "--add", "submodule.active", ":(exclude)vendor")
+        clean = validate_worktree(self.repo.resolve(), head)
+        self.assertEqual(clean.head_sha, head)
+
+    def test_raw_gitlink_blocks_included_submodule_path_config(self) -> None:
         head = self.add_gitlink()
         included = self.root / "included-raw-submodule.config"
         included.write_text(
@@ -540,7 +561,10 @@ class NamedLaneGuardTest(unittest.TestCase):
         )
         git(self.repo, "config", "include.path", str(included))
 
-        with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "Git config include directives are not allowed",
+        ):
             validate_worktree(self.repo.resolve(), head)
 
     def test_empty_gitmodules_without_definitions_allows_absent_gitlink(
@@ -685,7 +709,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 self.assertFalse(marker.exists())
                 git(self.repo, "config", "--unset-all", key)
 
-    def test_included_filter_command_is_rejected_before_execution(self) -> None:
+    def test_included_filter_command_is_blocked_before_execution(self) -> None:
         tracked = self.repo / "AGENTS.md"
         tracked.write_text("clean\n", encoding="utf-8")
         (self.repo / ".gitattributes").write_text(
@@ -707,7 +731,7 @@ class NamedLaneGuardTest(unittest.TestCase):
 
         with self.assertRaisesRegex(
             NamedLaneGuardError,
-            "executable Git filter or diff commands",
+            "Git config include directives are not allowed",
         ):
             validate_worktree(self.repo.resolve(), head)
         self.assertFalse(marker.exists())
@@ -746,7 +770,9 @@ class NamedLaneGuardTest(unittest.TestCase):
                 self.assertFalse(marker.exists())
                 git(self.repo, "config", "--unset-all", key)
 
-    def test_included_and_worktree_diff_commands_are_rejected(self) -> None:
+    def test_included_config_is_blocked_and_worktree_diff_command_is_rejected(
+        self,
+    ) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
         head = self.commit()
         probe = self.make_executable("pass\n")
@@ -758,7 +784,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         git(self.repo, "config", "include.path", str(included))
         with self.assertRaisesRegex(
             NamedLaneGuardError,
-            "executable Git filter or diff commands",
+            "Git config include directives are not allowed",
         ):
             validate_worktree(self.repo.resolve(), head)
 
@@ -808,7 +834,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         with self.assertRaisesRegex(NamedLaneGuardError, "core.fsmonitor"):
             validate_worktree(self.repo.resolve(), head)
 
-    def test_core_fsmonitor_uses_effective_include_and_worktree_precedence(
+    def test_core_fsmonitor_uses_local_and_worktree_precedence(
         self,
     ) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
@@ -817,12 +843,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         probe = self.make_executable(
             f"import pathlib\npathlib.Path({str(marker)!r}).write_text('ran')\n"
         )
-        included = self.root / "included-fsmonitor.config"
-        included.write_text(
-            f"[core]\n\tfsmonitor = {probe}\n",
-            encoding="utf-8",
-        )
-        git(self.repo, "config", "include.path", str(included))
+        git(self.repo, "config", "core.fsmonitor", str(probe))
         with self.assertRaisesRegex(NamedLaneGuardError, "core.fsmonitor"):
             validate_worktree(self.repo.resolve(), head)
         self.assertFalse(marker.exists())
@@ -840,6 +861,76 @@ class NamedLaneGuardTest(unittest.TestCase):
         with self.assertRaisesRegex(NamedLaneGuardError, "core.fsmonitor"):
             validate_worktree(self.repo.resolve(), head)
         self.assertFalse(marker.exists())
+
+    def test_external_include_is_blocked_without_using_external_config(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        head = self.commit()
+        marker = self.root / "external-include.marker"
+        probe = self.make_executable(
+            f"import pathlib\npathlib.Path({str(marker)!r}).write_text('ran')\n"
+        )
+        included = self.root / "external.config"
+        included.write_text(
+            f"[core]\n\tfsmonitor = {probe}\n"
+            '[credential "https://example.invalid"]\n'
+            "\thelper = !external-secret-like-helper\n",
+            encoding="utf-8",
+        )
+        git(self.repo, "config", "include.path", str(included))
+
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "Git config include directives are not allowed",
+        ):
+            validate_worktree(self.repo.resolve(), head)
+        self.assertFalse(marker.exists())
+
+    def test_malformed_external_include_fails_closed_during_identity_probe(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        head = self.commit()
+        included = self.root / "malformed-external.config"
+        included.write_text("[broken\n", encoding="utf-8")
+        git(self.repo, "config", "include.path", str(included))
+
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "bounded local Git preflight failed",
+        ):
+            validate_worktree(self.repo.resolve(), head)
+
+    def test_inactive_include_if_is_still_blocked(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        head = self.commit()
+        included = self.root / "inactive-include.config"
+        included.write_text("[core]\n\tfsmonitor = false\n", encoding="utf-8")
+        git(
+            self.repo,
+            "config",
+            "includeIf.gitdir:/definitely/not/this/repository/.path",
+            str(included),
+        )
+
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "Git config include directives are not allowed",
+        ):
+            validate_worktree(self.repo.resolve(), head)
+
+    def test_per_worktree_include_is_blocked(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        head = self.commit()
+        included = self.root / "worktree-include.config"
+        included.write_text("[core]\n\tfsmonitor = false\n", encoding="utf-8")
+        git(self.repo, "config", "extensions.worktreeConfig", "true")
+        git(self.repo, "config", "--worktree", "include.path", str(included))
+
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "Git config include directives are not allowed",
+        ):
+            validate_worktree(self.repo.resolve(), head)
 
     def test_successful_process_writes_private_bounded_outputs(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
@@ -893,6 +984,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         }
         denied = {
             "ANTHROPIC_API_KEY": "secret",
+            "CLAUDE_CODE_OAUTH_TOKEN": "secret",
             "CLAUDE_CONFIG_DIR": "/private/claude",
             "GITHUB_TOKEN": "secret",
             "GH_TOKEN": "secret",

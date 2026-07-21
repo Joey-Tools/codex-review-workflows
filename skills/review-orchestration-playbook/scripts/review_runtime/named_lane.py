@@ -240,6 +240,7 @@ def _validate_initialized_submodules(
             root,
             (
                 "config",
+                "--no-includes",
                 "--null",
                 f"--blob={frozen_head}:.gitmodules",
                 "--get-regexp",
@@ -266,7 +267,7 @@ def _validate_initialized_submodules(
         root,
         (
             "config",
-            "--includes",
+            "--no-includes",
             "--null",
             "--get-regexp",
             r"^submodule\..*\.path$",
@@ -322,6 +323,11 @@ def _validate_initialized_submodules(
             continue
         globally_selected.update(paths)
 
+    configured_paths = frozenset(
+        path for paths in configured_names.values() for path in paths
+    )
+    globally_selected.update(gitlinks.difference(configured_paths))
+
     if globally_selected:
         global_active = _effective_submodule_active_pathspecs(root)
         if _match_submodule_active_pathspecs(
@@ -353,7 +359,7 @@ def _effective_tracked_submodule_active(
         root,
         (
             "config",
-            "--includes",
+            "--no-includes",
             "--null",
             "--type=bool",
             "--get-regexp",
@@ -408,7 +414,7 @@ def _effective_submodule_active_pathspecs(root: pathlib.Path) -> tuple[bytes, ..
         root,
         (
             "config",
-            "--includes",
+            "--no-includes",
             "--null",
             "--get-all",
             "submodule.active",
@@ -461,12 +467,23 @@ def _effective_git_config_keys(root: pathlib.Path) -> frozenset[bytes]:
         key
         for key in _git_capture(
             root,
-            ("config", "--includes", "--null", "--name-only", "--list"),
+            ("config", "--no-includes", "--null", "--name-only", "--list"),
             neutralize_external_diff=False,
             neutralize_fsmonitor=False,
         ).split(b"\0")
         if key
     )
+
+
+def _validate_git_config_includes(configured_keys: frozenset[bytes]) -> None:
+    for key in configured_keys:
+        lower_key = key.lower()
+        if lower_key == b"include.path" or (
+            lower_key.startswith(b"includeif.") and lower_key.endswith(b".path")
+        ):
+            raise NamedLaneGuardError(
+                "Git config include directives are not allowed before reviewer launch"
+            )
 
 
 def _validate_core_fsmonitor_config(
@@ -478,7 +495,7 @@ def _validate_core_fsmonitor_config(
     message = "effective core.fsmonitor must be disabled before reviewer launch"
     raw_output = _git_capture(
         root,
-        ("config", "--includes", "--null", "--get", "core.fsmonitor"),
+        ("config", "--no-includes", "--null", "--get", "core.fsmonitor"),
         neutralize_fsmonitor=False,
     )
     if not raw_output.endswith(b"\0") or b"\0" in raw_output[:-1]:
@@ -489,7 +506,7 @@ def _validate_core_fsmonitor_config(
             root,
             (
                 "config",
-                "--includes",
+                "--no-includes",
                 "--null",
                 "--type=bool",
                 "--fixed-value",
@@ -777,6 +794,7 @@ def validate_worktree(
         if mode != "160000" or object_type != "commit":
             raise NamedLaneGuardError("frozen Git gitlink entry has an invalid type")
     configured_keys = _effective_git_config_keys(root)
+    _validate_git_config_includes(configured_keys)
     _validate_core_fsmonitor_config(root, configured_keys)
     _validate_executable_git_config(configured_keys)
     _validate_initialized_submodules(

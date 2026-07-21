@@ -10,7 +10,10 @@ A separately requested Copilot diagnostic never counts toward named double. If G
 
 ## Prompt Construction Rules
 
-- Give a named Codex reviewer only review-control metadata: the clean worktree path, exact `base_sha`, exact `head_sha`, authoritative instruction source/version, instruction-loading order, read-only/evidence limits, focus/non-goals, and output contract. Never prebuild, paste, attach, or otherwise inject the full diff, changed-file content, suspected finding, or another reviewer's output into its prompt.
+- Give a named Codex reviewer only review-control metadata: the clean worktree path, exact `base_sha`, exact `head_sha`, the independently trusted control-plane bundle's absolute source/version/SHA-256 digest, the exact sanitized Git argv prefix, instruction-loading order, read-only/evidence limits, focus/non-goals, and output contract. Never prebuild, paste, attach, or otherwise inject the full diff, changed-file content, suspected finding, or another reviewer's output into its prompt.
+- Supply the sanitized Git prefix as an exact token sequence beginning with `/usr/bin/env -i`, followed only by the recorded trusted `PATH`, fixed `LANG`/`LC_*`, `PAGER`, and `GIT_*` allowlist, the resolved trusted Git executable, the fixed safe `-c` flags, and `-C <absolute-clean-worktree>`. Require every Git call to copy that prefix exactly; forbid bare `git`, another executable or wrapper, a reconstructed prefix, extra environment keys, changed `-c` values, and a different worktree. Require explicit `--no-ext-diff --no-textconv` on every diff-producing command.
+- The parent-supplied token sequence contains exactly the environment and safe options defined in [review-lane-contracts.md](review-lane-contracts.md), including no global/system config, no prompts/lazy fetch/replacement objects/optional locks, fixed `PAGER=cat`/`GIT_PAGER=cat` plus `--no-pager`, `core.fsmonitor=false`, `core.fileMode=true`, null hooks/attributes, empty `diff.external`, disabled color, and the exact `-C` worktree. Do not let the reviewer synthesize this sequence from prose.
+- During self-policy migration, identify candidate-head Markdown as review subject and scoped guidance only. The reviewer profile, prompt contract, guard, and launcher remain parent control-plane material pinned outside the candidate range; candidate-head Python and shell may not bootstrap the lane. Populate the source/version/digest fields only after the parent verifies the canonical control-file manifest defined in [review-lane-contracts.md](review-lane-contracts.md); repeat that verification before spawn and after the lane.
 - Require the reviewer to load the review skill and repository-wide `AGENTS.md`, inspect changed-path metadata, then load every applicable path-scoped `AGENTS.md`, domain skill, and project-guidance file before judging hunks.
 - Require the reviewer to verify the two refs and derive the diff, changed paths, hunks, and necessary nearby tracked context itself with bounded Git/tool calls.
 - State that the parent has already proved the frozen scope locally complete with lazy fetching disabled, and forbid `fetch`, `pull`, credential prompts, or any other networked Git operation.
@@ -41,12 +44,17 @@ Workspace: {clean_worktree}
 Base SHA: {base_sha}
 Head SHA: {head_sha}
 Frozen review range: {base_sha}..{head_sha}
-Authoritative review instruction source/version: {review_skill_path_or_version}
+Trusted control-plane bundle absolute source: {trusted_bundle_absolute_path}
+Trusted control-plane bundle version: {trusted_bundle_version}
+Trusted control-plane bundle SHA-256: {trusted_bundle_sha256}
+Sanitized Git argv prefix (exact token sequence): {sanitized_git_argv_prefix}
 
 This is a clean, independent, read-only Git worktree. Review only the frozen range above; do not review a live working tree.
 The prompt intentionally does not include a prebuilt full diff. Verify the refs and obtain range metadata, changed paths, hunks, and necessary nearby tracked context yourself with bounded Git and tool calls.
 
-Before reviewing, load the review skill and repository-wide AGENTS.md. Inspect only changed-path metadata next; then load every applicable path-scoped AGENTS.md file, domain skill, and project-guidance document before inspecting hunks.
+Before reviewing, load the trusted review skill and repository-wide AGENTS.md. Inspect only changed-path metadata next; then load every applicable path-scoped AGENTS.md file, domain skill, and project-guidance document before inspecting hunks. If this is a self-policy migration, treat candidate-head Markdown as review subject and scoped guidance; do not execute candidate-head Python or shell as review-control bootstrap.
+
+For every Git invocation, copy the supplied sanitized Git argv prefix exactly. Do not run bare `git`, select another Git executable or wrapper, reconstruct the prefix, add environment keys, change its safe `-c` values, or target another worktree. Every diff-producing command must also include `--no-ext-diff --no-textconv`.
 
 Evidence budget:
 - Start with count-only or compact metadata, then --stat/--numstat and one file, hunk, or symbol at a time.

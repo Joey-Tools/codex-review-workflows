@@ -39,13 +39,15 @@ materialization, supplied-diff prompts, helper-private credential carriers, or
 helper-owned outer sandboxes remain helper-only and cannot make an
 `isolated_review` artifact count as the canonical lane.
 
-The canonical lane uses ordinary Claude CLI authentication in trusted real
-`HOME`, or an explicitly authorized API key. The CLI may perform its own normal
-credential refresh in that control plane. The canonical lane does not use or
-claim the helper's credential-lock catalog, broker, staged carrier, guarded
-writeback, or recovery guarantees. Authentication rejection is still
-`blocked-authentication`, ambiguous credential persistence is inconclusive, and
-neither condition authorizes another provider.
+The canonical lane's only authentication interface is ordinary local Claude CLI
+login in trusted real `HOME`. The CLI may perform its own normal credential
+refresh in that control plane. The direct lane accepts no API key, OAuth-token
+environment interface, or helper carrier; when normal refresh is forbidden or
+only those other credentials are available, it reports `blocked-authentication`.
+The canonical lane does not use or claim the helper's credential-lock catalog,
+broker, staged carrier, guarded writeback, or recovery guarantees. Ambiguous
+credential persistence is inconclusive, and neither condition authorizes
+another provider.
 
 ### Native Selected-Deny Read Boundary For Claude Code 2.1.212
 
