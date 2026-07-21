@@ -4867,9 +4867,7 @@ class CredentialStagingTest(unittest.TestCase):
         nested = "[" * 65 + "0" + "]" * 65
         payload = (
             '{"claudeAiOauth":{"accessToken":"fixture",'
-            '"refreshToken":"fixture","expiresAt":'
-            + nested
-            + "}}"
+            '"refreshToken":"fixture","expiresAt":' + nested + "}}"
         ).encode()
         with tempfile.TemporaryDirectory() as temporary:
             source = pathlib.Path(temporary) / ".credentials.json"

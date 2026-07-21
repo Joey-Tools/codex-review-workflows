@@ -549,3 +549,15 @@ metadata behavior.
   `git diff --check` pass. Under the repository's operator-enforced policy, the
   seven-test trusted-Mac live gate remains current-head PR evidence and must be
   run after the final branch push rather than embedded in this pre-push commit.
+- Before final review, the branch integrated the newer `origin/master` head
+  `eaec097bd731c801a5f5a3e6628a8e9dad8fa4c9`, including the canonical named
+  Claude lane and current-head GitHub Codex evidence policy. Post-integration
+  validation used only Python 3.13: the host-level main suite ran 1,825 tests
+  with 6 expected platform skips, the deterministic independent suite ran 299
+  tests with zero skips, and the three formatter-touched provider/installer
+  modules ran 266 focused tests with 1 expected platform skip. Ruff lint and
+  the PR-range format gate, compileall, Bash syntax, ShellCheck, actionlint,
+  strict C syntax for both launchers, synthetic-token catalog validation, the
+  project-journal validator, the official skill validator, and `git diff
+  --check` pass. The exact-head trusted-Mac live gate still follows the final
+  push, as required by repository policy.

@@ -227,9 +227,9 @@ class ClaudeKeychainBrokerInstallerTests(unittest.TestCase):
             for process in processes
         ]
 
-        diagnostics = b"\n".join(
-            stdout + stderr for stdout, stderr in results
-        ).decode(errors="replace")
+        diagnostics = b"\n".join(stdout + stderr for stdout, stderr in results).decode(
+            errors="replace"
+        )
         self.assertEqual(
             [process.returncode for process in processes], [0, 0], diagnostics
         )
@@ -283,9 +283,7 @@ class ClaudeKeychainBrokerInstallerTests(unittest.TestCase):
                 ),
             )
             self.assertEqual(stat.S_IMODE(after_metadata.st_mode), 0o755)
-            self.assertEqual(
-                self._acl_listing(directory).splitlines()[1:], before_acl
-            )
+            self.assertEqual(self._acl_listing(directory).splitlines()[1:], before_acl)
         self._assert_no_staging_files()
 
     def test_bad_oversized_input_is_rejected(self) -> None:

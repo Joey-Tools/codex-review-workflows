@@ -318,12 +318,9 @@ def _decode_strict_json(payload: bytes, *, label: str) -> object:
         message = getattr(error, "msg", str(error))
         if message.startswith("duplicate JSON object key:"):
             raise ClaudeProvenanceInvalid(
-                f"{label} contains duplicate key: "
-                f"{message.partition(':')[2].strip()}"
+                f"{label} contains duplicate key: {message.partition(':')[2].strip()}"
             ) from error
-        raise ClaudeProvenanceInvalid(
-            f"{label} is invalid JSON: {message}"
-        ) from error
+        raise ClaudeProvenanceInvalid(f"{label} is invalid JSON: {message}") from error
 
 
 def require_supported_release_version(version: str) -> tuple[int, int, int]:
