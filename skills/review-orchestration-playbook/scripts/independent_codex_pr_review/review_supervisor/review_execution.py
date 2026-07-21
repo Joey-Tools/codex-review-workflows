@@ -66,6 +66,8 @@ from .secureio import (
 
 
 _SAFE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+_RUNTIME_LEASE_PREFIX = "authenticated-review-"
+_RUNTIME_LEASE_TOKEN_BYTES = 16
 _APP_SERVER_ARGUMENTS = (
     "app-server",
     "--session-source",
@@ -1000,7 +1002,10 @@ def _allocate_runtime_lease(runtime_root: pathlib.Path) -> _RuntimeLease:
     container_descriptor = _open_read_only_directory(runtime_root)
     try:
         for _ in range(64):
-            root = runtime_root / f"authenticated-review-{secrets.token_hex(16)}"
+            root = runtime_root / (
+                f"{_RUNTIME_LEASE_PREFIX}"
+                f"{secrets.token_hex(_RUNTIME_LEASE_TOKEN_BYTES)}"
+            )
             raw_name = os.fsencode(root.name)
             try:
                 os.mkdir(raw_name, 0o700, dir_fd=container_descriptor)
@@ -1070,6 +1075,18 @@ def _isolated_environment(
         "PATH": _SAFE_PATH,
         "TMPDIR": str(temp_dir) + "/",
     }
+
+
+def projected_isolated_review_environment(
+    runtime_root: pathlib.Path,
+) -> dict[str, str]:
+    projected_lease = runtime_root / (
+        f"{_RUNTIME_LEASE_PREFIX}{'0' * (_RUNTIME_LEASE_TOKEN_BYTES * 2)}"
+    )
+    return _isolated_environment(
+        codex_home=projected_lease / "review-home",
+        temp_dir=projected_lease / "review-tmp",
+    )
 
 
 def _sanitize_process_result(

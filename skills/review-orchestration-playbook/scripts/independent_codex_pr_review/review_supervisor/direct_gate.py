@@ -632,7 +632,7 @@ def _verify_snapshot_mutation_denials(
     expected = {"chmod": True, "rename": True, "unlink": True, "write": True}
     try:
         observed = json.loads(result.stdout.decode("ascii", "strict"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
         raise DirectGateError(
             "snapshot mutation probe emitted malformed evidence",
             stage="containment",

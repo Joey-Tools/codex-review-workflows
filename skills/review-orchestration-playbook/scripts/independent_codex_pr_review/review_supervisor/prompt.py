@@ -217,9 +217,8 @@ def reviewer_argv(
 
 def prove_exec_budget(
     argv: Sequence[str],
-    environment: Mapping[str, str] | None = None,
+    environment: Mapping[str, str],
 ) -> dict[str, int]:
-    environment = os.environ if environment is None else environment
     arg_max = os.sysconf("SC_ARG_MAX")
     if not isinstance(arg_max, int) or arg_max <= 0:
         raise ValueError("host does not expose a positive SC_ARG_MAX")
@@ -232,7 +231,7 @@ def prove_exec_budget(
     total = argv_bytes + environment_bytes + pointer_bytes + fixed_headroom
     if total > arg_max:
         raise ValueError(
-            "reviewer argv plus inherited environment exceeds the measured exec budget"
+            "launch argv plus environment exceeds the measured exec budget"
         )
     return {
         "arg_max": arg_max,

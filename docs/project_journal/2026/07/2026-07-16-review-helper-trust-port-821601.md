@@ -654,3 +654,47 @@ metadata behavior.
   host-gated skips outside the enclosing Codex Seatbelt; inside it, the only
   failure was the expected inability to nest the keychain broker's own
   `sandbox-exec`, and that exact test passed outside the outer sandbox.
+- Final review of `217a357..9a56da4` and the remaining current-head GitHub
+  conversations found five additional fail-closed gaps. Exec-budget preflight
+  measured the ambient parent environment instead of the projected isolated
+  reviewer environment; the actual launch boundary also omitted the final
+  `sandbox-exec` argv. Auth-carrier inspection converted `KeyboardInterrupt`
+  and `SystemExit` into a generic carrier error. Shared retained-state JSON
+  accepted `NaN`, infinity, and exponent overflow. `git cat-file --batch`
+  could block while stderr filled during a request, and leader-only shutdown
+  could leave descendants running. The fixes make exec-budget inputs explicit
+  at preflight and recheck the exact sandbox argv before fork, preserve auth
+  control-flow priority while closing every descriptor, enforce finite JSON
+  numbers for decoding and canonical output, and use a deadline-bound selector
+  plus start-identity-anchored process-group termination for every cat-file
+  exit path. Regressions include stderr flooding, held pipes, an exited wrapper
+  with a `SIGTERM`-resistant child, and a child that closes all standard I/O.
+  Python 3.13 passes all 102 directly affected tests; the deterministic suite
+  identity is intentionally advanced from 299 to 315 tests before the final
+  full-suite gate. No local Python 3.10 run was performed.
+- Current-head GitHub Codex review of `9a56da4` identified three valid App
+  Server boundary gaps. The strict JSON decoder did not normalize parser-level
+  recursion exhaustion, the protocol rejected the pinned runtime's initial
+  `userMessage` lifecycle item, and turn validation expected `full` snapshots
+  even though Codex Desktop `0.145.0-alpha.18` emits `notLoaded` with an empty
+  item list for turn start, started, and completed records. The protocol now
+  admits only the exact submitted prompt as the first undecorated user message,
+  treats validated item lifecycle notifications as canonical evidence, and
+  accepts only the consistent `notLoaded + []` or `full + exact observed items`
+  turn shapes. Parser recursion is normalized at the protocol, auth-carrier,
+  private-state JSON, no-child probe, and mutation-probe boundaries. The fourth
+  review finding, which proposed replacing the hosted macOS profile with the
+  production host profile, was rejected: Actions run 29870408435 on the same
+  head proved the hosted image still matched macOS 26.4 build 25E246, Darwin
+  25.4.0, and the reviewed `sandbox-exec` digest. Hosted and production pins
+  remain intentionally separate and fail closed on actual drift.
+- Final local validation used only Python 3.13. The directly affected unit set
+  passed all 83 tests; the deterministic independent-supervisor gate passed all
+  315 tests in 100.457 seconds; and the complete host-level suite passed all
+  2,294 tests in 409.548 seconds with 6 expected host/filesystem skips. An
+  inner-sandbox focused run reproduced the expected inability to nest one
+  Seatbelt integration, while the complete outer-sandbox run passed that path.
+  Ruff lint, changed-file formatting, compileall, actionlint, strict Linux
+  launcher C syntax, project-journal validation, and `git diff --check` pass.
+  Ruff 0.13.2 still identifies the same three unchanged baseline files outside
+  this change range that it would reformat; they remain untouched.

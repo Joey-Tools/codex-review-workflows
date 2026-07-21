@@ -30,13 +30,19 @@ from tests.test_appserver_protocol import (
     initialize_result,
     safe_config_result,
     thread_start_result,
+    user_message,
 )
 from tests.support import owned_temporary_directory
 
 
-def valid_transcript(config: AppServerSessionConfig) -> bytes:
+def valid_transcript(
+    config: AppServerSessionConfig,
+    *,
+    prompt: str = "self-contained evidence",
+) -> bytes:
     thread_result = thread_start_result(config)
     turn = in_progress_turn()
+    prompt_item = user_message(prompt)
     item = final_item()
     messages = (
         {"id": 1, "result": initialize_result()},
@@ -64,6 +70,24 @@ def valid_transcript(config: AppServerSessionConfig) -> bytes:
         {
             "method": "item/started",
             "params": {
+                "item": prompt_item,
+                "startedAtMs": 997,
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+            },
+        },
+        {
+            "method": "item/completed",
+            "params": {
+                "completedAtMs": 998,
+                "item": prompt_item,
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+            },
+        },
+        {
+            "method": "item/started",
+            "params": {
                 "item": item,
                 "startedAtMs": 999,
                 "threadId": "thread-1",
@@ -83,7 +107,12 @@ def valid_transcript(config: AppServerSessionConfig) -> bytes:
             "method": "turn/completed",
             "params": {
                 "threadId": "thread-1",
-                "turn": {"id": "turn-1", "items": [item], "status": "completed"},
+                "turn": {
+                    "id": "turn-1",
+                    "items": [],
+                    "itemsView": "notLoaded",
+                    "status": "completed",
+                },
             },
         },
     )
@@ -213,9 +242,9 @@ class AppServerRuntimeTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "abnormal-eof")
 
-        transcript = valid_transcript(self.config) + encode_json_line(
-            {"method": "warning", "params": {}}
-        )
+        transcript = valid_transcript(
+            self.config, prompt="evidence"
+        ) + encode_json_line({"method": "warning", "params": {}})
         with self.assertRaises(AppServerProtocolError) as raised:
             run_appserver_stdio_session(
                 reader=io.BytesIO(transcript),
@@ -227,7 +256,7 @@ class AppServerRuntimeTests(unittest.TestCase):
 
         with self.assertRaises(AppServerProtocolError) as raised:
             run_appserver_stdio_session(
-                reader=io.BytesIO(valid_transcript(self.config)),
+                reader=io.BytesIO(valid_transcript(self.config, prompt="evidence")),
                 writer=ShortWriter(),
                 prompt=b"evidence",
                 config=self.config,

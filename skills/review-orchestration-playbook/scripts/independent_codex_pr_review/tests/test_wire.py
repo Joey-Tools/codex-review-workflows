@@ -5,6 +5,7 @@ import time
 import unittest
 
 from review_supervisor.wire import (
+    _send_frame,
     peer_is_open,
     receive_blob,
     receive_record,
@@ -17,6 +18,57 @@ from tests.support import owned_temporary_directory
 
 
 class ControlWireTests(unittest.TestCase):
+    def test_receive_record_rejects_non_finite_numbers(self) -> None:
+        payloads = (
+            b'{"outer":[{"value":NaN}]}\n',
+            b'{"outer":[{"value":Infinity}]}\n',
+            b'{"outer":[{"value":-Infinity}]}\n',
+            b'{"outer":[{"value":1e400}]}\n',
+            b'{"outer":[{"value":-1e400}]}\n',
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                left, right = socket_pair()
+                try:
+                    deadline = time.monotonic() + 2
+                    _send_frame(left, payload, deadline=deadline)
+                    with self.assertRaises(ValueError):
+                        receive_record(right, deadline=deadline)
+                finally:
+                    left.close()
+                    right.close()
+
+    def test_send_record_rejects_non_finite_numbers_without_writing(self) -> None:
+        left, right = socket_pair()
+        right.setblocking(False)
+        try:
+            deadline = time.monotonic() + 2
+            for value in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    send_record(
+                        left,
+                        {"outer": [{"value": value}]},
+                        deadline=deadline,
+                    )
+            with self.assertRaises(BlockingIOError):
+                right.recv(1)
+        finally:
+            left.close()
+            right.close()
+
+    def test_record_accepts_nested_finite_float(self) -> None:
+        left, right = socket_pair()
+        try:
+            deadline = time.monotonic() + 2
+            expected = {"outer": [{"value": 1.25}]}
+            send_record(left, expected, deadline=deadline)
+            record, descriptors = receive_record(right, deadline=deadline)
+            self.assertEqual(record, expected)
+            self.assertEqual(descriptors, ())
+        finally:
+            left.close()
+            right.close()
+
     def test_stream_framing_and_scm_rights(self) -> None:
         with owned_temporary_directory("wire-") as root:
             artifact = root / "artifact"

@@ -276,7 +276,25 @@ class CliLifecycleTests(unittest.TestCase):
                     "named_lane_eligible": True,
                 }
             )
+        self.assertEqual(
+            output.getvalue().encode("ascii"),
+            canonical_json(
+                {
+                    "status": "ok",
+                    "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+                    "named_lane_eligible": NAMED_LANE_ELIGIBLE,
+                }
+            ),
+        )
         _assert_low_level_contract(self, json.loads(output.getvalue()))
+
+    def test_emit_rejects_non_finite_values_without_output(self) -> None:
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output), self.assertRaises(ValueError):
+                    _emit({"outer": [{"value": value}]})
+                self.assertEqual(output.getvalue(), "")
 
     def test_invalid_pr_url_fails_before_creating_runtime_directories(self) -> None:
         with owned_temporary_directory("cli-invalid-pr-") as root:

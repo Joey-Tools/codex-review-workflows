@@ -32,6 +32,7 @@ from .codex_executable import (
     verify_macos_filesystem_metadata,
 )
 from .process import process_start_identity
+from .prompt import prove_exec_budget
 
 
 SANDBOX_EXEC = pathlib.Path("/usr/bin/sandbox-exec")
@@ -1302,7 +1303,7 @@ def _read_bounded_pipe(fd: int, *, deadline: float) -> bytes:
 def _parse_preexec_state(payload: bytes) -> dict[str, Any]:
     try:
         state = json.loads(payload)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
         raise ValueError(f"pre-exec state is not valid JSON: {error}") from error
     expected_keys = {
         "ok",
@@ -1391,7 +1392,7 @@ def _parse_probe_output(
         )
     try:
         payload = json.loads(output)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
         return ProbeObservation(
             layer=layer,
             action=action,
@@ -2181,7 +2182,7 @@ def _revalidate_prepared_profile(
 
 def _launch_child(
     prepared: PreparedNoChildProfile,
-    argv: Sequence[str],
+    sandbox_argv: Sequence[str],
     *,
     cwd: pathlib.Path,
     environment: Mapping[str, str],
@@ -2221,12 +2222,6 @@ def _launch_child(
                 "setsid did not establish the launch leader invariant",
             )
         _set_zero_nproc_limit()
-        sandbox_argv = [
-            str(SANDBOX_EXEC),
-            "-p",
-            prepared.seatbelt_profile,
-            *argv,
-        ]
         os.execve(SANDBOX_EXEC, sandbox_argv, dict(environment))
     except BaseException as error:
         try:
@@ -2342,6 +2337,13 @@ def launch_prepared_no_child_process(
             )
     _revalidate_prepared_profile(prepared)
     child_environment = _validated_environment(environment)
+    sandbox_argv = (
+        str(SANDBOX_EXEC),
+        "-p",
+        prepared.seatbelt_profile,
+        *argv,
+    )
+    prove_exec_budget(sandbox_argv, environment=child_environment)
     parent_before = resource.getrlimit(resource.RLIMIT_NPROC)
     pid, error_read, error_write = _fork_with_launch_error_pipe()
     if pid == 0:
@@ -2351,7 +2353,7 @@ def launch_prepared_no_child_process(
             _exit_child_launch_failure(error_write, error)
         _launch_child(
             prepared,
-            argv,
+            sandbox_argv,
             cwd=pathlib.Path(cwd),
             environment=child_environment,
             stdin_fd=stdin_fd,

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import unittest
+from unittest import mock
 
 from review_supervisor.constants import MAX_PROMPT_BYTES
 from review_supervisor.evidence import EvidenceArtifact, EvidenceBundle
@@ -61,10 +63,15 @@ class PromptAndArgvTests(unittest.TestCase):
             self.assertNotIn(forbidden, joined)
 
     def test_exec_budget_is_measured_without_launching(self) -> None:
-        evidence = prove_exec_budget(
-            appserver_argv(codex_executable="/usr/local/bin/codex"),
-            environment={},
-        )
+        with mock.patch.dict(
+            os.environ,
+            {"AMBIENT_BLOAT": "x" * (2 * 1024 * 1024)},
+            clear=True,
+        ):
+            evidence = prove_exec_budget(
+                appserver_argv(codex_executable="/usr/local/bin/codex"),
+                environment={},
+            )
         self.assertLessEqual(evidence["projected_total"], evidence["arg_max"])
         self.assertEqual(evidence["environment_bytes"], 0)
 

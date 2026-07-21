@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import io
 import json
 import os
 import pathlib
+import signal
 import subprocess
 import sys
 import threading
@@ -11,6 +11,8 @@ import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
+
+import review_supervisor.gitraw as gitraw
 
 from review_supervisor.checkout import (
     RawMaterializer,
@@ -42,6 +44,11 @@ from review_supervisor.gitraw import (
 )
 from review_supervisor.ledger import acquire_retention_lease, read_attempt_state
 from review_supervisor.models import HelperCustody, TreeEntry
+from review_supervisor.process import (
+    process_start_identity,
+    signal_anchored_group,
+    wait_terminal,
+)
 from review_supervisor.runtime import _cleanup_worktree, _registration_json
 from review_supervisor.secureio import (
     canonical_json,
@@ -127,15 +134,14 @@ def _build_repository(
     return repo, base, head
 
 
-class _BatchInput:
-    def fileno(self) -> int:
-        return 91
-
-    def flush(self) -> None:
-        return None
-
-
-def _protocol_batch(response: bytes) -> CatFileBatch:
+def _protocol_batch(response: bytes) -> tuple[CatFileBatch, int]:
+    request_reader, request_writer = os.pipe()
+    stdout_reader, stdout_writer = os.pipe()
+    stderr_reader, stderr_writer = os.pipe()
+    if os.write(stdout_writer, response) != len(response):
+        raise AssertionError("protocol fixture response write was partial")
+    os.close(stdout_writer)
+    os.close(stderr_writer)
     batch = CatFileBatch.__new__(CatFileBatch)
     batch.info = RepositoryInfo(
         repo=pathlib.Path("/unused/repo"),
@@ -147,12 +153,29 @@ def _protocol_batch(response: bytes) -> CatFileBatch:
         git_executable=str(GIT),
     )
     batch.process = SimpleNamespace(
-        stdin=_BatchInput(),
-        stdout=io.BytesIO(response),
+        stdin=os.fdopen(request_writer, "wb", buffering=0),
+        stdout=os.fdopen(stdout_reader, "rb", buffering=0),
+        stderr=os.fdopen(stderr_reader, "rb", buffering=0),
+        poll=lambda: 0,
+        returncode=0,
     )
+    batch.process_group = None
+    batch.group_anchor = None
     batch.requests = 0
     batch.closed = False
-    return batch
+    batch.stderr = bytearray()
+    return batch, request_reader
+
+
+def _close_protocol_batch(batch: CatFileBatch, request_reader: int) -> None:
+    for stream in (
+        batch.process.stdin,
+        batch.process.stdout,
+        batch.process.stderr,
+    ):
+        if not stream.closed:
+            stream.close()
+    os.close(request_reader)
 
 
 def _scripted_batch(root: pathlib.Path, script: bytes) -> CatFileBatch:
@@ -172,6 +195,69 @@ def _scripted_batch(root: pathlib.Path, script: bytes) -> CatFileBatch:
             git_executable=str(executable),
         )
     )
+
+
+def _process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _process_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for_process_exit(pid: int, *, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while _process_exists(pid):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.01, remaining))
+    return True
+
+
+def _force_cleanup_batch(batch: CatFileBatch) -> None:
+    group_anchor = getattr(batch, "group_anchor", None)
+    if group_anchor is not None:
+        try:
+            signal_anchored_group(group_anchor, signal.SIGKILL)
+        except (ChildProcessError, PermissionError):
+            pass
+    try:
+        batch.process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
+    for stream in (
+        batch.process.stdin,
+        batch.process.stdout,
+        batch.process.stderr,
+    ):
+        if stream is not None and not stream.closed:
+            stream.close()
+
+
+def _kill_verified_process(pid: int, start_identity: str) -> None:
+    try:
+        current_identity = process_start_identity(pid)
+    except (OSError, ValueError):
+        return
+    if current_identity != start_identity:
+        return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 class RawGitProtocolTests(unittest.TestCase):
@@ -202,15 +288,18 @@ class RawGitProtocolTests(unittest.TestCase):
         object_id = object_digest("sha1", payload)
         entry = TreeEntry(0o100644, "blob", object_id, len(payload), b"file")
         response = f"{object_id} blob {len(payload)}\n".encode() + payload + b"\n"
-        batch = _protocol_batch(response)
-
-        with mock.patch("review_supervisor.gitraw.write_all") as write:
+        batch, request_reader = _protocol_batch(response)
+        try:
             captured = batch.read_blob(entry, capture=True)
+            request = os.read(request_reader, 4096)
+        finally:
+            _close_protocol_batch(batch, request_reader)
 
         self.assertEqual(captured, payload)
         self.assertEqual(batch.requests, 1)
-        write.assert_called_once_with(91, object_id.encode("ascii") + b"\n")
+        self.assertEqual(request, object_id.encode("ascii") + b"\n")
 
+    def test_cat_file_close_is_bounded_on_output_and_open_pipes(self) -> None:
         scripts = (
             (
                 "stderr-overflow",
@@ -231,6 +320,7 @@ class RawGitProtocolTests(unittest.TestCase):
                 with owned_temporary_directory("git-cat-file-close-") as root:
                     live_batch = _scripted_batch(root, script)
                     errors: list[BaseException] = []
+                    worker: threading.Thread | None = None
 
                     def close_batch() -> None:
                         try:
@@ -238,39 +328,267 @@ class RawGitProtocolTests(unittest.TestCase):
                         except BaseException as error:
                             errors.append(error)
 
-                    with mock.patch(
-                        "review_supervisor.gitraw.CAT_FILE_CLOSE_TIMEOUT_SECONDS",
-                        close_timeout,
-                    ):
-                        worker = threading.Thread(target=close_batch, daemon=True)
-                        worker.start()
-                        worker.join(timeout=4)
-                    blocked = worker.is_alive()
-                    if blocked:
-                        if live_batch.process.poll() is None:
-                            live_batch.process.terminate()
-                            try:
-                                live_batch.process.wait(timeout=2)
-                            except subprocess.TimeoutExpired:
-                                live_batch.process.kill()
-                                live_batch.process.wait(timeout=2)
-                        worker.join(timeout=2)
-                    self.assertFalse(blocked, "cat-file shutdown blocked on one pipe")
-                    self.assertFalse(worker.is_alive())
-                    self.assertEqual(len(errors), 1)
-                    self.assertIsInstance(errors[0], ValueError)
-                    self.assertIsNotNone(live_batch.process.poll())
-                    for stream in (
-                        live_batch.process.stdin,
-                        live_batch.process.stdout,
-                        live_batch.process.stderr,
-                    ):
-                        self.assertIsNotNone(stream)
-                        self.assertTrue(stream.closed)
-                    if expected_cause is None:
-                        self.assertIsNone(errors[0].__cause__)
-                    else:
-                        self.assertIsInstance(errors[0].__cause__, expected_cause)
+                    try:
+                        with mock.patch(
+                            "review_supervisor.gitraw.CAT_FILE_CLOSE_TIMEOUT_SECONDS",
+                            close_timeout,
+                        ):
+                            worker = threading.Thread(
+                                target=close_batch,
+                                daemon=True,
+                            )
+                            worker.start()
+                            worker.join(timeout=4)
+                        blocked = worker.is_alive()
+                        self.assertFalse(
+                            blocked,
+                            "cat-file shutdown blocked on one pipe",
+                        )
+                        self.assertFalse(worker.is_alive())
+                        self.assertEqual(len(errors), 1)
+                        self.assertIsInstance(errors[0], ValueError)
+                        self.assertIsNotNone(live_batch.process.poll())
+                        for stream in (
+                            live_batch.process.stdin,
+                            live_batch.process.stdout,
+                            live_batch.process.stderr,
+                        ):
+                            self.assertIsNotNone(stream)
+                            self.assertTrue(stream.closed)
+                        if expected_cause is None:
+                            self.assertIsNone(errors[0].__cause__)
+                        else:
+                            self.assertIsInstance(
+                                errors[0].__cause__,
+                                expected_cause,
+                            )
+                    finally:
+                        _force_cleanup_batch(live_batch)
+                        if worker is not None and worker.is_alive():
+                            worker.join(timeout=2)
+
+        with owned_temporary_directory("git-cat-file-anchor-failure-") as root:
+            cleaned: list[subprocess.Popen[bytes]] = []
+            abort_session = gitraw._abort_unanchored_fresh_session
+
+            def record_abort(process: subprocess.Popen[bytes]) -> None:
+                cleaned.append(process)
+                abort_session(process)
+
+            with (
+                mock.patch.object(
+                    gitraw,
+                    "process_start_identity",
+                    side_effect=RuntimeError("synthetic identity failure"),
+                ),
+                mock.patch.object(
+                    gitraw,
+                    "_abort_unanchored_fresh_session",
+                    side_effect=record_abort,
+                ),
+                self.assertRaisesRegex(RuntimeError, "identity failure"),
+            ):
+                _scripted_batch(root, b"#!/bin/sh\nexec /bin/sleep 30\n")
+
+            self.assertEqual(len(cleaned), 1)
+            self.assertIsNotNone(cleaned[0].returncode)
+            for stream in (
+                cleaned[0].stdin,
+                cleaned[0].stdout,
+                cleaned[0].stderr,
+            ):
+                self.assertIsNotNone(stream)
+                self.assertTrue(stream.closed)
+
+    def test_cat_file_read_is_bounded_on_stderr_flood_and_open_pipes(self) -> None:
+        payload = b"payload"
+        object_id = object_digest("sha1", payload)
+        entry = TreeEntry(0o100644, "blob", object_id, len(payload), b"file")
+        scripts = (
+            (
+                "stderr-overflow",
+                b"#!/bin/sh\nIFS= read -r request\n"
+                b"/usr/bin/head -c 4194304 /dev/zero >&2\n",
+                OverflowError,
+                1.0,
+            ),
+            (
+                "open-pipes",
+                b"#!/bin/sh\nIFS= read -r request\nexec /bin/sleep 30\n",
+                TimeoutError,
+                0.25,
+            ),
+        )
+        for label, script, expected_error, read_timeout in scripts:
+            with self.subTest(read_case=label):
+                with owned_temporary_directory("git-cat-file-read-") as root:
+                    live_batch = _scripted_batch(root, script)
+                    self.assertEqual(
+                        os.getpgid(live_batch.process.pid),
+                        live_batch.process_group,
+                    )
+                    self.assertEqual(
+                        os.getsid(live_batch.process.pid),
+                        live_batch.process.pid,
+                    )
+                    errors: list[BaseException] = []
+                    worker: threading.Thread | None = None
+
+                    def read_blob() -> None:
+                        try:
+                            live_batch.read_blob(entry, capture=True)
+                        except BaseException as error:
+                            errors.append(error)
+
+                    try:
+                        started = time.monotonic()
+                        with mock.patch(
+                            "review_supervisor.gitraw.CAT_FILE_READ_TIMEOUT_SECONDS",
+                            read_timeout,
+                        ):
+                            worker = threading.Thread(
+                                target=read_blob,
+                                daemon=True,
+                            )
+                            worker.start()
+                            worker.join(timeout=4)
+                        elapsed = time.monotonic() - started
+                        blocked = worker.is_alive()
+
+                        self.assertFalse(
+                            blocked,
+                            "cat-file read blocked on one pipe",
+                        )
+                        self.assertFalse(worker.is_alive())
+                        self.assertLess(elapsed, 4)
+                        self.assertEqual(len(errors), 1)
+                        self.assertIsInstance(errors[0], expected_error)
+                        self.assertTrue(live_batch.closed)
+                        self.assertIsNotNone(live_batch.process.poll())
+                        for stream in (
+                            live_batch.process.stdin,
+                            live_batch.process.stdout,
+                            live_batch.process.stderr,
+                        ):
+                            self.assertIsNotNone(stream)
+                            self.assertTrue(stream.closed)
+                    finally:
+                        _force_cleanup_batch(live_batch)
+                        if worker is not None and worker.is_alive():
+                            worker.join(timeout=2)
+
+    def test_cat_file_close_terminates_descendant_after_leader_exit(self) -> None:
+        script = (
+            b"#!/bin/sh\n"
+            b"(trap '' TERM; exec /bin/sleep 30) &\n"
+            b'printf \'%s\\n\' "$!" > "$0.child-pid"\n'
+            b"exit 0\n"
+        )
+        with owned_temporary_directory("git-cat-file-descendant-") as root:
+            live_batch = _scripted_batch(root, script)
+            pid_path = root / "fake-git.child-pid"
+            descendant_pid: int | None = None
+            descendant_identity: str | None = None
+            worker: threading.Thread | None = None
+            try:
+                deadline = time.monotonic() + 2
+                while not pid_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(
+                    pid_path.exists(),
+                    "background child PID was not recorded",
+                )
+                descendant_pid = int(pid_path.read_text(encoding="ascii").strip())
+                descendant_identity = process_start_identity(descendant_pid)
+                wait_terminal(
+                    live_batch.process.pid,
+                    deadline=time.monotonic() + 2,
+                )
+                self.assertEqual(
+                    os.getpgid(descendant_pid),
+                    live_batch.process_group,
+                )
+                self.assertTrue(_process_exists(descendant_pid))
+                errors: list[BaseException] = []
+
+                def close_batch() -> None:
+                    try:
+                        live_batch.close()
+                    except BaseException as error:
+                        errors.append(error)
+
+                started = time.monotonic()
+                with mock.patch(
+                    "review_supervisor.gitraw.CAT_FILE_CLOSE_TIMEOUT_SECONDS",
+                    0.25,
+                ):
+                    worker = threading.Thread(target=close_batch, daemon=True)
+                    worker.start()
+                    worker.join(timeout=4)
+                elapsed = time.monotonic() - started
+                blocked = worker.is_alive()
+
+                self.assertFalse(blocked, "cat-file descendant kept close blocked")
+                self.assertFalse(worker.is_alive())
+                self.assertLess(elapsed, 4)
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], ValueError)
+                self.assertIsInstance(errors[0].__cause__, TimeoutError)
+                self.assertTrue(
+                    _wait_for_process_exit(descendant_pid, timeout=2),
+                    "cat-file background descendant survived group termination",
+                )
+            finally:
+                _force_cleanup_batch(live_batch)
+                if descendant_pid is not None and descendant_identity is not None:
+                    _kill_verified_process(descendant_pid, descendant_identity)
+                if worker is not None and worker.is_alive():
+                    worker.join(timeout=2)
+
+    def test_cat_file_close_terminates_descendant_that_closed_its_pipes(self) -> None:
+        script = (
+            b"#!/bin/sh\n"
+            b"/bin/sleep 30 </dev/null >/dev/null 2>&1 &\n"
+            b'printf \'%s\\n\' "$!" > "$0.child-pid"\n'
+            b"exit 0\n"
+        )
+        with owned_temporary_directory("git-cat-file-detached-descendant-") as root:
+            live_batch = _scripted_batch(root, script)
+            pid_path = root / "fake-git.child-pid"
+            descendant_pid: int | None = None
+            descendant_identity: str | None = None
+            try:
+                deadline = time.monotonic() + 2
+                while not pid_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(
+                    pid_path.exists(),
+                    "background child PID was not recorded",
+                )
+                descendant_pid = int(pid_path.read_text(encoding="ascii").strip())
+                descendant_identity = process_start_identity(descendant_pid)
+                wait_terminal(
+                    live_batch.process.pid,
+                    deadline=time.monotonic() + 2,
+                )
+                self.assertEqual(
+                    os.getpgid(descendant_pid),
+                    live_batch.process_group,
+                )
+                self.assertTrue(_process_exists(descendant_pid))
+
+                started = time.monotonic()
+                live_batch.close()
+                self.assertLess(time.monotonic() - started, 2)
+                self.assertTrue(
+                    _wait_for_process_exit(descendant_pid, timeout=2),
+                    "cat-file detached descendant survived normal close",
+                )
+                self.assertFalse(_process_group_exists(live_batch.process_group))
+            finally:
+                _force_cleanup_batch(live_batch)
+                if descendant_pid is not None and descendant_identity is not None:
+                    _kill_verified_process(descendant_pid, descendant_identity)
 
     def test_cat_file_rejects_oid_type_and_length_header_mismatches(self) -> None:
         payload = b"payload"
@@ -283,10 +601,14 @@ class RawGitProtocolTests(unittest.TestCase):
         )
         for header in headers:
             with self.subTest(header=header):
-                batch = _protocol_batch(header.encode() + b"\n" + payload + b"\n")
-                with mock.patch("review_supervisor.gitraw.write_all"):
+                batch, request_reader = _protocol_batch(
+                    header.encode() + b"\n" + payload + b"\n"
+                )
+                try:
                     with self.assertRaisesRegex(ValueError, "header mismatch"):
                         batch.read_blob(entry, capture=True)
+                finally:
+                    _close_protocol_batch(batch, request_reader)
 
     def test_cat_file_rejects_payload_length_delimiter_and_digest_mismatches(
         self,
@@ -313,10 +635,12 @@ class RawGitProtocolTests(unittest.TestCase):
         )
         for response, candidate, message in cases:
             with self.subTest(message=message):
-                batch = _protocol_batch(response)
-                with mock.patch("review_supervisor.gitraw.write_all"):
+                batch, request_reader = _protocol_batch(response)
+                try:
                     with self.assertRaisesRegex(ValueError, message):
                         batch.read_blob(candidate, capture=True)
+                finally:
+                    _close_protocol_batch(batch, request_reader)
 
 
 @unittest.skipUnless(GIT.is_file(), "/usr/bin/git is required")

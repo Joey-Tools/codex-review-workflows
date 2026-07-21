@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import pathlib
 import signal
 import sys
@@ -26,7 +25,7 @@ from .runtime import (
     prompt_helper_main,
     prompt_verifier_main,
 )
-from .secureio import require_python_313
+from .secureio import canonical_json, require_python_313
 from .supervisor import cleanup, final_result, preflight, recover, release, run, status
 
 
@@ -260,9 +259,8 @@ def _emit(value: dict[str, Any]) -> None:
         "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
         "named_lane_eligible": NAMED_LANE_ELIGIBLE,
     }
-    print(
-        json.dumps(envelope, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-    )
+    serialized = canonical_json(envelope).decode("ascii")
+    sys.stdout.write(serialized)
 
 
 def _failure_payload(error: BaseException) -> dict[str, Any]:

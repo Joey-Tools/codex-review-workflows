@@ -223,7 +223,12 @@ def thread_start_result(
 
 
 def in_progress_turn() -> dict[str, object]:
-    return {"id": "turn-1", "items": [], "status": "inProgress"}
+    return {
+        "id": "turn-1",
+        "items": [],
+        "itemsView": "notLoaded",
+        "status": "inProgress",
+    }
 
 
 def final_item(text: str = "No findings.") -> dict[str, object]:
@@ -232,6 +237,15 @@ def final_item(text: str = "No findings.") -> dict[str, object]:
         "phase": "final_answer",
         "text": text,
         "type": "agentMessage",
+    }
+
+
+def user_message(text: str = "review evidence") -> dict[str, object]:
+    return {
+        "clientId": None,
+        "content": [{"text": text, "text_elements": [], "type": "text"}],
+        "id": "user-message-1",
+        "type": "userMessage",
     }
 
 
@@ -315,6 +329,8 @@ def complete(
     *,
     start_item: bool = True,
     prior_items: tuple[dict[str, object], ...] = (),
+    terminal_items: tuple[dict[str, object], ...] | None = None,
+    terminal_items_view: str | None = None,
 ) -> None:
     item = item or final_item()
     if start_item:
@@ -340,16 +356,21 @@ def complete(
             },
         }
     )
+    turn: dict[str, object] = {
+        "id": "turn-1",
+        "items": (
+            [*prior_items, item] if terminal_items is None else list(terminal_items)
+        ),
+        "status": "completed",
+    }
+    if terminal_items_view is not None:
+        turn["itemsView"] = terminal_items_view
     protocol.accept_message(
         {
             "method": "turn/completed",
             "params": {
                 "threadId": "thread-1",
-                "turn": {
-                    "id": "turn-1",
-                    "items": [*prior_items, item],
-                    "status": "completed",
-                },
+                "turn": turn,
             },
         }
     )
@@ -384,6 +405,15 @@ class JsonLineTests(unittest.TestCase):
             nested = [nested]
         with self.assertRaises(AppServerProtocolError):
             decode_json_line(encode_json_line({"nested": nested}))
+        with (
+            mock.patch(
+                "review_supervisor.appserver_protocol.json.loads",
+                side_effect=RecursionError,
+            ),
+            self.assertRaises(AppServerProtocolError) as raised,
+        ):
+            decode_json_line(b'{"nested":[]}\n')
+        self.assertEqual(raised.exception.code, "json-depth")
 
     def test_prelaunch_turn_start_budget_includes_json_escaping(self) -> None:
         self.assertGreater(validate_prelaunch_turn_start_record(b"evidence"), 0)
@@ -484,8 +514,37 @@ class AppServerProtocolTests(unittest.TestCase):
                 "params": {"threadId": "thread-1", "turn": turn},
             }
         )
+        prompt_item = user_message()
+        protocol.accept_message(
+            {
+                "method": "item/started",
+                "params": {
+                    "item": prompt_item,
+                    "startedAtMs": 997,
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                },
+            }
+        )
+        protocol.accept_message(
+            {
+                "method": "item/completed",
+                "params": {
+                    "completedAtMs": 998,
+                    "item": prompt_item,
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                },
+            }
+        )
         item = final_item()
-        complete(protocol, item)
+        complete(
+            protocol,
+            item,
+            prior_items=(prompt_item,),
+            terminal_items=(),
+            terminal_items_view="notLoaded",
+        )
         result = protocol.finish_eof()
         self.assertEqual(result.review_status, "clean")
         self.assertEqual(result.final_text, "No findings.")
@@ -1131,6 +1190,23 @@ class AppServerProtocolTests(unittest.TestCase):
     ) -> None:
         protocol = self.protocol()
         advance_to_running(protocol, self.config)
+        mismatched_prompt = user_message("different evidence")
+        with self.assertRaises(AppServerProtocolError) as raised:
+            protocol.accept_message(
+                {
+                    "method": "item/started",
+                    "params": {
+                        "item": mismatched_prompt,
+                        "startedAtMs": 0,
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                    },
+                }
+            )
+        self.assertEqual(raised.exception.code, "final-cross-check")
+
+        protocol = self.protocol()
+        advance_to_running(protocol, self.config)
         with self.assertRaises(AppServerProtocolError) as raised:
             protocol.accept_message(
                 {
@@ -1211,6 +1287,24 @@ class AppServerProtocolTests(unittest.TestCase):
                         "turn": {
                             "id": "turn-1",
                             "items": [mismatched],
+                            "itemsView": "notLoaded",
+                            "status": "completed",
+                        },
+                    },
+                }
+            )
+        self.assertEqual(raised.exception.code, "final-cross-check")
+
+        with self.assertRaises(AppServerProtocolError) as raised:
+            protocol.accept_message(
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turn": {
+                            "id": "turn-1",
+                            "items": [],
+                            "itemsView": "full",
                             "status": "completed",
                         },
                     },

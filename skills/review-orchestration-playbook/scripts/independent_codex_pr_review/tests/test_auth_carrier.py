@@ -255,6 +255,80 @@ class AuthCarrierTests(unittest.TestCase):
             self.assertEqual(len(closed), 2)
             self.assertNotIn("sensitive close detail", str(raised.exception))
 
+    def test_load_preserves_inspection_control_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = self.write_auth(pathlib.Path(raw_root), expiration=10_000)
+
+            for error in (KeyboardInterrupt(), SystemExit(23)):
+                with (
+                    self.subTest(error=type(error).__name__),
+                    self.assertRaises(type(error)),
+                ):
+                    auth_carrier.load_external_auth(
+                        path,
+                        filesystem_metadata_verifier=mock.Mock(side_effect=error),
+                        now=1_000,
+                        minimum_remaining_seconds=2_700,
+                    )
+
+    def test_revalidation_preserves_inspection_control_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = self.write_auth(pathlib.Path(raw_root), expiration=10_000)
+            evidence = load_external_auth(
+                path,
+                now=1_000,
+                minimum_remaining_seconds=2_700,
+            )
+
+            for error in (KeyboardInterrupt(), SystemExit(23)):
+                with (
+                    self.subTest(error=type(error).__name__),
+                    self.assertRaises(type(error)) as raised,
+                ):
+                    auth_carrier.revalidate_external_auth_source(
+                        path,
+                        evidence,
+                        filesystem_metadata_verifier=mock.Mock(side_effect=error),
+                        now=1_000,
+                    )
+                self.assertIs(raised.exception, error)
+
+    def test_cleanup_control_flow_overrides_ordinary_inspection_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = self.write_auth(pathlib.Path(raw_root), expiration=10_000)
+            original_close = auth_carrier.os.close
+            close_attempts: list[int] = []
+            cleanup_failures = (KeyboardInterrupt(), SystemExit(23))
+
+            def close_with_control_flow(fd: int) -> None:
+                original_close(fd)
+                failure = cleanup_failures[len(close_attempts)]
+                close_attempts.append(fd)
+                raise failure
+
+            with (
+                mock.patch.object(
+                    auth_carrier,
+                    "read_fd_exact",
+                    side_effect=OSError("ordinary inspection failure"),
+                ) as read_exact,
+                mock.patch.object(
+                    auth_carrier.os,
+                    "close",
+                    side_effect=close_with_control_flow,
+                ),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                load_external_auth(
+                    path,
+                    now=1_000,
+                    minimum_remaining_seconds=2_700,
+                )
+
+            read_exact.assert_called_once()
+            self.assertEqual(len(close_attempts), 2)
+            self.assertEqual(len(set(close_attempts)), 2)
+
     def test_rejects_expiry_mode_links_duplicates_and_malformed_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = pathlib.Path(raw_root)
@@ -290,6 +364,30 @@ class AuthCarrierTests(unittest.TestCase):
             )
             with self.assertRaises(AuthCarrierError):
                 load_external_auth(expired, now=1_000, minimum_remaining_seconds=60)
+
+    def test_rejects_non_finite_float_in_nested_unknown_json_field(self) -> None:
+        with mock.patch.object(
+            auth_carrier.json,
+            "loads",
+            side_effect=RecursionError,
+        ):
+            with self.assertRaisesRegex(AuthCarrierError, "strict UTF-8 JSON"):
+                auth_carrier._decode_json(b"{}")
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = self.write_auth(pathlib.Path(raw_root), expiration=10_000)
+            raw = path.read_bytes()
+            path.write_bytes(raw[:-1] + b',"unknown":{"nested":[1e400]}}')
+
+            with self.assertRaisesRegex(
+                AuthCarrierError,
+                "non-finite JSON number",
+            ):
+                load_external_auth(
+                    path,
+                    now=1_000,
+                    minimum_remaining_seconds=2_700,
+                )
 
     def test_rejects_wrong_mode_and_malformed_stale_carriers_before_refresh(
         self,

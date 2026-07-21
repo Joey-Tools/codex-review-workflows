@@ -64,6 +64,7 @@ from .recovery_cleanup import (
     delete_custodied_roots,
     remove_published_manifest,
 )
+from .review_execution import projected_isolated_review_environment
 from .runtime import (
     _cleanup_worktree,
     _compact_terminal,
@@ -247,7 +248,10 @@ def prepare_run(
         prompt=prompt,
     )
     ensure_no_path_value(os.environ.values(), pathlib.Path(helper.workspace_root))
-    exec_budget = prove_exec_budget(argv)
+    reviewer_environment = projected_isolated_review_environment(
+        attempt_dir / "review-runtime"
+    )
+    exec_budget = prove_exec_budget(argv, environment=reviewer_environment)
     return PreparedRun(
         helper=helper,
         repository=repository,

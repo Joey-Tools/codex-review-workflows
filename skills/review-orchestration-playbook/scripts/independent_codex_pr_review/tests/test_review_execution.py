@@ -140,6 +140,27 @@ def _launched(pid: int = 424242) -> LaunchedNoChildProcess:
 
 
 class ReviewExecutionTests(unittest.TestCase):
+    def test_projected_review_environment_matches_runtime_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            runtime_root = pathlib.Path(raw_root) / "review-runtime"
+            with patch.object(
+                execution.secrets,
+                "token_hex",
+                return_value="0" * 32,
+            ):
+                lease = execution._allocate_runtime_lease(runtime_root)
+            try:
+                actual = execution._isolated_environment(
+                    codex_home=lease.root / "review-home",
+                    temp_dir=lease.root / "review-tmp",
+                )
+                projected = execution.projected_isolated_review_environment(
+                    runtime_root
+                )
+                self.assertEqual(projected, actual)
+            finally:
+                lease.cleanup()
+
     def test_runtime_lease_removes_its_empty_container_after_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             runtime_root = pathlib.Path(raw_root) / "review-runtime"

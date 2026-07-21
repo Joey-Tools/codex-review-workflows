@@ -4,6 +4,7 @@ import hashlib
 import os
 import pathlib
 import selectors
+import signal
 import stat
 import subprocess
 import time
@@ -21,6 +22,12 @@ from .constants import (
 )
 from .errors import blocked, inconclusive
 from .models import Identity, TreeEntry, TreeManifest
+from .process import (
+    SpawnedProcess,
+    process_start_identity,
+    signal_anchored_group,
+    wait_terminal,
+)
 from .secureio import (
     open_absolute_directory_chain,
     open_directory,
@@ -30,12 +37,14 @@ from .secureio import (
     raw_directory_entries,
     read_fd_exact,
     validate_private_directory_fd,
-    write_all,
 )
 
 
 CAT_FILE_CLOSE_TIMEOUT_SECONDS = 5.0
+CAT_FILE_READ_TIMEOUT_SECONDS = 30.0
 CAT_FILE_STDERR_LIMIT_BYTES = 8192
+CAT_FILE_TERMINATE_GRACE_SECONDS = 0.1
+CAT_FILE_TERMINATE_TIMEOUT_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -82,21 +91,60 @@ def sanitized_git_environment(extra: dict[str, str] | None = None) -> dict[str, 
     return environment
 
 
-def _terminate_process(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        return
+def _terminate_process(
+    process: subprocess.Popen[bytes],
+    *,
+    group_anchor: SpawnedProcess | None = None,
+) -> int | None:
+    if group_anchor is None:
+        if process.poll() is not None:
+            return process.returncode
+        try:
+            process.terminate()
+            return process.wait(timeout=1)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                return process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                return None
+
+    if group_anchor.pid != process.pid or group_anchor.pgid != process.pid:
+        raise ValueError("cat-file process group is not bound to its leader")
+
+    deadline = time.monotonic() + CAT_FILE_TERMINATE_TIMEOUT_SECONDS
+    signal_anchored_group(group_anchor, signal.SIGTERM)
+    grace_deadline = min(
+        deadline,
+        time.monotonic() + CAT_FILE_TERMINATE_GRACE_SECONDS,
+    )
+    while time.monotonic() < grace_deadline:
+        time.sleep(min(0.01, grace_deadline - time.monotonic()))
+    signal_anchored_group(group_anchor, signal.SIGKILL)
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("cat-file process-group termination timed out")
+    return process.wait(timeout=remaining)
+
+
+def _abort_unanchored_fresh_session(process: subprocess.Popen[bytes]) -> None:
     try:
-        process.terminate()
-        process.wait(timeout=1)
-    except (ProcessLookupError, subprocess.TimeoutExpired):
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
         try:
             process.kill()
         except ProcessLookupError:
             pass
-        try:
-            process.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            pass
+    try:
+        process.wait(timeout=CAT_FILE_TERMINATE_TIMEOUT_SECONDS)
+    finally:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
 
 
 def run_bounded(
@@ -205,9 +253,10 @@ def _drain_started_process(
     timeout: float,
     stdout_limit: int,
     stderr_limit: int,
+    group_anchor: SpawnedProcess | None = None,
 ) -> tuple[int, bytes, bytes]:
     if process.stdout is None or process.stderr is None:
-        _terminate_process(process)
+        _terminate_process(process, group_anchor=group_anchor)
         raise RuntimeError("cannot drain bounded Git pipes")
     selector = selectors.DefaultSelector()
     streams = {
@@ -225,7 +274,7 @@ def _drain_started_process(
             if remaining <= 0:
                 raise TimeoutError("bounded Git shutdown timed out")
             events = selector.select(min(remaining, 0.25))
-            if not events and process.poll() is not None:
+            if not events and group_anchor is None and process.poll() is not None:
                 events = [
                     (key, selectors.EVENT_READ) for key in selector.get_map().values()
                 ]
@@ -247,14 +296,21 @@ def _drain_started_process(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("bounded Git shutdown timed out before reap")
-        returncode = process.wait(timeout=remaining)
+        if group_anchor is None:
+            returncode = process.wait(timeout=remaining)
+        else:
+            wait_terminal(process.pid, deadline=deadline)
+            terminated = _terminate_process(process, group_anchor=group_anchor)
+            if terminated is None:
+                raise TimeoutError("cat-file process-group leader was not reaped")
+            returncode = terminated
         return (
             returncode,
             bytes(buffers[process.stdout.fileno()]),
             bytes(buffers[process.stderr.fileno()]),
         )
     except BaseException:
-        _terminate_process(process)
+        _terminate_process(process, group_anchor=group_anchor)
         raise
     finally:
         selector.close()
@@ -538,23 +594,34 @@ class CatFileBatch:
             stderr=subprocess.PIPE,
             bufsize=0,
             close_fds=True,
-            start_new_session=False,
+            start_new_session=True,
+        )
+        self.process_group = self.process.pid
+        try:
+            start_identity = process_start_identity(self.process.pid)
+        except BaseException:
+            _abort_unanchored_fresh_session(self.process)
+            raise
+        self.group_anchor = SpawnedProcess(
+            pid=self.process.pid,
+            pgid=self.process_group,
+            acknowledgement_fd=-1,
+            passed_fd_numbers=(),
+            start_identity=start_identity,
         )
         if (
             self.process.stdin is None
             or self.process.stdout is None
             or self.process.stderr is None
         ):
-            _terminate_process(self.process)
+            _terminate_process(
+                self.process,
+                group_anchor=self.group_anchor,
+            )
             raise RuntimeError("cannot create cat-file batch pipes")
         self.requests = 0
         self.closed = False
-
-    def _readline(self, maximum: int) -> bytes:
-        line = self.process.stdout.readline(maximum + 1)
-        if len(line) > maximum or not line.endswith(b"\n"):
-            raise ValueError("cat-file emitted an invalid bounded header")
-        return line[:-1]
+        self.stderr = bytearray()
 
     def read_blob(
         self,
@@ -565,32 +632,159 @@ class CatFileBatch:
     ) -> bytes | None:
         if self.closed or entry.size is None or entry.object_type != "blob":
             raise ValueError("invalid cat-file blob request")
-        write_all(self.process.stdin.fileno(), entry.object_id.encode("ascii") + b"\n")
-        self.process.stdin.flush()
-        header = self._readline(256)
+        request = entry.object_id.encode("ascii") + b"\n"
         expected_header = f"{entry.object_id} blob {entry.size}".encode("ascii")
-        if header != expected_header:
-            raise ValueError(f"cat-file header mismatch: {header!r}")
         digest = hashlib.new(self.info.object_format)
         digest.update(f"blob {entry.size}\0".encode("ascii"))
-        remaining = entry.size
+        payload_remaining = entry.size
         captured = bytearray() if capture else None
-        while remaining:
-            chunk = self.process.stdout.read(min(64 * 1024, remaining))
-            if not chunk:
-                raise ValueError("cat-file payload ended early")
-            digest.update(chunk)
-            if captured is not None:
-                captured.extend(chunk)
-            if consumer is not None:
-                consumer(chunk)
-            remaining -= len(chunk)
-        if self.process.stdout.read(1) != b"\n":
-            raise ValueError("cat-file payload delimiter is invalid")
-        if digest.hexdigest() != entry.object_id:
-            raise ValueError("raw Git blob digest mismatch")
-        self.requests += 1
-        return bytes(captured) if captured is not None else None
+        header = bytearray()
+        request_offset = 0
+        protocol_state = "header"
+        deadline = time.monotonic() + CAT_FILE_READ_TIMEOUT_SECONDS
+        selector = selectors.DefaultSelector()
+        stdin_fd = self.process.stdin.fileno()
+        stdout_fd = self.process.stdout.fileno()
+        stderr_fd = self.process.stderr.fileno()
+        try:
+            for descriptor in (stdin_fd, stdout_fd, stderr_fd):
+                os.set_blocking(descriptor, False)
+            selector.register(stdin_fd, selectors.EVENT_WRITE, "stdin")
+            selector.register(stdout_fd, selectors.EVENT_READ, "stdout")
+            selector.register(stderr_fd, selectors.EVENT_READ, "stderr")
+
+            while protocol_state != "done":
+                remaining_time = deadline - time.monotonic()
+                if remaining_time <= 0:
+                    raise TimeoutError("cat-file blob request timed out")
+                events = selector.select(min(remaining_time, 0.25))
+                events.sort(key=lambda event: event[0].data != "stderr")
+                for key, _ in events:
+                    descriptor = key.fd
+                    if key.data == "stdin":
+                        try:
+                            written = os.write(
+                                descriptor,
+                                request[request_offset:],
+                            )
+                        except BlockingIOError:
+                            continue
+                        except BrokenPipeError as error:
+                            raise ValueError(
+                                "cat-file request pipe ended early"
+                            ) from error
+                        if written <= 0:
+                            raise ValueError("cat-file request pipe ended early")
+                        request_offset += written
+                        if request_offset == len(request):
+                            selector.unregister(descriptor)
+                        continue
+
+                    if key.data == "stderr":
+                        stderr_room = CAT_FILE_STDERR_LIMIT_BYTES - len(self.stderr)
+                        try:
+                            chunk = os.read(
+                                descriptor,
+                                min(64 * 1024, stderr_room + 1),
+                            )
+                        except BlockingIOError:
+                            continue
+                        if not chunk:
+                            selector.unregister(descriptor)
+                            continue
+                        if len(chunk) > stderr_room:
+                            raise OverflowError("cat-file stderr exceeded its byte cap")
+                        self.stderr.extend(chunk)
+                        continue
+
+                    if protocol_state == "header":
+                        read_size = 257 - len(header)
+                    elif protocol_state == "payload":
+                        read_size = min(64 * 1024, payload_remaining)
+                    else:
+                        read_size = 1
+                    try:
+                        chunk = os.read(descriptor, read_size)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        if protocol_state == "header":
+                            raise ValueError(
+                                "cat-file emitted an invalid bounded header"
+                            )
+                        if protocol_state == "payload":
+                            raise ValueError("cat-file payload ended early")
+                        raise ValueError("cat-file payload delimiter ended early")
+
+                    offset = 0
+                    while offset < len(chunk):
+                        if protocol_state == "header":
+                            newline = chunk.find(b"\n", offset)
+                            if newline < 0:
+                                header.extend(chunk[offset:])
+                                if len(header) > 256:
+                                    raise ValueError(
+                                        "cat-file emitted an invalid bounded header"
+                                    )
+                                offset = len(chunk)
+                                continue
+                            header.extend(chunk[offset:newline])
+                            if len(header) > 256:
+                                raise ValueError(
+                                    "cat-file emitted an invalid bounded header"
+                                )
+                            if header != expected_header:
+                                raise ValueError(
+                                    f"cat-file header mismatch: {bytes(header)!r}"
+                                )
+                            offset = newline + 1
+                            protocol_state = (
+                                "payload" if payload_remaining else "delimiter"
+                            )
+                            continue
+
+                        if protocol_state == "payload":
+                            chunk_size = min(
+                                len(chunk) - offset,
+                                payload_remaining,
+                            )
+                            payload = chunk[offset : offset + chunk_size]
+                            digest.update(payload)
+                            if captured is not None:
+                                captured.extend(payload)
+                            if consumer is not None:
+                                consumer(payload)
+                            payload_remaining -= chunk_size
+                            offset += chunk_size
+                            if payload_remaining == 0:
+                                protocol_state = "delimiter"
+                            continue
+
+                        if chunk[offset : offset + 1] != b"\n":
+                            raise ValueError("cat-file payload delimiter is invalid")
+                        offset += 1
+                        protocol_state = "done"
+                        if offset != len(chunk):
+                            raise ValueError(
+                                "cat-file emitted bytes after the exact response"
+                            )
+
+                if protocol_state == "done" and request_offset != len(request):
+                    raise ValueError(
+                        "cat-file responded before the request was complete"
+                    )
+
+            if time.monotonic() >= deadline:
+                raise TimeoutError("cat-file blob request timed out")
+            if digest.hexdigest() != entry.object_id:
+                raise ValueError("raw Git blob digest mismatch")
+            self.requests += 1
+            return bytes(captured) if captured is not None else None
+        except BaseException:
+            self.abort()
+            raise
+        finally:
+            selector.close()
 
     def close(self) -> None:
         if self.closed:
@@ -598,18 +792,26 @@ class CatFileBatch:
         self.closed = True
         try:
             self.process.stdin.close()
+            stderr_limit = CAT_FILE_STDERR_LIMIT_BYTES - len(self.stderr)
+            if stderr_limit < 0:
+                raise OverflowError("cat-file stderr exceeded its byte cap")
             returncode, extra, stderr = _drain_started_process(
                 self.process,
                 timeout=CAT_FILE_CLOSE_TIMEOUT_SECONDS,
                 stdout_limit=1,
-                stderr_limit=CAT_FILE_STDERR_LIMIT_BYTES,
+                stderr_limit=stderr_limit,
+                group_anchor=self.group_anchor,
             )
+            self.stderr.extend(stderr)
         except (OverflowError, subprocess.TimeoutExpired, TimeoutError) as error:
             raise ValueError(
                 "cat-file producer failed or emitted invalid bounded shutdown output"
             ) from error
         except BaseException:
-            _terminate_process(self.process)
+            _terminate_process(
+                self.process,
+                group_anchor=self.group_anchor,
+            )
             for stream in (
                 self.process.stdin,
                 self.process.stdout,
@@ -628,7 +830,10 @@ class CatFileBatch:
     def abort(self) -> None:
         if not self.closed:
             self.closed = True
-            _terminate_process(self.process)
+            _terminate_process(
+                self.process,
+                group_anchor=self.group_anchor,
+            )
             for stream in (
                 self.process.stdin,
                 self.process.stdout,

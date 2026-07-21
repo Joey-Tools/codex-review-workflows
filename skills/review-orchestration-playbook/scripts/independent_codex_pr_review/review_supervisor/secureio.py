@@ -5,6 +5,7 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import pathlib
 import platform
@@ -397,6 +398,17 @@ def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _reject_nonfinite_json_constant(value: str) -> Any:
+    raise ValueError(f"non-finite JSON number: {value}")
+
+
+def _parse_finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON number: {value}")
+    return parsed
+
+
 def _validate_json_depth(value: Any, depth: int = 0) -> None:
     if depth > MAX_JSON_DEPTH:
         raise ValueError("JSON nesting is too deep")
@@ -412,8 +424,16 @@ def decode_json_bytes(value: bytes) -> Any:
     if b"\0" in value:
         raise ValueError("JSON contains NUL")
     text = value.decode("utf-8", "strict")
-    parsed = json.loads(text, object_pairs_hook=_reject_duplicate_pairs)
-    _validate_json_depth(parsed)
+    try:
+        parsed = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=_reject_nonfinite_json_constant,
+            parse_float=_parse_finite_json_float,
+        )
+        _validate_json_depth(parsed)
+    except RecursionError as error:
+        raise ValueError("JSON nesting is too deep") from error
     return parsed
 
 
@@ -433,7 +453,13 @@ def read_json_nofollow(
 
 def canonical_json(value: Any) -> bytes:
     return (
-        json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         + "\n"
     ).encode("ascii")
 

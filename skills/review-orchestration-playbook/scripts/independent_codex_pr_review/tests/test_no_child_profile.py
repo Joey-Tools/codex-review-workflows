@@ -319,6 +319,19 @@ class NoChildProfileUnitTests(unittest.TestCase):
             profile.PROBE_DETAIL_KILLED_BEFORE_EVIDENCE,
         )
 
+        with mock.patch.object(profile.json, "loads", side_effect=RecursionError):
+            with self.assertRaisesRegex(ValueError, "not valid JSON"):
+                profile._parse_preexec_state(b"{}")
+            recursion_observation = profile._parse_probe_output(
+                layer="seatbelt",
+                action="baseline",
+                completed=subprocess.CompletedProcess(
+                    ("/usr/bin/sandbox-exec",), 0, b"{}", b""
+                ),
+            )
+        self.assertEqual(recursion_observation.outcome, "ambiguous")
+        self.assertIn("not canonical JSON", recursion_observation.detail)
+
     def test_nonexistent_probe_leader_uses_a_normalized_reason(self) -> None:
         error = ProcessLookupError(errno.ESRCH, "synthetic private path")
         detail = profile._leader_binding_error_detail(error)
@@ -879,6 +892,54 @@ class NoChildProfileUnitTests(unittest.TestCase):
             profile._validated_environment(
                 {"DYLD_INSERT_LIBRARIES": "/synthetic/injected.dylib"}
             )
+
+    def test_launch_budgets_exact_sandbox_argv_before_fork(self) -> None:
+        executable = profile.ExecutableIdentity(
+            path="/synthetic/app-server",
+            device=1,
+            inode=2,
+            mode=0o100755,
+            uid=os.getuid(),
+            gid=os.getgid(),
+            size=4,
+            mtime_ns=1,
+            ctime_ns=1,
+            sha256="a" * 64,
+        )
+        prepared = profile.PreparedNoChildProfile(
+            executable=executable,
+            expected_sha256=executable.sha256,
+            seatbelt_profile="(version 1)\n(deny default)\n",
+            evidence=mock.sentinel.compatibility,
+        )
+        environment = {"PATH": "/usr/bin", "LANG": "C"}
+        expected_argv = (
+            str(profile.SANDBOX_EXEC),
+            "-p",
+            prepared.seatbelt_profile,
+            executable.path,
+            "app-server",
+        )
+        with (
+            mock.patch.object(profile, "require_compatible"),
+            mock.patch.object(profile, "_require_live_runtime"),
+            mock.patch.object(profile, "_revalidate_prepared_profile"),
+            mock.patch.object(
+                profile,
+                "prove_exec_budget",
+                side_effect=ValueError("synthetic exec budget overflow"),
+            ) as budget,
+            mock.patch.object(profile, "_fork_with_launch_error_pipe") as fork,
+            self.assertRaisesRegex(ValueError, "exec budget overflow"),
+        ):
+            profile.launch_prepared_no_child_process(
+                prepared,
+                [executable.path, "app-server"],
+                cwd="/",
+                environment=environment,
+            )
+        budget.assert_called_once_with(expected_argv, environment=environment)
+        fork.assert_not_called()
 
     def test_unsupported_platform_blocks_without_starting_probe_children(
         self,

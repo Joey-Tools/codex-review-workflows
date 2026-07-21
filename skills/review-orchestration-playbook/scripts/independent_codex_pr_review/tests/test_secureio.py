@@ -12,12 +12,60 @@ from review_supervisor.ledger import acquire_retention_lease
 from review_supervisor.secureio import (
     _verify_macos_metadata,
     atomic_write_json,
+    canonical_json,
+    decode_json_bytes,
     open_absolute_directory_chain,
     open_regular_nofollow,
     require_private_directory,
 )
 
 from tests.support import owned_temporary_directory
+
+
+class StrictJsonTests(unittest.TestCase):
+    def test_canonical_json_rejects_nested_non_finite_floats(self) -> None:
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                canonical_json({"outer": [{"value": value}]})
+
+        self.assertEqual(canonical_json({"value": 1.25}), b'{"value":1.25}\n')
+
+        with mock.patch(
+            "review_supervisor.secureio.json.loads",
+            side_effect=RecursionError,
+        ):
+            with self.assertRaisesRegex(ValueError, "nesting is too deep"):
+                decode_json_bytes(b"{}")
+
+    def test_atomic_write_rejects_non_finite_before_publish_or_replace(self) -> None:
+        with owned_temporary_directory("secureio-non-finite-") as root:
+            for label, value in (
+                ("nan", float("nan")),
+                ("positive-infinity", float("inf")),
+                ("negative-infinity", float("-inf")),
+            ):
+                with self.subTest(label=label):
+                    target = root / f"{label}.json"
+                    original = b'{"status":"original"}\n'
+                    target.write_bytes(original)
+                    target.chmod(0o600)
+
+                    with self.assertRaises(ValueError):
+                        atomic_write_json(
+                            target,
+                            {"outer": [{"value": value}]},
+                            replace=True,
+                        )
+                    self.assertEqual(target.read_bytes(), original)
+
+                    new_target = root / f"{label}-new.json"
+                    with self.assertRaises(ValueError):
+                        atomic_write_json(
+                            new_target,
+                            {"outer": [{"value": value}]},
+                            replace=False,
+                        )
+                    self.assertFalse(new_target.exists())
 
 
 class PrivateDirectoryAnchorTests(unittest.TestCase):

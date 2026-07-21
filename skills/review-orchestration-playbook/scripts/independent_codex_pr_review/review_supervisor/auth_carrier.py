@@ -378,8 +378,13 @@ def _inspect_auth_source(
             try:
                 os.close(fd)
             except BaseException as error:
-                if failure is None:
+                if failure is None or (
+                    isinstance(error, (KeyboardInterrupt, SystemExit))
+                    and not isinstance(failure, (KeyboardInterrupt, SystemExit))
+                ):
                     failure = error
+    if isinstance(failure, (KeyboardInterrupt, SystemExit)):
+        raise failure.with_traceback(None) from None
     if isinstance(failure, AuthCarrierError):
         raise failure
     if failure is not None:
@@ -468,11 +473,29 @@ def _decode_json(raw: bytes) -> dict[str, Any]:
         )
     except AuthCarrierError:
         raise
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
         raise AuthCarrierError("auth carrier is not strict UTF-8 JSON") from error
+    try:
+        _reject_non_finite_json_floats(value)
+    except RecursionError as error:
+        raise AuthCarrierError("auth carrier JSON nesting is too deep") from error
     if not isinstance(value, dict):
         raise AuthCarrierError("auth carrier root is not an object")
     return value
+
+
+def _reject_non_finite_json_floats(value: Any) -> None:
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise AuthCarrierError("auth carrier contains a non-finite JSON number")
+        return
+    if isinstance(value, dict):
+        for child in value.values():
+            _reject_non_finite_json_floats(child)
+        return
+    if isinstance(value, list):
+        for child in value:
+            _reject_non_finite_json_floats(child)
 
 
 def _decode_jwt_claims(token: str) -> dict[str, Any]:

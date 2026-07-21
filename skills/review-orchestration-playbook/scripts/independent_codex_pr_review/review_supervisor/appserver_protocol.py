@@ -581,6 +581,11 @@ def decode_json_line(
         )
     except AppServerProtocolError:
         raise
+    except RecursionError as error:
+        raise AppServerProtocolError(
+            "protocol JSON exceeds its nesting-depth limit",
+            code="json-depth",
+        ) from error
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise AppServerProtocolError(
             "protocol record is not strict UTF-8 JSON",
@@ -1018,6 +1023,7 @@ class AppServerProtocol:
                 _object(params["turn"], "turn/started turn"),
                 expected_status="inProgress",
                 expected_items=[],
+                expected_items_view="notLoaded",
             )
             self._turn_notification = turn
             self._turn_id = turn["id"]
@@ -1228,7 +1234,14 @@ class AppServerProtocol:
             "item/started item type",
             limit=64,
         )
-        if item_type == "reasoning":
+        if item_type == "userMessage":
+            if self._completed_items:
+                raise AppServerProtocolError(
+                    "user message lifecycle item is not first in the turn",
+                    code="protocol-order",
+                )
+            item = _validate_user_message(raw_item, expected_prompt=self._prompt)
+        elif item_type == "reasoning":
             reasoning_count = sum(
                 item["type"] == "reasoning" for item in self._completed_items
             )
@@ -1519,7 +1532,9 @@ class AppServerProtocol:
                 "completed item type does not match the started item",
                 code="final-cross-check",
             )
-        if item_type == "reasoning":
+        if item_type == "userMessage":
+            item = _validate_user_message(raw_item, expected_prompt=self._prompt)
+        elif item_type == "reasoning":
             item = _validate_reasoning_item(raw_item)
         elif item_type == "agentMessage":
             item = _validate_final_agent_message(raw_item)
@@ -1533,7 +1548,13 @@ class AppServerProtocol:
                 "completed item ID does not match the started item",
                 code="protocol-id",
             )
-        if item_type == "reasoning":
+        if item_type == "userMessage":
+            if item != self._active_item:
+                raise AppServerProtocolError(
+                    "completed user message differs from its start record",
+                    code="final-cross-check",
+                )
+        elif item_type == "reasoning":
             if (
                 item["content"] != self._reasoning_content
                 or item["summary"] != self._reasoning_summary
@@ -1542,7 +1563,7 @@ class AppServerProtocol:
                     "completed reasoning differs from its bounded stream",
                     code="final-cross-check",
                 )
-        else:
+        elif item_type == "agentMessage":
             streamed = self._active_item["text"] + "".join(self._streamed_parts)
             if self._streamed_parts and item["text"] != streamed:
                 raise AppServerProtocolError(
@@ -1593,7 +1614,9 @@ class AppServerProtocol:
         turn = _validate_turn(
             _object(params["turn"], "turn/completed turn"),
             expected_status="completed",
-            expected_items=self._completed_items,
+            expected_items=[],
+            expected_items_view="notLoaded",
+            alternative_full_items=self._completed_items,
         )
         if turn["id"] != _required_id(self._turn_id, "turn ID"):
             raise AppServerProtocolError(
@@ -2266,6 +2289,7 @@ def _validate_turn_start_response(
         _object(result["turn"], "turn/start turn"),
         expected_status="inProgress",
         expected_items=[],
+        expected_items_view="notLoaded",
     )
     if not expected_thread_id:
         raise AppServerProtocolError("thread ID is unavailable", code="protocol-id")
@@ -2277,6 +2301,8 @@ def _validate_turn(
     *,
     expected_status: str,
     expected_items: list[dict[str, Any]],
+    expected_items_view: str = "full",
+    alternative_full_items: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     required = {"id", "items", "status"}
     _exact_keys(turn, required=required, optional=_TURN_KEYS - required, label="turn")
@@ -2288,20 +2314,21 @@ def _validate_turn(
             if turn["status"] in {"failed", "interrupted"}
             else "result-schema",
         )
-    if turn["items"] != expected_items:
+    items_view = turn.get("itemsView", "full")
+    items_match = items_view == expected_items_view and turn["items"] == expected_items
+    if alternative_full_items is not None:
+        items_match = items_match or (
+            items_view == "full" and turn["items"] == alternative_full_items
+        )
+    if not items_match:
         raise AppServerProtocolError(
-            "turn items do not exactly match the observed final item",
+            "turn items and itemsView do not match the observed lifecycle",
             code="final-cross-check",
         )
     if turn.get("error") is not None:
         raise AppServerProtocolError(
             "turn contains an error payload",
             code="turn-failed",
-        )
-    if turn.get("itemsView", "full") != "full":
-        raise AppServerProtocolError(
-            "turn items view is not complete",
-            code="final-cross-check",
         )
     for key in ("startedAt", "completedAt", "durationMs"):
         if turn.get(key) is not None:
@@ -2338,6 +2365,51 @@ def _validate_reasoning_item(item: dict[str, Any]) -> dict[str, Any]:
         "summary": summary,
         "type": "reasoning",
     }
+
+
+def _validate_user_message(
+    item: dict[str, Any],
+    *,
+    expected_prompt: str,
+) -> dict[str, Any]:
+    _exact_keys(
+        item,
+        required={"content", "id", "type"},
+        optional={"clientId"},
+        label="user message item",
+    )
+    if item["type"] != "userMessage":
+        raise AppServerProtocolError(
+            f"forbidden thread item type: {item['type']!r}",
+            code="tool-or-item-forbidden",
+        )
+    _identifier(item["id"], "user message item ID")
+    if item.get("clientId") is not None:
+        _bounded_string(item["clientId"], "user message client ID", limit=512)
+    content = item["content"]
+    if not isinstance(content, list) or len(content) != 1:
+        raise AppServerProtocolError(
+            "user message must contain exactly one text input",
+            code="final-cross-check",
+        )
+    text_input = _object(content[0], "user message text input")
+    _exact_keys(
+        text_input,
+        required={"text", "type"},
+        optional={"text_elements"},
+        label="user message text input",
+    )
+    if text_input["type"] != "text" or text_input.get("text_elements", []) != []:
+        raise AppServerProtocolError(
+            "user message contains non-text or decorated input",
+            code="tool-or-item-forbidden",
+        )
+    if _text(text_input["text"], "user message text") != expected_prompt:
+        raise AppServerProtocolError(
+            "user message does not match the submitted review prompt",
+            code="final-cross-check",
+        )
+    return item
 
 
 def _validate_string_list(value: Any, label: str) -> list[str]:
