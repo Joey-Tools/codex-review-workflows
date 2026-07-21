@@ -1650,6 +1650,173 @@ class ChildEnvironmentTest(unittest.TestCase):
             self.assertFalse(owner.started())
             on_process_quiescent.assert_not_called()
 
+    def test_logged_command_pipe_failure_does_not_publish_process_start(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            directory_descriptor = os.open(root, os.O_RDONLY)
+            owner = common.ProcessStartOwner()
+            on_process_quiescent = mock.Mock()
+            try:
+                with (
+                    mock.patch.object(
+                        common.os,
+                        "pipe",
+                        side_effect=OSError("pipe failed"),
+                    ),
+                    mock.patch.object(common.subprocess, "Popen") as popen,
+                    mock.patch.object(
+                        common.signal,
+                        "signal",
+                        return_value=signal.SIG_DFL,
+                    ),
+                    mock.patch.object(
+                        common,
+                        "block_forwarded_signals",
+                        return_value=None,
+                    ),
+                ):
+                    with self.assertRaisesRegex(OSError, "pipe failed"):
+                        common.run(
+                            ("reviewer",),
+                            cwd_fd=directory_descriptor,
+                            stdout_path=root / "stdout.log",
+                            stderr_path=root / "stderr.log",
+                            on_process_starting=owner.publish_starting,
+                            on_process_started=owner.publish_started,
+                            on_process_quiescent=on_process_quiescent,
+                        )
+            finally:
+                os.close(directory_descriptor)
+
+        self.assertEqual(owner.state, common.ProcessStartState.NOT_STARTED)
+        self.assertFalse(owner.may_have_started())
+        popen.assert_not_called()
+        on_process_quiescent.assert_not_called()
+
+    def test_logged_command_descriptor_prep_failure_does_not_publish_process_start(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            directory_descriptor = os.open(root, os.O_RDONLY)
+            handoff_read_descriptor, handoff_write_descriptor = os.pipe()
+            owner = common.ProcessStartOwner()
+            on_process_quiescent = mock.Mock()
+            try:
+                with (
+                    mock.patch.object(
+                        common.os,
+                        "pipe",
+                        return_value=(
+                            handoff_read_descriptor,
+                            handoff_write_descriptor,
+                        ),
+                    ),
+                    mock.patch.object(
+                        common,
+                        "_descriptor_cwd_command",
+                        side_effect=OSError("descriptor prep failed"),
+                    ),
+                    mock.patch.object(common.subprocess, "Popen") as popen,
+                    mock.patch.object(
+                        common.signal,
+                        "signal",
+                        return_value=signal.SIG_DFL,
+                    ),
+                    mock.patch.object(
+                        common,
+                        "block_forwarded_signals",
+                        return_value=None,
+                    ),
+                ):
+                    with self.assertRaisesRegex(OSError, "descriptor prep failed"):
+                        common.run(
+                            ("reviewer",),
+                            cwd_fd=directory_descriptor,
+                            stdout_path=root / "stdout.log",
+                            stderr_path=root / "stderr.log",
+                            on_process_starting=owner.publish_starting,
+                            on_process_started=owner.publish_started,
+                            on_process_quiescent=on_process_quiescent,
+                        )
+            finally:
+                os.close(directory_descriptor)
+
+        self.assertEqual(owner.state, common.ProcessStartState.NOT_STARTED)
+        self.assertFalse(owner.may_have_started())
+        popen.assert_not_called()
+        on_process_quiescent.assert_not_called()
+        for descriptor in (handoff_read_descriptor, handoff_write_descriptor):
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_logged_command_pass_fd_merge_failure_does_not_publish_process_start(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            directory_descriptor = os.open(root, os.O_RDONLY)
+            handoff_read_descriptor, handoff_write_descriptor = os.pipe()
+            owner = common.ProcessStartOwner()
+            on_process_quiescent = mock.Mock()
+            try:
+                with (
+                    mock.patch.object(
+                        common.os,
+                        "pipe",
+                        return_value=(
+                            handoff_read_descriptor,
+                            handoff_write_descriptor,
+                        ),
+                    ),
+                    mock.patch.object(
+                        common,
+                        "_descriptor_cwd_command",
+                        return_value=(
+                            ("reviewer",),
+                            (directory_descriptor, handoff_write_descriptor),
+                        ),
+                    ),
+                    mock.patch.object(
+                        common,
+                        "_merge_pass_fds",
+                        side_effect=OSError("pass fd merge failed"),
+                    ),
+                    mock.patch.object(common.subprocess, "Popen") as popen,
+                    mock.patch.object(
+                        common.signal,
+                        "signal",
+                        return_value=signal.SIG_DFL,
+                    ),
+                    mock.patch.object(
+                        common,
+                        "block_forwarded_signals",
+                        return_value=None,
+                    ),
+                ):
+                    with self.assertRaisesRegex(OSError, "pass fd merge failed"):
+                        common.run(
+                            ("reviewer",),
+                            cwd_fd=directory_descriptor,
+                            stdout_path=root / "stdout.log",
+                            stderr_path=root / "stderr.log",
+                            on_process_starting=owner.publish_starting,
+                            on_process_started=owner.publish_started,
+                            on_process_quiescent=on_process_quiescent,
+                        )
+            finally:
+                os.close(directory_descriptor)
+
+        self.assertEqual(owner.state, common.ProcessStartState.NOT_STARTED)
+        self.assertFalse(owner.may_have_started())
+        popen.assert_not_called()
+        on_process_quiescent.assert_not_called()
+        for descriptor in (handoff_read_descriptor, handoff_write_descriptor):
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
     def test_logged_command_publishes_successful_process_start_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)

@@ -924,10 +924,6 @@ def _run_logged_process(
     try:
         if pending_signal is not None:
             raise ForwardedSignal(pending_signal)
-        if on_process_starting is not None:
-            # Popen can create a child before either returning or raising, and
-            # its result can be interrupted before Python stores the handle.
-            on_process_starting()
         if cwd_fd is not None:
             handoff_read_descriptor, handoff_write_descriptor = os.pipe()
         spawn_command, cwd_pass_fds = _descriptor_cwd_command(
@@ -935,10 +931,15 @@ def _run_logged_process(
             cwd_fd,
             status_fd=handoff_write_descriptor,
         )
+        spawn_pass_fds = _merge_pass_fds(pass_fds, cwd_pass_fds)
+        if on_process_starting is not None:
+            # Popen can create a child before either returning or raising, and
+            # its result can be interrupted before Python stores the handle.
+            on_process_starting()
         process = subprocess.Popen(
             spawn_command,
             cwd=cwd,
-            pass_fds=_merge_pass_fds(pass_fds, cwd_pass_fds),
+            pass_fds=spawn_pass_fds,
             env=env,
             stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
             stdout=(
