@@ -10,7 +10,9 @@ import unittest
 from unittest import mock
 
 from review_supervisor.constants import (
+    LOW_LEVEL_HELPER_REVIEW_CONTRACT,
     MAX_EVIDENCE_PRIMARY_BYTES,
+    NAMED_LANE_ELIGIBLE,
     PROCESS_ENVELOPE_BYTES,
     RELEASED_TTL_SECONDS,
     SCHEMA_VERSION,
@@ -22,7 +24,7 @@ from review_supervisor.ledger import (
     reconcile_ledger,
 )
 from review_supervisor.process import await_exec, fork_exec
-from review_supervisor.runtime import _validate_terminal_lifecycle
+from review_supervisor.runtime import _compact_terminal, _validate_terminal_lifecycle
 from review_supervisor.secureio import (
     allocated_bytes,
     boot_identifier,
@@ -52,6 +54,33 @@ from tests.support import owned_temporary_directory
 
 TOOL_ROOT = pathlib.Path(__file__).resolve().parent.parent
 ENTRYPOINT = TOOL_ROOT / "independent-codex-pr-review"
+
+
+class ReviewContractEnvelopeTests(unittest.TestCase):
+    def test_compact_terminal_is_always_named_lane_ineligible(self) -> None:
+        cases = (
+            ("clean", True),
+            ("findings", True),
+            ("inconclusive", False),
+        )
+        for review_status, authorized in cases:
+            with self.subTest(review_status=review_status):
+                summary = _compact_terminal(
+                    {
+                        "prompt_path": "/tmp/attempt/prompt.txt",
+                        "review_contract": "forged",
+                        "named_lane_eligible": True,
+                        "review_status": review_status,
+                        "checkout_settlement": "exact",
+                        "worktree_status": "removed",
+                        "failure": {"status": "inconclusive"},
+                    },
+                    final_authorization_exact=authorized,
+                )
+                self.assertEqual(
+                    summary["review_contract"], LOW_LEVEL_HELPER_REVIEW_CONTRACT
+                )
+                self.assertIs(summary["named_lane_eligible"], False)
 
 
 class PreflightAdmissionTests(unittest.TestCase):
@@ -127,6 +156,8 @@ def _write_attempt(
         prompt.chmod(0o600)
     state: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
+        "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+        "named_lane_eligible": NAMED_LANE_ELIGIBLE,
         "attempt_id": attempt_id,
         "record_generation": 1,
         "previous_record_sha256": None,
@@ -571,6 +602,10 @@ class FinalAuthorizationTests(unittest.TestCase):
             )["attempts"][0]
             self.assertEqual(completed["overall_status"], "completed")
             self.assertEqual(
+                completed["review_contract"], LOW_LEVEL_HELPER_REVIEW_CONTRACT
+            )
+            self.assertIs(completed["named_lane_eligible"], False)
+            self.assertEqual(
                 authorization["predecessor_generation"],
                 state["record_generation"] - 1,
             )
@@ -586,6 +621,10 @@ class FinalAuthorizationTests(unittest.TestCase):
                 retention_root=retention,
                 attempt_dir=attempt,
             )
+            self.assertEqual(
+                result["review_contract"], LOW_LEVEL_HELPER_REVIEW_CONTRACT
+            )
+            self.assertIs(result["named_lane_eligible"], False)
             self.assertEqual(result["final_message"], "No findings.")
 
     def test_terminal_auth_refresh_closure_must_match_process_history(self) -> None:

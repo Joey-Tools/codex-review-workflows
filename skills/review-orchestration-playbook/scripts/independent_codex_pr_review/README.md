@@ -223,6 +223,12 @@ final artifact 才能进入独立 authorization/readback 流程。
 
 所有公共命令 stdout 都只有一行 compact JSON。
 
+每个公共 JSON envelope 和持久化 attempt state 都固定包含
+`review_contract: supplied-diff-no-git` 与 `named_lane_eligible: false`。缺失、畸形或不为
+布尔值 `false` 的持久化标签会在读取时失败关闭。exit `0`、`overall_status: completed`、
+`review_status: clean`、请求模型名或 `No findings.` 都不能把这个预供证据、无 reviewer Git
+能力的低层 helper 升级为 named review lane。
+
 - `0`: 命令完成；`run` 得到可分类 terminal artifact，或管理操作成功。
 - `1`: attempt 已 terminal，但存在 inconclusive/manual cleanup 阻塞。
 - `2`: preflight、handoff、recovery、state authentication 或 CLI 操作失败关闭。

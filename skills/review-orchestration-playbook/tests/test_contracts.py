@@ -17,7 +17,9 @@ SKILL_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SKILL_SCOPE_ROOT = SKILL_ROOT.parents[1]
 SCRIPTS = SKILL_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(SCRIPTS / "independent_codex_pr_review"))
 
+from review_supervisor import constants as independent_constants  # noqa: E402
 from review_runtime import (  # noqa: E402
     claude_capabilities,
     claude_linux,
@@ -292,6 +294,24 @@ class RepositoryContractTest(unittest.TestCase):
             "supplied-diff-no-git",
         )
         self.assertFalse(providers.NAMED_LANE_ELIGIBLE)
+        self.assertEqual(
+            independent_constants.LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+            providers.LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+        )
+        self.assertIs(
+            independent_constants.NAMED_LANE_ELIGIBLE,
+            providers.NAMED_LANE_ELIGIBLE,
+        )
+        independent_readme = (
+            SCRIPTS / "independent_codex_pr_review" / "README.md"
+        ).read_text(encoding="utf-8")
+        helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
+            encoding="utf-8"
+        )
+        for contract_text in (independent_readme, helper_contract):
+            self.assertIn("review_contract: supplied-diff-no-git", contract_text)
+            self.assertIn("named_lane_eligible: false", contract_text)
+            self.assertIn("No findings.", contract_text)
         for candidate in (
             SKILL_ROOT / "SKILL.md",
             SKILL_ROOT / "references/helper-contract.md",
@@ -845,8 +865,22 @@ class RepositoryContractTest(unittest.TestCase):
             SCRIPTS
             / "independent_codex_pr_review/tests/run_required_no_child_profile.py"
         ).read_text(encoding="utf-8")
-        self.assertIn("if result.skipped:", required_runner)
+        self.assertIn("result.skipped,", required_runner)
         self.assertIn("result.wasSuccessful()", required_runner)
+        self.assertIn("result.testsRun != expected_count", required_runner)
+        self.assertIn("result.expectedFailures", required_runner)
+        self.assertIn("result.unexpectedSuccesses", required_runner)
+        integration_test = (
+            SCRIPTS / "independent_codex_pr_review/tests/test_no_child_profile.py"
+        ).read_text(encoding="utf-8")
+        production_profile = (
+            SCRIPTS
+            / "independent_codex_pr_review/review_supervisor/no_child_profile.py"
+        ).read_text(encoding="utf-8")
+        hosted_profile = "github-macos-26-arm64-26.4-25E246"
+        self.assertIn(hosted_profile, integration_test)
+        self.assertNotIn(hosted_profile, production_profile)
+        self.assertNotIn("25E246", production_profile)
 
         profile_contracts = {
             "canonical": (
@@ -865,12 +899,14 @@ class RepositoryContractTest(unittest.TestCase):
             supervisor_job = workflow[start:end]
             with self.subTest(profile=profile):
                 self.assertIn("runs-on: macos-26", supervisor_job)
+                self.assertIn("timeout-minutes: 15", supervisor_job)
                 self.assertIn(
                     """      - name: Report live no-child runtime fingerprint
         run: |
           /usr/bin/sw_vers -productVersion
           /usr/bin/sw_vers -buildVersion
           /usr/bin/uname -r
+          /usr/bin/uname -m
           /usr/bin/shasum -a 256 /usr/bin/sandbox-exec
 """,
                     supervisor_job,
@@ -880,6 +916,9 @@ class RepositoryContractTest(unittest.TestCase):
         working-directory: {skill_root}/scripts/independent_codex_pr_review
         env:
           CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE: "1"
+          CODEX_REVIEW_LIVE_NO_CHILD_RUNTIME_PROFILE: github-macos-26-arm64-26.4-25E246
+          CODEX_REVIEW_RUNNER_ENVIRONMENT: ${{{{ runner.environment }}}}
+          CODEX_REVIEW_RUNNER_ARCH: ${{{{ runner.arch }}}}
         run: |
           python3 -m tests.run_required_no_child_profile
 """,

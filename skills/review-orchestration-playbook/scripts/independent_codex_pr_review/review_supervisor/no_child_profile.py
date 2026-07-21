@@ -147,7 +147,7 @@ class CompatibilityEvidence:
 
     @property
     def production_capable(self) -> bool:
-        return self.compatible
+        return self.compatible and self.runtime_pin == PINNED_RUNTIME
 
     def observation(self, layer: str, action: str) -> ProbeObservation | None:
         for item in self.observations:

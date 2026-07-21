@@ -25,6 +25,8 @@ from .constants import (
     CHECKOUT_SECONDS,
     FINAL_MESSAGE_BYTES,
     HANDOFF_SECONDS,
+    LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+    NAMED_LANE_ELIGIBLE,
     PRIMARY_DIFF_RELATIVE_PATH,
     PROCESS_TERM_GRACE_SECONDS,
     READER_DRAIN_SECONDS,
@@ -3621,6 +3623,8 @@ def _compact_terminal(
     retained_worktree = state.get("retained_worktree")
     helper_custody = state.get("helper_custody")
     return {
+        "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+        "named_lane_eligible": NAMED_LANE_ELIGIBLE,
         "attempt_id": state.get("attempt_id"),
         "overall_status": overall,
         "repo": state.get("repo"),

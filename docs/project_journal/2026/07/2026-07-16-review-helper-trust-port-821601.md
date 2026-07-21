@@ -399,10 +399,30 @@ metadata behavior.
   hosted runner drifted from the pinned macOS runtime. The job now runs on
   `macos-26`, invokes the live integration through a zero-skip runner, and
   converts runtime-pin or Seatbelt availability drift into a required-CI
-  failure while preserving ordinary local skips on unpinned hosts. Final
-  host-level Python 3.13 validation ran all 6 live
-  no-child integration tests, 274 independent-supervisor tests, and 1,429 main
-  tests with 5 platform skips. One intermediate supervisor run hit a transient
-  missing status file in the unrelated hard-process-limit test; the exact test
-  and the subsequent complete supervisor run both passed. The 40-test contract
-  suite and Ruff lint/format checks also pass.
+  failure while preserving ordinary local skips on unpinned hosts. GitHub's
+  hosted `macos-26` image remains on 26.4 while the production host pin is
+  26.5.2, so CI uses an exact test-only 26.4 runtime/build/kernel/sandbox-exec
+  profile without changing the production allowlist.
+- A whole-range fresh-context review found that the low-level supplied-evidence
+  supervisor could emit `overall_status: completed` without an explicit machine
+  label preventing named-lane counting. Every new attempt state and public JSON
+  envelope now carries `review_contract: supplied-diff-no-git` and
+  `named_lane_eligible: false`. State reads and pre-write transitions reject
+  missing, malformed, forged, or integer-zero eligibility, while the public CLI
+  overwrites conflicting producer metadata with the fixed ineligible contract.
+  Exit zero, clean review status, requested model, and `No findings.` cannot
+  upgrade this helper into a canonical named lane.
+- Full-suite load exposed that the Python fake app-server fixtures had only
+  1.0-1.4 seconds after cleanup reservation for interpreter startup, marker
+  publication, and protocol work. Production correctly timed out and cleaned
+  those processes before their fixture markers appeared. Test-only budgets now
+  allow five seconds while preserving the production full-lifecycle deadline
+  and every strict stage, code, PID, and descendant assertion.
+- Final host-level validation used only Python 3.13. All 6 live no-child
+  integration tests ran without skips inside the complete 280-test independent
+  supervisor suite, and the 1,429-test main suite passed with 5 platform skips.
+  The 82 focused lifecycle tests and 40 repository contract tests pass. Ruff
+  lint and formatting, compileall, Bash syntax, ShellCheck, actionlint,
+  canonical CI fixture equality, project-journal validation, the official skill
+  validator, synthetic-token validation, broker developer byte reproduction,
+  and `git diff --check` also pass.

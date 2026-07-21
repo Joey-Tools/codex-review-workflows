@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import pathlib
@@ -7,7 +9,12 @@ import subprocess
 import sys
 import unittest
 
-from review_supervisor.constants import SCHEMA_VERSION
+from review_supervisor.cli import _emit
+from review_supervisor.constants import (
+    LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+    NAMED_LANE_ELIGIBLE,
+    SCHEMA_VERSION,
+)
 from review_supervisor.secureio import (
     allocated_bytes,
     boot_identifier,
@@ -43,6 +50,13 @@ def _invoke(*arguments: str) -> tuple[int, dict[str, object]]:
     return completed.returncode, json.loads(lines[0])
 
 
+def _assert_low_level_contract(
+    testcase: unittest.TestCase, payload: dict[str, object]
+) -> None:
+    testcase.assertEqual(payload["review_contract"], LOW_LEVEL_HELPER_REVIEW_CONTRACT)
+    testcase.assertIs(payload["named_lane_eligible"], False)
+
+
 def _write_attempt(
     retention: pathlib.Path,
     *,
@@ -55,6 +69,8 @@ def _write_attempt(
     attempt.mkdir(mode=0o700)
     state = {
         "schema_version": SCHEMA_VERSION,
+        "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+        "named_lane_eligible": NAMED_LANE_ELIGIBLE,
         "attempt_id": attempt_id,
         "record_generation": 1,
         "previous_record_sha256": None,
@@ -250,6 +266,18 @@ def _authorize_final(attempt: pathlib.Path, content: bytes) -> dict[str, object]
 
 
 class CliLifecycleTests(unittest.TestCase):
+    def test_emit_overrides_conflicting_contract_metadata(self) -> None:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            _emit(
+                {
+                    "status": "ok",
+                    "review_contract": "forged",
+                    "named_lane_eligible": True,
+                }
+            )
+        _assert_low_level_contract(self, json.loads(output.getvalue()))
+
     def test_final_revalidates_the_sealed_artifact(self) -> None:
         with owned_temporary_directory("cli-final-") as root:
             retention = root / "retention"
@@ -270,6 +298,7 @@ class CliLifecycleTests(unittest.TestCase):
                 str(attempt),
             )
             self.assertEqual(code, 0, payload)
+            _assert_low_level_contract(self, payload)
             self.assertEqual(payload["final_message"], "No findings.")
             code, payload = _invoke(
                 "release",
@@ -281,6 +310,7 @@ class CliLifecycleTests(unittest.TestCase):
                 "resolved",
             )
             self.assertEqual(code, 0, payload)
+            _assert_low_level_contract(self, payload)
             code, payload = _invoke(
                 "final",
                 "--retention-root",
@@ -289,6 +319,7 @@ class CliLifecycleTests(unittest.TestCase):
                 str(attempt),
             )
             self.assertEqual(code, 0, payload)
+            _assert_low_level_contract(self, payload)
             self.assertEqual(payload["final_message"], "No findings.")
             final_path = attempt / "final.txt"
             final_path.write_bytes(b"No findings?\n")
@@ -300,6 +331,7 @@ class CliLifecycleTests(unittest.TestCase):
                 str(attempt),
             )
             self.assertEqual(code, 2)
+            _assert_low_level_contract(self, payload)
             self.assertEqual(payload["overall_status"], "inconclusive")
 
     def test_final_rejects_each_forged_terminal_binding(self) -> None:
@@ -375,6 +407,7 @@ class CliLifecycleTests(unittest.TestCase):
                     str(attempt),
                 )
                 self.assertEqual(code, 2, payload)
+                _assert_low_level_contract(self, payload)
                 self.assertEqual(payload["failure_code"], "final-authorization-invalid")
 
     def test_same_boot_recovery_fails_closed_without_mutation(self) -> None:
@@ -396,6 +429,7 @@ class CliLifecycleTests(unittest.TestCase):
                 str(attempt),
             )
             self.assertEqual(code, 2)
+            _assert_low_level_contract(self, payload)
             self.assertEqual(payload["overall_status"], "blocked")
             self.assertEqual(payload["failure_code"], "same-boot-owner-required")
             self.assertEqual((attempt / "state.json").read_bytes(), before)
@@ -418,6 +452,8 @@ class CliLifecycleTests(unittest.TestCase):
                 str(attempt),
             )
             self.assertEqual(code, 0, payload)
+            _assert_low_level_contract(self, payload)
+            _assert_low_level_contract(self, payload["attempts"][0])
             self.assertEqual(payload["attempts"][0]["retention_state"], "held")
 
             code, payload = _invoke(
@@ -430,6 +466,7 @@ class CliLifecycleTests(unittest.TestCase):
                 "resolved",
             )
             self.assertEqual(code, 0, payload)
+            _assert_low_level_contract(self, payload)
             self.assertEqual(payload["status"], "released")
 
             code, payload = _invoke(
@@ -440,6 +477,7 @@ class CliLifecycleTests(unittest.TestCase):
                 str(attempt),
             )
             self.assertEqual(code, 0, payload)
+            _assert_low_level_contract(self, payload)
             self.assertEqual(payload["status"], "reclaimed")
             self.assertFalse(attempt.exists())
 

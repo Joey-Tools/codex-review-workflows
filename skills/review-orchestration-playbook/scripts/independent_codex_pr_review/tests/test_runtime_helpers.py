@@ -8,7 +8,12 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from review_supervisor.constants import APP_SERVER_CLI_VERSION, SCHEMA_VERSION
+from review_supervisor.constants import (
+    APP_SERVER_CLI_VERSION,
+    LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+    NAMED_LANE_ELIGIBLE,
+    SCHEMA_VERSION,
+)
 from review_supervisor.errors import inconclusive
 from review_supervisor.ledger import acquire_retention_lease, read_attempt_state
 from review_supervisor.process import TerminationSchedule, process_start_identity
@@ -357,6 +362,8 @@ class RuntimeHelperTests(unittest.TestCase):
             attempt.mkdir(mode=0o700)
             state = {
                 "schema_version": SCHEMA_VERSION,
+                "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+                "named_lane_eligible": NAMED_LANE_ELIGIBLE,
                 "attempt_id": f"1-{'a' * 32}",
                 "record_generation": 1,
                 "previous_record_sha256": None,
@@ -401,6 +408,8 @@ class RuntimeHelperTests(unittest.TestCase):
             attempt.mkdir(mode=0o700)
             state = {
                 "schema_version": SCHEMA_VERSION,
+                "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+                "named_lane_eligible": NAMED_LANE_ELIGIBLE,
                 "attempt_id": f"1-{'9' * 32}",
                 "record_generation": 1,
                 "previous_record_sha256": None,
@@ -487,6 +496,8 @@ class RuntimeHelperTests(unittest.TestCase):
             attempt.mkdir(mode=0o700)
             state = {
                 "schema_version": SCHEMA_VERSION,
+                "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+                "named_lane_eligible": NAMED_LANE_ELIGIBLE,
                 "attempt_id": f"1-{'b' * 32}",
                 "record_generation": 1,
                 "previous_record_sha256": None,
@@ -726,6 +737,8 @@ class RuntimeHelperTests(unittest.TestCase):
             identity = identity_from_stat(os.stat(prompt_path, follow_symlinks=False))
             state = {
                 "schema_version": SCHEMA_VERSION,
+                "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+                "named_lane_eligible": NAMED_LANE_ELIGIBLE,
                 "attempt_id": f"1-{'c' * 32}",
                 "record_generation": 1,
                 "previous_record_sha256": None,
@@ -780,6 +793,8 @@ class RuntimeHelperTests(unittest.TestCase):
             }
             state = {
                 "schema_version": SCHEMA_VERSION,
+                "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+                "named_lane_eligible": NAMED_LANE_ELIGIBLE,
                 "attempt_id": f"1-{'e' * 32}",
                 "record_generation": 1,
                 "previous_record_sha256": None,
@@ -836,6 +851,8 @@ class RuntimeHelperTests(unittest.TestCase):
             }
             tampered_state = {
                 "schema_version": SCHEMA_VERSION,
+                "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+                "named_lane_eligible": NAMED_LANE_ELIGIBLE,
                 "attempt_id": f"2-{'f' * 32}",
                 "record_generation": 1,
                 "previous_record_sha256": None,
@@ -878,6 +895,8 @@ class RuntimeHelperTests(unittest.TestCase):
                 token = "a" * 64
                 state = {
                     "schema_version": SCHEMA_VERSION,
+                    "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+                    "named_lane_eligible": NAMED_LANE_ELIGIBLE,
                     "attempt_id": f"1-{'a' * 32}",
                     "record_generation": 1,
                     "previous_record_sha256": None,

@@ -113,6 +113,7 @@ jobs:
   independent_supervisor_tests:
     name: independent-supervisor (python-3.13)
     runs-on: macos-26
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -127,11 +128,15 @@ jobs:
           /usr/bin/sw_vers -productVersion
           /usr/bin/sw_vers -buildVersion
           /usr/bin/uname -r
+          /usr/bin/uname -m
           /usr/bin/shasum -a 256 /usr/bin/sandbox-exec
       - name: Require pinned live no-child profile integration
         working-directory: personal_codex/skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         env:
           CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE: "1"
+          CODEX_REVIEW_LIVE_NO_CHILD_RUNTIME_PROFILE: github-macos-26-arm64-26.4-25E246
+          CODEX_REVIEW_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          CODEX_REVIEW_RUNNER_ARCH: ${{ runner.arch }}
         run: |
           python3 -m tests.run_required_no_child_profile
       - name: Run independent review supervisor tests

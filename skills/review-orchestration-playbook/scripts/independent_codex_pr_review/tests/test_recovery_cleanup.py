@@ -8,7 +8,11 @@ import time
 import unittest
 from unittest import mock
 
-from review_supervisor.constants import SCHEMA_VERSION
+from review_supervisor.constants import (
+    LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+    NAMED_LANE_ELIGIBLE,
+    SCHEMA_VERSION,
+)
 from review_supervisor.gitraw import (
     add_detached_worktree,
     enumerate_registration,
@@ -185,6 +189,8 @@ class TargetedRecoveryTests(unittest.TestCase):
         attempt.mkdir(mode=0o700)
         state = {
             "schema_version": SCHEMA_VERSION,
+            "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+            "named_lane_eligible": NAMED_LANE_ELIGIBLE,
             "attempt_id": attempt_id,
             "record_generation": 1,
             "previous_record_sha256": None,

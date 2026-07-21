@@ -15,7 +15,9 @@ from .constants import (
     CHECKOUT_ACCOUNTING_CAP_BYTES,
     CHECKOUT_SYNTHETIC_PATH_BYTES_BOUND,
     HOST_FREE_SPACE_FLOOR_BYTES,
+    LOW_LEVEL_HELPER_REVIEW_CONTRACT,
     MIB,
+    NAMED_LANE_ELIGIBLE,
     PROCESS_ENVELOPE_BYTES,
     PRIMARY_DIFF_RELATIVE_PATH,
     REGISTRATION_DESCENDANT_COUNT_CAP,
@@ -62,6 +64,14 @@ INITIAL_CRASH_TEMP_CAP = 8
 
 class EntryCountMismatch(ValueError):
     pass
+
+
+def _validate_review_contract(state: dict[str, Any]) -> None:
+    if (
+        state.get("review_contract") != LOW_LEVEL_HELPER_REVIEW_CONTRACT
+        or state.get("named_lane_eligible") is not NAMED_LANE_ELIGIBLE
+    ):
+        raise ValueError("attempt state review contract is invalid")
 
 
 @dataclass(frozen=True)
@@ -166,6 +176,7 @@ def read_attempt_state(attempt_dir: pathlib.Path) -> tuple[dict[str, Any], bytes
     state = decode_json_bytes(raw)
     if not isinstance(state, dict) or state.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("attempt state schema is invalid")
+    _validate_review_contract(state)
     return state, raw, sha256_bytes(raw)
 
 
@@ -274,6 +285,8 @@ def _reclaim_initial_crash_attempt(
                 not isinstance(candidate, dict)
                 or canonical_json(candidate) != raw
                 or candidate.get("schema_version") != SCHEMA_VERSION
+                or candidate.get("review_contract") != LOW_LEVEL_HELPER_REVIEW_CONTRACT
+                or candidate.get("named_lane_eligible") is not NAMED_LANE_ELIGIBLE
                 or candidate.get("attempt_id") != attempt_id
                 or type(candidate.get("record_generation")) is not int
                 or candidate["record_generation"] != 1
@@ -871,6 +884,8 @@ def create_reserved_attempt(
             os.close(binding_fd)
     state = {
         "schema_version": SCHEMA_VERSION,
+        "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+        "named_lane_eligible": NAMED_LANE_ELIGIBLE,
         "attempt_id": attempt_id,
         "record_generation": 1,
         "previous_record_sha256": None,
@@ -974,6 +989,7 @@ def commit_state(
     next_state.update(updates)
     next_state["record_generation"] = current["record_generation"] + 1
     next_state["previous_record_sha256"] = current_digest
+    _validate_review_contract(next_state)
     _, next_digest = atomic_write_json(
         attempt_dir / "state.json", next_state, replace=True
     )

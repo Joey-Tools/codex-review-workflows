@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import errno
 import hashlib
 import json
 import os
 import pathlib
+import platform
 import resource
 import signal
 import shutil
@@ -31,6 +33,15 @@ from review_supervisor import no_child_profile as profile
 
 
 REQUIRE_LIVE_NO_CHILD_PROFILE_ENV = "CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE"
+GITHUB_HOSTED_RUNTIME_PROFILE = "github-macos-26-arm64-26.4-25E246"
+GITHUB_HOSTED_RUNTIME_PIN = profile.RuntimePin(
+    macos_product_version="26.4",
+    macos_build_version="25E246",
+    darwin_release="25.4.0",
+    sandbox_exec_sha256=(
+        "d1ee30dbde955aaa75c7f801fdfea4df05b10129454d7982eb6453f771436d42"
+    ),
+)
 
 
 def _sha256(path: pathlib.Path) -> str:
@@ -321,6 +332,44 @@ class NoChildProfileUnitTests(unittest.TestCase):
             ),
         ):
             NoChildProfileDarwinIntegrationTests.setUpClass()
+
+    def test_hosted_live_runtime_profile_is_exact_and_test_only(self) -> None:
+        pin = GITHUB_HOSTED_RUNTIME_PIN
+        self.assertEqual(pin.macos_product_version, "26.4")
+        self.assertEqual(pin.macos_build_version, "25E246")
+        self.assertEqual(pin.darwin_release, "25.4.0")
+        self.assertEqual(
+            pin.sandbox_exec_sha256,
+            "d1ee30dbde955aaa75c7f801fdfea4df05b10129454d7982eb6453f771436d42",
+        )
+        self.assertNotEqual(pin, profile.PINNED_RUNTIME)
+
+    def test_custom_runtime_pin_evidence_is_not_production_capable(self) -> None:
+        evidence = profile.CompatibilityEvidence(
+            schema_version=profile.EVIDENCE_SCHEMA_VERSION,
+            runtime_pin=GITHUB_HOSTED_RUNTIME_PIN,
+            runtime=profile.RuntimeFingerprint(
+                platform="darwin",
+                system="Darwin",
+                macos_product_version="26.4",
+                macos_build_version="25E246",
+                darwin_release="25.4.0",
+                python_version=(3, 13, 0),
+                python_executable="/synthetic/python3.13",
+                effective_uid=501,
+            ),
+            sandbox_exec=None,
+            probe_executable=None,
+            alternate_executable=None,
+            seatbelt_profile_sha256=None,
+            parent_nproc_before=None,
+            parent_nproc_after=None,
+            observations=(),
+            blockers=(),
+        )
+
+        self.assertTrue(evidence.compatible)
+        self.assertFalse(evidence.production_capable)
 
     def test_preexec_order_establishes_leader_before_zeroing_nproc(self) -> None:
         events: list[str] = []
@@ -890,6 +939,10 @@ class NoChildProfileUnitTests(unittest.TestCase):
 
 
 class NoChildProfileDarwinIntegrationTests(unittest.TestCase):
+    RUNTIME_PIN = profile.PINNED_RUNTIME
+    EXPECTED_MACHINE: str | None = None
+    PRODUCTION_EVIDENCE_EXPECTED = True
+
     @classmethod
     def _skip_or_fail(cls, message: str) -> None:
         if os.environ.get(REQUIRE_LIVE_NO_CHILD_PROFILE_ENV) == "1":
@@ -902,7 +955,16 @@ class NoChildProfileDarwinIntegrationTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         super().setUpClass()
         runtime = profile._runtime_fingerprint()
-        pin = profile.PINNED_RUNTIME
+        pin = cls.RUNTIME_PIN
+        cls._runtime_pin = pin
+        if cls.EXPECTED_MACHINE is not None:
+            observed_machine = platform.machine()
+            if observed_machine != cls.EXPECTED_MACHINE:
+                cls._skip_or_fail(
+                    "live no-child profile checks require the exact machine "
+                    f"architecture: observed={observed_machine!r}, "
+                    f"pinned={cls.EXPECTED_MACHINE!r}"
+                )
         observed_runtime = (
             runtime.platform,
             runtime.python_version[:2],
@@ -929,6 +991,7 @@ class NoChildProfileDarwinIntegrationTests(unittest.TestCase):
             prefix=".no-child-probe-",
             dir=test_root,
         )
+        cls.addClassCleanup(cls._temporary.cleanup)
         root = pathlib.Path(cls._temporary.name)
         cls.synthetic_python = root / "synthetic-python3.13"
         cls.synthetic_alternate = root / "synthetic-alternate"
@@ -937,15 +1000,11 @@ class NoChildProfileDarwinIntegrationTests(unittest.TestCase):
         cls.synthetic_python.chmod(0o755)
         cls.synthetic_alternate.chmod(0o755)
         cls.evidence = profile.probe_compatibility(
+            pin=pin,
             probe_executable_path=cls.synthetic_python,
             alternate_executable_path=cls.synthetic_alternate,
             python_home=sys.base_prefix,
         )
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        cls._temporary.cleanup()
-        super().tearDownClass()
 
     def _assert_ordered_leader_binding(
         self,
@@ -983,6 +1042,7 @@ class NoChildProfileDarwinIntegrationTests(unittest.TestCase):
         )
 
     def test_probe_uses_exact_synthetic_macho_executables(self) -> None:
+        self.assertEqual(self.evidence.runtime_pin, self._runtime_pin)
         self.assertIsNotNone(self.evidence.probe_executable)
         assert self.evidence.probe_executable is not None
         self.assertEqual(
@@ -1103,9 +1163,15 @@ class NoChildProfileDarwinIntegrationTests(unittest.TestCase):
                 self.assertEqual(observation.error_number, errno.EPERM)
 
         self.assertTrue(self.evidence.compatible)
-        self.assertTrue(self.evidence.production_capable)
+        self.assertEqual(
+            self.evidence.production_capable,
+            self.PRODUCTION_EVIDENCE_EXPECTED,
+        )
         self.assertEqual(self.evidence.blockers, ())
-        profile.require_compatible(self.evidence)
+        if self.PRODUCTION_EVIDENCE_EXPECTED:
+            profile.require_compatible(self.evidence)
+        else:
+            self.assertNotEqual(self.evidence.runtime_pin, profile.PINNED_RUNTIME)
 
     def test_secure_owner_snapshot_profile_enforces_exec_and_write_boundaries(
         self,
@@ -1257,10 +1323,20 @@ class NoChildProfileDarwinIntegrationTests(unittest.TestCase):
     def test_public_launcher_returns_bound_leader_evidence(self) -> None:
         executable = pathlib.Path("/bin/sleep").resolve()
         try:
-            prepared = profile.prepare_no_child_profile(
-                executable,
-                expected_sha256=_sha256(executable),
+            probe_override = (
+                mock.patch.object(
+                    profile,
+                    "probe_compatibility",
+                    return_value=self.evidence,
+                )
+                if not self.PRODUCTION_EVIDENCE_EXPECTED
+                else contextlib.nullcontext()
             )
+            with probe_override:
+                prepared = profile.prepare_no_child_profile(
+                    executable,
+                    expected_sha256=_sha256(executable),
+                )
         except profile.NoChildProfileUnavailable as error:
             if "seatbelt-baseline-not-observed" in error.evidence.blockers:
                 self._skip_or_fail(

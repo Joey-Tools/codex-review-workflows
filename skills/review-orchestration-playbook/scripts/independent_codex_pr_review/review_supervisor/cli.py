@@ -8,7 +8,13 @@ import sys
 from collections.abc import Sequence
 from typing import Any
 
-from .constants import VERSION, default_checkout_parent, default_retention_root
+from .constants import (
+    LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+    NAMED_LANE_ELIGIBLE,
+    VERSION,
+    default_checkout_parent,
+    default_retention_root,
+)
 from .custody import custody_helper_main
 from .errors import SupervisorError
 from .final_transport import run_fifo_reader
@@ -249,13 +255,22 @@ def _run_internal(mode: str, argv: Sequence[str]) -> int:
 
 
 def _emit(value: dict[str, Any]) -> None:
-    print(json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+    envelope = {
+        **value,
+        "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+        "named_lane_eligible": NAMED_LANE_ELIGIBLE,
+    }
+    print(
+        json.dumps(envelope, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    )
 
 
 def _failure_payload(error: BaseException) -> dict[str, Any]:
     if isinstance(error, SupervisorError):
         failure = error.failure
         return {
+            "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+            "named_lane_eligible": NAMED_LANE_ELIGIBLE,
             "overall_status": failure.status,
             "review_status": failure.review_status,
             "failure_stage": failure.stage,
@@ -263,6 +278,8 @@ def _failure_payload(error: BaseException) -> dict[str, Any]:
             "message": failure.message,
         }
     return {
+        "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+        "named_lane_eligible": NAMED_LANE_ELIGIBLE,
         "overall_status": "inconclusive",
         "review_status": "not-run",
         "failure_stage": "cli",

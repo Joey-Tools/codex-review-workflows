@@ -18,9 +18,11 @@ from .constants import (
     CHECKOUT_SECONDS,
     FINAL_MESSAGE_BYTES,
     HANDOFF_SECONDS,
+    LOW_LEVEL_HELPER_REVIEW_CONTRACT,
     LOG_AGGREGATE_BYTES,
     MAX_EVIDENCE_PRIMARY_BYTES,
     PROCESS_ENVELOPE_BYTES,
+    NAMED_LANE_ELIGIBLE,
     RELEASED_TTL_SECONDS,
     REVIEWER_LAUNCH_SECONDS,
     REVIEWER_RUNTIME_SECONDS,
@@ -357,6 +359,8 @@ def preflight(
         )
         return {
             "status": "ready",
+            "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+            "named_lane_eligible": NAMED_LANE_ELIGIBLE,
             "review_status": "not-run",
             "created_attempt": False,
             "repo": str(prepared.repository.repo),
@@ -1242,6 +1246,8 @@ def run(
             )
         failure = error.failure if isinstance(error, SupervisorError) else None
         return 2, {
+            "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+            "named_lane_eligible": NAMED_LANE_ELIGIBLE,
             "overall_status": failure.status if failure else "inconclusive",
             "review_status": failure.review_status if failure else "not-run",
             "failure_stage": failure.stage if failure else "outer-supervisor",
@@ -1372,6 +1378,8 @@ def status(
         )
     return {
         "status": "ok",
+        "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+        "named_lane_eligible": NAMED_LANE_ELIGIBLE,
         "retention_root": str(root),
         "attempt_count": len(attempts),
         "attempts": attempts,
@@ -1522,6 +1530,8 @@ def final_result(
         )
     return {
         "status": "ok",
+        "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+        "named_lane_eligible": NAMED_LANE_ELIGIBLE,
         "attempt_id": state["attempt_id"],
         "review_status": review_status,
         "review_range": state.get("review_range"),

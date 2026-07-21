@@ -17,7 +17,12 @@ from review_supervisor.checkout import (
     read_and_validate_symlink_graphs,
     validate_namespaces,
 )
-from review_supervisor.constants import MAX_SYMLINK_BYTES, SCHEMA_VERSION
+from review_supervisor.constants import (
+    LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+    MAX_SYMLINK_BYTES,
+    NAMED_LANE_ELIGIBLE,
+    SCHEMA_VERSION,
+)
 from review_supervisor.errors import SupervisorError
 from review_supervisor.gitraw import (
     CatFileBatch,
@@ -304,6 +309,8 @@ class RawGitCheckoutTests(unittest.TestCase):
                 registration_value["descendant_path_bytes"] = post_index_path_bytes
                 state = {
                     "schema_version": SCHEMA_VERSION,
+                    "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+                    "named_lane_eligible": NAMED_LANE_ELIGIBLE,
                     "attempt_id": attempt_id,
                     "record_generation": 1,
                     "previous_record_sha256": None,
@@ -415,6 +422,10 @@ class RawGitCheckoutTests(unittest.TestCase):
             )
             payload = json.loads(completed.stdout)
             self.assertEqual(payload["status"], "ready")
+            self.assertEqual(
+                payload["review_contract"], LOW_LEVEL_HELPER_REVIEW_CONTRACT
+            )
+            self.assertIs(payload["named_lane_eligible"], False)
             self.assertEqual(payload["review_status"], "not-run")
             self.assertFalse(payload["created_attempt"])
             self.assertEqual(payload["review_range"], f"{base_sha}..{head_sha}")

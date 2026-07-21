@@ -4,7 +4,10 @@ import pathlib
 
 
 VERSION = "2.0.0"
+# Schema v1 is first released with the mandatory low-level review contract fields.
 SCHEMA_VERSION = 1
+LOW_LEVEL_HELPER_REVIEW_CONTRACT = "supplied-diff-no-git"
+NAMED_LANE_ELIGIBLE = False
 
 MIB = 1024 * 1024
 GIB = 1024 * MIB

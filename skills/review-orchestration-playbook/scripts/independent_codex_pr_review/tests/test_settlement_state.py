@@ -5,7 +5,12 @@ import time
 import unittest
 from unittest import mock
 
-from review_supervisor.constants import PROCESS_ENVELOPE_BYTES, SCHEMA_VERSION
+from review_supervisor.constants import (
+    LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+    NAMED_LANE_ELIGIBLE,
+    PROCESS_ENVELOPE_BYTES,
+    SCHEMA_VERSION,
+)
 from review_supervisor.ledger import read_attempt_state, reconcile_ledger
 from review_supervisor.secureio import allocated_bytes, canonical_json
 from review_supervisor.settlement_state import publish_exact_process_settlement
@@ -22,6 +27,8 @@ class ProcessSettlementTests(unittest.TestCase):
         attempt.mkdir(mode=0o700)
         state = {
             "schema_version": SCHEMA_VERSION,
+            "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+            "named_lane_eligible": NAMED_LANE_ELIGIBLE,
             "attempt_id": attempt_id,
             "record_generation": 1,
             "previous_record_sha256": None,

@@ -78,6 +78,8 @@ The low-level Claude helper requires either `--egress-consent explicit-claude-re
 
 Every new state and `egress.json` record is machine-labeled `review_contract: supplied-diff-no-git` and `named_lane_eligible: false`. `stateful status` exposes those fields, while `attempts[].runtime` remains the authoritative actual backend. Consumers must not infer a named lane from the top-level requested helper reviewer, exit `0`, or the findings-only output of `stateful final`; that command intentionally returns the saved low-level artifact, not a named-lane envelope.
 
+The self-contained `independent-codex-pr-review` supervisor uses the same contract values. Every public JSON command envelope and durable attempt state carries both fields; missing, malformed, or non-boolean-false eligibility fails state authentication. Exit `0`, `overall_status: completed`, `review_status: clean`, a requested model name, or `No findings.` never upgrades this supplied-evidence runtime into a named lane.
+
 The foreground compatibility command likewise prints only the raw helper artifact and does not emit a machine envelope. Its command surface is unconditionally ineligible for named-lane counting. Automation that needs machine-readable contract metadata must use `stateful status`; it must never ingest foreground stdout or `stateful final` as named-review evidence.
 
 Model verification normalizes punctuation only and then requires exact equality. A requested `gpt-5.5` never accepts `gpt-5.5-mini`, `gpt-5.5-codex`, or any other suffix as the same model.

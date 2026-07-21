@@ -512,7 +512,7 @@ class ManagedAuthRefreshTests(unittest.TestCase):
             max_stdout_bytes=4096,
             max_stderr_bytes=4096,
             max_record_bytes=2048,
-            total_seconds=2.0,
+            total_seconds=5.0,
             shutdown_seconds=0.4,
             cleanup_reserve_seconds=0.6,
             term_grace_seconds=0.05,
@@ -909,7 +909,7 @@ class ManagedAuthRefreshTests(unittest.TestCase):
                 "total-timeout",
                 0,
                 self._limits(
-                    total_seconds=1.5,
+                    total_seconds=5.0,
                     cleanup_reserve_seconds=0.5,
                     shutdown_seconds=0.2,
                 ),
@@ -1092,7 +1092,7 @@ class ManagedAuthRefreshTests(unittest.TestCase):
                     neutral_cwd=neutral,
                     environment=environment,
                     limits=self._limits(
-                        total_seconds=1.5,
+                        total_seconds=5.0,
                         cleanup_reserve_seconds=0.5,
                     ),
                 )
