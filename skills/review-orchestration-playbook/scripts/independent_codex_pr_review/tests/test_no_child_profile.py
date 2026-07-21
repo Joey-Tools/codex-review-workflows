@@ -11,6 +11,7 @@ import resource
 import signal
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -283,6 +284,108 @@ def _synthetic_compatible_observations(
 
 
 class NoChildProfileUnitTests(unittest.TestCase):
+    def test_nested_seatbelt_denial_is_normalized_without_raw_stderr(self) -> None:
+        observation = profile._parse_probe_output(
+            layer="seatbelt",
+            action="baseline",
+            completed=subprocess.CompletedProcess(
+                ("/usr/bin/sandbox-exec",),
+                71,
+                b"",
+                b"sandbox-exec: sandbox_apply: Operation not permitted\n",
+            ),
+        )
+
+        self.assertEqual(observation.outcome, "ambiguous")
+        self.assertEqual(
+            observation.detail,
+            profile.PROBE_DETAIL_OUTER_SEATBELT_DENIED,
+        )
+        self.assertNotIn("sandbox_apply", observation.detail)
+
+    def test_nonexistent_probe_leader_uses_a_normalized_reason(self) -> None:
+        error = ProcessLookupError(errno.ESRCH, "synthetic private path")
+        detail = profile._leader_binding_error_detail(error)
+
+        self.assertEqual(
+            detail,
+            profile.PROBE_DETAIL_LEADER_EXITED_BEFORE_BINDING,
+        )
+        self.assertNotIn("synthetic private path", detail)
+
+    def test_hosted_fail_closed_signature_matches_production_blockers(self) -> None:
+        from .run_hosted_no_child_fail_closed import (
+            PROBE_ACTIONS,
+            _expected_outer_sandbox_blockers,
+            _matches_outer_sandbox_observations,
+        )
+
+        parent_limit = (256, 512)
+        profile_sha256 = "a" * 64
+        observations: list[profile.ProbeObservation] = []
+        for layer_index, layer in enumerate(("rlimit", "seatbelt", "combined")):
+            expected_limit = parent_limit if layer == "seatbelt" else (0, 0)
+            expected_profile = None if layer == "rlimit" else profile_sha256
+            expected_detail = (
+                profile.PROBE_DETAIL_LEADER_EXITED_BEFORE_BINDING
+                if layer == "rlimit"
+                else profile.PROBE_DETAIL_OUTER_SEATBELT_DENIED
+            )
+            for action_index, action in enumerate(PROBE_ACTIONS):
+                pid = 4000 + layer_index * 100 + action_index
+                observations.append(
+                    profile.ProbeObservation(
+                        layer=layer,
+                        action=action,
+                        outcome="ambiguous",
+                        detail=expected_detail,
+                        child_pid=pid,
+                        child_process_group=None,
+                        child_session=None,
+                        child_start_identity=None,
+                        profile_sha256=expected_profile,
+                        pre_exec_setsid_succeeded=True,
+                        pre_exec_pid=pid,
+                        pre_exec_process_group=pid,
+                        pre_exec_session=pid,
+                        pre_exec_nproc_soft=expected_limit[0],
+                        pre_exec_nproc_hard=expected_limit[1],
+                        nproc_soft=None,
+                        nproc_hard=None,
+                    )
+                )
+        blockers = profile._probe_blockers(
+            observations,
+            parent_nproc=parent_limit,
+            profile_sha256=profile_sha256,
+        )
+        evidence = profile.CompatibilityEvidence(
+            schema_version=profile.EVIDENCE_SCHEMA_VERSION,
+            runtime_pin=GITHUB_HOSTED_RUNTIME_PIN,
+            runtime=profile.RuntimeFingerprint(
+                platform="darwin",
+                system="Darwin",
+                macos_product_version="26.4",
+                macos_build_version="25E246",
+                darwin_release="25.4.0",
+                python_version=(3, 13, 0),
+                python_executable="/synthetic/python3.13",
+                effective_uid=501,
+            ),
+            sandbox_exec=None,
+            probe_executable=None,
+            alternate_executable=None,
+            seatbelt_profile_sha256=profile_sha256,
+            parent_nproc_before=parent_limit,
+            parent_nproc_after=parent_limit,
+            observations=tuple(observations),
+            blockers=tuple(blockers),
+        )
+
+        self.assertEqual(set(blockers), _expected_outer_sandbox_blockers())
+        self.assertEqual(len(blockers), len(set(blockers)))
+        self.assertTrue(_matches_outer_sandbox_observations(evidence))
+
     def test_required_live_ci_fails_closed_on_runtime_pin_mismatch(self) -> None:
         runtime = profile.RuntimeFingerprint(
             platform="darwin",

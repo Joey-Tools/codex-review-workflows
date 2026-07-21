@@ -860,16 +860,59 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn('if [[ "$mode" == "hosted-check" ]]', script)
         self.assertIn("initialize_expected_tool_digests", script)
 
-    def test_independent_supervisor_ci_requires_pinned_live_profile(self) -> None:
-        required_runner = (
+    def test_independent_supervisor_ci_separates_hosted_and_live_gates(self) -> None:
+        live_runner = (
             SCRIPTS
             / "independent_codex_pr_review/tests/run_required_no_child_profile.py"
         ).read_text(encoding="utf-8")
-        self.assertIn("result.skipped,", required_runner)
-        self.assertIn("result.wasSuccessful()", required_runner)
-        self.assertIn("result.testsRun != expected_count", required_runner)
-        self.assertIn("result.expectedFailures", required_runner)
-        self.assertIn("result.unexpectedSuccesses", required_runner)
+        deterministic_runner = (
+            SCRIPTS / "independent_codex_pr_review/tests/"
+            "run_required_deterministic_supervisor.py"
+        ).read_text(encoding="utf-8")
+        hosted_probe = (
+            SCRIPTS / "independent_codex_pr_review/tests/"
+            "run_hosted_no_child_fail_closed.py"
+        ).read_text(encoding="utf-8")
+        pr_readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+        for runner in (live_runner, deterministic_runner):
+            self.assertIn("result.skipped,", runner)
+            self.assertIn("result.wasSuccessful()", runner)
+            self.assertIn("result.testsRun !=", runner)
+            self.assertIn("result.expectedFailures", runner)
+            self.assertIn("result.unexpectedSuccesses", runner)
+        self.assertIn("NoChildProfileDarwinIntegrationTests", live_runner)
+        self.assertIn("CodexExecutableAuthenticationTests", live_runner)
+        self.assertIn("REQUIRE_LIVE_NO_CHILD_PROFILE_ENV", live_runner)
+        self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
+        self.assertIn("expected_count != 7", live_runner)
+        self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 276", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
+        self.assertIn("selected_identity_sha256 !=", deterministic_runner)
+        self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
+        self.assertIn("if duplicate_keys:", deterministic_runner)
+        self.assertIn("expected_discovered_count", deterministic_runner)
+        self.assertIn("_test_key", deterministic_runner)
+        for contract in (
+            'platform.machine() != "arm64"',
+            "_matches_outer_sandbox_observations(evidence)",
+            "blockers == expected_blockers",
+            "len(blockers) == len(evidence.blockers)",
+            '"reviewed_fail_closed_signature": signature_matches',
+            "if evidence.compatible or evidence.production_capable",
+        ):
+            self.assertIn(contract, hosted_probe)
+        self.assertNotIn("sandbox_apply", hosted_probe)
+        for requirement in (
+            "operator-enforced exact-head gate",
+            "seven tests run, zero skips",
+            "Any push invalidates that evidence",
+            "Hosted CI's fail-closed probe is not a substitute",
+            "tests.run_required_no_child_profile",
+        ):
+            self.assertIn(requirement, pr_readiness)
         integration_test = (
             SCRIPTS / "independent_codex_pr_review/tests/test_no_child_profile.py"
         ).read_text(encoding="utf-8")
@@ -901,7 +944,7 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertIn("runs-on: macos-26", supervisor_job)
                 self.assertIn("timeout-minutes: 15", supervisor_job)
                 self.assertIn(
-                    """      - name: Report live no-child runtime fingerprint
+                    """      - name: Report hosted no-child runtime fingerprint
         run: |
           /usr/bin/sw_vers -productVersion
           /usr/bin/sw_vers -buildVersion
@@ -912,16 +955,24 @@ class RepositoryContractTest(unittest.TestCase):
                     supervisor_job,
                 )
                 self.assertIn(
-                    f"""      - name: Require pinned live no-child profile integration
+                    f"""      - name: Confirm hosted no-child profile fails closed
         working-directory: {skill_root}/scripts/independent_codex_pr_review
         env:
-          CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE: "1"
           CODEX_REVIEW_LIVE_NO_CHILD_RUNTIME_PROFILE: github-macos-26-arm64-26.4-25E246
           CODEX_REVIEW_RUNNER_ENVIRONMENT: ${{{{ runner.environment }}}}
           CODEX_REVIEW_RUNNER_ARCH: ${{{{ runner.arch }}}}
         run: |
-          python3 -m tests.run_required_no_child_profile
+          python3 -m tests.run_hosted_no_child_fail_closed
+      - name: Run deterministic independent supervisor tests
+        working-directory: {skill_root}/scripts/independent_codex_pr_review
+        run: |
+          python3 -m tests.run_required_deterministic_supervisor
 """,
+                    supervisor_job,
+                )
+                self.assertNotIn("tests.run_required_no_child_profile", supervisor_job)
+                self.assertNotIn(
+                    "CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE",
                     supervisor_job,
                 )
 

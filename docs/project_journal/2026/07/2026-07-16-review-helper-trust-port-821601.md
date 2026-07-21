@@ -426,3 +426,34 @@ metadata behavior.
   canonical CI fixture equality, project-journal validation, the official skill
   validator, synthetic-token validation, broker developer byte reproduction,
   and `git diff --check` also pass.
+- GitHub Actions run 29821520816 disproved the assumption that an exact hosted
+  runtime fingerprint establishes production isolation capability. The
+  `macos-26` runner matched macOS 26.4 build 25E246, Darwin 25.4.0, arm64, and
+  the pinned `sandbox-exec` digest, but its outer Seatbelt made nested Seatbelt
+  unavailable and left process-group, start-identity, and post-exec RLIMIT
+  evidence ambiguous. Hosted CI now runs every deterministic supervisor test
+  through an exact-count zero-skip runner and separately requires this hosted
+  environment to match the reviewed fail-closed blocker signature. The six
+  no-child profile cases and the existing snapshot Seatbelt adversarial case
+  form a seven-test production live gate and are no longer claimed by Hosted
+  CI. They remain a required trusted-Mac Python 3.13 delivery gate for
+  isolation-boundary changes until a separately reviewed ephemeral isolated
+  Mac runner exists. The gate is explicitly operator-enforced rather than a
+  branch-protection status: the final PR evidence must bind seven passes with
+  zero skips to the exact current head, and every push invalidates that record.
+- Three focused read-only reviews found and closed five weaknesses in the split
+  gate design. The live runner now rejects duplicate required identities; the
+  deterministic runner pins both the exact count and a stable SHA-256 digest of
+  all selected test identities. Hosted evidence normalizes outer-Seatbelt and
+  early-leader-exit reasons without retaining raw stderr or paths, verifies the
+  actual arm64 process, matches all 24 structured observations, and requires
+  the exact production-derived blocker set with no unreviewed extras. The
+  operator-only nature of the trusted-Mac gate and its exact-head invalidation
+  rule are explicit in PR-readiness policy.
+- Post-remediation validation used only Python 3.13. The host-level main suite
+  ran 1,429 tests with 5 platform skips; the deterministic independent suite
+  ran 276 tests with zero skips; and the trusted-Mac live isolation gate ran all
+  7 tests with zero skips. The 21 focused no-child unit tests and 40 repository
+  contract tests pass. Ruff lint and formatting, compileall, actionlint,
+  canonical CI fixture equality, project-journal validation, the official
+  skill validator, synthetic-token validation, and `git diff --check` pass.

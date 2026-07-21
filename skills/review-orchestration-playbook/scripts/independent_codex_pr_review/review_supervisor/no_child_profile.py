@@ -41,6 +41,8 @@ MAX_EXECUTABLE_BYTES = 1 << 30
 MAX_WRITABLE_ROOTS = 8
 MAX_SEATBELT_PROFILE_BYTES = 32 * 1024
 PROBE_TIMEOUT_SECONDS = 5.0
+PROBE_DETAIL_OUTER_SEATBELT_DENIED = "nested-seatbelt-denied-by-outer-sandbox"
+PROBE_DETAIL_LEADER_EXITED_BEFORE_BINDING = "probe-leader-exited-before-binding"
 
 
 @dataclass(frozen=True)
@@ -1339,6 +1341,18 @@ def _parse_probe_output(
     completed: subprocess.CompletedProcess[bytes],
 ) -> ProbeObservation:
     output = completed.stdout.strip()
+    if (
+        not output
+        and completed.returncode == 71
+        and completed.stderr.strip()
+        == b"sandbox-exec: sandbox_apply: Operation not permitted"
+    ):
+        return ProbeObservation(
+            layer=layer,
+            action=action,
+            outcome="ambiguous",
+            detail=PROBE_DETAIL_OUTER_SEATBELT_DENIED,
+        )
     if not output:
         if action == "exec" and completed.returncode == 0:
             return ProbeObservation(
@@ -1443,6 +1457,12 @@ def _parse_probe_output(
         nproc_soft=payload["nproc_soft"],
         nproc_hard=payload["nproc_hard"],
     )
+
+
+def _leader_binding_error_detail(error: OSError | ValueError) -> str:
+    if isinstance(error, OSError) and error.errno == errno.ESRCH:
+        return PROBE_DETAIL_LEADER_EXITED_BEFORE_BINDING
+    return _bounded_text(f"cannot bind live leader identity: {error}")
 
 
 def _run_probe_case(
@@ -1565,7 +1585,7 @@ def _run_probe_case(
         child_session = os.getsid(process.pid)
         child_start_identity = process_start_identity(process.pid)
     except (OSError, ValueError) as error:
-        leader_error = _bounded_text(f"cannot bind live leader identity: {error}")
+        leader_error = _leader_binding_error_detail(error)
     try:
         os.write(release_write, b"G")
     except OSError as error:
@@ -1614,10 +1634,17 @@ def _run_probe_case(
         completed=completed,
     )
     if state_error or leader_error:
+        detail = state_error or leader_error
+        if (
+            not state_error
+            and leader_error == PROBE_DETAIL_LEADER_EXITED_BEFORE_BINDING
+            and observation.detail == PROBE_DETAIL_OUTER_SEATBELT_DENIED
+        ):
+            detail = PROBE_DETAIL_OUTER_SEATBELT_DENIED
         return replace(
             observation,
             outcome="ambiguous",
-            detail=state_error or leader_error,
+            detail=detail,
             child_pid=process.pid,
             child_process_group=child_process_group,
             child_session=child_session,

@@ -81,26 +81,25 @@ jobs:
         working-directory: skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         run: |
           python3 -m compileall -q review_supervisor independent-codex-pr-review
-      - name: Report live no-child runtime fingerprint
+      - name: Report hosted no-child runtime fingerprint
         run: |
           /usr/bin/sw_vers -productVersion
           /usr/bin/sw_vers -buildVersion
           /usr/bin/uname -r
           /usr/bin/uname -m
           /usr/bin/shasum -a 256 /usr/bin/sandbox-exec
-      - name: Require pinned live no-child profile integration
+      - name: Confirm hosted no-child profile fails closed
         working-directory: skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         env:
-          CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE: "1"
           CODEX_REVIEW_LIVE_NO_CHILD_RUNTIME_PROFILE: github-macos-26-arm64-26.4-25E246
           CODEX_REVIEW_RUNNER_ENVIRONMENT: ${{ runner.environment }}
           CODEX_REVIEW_RUNNER_ARCH: ${{ runner.arch }}
         run: |
-          python3 -m tests.run_required_no_child_profile
-      - name: Run independent review supervisor tests
+          python3 -m tests.run_hosted_no_child_fail_closed
+      - name: Run deterministic independent supervisor tests
         working-directory: skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         run: |
-          python3 -m unittest discover -s tests -p 'test_*.py'
+          python3 -m tests.run_required_deterministic_supervisor
       - name: Verify independent review supervisor CLI
         working-directory: skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         run: |
