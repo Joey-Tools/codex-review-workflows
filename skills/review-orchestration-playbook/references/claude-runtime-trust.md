@@ -864,7 +864,10 @@ digests, compiles both slices with the fixed deployment target, combines them,
 applies the fixed identifier and hardened-runtime ad-hoc signature, and requires
 the rebuilt SHA-256 and bytes to equal the tracked artifact. It also pins Xcode
 26.6 build 17F113, the macOS 26.5 SDK, Apple clang/linker, codesign, and every
-build-tool digest, and rechecks those pins after compilation.
+build-tool digest, and rechecks those pins after compilation. Developer and
+GitHub-hosted runner tool digests are pinned separately because the hosted
+`macos-26-arm64` image repackages the same versioned Xcode toolchain; both modes
+must still reproduce the same tracked broker bytes.
 
 The mandatory `broker-reproducibility` job runs `--check` as the ordinary
 GitHub-hosted `macos-26` runner user. It requires the exact hosted-runner context,

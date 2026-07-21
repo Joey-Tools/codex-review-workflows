@@ -12,12 +12,18 @@ EXPECTED_SDK_BUILD="25F70"
 EXPECTED_CLANG_VERSION="Apple clang version 21.0.0 (clang-2100.1.1.101)"
 EXPECTED_LD_PROJECT="PROJECT:ld-1267"
 EXPECTED_CODESIGN_PROJECT="PROJECT:codesign-83.100.6"
-EXPECTED_CLANG_SHA256="7def90dd8829726686213a747fc5bff1583df933dae5edc55d755479e0bfe00a"
-EXPECTED_LD_SHA256="5897b275efd93b201b6df5832dd541262b3f20f290859ba78f2200a6a66ef38b"
-EXPECTED_LIPO_SHA256="661f3514be6992bb66346e3e48d974fc0ce5b9be5eab55321eabf4818fb3bf28"
-EXPECTED_VTOOL_SHA256="c87bf9bb62dc6a3c5d7faf5c5f8dabc94aba865161a3e08b9f1871150e938fe6"
-EXPECTED_CODESIGN_ALLOCATE_SHA256="c56802d5bfdc2ee8b0e6e4358239f4de4c3b34814f71bee7a185100d78d6ad4b"
-EXPECTED_CODESIGN_SHA256="214d455584d19abc0d74d02b9cbc7d3da6bdcb0596c235e6156dd9ed2f4e1ba7"
+EXPECTED_DEVELOPER_CLANG_SHA256="7def90dd8829726686213a747fc5bff1583df933dae5edc55d755479e0bfe00a"
+EXPECTED_DEVELOPER_LD_SHA256="5897b275efd93b201b6df5832dd541262b3f20f290859ba78f2200a6a66ef38b"
+EXPECTED_DEVELOPER_LIPO_SHA256="661f3514be6992bb66346e3e48d974fc0ce5b9be5eab55321eabf4818fb3bf28"
+EXPECTED_DEVELOPER_VTOOL_SHA256="c87bf9bb62dc6a3c5d7faf5c5f8dabc94aba865161a3e08b9f1871150e938fe6"
+EXPECTED_DEVELOPER_CODESIGN_ALLOCATE_SHA256="c56802d5bfdc2ee8b0e6e4358239f4de4c3b34814f71bee7a185100d78d6ad4b"
+EXPECTED_DEVELOPER_CODESIGN_SHA256="214d455584d19abc0d74d02b9cbc7d3da6bdcb0596c235e6156dd9ed2f4e1ba7"
+EXPECTED_HOSTED_CLANG_SHA256="d2e4bf622758eee1bf7267c060497fb2c41e098d37b0fca8be73898dc7e14eda"
+EXPECTED_HOSTED_LD_SHA256="e412b9f2af31b1567a9eabc28f553a8f1cf34127e2107cb39c2694cf147571a4"
+EXPECTED_HOSTED_LIPO_SHA256="d8ced1b847259d388ce48178e0a908a4be87dc3f8b1b3b2c997d2a8d6936f84d"
+EXPECTED_HOSTED_VTOOL_SHA256="4fe292643e9c8c528148c5be41d8d22801a17ec1f2bdaf85665c25c5cc56e236"
+EXPECTED_HOSTED_CODESIGN_ALLOCATE_SHA256="b22f65e9f3ac39e5d64a2b88b42d4b2571926f929fc8b6b57cfc10de6d0d16ac"
+EXPECTED_HOSTED_CODESIGN_SHA256="06eacc36d43376972d3bca0a2137ea4efd6d0fe27de8a7af0e6b11d599e8f337"
 DEFAULT_DEVELOPER_DIR="/Applications/Xcode-26.6.0.app/Contents/Developer"
 HOSTED_RUNNER_DEVELOPER_DIR="/Applications/Xcode_26.6.app/Contents/Developer"
 DEVELOPER_DIR="${DEVELOPER_DIR:-$DEFAULT_DEVELOPER_DIR}"
@@ -77,6 +83,24 @@ initialize_expected_toolchain_paths() {
   sdk_root="$DEVELOPER_DIR/Platforms/MacOSX.platform/Developer/SDKs/MacOSX${EXPECTED_SDK_VERSION}.sdk"
 }
 
+initialize_expected_tool_digests() {
+  if [[ "$mode" == "hosted-check" ]]; then
+    expected_clang_sha256="$EXPECTED_HOSTED_CLANG_SHA256"
+    expected_ld_sha256="$EXPECTED_HOSTED_LD_SHA256"
+    expected_lipo_sha256="$EXPECTED_HOSTED_LIPO_SHA256"
+    expected_vtool_sha256="$EXPECTED_HOSTED_VTOOL_SHA256"
+    expected_codesign_allocate_sha256="$EXPECTED_HOSTED_CODESIGN_ALLOCATE_SHA256"
+    expected_codesign_sha256="$EXPECTED_HOSTED_CODESIGN_SHA256"
+  else
+    expected_clang_sha256="$EXPECTED_DEVELOPER_CLANG_SHA256"
+    expected_ld_sha256="$EXPECTED_DEVELOPER_LD_SHA256"
+    expected_lipo_sha256="$EXPECTED_DEVELOPER_LIPO_SHA256"
+    expected_vtool_sha256="$EXPECTED_DEVELOPER_VTOOL_SHA256"
+    expected_codesign_allocate_sha256="$EXPECTED_DEVELOPER_CODESIGN_ALLOCATE_SHA256"
+    expected_codesign_sha256="$EXPECTED_DEVELOPER_CODESIGN_SHA256"
+  fi
+}
+
 require_pinned_toolchain() {
   local xcode_version sdk_version sdk_build clang_version ld_version
   local codesign_version resolved_clang resolved_ld resolved_lipo resolved_vtool
@@ -124,17 +148,17 @@ require_pinned_toolchain() {
   [[ "$codesign_version" == *"$EXPECTED_CODESIGN_PROJECT"* ]] ||
     fail "broker checks require the pinned codesign implementation"
 
-  require_tool_digest "$clang" "$EXPECTED_CLANG_SHA256" "clang"
-  require_tool_digest "$ld" "$EXPECTED_LD_SHA256" "ld"
-  require_tool_digest "$lipo" "$EXPECTED_LIPO_SHA256" "lipo"
-  require_tool_digest "$vtool" "$EXPECTED_VTOOL_SHA256" "vtool"
+  require_tool_digest "$clang" "$expected_clang_sha256" "clang"
+  require_tool_digest "$ld" "$expected_ld_sha256" "ld"
+  require_tool_digest "$lipo" "$expected_lipo_sha256" "lipo"
+  require_tool_digest "$vtool" "$expected_vtool_sha256" "vtool"
   require_tool_digest \
     "$codesign_allocate" \
-    "$EXPECTED_CODESIGN_ALLOCATE_SHA256" \
+    "$expected_codesign_allocate_sha256" \
     "codesign_allocate"
   require_tool_digest \
     "/usr/bin/codesign" \
-    "$EXPECTED_CODESIGN_SHA256" \
+    "$expected_codesign_sha256" \
     "codesign"
 }
 
@@ -177,6 +201,7 @@ probe_environment=(
 )
 
 initialize_expected_toolchain_paths
+initialize_expected_tool_digests
 if [[ "$mode" == "hosted-check" ]]; then
   require_hosted_runner_context
 fi

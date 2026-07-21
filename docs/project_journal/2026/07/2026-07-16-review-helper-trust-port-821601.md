@@ -353,3 +353,8 @@ metadata behavior.
   reproduction all pass. The hosted-only broker `--check` remains a required
   `macos-26` CI gate because this host does not provide the pinned
   `/Applications/Xcode_26.6.app` toolchain path.
+- The first hosted `macos-26` run exposed that GitHub's `macos-26-arm64`
+  image repackages all six pinned build tools even though Xcode 26.6 build
+  17F113 and SDK 26.5 build 25F70 match the developer installation. The build
+  gate now selects separately reviewed developer and hosted-runner digest sets
+  while requiring both contexts to reproduce the same tracked broker bytes.

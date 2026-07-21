@@ -827,6 +827,18 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("--output", script)
         self.assertIn("not a security boundary", script)
         self.assertIn("byte-reproducible", script)
+        for mode in ("DEVELOPER", "HOSTED"):
+            for tool in (
+                "CLANG",
+                "LD",
+                "LIPO",
+                "VTOOL",
+                "CODESIGN_ALLOCATE",
+                "CODESIGN",
+            ):
+                self.assertIn(f'EXPECTED_{mode}_{tool}_SHA256="', script)
+        self.assertIn('if [[ "$mode" == "hosted-check" ]]', script)
+        self.assertIn("initialize_expected_tool_digests", script)
 
     def test_independent_supervisor_remains_a_bounded_low_level_tool(self) -> None:
         tool_root = SCRIPTS / "independent_codex_pr_review"

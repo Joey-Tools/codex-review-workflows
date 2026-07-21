@@ -102,22 +102,6 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: Report hosted-runner toolchain identity
-        env:
-          DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
-        run: |
-          set -euo pipefail
-          toolchain_root="$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin"
-          /usr/bin/xcodebuild -version
-          /usr/bin/xcrun --sdk macosx --show-sdk-version
-          /usr/bin/xcrun --sdk macosx --show-sdk-build-version
-          /usr/bin/shasum -a 256 \
-            "$toolchain_root/clang" \
-            "$toolchain_root/ld" \
-            "$toolchain_root/lipo" \
-            "$toolchain_root/vtool" \
-            "$toolchain_root/codesign_allocate" \
-            /usr/bin/codesign
       - name: Require hosted-runner byte reproduction
         env:
           DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
