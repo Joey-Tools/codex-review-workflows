@@ -100,6 +100,47 @@ def _matches_outer_sandbox_observations(
     return True
 
 
+def _signature_diagnostics(
+    evidence: profile.CompatibilityEvidence,
+    *,
+    expected_blockers: set[str],
+    runtime_matches: bool,
+    observation_signature_matches: bool,
+) -> dict[str, object]:
+    missing_evidence = []
+    for name in (
+        "sandbox_exec",
+        "probe_executable",
+        "alternate_executable",
+        "seatbelt_profile_sha256",
+    ):
+        if getattr(evidence, name) is None:
+            missing_evidence.append(name)
+    return {
+        "blockers_match": set(evidence.blockers) == expected_blockers
+        and len(evidence.blockers) == len(expected_blockers),
+        "expected_blockers": sorted(expected_blockers),
+        "missing_evidence": missing_evidence,
+        "observation_signature_matches": observation_signature_matches,
+        "observations": [item.to_json() for item in evidence.observations],
+        "observed_blockers": list(evidence.blockers),
+        "parent_nproc_after": (
+            list(evidence.parent_nproc_after)
+            if evidence.parent_nproc_after is not None
+            else None
+        ),
+        "parent_nproc_before": (
+            list(evidence.parent_nproc_before)
+            if evidence.parent_nproc_before is not None
+            else None
+        ),
+        "parent_nproc_stable": (
+            evidence.parent_nproc_before == evidence.parent_nproc_after
+        ),
+        "runtime_matches": runtime_matches,
+    }
+
+
 def main() -> int:
     required_environment = {
         LIVE_RUNTIME_PROFILE_ENV: GITHUB_HOSTED_RUNTIME_PROFILE,
@@ -159,9 +200,10 @@ def main() -> int:
         and evidence.sandbox_exec.sha256
         == GITHUB_HOSTED_RUNTIME_PIN.sandbox_exec_sha256
     )
+    observation_signature_matches = _matches_outer_sandbox_observations(evidence)
     signature_matches = (
         runtime_matches
-        and _matches_outer_sandbox_observations(evidence)
+        and observation_signature_matches
         and blockers == expected_blockers
         and len(blockers) == len(evidence.blockers)
         and evidence.parent_nproc_before == evidence.parent_nproc_after
@@ -169,17 +211,19 @@ def main() -> int:
         and evidence.alternate_executable is not None
         and evidence.seatbelt_profile_sha256 is not None
     )
-    print(
-        json.dumps(
-            {
-                "compatible": evidence.compatible,
-                "production_capable": evidence.production_capable,
-                "reviewed_fail_closed_signature": signature_matches,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
+    summary: dict[str, object] = {
+        "compatible": evidence.compatible,
+        "production_capable": evidence.production_capable,
+        "reviewed_fail_closed_signature": signature_matches,
+    }
+    if not signature_matches:
+        summary["signature_diagnostics"] = _signature_diagnostics(
+            evidence,
+            expected_blockers=expected_blockers,
+            runtime_matches=runtime_matches,
+            observation_signature_matches=observation_signature_matches,
         )
-    )
+    print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
     if evidence.compatible or evidence.production_capable:
         print(
             "GitHub hosted no-child profile unexpectedly became capable; "

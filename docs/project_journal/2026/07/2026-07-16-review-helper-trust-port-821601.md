@@ -571,3 +571,12 @@ metadata behavior.
   passes 14 independent auth-carrier tests and 156 provider tests with 1
   expected platform skip; exact-range admission is rerun against the resulting
   signed commit before review resumes.
+- The first current-head Hosted Runner gate then failed only because its new
+  no-child fail-closed signature returned a boolean mismatch with no actionable
+  evidence; runtime version, build, Darwin release, architecture, and
+  `sandbox-exec` digest still matched the pin. Mismatch output now includes a
+  bounded structured comparison of expected/observed blockers, normalized
+  observations, parent limits, missing evidence fields, and each signature
+  subcheck. It does not retain raw probe stderr or repository data. The focused
+  Python 3.13 no-child suite passes all 27 tests outside the enclosing Codex
+  Seatbelt; the next Hosted run supplies the exact drift needed for calibration.

@@ -318,6 +318,7 @@ class NoChildProfileUnitTests(unittest.TestCase):
             PROBE_ACTIONS,
             _expected_outer_sandbox_blockers,
             _matches_outer_sandbox_observations,
+            _signature_diagnostics,
         )
 
         parent_limit = (256, 512)
@@ -385,6 +386,20 @@ class NoChildProfileUnitTests(unittest.TestCase):
         self.assertEqual(set(blockers), _expected_outer_sandbox_blockers())
         self.assertEqual(len(blockers), len(set(blockers)))
         self.assertTrue(_matches_outer_sandbox_observations(evidence))
+        diagnostics = _signature_diagnostics(
+            evidence,
+            expected_blockers=_expected_outer_sandbox_blockers(),
+            runtime_matches=True,
+            observation_signature_matches=True,
+        )
+        self.assertTrue(diagnostics["blockers_match"])
+        self.assertTrue(diagnostics["observation_signature_matches"])
+        self.assertTrue(diagnostics["parent_nproc_stable"])
+        self.assertEqual(
+            diagnostics["missing_evidence"],
+            ["sandbox_exec", "probe_executable", "alternate_executable"],
+        )
+        self.assertEqual(len(diagnostics["observations"]), len(observations))
 
     def test_required_live_ci_fails_closed_on_runtime_pin_mismatch(self) -> None:
         runtime = profile.RuntimeFingerprint(
