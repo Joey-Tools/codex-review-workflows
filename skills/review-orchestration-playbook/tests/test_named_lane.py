@@ -20,9 +20,11 @@ SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime.common import (  # noqa: E402
-    ReviewOutputLimitError,
-    ReviewTimeoutError,
     ForwardedSignal,
+    ReviewOutputDrainError,
+    ReviewOutputLimitError,
+    ReviewProcessLeakError,
+    ReviewTimeoutError,
     TRUSTED_PATH,
 )
 from review_runtime.named_lane import (  # noqa: E402
@@ -658,56 +660,69 @@ class NamedLaneGuardTest(unittest.TestCase):
                 stream_limit_bytes=64,
             )
 
-    def test_validate_cli_classifies_bounded_output_failure_as_blocked_safety(
-        self,
-    ) -> None:
-        stderr = io.StringIO()
-        with (
-            mock.patch(
-                "review_runtime.named_lane.validate_worktree",
-                side_effect=ReviewOutputLimitError("too much output"),
+    def test_cli_classifies_bounded_failures_by_subcommand(self) -> None:
+        cases = (
+            ("deadline", lambda: ReviewTimeoutError("deadline"), 2),
+            ("output-limit", lambda: ReviewOutputLimitError("limit"), 2),
+            ("output-drain", lambda: ReviewOutputDrainError("drain"), 2),
+            ("process-leak", lambda: ReviewProcessLeakError("leak"), 2),
+            (
+                "forwarded-signal",
+                lambda: ForwardedSignal(signal.SIGTERM),
+                128 + signal.SIGTERM,
             ),
-            contextlib.redirect_stderr(stderr),
-        ):
-            returncode = named_lane_main(
+        )
+        commands = (
+            (
+                "validate-worktree",
+                "review_runtime.named_lane.validate_worktree",
                 (
                     "validate-worktree",
                     "--worktree",
                     str(self.repo.resolve()),
                     "--head",
                     "0" * 40,
-                )
-            )
-
-        self.assertEqual(returncode, 2)
-        self.assertEqual(
-            json.loads(stderr.getvalue()),
-            {"status": "blocked-safety", "reason": "output-limit"},
-        )
-
-        stderr = io.StringIO()
-        with (
-            mock.patch(
-                "review_runtime.named_lane.validate_worktree",
-                side_effect=ForwardedSignal(signal.SIGTERM),
+                ),
+                "blocked-safety",
             ),
-            contextlib.redirect_stderr(stderr),
-        ):
-            returncode = named_lane_main(
+            (
+                "run-claude",
+                "review_runtime.named_lane.run_claude",
                 (
-                    "validate-worktree",
+                    "run-claude",
                     "--worktree",
                     str(self.repo.resolve()),
-                    "--head",
-                    "0" * 40,
-                )
-            )
-
-        self.assertEqual(returncode, 128 + signal.SIGTERM)
-        self.assertEqual(
-            json.loads(stderr.getvalue()),
-            {"status": "blocked-safety", "reason": "forwarded-signal"},
+                    "--stdout-path",
+                    str(self.root / "stdout"),
+                    "--stderr-path",
+                    str(self.root / "stderr"),
+                    "--",
+                    "/usr/bin/false",
+                ),
+                "inconclusive",
+            ),
         )
+
+        for command, target, argv, expected_status in commands:
+            for reason, error_factory, expected_returncode in cases:
+                with self.subTest(command=command, reason=reason):
+                    stderr = io.StringIO()
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(
+                            mock.patch(target, side_effect=error_factory())
+                        )
+                        if command == "run-claude":
+                            stdin = mock.Mock()
+                            stdin.buffer = io.BytesIO(b"")
+                            stack.enter_context(mock.patch.object(sys, "stdin", stdin))
+                        stack.enter_context(contextlib.redirect_stderr(stderr))
+                        returncode = named_lane_main(argv)
+
+                    self.assertEqual(returncode, expected_returncode)
+                    self.assertEqual(
+                        json.loads(stderr.getvalue()),
+                        {"status": expected_status, "reason": reason},
+                    )
 
 
 if __name__ == "__main__":
