@@ -46,23 +46,27 @@ Before considering correlation, require all of the following:
 - the current request was posted after the accepted head became current, and the candidate response was posted after that request; and
 - the same full `headRefOid` remained current from the request through the final acceptance reread.
 
-Then require one of these correlation paths:
+For a terminal completion, require one of these correlation paths:
 
 1. **Explicit binding:** trusted provider evidence ties the candidate to the exact request comment ID/URL or to a run/check identity already tied to that request, **or** the candidate names the full exact current `headRefOid`. A completion comment such as `Reviewed commit: <headRefOid>` is sufficient even when it contains no request link.
 2. **Unambiguous fallback:** when the candidate has no explicit request, run, or head marker, the current request is the sole still-unresolved `@codex review` request across **all** recorded heads, and no other `@codex review` request intervened between it and the candidate response.
 
 Do not infer resolution from a head change, infer request identity from similar wording, or pair a response to the nearest request by timestamp alone. If an older request remains unresolved and the candidate lacks explicit binding, or if any intervening request makes the fallback ambiguous, classify the third lane as `triple-inconclusive`.
 
+An authenticated no-start rejection has a stricter request-binding requirement because a full SHA proves only which head the response concerns, not which same-head request it rejects. Accept no-start correlation only when trusted provider evidence ties the rejection to the exact request comment ID/URL or to a provider request/dispatch identity already tied to that request, or when the same sole-unresolved/no-intervening fallback applies. A delayed SHA-only rejection while another same-head request remains unresolved is `triple-inconclusive`, even when the head stayed current. An acknowledgement or actual run, check, or review activity proves service start and therefore cannot supply no-start fallback evidence.
+
 | Candidate evidence | Decision |
 | --- | --- |
 | Expected-author review with `commit_id == headRefOid`, after the current request | Accept as the preferred strong current-head binding. |
-| Expected-author issue comment on a stable current head that names the full current SHA, for example `Reviewed commit: <headRefOid>` | Accept; an exact SHA is sufficient without a request URL. |
+| Expected-author completion comment on a stable current head that names the full current SHA, for example `Reviewed commit: <headRefOid>` | Accept the completion; an exact SHA is sufficient without a request URL. |
 | Expected-author issue comment on a stable current head tied to the exact request ID/URL or its already-linked run identity | Accept. |
 | Marker-free expected-author issue comment; this request is the sole unresolved request across all heads and no request intervened | Accept only through the unambiguous fallback. |
+| Expected-author no-start rejection tied to the exact request/dispatch identity, or covered by the sole-unresolved/no-intervening fallback | Correlate it; only an explicit missing-integration/service-unavailable rejection may then prove effective double. |
+| SHA-only delayed no-start rejection while another request on the same head remains unresolved | `triple-inconclusive`; the SHA binds the head but not the rejected request. |
 | Marker-free comment after a new-head request while an older-head request remains unresolved, or after an intervening request | `triple-inconclusive`; the head change and nearest timestamp do not disambiguate it. |
 | Unknown author, response before the request, or head changed before acceptance | Reject as untrustworthy or stale; report `triple-inconclusive` unless separate authenticated evidence proves no-start unavailability. |
 
-The same issue-comment correlation rule governs an authenticated no-start rejection. Only after the comment is correlated may its explicit missing-integration or service-unavailable statement justify effective double; an uncorrelated or generic rejection remains `triple-inconclusive`.
+Only after an authenticated no-start rejection satisfies its stricter request/dispatch binding or the sole-unresolved fallback may an explicit missing-integration or service-unavailable statement justify effective double. A full SHA by itself, an uncorrelated rejection, or a generic rejection remains `triple-inconclusive`.
 
 Posting `@codex review` is request transport, not completion or proof that the service started. An authenticated response from the expected GitHub/Codex identity, correlated under the rule above and bound to the unchanged current head, may prove no-start unavailability when it explicitly rejects the request because the integration is missing/unsupported or the service is unavailable. An acknowledgement, run/check identity, or review activity proves service start. No response, unknown author, absent review/comment, request-comment failure, rate limit, permission error, timeout, or generic HTTP/network failure proves neither unavailable nor clean; report `triple-inconclusive`.
 

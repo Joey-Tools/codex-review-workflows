@@ -472,6 +472,77 @@ class NamedLaneGuardTest(unittest.TestCase):
         with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
             validate_worktree(self.repo.resolve(), head)
 
+    def test_raw_gitlink_effective_path_uses_registration_and_activation(
+        self,
+    ) -> None:
+        head = self.add_gitlink()
+        self.assertFalse((self.repo / ".gitmodules").exists())
+        git(self.repo, "config", "submodule.unrelated.path", "elsewhere")
+        git(
+            self.repo,
+            "config",
+            "submodule.unrelated.url",
+            str(self.root / "unrelated"),
+        )
+        clean = validate_worktree(self.repo.resolve(), head)
+        self.assertEqual(clean.head_sha, head)
+
+        git(self.repo, "config", "submodule.named.path", "vendor")
+        clean = validate_worktree(self.repo.resolve(), head)
+        self.assertEqual(clean.head_sha, head)
+
+        git(self.repo, "config", "submodule.active", "vendor")
+        with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
+            validate_worktree(self.repo.resolve(), head)
+
+        git(self.repo, "config", "submodule.named.active", "false")
+        clean = validate_worktree(self.repo.resolve(), head)
+        self.assertEqual(clean.head_sha, head)
+
+        git(self.repo, "config", "submodule.named.active", "true")
+        with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
+            validate_worktree(self.repo.resolve(), head)
+
+        git(self.repo, "config", "--unset-all", "submodule.active")
+        git(self.repo, "config", "--unset-all", "submodule.named.active")
+        git(
+            self.repo,
+            "config",
+            "submodule.named.url",
+            str(self.root / "submodule-source"),
+        )
+        with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
+            validate_worktree(self.repo.resolve(), head)
+
+        git(self.repo, "config", "--unset-all", "submodule.named.path")
+        git(self.repo, "config", "--unset-all", "submodule.named.url")
+        git(self.repo, "config", "submodule.vendor.active", "true")
+        with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
+            validate_worktree(self.repo.resolve(), head)
+
+    def test_raw_gitlink_reads_worktree_submodule_path_config(self) -> None:
+        head = self.add_gitlink()
+        git(self.repo, "config", "extensions.worktreeConfig", "true")
+        git(self.repo, "config", "--worktree", "submodule.named.path", "vendor")
+        git(self.repo, "config", "--worktree", "submodule.named.active", "true")
+
+        with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
+            validate_worktree(self.repo.resolve(), head)
+
+    def test_raw_gitlink_reads_included_submodule_path_config(self) -> None:
+        head = self.add_gitlink()
+        included = self.root / "included-raw-submodule.config"
+        included.write_text(
+            '[submodule "named"]\n'
+            "\tpath = vendor\n"
+            f"\turl = {self.root / 'submodule-source'}\n",
+            encoding="utf-8",
+        )
+        git(self.repo, "config", "include.path", str(included))
+
+        with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
+            validate_worktree(self.repo.resolve(), head)
+
     def test_empty_gitmodules_without_definitions_allows_absent_gitlink(
         self,
     ) -> None:
@@ -560,6 +631,19 @@ class NamedLaneGuardTest(unittest.TestCase):
         with self.assertRaisesRegex(NamedLaneGuardError, "full Git object ID"):
             validate_worktree(self.repo.resolve(), "--not-a-revision")
 
+    @unittest.skipUnless(os.name == "posix", "file mode validation requires POSIX")
+    def test_status_forces_filemode_checks_over_repository_config(self) -> None:
+        tracked = self.repo / "review.sh"
+        tracked.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        tracked.chmod(0o755)
+        head = self.commit()
+        git(self.repo, "config", "core.fileMode", "false")
+        tracked.chmod(0o644)
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+
+        with self.assertRaisesRegex(NamedLaneGuardError, "must be clean"):
+            validate_worktree(self.repo.resolve(), head)
+
     def test_status_filter_commands_are_rejected_before_execution(self) -> None:
         tracked = self.repo / "AGENTS.md"
         tracked.write_text("clean\n", encoding="utf-8")
@@ -595,7 +679,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 git(self.repo, "config", key, str(probe))
                 with self.assertRaisesRegex(
                     NamedLaneGuardError,
-                    "filter clean/process commands",
+                    "executable Git filter or diff commands",
                 ):
                     validate_worktree(self.repo.resolve(), head)
                 self.assertFalse(marker.exists())
@@ -623,10 +707,75 @@ class NamedLaneGuardTest(unittest.TestCase):
 
         with self.assertRaisesRegex(
             NamedLaneGuardError,
-            "filter clean/process commands",
+            "executable Git filter or diff commands",
         ):
             validate_worktree(self.repo.resolve(), head)
         self.assertFalse(marker.exists())
+
+    def test_reviewer_executable_diff_config_is_rejected(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        head = self.commit()
+        marker = self.root / "diff-command.marker"
+        probe = self.make_executable(
+            f"import pathlib\npathlib.Path({str(marker)!r}).write_text('ran')\n"
+        )
+
+        harmless = (
+            ("diff.command", str(probe)),
+            ("diff.textconv", str(probe)),
+            ("diff.unsafe.binary", "true"),
+            ("diff.unsafe.cachetextconv", "true"),
+        )
+        for key, value in harmless:
+            git(self.repo, "config", key, value)
+        clean = validate_worktree(self.repo.resolve(), head)
+        self.assertEqual(clean.head_sha, head)
+
+        for key in (
+            "diff.external",
+            "diff.unsafe.command",
+            "diff.unsafe.textconv",
+        ):
+            with self.subTest(key=key):
+                git(self.repo, "config", key, str(probe))
+                with self.assertRaisesRegex(
+                    NamedLaneGuardError,
+                    "executable Git filter or diff commands",
+                ):
+                    validate_worktree(self.repo.resolve(), head)
+                self.assertFalse(marker.exists())
+                git(self.repo, "config", "--unset-all", key)
+
+    def test_included_and_worktree_diff_commands_are_rejected(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        head = self.commit()
+        probe = self.make_executable("pass\n")
+        included = self.root / "included-diff.config"
+        included.write_text(
+            f"[diff]\n\texternal = {probe}\n",
+            encoding="utf-8",
+        )
+        git(self.repo, "config", "include.path", str(included))
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "executable Git filter or diff commands",
+        ):
+            validate_worktree(self.repo.resolve(), head)
+
+        git(self.repo, "config", "--unset-all", "include.path")
+        git(self.repo, "config", "extensions.worktreeConfig", "true")
+        git(
+            self.repo,
+            "config",
+            "--worktree",
+            "diff.unsafe.textconv",
+            str(probe),
+        )
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "executable Git filter or diff commands",
+        ):
+            validate_worktree(self.repo.resolve(), head)
 
     def test_successful_process_writes_private_bounded_outputs(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
@@ -1468,6 +1617,71 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertFalse(stdout_path.exists())
         self.assertFalse(stderr_path.exists())
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "structured prompt signals require POSIX signal masks",
+    )
+    def test_cli_prompt_read_classifies_and_restores_forwarded_signals(
+        self,
+    ) -> None:
+        argv = (
+            "run-claude",
+            "--worktree",
+            str(self.repo.resolve()),
+            "--stdout-path",
+            str(self.root / "prompt-signal.stdout"),
+            "--stderr-path",
+            str(self.root / "prompt-signal.stderr"),
+            "--timeout-seconds",
+            "5",
+            "--",
+            "/usr/bin/false",
+        )
+
+        for forwarded in named_lane_runtime.forwarded_signals():
+            with self.subTest(signal=forwarded):
+                previous_handlers = {
+                    candidate: signal.getsignal(candidate)
+                    for candidate in named_lane_runtime.forwarded_signals()
+                }
+                previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+
+                def interrupt_prompt(*_arguments: object) -> bytes:
+                    handler = signal.getsignal(forwarded)
+                    self.assertTrue(callable(handler))
+                    handler(int(forwarded), None)
+                    self.fail("forwarded signal handler returned")
+
+                with (
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "_read_control_prompt",
+                        side_effect=interrupt_prompt,
+                    ),
+                    mock.patch.object(named_lane_runtime, "run_claude") as run,
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    returncode = named_lane_main(argv)
+
+                self.assertEqual(returncode, 128 + int(forwarded))
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(
+                    json.loads(stderr.getvalue()),
+                    {"status": "inconclusive", "reason": "forwarded-signal"},
+                )
+                run.assert_not_called()
+                for candidate, previous in previous_handlers.items():
+                    self.assertEqual(signal.getsignal(candidate), previous)
+                self.assertEqual(
+                    signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+                    previous_mask,
+                )
+                self.assertFalse((self.root / "prompt-signal.stdout").exists())
+                self.assertFalse((self.root / "prompt-signal.stderr").exists())
 
     def test_cli_prompt_read_shares_deadline_with_process(self) -> None:
         result = {"status": "complete"}

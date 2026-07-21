@@ -913,6 +913,11 @@ class RepositoryContractTest(unittest.TestCase):
             "no other `@codex review` request intervened",
             "pair a response to the nearest request by timestamp alone",
             "an older-head request remains unresolved",
+            "a full SHA proves only which head the response concerns",
+            "exact request comment ID/URL",
+            "provider request/dispatch identity",
+            "another same-head request remains unresolved",
+            "SHA-only delayed no-start rejection",
             "`triple-inconclusive`",
             "`commit_id == headRefOid`",
         ):
@@ -927,7 +932,19 @@ class RepositoryContractTest(unittest.TestCase):
             readiness,
         )
         self.assertIn(
-            "without explicit correlation, that ambiguity is `triple-inconclusive`",
+            "without the required correlation, that ambiguity is `triple-inconclusive`",
+            readiness,
+        )
+        self.assertIn(
+            "A terminal completion may bind through the exact request/run, the full exact current SHA",
+            readiness,
+        )
+        self.assertIn(
+            "A no-start rejection must instead bind to the exact request/dispatch",
+            readiness,
+        )
+        self.assertIn(
+            "Exact current-head SHA binding alone is not request binding for no-start evidence",
             readiness,
         )
 
@@ -1152,6 +1169,12 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("per-name boolean precedence", canonical)
         self.assertIn("repeated `submodule.active` pathspec", contracts)
         self.assertIn("explicit per-name false", contracts)
+        self.assertIn("raw gitlink has no tracked `.gitmodules`", contracts)
+        self.assertIn("forces `core.fileMode=true`", contracts)
+        self.assertIn("`diff.external`", contracts)
+        self.assertIn("`diff.<driver>.command`", contracts)
+        self.assertIn("`diff.<driver>.textconv`", contracts)
+        self.assertIn("both `--no-ext-diff` and `--no-textconv`", contracts)
 
         for anchor in (
             "_validate_index_flags",
@@ -1161,8 +1184,11 @@ class RepositoryContractTest(unittest.TestCase):
             '"--no-renames"',
             'entry[0] == "160000"',
             "_validate_initialized_submodules",
+            'r"^submodule\\..*\\.path$"',
             "_effective_submodule_active_pathspecs",
             "_match_submodule_active_pathspecs",
+            '"core.fileMode=true"',
+            "_validate_executable_git_config",
             "_validate_materialized_gitlink",
             "_status_has_disallowed_changes",
         ):
@@ -1361,9 +1387,12 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("DEFAULT_TIMEOUT_SECONDS = 1_800.0", runtime)
         self.assertIn("DEFAULT_STREAM_LIMIT_BYTES = 64 * 1024 * 1024", runtime)
         self.assertIn("_read_control_prompt", runtime)
+        self.assertIn("_structured_forwarded_signals", runtime)
         self.assertIn("_remaining_deadline_seconds", runtime)
         self.assertIn("withholds EOF", canonical)
         self.assertIn("withholds EOF", contracts)
+        self.assertIn("structured `inconclusive` / `forwarded-signal`", canonical)
+        self.assertIn("reason `forwarded-signal`", contracts)
         self.assertIn("run_bounded_capture", runtime)
         self.assertIn("whole-process-tree quiescence", canonical)
 

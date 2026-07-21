@@ -116,24 +116,24 @@ def _git_capture(
     *,
     output_limit_bytes: int = GIT_OUTPUT_LIMIT_BYTES,
     allow_no_match: bool = False,
+    neutralize_external_diff: bool = True,
     stdin: bytearray | None = None,
 ) -> bytes:
     git = resolve_git()
-    command = (
+    safety_config = [
         str(git),
         "--no-pager",
         "-c",
         "core.fsmonitor=false",
         "-c",
+        "core.fileMode=true",
+        "-c",
         "core.hooksPath=/dev/null",
-        "-c",
-        "diff.external=",
-        "-c",
-        "color.ui=false",
-        "-C",
-        str(root),
-        *tuple(arguments),
-    )
+    ]
+    if neutralize_external_diff:
+        safety_config.extend(("-c", "diff.external="))
+    safety_config.extend(("-c", "color.ui=false", "-C", str(root)))
+    command = (*safety_config, *tuple(arguments))
     capture = run_bounded_capture(
         command,
         env=_git_environment(),
@@ -228,37 +228,62 @@ def _validate_initialized_submodules(
     configured_keys: frozenset[bytes],
 ) -> None:
     gitmodules = tree.get(pathlib.PurePosixPath(".gitmodules"))
-    if not gitlinks or gitmodules is None:
+    if not gitlinks:
         return
-    mode, object_type, _object_id = gitmodules
-    if mode not in {"100644", "100755"} or object_type != "blob":
-        raise NamedLaneGuardError("frozen .gitmodules must be a regular blob")
-    configured_names: dict[bytes, pathlib.PurePosixPath] = {}
-    definitions = _git_capture(
+    configured_names: dict[bytes, set[pathlib.PurePosixPath]] = {}
+    if gitmodules is not None:
+        mode, object_type, _object_id = gitmodules
+        if mode not in {"100644", "100755"} or object_type != "blob":
+            raise NamedLaneGuardError("frozen .gitmodules must be a regular blob")
+        definitions = _git_capture(
+            root,
+            (
+                "config",
+                "--null",
+                f"--blob={frozen_head}:.gitmodules",
+                "--get-regexp",
+                r"^submodule\..*\.path$",
+            ),
+            allow_no_match=True,
+        )
+        for key, raw_path in _parse_git_config_records(
+            definitions,
+            label="frozen submodule path",
+        ):
+            lower_key = key.lower()
+            if not lower_key.startswith(b"submodule.") or not lower_key.endswith(
+                b".path"
+            ):
+                raise NamedLaneGuardError("malformed frozen submodule path record")
+            relative_path = pathlib.PurePosixPath(os.fsdecode(raw_path))
+            if relative_path in gitlinks:
+                name = key[len(b"submodule.") : -len(b".path")]
+                configured_names.setdefault(name, set()).add(relative_path)
+
+    effective_paths: dict[bytes, pathlib.PurePosixPath] = {}
+    path_definitions = _git_capture(
         root,
         (
             "config",
+            "--includes",
             "--null",
-            f"--blob={frozen_head}:.gitmodules",
             "--get-regexp",
             r"^submodule\..*\.path$",
         ),
         allow_no_match=True,
     )
-    for record in definitions.split(b"\0"):
-        if not record:
-            continue
-        key, separator, raw_path = record.partition(b"\n")
+    for key, raw_path in _parse_git_config_records(
+        path_definitions,
+        label="effective submodule path",
+    ):
         lower_key = key.lower()
-        if (
-            not separator
-            or not lower_key.startswith(b"submodule.")
-            or not lower_key.endswith(b".path")
-        ):
-            raise NamedLaneGuardError("malformed frozen submodule path record")
-        relative_path = pathlib.PurePosixPath(os.fsdecode(raw_path))
+        if not lower_key.startswith(b"submodule.") or not lower_key.endswith(b".path"):
+            raise NamedLaneGuardError("malformed effective submodule path record")
+        name = key[len(b"submodule.") : -len(b".path")]
+        effective_paths[name] = pathlib.PurePosixPath(os.fsdecode(raw_path))
+    for name, relative_path in effective_paths.items():
         if relative_path in gitlinks:
-            configured_names[key[len(b"submodule.") : -len(b".path")]] = relative_path
+            configured_names.setdefault(name, set()).add(relative_path)
 
     configured_urls: set[bytes] = set()
     for key in configured_keys:
@@ -266,7 +291,20 @@ def _validate_initialized_submodules(
             continue
         lower_key = key.lower()
         if lower_key.startswith(b"submodule.") and lower_key.endswith(b".url"):
-            configured_urls.add(key[len(b"submodule.") : -len(b".url")])
+            name = key[len(b"submodule.") : -len(b".url")]
+            configured_urls.add(name)
+            named_path = pathlib.PurePosixPath(os.fsdecode(name))
+            if named_path in gitlinks:
+                configured_names.setdefault(name, set()).add(named_path)
+        elif (
+            lower_key != b"submodule.active"
+            and lower_key.startswith(b"submodule.")
+            and lower_key.endswith(b".active")
+        ):
+            name = key[len(b"submodule.") : -len(b".active")]
+            named_path = pathlib.PurePosixPath(os.fsdecode(name))
+            if named_path in gitlinks:
+                configured_names.setdefault(name, set()).add(named_path)
 
     configured_active = _effective_tracked_submodule_active(
         root,
@@ -274,14 +312,14 @@ def _validate_initialized_submodules(
     )
 
     globally_selected: set[pathlib.PurePosixPath] = set()
-    for name, path in configured_names.items():
+    for name, paths in configured_names.items():
         if name in configured_urls or configured_active.get(name) is True:
             raise NamedLaneGuardError(
                 "tracked gitlinks must not be initialized as submodules"
             )
         if configured_active.get(name) is False:
             continue
-        globally_selected.add(path)
+        globally_selected.update(paths)
 
     if globally_selected:
         global_active = _effective_submodule_active_pathspecs(root)
@@ -423,19 +461,41 @@ def _effective_git_config_keys(root: pathlib.Path) -> frozenset[bytes]:
         for key in _git_capture(
             root,
             ("config", "--includes", "--null", "--name-only", "--list"),
+            neutralize_external_diff=False,
         ).split(b"\0")
         if key
     )
 
 
-def _validate_status_filter_config(configured_keys: frozenset[bytes]) -> None:
+def _matches_named_driver_key(
+    key: bytes,
+    prefix: bytes,
+    variables: frozenset[bytes],
+) -> bool:
+    if not key.startswith(prefix):
+        return False
+    _driver, separator, variable = key[len(prefix) :].rpartition(b".")
+    return bool(separator) and variable in variables
+
+
+def _validate_executable_git_config(configured_keys: frozenset[bytes]) -> None:
     for key in configured_keys:
         lower_key = key.lower()
-        if lower_key.startswith(b"filter.") and lower_key.endswith(
-            (b".clean", b".process")
-        ):
+        status_filter = _matches_named_driver_key(
+            lower_key,
+            b"filter.",
+            frozenset((b"clean", b"process")),
+        )
+        reviewer_diff = lower_key == b"diff.external" or (
+            _matches_named_driver_key(
+                lower_key,
+                b"diff.",
+                frozenset((b"command", b"textconv")),
+            )
+        )
+        if status_filter or reviewer_diff:
             raise NamedLaneGuardError(
-                "Git filter clean/process commands are not allowed before status"
+                "executable Git filter or diff commands are not allowed"
             )
 
 
@@ -679,7 +739,7 @@ def validate_worktree(
         if mode != "160000" or object_type != "commit":
             raise NamedLaneGuardError("frozen Git gitlink entry has an invalid type")
     configured_keys = _effective_git_config_keys(root)
-    _validate_status_filter_config(configured_keys)
+    _validate_executable_git_config(configured_keys)
     _validate_initialized_submodules(
         root,
         frozen_head,
@@ -806,6 +866,43 @@ def _read_control_prompt(
             break
         payload.extend(chunk)
     return bytes(payload)
+
+
+@contextlib.contextmanager
+def _structured_forwarded_signals() -> Iterable[None]:
+    previous_handlers: dict[signal.Signals, object] = {}
+
+    def raise_forwarded_signal(signum: int, _frame: object) -> None:
+        raise ForwardedSignal(signal.Signals(signum))
+
+    previous_mask = block_forwarded_signals()
+    pending_signal: signal.Signals | None = None
+    initial_mask_restored = False
+    try:
+        for forwarded in forwarded_signals():
+            previous_handlers[forwarded] = signal.getsignal(forwarded)
+            signal.signal(forwarded, raise_forwarded_signal)
+        if previous_mask is not None:
+            pending_signal = consume_pending_forwarded_signal()
+        restore_signal_mask(previous_mask)
+        initial_mask_restored = True
+        if pending_signal is not None:
+            raise ForwardedSignal(pending_signal)
+        yield
+    finally:
+        cleanup_mask = block_forwarded_signals()
+        pending_cleanup_signal: signal.Signals | None = None
+        try:
+            for forwarded, previous in previous_handlers.items():
+                signal.signal(forwarded, previous)
+            if cleanup_mask is not None:
+                pending_cleanup_signal = consume_pending_forwarded_signal()
+        finally:
+            restore_signal_mask(
+                cleanup_mask if initial_mask_restored else previous_mask
+            )
+        if pending_cleanup_signal is not None:
+            raise ForwardedSignal(pending_cleanup_signal)
 
 
 def _revalidate_output_parent(target: _OutputTarget) -> None:
@@ -1423,31 +1520,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             command.pop(0)
         if args.prompt_limit_bytes <= 0:
             raise NamedLaneGuardError("prompt limit must be positive")
-        timeout = _validate_positive_finite(float(args.timeout_seconds), "timeout")
-        deadline = time.monotonic() + timeout
-        prompt = _read_control_prompt(
-            sys.stdin.buffer,
-            args.prompt_limit_bytes,
-            deadline,
-        )
-        if len(prompt) > args.prompt_limit_bytes:
-            raise NamedLaneGuardError(
-                "Claude control prompt exceeded its bounded limit"
+        with _structured_forwarded_signals():
+            timeout = _validate_positive_finite(
+                float(args.timeout_seconds),
+                "timeout",
             )
-        result = run_claude(
-            worktree=pathlib.Path(args.worktree),
-            stdout_path=pathlib.Path(args.stdout_path),
-            stderr_path=pathlib.Path(args.stderr_path),
-            command=command,
-            prompt=prompt,
-            timeout_seconds=_remaining_deadline_seconds(
+            deadline = time.monotonic() + timeout
+            prompt = _read_control_prompt(
+                sys.stdin.buffer,
+                args.prompt_limit_bytes,
                 deadline,
-                "Claude named lane",
-            ),
-            stream_limit_bytes=args.stream_limit_bytes,
-            inherit_node_extra_ca_certs=args.inherit_node_extra_ca_certs,
-            deadline_monotonic=deadline,
-        )
+            )
+            if len(prompt) > args.prompt_limit_bytes:
+                raise NamedLaneGuardError(
+                    "Claude control prompt exceeded its bounded limit"
+                )
+            result = run_claude(
+                worktree=pathlib.Path(args.worktree),
+                stdout_path=pathlib.Path(args.stdout_path),
+                stderr_path=pathlib.Path(args.stderr_path),
+                command=command,
+                prompt=prompt,
+                timeout_seconds=_remaining_deadline_seconds(
+                    deadline,
+                    "Claude named lane",
+                ),
+                stream_limit_bytes=args.stream_limit_bytes,
+                inherit_node_extra_ca_certs=args.inherit_node_extra_ca_certs,
+                deadline_monotonic=deadline,
+            )
         _emit(result)
         return 0 if result["status"] == "complete" else 1
     except ForwardedSignal as error:
