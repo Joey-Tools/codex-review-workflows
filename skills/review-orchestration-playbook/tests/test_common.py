@@ -22,8 +22,7 @@ class ChildEnvironmentTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = pathlib.Path(temporary) / "review.log"
             path.write_bytes(
-                b"discarded-line\n" * 10_000
-                + b"keep-one\nkeep-two\nkeep-three\n"
+                b"discarded-line\n" * 10_000 + b"keep-one\nkeep-two\nkeep-three\n"
             )
 
             result = common.tail_text(path, line_count=2, byte_count=128)
@@ -93,11 +92,7 @@ class ChildEnvironmentTest(unittest.TestCase):
                     (
                         sys.executable,
                         "-c",
-                        (
-                            "import os,time; "
-                            "os.write(1, b'x' * 4097); "
-                            "time.sleep(5)"
-                        ),
+                        ("import os,time; os.write(1, b'x' * 4097); time.sleep(5)"),
                     ),
                     stdout_path=root / "stdout.log",
                     stderr_path=root / "stderr.log",
@@ -149,9 +144,7 @@ class ChildEnvironmentTest(unittest.TestCase):
     def test_invalid_bounded_output_arguments_preserve_existing_logs(
         self, popen: mock.Mock
     ) -> None:
-        cases = (
-            ({"output_file_limit_bytes": 0}, "must be positive"),
-        )
+        cases = (({"output_file_limit_bytes": 0}, "must be positive"),)
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             for index, (arguments, message) in enumerate(cases):
@@ -213,14 +206,16 @@ class ChildEnvironmentTest(unittest.TestCase):
         completed.stderr[:] = b"\x00" * len(completed.stderr)
 
     @mock.patch.object(common.threading, "Thread")
-    def test_failed_drain_thread_start_is_not_joined(
+    def test_failed_drain_thread_start_is_wrapped_and_not_joined(
         self, thread_factory: mock.Mock
     ) -> None:
         thread = thread_factory.return_value
         thread.start.side_effect = RuntimeError("thread start failed")
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
-            with self.assertRaisesRegex(RuntimeError, "thread start failed"):
+            with self.assertRaisesRegex(
+                common.ReviewOutputDrainError, "I/O thread could not start"
+            ):
                 common.run(
                     (sys.executable, "-c", "pass"),
                     stdout_path=root / "stdout.log",
@@ -243,7 +238,9 @@ class ChildEnvironmentTest(unittest.TestCase):
                 mock.patch.object(
                     common.select, "select", return_value=([123], [], [])
                 ),
-                mock.patch.object(common.os, "read", side_effect=OSError("read failed")),
+                mock.patch.object(
+                    common.os, "read", side_effect=OSError("read failed")
+                ),
             ):
                 with self.assertRaises(common.ReviewOutputDrainError):
                     common.run(
@@ -556,9 +553,7 @@ class ChildEnvironmentTest(unittest.TestCase):
                 events.append("spawn")
                 return process
 
-            on_process_started = mock.Mock(
-                side_effect=lambda: events.append("started")
-            )
+            on_process_started = mock.Mock(side_effect=lambda: events.append("started"))
             with (
                 mock.patch.object(common.subprocess, "Popen", side_effect=spawn),
                 mock.patch.object(

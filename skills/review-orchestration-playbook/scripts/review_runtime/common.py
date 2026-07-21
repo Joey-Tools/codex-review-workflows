@@ -203,9 +203,7 @@ def run(
         raise ReviewError("output_file_limit_bytes requires timeout_seconds")
     if timeout_seconds is not None and (stdout_path is None or stderr_path is None):
         raise ReviewError("timeout_seconds requires logged output paths")
-    if on_process_started is not None and (
-        stdout_path is None or stderr_path is None
-    ):
+    if on_process_started is not None and (stdout_path is None or stderr_path is None):
         raise ReviewError("on_process_started requires logged output paths")
     if output_file_limit_bytes is not None and output_file_limit_bytes <= 0:
         raise ReviewError("output_file_limit_bytes must be positive")
@@ -589,6 +587,15 @@ def _run_logged_process(
             finally:
                 view.release()
 
+        def start_io_thread(thread: threading.Thread) -> None:
+            try:
+                thread.start()
+            except RuntimeError as error:
+                raise ReviewOutputDrainError(
+                    f"command I/O thread could not start: {' '.join(command)}"
+                ) from error
+            io_threads.append(thread)
+
         thread_start_mask = block_forwarded_signals()
         try:
             for stream, destination, limit_bytes in (
@@ -600,8 +607,7 @@ def _run_logged_process(
                     args=(stream, destination, limit_bytes),
                     daemon=True,
                 )
-                thread.start()
-                io_threads.append(thread)
+                start_io_thread(thread)
             if stdin is not None:
                 assert process.stdin is not None
                 thread = threading.Thread(
@@ -609,8 +615,7 @@ def _run_logged_process(
                     args=(process.stdin, stdin),
                     daemon=True,
                 )
-                thread.start()
-                io_threads.append(thread)
+                start_io_thread(thread)
         finally:
             restore_signal_mask(thread_start_mask)
         assert timeout_seconds is not None
@@ -630,8 +635,7 @@ def _run_logged_process(
         if leftover_process_group:
             exit_deadline = time.monotonic() + PROCESS_GROUP_EXIT_GRACE_SECONDS
             while (
-                _process_group_exists(process.pid)
-                and time.monotonic() < exit_deadline
+                _process_group_exists(process.pid) and time.monotonic() < exit_deadline
             ):
                 time.sleep(PROCESS_GROUP_POLL_SECONDS)
             leftover_process_group = _process_group_exists(process.pid)
@@ -653,8 +657,7 @@ def _run_logged_process(
             ) from drain_errors[0]
         if output_overflow.is_set():
             raise ReviewOutputLimitError(
-                "command output exceeded its bounded stream limit: "
-                f"{' '.join(command)}"
+                f"command output exceeded its bounded stream limit: {' '.join(command)}"
             )
         if leftover_process_group:
             raise ReviewProcessLeakError(

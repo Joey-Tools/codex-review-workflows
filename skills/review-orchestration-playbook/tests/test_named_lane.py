@@ -724,6 +724,60 @@ class NamedLaneGuardTest(unittest.TestCase):
                         {"status": expected_status, "reason": reason},
                     )
 
+    def test_cli_wraps_thread_start_failure_by_subcommand(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        head = self.commit()
+        executable = self.make_executable("pass\n")
+        commands = (
+            (
+                (
+                    "validate-worktree",
+                    "--worktree",
+                    str(self.repo.resolve()),
+                    "--head",
+                    head,
+                ),
+                "blocked-safety",
+            ),
+            (
+                (
+                    "run-claude",
+                    "--worktree",
+                    str(self.repo.resolve()),
+                    "--stdout-path",
+                    str(self.root / "thread-start.stdout"),
+                    "--stderr-path",
+                    str(self.root / "thread-start.stderr"),
+                    "--",
+                    str(executable),
+                ),
+                "inconclusive",
+            ),
+        )
+
+        for argv, expected_status in commands:
+            with self.subTest(command=argv[0]):
+                stderr = io.StringIO()
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(
+                        mock.patch(
+                            "review_runtime.common.threading.Thread.start",
+                            side_effect=RuntimeError("cannot start new thread"),
+                        )
+                    )
+                    if argv[0] == "run-claude":
+                        stdin = mock.Mock()
+                        stdin.buffer = io.BytesIO(b"")
+                        stack.enter_context(mock.patch.object(sys, "stdin", stdin))
+                    stack.enter_context(contextlib.redirect_stderr(stderr))
+                    returncode = named_lane_main(argv)
+
+                self.assertEqual(returncode, 2)
+                self.assertEqual(
+                    json.loads(stderr.getvalue()),
+                    {"status": expected_status, "reason": "output-drain"},
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
