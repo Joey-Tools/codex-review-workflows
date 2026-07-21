@@ -27,7 +27,7 @@ description: "Run a local pre-commit delivery gate for non-trivial repo changes:
 
 3. 跑构建和测试。
 - 优先选择当前 repo 最宽但合理的验证：build、unit tests、integration tests、e2e。
-- 对当前验证所需的每个 runtime/toolchain，本地默认各选择一个确定的 version，并在同一轮验证中固定使用。每个工具链按以下严格顺序检查，采用第一个能解析为单一兼容版本的来源：the user 明确指定的版本；repo-local policy 明确指定的本地验证版本；repo 固定配置或 version pin（例如 `.python-version`）；repo 常规 runner 或项目工具的默认解析结果（例如常规 `uv run`）；本机已安装且与项目兼容的最新版本。已选中的较高优先级来源内部冲突，或与项目约束不兼容时，停止并报告 blocker，不得静默降级到较低优先级。记录实际采用的 runtime/toolchain versions 及其来源。
+- 对当前验证所需的每个 runtime/toolchain，本地默认各选择一个确定的 version，并在同一轮验证中固定使用。每个工具链按以下严格顺序查找，选用第一个实际存在的来源：the user 明确指定的版本；repo-local policy 明确指定的本地验证版本；repo 固定配置或 version pin（例如 `.python-version`）；repo 常规 runner 或项目工具的默认解析结果（例如常规 `uv run`）；本机已安装且与项目兼容的最新版本。只有当前来源不存在时才检查下一个来源。选定来源必须解析为唯一且与项目兼容的版本；若其内部冲突、无法唯一解析或与项目约束不兼容，停止并报告 blocker，不得静默降级到较低优先级。记录实际采用的 runtime/toolchain versions 及其来源。
 - 同一 runtime/toolchain 的最低支持版本和 CI matrix 本身不构成本地多版本门禁。只有 the user 或 repo-local policy 明确要求本地多版本验证，或本次改动目标就是跨版本兼容性时，才扩成本地多版本验证。
 - 确需对同一 runtime/toolchain 本地验证多个版本时，先识别共享的 checkout 产物、缓存、固定端口和其他可变状态。只有 suite 已证明顺序复用安全时，才可在同一 checkout 串行执行。版本敏感的产物、缓存或可变状态必须为每个版本使用独立 worktree/cache/state，或在版本间显式清理并重建；只有 suite 已证明隔离时才可在同一 checkout 并发。
 - 失败时回到最早受影响步骤修复，再重跑受影响验证。
