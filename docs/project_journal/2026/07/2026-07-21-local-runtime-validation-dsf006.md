@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-21
 updated: 2026-07-21
 branch: codex/daily-skill-friction-20260721-codex-review-workflows-local-runtime-validation-guardrail
-pr:
+pr: https://github.com/Joey-Tools/codex-review-workflows/pull/70
 supersedes: []
 superseded_by:
 ---
@@ -31,6 +31,7 @@ superseded_by:
 
 ## Evidence
 
+- https://github.com/Joey-Tools/codex-review-workflows/pull/70
 - Daily Skill Friction found two independent tasks where an unrequested concurrent two-version Python matrix interfered through shared checkout state and required user correction.
 - A repository contract test preserves the single-runtime resolution order, matrix scope, and isolation requirements.
 - `uv run --isolated --with pyyaml python3 .../quick_validate.py skills/change-delivery-workflow` passed.
