@@ -1211,6 +1211,8 @@ class RepositoryContractTest(unittest.TestCase):
             ):
                 with self.subTest(anchor=anchor):
                     self.assertIn(anchor, content)
+            self.assertIn("--inherit-node-extra-ca-certs", content)
+            self.assertIn("Ambient `NODE_EXTRA_CA_CERTS`", content)
         for anchor in (
             "pwd.getpwuid(os.getuid())",
             "GIT_NO_LAZY_FETCH=1",
@@ -1233,10 +1235,12 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn(anchor, skill)
         self.assertIn("already-canonical real directory", canonical)
         self.assertIn("leaf must be absent and non-symlink", canonical)
+        self.assertIn("open directory descriptor", canonical)
+        self.assertIn("(st_dev, st_ino)", canonical)
 
         self.assertIn("CLAUDE_ENV_PASSTHROUGH_KEYS", runtime)
         self.assertIn("pwd.getpwuid(os.getuid())", runtime)
-        self.assertIn("env=_claude_environment()", runtime)
+        self.assertIn("env=_claude_environment(inherit_node_extra_ca_certs)", runtime)
         self.assertNotIn("env=dict(os.environ)", runtime)
         for key in (
             "LANG",
@@ -1257,7 +1261,13 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             with self.subTest(key=key):
                 self.assertIn(f'"{key}"', runtime)
-        self.assertNotIn('"NODE_EXTRA_CA_CERTS",', runtime)
+        self.assertIn('os.environ.get("NODE_EXTRA_CA_CERTS")', runtime)
+        self.assertIn('"--inherit-node-extra-ca-certs"', runtime)
+        self.assertIn("_validate_node_extra_ca_certs", runtime)
+        self.assertIn("_OutputTarget", runtime)
+        self.assertIn("dir_fd=target.parent_fd", runtime)
+        self.assertIn("_revalidate_output_parent(stdout)", runtime)
+        self.assertIn("_revalidate_output_parent(stderr)", runtime)
         self.assertIn("Claude output path must not already exist", runtime)
         self.assertIn("Claude output parent must be a real directory", runtime)
         self.assertIn("Claude output parent must not traverse a symlink", runtime)

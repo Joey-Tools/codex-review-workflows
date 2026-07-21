@@ -331,6 +331,60 @@ class NamedLaneGuardTest(unittest.TestCase):
         with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
             validate_worktree(self.repo.resolve(), head)
 
+    def test_empty_gitmodules_without_definitions_allows_absent_gitlink(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        (self.repo / ".gitmodules").write_text("", encoding="utf-8")
+        target = self.commit("gitlink target")
+        git(
+            self.repo,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000",
+            target,
+            "vendor",
+        )
+        git(self.repo, "commit", "-m", "add raw gitlink")
+        head = git(self.repo, "rev-parse", "HEAD")
+
+        result = validate_worktree(self.repo.resolve(), head)
+
+        self.assertEqual(result.head_sha, head)
+
+    def test_malformed_gitmodules_is_not_treated_as_no_definitions(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        (self.repo / ".gitmodules").write_text(
+            '[submodule "broken"\n', encoding="utf-8"
+        )
+        target = self.commit("gitlink target")
+        git(
+            self.repo,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000",
+            target,
+            "vendor",
+        )
+        tree = git(self.repo, "write-tree")
+        head = git(
+            self.repo,
+            "commit-tree",
+            tree,
+            "-p",
+            target,
+            "-m",
+            "add raw gitlink",
+        )
+        git(self.repo, "update-ref", "refs/heads/master", head, target)
+
+        with self.assertRaisesRegex(
+            NamedLaneGuardError, "bounded local Git preflight failed"
+        ):
+            validate_worktree(self.repo.resolve(), head)
+
     def test_guard_does_not_scan_ordinary_file_contents(self) -> None:
         (self.repo / "AGENTS.md").write_text(
             "synthetic-looking text sk-" + "A" * 48 + "\n",
@@ -407,6 +461,8 @@ class NamedLaneGuardTest(unittest.TestCase):
         )
         stdout = self.root / "environment.json"
         stderr = self.root / "environment.err"
+        default_stdout = self.root / "environment-default.json"
+        default_stderr = self.root / "environment-default.err"
         allowed = {
             "LANG": "en_US.UTF-8",
             "TERM": "xterm-256color",
@@ -426,7 +482,22 @@ class NamedLaneGuardTest(unittest.TestCase):
             "TMPDIR": "/private/tmpdir",
             "XDG_CONFIG_HOME": "/private/config",
         }
+        node_extra_ca = self.root / "node-extra-ca.pem"
+        node_extra_ca.write_text(
+            "-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n",
+            encoding="ascii",
+        )
+        denied["NODE_EXTRA_CA_CERTS"] = str(node_extra_ca)
         with mock.patch.dict(os.environ, {**allowed, **denied}, clear=True):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=default_stdout,
+                stderr_path=default_stderr,
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
             run_claude(
                 worktree=self.repo.resolve(),
                 stdout_path=stdout,
@@ -435,9 +506,11 @@ class NamedLaneGuardTest(unittest.TestCase):
                 prompt=b"",
                 timeout_seconds=2.0,
                 stream_limit_bytes=16 * 1024,
+                inherit_node_extra_ca_certs=True,
             )
 
         child = json.loads(stdout.read_text(encoding="utf-8"))
+        default_child = json.loads(default_stdout.read_text(encoding="utf-8"))
         account = pwd.getpwuid(os.getuid())
         for key, value in allowed.items():
             self.assertEqual(child[key], value)
@@ -446,8 +519,10 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(child["LOGNAME"], account.pw_name)
         self.assertEqual(child["SHELL"], account.pw_shell)
         self.assertEqual(child["PATH"], TRUSTED_PATH)
-        for key in denied:
+        for key in denied.keys() - {"NODE_EXTRA_CA_CERTS"}:
             self.assertNotIn(key, child)
+        self.assertNotIn("NODE_EXTRA_CA_CERTS", default_child)
+        self.assertEqual(child["NODE_EXTRA_CA_CERTS"], str(node_extra_ca))
         self.assertEqual(child["GIT_NO_LAZY_FETCH"], "1")
         self.assertEqual(child["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(child["GIT_NO_REPLACE_OBJECTS"], "1")
@@ -460,6 +535,38 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(child["GIT_PAGER"], "cat")
         self.assertEqual(child["PAGER"], "cat")
         self.assertNotIn("GIT_ALLOW_PROTOCOL", child)
+
+    @unittest.skipUnless(os.name == "posix", "account environment requires POSIX")
+    def test_opted_in_node_extra_ca_rejects_relative_and_symlink_paths(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("pass\n")
+        real_ca = self.root / "real-node-ca.pem"
+        real_ca.write_text("certificate fixture\n", encoding="ascii")
+        linked_ca = self.root / "linked-node-ca.pem"
+        linked_ca.symlink_to(real_ca)
+
+        for label, ca_path, message in (
+            ("relative", pathlib.Path("node-ca.pem"), "must be absolute"),
+            ("symlink", linked_ca, "exact readable regular file"),
+        ):
+            with self.subTest(label=label):
+                with mock.patch.dict(
+                    os.environ,
+                    {"NODE_EXTRA_CA_CERTS": str(ca_path)},
+                    clear=True,
+                ):
+                    with self.assertRaisesRegex(NamedLaneGuardError, message):
+                        run_claude(
+                            worktree=self.repo.resolve(),
+                            stdout_path=self.root / f"{label}.out",
+                            stderr_path=self.root / f"{label}.err",
+                            command=(str(executable),),
+                            prompt=b"",
+                            timeout_seconds=1.0,
+                            stream_limit_bytes=64,
+                            inherit_node_extra_ca_certs=True,
+                        )
 
     def test_stream_limit_accepts_exact_limit_and_rejects_one_more_byte(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
@@ -659,6 +766,47 @@ class NamedLaneGuardTest(unittest.TestCase):
                 timeout_seconds=1.0,
                 stream_limit_bytes=64,
             )
+
+    def test_process_anchors_outputs_if_parent_is_replaced_after_launch(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        output_parent = self.root / "outputs"
+        displaced_parent = self.root / "outputs-displaced"
+        output_parent.mkdir()
+        executable = self.make_executable(
+            "import os, pathlib, sys\n"
+            "parent = pathlib.Path(sys.argv[1])\n"
+            "displaced = pathlib.Path(sys.argv[2])\n"
+            "redirect = pathlib.Path(sys.argv[3])\n"
+            "os.rename(parent, displaced)\n"
+            "os.symlink(redirect, parent, target_is_directory=True)\n"
+            "sys.stdout.write('captured stdout')\n"
+            "sys.stderr.write('captured stderr')\n"
+        )
+
+        with self.assertRaisesRegex(NamedLaneGuardError, "changed after validation"):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=output_parent / "stdout.bin",
+                stderr_path=output_parent / "stderr.bin",
+                command=(
+                    str(executable),
+                    str(output_parent),
+                    str(displaced_parent),
+                    str(self.repo),
+                ),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=64,
+            )
+
+        self.assertTrue(output_parent.is_symlink())
+        self.assertFalse((self.repo / "stdout.bin").exists())
+        self.assertFalse((self.repo / "stderr.bin").exists())
+        self.assertFalse((displaced_parent / "stdout.bin").exists())
+        self.assertFalse((displaced_parent / "stderr.bin").exists())
 
     def test_cli_classifies_bounded_failures_by_subcommand(self) -> None:
         cases = (

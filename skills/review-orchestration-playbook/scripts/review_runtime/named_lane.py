@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
 import pathlib
 import re
+import secrets
 import stat
 import sys
-import tempfile
 from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
 
@@ -67,6 +68,12 @@ class WorktreeValidation:
     guidance_count: int
 
 
+@dataclass(frozen=True)
+class _OutputTarget:
+    path: pathlib.Path
+    parent_fd: int
+
+
 def _git_environment() -> dict[str, str]:
     environment = {
         "GIT_ASKPASS": "/usr/bin/false",
@@ -91,6 +98,7 @@ def _git_capture(
     arguments: Iterable[str],
     *,
     output_limit_bytes: int = GIT_OUTPUT_LIMIT_BYTES,
+    allow_no_match: bool = False,
 ) -> bytes:
     git = resolve_git()
     command = (
@@ -116,7 +124,13 @@ def _git_capture(
         stderr_limit_bytes=1024 * 1024,
     )
     try:
-        if capture.returncode != 0:
+        no_match = (
+            allow_no_match
+            and capture.returncode == 1
+            and not capture.stdout
+            and not capture.stderr
+        )
+        if capture.returncode != 0 and not no_match:
             raise NamedLaneGuardError("bounded local Git preflight failed")
         return bytes(capture.stdout)
     finally:
@@ -209,6 +223,7 @@ def _validate_initialized_submodules(
             "--get-regexp",
             r"^submodule\..*\.path$",
         ),
+        allow_no_match=True,
     )
     for record in definitions.split(b"\0"):
         if not record:
@@ -496,7 +511,28 @@ def _validate_positive_finite(value: float, label: str) -> float:
     return value
 
 
-def _validate_output_path(path: pathlib.Path, worktree: pathlib.Path) -> pathlib.Path:
+def _revalidate_output_parent(target: _OutputTarget) -> None:
+    parent = target.path.parent
+    try:
+        descriptor_metadata = os.fstat(target.parent_fd)
+        lexical_metadata = parent.lstat()
+        resolved = parent.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "Claude output parent changed after validation"
+        ) from error
+    if (
+        not stat.S_ISDIR(descriptor_metadata.st_mode)
+        or not stat.S_ISDIR(lexical_metadata.st_mode)
+        or stat.S_ISLNK(lexical_metadata.st_mode)
+        or resolved != parent
+        or (descriptor_metadata.st_dev, descriptor_metadata.st_ino)
+        != (lexical_metadata.st_dev, lexical_metadata.st_ino)
+    ):
+        raise NamedLaneGuardError("Claude output parent changed after validation")
+
+
+def _validate_output_path(path: pathlib.Path, worktree: pathlib.Path) -> _OutputTarget:
     if not path.is_absolute():
         raise NamedLaneGuardError("output paths must be absolute")
     try:
@@ -526,10 +562,98 @@ def _validate_output_path(path: pathlib.Path, worktree: pathlib.Path) -> pathlib
     canonical = parent_resolved / path.name
     if is_relative_to(canonical, worktree):
         raise NamedLaneGuardError("Claude output paths must stay outside the worktree")
-    return canonical
+    open_flags = os.O_RDONLY
+    for flag_name in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW"):
+        open_flags |= getattr(os, flag_name, 0)
+    try:
+        parent_fd = os.open(parent_resolved, open_flags)
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "Claude output parent cannot be opened safely"
+        ) from error
+    try:
+        opened_metadata = os.fstat(parent_fd)
+    except OSError as error:
+        os.close(parent_fd)
+        raise NamedLaneGuardError(
+            "Claude output parent cannot be inspected safely"
+        ) from error
+    if (opened_metadata.st_dev, opened_metadata.st_ino) != (
+        parent_metadata.st_dev,
+        parent_metadata.st_ino,
+    ):
+        os.close(parent_fd)
+        raise NamedLaneGuardError("Claude output parent changed during validation")
+    target = _OutputTarget(path=canonical, parent_fd=parent_fd)
+    try:
+        _revalidate_output_parent(target)
+        try:
+            os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise NamedLaneGuardError(
+                "Claude output path is not safely accessible"
+            ) from error
+        else:
+            raise NamedLaneGuardError("Claude output path must not already exist")
+    except Exception:
+        os.close(parent_fd)
+        raise
+    return target
 
 
-def _claude_environment() -> dict[str, str]:
+def _validate_node_extra_ca_certs(path: pathlib.Path) -> str:
+    if not path.is_absolute():
+        raise NamedLaneGuardError("Node extra CA path must be absolute")
+    try:
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "Node extra CA path is not safely accessible"
+        ) from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or resolved != path
+    ):
+        raise NamedLaneGuardError(
+            "Node extra CA path must be an exact readable regular file"
+        )
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise NamedLaneGuardError("Node extra CA validation requires O_NOFOLLOW")
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow,
+        )
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "Node extra CA path must be an exact readable regular file"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+        after = path.lstat()
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "Node extra CA path changed during validation"
+        ) from error
+    finally:
+        os.close(descriptor)
+
+    def identity(value: os.stat_result) -> tuple[int, int, int, int]:
+        return (value.st_dev, value.st_ino, value.st_mode, value.st_uid)
+
+    if identity(metadata) != identity(opened) or identity(opened) != identity(after):
+        raise NamedLaneGuardError("Node extra CA path changed during validation")
+    return str(resolved)
+
+
+def _claude_environment(
+    inherit_node_extra_ca_certs: bool = False,
+) -> dict[str, str]:
     if os.name != "posix":
         raise NamedLaneGuardError("named Claude lanes require a POSIX account")
     try:
@@ -562,28 +686,80 @@ def _claude_environment() -> dict[str, str]:
         value = os.environ.get(key)
         if value is not None:
             environment[key] = value
+    if inherit_node_extra_ca_certs:
+        node_extra_ca_certs = os.environ.get("NODE_EXTRA_CA_CERTS")
+        if not node_extra_ca_certs:
+            raise NamedLaneGuardError(
+                "explicit Node extra CA inheritance requires a configured path"
+            )
+        environment["NODE_EXTRA_CA_CERTS"] = _validate_node_extra_ca_certs(
+            pathlib.Path(node_extra_ca_certs)
+        )
     return environment
 
 
-def _write_private_bytes(path: pathlib.Path, payload: bytes | bytearray) -> None:
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", dir=path.parent
-    )
-    temporary = pathlib.Path(temporary_name)
+def _open_private_temporary(target: _OutputTarget) -> tuple[int, str]:
+    open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    for flag_name in ("O_CLOEXEC", "O_NOFOLLOW"):
+        open_flags |= getattr(os, flag_name, 0)
+    for _attempt in range(16):
+        name = f".named-lane-{secrets.token_hex(16)}"
+        try:
+            descriptor = os.open(
+                name,
+                open_flags,
+                0o600,
+                dir_fd=target.parent_fd,
+            )
+        except FileExistsError:
+            continue
+        except OSError as error:
+            raise NamedLaneGuardError(
+                "Claude output temporary file cannot be created safely"
+            ) from error
+        return descriptor, name
+    raise NamedLaneGuardError("Claude output temporary name could not be reserved")
+
+
+def _write_private_bytes(target: _OutputTarget, payload: bytes | bytearray) -> None:
+    descriptor, temporary_name = _open_private_temporary(target)
     try:
         os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         try:
-            os.link(temporary, path)
+            os.link(
+                temporary_name,
+                target.path.name,
+                src_dir_fd=target.parent_fd,
+                dst_dir_fd=target.parent_fd,
+                follow_symlinks=False,
+            )
         except FileExistsError as error:
             raise NamedLaneGuardError(
                 "Claude output path appeared during write"
             ) from error
+        except OSError as error:
+            raise NamedLaneGuardError(
+                "Claude output cannot be published safely"
+            ) from error
     finally:
-        temporary.unlink(missing_ok=True)
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_name, dir_fd=target.parent_fd)
+        except FileNotFoundError:
+            pass
+
+
+def _remove_private_output(target: _OutputTarget) -> None:
+    try:
+        os.unlink(target.path.name, dir_fd=target.parent_fd)
+    except FileNotFoundError:
+        pass
 
 
 def run_claude(
@@ -595,6 +771,7 @@ def run_claude(
     prompt: bytes,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     stream_limit_bytes: int = DEFAULT_STREAM_LIMIT_BYTES,
+    inherit_node_extra_ca_certs: bool = False,
 ) -> dict[str, object]:
     root = _resolve_worktree_root(worktree)
     if not command:
@@ -622,39 +799,55 @@ def run_claude(
     if stream_limit_bytes <= 0:
         raise NamedLaneGuardError("stream limit must be positive")
     stdout = _validate_output_path(stdout_path, root)
-    stderr = _validate_output_path(stderr_path, root)
-    if stdout == stderr:
-        raise NamedLaneGuardError("stdout and stderr paths must differ")
-    capture = run_bounded_capture(
-        command,
-        cwd=root,
-        env=_claude_environment(),
-        stdin=bytearray(prompt),
-        timeout_seconds=timeout,
-        stdout_limit_bytes=stream_limit_bytes,
-        stderr_limit_bytes=stream_limit_bytes,
-    )
     try:
-        stdout_written = False
+        stderr = _validate_output_path(stderr_path, root)
         try:
-            _write_private_bytes(stdout, capture.stdout)
-            stdout_written = True
-            _write_private_bytes(stderr, capture.stderr)
-        except Exception:
-            if stdout_written:
-                stdout.unlink(missing_ok=True)
-            raise
-        return {
-            "status": "complete" if capture.returncode == 0 else "failed",
-            "returncode": capture.returncode,
-            "stdout_path": str(stdout),
-            "stdout_bytes": len(capture.stdout),
-            "stderr_path": str(stderr),
-            "stderr_bytes": len(capture.stderr),
-        }
+            if stdout.path == stderr.path:
+                raise NamedLaneGuardError("stdout and stderr paths must differ")
+            capture = run_bounded_capture(
+                command,
+                cwd=root,
+                env=_claude_environment(inherit_node_extra_ca_certs),
+                stdin=bytearray(prompt),
+                timeout_seconds=timeout,
+                stdout_limit_bytes=stream_limit_bytes,
+                stderr_limit_bytes=stream_limit_bytes,
+            )
+            try:
+                stdout_written = False
+                stderr_written = False
+                try:
+                    _revalidate_output_parent(stdout)
+                    _revalidate_output_parent(stderr)
+                    _write_private_bytes(stdout, capture.stdout)
+                    stdout_written = True
+                    _write_private_bytes(stderr, capture.stderr)
+                    stderr_written = True
+                    _revalidate_output_parent(stdout)
+                    _revalidate_output_parent(stderr)
+                except Exception:
+                    if stderr_written:
+                        _remove_private_output(stderr)
+                    if stdout_written:
+                        _remove_private_output(stdout)
+                    raise
+                return {
+                    "status": "complete" if capture.returncode == 0 else "failed",
+                    "returncode": capture.returncode,
+                    "stdout_path": str(stdout.path),
+                    "stdout_bytes": len(capture.stdout),
+                    "stderr_path": str(stderr.path),
+                    "stderr_bytes": len(capture.stderr),
+                }
+            finally:
+                capture.stdout[:] = b"\x00" * len(capture.stdout)
+                capture.stderr[:] = b"\x00" * len(capture.stderr)
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(stderr.parent_fd)
     finally:
-        capture.stdout[:] = b"\x00" * len(capture.stdout)
-        capture.stderr[:] = b"\x00" * len(capture.stderr)
+        with contextlib.suppress(OSError):
+            os.close(stdout.parent_fd)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -689,6 +882,7 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_PROMPT_LIMIT_BYTES,
     )
+    claude.add_argument("--inherit-node-extra-ca-certs", action="store_true")
     claude.add_argument("claude_argv", nargs=argparse.REMAINDER)
     return parser
 
@@ -735,6 +929,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             prompt=prompt,
             timeout_seconds=args.timeout_seconds,
             stream_limit_bytes=args.stream_limit_bytes,
+            inherit_node_extra_ca_certs=args.inherit_node_extra_ca_certs,
         )
         _emit(result)
         return 0 if result["status"] == "complete" else 1
