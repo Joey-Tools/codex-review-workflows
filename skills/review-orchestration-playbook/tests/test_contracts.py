@@ -1406,14 +1406,15 @@ class RepositoryContractTest(unittest.TestCase):
             "does **not** resolve the older request",
             "the full exact current `headRefOid`",
             "the current request is the sole still-unresolved `@codex review` request",
+            "A head marker does not relax either condition",
             "no other `@codex review` request intervened",
             "pair a response to the nearest request by timestamp alone",
             "an older-head request remains unresolved",
-            "a full SHA proves only which head the response concerns",
+            "a full SHA proves only which head the response concerns, not which request caused it",
             "exact request comment ID/URL",
             "provider request/dispatch identity",
-            "another same-head request remains unresolved",
-            "SHA-only delayed no-start rejection",
+            "SHA-only delayed result while any older request remains unresolved",
+            "even when the candidate names the full exact current `headRefOid`",
             "`triple-inconclusive`",
             "`commit_id == headRefOid`",
         ):
@@ -1432,15 +1433,52 @@ class RepositoryContractTest(unittest.TestCase):
             readiness,
         )
         self.assertIn(
-            "A terminal completion may bind through the exact request/run, the full exact current SHA",
+            "A terminal completion must bind through the exact request/run or the sole-unresolved/no-intervening fallback",
             readiness,
         )
         self.assertIn(
-            "A no-start rejection must instead bind to the exact request/dispatch",
+            "The full exact current SHA may corroborate artifact scope, but it does not identify which request caused the response",
             readiness,
         )
         self.assertIn(
-            "Exact current-head SHA binding alone is not request binding for no-start evidence",
+            "Exact current-head SHA binding alone is not request binding for completion or no-start evidence",
+            readiness,
+        )
+        self.assertIn(
+            "A current-SHA marker cannot disambiguate which request caused a result",
+            readiness,
+        )
+        self.assertNotIn(
+            "the full exact current SHA, or the sole-unresolved-request fallback",
+            readiness,
+        )
+
+    def test_current_sha_does_not_resolve_an_older_request(self) -> None:
+        probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
+            encoding="utf-8"
+        )
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "SHA-only delayed terminal completion or no-start rejection while any older request remains unresolved",
+            probes,
+        )
+        self.assertIn(
+            "even when the terminal response names the current SHA",
+            readiness,
+        )
+        self.assertIn(
+            "an older request may execute after the push and review that same current head",
+            readiness,
+        )
+        self.assertNotIn(
+            "the SHA disambiguates any unresolved different-head request",
+            probes,
+        )
+        self.assertNotIn(
+            "full-current-SHA binding that disambiguates the head epoch",
             readiness,
         )
 
