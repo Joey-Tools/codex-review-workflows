@@ -55,7 +55,7 @@ This rule applies even when a direct diff would fit in the current prompt. It av
 - Use the detached worktree as review scope and real `HOME` as the trusted Claude CLI control plane. The model may have `Read`, `Grep`, `Glob`, and sandboxed `Bash`.
 - Treat the native selected-deny sandbox accurately: launch must request global `denyWrite` and critical-sensitive-root `denyRead`; those requested controls define the native-sandbox enforcement boundary, but `allowRead` is not a global host-read whitelist. Sandboxed Bash can technically read another host path that is not covered by `denyRead`; the prompt/model scope must explicitly forbid every outside-workspace read.
 - Treat Claude Code 2.1.212 `system/init` and capability output as evidence for only the fields it reports. It cannot attest the final merged sandbox, merged managed permission arrays, or actual path-rule evaluation; record the sandbox controls as requested configuration, not independently verified effective enforcement.
-- Apply the executable, sandbox, authentication, credential-recovery, and platform rules in [claude-runtime-trust.md](claude-runtime-trust.md).
+- Apply only the canonical-applicable executable provenance, version/platform, native-sandbox, ordinary-authentication, and failure-classification rules in [claude-runtime-trust.md](claude-runtime-trust.md). Its helper-private credential broker, carrier, lock, guarded-writeback, and recovery rules do not apply to this direct lane.
 - A different provider cannot satisfy this lane. Model fallback within Claude Code remains one lane; provider substitution does not.
 
 ## GitHub Codex Lane Contract

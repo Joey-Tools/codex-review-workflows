@@ -1003,6 +1003,9 @@ class RepositoryContractTest(unittest.TestCase):
     def test_canonical_claude_auth_control_plane_is_not_helper_broker(self) -> None:
         agents = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        lane_contracts = (
+            SKILL_ROOT / "references/review-lane-contracts.md"
+        ).read_text(encoding="utf-8")
         canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
             encoding="utf-8"
         )
@@ -1024,6 +1027,9 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("Do not apply its catalog, broker, carrier, lock", runtime)
         self.assertIn("do not apply to this direct real-`HOME` lane", skill)
         self.assertIn("a narrow CLI control-plane exception", skill)
+        self.assertIn("Apply only the canonical-applicable executable", lane_contracts)
+        self.assertIn("recovery rules do not apply to this direct lane", lane_contracts)
+        self.assertNotIn("authentication, credential-recovery", lane_contracts)
         self.assertIn("Those guarantees do not apply", agents)
         for retired_global_detail in (
             "Local-login writeback requires",
@@ -1053,6 +1059,17 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn(anchor, normalized)
         self.assertIn("## Historical Helper State", journal)
         self.assertNotIn("## Current State", journal)
+
+    def test_migration_journal_requires_zero_inherited_turns_for_single(self) -> None:
+        journal = (
+            REPO_ROOT
+            / "docs/project_journal/2026/07/"
+            / "2026-07-20-review-policy-migration-7f2001.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("one dedicated fresh-context Codex reviewer", journal)
+        self.assertIn("zero inherited turns", journal)
+        self.assertNotIn("fresh or otherwise clear-context", journal)
 
     def test_core_active_policy_has_no_retired_codex_pr_gate_names(self) -> None:
         active_policy = (

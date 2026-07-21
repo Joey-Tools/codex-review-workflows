@@ -22,7 +22,7 @@ superseded_by:
 
 ## Current State
 
-- Single review is a fresh or otherwise clear-context Codex review in a clean Git workspace, with no prepared diff supplied to the reviewer.
+- Single review is one dedicated fresh-context Codex reviewer launched with zero inherited turns in a clean Git workspace, with no prepared diff supplied to the reviewer.
 - Double review adds an actual Claude Code review in a separate read-only workspace.
 - Triple review adds exact `@codex review` on a supported GitHub Cloud PR plus a trustworthy terminal GitHub Codex result bound to the current PR head; the request comment does not complete the lane by itself.
 - Directly known no-PR/unsupported-host/unsupported-identity evidence or an authenticated provider no-start rejection can make a requested triple an effective double. Missing response or generic failure is inconclusive; untrustworthy evidence after service start is triple-inconclusive instead of fallback.
@@ -46,3 +46,4 @@ superseded_by:
 - GitHub Codex review on PR #68 found that partial-clone worktrees could lazy-fetch during review. The final contract requires parent-owned no-lazy-fetch/local-completeness proof and forbids reviewer fetches or credential prompts without generating a full diff.
 - Final whole-range rereview found that repository-wide helper broker/writeback rules still conflicted with the canonical real-`HOME` Claude lane. Active policy now scopes broker, carrier, lock, guarded-writeback, and recovery guarantees to the low-level helper and defines ordinary CLI authentication refresh as a narrow trusted-control-plane exception for the direct lane.
 - A subsequent fresh-context whole-range review found that the superseded Claude authentication journal still labeled helper-only gates as current. The journal now carries an explicit historical/helper-only banner and cannot define named review lanes or the canonical direct Claude lane.
+- The terminal whole-range review removed one residual canonical-lane reference to helper credential recovery and one journal phrase that could have weakened fresh context from zero inherited turns to an ambiguous cleared context.
