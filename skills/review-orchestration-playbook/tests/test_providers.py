@@ -2367,9 +2367,10 @@ class ProviderPolicyTest(unittest.TestCase):
                     ),
                     self.assertRaises(type(interruption)) as raised,
                 ):
-                    with providers._owned_claude_macos_credentials(
-                        self.review
-                    ) as (_owned, expected):
+                    with providers._owned_claude_macos_credentials(self.review) as (
+                        _owned,
+                        expected,
+                    ):
                         copied = expected
                         raise interruption
 
@@ -16317,7 +16318,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 75)
@@ -17325,7 +17326,7 @@ class ProviderPolicyTest(unittest.TestCase):
             outcome = providers.run_review(
                 review=self.review,
                 reviewer="claude",
-                egress_consent="triple-review",
+                egress_consent="explicit-claude-with-copilot-fallback",
             )
 
         self.assertEqual(outcome.returncode, 75)
@@ -18812,6 +18813,56 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         )
 
+    def test_named_review_consents_are_rejected_before_preflight(self) -> None:
+        for consent in ("double-review", "triple-review"):
+            with (
+                self.subTest(consent=consent),
+                mock.patch.object(
+                    providers,
+                    "validate_external_workspace",
+                ) as validate,
+            ):
+                outcome = providers.run_review(
+                    review=self.review,
+                    reviewer="claude",
+                    egress_consent=consent,
+                )
+
+                self.assertEqual(outcome.returncode, 2)
+                validate.assert_not_called()
+                self.assertFalse(
+                    (self.review.container_dir / "preflight.json").exists()
+                )
+                self.assertFalse((self.review.container_dir / "egress.json").exists())
+
+    def test_egress_evidence_marks_the_low_level_helper_contract(self) -> None:
+        with (
+            mock.patch.object(
+                providers,
+                "validate_external_workspace",
+                return_value={},
+            ),
+            mock.patch.object(
+                providers,
+                "_is_claude_linux_host",
+                side_effect=ReviewError("stop after egress evidence"),
+            ),
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="claude",
+                egress_consent="explicit-claude-review",
+            )
+
+        self.assertEqual(outcome.returncode, 2)
+        evidence = json.loads(
+            (self.review.container_dir / "egress.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(evidence["reviewer"], "low-level-helper")
+        self.assertEqual(evidence["requested_helper_reviewer"], "claude")
+        self.assertEqual(evidence["review_contract"], "supplied-diff-no-git")
+        self.assertFalse(evidence["named_lane_eligible"])
+
     def test_linux_prompt_guard_does_not_scan_frozen_diff(self) -> None:
         self.review.diff_file.write_text(
             "diff --git a/example.py b/example.py\n+@decorator\n",
@@ -19110,7 +19161,7 @@ class ProviderPolicyTest(unittest.TestCase):
             outcome = providers.run_review(
                 review=self.review,
                 reviewer="claude",
-                egress_consent="double-review",
+                egress_consent="explicit-claude-with-copilot-fallback",
             )
 
         self.assertEqual(outcome.returncode, 75)
@@ -19215,7 +19266,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 outcome = providers.run_review(
                     review=self.review,
                     reviewer="claude",
-                    egress_consent="double-review",
+                    egress_consent="explicit-claude-with-copilot-fallback",
                 )
 
             self.assertEqual(outcome.returncode, expected_returncode)
@@ -19343,7 +19394,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 outcome = providers.run_review(
                     review=self.review,
                     reviewer="claude",
-                    egress_consent="double-review",
+                    egress_consent="explicit-claude-with-copilot-fallback",
                 )
 
             self.assertEqual(outcome.returncode, expected_returncode)
@@ -19397,7 +19448,7 @@ class ProviderPolicyTest(unittest.TestCase):
             outcome = providers.run_review(
                 review=self.review,
                 reviewer="claude",
-                egress_consent="double-review",
+                egress_consent="explicit-claude-with-copilot-fallback",
             )
         self.assertEqual(outcome.returncode, 0)
         self.assertEqual(
@@ -19546,7 +19597,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     outcome = providers.run_review(
                         review=self.review,
                         reviewer="claude",
-                        egress_consent="double-review",
+                        egress_consent="explicit-claude-with-copilot-fallback",
                     )
 
                 self.assertEqual(outcome.returncode, 75)
@@ -19603,7 +19654,7 @@ class ProviderPolicyTest(unittest.TestCase):
             outcome = providers.run_review(
                 review=self.review,
                 reviewer="claude",
-                egress_consent="double-review",
+                egress_consent="explicit-claude-with-copilot-fallback",
             )
 
         self.assertEqual(outcome.returncode, 0)
@@ -19644,7 +19695,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 75)
@@ -19688,7 +19739,7 @@ class ProviderPolicyTest(unittest.TestCase):
             outcome = providers.run_review(
                 review=self.review,
                 reviewer="claude",
-                egress_consent="triple-review",
+                egress_consent="explicit-claude-with-copilot-fallback",
             )
         self.assertEqual(outcome.returncode, 75)
         self.assertEqual(claude_attempt.call_count, 1)
@@ -19720,7 +19771,7 @@ class ProviderPolicyTest(unittest.TestCase):
             outcome = providers.run_review(
                 review=self.review,
                 reviewer="claude",
-                egress_consent="double-review",
+                egress_consent="explicit-claude-with-copilot-fallback",
             )
         self.assertEqual(outcome.returncode, 1)
         self.assertEqual(claude_attempt.call_count, 1)
@@ -19740,7 +19791,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
         self.assertEqual(outcome.returncode, 2)
         copilot_attempt.assert_not_called()
@@ -19769,7 +19820,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 75)
@@ -19799,7 +19850,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 75)
@@ -19835,7 +19886,7 @@ class ProviderPolicyTest(unittest.TestCase):
             outcome = providers.run_review(
                 review=self.review,
                 reviewer="claude",
-                egress_consent="double-review",
+                egress_consent="explicit-claude-with-copilot-fallback",
             )
 
         self.assertEqual(outcome.returncode, 75)
@@ -19878,7 +19929,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="triple-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 0)
@@ -19909,7 +19960,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="triple-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 1)
@@ -19944,7 +19995,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="triple-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 2)
@@ -19981,7 +20032,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 2)
@@ -20018,7 +20069,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 2)
@@ -20062,7 +20113,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 0)
@@ -20100,7 +20151,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 0)
@@ -20127,7 +20178,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 2)
@@ -20160,7 +20211,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 75)
@@ -20202,7 +20253,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 0)
@@ -20253,7 +20304,7 @@ class ProviderPolicyTest(unittest.TestCase):
             outcome = providers.run_review(
                 review=self.review,
                 reviewer="claude",
-                egress_consent="double-review",
+                egress_consent="explicit-claude-with-copilot-fallback",
             )
 
         runner_error = (self.review.container_dir / "runner-error.txt").read_text(
@@ -20300,7 +20351,7 @@ class ProviderPolicyTest(unittest.TestCase):
             outcome = providers.run_review(
                 review=self.review,
                 reviewer="claude",
-                egress_consent="double-review",
+                egress_consent="explicit-claude-with-copilot-fallback",
             )
 
         runner_error = (self.review.container_dir / "runner-error.txt").read_text(
@@ -20360,7 +20411,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 2)
@@ -20447,7 +20498,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 2)
@@ -20495,7 +20546,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 75)
@@ -20512,8 +20563,8 @@ class ProviderPolicyTest(unittest.TestCase):
         snapshot = self.review.container_dir / "verified-claude"
         snapshot.write_bytes(b"snapshot")
         cases = (
-            ("double-review", "missing"),
-            ("triple-review", "non-executable"),
+            ("explicit-claude-with-copilot-fallback", "missing"),
+            ("explicit-claude-with-copilot-fallback", "non-executable"),
         )
 
         for consent, condition in cases:
@@ -20658,7 +20709,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 75)
@@ -20714,7 +20765,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 75)
@@ -20780,7 +20831,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 2)
@@ -20835,7 +20886,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="triple-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 2)
@@ -20947,7 +20998,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="triple-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 0)
@@ -20990,7 +21041,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 2)
@@ -21043,7 +21094,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 2)
@@ -21097,7 +21148,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 2)
@@ -21145,7 +21196,7 @@ class ProviderPolicyTest(unittest.TestCase):
             outcome = providers.run_review(
                 review=self.review,
                 reviewer="claude",
-                egress_consent="double-review",
+                egress_consent="explicit-claude-with-copilot-fallback",
             )
 
         self.assertEqual(outcome.returncode, 2)
@@ -21210,7 +21261,7 @@ class ProviderPolicyTest(unittest.TestCase):
             outcome = providers.run_review(
                 review=self.review,
                 reviewer="claude",
-                egress_consent="double-review",
+                egress_consent="explicit-claude-with-copilot-fallback",
             )
 
         self.assertEqual(outcome.returncode, 0)
@@ -21276,7 +21327,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 0)
@@ -21325,7 +21376,7 @@ class ProviderPolicyTest(unittest.TestCase):
             outcome = providers.run_review(
                 review=self.review,
                 reviewer="claude",
-                egress_consent="double-review",
+                egress_consent="explicit-claude-with-copilot-fallback",
             )
 
         self.assertEqual(outcome.returncode, 1)
@@ -21401,7 +21452,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     outcome = providers.run_review(
                         review=self.review,
                         reviewer="claude",
-                        egress_consent="double-review",
+                        egress_consent="explicit-claude-with-copilot-fallback",
                     )
 
                 self.assertEqual(outcome.returncode, 2)
@@ -21450,7 +21501,7 @@ class ProviderPolicyTest(unittest.TestCase):
             outcome = providers.run_review(
                 review=self.review,
                 reviewer="claude",
-                egress_consent="double-review",
+                egress_consent="explicit-claude-with-copilot-fallback",
             )
 
         self.assertEqual(outcome.returncode, 2)
@@ -21480,7 +21531,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 2)
@@ -21506,7 +21557,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="triple-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 75)
@@ -21534,7 +21585,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="triple-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 75)
@@ -21562,7 +21613,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="triple-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 75)
@@ -21590,7 +21641,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="triple-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
 
         self.assertEqual(outcome.returncode, 75)
@@ -21627,7 +21678,7 @@ class ProviderPolicyTest(unittest.TestCase):
             outcome = providers.run_review(
                 review=self.review,
                 reviewer="claude",
-                egress_consent="triple-review",
+                egress_consent="explicit-claude-with-copilot-fallback",
             )
 
         self.assertEqual(outcome.returncode, 2)
@@ -21842,7 +21893,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
         self.assertEqual(outcome.returncode, 2)
         resolve.assert_not_called()
@@ -21936,7 +21987,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
         self.assertEqual(outcome.returncode, 2)
         resolve.assert_not_called()
@@ -21958,7 +22009,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
         self.assertEqual(outcome.returncode, 2)
         resolve.assert_not_called()
@@ -21978,7 +22029,7 @@ class ProviderPolicyTest(unittest.TestCase):
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
-            egress_consent="double-review",
+            egress_consent="explicit-claude-with-copilot-fallback",
         )
         self.assertEqual(outcome.returncode, 2)
         resolve.assert_not_called()
@@ -26697,7 +26748,7 @@ class ProviderPolicyTest(unittest.TestCase):
             outcome = providers.run_review(
                 review=self.review,
                 reviewer="claude",
-                egress_consent="triple-review",
+                egress_consent="explicit-claude-with-copilot-fallback",
             )
 
         self.assertEqual(outcome.returncode, 0)
@@ -26786,7 +26837,7 @@ class ProviderPolicyTest(unittest.TestCase):
             outcome = providers.run_review(
                 review=self.review,
                 reviewer="claude",
-                egress_consent="triple-review",
+                egress_consent="explicit-claude-with-copilot-fallback",
             )
 
         self.assertEqual(outcome.returncode, 75)

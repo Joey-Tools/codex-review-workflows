@@ -19,6 +19,7 @@ from .constants import (
     FINAL_MESSAGE_BYTES,
     HANDOFF_SECONDS,
     LOG_AGGREGATE_BYTES,
+    MAX_EVIDENCE_PRIMARY_BYTES,
     PROCESS_ENVELOPE_BYTES,
     RELEASED_TTL_SECONDS,
     REVIEWER_LAUNCH_SECONDS,
@@ -148,7 +149,40 @@ def _resolve_codex(value: str | None) -> str:
                 code="codex-unavailable",
             )
         path = pathlib.Path(located)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as error:
+        raise blocked(
+            "Codex executable cannot be opened as a stable regular file",
+            stage="runtime-selection",
+            code="codex-unavailable",
+        ) from error
+    try:
+        metadata = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or not metadata.st_mode & 0o111:
+        raise blocked(
+            "Codex executable is not an executable regular file",
+            stage="runtime-selection",
+            code="codex-unavailable",
+        )
+    if not os.access(path, os.X_OK):
+        raise blocked(
+            "Codex executable is not executable by the current user",
+            stage="runtime-selection",
+            code="codex-unavailable",
+        )
     return str(path)
+
+
+def _require_primary_evidence_budget(diff_length: int) -> None:
+    if not 1 <= diff_length <= MAX_EVIDENCE_PRIMARY_BYTES:
+        raise blocked(
+            "Primary diff does not fit the independent reviewer evidence budget",
+            stage="evidence-admission",
+            code="primary-evidence-size-invalid",
+        )
 
 
 def prepare_run(
@@ -170,6 +204,7 @@ def prepare_run(
         base_sha=base_sha,
         head_sha=head_sha,
     )
+    _require_primary_evidence_budget(helper.diff_length)
     repository = inspect_repository(
         repo=repo,
         base_sha=base_sha,

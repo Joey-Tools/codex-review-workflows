@@ -312,8 +312,8 @@ metadata behavior.
   creates valid shared parents atomically without a post-create permission
   transition, while broker reproducibility runs as an ordinary hosted
   `macos-26` user and is explicitly documented as a reproducibility gate rather
-  than a trust boundary. PR readiness now ships a self-contained Python 3.13
-  independent Codex supervisor with isolated `CODEX_HOME`, bounded authenticated
+  than a trust boundary. Low-level helper maintenance now ships a self-contained
+  Python 3.13 independent Codex supervisor with isolated `CODEX_HOME`, bounded authenticated
   evidence, app-server stdio, exact model/effort verification, sealed terminal
   evidence, and exact process/checkout settlement. A cleanup-lock regression
   also avoids a redundant same-mode `fchmod` that could change ctime during a
@@ -331,3 +331,25 @@ metadata behavior.
   their values at runtime from non-credential-shaped fragments because the
   catalog access-token shape intentionally does not satisfy that parser test.
   The three affected Python 3.13 test modules run 34 tests with no failures.
+- The final upstream integration adopts the canonical clean-worktree Codex,
+  direct Claude Code, and current-head GitHub Codex review shapes from PRs 68-70.
+  The supplied-diff helper and independent supervisor remain low-level security
+  tools with dedicated CI; neither satisfies a named review lane or becomes an
+  implicit PR-readiness gate. Named double/triple consent no longer authorizes
+  the helper's Copilot compatibility path, which requires a separate explicit
+  supplemental request.
+- The last old-head frozen review found that supervisor preflight accepted a
+  primary diff larger than its final 4 MiB evidence allowance and accepted an
+  explicit nonexistent or nonexecutable Codex path. Preflight now rejects both
+  conditions before attempt, prompt, or worktree creation; complete Codex
+  signature, version, schema, snapshot, and auth verification remains in `run`
+  before any model request.
+- Final integrated-head validation used only Python 3.13 as requested. The
+  host-level canonical suite ran 1,427 tests with 5 skips, and the independent
+  supervisor suite ran 271 tests with 4 skips. Ruff lint and the independent
+  package format gate, Python 3.13 compileall, Bash syntax, ShellCheck,
+  actionlint, canonical CI fixture equality, project-journal validation, the
+  official skill validator, `git diff --check`, and broker developer byte
+  reproduction all pass. The hosted-only broker `--check` remains a required
+  `macos-26` CI gate because this host does not provide the pinned
+  `/Applications/Xcode_26.6.app` toolchain path.

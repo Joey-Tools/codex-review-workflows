@@ -103,7 +103,7 @@ class StatefulLifecycleTest(unittest.TestCase):
             {
                 "version": 1,
                 "reviewer": "claude",
-                "egress_consent": "double-review",
+                "egress_consent": "explicit-claude-with-copilot-fallback",
                 "workspace": self.review.to_json(),
                 "keep_workspace": False,
                 "pid": 99999999,
@@ -161,7 +161,11 @@ class StatefulLifecycleTest(unittest.TestCase):
         summary = state.status(self.review.container_dir)
         self.assertFalse(summary["running"])
         self.assertEqual(summary["exit_code"], 0)
-        self.assertEqual(summary["egress_consent"], "double-review")
+        self.assertEqual(summary["review_contract"], "supplied-diff-no-git")
+        self.assertFalse(summary["named_lane_eligible"])
+        self.assertEqual(
+            summary["egress_consent"], "explicit-claude-with-copilot-fallback"
+        )
         self.assertEqual(len(summary["attempts"]), 1)
 
         exit_code, text = state.final(self.review.container_dir)
@@ -170,7 +174,7 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertFalse(self.review.workspace_root.exists())
         self.assertTrue(self.review.container_dir.exists())
 
-    def test_codex_unavailable_retains_preflight_workspace_until_cleanup(self) -> None:
+    def test_codex_unavailable_retains_helper_workspace_until_cleanup(self) -> None:
         self.write_codex_unavailable_state()
         self.write_passed_preflight(
             primary_diff=self.primary_diff_attestation(),
@@ -179,7 +183,7 @@ class StatefulLifecycleTest(unittest.TestCase):
         exit_code, text = state.final(self.review.container_dir)
 
         self.assertEqual(exit_code, 127)
-        self.assertIn("retained for clean-context fallback", text)
+        self.assertIn("legacy helper workspace retained for diagnosis only", text)
         self.assertTrue(self.review.workspace_root.exists())
         summary = state.status(self.review.container_dir)
         self.assertTrue(summary["fallback_workspace_retained"])
@@ -200,7 +204,9 @@ class StatefulLifecycleTest(unittest.TestCase):
             state.status(self.review.container_dir)["fallback_workspace_retained"]
         )
 
-    def test_fallback_accepts_bounded_preflight_larger_than_compact_evidence(self) -> None:
+    def test_fallback_accepts_bounded_preflight_larger_than_compact_evidence(
+        self,
+    ) -> None:
         self.write_codex_unavailable_state()
         evidence: dict[str, object] = {
             "review_range": f"{self.base}..{self.head}",
@@ -381,8 +387,12 @@ class StatefulLifecycleTest(unittest.TestCase):
     def test_concurrent_wait_serializes_workspace_cleanup(self) -> None:
         self.write_completed_state()
         with ThreadPoolExecutor(max_workers=2) as executor:
-            first = executor.submit(state.wait, self.review.container_dir, timeout_seconds=2)
-            second = executor.submit(state.wait, self.review.container_dir, timeout_seconds=2)
+            first = executor.submit(
+                state.wait, self.review.container_dir, timeout_seconds=2
+            )
+            second = executor.submit(
+                state.wait, self.review.container_dir, timeout_seconds=2
+            )
             self.assertEqual(first.result(timeout=2), 0)
             self.assertEqual(second.result(timeout=2), 0)
 
@@ -404,7 +414,9 @@ class StatefulLifecycleTest(unittest.TestCase):
             return metadata
 
         try:
-            with mock.patch.object(state.os, "stat", side_effect=stat_then_create_child):
+            with mock.patch.object(
+                state.os, "stat", side_effect=stat_then_create_child
+            ):
                 state._validate_private_directory_path_identity(
                     state_dir,
                     descriptor,
@@ -491,15 +503,19 @@ class StatefulLifecycleTest(unittest.TestCase):
 
     def test_private_lock_creation_avoids_redundant_mode_transition(self) -> None:
         lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
-        with mock.patch.object(state.os, "fchmod", wraps=os.fchmod) as fchmod:
-            with state.open_private_lock_file(
-                lock_path,
-                label="test cleanup lock",
-            ) as cleanup_lock:
-                self.assertEqual(
-                    stat.S_IMODE(os.fstat(cleanup_lock.fileno()).st_mode),
-                    0o600,
-                )
+        previous_umask = os.umask(0)
+        try:
+            with mock.patch.object(state.os, "fchmod", wraps=os.fchmod) as fchmod:
+                with state.open_private_lock_file(
+                    lock_path,
+                    label="test cleanup lock",
+                ) as cleanup_lock:
+                    self.assertEqual(
+                        stat.S_IMODE(os.fstat(cleanup_lock.fileno()).st_mode),
+                        0o600,
+                    )
+        finally:
+            os.umask(previous_umask)
 
         fchmod.assert_not_called()
 
@@ -998,7 +1014,7 @@ time.sleep(0.2)
             {
                 "version": 1,
                 "reviewer": "claude",
-                "egress_consent": "double-review",
+                "egress_consent": "explicit-claude-with-copilot-fallback",
                 "workspace": self.review.to_json(),
             },
         )
@@ -1013,9 +1029,7 @@ time.sleep(0.2)
             exit_code = state.run_state(state_dir=state_dir)
 
         self.assertEqual(exit_code, 128 + signal.SIGTERM)
-        runner_error = (state_dir / "runner-error.txt").read_text(
-            encoding="utf-8"
-        )
+        runner_error = (state_dir / "runner-error.txt").read_text(encoding="utf-8")
         self.assertIn(f"signal {int(signal.SIGTERM)}", runner_error)
         self.assertIn(str(carrier), runner_error)
         self.assertEqual(
@@ -1034,7 +1048,7 @@ time.sleep(0.2)
             {
                 "version": 1,
                 "reviewer": "claude",
-                "egress_consent": "double-review",
+                "egress_consent": "explicit-claude-with-copilot-fallback",
                 "workspace": self.review.to_json(),
             },
         )
@@ -1349,9 +1363,7 @@ time.sleep(0.2)
             ),
             mock.patch.object(state.subprocess, "Popen", return_value=process),
             mock.patch.object(state, "terminate_process_group") as terminate,
-            mock.patch.object(
-                state, "cleanup_workspace", return_value=None
-            ) as cleanup,
+            mock.patch.object(state, "cleanup_workspace", return_value=None) as cleanup,
         ):
             with self.assertRaises(BrokenPipeError):
                 state.start(
@@ -1438,9 +1450,7 @@ time.sleep(0.2)
                 "terminate_process_group",
                 side_effect=signal_during_cleanup,
             ) as terminate,
-            mock.patch.object(
-                state, "cleanup_workspace", return_value=None
-            ) as cleanup,
+            mock.patch.object(state, "cleanup_workspace", return_value=None) as cleanup,
         ):
             with self.assertRaises(state.ForwardedSignal) as raised:
                 state.start(

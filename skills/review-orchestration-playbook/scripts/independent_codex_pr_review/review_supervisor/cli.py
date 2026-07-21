@@ -56,7 +56,7 @@ def _add_source_arguments(parser: argparse.ArgumentParser) -> None:
 def _public_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="independent-codex-pr-review",
-        description="Task-scoped supervisor for the independent Codex PR-readiness gate.",
+        description="Task-scoped supervisor for low-level independent Codex review.",
     )
     parser.add_argument("--version", action="version", version=VERSION)
     subparsers = parser.add_subparsers(dest="command", required=True)

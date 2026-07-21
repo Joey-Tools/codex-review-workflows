@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 from review_supervisor.constants import (
+    MAX_EVIDENCE_PRIMARY_BYTES,
     PROCESS_ENVELOPE_BYTES,
     RELEASED_TTL_SECONDS,
     SCHEMA_VERSION,
@@ -35,6 +36,8 @@ from review_supervisor.supervisor import (
     _prepare_with_reclamation,
     _publish_final_authorization,
     _reclaim_released_attempts,
+    _require_primary_evidence_budget,
+    _resolve_codex,
     _settle_rewritten_process_charge,
     _terminate_incomplete_handoff,
     cleanup,
@@ -49,6 +52,45 @@ from tests.support import owned_temporary_directory
 
 TOOL_ROOT = pathlib.Path(__file__).resolve().parent.parent
 ENTRYPOINT = TOOL_ROOT / "independent-codex-pr-review"
+
+
+class PreflightAdmissionTests(unittest.TestCase):
+    def test_rejects_primary_diff_outside_final_evidence_budget(self) -> None:
+        for length in (0, MAX_EVIDENCE_PRIMARY_BYTES + 1):
+            with (
+                self.subTest(length=length),
+                self.assertRaises(SupervisorError) as caught,
+            ):
+                _require_primary_evidence_budget(length)
+
+            self.assertEqual(caught.exception.failure.stage, "evidence-admission")
+            self.assertEqual(
+                caught.exception.failure.code,
+                "primary-evidence-size-invalid",
+            )
+
+    def test_accepts_primary_diff_at_final_evidence_limit(self) -> None:
+        _require_primary_evidence_budget(MAX_EVIDENCE_PRIMARY_BYTES)
+
+    def test_rejects_missing_and_nonexecutable_codex_paths(self) -> None:
+        with owned_temporary_directory("codex-preflight-") as root:
+            missing = root / "missing-codex"
+            with self.assertRaises(SupervisorError) as missing_error:
+                _resolve_codex(str(missing))
+            self.assertEqual(
+                missing_error.exception.failure.stage,
+                "runtime-selection",
+            )
+
+            nonexecutable = root / "codex"
+            nonexecutable.write_bytes(b"not executable\n")
+            nonexecutable.chmod(0o600)
+            with self.assertRaises(SupervisorError) as mode_error:
+                _resolve_codex(str(nonexecutable))
+            self.assertEqual(
+                mode_error.exception.failure.code,
+                "codex-unavailable",
+            )
 
 
 def _write_exact_state(attempt: pathlib.Path, state: dict[str, object]) -> None:

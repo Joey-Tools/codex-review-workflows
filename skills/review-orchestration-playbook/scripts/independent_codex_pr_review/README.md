@@ -1,6 +1,7 @@
-# Independent Codex PR Review Supervisor v2
+# Independent Codex Low-Level Review Supervisor v2
 
-这是 `independent-codex-pr-review` gate 的任务级实现。它只在本目录的默认
+这是 `independent-codex-pr-review` 低层工具的任务级实现。它不满足 named single、
+double、triple review，也不是 canonical PR-readiness 的隐式门禁。它只在本目录的默认
 `runtime/` 下创建 supervisor 状态、独立 checkout 和测试临时文件，不修改目标仓库
 源码、文档、refs、当前 checkout 或 helper 状态。只有现有 access token 无法覆盖有界
 review deadline 时，`run` 才允许经过同一受限 Codex snapshot 执行 no-model managed-auth
@@ -53,8 +54,10 @@ $HELPER stateful final --state-dir "$HELPER_STATE"
 
 仅在 helper 已 terminal 后运行独立 preflight。它验证 exact repo/base/head、helper
 runner completion、primary-diff 双重 attestation、control directory 完整性、source
-metadata、账本、host floor、raw Git manifests、prompt bytes 和 exec argv budget；不会创建
-attempt、prompt 或 worktree，也不会启动 Codex。
+metadata、最终 primary-evidence byte limit、账本、host floor、raw Git manifests、prompt
+bytes、Codex path 的 stable regular/executable 形态和 exec argv budget；不会创建 attempt、
+prompt 或 worktree，也不会启动 Codex。Codex 的签名、版本、schema、snapshot 和 external
+auth generation 仍由 `run` 在任何 model request 之前完成验证。
 
 ```bash
 python3.13 "$SUPERVISOR" preflight \
