@@ -1071,6 +1071,22 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("zero inherited turns", journal)
         self.assertNotIn("fresh or otherwise clear-context", journal)
 
+    def test_readme_separates_canonical_claude_from_helper_only_details(self) -> None:
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        boundary = readme.index("## Low-Level `isolated_review` Helper Only")
+
+        self.assertLess(readme.index("accepted real-`HOME`"), boundary)
+        for helper_detail in (
+            "private, checksum-keyed executable snapshot",
+            "dedicated writable `/auth` carrier root",
+            "Low-level helper Claude authentication",
+            "Low-level helper local-login refresh writeback",
+            "For the low-level helper, missing, malformed, unsafe",
+        ):
+            self.assertGreater(readme.index(helper_detail), boundary)
+        self.assertIn("not requirements or guarantees of the canonical direct Claude lane", readme)
+        self.assertIn("cannot satisfy named double or triple review", readme)
+
     def test_core_active_policy_has_no_retired_codex_pr_gate_names(self) -> None:
         active_policy = (
             REPO_ROOT / "AGENTS.md",
