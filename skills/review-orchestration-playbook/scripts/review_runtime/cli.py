@@ -47,7 +47,10 @@ def _add_review_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--head-ref", required=True, help="Frozen head commit-ish.")
     parser.add_argument(
         "--prompt-file",
-        help="Optional prompt template supporting review placeholders.",
+        help=(
+            "Optional supplemental prompt template supporting review placeholders; "
+            "it cannot replace the helper's mandatory review boundary."
+        ),
     )
     parser.add_argument(
         "--keep-workspace",
