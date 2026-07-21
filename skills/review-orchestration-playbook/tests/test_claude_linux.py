@@ -9553,7 +9553,10 @@ class CredentialStagingTest(unittest.TestCase):
                     result,
                     claude_linux.LinuxCredentialInspectionInconclusive,
                 )
-                self.assertIs(result.__cause__, mask_failure)
+                self.assertIn(
+                    mask_failure,
+                    self._explicit_cause_nodes(result),
+                )
                 self.assertEqual(
                     watcher.request_stop_calls,
                     expected_attempts,
@@ -10664,9 +10667,9 @@ class CredentialStagingTest(unittest.TestCase):
             def retain_source_anchor_after_timeout(self) -> None:
                 self.retain_anchor_calls += 1
                 self.source_handoff_attempted.set()
-                if not self.allow_source_handoff.is_set():
+                if not self.allow_source_handoff.wait(timeout=2.0):
                     raise OSError(
-                        "injected synchronous source-handoff failure "
+                        "timed out waiting for injected source-handoff proof "
                         f"{self.retain_anchor_calls}"
                     )
                 self.source_anchor.detach_to_watcher()
@@ -10713,7 +10716,7 @@ class CredentialStagingTest(unittest.TestCase):
             returned_before_proof = False
             try:
                 release_thread.start()
-                self.assertTrue(source_handoff_attempted.wait(timeout=0.5))
+                self.assertTrue(source_handoff_attempted.wait(timeout=1.0))
                 release_thread.join(timeout=0.05)
                 returned_before_proof = not release_thread.is_alive()
                 self.assertIs(

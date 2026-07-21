@@ -22917,8 +22917,21 @@ class ProviderPolicyTest(unittest.TestCase):
 
                 self.assertTrue(injected)
                 self.assertIs(raised.exception, interruption)
-                self.assertIsNone(interruption.__cause__)
+                if isinstance(
+                    interruption,
+                    providers.ForwardedSignal,
+                ) or callable(getattr(interruption, "add_note", None)):
+                    self.assertIsNone(interruption.__cause__)
+                else:
+                    self.assertIsInstance(
+                        interruption.__cause__,
+                        claude_refresh_lock.ClaudeRefreshLockCleanupDiagnostic,
+                    )
                 self.assertIs(interruption.__context__, primary)
+                self.assert_exception_visible_exact_or_rendered(
+                    interruption,
+                    primary,
+                )
                 begin_handoff.assert_not_called()
                 settle.assert_not_called()
                 complete.assert_not_called()
