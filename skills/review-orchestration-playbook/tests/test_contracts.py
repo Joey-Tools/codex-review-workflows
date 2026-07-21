@@ -1189,7 +1189,7 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn(anchor, skill)
 
         for anchor in (
-            "pre-status isolated clone",
+            "pre-status isolated reachable-object import",
             "Never derive a formal named-lane range from a dirty working tree",
             "Expose the workspace and Git metadata for read-only reviewer behavior",
             "free of generated prompts, diff files, manifests, state directories, and helper control artifacts",
@@ -1524,7 +1524,7 @@ class RepositoryContractTest(unittest.TestCase):
             )
         ]
         ordered_anchors = (
-            "pre-status isolated clone",
+            "pre-status isolated reachable-object import",
             "Before checkout",
             "Materialize `head_sha` only after that audit",
             "As the first worktree-status operation",
@@ -1540,7 +1540,6 @@ class RepositoryContractTest(unittest.TestCase):
             "`GIT_CONFIG_GLOBAL=/dev/null`",
             "`GIT_CONFIG_SYSTEM=/dev/null`",
             "`GIT_ATTR_NOSYSTEM=1`",
-            "`GIT_CEILING_DIRECTORIES=<source-parent>`",
             "`GIT_CEILING_DIRECTORIES=<destination-parent>`",
             "`GIT_NO_LAZY_FETCH=1`",
             "`GIT_NO_REPLACE_OBJECTS=1`",
@@ -1551,16 +1550,18 @@ class RepositoryContractTest(unittest.TestCase):
             "-c core.fsmonitor=false",
             "-c core.attributesFile=/dev/null",
             "-c submodule.recurse=false",
-            "--no-checkout --no-hardlinks",
-            "--reject-shallow",
-            "--no-recurse-submodules",
-            "promisor dependency",
+            "250,000 reachable objects",
+            "2 GiB of reachable logical object bytes",
+            "256 MiB compressed pack",
+            "pack-objects --stdout --no-reuse-delta --no-reuse-object",
+            "index-pack --stdin --strict --max-input-size=<256 MiB>",
+            "destination's complete object inventory",
+            "promisor markers/configuration",
             "sibling `.bundle` / `.git` suffix discovery",
             "exact `.git` marker",
             "bounded full object-validity `git fsck`",
-            "alternate-dependent",
-            "`commondir`, `config.worktree`, or per-worktree config",
-            "`.git/objects/info/alternates`",
+            "no `commondir`, `config.worktree`, per-worktree config",
+            "alternate, HTTP-alternate, shallow, sparse, promisor, or bitmap state",
             "executable clean/smudge/process filter",
             "The guard's forced ordinary/staged status is the first status query",
             "recorded device, inode, and owner",
@@ -1568,7 +1569,7 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn(anchor, shared)
 
         self.assertIn("never use `git worktree add`", shared)
-        self.assertIn("`git clone -c`", shared)
+        self.assertIn("never loaded by Git", shared)
         self.assertIn("cleanup failure must report the exact retained path", skill)
         self.assertIn("complete flushed success receipt", skill)
         self.assertNotIn("parent-validated native Git", shared)
@@ -2163,8 +2164,9 @@ class RepositoryContractTest(unittest.TestCase):
             '"disableBundledSkills": true',
             "`--safe-mode` alone is not evidence that bundled skills are absent",
             '"denyWrite": ["/"]',
-            "owner-private, lane-local, no-checkout local clone",
-            "no remote transport",
+            "owner-private lane-local repository",
+            "private destination inventory is exact",
+            "remote transport",
             "GIT_NO_LAZY_FETCH=1",
             "locally complete",
             "never run `fetch`, `pull`",

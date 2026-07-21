@@ -1197,6 +1197,15 @@ class NamedLaneGuardTest(unittest.TestCase):
         base = self.commit("base")
         (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
         head = self.commit("head")
+        (self.repo / "unrelated-large.bin").write_bytes(os.urandom(2 * 1024 * 1024))
+        unrelated_head = self.commit("unrelated side history")
+        unrelated_blob = git(
+            self.repo,
+            "rev-parse",
+            f"{unrelated_head}:unrelated-large.bin",
+        )
+        git(self.repo, "branch", "unrelated-side", unrelated_head)
+        git(self.repo, "reset", "--hard", head)
         destination = self.root / "lane"
         original_capture = named_lane_runtime.run_bounded_capture
 
@@ -1205,12 +1214,17 @@ class NamedLaneGuardTest(unittest.TestCase):
             "run_bounded_capture",
             wraps=original_capture,
         ) as capture:
-            result = materialize_worktree(
-                self.repo.resolve(),
-                destination,
-                base,
-                head,
-            )
+            with mock.patch.object(
+                named_lane_runtime,
+                "MATERIALIZER_PACK_BYTES_LIMIT",
+                128 * 1024,
+            ):
+                result = materialize_worktree(
+                    self.repo.resolve(),
+                    destination,
+                    base,
+                    head,
+                )
 
         self.assertEqual(result.root, destination)
         self.assertEqual(result.base_sha, base)
@@ -1266,17 +1280,32 @@ class NamedLaneGuardTest(unittest.TestCase):
             "false",
         )
         tracked_blob = git(self.repo, "rev-parse", f"{head}:tracked.txt")
-        source_object = (
-            self.repo / ".git" / "objects" / tracked_blob[:2] / tracked_blob[2:]
-        )
-        materialized_object = (
-            destination / ".git" / "objects" / tracked_blob[:2] / tracked_blob[2:]
-        )
-        self.assertTrue(source_object.is_file())
-        self.assertTrue(materialized_object.is_file())
-        self.assertNotEqual(
-            (source_object.stat().st_dev, source_object.stat().st_ino),
-            (materialized_object.stat().st_dev, materialized_object.stat().st_ino),
+        git(destination, "cat-file", "-e", tracked_blob)
+        for unrelated_object in (unrelated_head, unrelated_blob):
+            absent = subprocess.run(
+                (
+                    "git",
+                    "-C",
+                    str(destination),
+                    "cat-file",
+                    "-e",
+                    unrelated_object,
+                ),
+                check=False,
+                env={
+                    **os.environ,
+                    "GIT_CONFIG_GLOBAL": os.devnull,
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CONFIG_SYSTEM": os.devnull,
+                    "GIT_NO_LAZY_FETCH": "1",
+                },
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(absent.returncode, 0)
+        self.assertNotIn(
+            "refs/heads/unrelated-side",
+            git(destination, "for-each-ref", "--format=%(refname)").splitlines(),
         )
         validated = validate_worktree(destination, head)
         self.assertEqual(validated.head_sha, head)
@@ -1294,40 +1323,41 @@ class NamedLaneGuardTest(unittest.TestCase):
                 self.assertEqual(command[commit_graph_index - 1], "-c")
                 multi_pack_index = command.index("core.multiPackIndex=false")
                 self.assertEqual(command[multi_pack_index - 1], "-c")
-        clone = next(command for command in commands if "clone" in command)
-        clone_index = clone.index("clone")
-        self.assertLess(
-            max(index for index, item in enumerate(clone) if item == "-c"), clone_index
+        for forbidden in ("clone", "fetch", "upload-pack"):
+            self.assertFalse(any(forbidden in command for command in commands))
+        init = next(command for command in commands if "init" in command)
+        self.assertIn("--object-format=sha1", init)
+        self.assertTrue(any(item.startswith("--template=") for item in init))
+        pack = next(command for command in commands if "pack-objects" in command)
+        self.assertIn("--stdout", pack)
+        self.assertIn("--no-reuse-delta", pack)
+        self.assertIn("--no-reuse-object", pack)
+        self.assertNotIn("--revs", pack)
+        self.assertNotIn("--all", pack)
+        index_pack = next(command for command in commands if "index-pack" in command)
+        self.assertIn("--stdin", index_pack)
+        self.assertIn("--strict", index_pack)
+        self.assertTrue(
+            any(item.startswith("--max-input-size=") for item in index_pack)
         )
-        self.assertIn("--local", clone)
-        self.assertIn("--no-checkout", clone)
-        self.assertIn("--no-hardlinks", clone)
-        self.assertIn("--reject-shallow", clone)
-        self.assertIn("--no-recurse-submodules", clone)
-        self.assertTrue(any(item.startswith("--template=") for item in clone))
-
-        clone_call = next(
-            call for call in capture.call_args_list if "clone" in tuple(call.args[0])
+        init_call = next(
+            call for call in capture.call_args_list if "init" in tuple(call.args[0])
         )
-        clone_environment = clone_call.kwargs["env"]
-        clone_cwd = pathlib.Path(clone_call.kwargs["cwd"])
-        self.assertEqual(clone_cwd.name, "tmp")
-        self.assertTrue(clone_cwd.parent.name.startswith(".named-lane-materializer-"))
-        self.assertEqual(clone_cwd.parent.parent, self.root)
+        init_environment = init_call.kwargs["env"]
+        materializer_cwd = pathlib.Path(init_call.kwargs["cwd"])
+        self.assertEqual(materializer_cwd.name, "tmp")
+        self.assertTrue(
+            materializer_cwd.parent.name.startswith(".named-lane-materializer-")
+        )
+        self.assertEqual(materializer_cwd.parent.parent, self.root)
         for call in capture.call_args_list:
-            self.assertEqual(pathlib.Path(call.kwargs["cwd"]), clone_cwd)
-            command = tuple(call.args[0])
-            expected_ceiling = (
-                self.repo.resolve().parent
-                if "--show-toplevel" in command or "--absolute-git-dir" in command
-                else destination.parent
-            )
+            self.assertEqual(pathlib.Path(call.kwargs["cwd"]), materializer_cwd)
             self.assertEqual(
                 call.kwargs["env"]["GIT_CEILING_DIRECTORIES"],
-                str(expected_ceiling),
+                str(destination.parent),
             )
         self.assertEqual(
-            set(clone_environment),
+            set(init_environment),
             {
                 "GIT_ASKPASS",
                 "GIT_ATTR_NOSYSTEM",
@@ -1348,30 +1378,46 @@ class NamedLaneGuardTest(unittest.TestCase):
                 "XDG_CONFIG_HOME",
             },
         )
-        self.assertEqual(clone_environment["GIT_ASKPASS"], "/usr/bin/false")
+        self.assertEqual(init_environment["GIT_ASKPASS"], "/usr/bin/false")
         self.assertEqual(
-            clone_environment["GIT_CEILING_DIRECTORIES"],
+            init_environment["GIT_CEILING_DIRECTORIES"],
             str(destination.parent),
         )
-        self.assertEqual(clone_environment["GIT_CONFIG_GLOBAL"], os.devnull)
-        self.assertEqual(clone_environment["GIT_CONFIG_NOSYSTEM"], "1")
-        self.assertEqual(clone_environment["GIT_CONFIG_SYSTEM"], os.devnull)
-        self.assertEqual(clone_environment["GIT_ATTR_NOSYSTEM"], "1")
-        self.assertEqual(clone_environment["GIT_NO_LAZY_FETCH"], "1")
-        self.assertEqual(clone_environment["GIT_NO_REPLACE_OBJECTS"], "1")
-        self.assertEqual(clone_environment["GIT_TERMINAL_PROMPT"], "0")
-        self.assertEqual(clone_environment["GIT_OPTIONAL_LOCKS"], "0")
-        self.assertEqual(clone_environment["GIT_PAGER"], "cat")
-        self.assertEqual(clone_environment["PAGER"], "cat")
-        self.assertNotIn("GIT_TEMPLATE_DIR", clone_environment)
-        self.assertNotIn("TMPDIR", clone_environment)
-        self.assertNotEqual(clone_environment["HOME"], str(pathlib.Path.home()))
+        self.assertEqual(init_environment["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(init_environment["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(init_environment["GIT_CONFIG_SYSTEM"], os.devnull)
+        self.assertEqual(init_environment["GIT_ATTR_NOSYSTEM"], "1")
+        self.assertEqual(init_environment["GIT_NO_LAZY_FETCH"], "1")
+        self.assertEqual(init_environment["GIT_NO_REPLACE_OBJECTS"], "1")
+        self.assertEqual(init_environment["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(init_environment["GIT_OPTIONAL_LOCKS"], "0")
+        self.assertEqual(init_environment["GIT_PAGER"], "cat")
+        self.assertEqual(init_environment["PAGER"], "cat")
+        self.assertNotIn("GIT_TEMPLATE_DIR", init_environment)
+        self.assertNotIn("TMPDIR", init_environment)
+        self.assertNotEqual(init_environment["HOME"], str(pathlib.Path.home()))
         self.assertNotEqual(
-            clone_environment["XDG_CONFIG_HOME"],
+            init_environment["XDG_CONFIG_HOME"],
             os.environ.get("XDG_CONFIG_HOME"),
         )
+        pack_call = next(
+            call
+            for call in capture.call_args_list
+            if "pack-objects" in tuple(call.args[0])
+        )
+        self.assertEqual(
+            pack_call.kwargs["env"]["GIT_ALTERNATE_OBJECT_DIRECTORIES"],
+            str((self.repo / ".git" / "objects").resolve()),
+        )
+        self.assertFalse(
+            any(
+                str(self.repo.resolve()) in argument
+                for command in commands
+                for argument in command
+            )
+        )
 
-    def test_materializer_ignores_a_forged_copied_commit_graph(self) -> None:
+    def test_materializer_ignores_a_forged_source_commit_graph(self) -> None:
         (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
         base = self.commit("base")
         (self.repo / "head-only.txt").write_text("head only\n", encoding="utf-8")
@@ -1439,7 +1485,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             (destination / "head-only.txt").read_text(encoding="utf-8"),
             "head only\n",
         )
-        self.assertTrue(
+        self.assertFalse(
             (destination / ".git" / "objects" / "info" / "commit-graph").is_file()
         )
         self.assertEqual(
@@ -1643,7 +1689,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         destination = self.root / "forged-pack-index-lane"
         with self.assertRaisesRegex(
             NamedLaneGuardError,
-            "bounded materializer Git fsck failed",
+            r"bounded materializer Git (?:ls-tree|fsck) failed",
         ):
             materialize_worktree(
                 self.repo.resolve(),
@@ -1665,10 +1711,10 @@ class NamedLaneGuardTest(unittest.TestCase):
         original_capture = named_lane_runtime.run_bounded_capture
         observed_fenced_cwd = False
 
-        def probe_clone_cwd(argv: object, **kwargs: object) -> object:
+        def probe_init_cwd(argv: object, **kwargs: object) -> object:
             nonlocal observed_fenced_cwd
             command = tuple(argv)
-            if not observed_fenced_cwd and "clone" in command:
+            if not observed_fenced_cwd and "init" in command:
                 probe = original_capture(
                     (
                         str(named_lane_runtime.resolve_git()),
@@ -1693,7 +1739,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         with mock.patch.object(
             named_lane_runtime,
             "run_bounded_capture",
-            side_effect=probe_clone_cwd,
+            side_effect=probe_init_cwd,
         ):
             materialize_worktree(
                 self.repo.resolve(),
@@ -1744,7 +1790,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             nonlocal removed_target_head
             command = tuple(argv)
             result = original_capture(command, **kwargs)
-            if not removed_target_head and "clone" in command:
+            if not removed_target_head and "init" in command:
                 (destination / ".git" / "HEAD").unlink()
                 removed_target_head = True
             return result
@@ -2002,7 +2048,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         def inject_hook(argv: object, **kwargs: object) -> object:
             nonlocal injected
             result = original_capture(argv, **kwargs)
-            if not injected and "clone" in tuple(argv):
+            if not injected and "init" in tuple(argv):
                 target_hooks = destination / ".git" / "hooks"
                 target_hooks.mkdir(exist_ok=True)
                 shutil.copy2(probe, target_hooks / "post-checkout")
@@ -2055,6 +2101,220 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertFalse(
             (destination / ".git" / "objects" / "info" / "alternates").exists()
         )
+
+    def test_materializer_rejects_linked_source_per_worktree_shallow_state(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit("head")
+        linked_source = self.root / "linked-shallow-source"
+        git(
+            self.repo,
+            "worktree",
+            "add",
+            "--detach",
+            str(linked_source),
+            head,
+        )
+        linked_admin = pathlib.Path(
+            git(linked_source, "rev-parse", "--absolute-git-dir")
+        )
+        shallow = linked_admin / "shallow"
+        destination = self.root / "linked-shallow-lane"
+        shallow.write_bytes(b"")
+        try:
+            with self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "per-worktree shallow repository state is not allowed",
+            ):
+                materialize_worktree(
+                    linked_source.resolve(),
+                    destination,
+                    base,
+                    head,
+                )
+        finally:
+            shallow.unlink(missing_ok=True)
+
+        self.assertFalse(destination.exists())
+        self.assertEqual(list(self.root.glob(".named-lane-materializer-*")), [])
+
+    def test_materializer_preserves_sha256_object_format(self) -> None:
+        sha256_repo = self.root / "sha256-repo"
+        sha256_repo.mkdir()
+        git(sha256_repo, "init", "-b", "master", "--object-format=sha256")
+        git(sha256_repo, "config", "user.name", "Named Lane Test")
+        git(
+            sha256_repo,
+            "config",
+            "user.email",
+            "named-lane@example.invalid",
+        )
+        git(sha256_repo, "config", "commit.gpgsign", "false")
+        (sha256_repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        git(sha256_repo, "add", "-A")
+        git(sha256_repo, "commit", "-m", "base")
+        base = git(sha256_repo, "rev-parse", "HEAD")
+        (sha256_repo / "tracked.txt").write_text("head\n", encoding="utf-8")
+        git(sha256_repo, "add", "-A")
+        git(sha256_repo, "commit", "-m", "head")
+        head = git(sha256_repo, "rev-parse", "HEAD")
+        destination = self.root / "sha256-lane"
+
+        result = materialize_worktree(
+            sha256_repo.resolve(),
+            destination,
+            base,
+            head,
+        )
+
+        self.assertEqual(len(head), 64)
+        self.assertEqual(result.head_sha, head)
+        self.assertEqual(
+            git(destination, "config", "--local", "extensions.objectFormat"),
+            "sha256",
+        )
+        self.assertEqual(validate_worktree(destination, head).head_sha, head)
+
+    def test_materializer_hard_caps_fail_closed_and_clean_destination(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "tracked.txt").write_text("head payload\n", encoding="utf-8")
+        head = self.commit("head")
+        cases = (
+            (
+                "source-control-bytes",
+                "MATERIALIZER_SOURCE_CONTROL_FILE_LIMIT_BYTES",
+                1,
+                "exact Git worktree root",
+            ),
+            (
+                "object-count",
+                "MATERIALIZER_OBJECT_COUNT_LIMIT",
+                1,
+                "object-count limit",
+            ),
+            (
+                "logical-bytes",
+                "MATERIALIZER_LOGICAL_OBJECT_BYTES_LIMIT",
+                1,
+                "logical-byte limit",
+            ),
+            (
+                "checkout-entries",
+                "MATERIALIZER_CHECKOUT_ENTRY_COUNT_LIMIT",
+                1,
+                "entry-count limit",
+            ),
+            (
+                "checkout-blobs",
+                "MATERIALIZER_CHECKOUT_BLOB_BYTES_LIMIT",
+                1,
+                "blob-occurrence-byte limit",
+            ),
+            (
+                "checkout-paths",
+                "MATERIALIZER_CHECKOUT_PATH_BYTES_LIMIT",
+                1,
+                "aggregate-path-byte limit",
+            ),
+            (
+                "pack-bytes",
+                "MATERIALIZER_PACK_BYTES_LIMIT",
+                64,
+                "compressed-byte limit",
+            ),
+        )
+
+        for label, constant, limit, expected in cases:
+            with self.subTest(label=label):
+                destination = self.root / f"capped-{label}-lane"
+                with (
+                    mock.patch.object(named_lane_runtime, constant, limit),
+                    self.assertRaisesRegex(NamedLaneGuardError, expected),
+                ):
+                    materialize_worktree(
+                        self.repo.resolve(),
+                        destination,
+                        base,
+                        head,
+                    )
+
+                self.assertFalse(destination.exists())
+                self.assertEqual(
+                    list(self.root.glob(".named-lane-materializer-*")),
+                    [],
+                )
+
+    def test_materializer_rejects_source_promisor_configuration(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        head = self.commit("base")
+        config = self.repo / ".git" / "config"
+        original_config = config.read_bytes()
+        cases = (
+            ("partial-clone", b"[extensions]\n\tpartialClone = origin\n"),
+            ("promisor-remote", b'[remote "origin"]\n\tpromisor = true\n'),
+        )
+
+        for label, addition in cases:
+            with self.subTest(label=label):
+                config.write_bytes(original_config + addition)
+                destination = self.root / f"source-{label}-lane"
+                try:
+                    with self.assertRaisesRegex(
+                        NamedLaneGuardError,
+                        "source Git promisor configuration is not allowed",
+                    ):
+                        materialize_worktree(
+                            self.repo.resolve(),
+                            destination,
+                            head,
+                            head,
+                        )
+                finally:
+                    config.write_bytes(original_config)
+
+                self.assertFalse(destination.exists())
+
+    def test_materializer_rejects_source_alternates_shallow_and_promisor_state(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        head = self.commit("base")
+        objects = self.repo / ".git" / "objects"
+        info = objects / "info"
+        pack = objects / "pack"
+        info.mkdir(exist_ok=True)
+        pack.mkdir(exist_ok=True)
+        cases = (
+            (info / "alternates", b"", "alternates is not allowed"),
+            (
+                info / "http-alternates",
+                b"",
+                "HTTP alternates is not allowed",
+            ),
+            (self.repo / ".git" / "shallow", b"", "shallow repository state"),
+            (pack / "source.promisor", b"", "promisor state is not allowed"),
+        )
+
+        for index, (state_path, payload, expected) in enumerate(cases):
+            with self.subTest(path=state_path.name):
+                state_path.write_bytes(payload)
+                destination = self.root / f"source-state-{index}-lane"
+                try:
+                    with self.assertRaisesRegex(NamedLaneGuardError, expected):
+                        materialize_worktree(
+                            self.repo.resolve(),
+                            destination,
+                            head,
+                            head,
+                        )
+                finally:
+                    state_path.unlink(missing_ok=True)
+
+                self.assertFalse(destination.exists())
 
     def test_materializer_rejects_unsafe_target_config_before_checkout(self) -> None:
         (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
@@ -2124,7 +2384,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     command = tuple(argv)
                     commands.append(command)
                     result = original_capture(command, **kwargs)
-                    if not injected and "clone" in command:
+                    if not injected and "init" in command:
                         if value is None:
                             section, name = key.split(".", 1)
                             with (destination / ".git" / "config").open(
@@ -2160,7 +2420,6 @@ class NamedLaneGuardTest(unittest.TestCase):
         base = self.commit("base")
         (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
         head = self.commit("head")
-        tracked_blob = git(self.repo, "rev-parse", f"{head}:tracked.txt")
         original_capture = named_lane_runtime.run_bounded_capture
         cases = (
             ("commondir", "commondir state"),
@@ -2170,7 +2429,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             ("shallow", "shallow repository state"),
             ("promisor", "promisor state"),
             ("promisor-mixed-case", "promisor state"),
-            ("missing-object", "materializer Git fsck failed"),
+            ("missing-object", "object inventory does not match"),
         )
 
         for label, expected in cases:
@@ -2182,7 +2441,12 @@ class NamedLaneGuardTest(unittest.TestCase):
                     nonlocal injected
                     command = tuple(argv)
                     result = original_capture(command, **kwargs)
-                    if not injected and "clone" in command:
+                    injection_point = (
+                        "index-pack" in command
+                        if label == "missing-object"
+                        else "init" in command
+                    )
+                    if not injected and injection_point:
                         if label == "commondir":
                             (destination / ".git" / "commondir").write_text(
                                 "../shared\n",
@@ -2219,14 +2483,10 @@ class NamedLaneGuardTest(unittest.TestCase):
                             )
                             (pack / suffix).write_bytes(b"")
                         else:
-                            loose_object = (
-                                destination
-                                / ".git"
-                                / "objects"
-                                / tracked_blob[:2]
-                                / tracked_blob[2:]
-                            )
-                            loose_object.unlink()
+                            for packed_object in (
+                                destination / ".git" / "objects" / "pack"
+                            ).iterdir():
+                                packed_object.unlink()
                         injected = True
                     return result
 
@@ -2282,7 +2542,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             nonlocal injected
             command = tuple(argv)
             result = original_capture(command, **kwargs)
-            if not injected and "clone" in command:
+            if not injected and "init" in command:
                 git(destination, "config", "core.fsmonitor", "/usr/bin/false")
                 injected = True
             return result
@@ -2336,6 +2596,33 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(retained, target)
         self.assertTrue(target.is_dir())
         self.assertTrue(original.is_dir())
+
+    def test_materializer_cleanup_propagates_control_flow_base_exceptions(
+        self,
+    ) -> None:
+        for control_flow in (
+            KeyboardInterrupt(),
+            SystemExit(7),
+            ForwardedSignal(signal.SIGTERM),
+        ):
+            with self.subTest(control_flow=type(control_flow).__name__):
+                target = self.root / f"cleanup-{type(control_flow).__name__}"
+                target.mkdir(mode=0o700)
+                expected_identity = named_lane_runtime._directory_identity(
+                    target.lstat()
+                )
+                with mock.patch.object(
+                    named_lane_runtime.shutil,
+                    "rmtree",
+                    side_effect=control_flow,
+                ):
+                    with self.assertRaises(type(control_flow)):
+                        named_lane_runtime._cleanup_materializer_path(
+                            target,
+                            self.root,
+                            named_lane_runtime._directory_identity(self.root.lstat()),
+                            expected_identity,
+                        )
 
     def test_materializer_cli_structures_signal_during_python_cleanup_window(
         self,
@@ -2773,7 +3060,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             if pathlib.Path(path) == destination:
                 cleanup_failed = True
                 signal.raise_signal(signal.SIGINT)
-                raise OSError("simulated rollback failure")
+                raise RecursionError("simulated deep-tree rollback failure")
             original_rmtree(path, *args, **kwargs)
 
         def interrupt_outer_terminal_teardown(previous: object) -> None:
@@ -4210,6 +4497,99 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertFalse(stdout.exists())
         self.assertFalse(stderr.exists())
         self.assertEqual(list(self.root.glob(".named-lane-*")), [])
+
+    def test_initial_output_fstat_failure_removes_temporary_leaf(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("print('captured')\n")
+        stdout = self.root / "fstat-stdout.bin"
+        stderr = self.root / "fstat-stderr.bin"
+        real_fstat = os.fstat
+        failed_once = False
+
+        def fail_temporary_fstat(descriptor: int) -> os.stat_result:
+            nonlocal failed_once
+            if not failed_once and list(self.root.glob(".named-lane-*")):
+                failed_once = True
+                raise OSError("synthetic temporary fstat failure")
+            return real_fstat(descriptor)
+
+        with mock.patch.object(
+            named_lane_runtime.os,
+            "fstat",
+            side_effect=fail_temporary_fstat,
+        ):
+            with self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "temporary file cannot be inspected safely",
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=stdout,
+                    stderr_path=stderr,
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=64,
+                )
+
+        self.assertTrue(failed_once)
+        self.assertFalse(stdout.exists())
+        self.assertFalse(stderr.exists())
+        self.assertEqual(list(self.root.glob(".named-lane-*")), [])
+
+    def test_persistent_output_fstat_failure_retains_unverified_temporary_leaf(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("print('captured')\n")
+        stdout = self.root / "persistent-fstat-stdout.bin"
+        stderr = self.root / "persistent-fstat-stderr.bin"
+        real_fstat = os.fstat
+        failure_count = 0
+
+        def fail_stderr_temporary_fstat(descriptor: int) -> os.stat_result:
+            nonlocal failure_count
+            if stdout.exists() and list(self.root.glob(".named-lane-*")):
+                failure_count += 1
+                raise OSError("synthetic persistent temporary fstat failure")
+            return real_fstat(descriptor)
+
+        retained_path: pathlib.Path | None = None
+        try:
+            with mock.patch.object(
+                named_lane_runtime.os,
+                "fstat",
+                side_effect=fail_stderr_temporary_fstat,
+            ):
+                with self.assertRaisesRegex(
+                    NamedLaneGuardError,
+                    "temporary cleanup remained incomplete",
+                ) as context:
+                    run_claude(
+                        worktree=self.repo.resolve(),
+                        stdout_path=stdout,
+                        stderr_path=stderr,
+                        command=(str(executable),),
+                        prompt=b"",
+                        timeout_seconds=2.0,
+                        stream_limit_bytes=64,
+                    )
+
+            retained = list(self.root.glob(".named-lane-*"))
+            self.assertEqual(failure_count, 2)
+            self.assertEqual(len(retained), 1)
+            retained_path = retained[0]
+            self.assertIn(
+                f"retained Claude output temporary path: {retained_path}",
+                str(context.exception),
+            )
+            self.assertFalse(stdout.exists())
+            self.assertFalse(stderr.exists())
+        finally:
+            if retained_path is not None:
+                retained_path.unlink(missing_ok=True)
 
     def test_output_publication_requires_signal_mask_before_writing(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
