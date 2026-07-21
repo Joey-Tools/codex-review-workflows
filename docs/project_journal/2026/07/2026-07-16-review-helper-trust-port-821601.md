@@ -526,3 +526,26 @@ metadata behavior.
   constants inside `test_lfs.py` and removes the three standalone fixture
   blobs instead of weakening detection. The focused Python 3.13 LFS parser
   suite passes; the replacement head must repeat all exact-head gates.
+- A fresh-context Codex review of
+  `7e8a718c799b7968b45e306cbdcb02d8b5879f57..8ed6d197d6715dbcf00d7c9429c4ad640be37ffd`
+  found two private-state custody gaps. Retention and checkout roots checked
+  only POSIX owner/write bits, so a macOS extended ACL could expose or permit
+  mutation. Recursive path creation and later absolute-path reopen also did
+  not authenticate writable ancestors or retain the retention-root identity.
+- Private runtime paths now use a component-by-component no-follow descriptor
+  walk with root/current-user ownership, non-writable ancestor policy, a
+  narrow sticky-directory exception, and fixed root-owned Darwin aliases.
+  Descriptor-based macOS metadata inspection rejects every ACL, quarantine,
+  and unknown xattr on private nodes while allowing only OS-created provenance
+  metadata; trusted system ancestors additionally permit rootless metadata.
+  The retention lease holds its root descriptor, creates attempts with
+  `mkdirat`, revalidates the lexical binding, and records durable retention and
+  attempt identities. Private state, prompt, final, settlement, cleanup, and
+  runtime artifacts are checked both at creation and after reopen/publication.
+- Remediation validation used only Python 3.13. The host-level main suite ran
+  1,740 tests with 6 expected platform skips, and the deterministic independent
+  suite ran 299 tests with zero skips. Ruff lint and formatting, compileall,
+  project-journal validation, the official skill validator, and
+  `git diff --check` pass. Under the repository's operator-enforced policy, the
+  seven-test trusted-Mac live gate remains current-head PR evidence and must be
+  run after the final branch push rather than embedded in this pre-push commit.

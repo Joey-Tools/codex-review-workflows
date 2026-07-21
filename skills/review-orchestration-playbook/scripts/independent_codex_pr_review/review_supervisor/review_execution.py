@@ -8,7 +8,6 @@ import pwd
 import secrets
 import shutil
 import signal
-import stat
 import sys
 import time
 from dataclasses import dataclass, replace
@@ -60,6 +59,10 @@ from .no_child_profile import (
     launch_prepared_no_child_process,
     prepare_custodied_snapshot_no_child_profile,
 )
+from .secureio import (
+    open_absolute_directory_chain,
+    validate_private_directory_fd,
+)
 
 
 _SAFE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
@@ -105,8 +108,18 @@ class _RuntimeLease:
         if not name or name in {".", ".."} or "/" in name or "\x00" in name:
             raise ValueError("runtime child name is invalid")
         path = self.root / name
-        os.mkdir(path, 0o700)
-        _require_owner_only_directory(path, label="runtime child")
+        raw_name = os.fsencode(name)
+        os.mkdir(raw_name, 0o700, dir_fd=self.root_fd)
+        os.fsync(self.root_fd)
+        child_fd = os.open(
+            raw_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=self.root_fd,
+        )
+        try:
+            validate_private_directory_fd(child_fd, path)
+        finally:
+            os.close(child_fd)
         _require_empty_directory(path, label="runtime child")
         return path
 
@@ -958,13 +971,11 @@ def _canonical_absolute_path(path: pathlib.Path, *, label: str) -> pathlib.Path:
 
 def _require_owner_only_directory(path: pathlib.Path, *, label: str) -> None:
     value = _canonical_absolute_path(path, label=label)
-    metadata = os.lstat(value)
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != os.getuid()
-        or stat.S_IMODE(metadata.st_mode) != 0o700
-    ):
-        raise ValueError(f"{label} must be an exact owner-only directory")
+    try:
+        fd, _ = open_absolute_directory_chain(value, private_leaf=True)
+    except (OSError, ValueError) as error:
+        raise ValueError(f"{label} must be an exact owner-only directory") from error
+    os.close(fd)
 
 
 def _require_empty_directory(path: pathlib.Path, *, label: str) -> None:
@@ -975,8 +986,12 @@ def _require_empty_directory(path: pathlib.Path, *, label: str) -> None:
 
 def _ensure_runtime_root(path: pathlib.Path) -> None:
     value = _canonical_absolute_path(path, label="runtime root")
-    value.mkdir(mode=0o700, parents=True, exist_ok=True)
-    _require_owner_only_directory(value, label="runtime root")
+    fd, _ = open_absolute_directory_chain(
+        value,
+        create=True,
+        private_leaf=True,
+    )
+    os.close(fd)
 
 
 def _allocate_runtime_lease(runtime_root: pathlib.Path) -> _RuntimeLease:
@@ -986,13 +1001,19 @@ def _allocate_runtime_lease(runtime_root: pathlib.Path) -> _RuntimeLease:
     try:
         for _ in range(64):
             root = runtime_root / f"authenticated-review-{secrets.token_hex(16)}"
+            raw_name = os.fsencode(root.name)
             try:
-                os.mkdir(root, 0o700)
+                os.mkdir(raw_name, 0o700, dir_fd=container_descriptor)
             except FileExistsError:
                 continue
-            _require_owner_only_directory(root, label="fresh runtime")
+            os.fsync(container_descriptor)
+            descriptor = os.open(
+                raw_name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=container_descriptor,
+            )
+            validate_private_directory_fd(descriptor, root)
             _require_empty_directory(root, label="fresh runtime")
-            descriptor = _open_read_only_directory(root)
             return _RuntimeLease(
                 container=runtime_root,
                 container_fd=container_descriptor,

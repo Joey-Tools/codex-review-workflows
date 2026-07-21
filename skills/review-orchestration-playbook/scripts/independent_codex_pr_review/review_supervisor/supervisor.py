@@ -80,6 +80,7 @@ from .secureio import (
     allocated_bytes,
     boot_identifier,
     canonical_json,
+    directory_identities_match,
     ensure_no_path_value,
     fsync_directory,
     identity_from_stat,
@@ -562,7 +563,11 @@ def _prequiescence_abort(
         )
         prompt_path = pathlib.Path(state["prompt_path"])
         try:
-            fd, identity = open_regular_nofollow(prompt_path, expected_uid=os.getuid())
+            fd, identity = open_regular_nofollow(
+                prompt_path,
+                expected_uid=os.getuid(),
+                private_metadata=True,
+            )
             os.close(fd)
             if state.get("prompt_identity") and identity != Identity(
                 **state["prompt_identity"]
@@ -1277,31 +1282,60 @@ def _normalize_absolute(path: pathlib.Path) -> pathlib.Path:
     return normalized
 
 
+def _bound_identity(value: Any) -> Identity:
+    fields = {"device", "inode", "mode", "link_count", "uid", "size"}
+    if (
+        not isinstance(value, dict)
+        or set(value) != fields
+        or any(type(value[field]) is not int for field in fields)
+    ):
+        raise ValueError("directory binding identity is malformed")
+    return Identity(**value)
+
+
 def _validate_attempt_directory(
     retention_root: pathlib.Path,
     attempt_dir: pathlib.Path,
 ) -> tuple[pathlib.Path, pathlib.Path]:
     root = _normalize_absolute(retention_root)
     attempt = _normalize_absolute(attempt_dir)
-    require_private_directory(root)
+    root_identity = require_private_directory(root)
     match = ATTEMPT_NAME_PATTERN.fullmatch(attempt.name)
     if attempt.parent != root or match is None:
         raise ValueError(
             "attempt directory is not an exact child of the retention root"
         )
-    identity = require_private_directory(attempt)
-    if stat.S_IMODE(identity.mode) != 0o700:
-        raise ValueError("attempt directory mode is not 0700")
+    attempt_identity = require_private_directory(attempt)
     state, _, _ = read_attempt_state(attempt)
     if state.get("attempt_id") != match.group(1):
         raise ValueError("attempt directory name does not match durable state")
+    root_binding = state.get("retention_root_binding")
+    if root_binding is not None and (
+        not isinstance(root_binding, dict)
+        or pathlib.Path(root_binding.get("path", "")) != root
+        or not directory_identities_match(
+            root_identity,
+            _bound_identity(root_binding.get("identity")),
+        )
+    ):
+        raise ValueError("retention root differs from the durable binding")
+    attempt_binding = state.get("attempt_directory_binding")
+    if attempt_binding is not None and (
+        not isinstance(attempt_binding, dict)
+        or pathlib.Path(attempt_binding.get("path", "")) != attempt
+        or not directory_identities_match(
+            attempt_identity,
+            _bound_identity(attempt_binding.get("identity")),
+        )
+    ):
+        raise ValueError("attempt directory differs from the durable binding")
     return root, attempt
 
 
 def _list_attempt_directories(retention_root: pathlib.Path) -> tuple[pathlib.Path, ...]:
     root = _normalize_absolute(retention_root)
     require_private_directory(root)
-    root_fd, _ = open_absolute_directory_chain(root)
+    root_fd, _ = open_absolute_directory_chain(root, private_leaf=True)
     try:
         names = tuple(os.fsencode(value) for value in os.listdir(root_fd))
         if len(names) > 10_001:
@@ -1506,7 +1540,11 @@ def final_result(
             stage="output",
             code="final-seal-invalid",
         )
-    fd, identity = open_regular_nofollow(final_path, expected_uid=os.getuid())
+    fd, identity = open_regular_nofollow(
+        final_path,
+        expected_uid=os.getuid(),
+        private_metadata=True,
+    )
     try:
         expected_identity = Identity(**seal["identity"])
         if identity != expected_identity or seal.get("length") != identity.size:
@@ -1551,7 +1589,9 @@ def _validate_process_inventory(
     *,
     allow_fifo: bool,
 ) -> dict[str, Any]:
-    directory_fd, identity = open_absolute_directory_chain(attempt_dir)
+    directory_fd, identity = open_absolute_directory_chain(
+        attempt_dir, private_leaf=True
+    )
     try:
         if identity.uid != os.getuid() or stat.S_IMODE(identity.mode) != 0o700:
             raise ValueError("attempt inventory root identity is unsafe")
@@ -1637,7 +1677,7 @@ def _remove_recovery_artifacts(
     state: dict[str, Any],
     inventory: dict[str, Any],
 ) -> dict[str, Any]:
-    directory_fd, _ = open_absolute_directory_chain(attempt_dir)
+    directory_fd, _ = open_absolute_directory_chain(attempt_dir, private_leaf=True)
     prompt_result = "absent"
     removed_temporaries: list[str] = []
     runtime_cleanup: dict[str, Any] | None = None
@@ -1735,7 +1775,7 @@ def _remove_exact_settled_runtime(
     attempt_dir: pathlib.Path,
     inventory: dict[str, Any],
 ) -> dict[str, Any]:
-    directory_fd, _ = open_absolute_directory_chain(attempt_dir)
+    directory_fd, _ = open_absolute_directory_chain(attempt_dir, private_leaf=True)
     removed_temporaries: list[str] = []
     runtime_cleanup: dict[str, Any] | None = None
     try:
@@ -2344,7 +2384,7 @@ def _released_attempt_candidates(
 
 
 def _remove_reclaim_artifacts(attempt: pathlib.Path) -> None:
-    attempt_fd, _ = open_absolute_directory_chain(attempt)
+    attempt_fd, _ = open_absolute_directory_chain(attempt, private_leaf=True)
     try:
         names = tuple(os.fsencode(value) for value in os.listdir(attempt_fd))
         if len(names) > 1_000:
@@ -2368,7 +2408,7 @@ def _remove_reclaim_artifacts(attempt: pathlib.Path) -> None:
 
 
 def _remove_reclaimed_attempt(root: pathlib.Path, attempt: pathlib.Path) -> None:
-    root_fd, _ = open_absolute_directory_chain(root)
+    root_fd, _ = open_absolute_directory_chain(root, private_leaf=True)
     attempt_fd: int | None = None
     try:
         attempt_fd = os.open(
@@ -2536,7 +2576,7 @@ def _reclaim_released_attempts(
 
 
 def _remove_empty_attempt_residue(root: pathlib.Path, attempt: pathlib.Path) -> bool:
-    root_fd, _ = open_absolute_directory_chain(root)
+    root_fd, _ = open_absolute_directory_chain(root, private_leaf=True)
     attempt_fd: int | None = None
     try:
         try:

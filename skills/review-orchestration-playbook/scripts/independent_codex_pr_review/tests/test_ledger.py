@@ -16,7 +16,7 @@ from review_supervisor.ledger import (
     EntryCountMismatch,
     INITIAL_CRASH_RECLAIM_AGE_SECONDS,
     LedgerSnapshot,
-    RetentionLease,
+    acquire_retention_lease,
     aggregate_unique_parents,
     calculate_admission,
     commit_state,
@@ -31,7 +31,11 @@ from review_supervisor.models import (
     Identity,
     TreeManifest,
 )
-from review_supervisor.secureio import canonical_json
+from review_supervisor.secureio import (
+    canonical_json,
+    directory_identities_match,
+    identity_from_stat,
+)
 
 from tests.support import owned_temporary_directory
 
@@ -376,24 +380,38 @@ class InitialAttemptCrashRecoveryTests(unittest.TestCase):
                 targeted_manifest_bound=0,
                 process_charge=PROCESS_ENVELOPE_BYTES,
             )
-            attempt, state, digest = create_reserved_attempt(
-                lease=RetentionLease(root=retention, fd=-1),
-                checkout_parent=checkout,
-                prompt=b"review\n",
-                prompt_sha256="6" * 64,
-                custody=custody,
-                admission=admission,
-                base_manifest_sha256="7" * 64,
-                head_manifest_sha256="8" * 64,
-                repo=root,
-                common_git_dir=git_dir,
-                pr_url="https://github.example/owner/repo/pull/1",
-                git_executable="/usr/bin/git",
-                codex_executable="/usr/bin/true",
-                exec_budget={},
-            )
+            with acquire_retention_lease(retention, deadline=10**12) as lease:
+                attempt, state, digest = create_reserved_attempt(
+                    lease=lease,
+                    checkout_parent=checkout,
+                    prompt=b"review\n",
+                    prompt_sha256="6" * 64,
+                    custody=custody,
+                    admission=admission,
+                    base_manifest_sha256="7" * 64,
+                    head_manifest_sha256="8" * 64,
+                    repo=root,
+                    common_git_dir=git_dir,
+                    pr_url="https://github.example/owner/repo/pull/1",
+                    git_executable="/usr/bin/git",
+                    codex_executable="/usr/bin/true",
+                    exec_budget={},
+                )
             self.assertEqual(state["review_contract"], LOW_LEVEL_HELPER_REVIEW_CONTRACT)
             self.assertIs(state["named_lane_eligible"], NAMED_LANE_ELIGIBLE)
+            self.assertTrue(
+                directory_identities_match(
+                    Identity(**state["retention_root_binding"]["identity"]),
+                    identity_from_stat(retention.stat()),
+                )
+            )
+            self.assertEqual(state["attempt_directory_binding"]["path"], str(attempt))
+            self.assertTrue(
+                directory_identities_match(
+                    Identity(**state["attempt_directory_binding"]["identity"]),
+                    identity_from_stat(attempt.stat()),
+                )
+            )
             persisted, _, _ = read_attempt_state(attempt)
             self.assertEqual(persisted["review_contract"], state["review_contract"])
             self.assertIs(persisted["named_lane_eligible"], False)

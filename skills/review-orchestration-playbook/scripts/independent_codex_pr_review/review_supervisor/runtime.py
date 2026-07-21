@@ -87,9 +87,9 @@ from .secureio import (
     open_regular_nofollow,
     publish_bytes,
     read_fd_exact,
-    require_private_directory,
     sha256_bytes,
     fsync_directory,
+    validate_private_directory_fd,
 )
 from .settlement_state import publish_exact_process_settlement
 from .wire import (
@@ -1915,9 +1915,18 @@ def checkout_worker_main(
         release, _ = receive_record(control, deadline=deadline)
         if release != {"type": "continue-phase0", "token": token}:
             raise ValueError("checkout worker phase-0 release is invalid")
-        control_namespace = pathlib.Path(state["control_namespace"])
-        os.mkdir(control_namespace, 0o700)
-        require_private_directory(control_namespace)
+        checkout_parent_fd, checkout_parent_identity = open_absolute_directory_chain(
+            pathlib.Path(state["worktree_path"]).parent,
+            private_leaf=True,
+        )
+        try:
+            control_namespace, _ = _ensure_control_namespace(
+                state,
+                checkout_parent_fd=checkout_parent_fd,
+                checkout_parent_identity=checkout_parent_identity,
+            )
+        finally:
+            os.close(checkout_parent_fd)
         semantics = probe_name_semantics(control_namespace)
         base_entries, head_entries = validate_namespaces(
             base,
@@ -2025,7 +2034,11 @@ def _verify_prompt_artifact(state: dict[str, Any], prompt: bytes) -> None:
     }:
         raise ValueError("supervisor-private prompt does not match durable state")
     path = pathlib.Path(state["prompt_path"])
-    fd, identity = open_regular_nofollow(path, expected_uid=os.getuid())
+    fd, identity = open_regular_nofollow(
+        path,
+        expected_uid=os.getuid(),
+        private_metadata=True,
+    )
     try:
         if identity != _identity(state["prompt_identity"]):
             raise ValueError("published prompt identity changed")
@@ -2413,7 +2426,11 @@ def _verify_final_seal(
     if not isinstance(identity_value, dict):
         raise ValueError("reader seal does not contain an identity")
     expected = _identity(identity_value)
-    fd, actual = open_regular_nofollow(path, expected_uid=os.getuid())
+    fd, actual = open_regular_nofollow(
+        path,
+        expected_uid=os.getuid(),
+        private_metadata=True,
+    )
     try:
         if actual != expected:
             raise ValueError("final artifact identity differs from the reader seal")
@@ -2904,6 +2921,7 @@ def _ensure_control_namespace(
         dir_fd=checkout_parent_fd,
     )
     try:
+        validate_private_directory_fd(namespace_fd, path)
         if not directory_identities_match(
             identity_from_stat(os.fstat(namespace_fd)), identity
         ):
@@ -2919,7 +2937,7 @@ def _cleanup_control_namespace(
     expected_identity: Identity | None = None,
 ) -> None:
     path = pathlib.Path(state["control_namespace"])
-    parent_fd, _ = open_absolute_directory_chain(path.parent)
+    parent_fd, _ = open_absolute_directory_chain(path.parent, private_leaf=True)
     directory_fd: int | None = None
     try:
         try:
@@ -2931,6 +2949,7 @@ def _cleanup_control_namespace(
         except FileNotFoundError:
             return
         identity = identity_from_stat(os.fstat(directory_fd))
+        validate_private_directory_fd(directory_fd, path)
         if (
             identity.uid != os.getuid()
             or stat.S_IMODE(identity.mode) != 0o700
@@ -3044,7 +3063,8 @@ def _cleanup_worktree(
             raise ValueError("worktree parent differs from the reservation")
         common_git_dir = pathlib.Path(common_binding.get("path", ""))
         checkout_parent_fd, checkout_parent_identity = open_absolute_directory_chain(
-            worktree.parent
+            worktree.parent,
+            private_leaf=True,
         )
         common_fd, common_identity = open_absolute_directory_chain(common_git_dir)
         try:
@@ -3466,7 +3486,7 @@ def _cleanup_worktree(
 
 
 def _remove_clean_logs(attempt_dir: pathlib.Path) -> None:
-    directory_fd, _ = open_absolute_directory_chain(attempt_dir)
+    directory_fd, _ = open_absolute_directory_chain(attempt_dir, private_leaf=True)
     try:
         for name in tuple(os.fsencode(value) for value in os.listdir(directory_fd)):
             if not (

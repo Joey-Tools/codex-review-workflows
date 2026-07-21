@@ -21,6 +21,11 @@ from .models import FilesystemMeasure, Identity
 
 READ_CHUNK = 64 * 1024
 MAX_JSON_DEPTH = 64
+DARWIN_ROOT_ALIASES = {
+    "etc": "private/etc",
+    "tmp": "private/tmp",
+    "var": "private/var",
+}
 
 
 def require_python_313() -> None:
@@ -57,54 +62,210 @@ def directory_identities_match(left: Identity, right: Identity) -> bool:
     )
 
 
+def _verify_macos_metadata(
+    fd: int,
+    path: pathlib.Path,
+    kind: str,
+    *,
+    private: bool,
+) -> None:
+    if sys.platform != "darwin":
+        return
+    # Keep one authoritative ACL/xattr parser for executable and runtime custody.
+    from .codex_executable import (
+        inspect_macos_filesystem_metadata,
+        verify_macos_filesystem_metadata,
+    )
+
+    evidence = inspect_macos_filesystem_metadata(fd, kind)
+    if private:
+        if (
+            evidence.acl_entry_count != 0
+            or evidence.acl_entries
+            or evidence.quarantine_present
+            or set(evidence.xattrs) - {"com.apple.provenance"}
+        ):
+            raise ValueError("private filesystem object has extended metadata")
+        return
+    if (
+        evidence.acl_entry_count == 0
+        and not evidence.acl_entries
+        and not evidence.quarantine_present
+        and set(evidence.xattrs) <= {"com.apple.provenance", "com.apple.rootless"}
+    ):
+        return
+    verify_macos_filesystem_metadata(fd, path, kind)
+
+
+def _directory_is_trusted_ancestor(metadata: os.stat_result) -> bool:
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid not in {
+        0,
+        os.getuid(),
+    }:
+        return False
+    writable_by_others = metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    return not writable_by_others or bool(metadata.st_mode & stat.S_ISVTX)
+
+
+def _validate_directory_fd(
+    fd: int,
+    path: pathlib.Path,
+    *,
+    private: bool,
+) -> Identity:
+    metadata = os.fstat(fd)
+    identity = identity_from_stat(metadata)
+    if private:
+        valid = (
+            stat.S_ISDIR(metadata.st_mode)
+            and metadata.st_uid == os.getuid()
+            and stat.S_IMODE(metadata.st_mode) == 0o700
+        )
+    else:
+        valid = _directory_is_trusted_ancestor(metadata)
+    if not valid:
+        raise OSError(errno.EPERM, f"directory metadata is unsafe: {path}")
+    _verify_macos_metadata(fd, path, "directory", private=private)
+    return identity
+
+
+def _validate_regular_fd(
+    fd: int,
+    path: pathlib.Path,
+    *,
+    expected_uid: int | None,
+    expected_mode: int | None = None,
+    require_link_one: bool = True,
+    private_metadata: bool = False,
+) -> Identity:
+    metadata = os.fstat(fd)
+    identity = identity_from_stat(metadata)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise OSError(errno.EINVAL, "not a regular file")
+    if expected_uid is not None and metadata.st_uid != expected_uid:
+        raise OSError(errno.EPERM, "unexpected owner")
+    if expected_mode is not None and stat.S_IMODE(metadata.st_mode) != expected_mode:
+        raise OSError(errno.EPERM, "unexpected mode")
+    if require_link_one and metadata.st_nlink != 1:
+        raise OSError(errno.EMLINK, "unexpected link count")
+    if private_metadata:
+        if expected_uid != os.getuid():
+            raise ValueError("private metadata validation requires the current owner")
+        _verify_macos_metadata(fd, path, "file", private=True)
+    return identity
+
+
+def validate_private_directory_fd(fd: int, path: pathlib.Path) -> Identity:
+    return _validate_directory_fd(fd, path, private=True)
+
+
+def validate_private_regular_fd(
+    fd: int,
+    path: pathlib.Path,
+    *,
+    mode: int = 0o600,
+) -> Identity:
+    return _validate_regular_fd(
+        fd,
+        path,
+        expected_uid=os.getuid(),
+        expected_mode=mode,
+        private_metadata=True,
+    )
+
+
 def require_private_directory(path: pathlib.Path, *, create: bool = False) -> Identity:
-    if create:
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
-        metadata = os.lstat(path)
-    except OSError as error:
+        fd, identity = open_absolute_directory_chain(
+            path,
+            create=create,
+            private_leaf=True,
+        )
+    except (OSError, ValueError) as error:
         raise inconclusive(
             f"cannot inspect private directory {path}: {error}",
             stage="admission",
             code="private-directory-unavailable",
         ) from error
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != os.getuid()
-        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-    ):
-        raise inconclusive(
-            f"directory is not an owner-controlled no-follow directory: {path}",
-            stage="admission",
-            code="unsafe-directory",
-        )
-    return identity_from_stat(metadata)
+    else:
+        os.close(fd)
+        return identity
 
 
 def open_directory(path: pathlib.Path) -> int:
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
-    return os.open(path, flags)
+    fd, _ = open_absolute_directory_chain(path)
+    return fd
 
 
-def open_absolute_directory_chain(path: pathlib.Path) -> tuple[int, Identity]:
+def _canonical_directory_walk_path(path: pathlib.Path) -> pathlib.Path:
+    if sys.platform != "darwin" or len(path.parts) < 2:
+        return path
+    alias = path.parts[1]
+    target = DARWIN_ROOT_ALIASES.get(alias)
+    if target is None:
+        return path
+    alias_path = pathlib.Path("/") / alias
+    metadata = os.lstat(alias_path)
+    if (
+        not stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or os.readlink(alias_path) != target
+    ):
+        raise OSError(errno.EPERM, f"trusted Darwin root alias changed: {alias_path}")
+    return pathlib.Path("/") / target / pathlib.Path(*path.parts[2:])
+
+
+def open_absolute_directory_chain(
+    path: pathlib.Path,
+    *,
+    create: bool = False,
+    private_leaf: bool = False,
+) -> tuple[int, Identity]:
     if not path.is_absolute():
         raise ValueError("directory path must be absolute")
-    raw_parts = os.fsencode(os.path.normpath(path)).split(b"/")
-    if any(part in {b".", b".."} for part in raw_parts):
+    walk_path = _canonical_directory_walk_path(path)
+    raw_parts = tuple(os.fsencode(part) for part in walk_path.parts[1:])
+    if any(not part or part in {b".", b".."} or b"\0" in part for part in raw_parts):
         raise ValueError("directory path contains a dot component")
-    fd = os.open(b"/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    fd = os.open(b"/", flags)
+    current = pathlib.Path("/")
     try:
-        for part in raw_parts:
-            if not part:
-                continue
-            next_fd = os.open(
-                part,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                dir_fd=fd,
-            )
+        identity = _validate_directory_fd(
+            fd,
+            current,
+            private=private_leaf and not raw_parts,
+        )
+        for index, part in enumerate(raw_parts):
+            current /= os.fsdecode(part)
+            created = False
+            try:
+                next_fd = os.open(part, flags, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(part, 0o700, dir_fd=fd)
+                os.fsync(fd)
+                created = True
+                next_fd = os.open(part, flags, dir_fd=fd)
+            try:
+                descriptor_identity = _validate_directory_fd(
+                    next_fd,
+                    current,
+                    private=created or (private_leaf and index == len(raw_parts) - 1),
+                )
+                path_identity = identity_from_stat(
+                    os.stat(part, dir_fd=fd, follow_symlinks=False)
+                )
+                if not directory_identities_match(descriptor_identity, path_identity):
+                    raise OSError(errno.ESTALE, "directory path identity changed")
+            except BaseException:
+                os.close(next_fd)
+                raise
             os.close(fd)
             fd = next_fd
-        return fd, identity_from_stat(os.fstat(fd))
+            identity = descriptor_identity
+        return fd, identity
     except BaseException:
         os.close(fd)
         raise
@@ -116,22 +277,22 @@ def open_regular_at(
     *,
     expected_uid: int | None = None,
     require_link_one: bool = True,
+    private_metadata: bool = False,
 ) -> tuple[int, Identity]:
     if not name or b"/" in name or name in {b".", b".."} or b"\0" in name:
         raise ValueError("invalid leaf name")
     fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
     try:
-        descriptor_stat = os.fstat(fd)
         path_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        identity = identity_from_stat(descriptor_stat)
+        identity = _validate_regular_fd(
+            fd,
+            pathlib.Path(os.fsdecode(name)),
+            expected_uid=expected_uid,
+            require_link_one=require_link_one,
+            private_metadata=private_metadata,
+        )
         if identity != identity_from_stat(path_stat):
             raise OSError(errno.ESTALE, "path identity changed while opening")
-        if not stat.S_ISREG(descriptor_stat.st_mode):
-            raise OSError(errno.EINVAL, "not a regular file")
-        if expected_uid is not None and descriptor_stat.st_uid != expected_uid:
-            raise OSError(errno.EPERM, "unexpected owner")
-        if require_link_one and descriptor_stat.st_nlink != 1:
-            raise OSError(errno.EMLINK, "unexpected link count")
         return fd, identity
     except BaseException:
         os.close(fd)
@@ -144,21 +305,21 @@ def open_regular_nofollow(
     writable: bool = False,
     expected_uid: int | None = None,
     require_link_one: bool = True,
+    private_metadata: bool = False,
 ) -> tuple[int, Identity]:
     flags = (os.O_RDWR if writable else os.O_RDONLY) | os.O_CLOEXEC | os.O_NOFOLLOW
     fd = os.open(path, flags)
     try:
-        metadata = os.fstat(fd)
         path_metadata = os.lstat(path)
-        identity = identity_from_stat(metadata)
+        identity = _validate_regular_fd(
+            fd,
+            path,
+            expected_uid=expected_uid,
+            require_link_one=require_link_one,
+            private_metadata=private_metadata,
+        )
         if identity != identity_from_stat(path_metadata):
             raise OSError(errno.ESTALE, "path identity changed while opening")
-        if not stat.S_ISREG(metadata.st_mode):
-            raise OSError(errno.EINVAL, "not a regular file")
-        if expected_uid is not None and metadata.st_uid != expected_uid:
-            raise OSError(errno.EPERM, "unexpected owner")
-        if require_link_one and metadata.st_nlink != 1:
-            raise OSError(errno.EMLINK, "unexpected link count")
         return fd, identity
     except BaseException:
         os.close(fd)
@@ -361,7 +522,7 @@ def atomic_write_json(
     path: pathlib.Path, value: Any, *, replace: bool
 ) -> tuple[Identity, str]:
     data = canonical_json(value)
-    parent_fd = open_directory(path.parent)
+    parent_fd, _ = open_absolute_directory_chain(path.parent, private_leaf=True)
     temp_name = f".{path.name}.tmp-{os.getpid()}-{os.urandom(8).hex()}".encode("ascii")
     destination = os.fsencode(path.name)
     temp_fd: int | None = None
@@ -374,6 +535,15 @@ def atomic_write_json(
         )
         write_all(temp_fd, data)
         os.fsync(temp_fd)
+        written_identity = _validate_regular_fd(
+            temp_fd,
+            path.parent / os.fsdecode(temp_name),
+            expected_uid=os.getuid(),
+            expected_mode=0o600,
+            private_metadata=True,
+        )
+        if written_identity.size != len(data):
+            raise OSError(errno.EINVAL, "temporary state length is unsafe")
         os.close(temp_fd)
         temp_fd = None
         if replace:
@@ -387,11 +557,15 @@ def atomic_write_json(
             destination, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd
         )
         try:
-            identity = identity_from_stat(os.fstat(fd))
-            if not stat.S_ISREG(identity.mode) or identity.link_count != 1:
-                raise OSError(
-                    errno.EINVAL, "published state is not a private regular file"
-                )
+            identity = _validate_regular_fd(
+                fd,
+                path,
+                expected_uid=os.getuid(),
+                expected_mode=0o600,
+                private_metadata=True,
+            )
+            if identity != written_identity:
+                raise OSError(errno.ESTALE, "published state identity changed")
             actual = read_fd_exact(fd, max_bytes=len(data), expected_size=len(data))
             if actual != data:
                 raise OSError(errno.EIO, "published state readback mismatch")
@@ -409,7 +583,7 @@ def atomic_write_json(
 
 
 def publish_bytes(path: pathlib.Path, data: bytes, *, mode: int = 0o600) -> Identity:
-    parent_fd = open_directory(path.parent)
+    parent_fd, _ = open_absolute_directory_chain(path.parent, private_leaf=True)
     name = os.fsencode(path.name)
     temp_name = f".{path.name}.tmp-{os.getpid()}-{os.urandom(8).hex()}".encode("ascii")
     temp_fd: int | None = None
@@ -422,14 +596,14 @@ def publish_bytes(path: pathlib.Path, data: bytes, *, mode: int = 0o600) -> Iden
         )
         write_all(temp_fd, data)
         os.fsync(temp_fd)
-        written_identity = identity_from_stat(os.fstat(temp_fd))
-        if (
-            not stat.S_ISREG(written_identity.mode)
-            or written_identity.link_count != 1
-            or written_identity.uid != os.getuid()
-            or written_identity.size != len(data)
-            or stat.S_IMODE(written_identity.mode) != mode
-        ):
+        written_identity = _validate_regular_fd(
+            temp_fd,
+            path.parent / os.fsdecode(temp_name),
+            expected_uid=os.getuid(),
+            expected_mode=mode,
+            private_metadata=True,
+        )
+        if written_identity.size != len(data):
             raise OSError(errno.EINVAL, "temporary artifact metadata is unsafe")
         os.close(temp_fd)
         temp_fd = None
@@ -439,7 +613,13 @@ def publish_bytes(path: pathlib.Path, data: bytes, *, mode: int = 0o600) -> Iden
             name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd
         )
         try:
-            read_identity = identity_from_stat(os.fstat(read_fd))
+            read_identity = _validate_regular_fd(
+                read_fd,
+                path,
+                expected_uid=os.getuid(),
+                expected_mode=mode,
+                private_metadata=True,
+            )
             if written_identity != read_identity:
                 raise OSError(errno.ESTALE, "published artifact identity changed")
             actual = read_fd_exact(

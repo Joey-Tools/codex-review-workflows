@@ -22,7 +22,16 @@ servers、Plugins、Skills、Hooks、项目指令或 workspace 环境。
 - helper attempt 必须已完成，使用 `--reviewer codex --keep-workspace`，并保留匹配的
   `preflight.json`、`control-artifact-state.json`、`cleanup.lock` 和
   `.codex-review/review.diff`。
-- retention root 与 checkout parent 必须是当前用户控制且不可被 group/other 写入的目录。
+- retention root 与 checkout parent 必须是当前用户控制的精确 `0700` 目录。工具从
+  filesystem root 开始逐级执行 no-follow descriptor walk；每个祖先必须由 root 或当前
+  用户拥有，且不可被 group/other 写入，root/current-user owned sticky directory 是唯一
+  例外。macOS 只把 root-owned `/etc`、`/tmp`、`/var` 的固定系统 alias 映射到对应
+  `/private/*` 路径。
+- macOS 的每一级目录都经过稳定的 descriptor-based ACL/xattr 双重采样。私有目录和
+  文件拒绝所有 ACL、quarantine 和未知 xattr，只允许系统自动添加的
+  `com.apple.provenance`；可信系统祖先还允许 `com.apple.rootless`。retention lease
+  在整个 outer lifecycle 持有已认证 root descriptor，attempt 通过 `mkdirat` 创建，
+  并把 root 与 attempt identity 写入 durable state 供重启后的操作重新绑定。
 
 ## Exact Handoff And Run
 

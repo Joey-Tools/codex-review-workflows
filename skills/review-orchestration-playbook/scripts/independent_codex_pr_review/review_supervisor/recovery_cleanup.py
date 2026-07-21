@@ -624,12 +624,13 @@ def delete_custodied_roots(
 def remove_published_manifest(seal: dict[str, Any]) -> None:
     path = pathlib.Path(seal["path"])
     expected_identity = Identity(**seal["identity"])
-    directory_fd, _ = open_absolute_directory_chain(path.parent)
+    directory_fd, _ = open_absolute_directory_chain(path.parent, private_leaf=True)
     try:
         fd, identity = open_regular_at(
             directory_fd,
             os.fsencode(path.name),
             expected_uid=os.getuid(),
+            private_metadata=True,
         )
         try:
             if identity != expected_identity or identity.size != seal["length"]:

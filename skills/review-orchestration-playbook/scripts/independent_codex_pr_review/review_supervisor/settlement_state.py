@@ -10,12 +10,12 @@ from .ledger import MAX_ATTEMPT_STATE_BYTES, read_attempt_state
 from .secureio import (
     allocated_bytes,
     canonical_json,
-    identity_from_stat,
     open_absolute_directory_chain,
     open_regular_at,
     read_fd_exact,
     rename_exchange,
     sha256_bytes,
+    validate_private_regular_fd,
     write_all,
 )
 
@@ -83,7 +83,10 @@ def publish_exact_process_settlement(
     if not isinstance(retention_fs_identity, str) or not retention_fs_identity:
         raise ValueError("process settlement has no retention filesystem identity")
 
-    directory_fd, _ = open_absolute_directory_chain(attempt_dir)
+    directory_fd, _ = open_absolute_directory_chain(
+        attempt_dir,
+        private_leaf=True,
+    )
     candidate_name = f".state.json.tmp-{os.getpid()}-{os.urandom(8).hex()}"
     candidate_raw_name = os.fsencode(candidate_name)
     candidate_fd: int | None = None
@@ -95,14 +98,11 @@ def publish_exact_process_settlement(
             0o600,
             dir_fd=directory_fd,
         )
+        validate_private_regular_fd(
+            candidate_fd,
+            attempt_dir / candidate_name,
+        )
         anchor = os.fstat(candidate_fd)
-        if (
-            not stat.S_ISREG(anchor.st_mode)
-            or anchor.st_uid != os.getuid()
-            or anchor.st_nlink != 1
-            or stat.S_IMODE(anchor.st_mode) != 0o600
-        ):
-            raise ValueError("process settlement candidate identity is unsafe")
 
         retained_bytes = allocated_bytes(attempt_dir, entry_cap=1_000)
         candidate: dict[str, Any] | None = None
@@ -126,7 +126,10 @@ def publish_exact_process_settlement(
             os.lseek(candidate_fd, 0, os.SEEK_SET)
             write_all(candidate_fd, candidate_data)
             os.fsync(candidate_fd)
-            identity = identity_from_stat(os.fstat(candidate_fd))
+            identity = validate_private_regular_fd(
+                candidate_fd,
+                attempt_dir / candidate_name,
+            )
             if (
                 not stat.S_ISREG(identity.mode)
                 or identity.uid != os.getuid()
@@ -183,6 +186,7 @@ def publish_exact_process_settlement(
             directory_fd,
             b"state.json",
             expected_uid=os.getuid(),
+            private_metadata=True,
         )
         try:
             if (
@@ -204,6 +208,7 @@ def publish_exact_process_settlement(
             directory_fd,
             candidate_raw_name,
             expected_uid=os.getuid(),
+            private_metadata=True,
         )
         try:
             retained_predecessor = read_fd_exact(

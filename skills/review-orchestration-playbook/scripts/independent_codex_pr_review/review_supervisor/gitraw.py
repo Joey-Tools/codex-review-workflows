@@ -29,6 +29,7 @@ from .secureio import (
     publish_bytes,
     raw_directory_entries,
     read_fd_exact,
+    validate_private_directory_fd,
     write_all,
 )
 
@@ -715,9 +716,33 @@ def initialize_index(info: RepositoryInfo, registration: WorktreeRegistration) -
 
 
 def create_sanitized_view(info: RepositoryInfo, view: pathlib.Path) -> None:
-    view.mkdir(mode=0o700, parents=False, exist_ok=False)
-    (view / "objects").mkdir(mode=0o700)
-    (view / "refs").mkdir(mode=0o700)
+    parent_fd, _ = open_absolute_directory_chain(view.parent, private_leaf=True)
+    view_fd: int | None = None
+    try:
+        os.mkdir(os.fsencode(view.name), 0o700, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        view_fd = os.open(
+            os.fsencode(view.name),
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        validate_private_directory_fd(view_fd, view)
+        for name in ("objects", "refs"):
+            os.mkdir(os.fsencode(name), 0o700, dir_fd=view_fd)
+            child_fd = os.open(
+                os.fsencode(name),
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=view_fd,
+            )
+            try:
+                validate_private_directory_fd(child_fd, view / name)
+            finally:
+                os.close(child_fd)
+        os.fsync(view_fd)
+    finally:
+        if view_fd is not None:
+            os.close(view_fd)
+        os.close(parent_fd)
     repository_format_version = 1 if info.object_format == "sha256" else 0
     config = (
         b"[core]\n\trepositoryformatversion = "
@@ -741,6 +766,7 @@ def remove_sanitized_view(view: pathlib.Path, *, allow_partial: bool = False) ->
             os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
             dir_fd=parent_fd,
         )
+        validate_private_directory_fd(view_fd, view)
         view_stat = os.fstat(view_fd)
         if view_stat.st_uid != os.getuid() or stat.S_IMODE(view_stat.st_mode) != 0o700:
             raise ValueError("sanitized Git view root identity is unsafe")

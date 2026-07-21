@@ -36,7 +36,10 @@ def _reader_worker(
         f".{final_path.name}.tmp-{os.getpid()}-{os.urandom(8).hex()}".encode("ascii")
     )
     try:
-        directory_fd, _ = open_absolute_directory_chain(final_path.parent)
+        directory_fd, _ = open_absolute_directory_chain(
+            final_path.parent,
+            private_leaf=True,
+        )
         fifo_fd = os.open(fifo, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
         descriptor_identity = identity_from_stat(os.fstat(fifo_fd))
         path_identity = identity_from_stat(os.lstat(fifo))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import fcntl
 import math
 import os
@@ -29,7 +30,7 @@ from .constants import (
     UNSUPPORTED_CLAUSES,
 )
 from .errors import SupervisorError, blocked, inconclusive
-from .models import Admission, FilesystemMeasure, HelperCustody, TreeManifest
+from .models import Admission, FilesystemMeasure, HelperCustody, Identity, TreeManifest
 from .process import require_authenticated_no_child_process_profile
 from .secureio import (
     acquire_flock,
@@ -47,8 +48,9 @@ from .secureio import (
     open_absolute_directory_chain,
     open_regular_at,
     read_fd_exact,
-    require_private_directory,
     sha256_bytes,
+    validate_private_directory_fd,
+    validate_private_regular_fd,
 )
 
 
@@ -105,11 +107,33 @@ class LedgerSnapshot:
 class RetentionLease:
     root: pathlib.Path
     fd: int
+    root_fd: int
+    root_identity: Identity
+
+    def revalidate_root(self) -> Identity:
+        if self.fd < 0 or self.root_fd < 0:
+            raise OSError(errno.EBADF, "retention lease is closed")
+        held_identity = validate_private_directory_fd(self.root_fd, self.root)
+        current_fd, current_identity = open_absolute_directory_chain(
+            self.root,
+            private_leaf=True,
+        )
+        try:
+            if not directory_identities_match(
+                held_identity, self.root_identity
+            ) or not directory_identities_match(current_identity, self.root_identity):
+                raise OSError(errno.ESTALE, "retention root binding changed")
+        finally:
+            os.close(current_fd)
+        return held_identity
 
     def close(self) -> None:
         if self.fd >= 0:
             os.close(self.fd)
             self.fd = -1
+        if self.root_fd >= 0:
+            os.close(self.root_fd)
+            self.root_fd = -1
 
     def __enter__(self) -> "RetentionLease":
         return self
@@ -119,14 +143,19 @@ class RetentionLease:
 
 
 def acquire_retention_lease(root: pathlib.Path, *, deadline: float) -> RetentionLease:
-    require_private_directory(root, create=True)
-    root_fd, _ = open_absolute_directory_chain(root)
+    root_fd, root_identity = open_absolute_directory_chain(
+        root,
+        create=True,
+        private_leaf=True,
+    )
+    lock_fd = -1
     try:
         try:
             lock_fd, identity = open_regular_at(
                 root_fd,
                 b"retention.lock",
                 expected_uid=os.getuid(),
+                private_metadata=True,
             )
         except FileNotFoundError:
             lock_fd = os.open(
@@ -137,29 +166,40 @@ def acquire_retention_lease(root: pathlib.Path, *, deadline: float) -> Retention
             )
             os.fsync(lock_fd)
             os.fsync(root_fd)
-            identity = identity_from_stat(os.fstat(lock_fd))
+            identity = validate_private_regular_fd(
+                lock_fd,
+                root / "retention.lock",
+            )
         if not stat.S_ISREG(identity.mode) or stat.S_IMODE(identity.mode) != 0o600:
             os.close(lock_fd)
+            lock_fd = -1
             raise ValueError("retention lock has an unsafe identity or mode")
         acquire_flock(lock_fd, fcntl.LOCK_EX, deadline=deadline)
-        return RetentionLease(root=root, fd=lock_fd)
+        return RetentionLease(
+            root=root,
+            fd=lock_fd,
+            root_fd=root_fd,
+            root_identity=root_identity,
+        )
     except Exception as error:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+        os.close(root_fd)
         raise inconclusive(
             f"cannot acquire independent-review retention lock: {error}",
             stage="admission",
             code="retention-lock-unavailable",
         ) from error
-    finally:
-        os.close(root_fd)
 
 
 def read_attempt_state(attempt_dir: pathlib.Path) -> tuple[dict[str, Any], bytes, str]:
-    attempt_fd, _ = open_absolute_directory_chain(attempt_dir)
+    attempt_fd, _ = open_absolute_directory_chain(attempt_dir, private_leaf=True)
     try:
         state_fd, identity = open_regular_at(
             attempt_fd,
             b"state.json",
             expected_uid=os.getuid(),
+            private_metadata=True,
         )
         try:
             if identity.size > MAX_ATTEMPT_STATE_BYTES:
@@ -265,6 +305,7 @@ def _reclaim_initial_crash_attempt(
                 attempt_fd,
                 entry,
                 expected_uid=os.getuid(),
+                private_metadata=True,
             )
             try:
                 raw = read_fd_exact(
@@ -868,17 +909,41 @@ def create_reserved_attempt(
     prompt_path = attempt_dir / "prompt.txt"
     final_fifo = attempt_dir / "final.fifo"
     binding_fds: list[int] = []
+    attempt_identity: Identity
     try:
-        retention_fd, retention_identity = open_absolute_directory_chain(lease.root)
-        binding_fds.append(retention_fd)
+        retention_identity = lease.revalidate_root()
         checkout_parent_fd, checkout_parent_identity = open_absolute_directory_chain(
-            checkout_parent
+            checkout_parent,
+            private_leaf=True,
         )
         binding_fds.append(checkout_parent_fd)
         common_git_fd, common_git_identity = open_absolute_directory_chain(
             common_git_dir
         )
         binding_fds.append(common_git_fd)
+
+        attempt_name = os.fsencode(attempt_dir.name)
+        os.mkdir(attempt_name, 0o700, dir_fd=lease.root_fd)
+        os.fsync(lease.root_fd)
+        attempt_fd = os.open(
+            attempt_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=lease.root_fd,
+        )
+        try:
+            attempt_identity = validate_private_directory_fd(attempt_fd, attempt_dir)
+            path_identity = identity_from_stat(
+                os.stat(
+                    attempt_name,
+                    dir_fd=lease.root_fd,
+                    follow_symlinks=False,
+                )
+            )
+            if not directory_identities_match(attempt_identity, path_identity):
+                raise OSError(errno.ESTALE, "attempt directory binding changed")
+        finally:
+            os.close(attempt_fd)
+        lease.revalidate_root()
     finally:
         for binding_fd in binding_fds:
             os.close(binding_fd)
@@ -913,6 +978,10 @@ def create_reserved_attempt(
         "retention_root_binding": {
             "path": str(lease.root),
             "identity": retention_identity.to_json(),
+        },
+        "attempt_directory_binding": {
+            "path": str(attempt_dir),
+            "identity": attempt_identity.to_json(),
         },
         "checkout_parent_binding": {
             "path": str(checkout_parent),
@@ -965,7 +1034,6 @@ def create_reserved_attempt(
         "unsupported_clauses": list(UNSUPPORTED_CLAUSES),
     }
     try:
-        os.mkdir(attempt_dir, 0o700)
         _, digest = atomic_write_json(attempt_dir / "state.json", state, replace=False)
         return attempt_dir, state, digest
     except Exception as error:

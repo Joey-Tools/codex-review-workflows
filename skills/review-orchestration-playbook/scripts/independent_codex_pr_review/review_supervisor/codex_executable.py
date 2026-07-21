@@ -818,9 +818,8 @@ def _read_macos_filesystem_metadata(fd: int) -> ExtendedMetadataEvidence:
     )
 
 
-def verify_macos_filesystem_metadata(
+def inspect_macos_filesystem_metadata(
     fd: int,
-    path: pathlib.Path,
     kind: str,
 ) -> ExtendedMetadataEvidence:
     before = NodeIdentity.from_stat(os.fstat(fd))
@@ -834,9 +833,18 @@ def verify_macos_filesystem_metadata(
         or first != second
     ):
         raise OSError(errno.ESTALE, "filesystem metadata changed during inspection")
-    if not _filesystem_metadata_is_permitted(second, path=path, kind=kind):
-        raise ValueError("extended ACLs, xattrs, and quarantine are forbidden")
     return second
+
+
+def verify_macos_filesystem_metadata(
+    fd: int,
+    path: pathlib.Path,
+    kind: str,
+) -> ExtendedMetadataEvidence:
+    evidence = inspect_macos_filesystem_metadata(fd, kind)
+    if not _filesystem_metadata_is_permitted(evidence, path=path, kind=kind):
+        raise ValueError("extended ACLs, xattrs, and quarantine are forbidden")
+    return evidence
 
 
 def _permitted_macos_xattrs(path: pathlib.Path, *, kind: str) -> frozenset[str]:
