@@ -185,16 +185,47 @@ class LoadedStateMarker:
     preflight_receipt_error: str | None = None
 
 
-@dataclass(frozen=True)
 class _CleanupLockSet:
-    container: BoundReviewLock
-    compatibility: BinaryIO
+    def __init__(
+        self,
+        container: BoundReviewLock,
+        compatibility_opener: Callable[[], BinaryIO],
+    ) -> None:
+        self.container = container
+        self._compatibility_opener = compatibility_opener
+        self._compatibility: BinaryIO | None = None
+
+    @property
+    def compatibility(self) -> BinaryIO:
+        if self._compatibility is None:
+            raise ReviewError("review cleanup compatibility lock is not open")
+        return self._compatibility
+
+    def open_compatibility(self) -> None:
+        if self._compatibility is None:
+            self._compatibility = self._compatibility_opener()
 
     def fileno(self) -> int:
         return self.compatibility.fileno()
 
     def filenos(self) -> tuple[int, ...]:
         return (*self.container.filenos(), self.compatibility.fileno())
+
+    def close(self) -> None:
+        first_error: OSError | None = None
+        if self._compatibility is not None:
+            try:
+                self._compatibility.close()
+            except OSError as error:
+                first_error = error
+            self._compatibility = None
+        try:
+            self.container.close()
+        except OSError as error:
+            if first_error is None:
+                first_error = error
+        if first_error is not None:
+            raise first_error
 
 
 def _regular_file_identity(metadata: os.stat_result) -> tuple[int, ...]:
@@ -1866,7 +1897,8 @@ def _probe_bound_runner_lock(
 
         validate()
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Observers may overlap; only the runner's exclusive lease means active.
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
             acquired = True
         except BlockingIOError:
             validate()
@@ -2770,22 +2802,25 @@ def _open_cleanup_locks(
                 raise ReviewError(
                     f"cannot duplicate legacy cleanup directory lock: {error}"
                 ) from error
-        try:
-            with open_private_lock_file(
+        cleanup_lock = _CleanupLockSet(
+            container_lock,
+            lambda: open_private_lock_file(
                 cleanup_lock_name,
                 label="review cleanup lock",
                 allow_legacy_read_mode=True,
                 allowed_legacy_modes=PRIVATE_STATE_LEGACY_LOCK_MODES,
                 dir_fd=state_dir_fd,
-            ) as compatibility_lock:
-                yield (
-                    _CleanupLockSet(container_lock, compatibility_lock),
-                    cleanup_lock_name,
-                    state_dir_fd,
-                    revalidate_state_directory,
-                )
+            ),
+        )
+        try:
+            yield (
+                cleanup_lock,
+                cleanup_lock_name,
+                state_dir_fd,
+                revalidate_state_directory,
+            )
         finally:
-            container_lock.close()
+            cleanup_lock.close()
 
 
 def validate_cleanup_worker_lock_leases(
@@ -3101,6 +3136,24 @@ def _acquire_cleanup_lock(handle, *, deadline: float | None) -> bool:
                 f"{compatibility_error}"
             )
         descriptors = list(handle.filenos()[1:])
+    elif isinstance(handle, _CleanupLockSet):
+        acquired = []
+        for descriptor in handle.container.filenos():
+            if _acquire_cleanup_lock_descriptor(descriptor, deadline=deadline):
+                acquired.append(descriptor)
+                continue
+            for acquired_descriptor in reversed(acquired):
+                fcntl.flock(acquired_descriptor, fcntl.LOCK_UN)
+            return False
+        try:
+            # Serialize first creation and its chmod/identity validation under
+            # the preparation-bound container lease.
+            handle.open_compatibility()
+        except BaseException:
+            for acquired_descriptor in reversed(acquired):
+                fcntl.flock(acquired_descriptor, fcntl.LOCK_UN)
+            raise
+        descriptors = [handle.compatibility.fileno()]
     else:
         acquired = []
         descriptors = list(_cleanup_lock_fds(handle))
