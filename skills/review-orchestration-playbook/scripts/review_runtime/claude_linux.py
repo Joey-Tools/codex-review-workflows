@@ -279,15 +279,44 @@ class _CredentialDirectoryAnchor:
         self._descriptor_residue_diagnostic: (
             LinuxCredentialInspectionInconclusive | None
         ) = None
+        self._descriptor_residue_latched = False
+        self._descriptor_residue_fallback = LinuxCredentialInspectionInconclusive(
+            "Claude credential directory anchor cleanup is prohibited; "
+            "descriptor-bound residue was retained"
+        )
+        setattr(
+            self._descriptor_residue_fallback,
+            "_codex_claude_refresh_lock_descriptor_bound",
+            True,
+        )
+        setattr(
+            self._descriptor_residue_fallback,
+            "_codex_claude_source_descriptor_residue",
+            True,
+        )
+
+    def _descriptor_residue_diagnostic_locked(
+        self,
+    ) -> LinuxCredentialInspectionInconclusive | None:
+        if self._disposition is _CredentialDirectoryAnchorDisposition.CLOSED:
+            return None
+        if not self._descriptor_residue_latched and self._disposition is not (
+            _CredentialDirectoryAnchorDisposition.DESCRIPTOR_RESIDUE
+        ):
+            return None
+        diagnostic = (
+            self._descriptor_residue_diagnostic
+            or self._descriptor_residue_fallback
+        )
+        self._descriptor_residue_diagnostic = diagnostic
+        self._disposition = _CredentialDirectoryAnchorDisposition.DESCRIPTOR_RESIDUE
+        return diagnostic
 
     @property
     def descriptor(self) -> int:
         with self._state_lock:
-            if self._disposition is (
-                _CredentialDirectoryAnchorDisposition.DESCRIPTOR_RESIDUE
-            ):
-                diagnostic = self._descriptor_residue_diagnostic
-                assert diagnostic is not None
+            diagnostic = self._descriptor_residue_diagnostic_locked()
+            if diagnostic is not None:
                 raise diagnostic
             if not self._descriptors:
                 raise LinuxCredentialInspectionInconclusive(
@@ -298,11 +327,8 @@ class _CredentialDirectoryAnchor:
     @property
     def legacy_parent_descriptor(self) -> int:
         with self._state_lock:
-            if self._disposition is (
-                _CredentialDirectoryAnchorDisposition.DESCRIPTOR_RESIDUE
-            ):
-                diagnostic = self._descriptor_residue_diagnostic
-                assert diagnostic is not None
+            diagnostic = self._descriptor_residue_diagnostic_locked()
+            if diagnostic is not None:
                 raise diagnostic
             if not self._descriptors:
                 raise LinuxCredentialInspectionInconclusive(
@@ -326,6 +352,10 @@ class _CredentialDirectoryAnchor:
     @property
     def disposition(self) -> _CredentialDirectoryAnchorDisposition:
         with self._state_lock:
+            if self._disposition is _CredentialDirectoryAnchorDisposition.CLOSED:
+                return _CredentialDirectoryAnchorDisposition.CLOSED
+            if self._descriptor_residue_latched:
+                return _CredentialDirectoryAnchorDisposition.DESCRIPTOR_RESIDUE
             return self._disposition
 
     @property
@@ -333,19 +363,12 @@ class _CredentialDirectoryAnchor:
         self,
     ) -> LinuxCredentialInspectionInconclusive | None:
         with self._state_lock:
-            if self._disposition is not (
-                _CredentialDirectoryAnchorDisposition.DESCRIPTOR_RESIDUE
-            ):
-                return None
-            return self._descriptor_residue_diagnostic
+            return self._descriptor_residue_diagnostic_locked()
 
     def assert_stable(self, *, owner_uid: int) -> None:
         with self._state_lock:
-            if self._disposition is (
-                _CredentialDirectoryAnchorDisposition.DESCRIPTOR_RESIDUE
-            ):
-                diagnostic = self._descriptor_residue_diagnostic
-                assert diagnostic is not None
+            diagnostic = self._descriptor_residue_diagnostic_locked()
+            if diagnostic is not None:
                 raise diagnostic
             if not self._descriptors:
                 raise LinuxCredentialInspectionInconclusive(
@@ -395,6 +418,24 @@ class _CredentialDirectoryAnchor:
     def close_if_detached(self) -> None:
         self._close(detached=True)
 
+    def settle_descriptor_bound_residue(
+        self,
+        diagnostic: LinuxCredentialInspectionInconclusive,
+    ) -> LinuxCredentialInspectionInconclusive | None:
+        """Publish terminal no-close residue after bounded handoff failure."""
+
+        self._descriptor_residue_latched = True
+        with self._state_lock:
+            if self._disposition is _CredentialDirectoryAnchorDisposition.CLOSED:
+                self._descriptor_residue_latched = False
+                return None
+            if self._descriptor_residue_diagnostic is None:
+                self._descriptor_residue_diagnostic = diagnostic
+            existing = self._descriptor_residue_diagnostic_locked()
+            assert existing is not None
+            self._descriptors = ()
+        return existing
+
     def _close(self, *, detached: bool) -> None:
         try:
             self._close_once(detached=detached)
@@ -437,16 +478,14 @@ class _CredentialDirectoryAnchor:
             True,
         )
         with self._state_lock:
+            latched_diagnostic = self._descriptor_residue_diagnostic_locked()
+            if latched_diagnostic is not None:
+                self._descriptors = ()
+                raise latched_diagnostic
             if self._detached_to_watcher is not detached:
                 return
             if self._disposition is _CredentialDirectoryAnchorDisposition.CLOSED:
                 return
-            if self._disposition is (
-                _CredentialDirectoryAnchorDisposition.DESCRIPTOR_RESIDUE
-            ):
-                diagnostic = self._descriptor_residue_diagnostic
-                assert diagnostic is not None
-                raise diagnostic
             if not self._descriptors:
                 raise AssertionError(
                     "open Claude credential directory anchor lost its descriptors"
@@ -4924,18 +4963,80 @@ class _HostRefreshLockCleanupCoordinator:
         )
         settlement_diagnostic_recorded = False
         settlement_succeeded = False
+        source_retention_attempts = 0
+        source_settlement_attempts = 0
+        source_settlement_diagnostic = LinuxCredentialInspectionInconclusive(
+            f"{retry_scope} source-anchor handoff did not become terminal "
+            "after bounded retries; retaining descriptors as process-lifetime "
+            "residue"
+        )
+        setattr(
+            source_settlement_diagnostic,
+            "_codex_claude_refresh_lock_descriptor_bound",
+            True,
+        )
+        setattr(
+            source_settlement_diagnostic,
+            "_codex_claude_source_descriptor_residue",
+            True,
+        )
 
         while True:
             source_retention_required = self._source_retention_required_snapshot()
             if source_retention_required and not self._source_terminal:
-                try:
-                    self._retain_source_anchor()
-                except BaseException as error:
-                    self._record_bounded_source_retry_error(
-                        error,
-                        stage="terminal-proof",
-                        label="source-anchor terminal proof",
-                    )
+                if source_retention_attempts < (
+                    CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS
+                ):
+                    source_retention_attempts += 1
+                    try:
+                        self._retain_source_anchor()
+                    except BaseException as error:
+                        self._record_bounded_source_retry_error(
+                            error,
+                            stage="terminal-proof",
+                            label="source-anchor terminal proof",
+                        )
+                if (
+                    not self._source_terminal
+                    and source_retention_attempts
+                    >= CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS
+                ):
+                    if source_settlement_attempts < (
+                        CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS
+                    ):
+                        source_settlement_attempts += 1
+                        try:
+                            residue = (
+                                self._source_anchor.settle_descriptor_bound_residue(
+                                    source_settlement_diagnostic
+                                )
+                            )
+                        except BaseException as error:
+                            self._record_bounded_source_retry_error(
+                                error,
+                                stage="terminal-residue",
+                                label="source-anchor terminal residue",
+                            )
+                        else:
+                            if residue is not None:
+                                self._record_bounded_source_retry_error(
+                                    residue,
+                                    stage="terminal-residue",
+                                    label="source-anchor terminal residue",
+                                )
+                    if self._accept_source_anchor_terminal_disposition(
+                        allow_transfer=False,
+                    ):
+                        continue
+                    if source_settlement_attempts >= (
+                        CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS
+                    ):
+                        failure = LinuxCredentialInspectionInconclusive(
+                            "source-anchor descriptor residue did not publish "
+                            "a terminal disposition after bounded retries"
+                        )
+                        failure.__cause__ = source_settlement_diagnostic
+                        raise failure
             source_terminal = not source_retention_required or self._source_terminal
             lease_terminal = stable_lease is None
             if stable_lease is not None:
@@ -5008,6 +5109,23 @@ class _HostRefreshLockCleanupCoordinator:
                     )
 
     def _complete_synchronous_cleanup(
+        self,
+        stable_lease: ClaudeRefreshLockLease | None,
+        *,
+        publish_ready_hint: bool,
+    ) -> None:
+        try:
+            self._complete_claimed_synchronous_cleanup(
+                stable_lease,
+                publish_ready_hint=publish_ready_hint,
+            )
+        except BaseException:
+            with self._state_lock:
+                if self._phase is not _HostRefreshLockCleanupPhase.TERMINAL:
+                    self._synchronous_cleanup_claimed = False
+            raise
+
+    def _complete_claimed_synchronous_cleanup(
         self,
         stable_lease: ClaudeRefreshLockLease | None,
         *,
@@ -5143,7 +5261,15 @@ class _HostRefreshLockCleanupCoordinator:
             )
             return False
         if disposition is (_CredentialDirectoryAnchorDisposition.DESCRIPTOR_RESIDUE):
-            diagnostic = self._source_anchor.descriptor_residue_diagnostic
+            try:
+                diagnostic = self._source_anchor.descriptor_residue_diagnostic
+            except BaseException as error:
+                self._record_bounded_source_retry_error(
+                    error,
+                    stage="disposition",
+                    label="source-anchor residue diagnostic observation",
+                )
+                return False
             if diagnostic is None:
                 self._record_bounded_source_retry_error(
                     LinuxCredentialInspectionInconclusive(

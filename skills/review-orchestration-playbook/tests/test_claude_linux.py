@@ -2649,6 +2649,7 @@ class CredentialStagingTest(unittest.TestCase):
         self,
         *,
         with_lease: bool,
+        allow_source_residue: bool = False,
     ) -> Iterator[
         tuple[
             pathlib.Path,
@@ -2668,6 +2669,7 @@ class CredentialStagingTest(unittest.TestCase):
                 source,
                 owner_uid=os.getuid(),
             )
+            source_descriptors = source_anchor._descriptors
             coordinator = claude_linux._HostRefreshLockCleanupCoordinator(source_anchor)
             lease: claude_refresh_lock.ClaudeRefreshLockLease | None = None
             if with_lease:
@@ -2689,7 +2691,25 @@ class CredentialStagingTest(unittest.TestCase):
                     coordinator._thread.join(timeout=1.0)
                 if lease is not None:
                     self._dispose_refresh_lock_fixture(lease)
-                source_anchor.close_if_owned()
+                if (
+                    allow_source_residue
+                    and source_anchor.disposition
+                    is claude_linux._CredentialDirectoryAnchorDisposition.DESCRIPTOR_RESIDUE
+                ):
+                    for descriptor in source_descriptors:
+                        try:
+                            os.close(descriptor)
+                        except OSError:
+                            pass
+                    with source_anchor._state_lock:
+                        source_anchor._descriptor_residue_latched = False
+                        source_anchor._disposition = (
+                            claude_linux._CredentialDirectoryAnchorDisposition.CLOSED
+                        )
+                        source_anchor._descriptor_residue_diagnostic = None
+                        source_anchor._descriptors = ()
+                else:
+                    source_anchor.close_if_owned()
 
     def _assert_refresh_lock_descriptors_closed(
         self,
@@ -3482,6 +3502,133 @@ class CredentialStagingTest(unittest.TestCase):
                         real_close(descriptor)
                     except OSError:
                         pass
+
+    def test_source_anchor_residue_settlement_does_not_revive_closed_anchor(
+        self,
+    ) -> None:
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            source = self._credential(
+                root / ".credentials.json",
+                expires_at_ms=(now + 7200) * 1000,
+            )
+            anchor = claude_linux._open_credential_directory_anchor(
+                source,
+                owner_uid=os.getuid(),
+            )
+            anchor.close_if_owned()
+            diagnostic = claude_linux.LinuxCredentialInspectionInconclusive(
+                "injected late source-anchor residue settlement"
+            )
+
+            self.assertIsNone(anchor.settle_descriptor_bound_residue(diagnostic))
+            self.assertIs(
+                anchor.disposition,
+                claude_linux._CredentialDirectoryAnchorDisposition.CLOSED,
+            )
+            self.assertIsNone(anchor.descriptor_residue_diagnostic)
+            self.assertFalse(anchor._descriptor_residue_latched)
+            anchor.close_if_owned()
+            with self.assertRaisesRegex(
+                claude_linux.LinuxCredentialInspectionInconclusive,
+                "anchor is closed",
+            ):
+                _ = anchor.descriptor
+
+    def test_source_anchor_residue_fallback_is_stable_across_publication_race(
+        self,
+    ) -> None:
+        class PausingStateLock:
+            def __init__(self) -> None:
+                self._lock = threading.Lock()
+                self.settlement_thread_id: int | None = None
+                self.settlement_entered = threading.Event()
+                self.allow_settlement = threading.Event()
+                self._pause_once = True
+
+            def __enter__(self) -> None:
+                if (
+                    self._pause_once
+                    and threading.get_ident() == self.settlement_thread_id
+                ):
+                    self._pause_once = False
+                    self.settlement_entered.set()
+                    self.allow_settlement.wait(timeout=1.0)
+                self._lock.acquire()
+
+            def __exit__(
+                self,
+                _error_type: object,
+                _error: object,
+                _traceback: object,
+            ) -> None:
+                self._lock.release()
+
+        now = time.time()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            source = self._credential(
+                root / ".credentials.json",
+                expires_at_ms=(now + 7200) * 1000,
+            )
+            anchor = claude_linux._open_credential_directory_anchor(
+                source,
+                owner_uid=os.getuid(),
+            )
+            descriptors = anchor._descriptors
+            pausing_lock = PausingStateLock()
+            anchor._state_lock = pausing_lock  # type: ignore[assignment]
+            requested = claude_linux.LinuxCredentialInspectionInconclusive(
+                "injected contextual residue diagnostic"
+            )
+            results: list[
+                claude_linux.LinuxCredentialInspectionInconclusive | None
+            ] = []
+            failures: list[BaseException] = []
+
+            def settle_residue() -> None:
+                pausing_lock.settlement_thread_id = threading.get_ident()
+                try:
+                    results.append(
+                        anchor.settle_descriptor_bound_residue(requested)
+                    )
+                except BaseException as error:
+                    failures.append(error)
+
+            settlement = threading.Thread(target=settle_residue, daemon=True)
+            try:
+                settlement.start()
+                self.assertTrue(pausing_lock.settlement_entered.wait(timeout=0.5))
+                observed = anchor.descriptor_residue_diagnostic
+                self.assertIs(observed, anchor._descriptor_residue_fallback)
+                pausing_lock.allow_settlement.set()
+                settlement.join(timeout=1.0)
+
+                self.assertFalse(settlement.is_alive())
+                self.assertEqual(failures, [])
+                self.assertEqual(results, [observed])
+                self.assertIs(anchor.descriptor_residue_diagnostic, observed)
+                with self.assertRaises(
+                    claude_linux.LinuxCredentialInspectionInconclusive
+                ) as descriptor_read:
+                    _ = anchor.descriptor
+                self.assertIs(descriptor_read.exception, observed)
+            finally:
+                pausing_lock.allow_settlement.set()
+                settlement.join(timeout=1.0)
+                for descriptor in descriptors:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                with anchor._state_lock:
+                    anchor._descriptor_residue_latched = False
+                    anchor._disposition = (
+                        claude_linux._CredentialDirectoryAnchorDisposition.CLOSED
+                    )
+                    anchor._descriptor_residue_diagnostic = None
+                    anchor._descriptors = ()
 
     def test_default_accepts_one_second_remaining(self) -> None:
         now = time.time()
@@ -8958,7 +9105,7 @@ class CredentialStagingTest(unittest.TestCase):
                 self.retain_anchor_calls += 1
                 self.source_handoff_attempted.set()
                 if self.retain_anchor_calls >= (
-                    claude_linux.CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS + 3
+                    claude_linux.CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS
                 ):
                     self.repeated_failures_observed.set()
                 if not self.allow_source_handoff.is_set():
@@ -8987,6 +9134,7 @@ class CredentialStagingTest(unittest.TestCase):
                 source,
                 owner_uid=os.getuid(),
             )
+            source_descriptors = source_anchor._descriptors
             source_descriptor = source_anchor.descriptor
             allow_source_handoff = threading.Event()
             source_handoff_attempted = threading.Event()
@@ -9030,29 +9178,31 @@ class CredentialStagingTest(unittest.TestCase):
 
                 retain_thread.start()
                 self.assertTrue(source_handoff_attempted.wait(timeout=0.5))
-                retain_thread.join(timeout=0.05)
-
-                self.assertTrue(retain_thread.is_alive())
-                self.assertIs(
-                    coordinator._phase_snapshot(),
-                    claude_linux._HostRefreshLockCleanupPhase.CLEANUP,
-                )
-                self.assertFalse(coordinator._terminal.is_set())
-                self.assertEqual(retain_failures, [])
-                self.assertFalse(coordinator._source_terminal)
-                self.assertFalse(source_anchor.detached_to_watcher)
-                os.fstat(source_descriptor)
-                self.assertTrue(carrier.is_dir())
                 self.assertTrue(repeated_failures_observed.wait(timeout=1.0))
-
-                allow_source_handoff.set()
                 retain_thread.join(timeout=1.0)
 
                 self.assertFalse(retain_thread.is_alive())
                 self.assertEqual(retain_failures, [])
                 self.assertNotEqual(retain_errors, [])
                 self.assertTrue(coordinator._source_terminal)
-                self.assertTrue(source_anchor.detached_to_watcher)
+                self.assertFalse(source_anchor.detached_to_watcher)
+                self.assertIs(
+                    source_anchor.disposition,
+                    claude_linux._CredentialDirectoryAnchorDisposition.DESCRIPTOR_RESIDUE,
+                )
+                diagnostic = source_anchor.descriptor_residue_diagnostic
+                self.assertIsNotNone(diagnostic)
+                assert diagnostic is not None
+                self.assertTrue(any(error is diagnostic for error in retain_errors))
+                self.assertTrue(
+                    getattr(
+                        diagnostic,
+                        "_codex_claude_refresh_lock_descriptor_bound",
+                        False,
+                    )
+                )
+                os.fstat(source_descriptor)
+                self.assertTrue(carrier.is_dir())
                 self.assertIs(
                     coordinator._phase_snapshot(),
                     claude_linux._HostRefreshLockCleanupPhase.TERMINAL,
@@ -9081,7 +9231,6 @@ class CredentialStagingTest(unittest.TestCase):
                     1,
                 )
             finally:
-                allow_source_handoff.set()
                 if retain_thread.ident is not None:
                     retain_thread.join(timeout=1.0)
                 if coordinator._thread.ident is not None:
@@ -9089,8 +9238,22 @@ class CredentialStagingTest(unittest.TestCase):
                     coordinator._thread.join(timeout=1.0)
                 if lease is not None:
                     self._dispose_refresh_lock_fixture(lease)
-                source_anchor.close_if_detached()
-                source_anchor.close_if_owned()
+                if source_anchor.disposition is (
+                    claude_linux._CredentialDirectoryAnchorDisposition.DESCRIPTOR_RESIDUE
+                ):
+                    for descriptor in reversed(source_descriptors):
+                        try:
+                            os.close(descriptor)
+                        except OSError:
+                            pass
+                    with source_anchor._state_lock:
+                        source_anchor._disposition = (
+                            claude_linux._CredentialDirectoryAnchorDisposition.CLOSED
+                        )
+                        source_anchor._descriptor_residue_diagnostic = None
+                else:
+                    source_anchor.close_if_detached()
+                    source_anchor.close_if_owned()
 
     def test_stopped_watcher_transfer_interruption_requires_close_proof(
         self,
@@ -9166,7 +9329,10 @@ class CredentialStagingTest(unittest.TestCase):
     def test_cleanup_coordinator_retains_unknown_source_close_as_residue(
         self,
     ) -> None:
-        with self._host_cleanup_coordinator_fixture(with_lease=True) as (
+        with self._host_cleanup_coordinator_fixture(
+            with_lease=True,
+            allow_source_residue=True,
+        ) as (
             _root,
             _source,
             source_anchor,
@@ -10243,6 +10409,369 @@ class CredentialStagingTest(unittest.TestCase):
             )
             self.assertTrue(lease.retention_snapshot().terminal)
             source_anchor.close_if_detached()
+
+    def test_terminal_proof_bounds_persistent_source_handoff_failures(
+        self,
+    ) -> None:
+        with self._host_cleanup_coordinator_fixture(
+            with_lease=False,
+            allow_source_residue=True,
+        ) as (
+            root,
+            _source,
+            source_anchor,
+            coordinator,
+            no_lease,
+        ):
+            self.assertIsNone(no_lease)
+            carrier = root / "retained-carrier"
+            config_dir = carrier / "config"
+            config_dir.mkdir(parents=True)
+            staged = claude_linux.StagedCredential(
+                carrier_root=carrier,
+                config_dir=config_dir,
+                credential_path=config_dir / ".credentials.json",
+                expires_at_ms=(time.time() + 3600) * 1000,
+            )
+            coordinator.publish_watcher(staged, mock.Mock())
+            source_anchor.detach_to_watcher()
+            coordinator._mark_source_retention_required(None)
+            attempts = 0
+
+            def fail_source_handoff() -> None:
+                nonlocal attempts
+                attempts += 1
+                if attempts > claude_linux.CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS:
+                    coordinator._source_terminal = True
+                    raise AssertionError(
+                        "terminal proof retried source handoff without a bound"
+                    )
+                raise OSError(f"injected persistent source handoff {attempts}")
+
+            with (
+                mock.patch.object(
+                    coordinator,
+                    "_retain_source_anchor",
+                    side_effect=fail_source_handoff,
+                ),
+                mock.patch.object(claude_linux.time, "sleep", return_value=None),
+            ):
+                coordinator._wait_for_cleanup_terminal_proof(
+                    None,
+                    retry_scope="fixture",
+                )
+
+            self.assertEqual(
+                attempts,
+                claude_linux.CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS,
+            )
+            self.assertTrue(coordinator._source_terminal)
+            self.assertIs(
+                source_anchor.disposition,
+                claude_linux._CredentialDirectoryAnchorDisposition.DESCRIPTOR_RESIDUE,
+            )
+            diagnostic = source_anchor.descriptor_residue_diagnostic
+            self.assertIsNotNone(diagnostic)
+            assert diagnostic is not None
+            self.assertIs(
+                getattr(
+                    diagnostic,
+                    "_codex_claude_refresh_lock_descriptor_bound",
+                    False,
+                ),
+                True,
+            )
+            self.assertIs(
+                getattr(
+                    diagnostic,
+                    "_codex_claude_source_descriptor_residue",
+                    False,
+                ),
+                True,
+            )
+            self.assertTrue(
+                all(isinstance(error, BaseException) for error in coordinator._errors)
+            )
+
+    def test_terminal_proof_bounds_residue_terminalizer_failures(self) -> None:
+        with self._host_cleanup_coordinator_fixture(with_lease=False) as (
+            root,
+            _source,
+            _source_anchor,
+            coordinator,
+            no_lease,
+        ):
+            self.assertIsNone(no_lease)
+            carrier = root / "retained-carrier"
+            config_dir = carrier / "config"
+            config_dir.mkdir(parents=True)
+            staged = claude_linux.StagedCredential(
+                carrier_root=carrier,
+                config_dir=config_dir,
+                credential_path=config_dir / ".credentials.json",
+                expires_at_ms=(time.time() + 3600) * 1000,
+            )
+            coordinator.publish_watcher(staged, mock.Mock())
+            coordinator._mark_source_retention_required(None)
+
+            with (
+                mock.patch.object(
+                    coordinator,
+                    "_retain_source_anchor",
+                    side_effect=OSError("injected persistent source handoff"),
+                ),
+                mock.patch.object(
+                    coordinator._source_anchor,
+                    "settle_descriptor_bound_residue",
+                    side_effect=OSError("injected persistent residue settlement"),
+                ) as settle_residue,
+                mock.patch.object(claude_linux.time, "sleep", return_value=None),
+                self.assertRaisesRegex(
+                    claude_linux.LinuxCredentialInspectionInconclusive,
+                    "did not publish a terminal disposition after bounded retries",
+                ),
+            ):
+                coordinator._wait_for_cleanup_terminal_proof(
+                    None,
+                    retry_scope="fixture",
+                )
+
+            self.assertEqual(
+                settle_residue.call_count,
+                claude_linux.CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS,
+            )
+            self.assertFalse(coordinator._source_terminal)
+            self.assertTrue(
+                all(isinstance(error, BaseException) for error in coordinator._errors)
+            )
+
+    def test_dead_worker_takeover_releases_failed_synchronous_claim(self) -> None:
+        with self._host_cleanup_coordinator_fixture(with_lease=False) as (
+            _root,
+            _source,
+            _source_anchor,
+            coordinator,
+            no_lease,
+        ):
+            self.assertIsNone(no_lease)
+            proof_failures = [
+                claude_linux.LinuxCredentialInspectionInconclusive(
+                    f"injected terminal-proof failure {attempt}"
+                )
+                for attempt in range(2)
+            ]
+
+            with (
+                mock.patch.object(
+                    coordinator,
+                    "_wait_for_cleanup_terminal_proof",
+                    side_effect=proof_failures,
+                ) as terminal_proof,
+                mock.patch.object(
+                    coordinator._terminal,
+                    "wait",
+                    return_value=False,
+                ),
+            ):
+                for failure in proof_failures:
+                    with self.assertRaises(
+                        claude_linux.LinuxCredentialInspectionInconclusive
+                    ) as raised:
+                        coordinator.cancel_without_lease()
+                    self.assertIs(raised.exception, failure)
+                    self.assertFalse(coordinator._synchronous_cleanup_claimed)
+
+            self.assertEqual(terminal_proof.call_count, 2)
+            self.assertIs(
+                coordinator._phase_snapshot(),
+                claude_linux._HostRefreshLockCleanupPhase.CLEANUP,
+            )
+            self.assertFalse(coordinator._terminal.is_set())
+
+    def test_terminal_proof_latches_residue_before_interrupted_publication(
+        self,
+    ) -> None:
+        with self._host_cleanup_coordinator_fixture(
+            with_lease=False,
+            allow_source_residue=True,
+        ) as (
+            root,
+            _source,
+            source_anchor,
+            coordinator,
+            no_lease,
+        ):
+            self.assertIsNone(no_lease)
+            carrier = root / "retained-carrier"
+            config_dir = carrier / "config"
+            config_dir.mkdir(parents=True)
+            staged = claude_linux.StagedCredential(
+                carrier_root=carrier,
+                config_dir=config_dir,
+                credential_path=config_dir / ".credentials.json",
+                expires_at_ms=(time.time() + 3600) * 1000,
+            )
+            coordinator.publish_watcher(staged, mock.Mock())
+            source_anchor.detach_to_watcher()
+            coordinator._mark_source_retention_required(None)
+            source_descriptors = source_anchor._descriptors
+            control_flow = KeyboardInterrupt(
+                "injected descriptor-residue diagnostic publication interruption"
+            )
+
+            with (
+                mock.patch.object(
+                    coordinator,
+                    "_retain_source_anchor",
+                    side_effect=OSError("injected persistent source handoff"),
+                ),
+                self._interrupt_attribute_assignment(
+                    claude_linux._CredentialDirectoryAnchor
+                    ._descriptor_residue_diagnostic_locked,
+                    target=source_anchor,
+                    attribute_name="_descriptor_residue_diagnostic",
+                    error=control_flow,
+                ),
+                mock.patch.object(claude_linux.time, "sleep", return_value=None),
+            ):
+                coordinator._wait_for_cleanup_terminal_proof(
+                    None,
+                    retry_scope="fixture",
+                )
+
+            self.assertTrue(coordinator._source_terminal)
+            self.assertIs(
+                source_anchor.disposition,
+                claude_linux._CredentialDirectoryAnchorDisposition.DESCRIPTOR_RESIDUE,
+            )
+            diagnostic = source_anchor.descriptor_residue_diagnostic
+            self.assertIsNotNone(diagnostic)
+            assert diagnostic is not None
+            self.assertIsNot(diagnostic, control_flow)
+            self.assertTrue(any(error is control_flow for error in coordinator._errors))
+            self.assertTrue(
+                getattr(
+                    diagnostic,
+                    "_codex_claude_refresh_lock_descriptor_bound",
+                    False,
+                )
+            )
+            self.assertTrue(
+                getattr(
+                    diagnostic,
+                    "_codex_claude_source_descriptor_residue",
+                    False,
+                )
+            )
+
+            with mock.patch.object(
+                claude_linux.os,
+                "close",
+                wraps=claude_linux.os.close,
+            ) as close_descriptor:
+                with self.assertRaises(
+                    claude_linux.LinuxCredentialInspectionInconclusive
+                ) as first:
+                    source_anchor.close_if_owned()
+                self.assertIs(first.exception, diagnostic)
+
+                with self.assertRaises(
+                    claude_linux.LinuxCredentialInspectionInconclusive
+                ) as descriptor_read:
+                    _ = source_anchor.descriptor
+                self.assertIs(descriptor_read.exception, diagnostic)
+
+                with self.assertRaises(
+                    claude_linux.LinuxCredentialInspectionInconclusive
+                ) as legacy_descriptor_read:
+                    _ = source_anchor.legacy_parent_descriptor
+                self.assertIs(legacy_descriptor_read.exception, diagnostic)
+
+                with self.assertRaises(
+                    claude_linux.LinuxCredentialInspectionInconclusive
+                ) as stability_check:
+                    source_anchor.assert_stable(owner_uid=os.getuid())
+                self.assertIs(stability_check.exception, diagnostic)
+
+                with self.assertRaises(
+                    claude_linux.LinuxCredentialInspectionInconclusive
+                ) as repeated:
+                    source_anchor.close_if_detached()
+                self.assertIs(repeated.exception, diagnostic)
+                close_descriptor.assert_not_called()
+                for descriptor in source_descriptors:
+                    os.fstat(descriptor)
+
+    def test_terminal_proof_retries_interrupted_residue_diagnostic_read(
+        self,
+    ) -> None:
+        with self._host_cleanup_coordinator_fixture(
+            with_lease=False,
+            allow_source_residue=True,
+        ) as (
+            root,
+            _source,
+            source_anchor,
+            coordinator,
+            no_lease,
+        ):
+            self.assertIsNone(no_lease)
+            carrier = root / "retained-carrier"
+            config_dir = carrier / "config"
+            config_dir.mkdir(parents=True)
+            staged = claude_linux.StagedCredential(
+                carrier_root=carrier,
+                config_dir=config_dir,
+                credential_path=config_dir / ".credentials.json",
+                expires_at_ms=(time.time() + 3600) * 1000,
+            )
+            coordinator.publish_watcher(staged, mock.Mock())
+            source_anchor.detach_to_watcher()
+            coordinator._mark_source_retention_required(None)
+            control_flow = KeyboardInterrupt(
+                "injected source-anchor residue diagnostic read interruption"
+            )
+            real_diagnostic_getter = (
+                claude_linux._CredentialDirectoryAnchor
+                .descriptor_residue_diagnostic.fget
+            )
+            assert real_diagnostic_getter is not None
+            diagnostic_reads = 0
+
+            def read_residue_diagnostic(
+                anchor: claude_linux._CredentialDirectoryAnchor,
+            ) -> claude_linux.LinuxCredentialInspectionInconclusive | None:
+                nonlocal diagnostic_reads
+                diagnostic_reads += 1
+                if diagnostic_reads == 1:
+                    raise control_flow
+                return real_diagnostic_getter(anchor)
+
+            with (
+                mock.patch.object(
+                    coordinator,
+                    "_retain_source_anchor",
+                    side_effect=OSError("injected persistent source handoff"),
+                ),
+                mock.patch.object(
+                    claude_linux._CredentialDirectoryAnchor,
+                    "descriptor_residue_diagnostic",
+                    new=property(read_residue_diagnostic),
+                ),
+                mock.patch.object(claude_linux.time, "sleep", return_value=None),
+            ):
+                coordinator._wait_for_cleanup_terminal_proof(
+                    None,
+                    retry_scope="fixture",
+                )
+
+            self.assertEqual(diagnostic_reads, 2)
+            self.assertTrue(coordinator._source_terminal)
+            self.assertTrue(any(error is control_flow for error in coordinator._errors))
+            self.assertIs(
+                source_anchor.disposition,
+                claude_linux._CredentialDirectoryAnchorDisposition.DESCRIPTOR_RESIDUE,
+            )
 
     def test_worker_owner_read_interruption_keeps_source_requirement(self) -> None:
         with self._host_cleanup_coordinator_fixture(with_lease=True) as (
