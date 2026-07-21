@@ -638,6 +638,85 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                     "inconclusive",
                 )
 
+    def test_accepts_closed_allowed_warning_rate_limit_variant(self) -> None:
+        warning = copy.deepcopy(self._reviewed_intermediate_events()[-1])
+        info = warning["rate_limit_info"]
+        assert isinstance(info, dict)
+        info.update(
+            {
+                "status": "allowed_warning",
+                "utilization": 0.75,
+                "surpassedThreshold": 0.75,
+            }
+        )
+        del info["overageStatus"]
+        del info["overageResetsAt"]
+
+        outcome = self._validate(
+            [
+                copy.deepcopy(self.init_event),
+                warning,
+                copy.deepcopy(self.result_event),
+            ]
+        )
+
+        self.assertEqual(
+            outcome,
+            {"classification": "accepted", "findings": "\nNo findings.\n"},
+        )
+
+    def test_rejects_nonclosed_rate_limit_variants(self) -> None:
+        allowed = copy.deepcopy(self._reviewed_intermediate_events()[-1])
+        allowed_info = allowed["rate_limit_info"]
+        assert isinstance(allowed_info, dict)
+        del allowed_info["overageStatus"]
+
+        warning = copy.deepcopy(self._reviewed_intermediate_events()[-1])
+        warning_info = warning["rate_limit_info"]
+        assert isinstance(warning_info, dict)
+        warning_info.update(
+            {
+                "status": "allowed_warning",
+                "utilization": 1.1,
+                "surpassedThreshold": 0.75,
+            }
+        )
+        del warning_info["overageStatus"]
+        del warning_info["overageResetsAt"]
+
+        unknown = copy.deepcopy(self._reviewed_intermediate_events()[-1])
+        unknown_info = unknown["rate_limit_info"]
+        assert isinstance(unknown_info, dict)
+        unknown_info["status"] = "future_status"
+
+        for label, event, reason in (
+            (
+                "allowed missing field",
+                allowed,
+                "intermediate.rate-limit-event.rate_limit_info.overageStatus.missing",
+            ),
+            (
+                "warning invalid ratio",
+                warning,
+                "intermediate.rate-limit-event.rate_limit_info.utilization.malformed",
+            ),
+            (
+                "unknown status",
+                unknown,
+                "intermediate.rate-limit-event.rate_limit_info.status.unrecognized",
+            ),
+        ):
+            with self.subTest(label=label):
+                outcome = self._validate(
+                    [
+                        copy.deepcopy(self.init_event),
+                        event,
+                        copy.deepcopy(self.result_event),
+                    ]
+                )
+                self.assert_fail_closed(outcome, "inconclusive")
+                self.assertIn(reason, outcome["reasons"])
+
     def test_nonzero_success_is_inconclusive_and_returncode_must_be_exact_int(
         self,
     ) -> None:

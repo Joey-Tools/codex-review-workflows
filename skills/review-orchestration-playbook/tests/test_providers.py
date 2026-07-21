@@ -110,7 +110,9 @@ def claude_stream_fixture(
     *,
     model: str = "claude-opus-4-8",
     auth_source: str = "local-login",
+    claude_code_version: str = "2.1.216",
     init_updates: dict[str, object] | None = None,
+    intermediate_events: tuple[dict[str, object], ...] = (),
     result_updates: dict[str, object] | None = None,
 ) -> bytes:
     init: dict[str, object] = {
@@ -124,7 +126,7 @@ def claude_stream_fixture(
         "permissionMode": "dontAsk",
         "slash_commands": [],
         "apiKeySource": ("ANTHROPIC_API_KEY" if auth_source == "api-key" else "none"),
-        "claude_code_version": "2.1.216",
+        "claude_code_version": claude_code_version,
         "output_style": "default",
         "agents": ["claude", "Explore", "general-purpose", "Plan"],
         "skills": [],
@@ -143,10 +145,41 @@ def claude_stream_fixture(
         "is_error": False,
         "result": "No findings.",
         "modelUsage": {model: {}},
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "permission_denials": [],
+        "fast_mode_state": "off",
+        "terminal_reason": "completed",
+        "time_to_request_ms": 1,
+        "ttft_ms": 2,
+        "ttft_stream_ms": 3,
     }
+    if tuple(int(component) for component in claude_code_version.split(".")) < (
+        2,
+        1,
+        216,
+    ):
+        for field_name in (
+            "output_style",
+            "agents",
+            "capabilities",
+            "analytics_disabled",
+            "product_feedback_disabled",
+            "uuid",
+            "fast_mode_state",
+        ):
+            del init[field_name]
+        for field_name in (
+            "fast_mode_state",
+            "terminal_reason",
+            "time_to_request_ms",
+            "ttft_ms",
+            "ttft_stream_ms",
+        ):
+            del result[field_name]
     if result_updates:
         result.update(result_updates)
-    return (json.dumps(init) + "\n" + json.dumps(result) + "\n").encode()
+    events = (init, *intermediate_events, result)
+    return ("".join(json.dumps(event) + "\n" for event in events)).encode()
 
 
 class ProviderPolicyTest(unittest.TestCase):
@@ -5631,23 +5664,35 @@ class ProviderPolicyTest(unittest.TestCase):
                 requested_source="local-login",
             )
 
-    def test_claude_stream_requires_effective_init_and_terminal_contract(self) -> None:
+    def _validate_provider_claude_stream(
+        self,
+        payload: bytes,
+        *,
+        expected_version: str | None = "2.1.216",
+        process_returncode: int = 0,
+    ) -> dict[str, object]:
         auth = providers.ClaudeAuthenticationEvidence(
             requested_source="local-login",
             api_provider="firstParty",
             auth_method="claude.ai",
             api_key_source=None,
         )
-        valid = providers._strict_jsonl_objects(claude_stream_fixture(self.review))
-        assert valid is not None
-        self.assertEqual(
-            providers._parse_claude_stream_objects(
-                valid,
+        with tempfile.TemporaryFile() as stream:
+            stream.write(payload)
+            stream.flush()
+            return providers._validate_claude_stream_handle(
+                stream,
                 review=self.review,
                 requested_model="claude-opus-4-8",
                 authentication=auth,
-            ),
-            ("No findings.", "claude-opus-4-8", True),
+                expected_claude_code_version=expected_version,
+                process_returncode=process_returncode,
+            )
+
+    def test_claude_stream_requires_effective_versioned_contract(self) -> None:
+        self.assertEqual(
+            self._validate_provider_claude_stream(claude_stream_fixture(self.review)),
+            {"classification": "accepted", "findings": "No findings."},
         )
 
         for label, payload in (
@@ -5679,136 +5724,180 @@ class ProviderPolicyTest(unittest.TestCase):
                     init_updates={"model": "claude-opus-4-7"},
                 ),
             ),
+            (
+                "permission denial",
+                claude_stream_fixture(
+                    self.review,
+                    result_updates={"permission_denials": [{"tool": "Read"}]},
+                ),
+            ),
+            (
+                "unknown intermediate event",
+                claude_stream_fixture(
+                    self.review,
+                    intermediate_events=(
+                        {
+                            "type": "future_event",
+                            "session_id": "11111111-1111-4111-8111-111111111111",
+                        },
+                    ),
+                ),
+            ),
+            (
+                "session mismatch",
+                claude_stream_fixture(
+                    self.review,
+                    result_updates={
+                        "session_id": "99999999-9999-4999-8999-999999999999"
+                    },
+                ),
+            ),
+            (
+                "unknown terminal field",
+                claude_stream_fixture(
+                    self.review,
+                    result_updates={"future_field": True},
+                ),
+            ),
         ):
             with self.subTest(label=label):
-                objects = providers._strict_jsonl_objects(payload)
-                assert objects is not None
-                final_text, _effective_model, contract = (
-                    providers._parse_claude_stream_objects(
-                        objects,
-                        review=self.review,
-                        requested_model="claude-opus-4-8",
-                        authentication=auth,
-                    )
-                )
-                self.assertEqual(final_text, "No findings.")
-                self.assertFalse(contract)
+                outcome = self._validate_provider_claude_stream(payload)
+                self.assertNotEqual(outcome["classification"], "accepted")
+                self.assertNotIn("findings", outcome)
 
-    def test_claude_stream_allows_additive_nonsecurity_init_metadata(self) -> None:
-        auth = providers.ClaudeAuthenticationEvidence(
-            requested_source="local-login",
-            api_provider="firstParty",
-            auth_method="claude.ai",
-            api_key_source=None,
+        missing_extended = [
+            json.loads(line) for line in claude_stream_fixture(self.review).splitlines()
+        ]
+        del missing_extended[-1]["ttft_stream_ms"]
+        outcome = self._validate_provider_claude_stream(
+            ("".join(json.dumps(event) + "\n" for event in missing_extended)).encode()
         )
-        objects = providers._strict_jsonl_objects(
+        self.assertEqual(outcome["classification"], "inconclusive")
+        self.assertIn("terminal.ttft_stream_ms.missing", outcome["reasons"])
+
+    def test_claude_stream_rejects_unknown_init_metadata(self) -> None:
+        outcome = self._validate_provider_claude_stream(
             claude_stream_fixture(
                 self.review,
                 init_updates={"additive_metadata": {"releaseChannel": "stable"}},
             )
         )
-        assert objects is not None
-        self.assertTrue(
-            providers._parse_claude_stream_objects(
-                objects,
-                review=self.review,
-                requested_model="claude-opus-4-8",
-                authentication=auth,
-            )[2]
+        self.assertEqual(outcome["classification"], "inconclusive")
+        self.assertIn("init.unknown-field", outcome["reasons"])
+
+    def test_claude_stream_binds_each_profile_to_publisher_release(self) -> None:
+        for version in ("2.1.211", "2.1.215", "2.1.216", "2.9.999"):
+            with self.subTest(version=version):
+                payload = claude_stream_fixture(
+                    self.review,
+                    claude_code_version=version,
+                )
+                self.assertEqual(
+                    self._validate_provider_claude_stream(
+                        payload,
+                        expected_version=version,
+                    ),
+                    {"classification": "accepted", "findings": "No findings."},
+                )
+        legacy = claude_stream_fixture(self.review, claude_code_version="2.1.215")
+        self.assertNotEqual(
+            self._validate_provider_claude_stream(
+                legacy,
+                expected_version="2.1.216",
+            )["classification"],
+            "accepted",
         )
 
-    def test_claude_stream_binds_init_version_to_publisher_release(self) -> None:
-        auth = providers.ClaudeAuthenticationEvidence(
-            requested_source="local-login",
-            api_provider="firstParty",
-            auth_method="claude.ai",
-            api_key_source=None,
-        )
-        matching = providers._strict_jsonl_objects(
-            claude_stream_fixture(self.review),
-        )
-        mismatching = providers._strict_jsonl_objects(
-            claude_stream_fixture(
-                self.review,
-                init_updates={"claude_code_version": "2.1.215"},
-            ),
-        )
-        assert matching is not None
-        assert mismatching is not None
-
-        self.assertTrue(
-            providers._parse_claude_stream_objects(
-                matching,
-                review=self.review,
-                requested_model="claude-opus-4-8",
-                authentication=auth,
-                expected_claude_code_version="2.1.216",
-            )[2]
-        )
-        self.assertFalse(
-            providers._parse_claude_stream_objects(
-                mismatching,
-                review=self.review,
-                requested_model="claude-opus-4-8",
-                authentication=auth,
-                expected_claude_code_version="2.1.216",
-            )[2]
-        )
-
-    def test_claude_stream_parser_does_not_materialize_the_event_iterable(self) -> None:
-        auth = providers.ClaudeAuthenticationEvidence(
-            requested_source="local-login",
-            api_provider="firstParty",
-            auth_method="claude.ai",
-            api_key_source=None,
-        )
-        events = providers._strict_jsonl_objects(claude_stream_fixture(self.review))
-        assert events is not None
-
-        class SinglePassEvents:
-            def __init__(self) -> None:
-                self._events = iter(events)
-
-            def __iter__(self):
-                return self
-
-            def __next__(self):
-                return next(self._events)
-
-            def __length_hint__(self) -> int:
-                raise AssertionError("Claude stream events must not be materialized")
-
+    def test_claude_stream_machine_classification_controls_fallback(self) -> None:
         self.assertEqual(
-            providers._parse_claude_stream_objects(
-                SinglePassEvents(),
-                review=self.review,
-                requested_model="claude-opus-4-8",
-                authentication=auth,
+            providers._claude_stream_attempt_category(
+                {
+                    "classification": "blocked-authentication",
+                    "reasons": ["terminal.authentication-error"],
+                }
             ),
-            ("No findings.", "claude-opus-4-8", True),
+            "auth",
+        )
+        self.assertEqual(
+            providers._claude_stream_attempt_category(
+                {
+                    "classification": "blocked",
+                    "reasons": ["terminal.model-entitlement-denial"],
+                }
+            ),
+            "entitlement",
+        )
+        self.assertEqual(
+            providers._claude_stream_attempt_category(
+                {
+                    "classification": "blocked",
+                    "reasons": ["terminal.permission_denials.nonempty"],
+                }
+            ),
+            "permission-mismatch",
+        )
+        self.assertEqual(
+            providers._claude_stream_attempt_category(
+                {
+                    "classification": "blocked",
+                    "reasons": [
+                        "terminal.model-entitlement-denial",
+                        "terminal.permission_denials.nonempty",
+                    ],
+                }
+            ),
+            "permission-mismatch",
+        )
+        self.assertEqual(
+            providers._claude_stream_attempt_category(
+                {
+                    "classification": "inconclusive",
+                    "reasons": ["terminal.model-entitlement-denial"],
+                }
+            ),
+            "runtime-unverified",
         )
 
     def test_claude_stream_rejects_duplicate_or_misordered_contract_events(
         self,
     ) -> None:
-        auth = providers.ClaudeAuthenticationEvidence(
+        valid = claude_stream_fixture(self.review).splitlines(keepends=True)
+        for label, payload in (
+            ("duplicate init", valid[0] + valid[0] + valid[1]),
+            ("misordered", valid[1] + valid[0]),
+        ):
+            with self.subTest(label=label):
+                outcome = self._validate_provider_claude_stream(payload)
+                self.assertNotEqual(outcome["classification"], "accepted")
+                self.assertNotIn("findings", outcome)
+
+    def test_claude_stream_file_adapter_requires_no_follow_open(self) -> None:
+        stream_path = self.review.container_dir / "captured-claude-stream.jsonl"
+        stream_path.write_bytes(claude_stream_fixture(self.review))
+        authentication = providers.ClaudeAuthenticationEvidence(
             requested_source="local-login",
             api_provider="firstParty",
             auth_method="claude.ai",
             api_key_source=None,
         )
-        valid = providers._strict_jsonl_objects(claude_stream_fixture(self.review))
-        assert valid is not None
-        for objects in ((valid[0], valid[0], valid[1]), (valid[1], valid[0])):
-            with self.subTest(types=[item["type"] for item in objects]):
-                self.assertFalse(
-                    providers._parse_claude_stream_objects(
-                        objects,
-                        review=self.review,
-                        requested_model="claude-opus-4-8",
-                        authentication=auth,
-                    )[2]
-                )
+
+        with mock.patch.object(providers.os, "O_NOFOLLOW", None):
+            outcome = providers._parse_claude_stream_output_file(
+                stream_path,
+                review=self.review,
+                requested_model="claude-opus-4-8",
+                authentication=authentication,
+                expected_claude_code_version="2.1.216",
+                process_returncode=0,
+            )
+
+        self.assertEqual(
+            outcome,
+            {
+                "classification": "inconclusive",
+                "reasons": ["stream.capture-no-follow-unavailable"],
+            },
+        )
 
     def test_claude_arguments_and_native_sandbox_are_read_only(self) -> None:
         assert self.review.git_dir is not None
@@ -5962,6 +6051,7 @@ class ProviderPolicyTest(unittest.TestCase):
             "TEMP": str(temporary),
             "CLAUDE_CODE_TMPDIR": str(temporary),
             "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "0",
+            providers.CLAUDE_EXPECTED_VERSION_ENV_KEY: "2.1.216",
         }
 
         def resolve_claude(**_kwargs: object):
@@ -6059,6 +6149,11 @@ class ProviderPolicyTest(unittest.TestCase):
                 )
 
     @mock.patch.object(
+        providers.claude_stream_validator,
+        "validate_claude_stream",
+        wraps=providers.claude_stream_validator.validate_claude_stream,
+    )
+    @mock.patch.object(
         providers,
         "validate_external_workspace",
         wraps=providers.validate_external_workspace,
@@ -6068,6 +6163,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
         run_command: mock.Mock,
         validate_workspace: mock.Mock,
+        validate_stream: mock.Mock,
     ) -> None:
         def complete(argv: tuple[str, ...], **kwargs: object) -> Completed:
             is_auth = "auth" in argv
@@ -6114,12 +6210,24 @@ class ProviderPolicyTest(unittest.TestCase):
                 "TEMP": str(temporary),
                 "CLAUDE_CODE_TMPDIR": str(temporary),
                 "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "0",
+                providers.CLAUDE_EXPECTED_VERSION_ENV_KEY: "2.1.216",
             },
             executable=pathlib.Path("/bin/claude"),
             redact_values=("alpha", "omega"),
         )
 
         self.assertEqual(attempt.category, "success")
+        validate_stream.assert_called_once()
+        self.assertEqual(
+            validate_stream.call_args.kwargs,
+            {
+                "expected_cwd": self.review.workspace_root,
+                "requested_model": "claude-opus-4-8",
+                "claude_code_version": "2.1.216",
+                "authentication_source": "local-login",
+                "process_returncode": 0,
+            },
+        )
         self.assertFalse((self.review.workspace_root / ".claude").exists())
         self.assertEqual(run_command.call_count, 2)
         validate_workspace.assert_called_once_with(self.review)
@@ -6194,6 +6302,95 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(
             egress["authentication"]["effective_init_contract"], "verified"
         )
+
+    @mock.patch.object(
+        providers.claude_stream_validator,
+        "validate_claude_stream",
+    )
+    @mock.patch.object(providers, "run")
+    def test_claude_attempt_uses_machine_stream_classification_over_text(
+        self,
+        run_command: mock.Mock,
+        validate_stream: mock.Mock,
+    ) -> None:
+        misleading = b'{"error":"Model is not available for your account"}\n'
+
+        def complete(argv: tuple[str, ...], **kwargs: object) -> Completed:
+            is_auth = "auth" in argv
+            payload = (
+                claude_auth_status_fixture("local-login") if is_auth else misleading
+            )
+            if not is_auth:
+                staging = self.review.workspace_root / ".claude" / ".cc-writes"
+                staging.mkdir(parents=True, mode=0o700)
+            stdout_path = pathlib.Path(kwargs["stdout_path"])
+            stderr_path = pathlib.Path(kwargs["stderr_path"])
+            stdout_path.parent.mkdir(parents=True, exist_ok=True)
+            stdout_path.write_bytes(payload)
+            stderr_path.write_bytes(b"")
+            return Completed(argv=argv, returncode=0, stdout=payload, stderr=b"")
+
+        run_command.side_effect = complete
+        temporary = self.review.container_dir / "tmp"
+        temporary.mkdir(exist_ok=True)
+        env = {
+            "HOME": str(self.claude_pwd_home),
+            "TMPDIR": str(temporary),
+            "TMP": str(temporary),
+            "TEMP": str(temporary),
+            "CLAUDE_CODE_TMPDIR": str(temporary),
+            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "0",
+            providers.CLAUDE_EXPECTED_VERSION_ENV_KEY: "2.1.216",
+        }
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"schema": 1, "phase": "publisher-and-cli-contract-verified"},
+        )
+
+        cases = (
+            (
+                {"classification": "blocked-authentication", "reasons": ["auth"]},
+                "auth",
+                0,
+            ),
+            (
+                {
+                    "classification": "blocked",
+                    "reasons": ["terminal.model-entitlement-denial"],
+                },
+                "entitlement",
+                0,
+            ),
+            (
+                {
+                    "classification": "inconclusive",
+                    "reasons": ["intermediate.event.unknown-type"],
+                },
+                "runtime-unverified",
+                65,
+            ),
+            (
+                {
+                    "classification": "blocked",
+                    "reasons": ["terminal.permission_denials.nonempty"],
+                },
+                "permission-mismatch",
+                65,
+            ),
+        )
+        for index, (validation, category, returncode) in enumerate(cases, start=1):
+            with self.subTest(category=category):
+                validate_stream.return_value = validation
+                attempt = providers._claude_attempt(
+                    review=self.review,
+                    model="claude-opus-4-8",
+                    index=index,
+                    env=env,
+                    executable=pathlib.Path("/bin/claude"),
+                )
+                self.assertEqual(attempt.category, category)
+                self.assertEqual(attempt.returncode, returncode)
+                self.assertIsNone(attempt.final_text)
 
     @mock.patch.object(
         providers,

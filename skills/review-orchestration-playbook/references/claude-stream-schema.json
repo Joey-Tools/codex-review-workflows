@@ -458,31 +458,70 @@
                 "rule": "nonempty_string"
               },
               "rate_limit_info": {
-                "rule": "closed_object",
-                "required_fields": [
-                  "isUsingOverage",
-                  "overageInUse",
-                  "overageResetsAt",
-                  "overageStatus",
-                  "rateLimitType",
-                  "resetsAt",
-                  "status"
-                ],
-                "optional_fields": [],
-                "additional_fields": false,
-                "string_fields": [
-                  "status",
-                  "rateLimitType",
-                  "overageStatus"
-                ],
-                "nonnegative_integer_fields": [
-                  "resetsAt",
-                  "overageResetsAt"
-                ],
-                "boolean_fields": [
-                  "isUsingOverage",
-                  "overageInUse"
-                ]
+                "rule": "closed_object_variant",
+                "selector": "status",
+                "variants": {
+                  "allowed": {
+                    "match": {
+                      "status": "allowed"
+                    },
+                    "required_fields": [
+                      "isUsingOverage",
+                      "overageInUse",
+                      "overageResetsAt",
+                      "overageStatus",
+                      "rateLimitType",
+                      "resetsAt",
+                      "status"
+                    ],
+                    "optional_fields": [],
+                    "additional_fields": false,
+                    "string_fields": [
+                      "status",
+                      "rateLimitType",
+                      "overageStatus"
+                    ],
+                    "nonnegative_integer_fields": [
+                      "resetsAt",
+                      "overageResetsAt"
+                    ],
+                    "boolean_fields": [
+                      "isUsingOverage",
+                      "overageInUse"
+                    ]
+                  },
+                  "allowed-warning": {
+                    "match": {
+                      "status": "allowed_warning"
+                    },
+                    "required_fields": [
+                      "isUsingOverage",
+                      "overageInUse",
+                      "rateLimitType",
+                      "resetsAt",
+                      "status",
+                      "surpassedThreshold",
+                      "utilization"
+                    ],
+                    "optional_fields": [],
+                    "additional_fields": false,
+                    "string_fields": [
+                      "status",
+                      "rateLimitType"
+                    ],
+                    "nonnegative_integer_fields": [
+                      "resetsAt"
+                    ],
+                    "unit_interval_number_fields": [
+                      "utilization",
+                      "surpassedThreshold"
+                    ],
+                    "boolean_fields": [
+                      "isUsingOverage",
+                      "overageInUse"
+                    ]
+                  }
+                }
               }
             }
           }

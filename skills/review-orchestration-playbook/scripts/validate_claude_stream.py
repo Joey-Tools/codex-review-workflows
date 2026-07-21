@@ -233,17 +233,40 @@ USER_MESSAGE_FIELDS = frozenset(("content", "role"))
 USER_TOOL_RESULT_REQUIRED_FIELDS = frozenset(("type", "content", "tool_use_id"))
 USER_TOOL_RESULT_OPTIONAL_FIELDS = frozenset(("is_error",))
 RATE_LIMIT_EVENT_FIELDS = frozenset(("type", "rate_limit_info", "session_id", "uuid"))
-RATE_LIMIT_INFO_FIELDS = frozenset(
+RATE_LIMIT_INFO_COMMON_FIELDS = frozenset(
     (
         "status",
         "resetsAt",
         "rateLimitType",
-        "overageStatus",
-        "overageResetsAt",
         "isUsingOverage",
         "overageInUse",
     )
 )
+RATE_LIMIT_INFO_VARIANTS = {
+    "allowed": {
+        "match": {"status": "allowed"},
+        "required_fields": sorted(
+            RATE_LIMIT_INFO_COMMON_FIELDS | {"overageStatus", "overageResetsAt"}
+        ),
+        "optional_fields": [],
+        "additional_fields": False,
+        "string_fields": ["status", "rateLimitType", "overageStatus"],
+        "nonnegative_integer_fields": ["resetsAt", "overageResetsAt"],
+        "boolean_fields": ["isUsingOverage", "overageInUse"],
+    },
+    "allowed-warning": {
+        "match": {"status": "allowed_warning"},
+        "required_fields": sorted(
+            RATE_LIMIT_INFO_COMMON_FIELDS | {"utilization", "surpassedThreshold"}
+        ),
+        "optional_fields": [],
+        "additional_fields": False,
+        "string_fields": ["status", "rateLimitType"],
+        "nonnegative_integer_fields": ["resetsAt"],
+        "unit_interval_number_fields": ["utilization", "surpassedThreshold"],
+        "boolean_fields": ["isUsingOverage", "overageInUse"],
+    },
+}
 
 INTERMEDIATE_EVENT_CONTRACT = {
     "selector": "claude_code_version",
@@ -369,23 +392,9 @@ INTERMEDIATE_EVENT_CONTRACT = {
                     "session_id": {"rule": "session_binding"},
                     "uuid": {"rule": "nonempty_string"},
                     "rate_limit_info": {
-                        "rule": "closed_object",
-                        "required_fields": sorted(RATE_LIMIT_INFO_FIELDS),
-                        "optional_fields": [],
-                        "additional_fields": False,
-                        "string_fields": [
-                            "status",
-                            "rateLimitType",
-                            "overageStatus",
-                        ],
-                        "nonnegative_integer_fields": [
-                            "resetsAt",
-                            "overageResetsAt",
-                        ],
-                        "boolean_fields": [
-                            "isUsingOverage",
-                            "overageInUse",
-                        ],
+                        "rule": "closed_object_variant",
+                        "selector": "status",
+                        "variants": RATE_LIMIT_INFO_VARIANTS,
                     },
                 },
             },
@@ -1196,6 +1205,23 @@ def _validate_intermediate_boolean(
         evidence.inconclusive.add(f"{label}.{field_name}.malformed")
 
 
+def _validate_intermediate_unit_interval_number(
+    event: Mapping[str, Any],
+    field_name: str,
+    *,
+    label: str,
+    evidence: _Evidence,
+) -> None:
+    if field_name not in event:
+        return
+    value = event[field_name]
+    valid = type(value) is int and 0 <= value <= 1
+    if type(value) is Decimal:
+        valid = value.is_finite() and Decimal(0) <= value <= Decimal(1)
+    if not valid:
+        evidence.inconclusive.add(f"{label}.{field_name}.malformed")
+
+
 def _validate_intermediate_session(
     event: Mapping[str, Any],
     *,
@@ -1479,15 +1505,30 @@ def _validate_rate_limit_event(
     if "rate_limit_info" not in event:
         return
     info_label = f"{label}.rate_limit_info"
+    raw_info = event["rate_limit_info"]
+    if type(raw_info) is not dict:
+        evidence.inconclusive.add(f"{info_label}.malformed")
+        return
+    status = raw_info.get("status")
+    if status == "allowed":
+        variant = RATE_LIMIT_INFO_VARIANTS["allowed"]
+    elif status == "allowed_warning":
+        variant = RATE_LIMIT_INFO_VARIANTS["allowed-warning"]
+    else:
+        if type(status) is not str:
+            evidence.inconclusive.add(f"{info_label}.status.malformed")
+        else:
+            evidence.inconclusive.add(f"{info_label}.status.unrecognized")
+        return
     info = _validate_closed_object(
-        event["rate_limit_info"],
-        required_fields=RATE_LIMIT_INFO_FIELDS,
+        raw_info,
+        required_fields=frozenset(variant["required_fields"]),
         label=info_label,
         evidence=evidence,
     )
     if info is None:
         return
-    for field_name in ("status", "rateLimitType", "overageStatus"):
+    for field_name in variant["string_fields"]:
         _validate_intermediate_string(
             info,
             field_name,
@@ -1495,11 +1536,15 @@ def _validate_rate_limit_event(
             evidence=evidence,
             nonempty=False,
         )
-    for field_name in ("resetsAt", "overageResetsAt"):
+    for field_name in variant["nonnegative_integer_fields"]:
         _validate_intermediate_nonnegative_integer(
             info, field_name, label=info_label, evidence=evidence
         )
-    for field_name in ("isUsingOverage", "overageInUse"):
+    for field_name in variant.get("unit_interval_number_fields", []):
+        _validate_intermediate_unit_interval_number(
+            info, field_name, label=info_label, evidence=evidence
+        )
+    for field_name in variant["boolean_fields"]:
         _validate_intermediate_boolean(
             info, field_name, label=info_label, evidence=evidence
         )

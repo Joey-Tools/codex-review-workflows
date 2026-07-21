@@ -16,6 +16,8 @@ import urllib.parse
 from dataclasses import dataclass, replace
 from typing import Any, BinaryIO, Callable, Iterable, Iterator, Mapping
 
+import validate_claude_stream as claude_stream_validator
+
 from .claude_capabilities import (
     CLAUDE_REQUIRED_OPTIONS,
     ClaudeCapabilityError,
@@ -127,7 +129,6 @@ CLAUDE_PROBE_TIMEOUT_SECONDS = 20.0
 CLAUDE_PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024
 CLAUDE_AUTH_STATUS_TIMEOUT_SECONDS = 20.0
 CLAUDE_AUTH_STATUS_OUTPUT_LIMIT_BYTES = 64 * 1024
-CLAUDE_JSONL_RECORD_LIMIT_BYTES = 4 * 1024 * 1024
 CLAUDE_AUTH_LOGIN_ACTION = "Run `claude auth login`, then retry the review."
 CLAUDE_API_KEY_ACTION = "Unset or replace `ANTHROPIC_API_KEY`, then retry the review."
 CLAUDE_OAUTH_TOKEN_ACTION = (
@@ -214,31 +215,12 @@ CLAUDE_MODEL_SECRET_ENV_KEYS = (
 )
 CLAUDE_ENV_KEYS = (*CLAUDE_EXPLICIT_AUTH_ENV_KEYS, "NODE_EXTRA_CA_CERTS")
 CLAUDE_EXPECTED_VERSION_ENV_KEY = "CODEX_REVIEW_EXPECTED_CLAUDE_VERSION"
-CLAUDE_INIT_KEYS = (
-    "type",
-    "subtype",
-    "cwd",
-    "session_id",
-    "tools",
-    "mcp_servers",
-    "model",
-    "permissionMode",
-    "slash_commands",
-    "apiKeySource",
-    "claude_code_version",
-    "output_style",
-    "agents",
-    "skills",
-    "plugins",
-    "capabilities",
-    "analytics_disabled",
-    "product_feedback_disabled",
-    "uuid",
-    "fast_mode_state",
+CLAUDE_STREAM_ENTITLEMENT_REASONS = frozenset(
+    (
+        "terminal.model-entitlement-denial",
+        "terminal.organization-policy-denial",
+    )
 )
-CLAUDE_INIT_TOOLS = ("Bash", "Glob", "Grep", "Read")
-CLAUDE_INIT_AGENTS = ("claude", "Explore", "general-purpose", "Plan")
-CLAUDE_INIT_CAPABILITIES = ("interrupt_receipt_v1", "msg_lifecycle_v1")
 CLAUDE_IMMUTABLE_PROMPT_PREFIX = """Immutable Claude review boundary (authoritative):
 - Review only the helper-private detached workspace and its supplied review scope.
 - Do not directly read any path outside that workspace, including its parent, the source checkout, unrelated repositories, real-HOME content, credentials, or private files. Read-only Git may internally access only the workspace's registered private Git metadata and objects.
@@ -2173,147 +2155,65 @@ def _parse_claude_output(
     )
 
 
-def _claude_init_contract_matches(
-    init: dict[str, Any],
+def _validate_claude_stream_handle(
+    handle: BinaryIO,
     *,
     review: ReviewWorkspace,
     requested_model: str,
     authentication: ClaudeAuthenticationEvidence,
-    expected_claude_code_version: str | None = None,
-) -> bool:
-    if not set(CLAUDE_INIT_KEYS).issubset(init):
-        return False
-    if init.get("type") != "system" or init.get("subtype") != "init":
-        return False
-    if init.get("cwd") != str(review.workspace_root):
-        return False
-    if init.get("permissionMode") != "dontAsk":
-        return False
-    tools = init.get("tools")
-    if (
-        not isinstance(tools, list)
-        or len(tools) != len(CLAUDE_INIT_TOOLS)
-        or set(tools) != set(CLAUDE_INIT_TOOLS)
-    ):
-        return False
-    if any(
-        init.get(key) != []
-        for key in ("mcp_servers", "slash_commands", "skills", "plugins")
-    ):
-        return False
-    agents = init.get("agents")
-    if not isinstance(agents, list) or tuple(agents) != CLAUDE_INIT_AGENTS:
-        return False
-    capabilities = init.get("capabilities")
-    if (
-        not isinstance(capabilities, list)
-        or tuple(capabilities) != CLAUDE_INIT_CAPABILITIES
-    ):
-        return False
-    model = init.get("model")
-    if not isinstance(model, str) or not _model_matches(requested_model, model):
-        return False
-    expected_api_key_source = (
-        "ANTHROPIC_API_KEY" if authentication.requested_source == "api-key" else "none"
-    )
-    if init.get("apiKeySource") != expected_api_key_source:
-        return False
-    if init.get("output_style") != "default" or init.get("fast_mode_state") != "off":
-        return False
-    if init.get("analytics_disabled") is not True:
-        return False
-    if not isinstance(init.get("product_feedback_disabled"), bool):
-        return False
-    if not all(
-        isinstance(init.get(key), str) and init[key]
-        for key in ("session_id", "uuid", "claude_code_version")
-    ):
-        return False
-    observed_version = init["claude_code_version"]
+    expected_claude_code_version: str | None,
+    process_returncode: int,
+) -> dict[str, Any]:
+    if not expected_claude_code_version:
+        return {
+            "classification": "inconclusive",
+            "reasons": ["validator.claude-code-version-invalid"],
+        }
     try:
-        parsed_version = parse_claude_version(f"{observed_version} (Claude Code)")
-    except ClaudeCapabilityError:
-        return False
-    if (
-        expected_claude_code_version is not None
-        and parsed_version.text != expected_claude_code_version
-    ):
-        return False
-    return True
-
-
-def _parse_claude_stream_objects(
-    objects: Iterable[dict[str, Any]],
-    *,
-    review: ReviewWorkspace,
-    requested_model: str,
-    authentication: ClaudeAuthenticationEvidence,
-    expected_claude_code_version: str | None = None,
-) -> tuple[str | None, str | None, bool]:
-    init_event: tuple[int, dict[str, Any]] | None = None
-    result_event: tuple[int, dict[str, Any]] | None = None
-    init_count = 0
-    result_count = 0
-    last_index = -1
-    structured_error = False
-    for index, item in enumerate(objects):
-        last_index = index
-        if item.get("type") == "system" and item.get("subtype") == "init":
-            init_count += 1
-            if init_event is None:
-                init_event = (index, item)
-        if item.get("type") == "result":
-            result_count += 1
-            if result_event is None:
-                result_event = (index, item)
-        structured_error = structured_error or bool(_structured_error_item_text(item))
-    if last_index < 1 or init_event is None or result_event is None:
-        return None, None, False
-    if (
-        init_count != 1
-        or init_event[0] != 0
-        or result_count != 1
-        or result_event[0] != last_index
-    ):
-        return None, None, False
-    init_matches = _claude_init_contract_matches(
-        init_event[1],
-        review=review,
-        requested_model=requested_model,
-        authentication=authentication,
-        expected_claude_code_version=expected_claude_code_version,
+        handle.flush()
+        before = os.fstat(handle.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            return {
+                "classification": "inconclusive",
+                "reasons": ["stream.capture-not-regular-file"],
+            }
+        handle.seek(0)
+        result = claude_stream_validator.validate_claude_stream(
+            handle,
+            expected_cwd=review.workspace_root,
+            requested_model=requested_model,
+            claude_code_version=expected_claude_code_version,
+            authentication_source=authentication.requested_source,
+            process_returncode=process_returncode,
+        )
+        after = os.fstat(handle.fileno())
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return {
+            "classification": "inconclusive",
+            "reasons": ["stream.capture-read-failed"],
+        }
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
     )
-    final_text, effective_model = _parse_claude_result_object(
-        result_event[1],
-        requested_model=requested_model,
-        structured_error=structured_error,
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
     )
-    terminal_matches = (
-        final_text is not None
-        and effective_model is not None
-        and _model_matches(requested_model, effective_model)
-    )
-    return final_text, effective_model, init_matches and terminal_matches
-
-
-def _strict_claude_jsonl_file_objects(
-    path: pathlib.Path,
-) -> Iterable[dict[str, Any]]:
-    with path.open("rb") as handle:
-        while raw_line := handle.readline(CLAUDE_JSONL_RECORD_LIMIT_BYTES + 2):
-            line = raw_line[:-1] if raw_line.endswith(b"\n") else raw_line
-            if len(line) > CLAUDE_JSONL_RECORD_LIMIT_BYTES:
-                raise ValueError("Claude JSONL record exceeds the bounded parser limit")
-            if not line.strip(b" \t\r"):
-                continue
-            parsed = json.loads(
-                line.decode("utf-8"),
-                parse_constant=_reject_nonstandard_json_constant,
-                object_pairs_hook=_strict_json_object_from_pairs,
-            )
-            if not isinstance(parsed, dict):
-                raise ValueError("Claude JSONL record is not an object")
-            yield parsed
+    if before_identity != after_identity:
+        return {
+            "classification": "inconclusive",
+            "reasons": ["stream.capture-changed-during-validation"],
+        }
+    return result
 
 
 def _parse_claude_stream_output_file(
@@ -2322,18 +2222,72 @@ def _parse_claude_stream_output_file(
     review: ReviewWorkspace,
     requested_model: str,
     authentication: ClaudeAuthenticationEvidence,
-    expected_claude_code_version: str | None = None,
-) -> tuple[str | None, str | None, bool]:
+    expected_claude_code_version: str | None,
+    process_returncode: int,
+) -> dict[str, Any]:
+    no_follow_flag = getattr(os, "O_NOFOLLOW", None)
+    if no_follow_flag is None:
+        return {
+            "classification": "inconclusive",
+            "reasons": ["stream.capture-no-follow-unavailable"],
+        }
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | no_follow_flag
+    )
+    descriptor: int | None = None
     try:
-        return _parse_claude_stream_objects(
-            _strict_claude_jsonl_file_objects(path),
-            review=review,
-            requested_model=requested_model,
-            authentication=authentication,
-            expected_claude_code_version=expected_claude_code_version,
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            descriptor = None
+            return _validate_claude_stream_handle(
+                handle,
+                review=review,
+                requested_model=requested_model,
+                authentication=authentication,
+                expected_claude_code_version=expected_claude_code_version,
+                process_returncode=process_returncode,
+            )
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return {
+            "classification": "inconclusive",
+            "reasons": ["stream.capture-open-failed"],
+        }
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _claude_stream_attempt_category(result: Mapping[str, Any]) -> str:
+    classification = result.get("classification")
+    if classification == "accepted":
+        findings = result.get("findings")
+        return (
+            "success"
+            if isinstance(findings, str) and findings.strip()
+            else "runtime-unverified"
         )
-    except (OSError, UnicodeDecodeError, ValueError):
-        return None, None, False
+    if classification == "blocked-authentication":
+        return "auth"
+    reasons = result.get("reasons")
+    reason_set = (
+        frozenset(reasons)
+        if isinstance(reasons, list)
+        and reasons
+        and all(isinstance(reason, str) for reason in reasons)
+        else frozenset()
+    )
+    if (
+        classification == "blocked"
+        and reason_set
+        and reason_set <= CLAUDE_STREAM_ENTITLEMENT_REASONS
+    ):
+        return "entitlement"
+    if classification == "blocked":
+        return "permission-mismatch"
+    return "runtime-unverified"
 
 
 def _copilot_item_model_evidence(
@@ -4104,27 +4058,53 @@ def _claude_attempt_with_output(
             "post-attempt external review workspace validation failed; refusing "
             "the Claude result and any model fallback",
         )
+    stream_validation: dict[str, Any] = {
+        "classification": "inconclusive",
+        "reasons": ["workspace.post-attempt-validation-failed"],
+    }
     if post_attempt_workspace_verified:
         try:
-            final_text, effective_model, runtime_contract_verified = (
-                _parse_claude_stream_objects(
-                    output.strict_stdout_jsonl(completed),
+            output.ensure_captured(completed)
+            if output.stdout_file is None:
+                stream_validation = _parse_claude_stream_output_file(
+                    output.stdout_path,
                     review=review,
                     requested_model=model,
                     authentication=authentication,
                     expected_claude_code_version=env.get(
                         CLAUDE_EXPECTED_VERSION_ENV_KEY
                     ),
+                    process_returncode=completed.returncode,
                 )
-            )
+            else:
+                stream_validation = _validate_claude_stream_handle(
+                    output.stdout_file,
+                    review=review,
+                    requested_model=model,
+                    authentication=authentication,
+                    expected_claude_code_version=env.get(
+                        CLAUDE_EXPECTED_VERSION_ENV_KEY
+                    ),
+                    process_returncode=completed.returncode,
+                )
         except (OSError, UnicodeDecodeError, ValueError):
-            final_text = None
-            effective_model = None
+            stream_validation = {
+                "classification": "inconclusive",
+                "reasons": ["stream.validation-failed"],
+            }
+    stream_category = _claude_stream_attempt_category(stream_validation)
+    runtime_contract_verified = stream_category == "success"
+    final_text = None
+    if runtime_contract_verified:
+        candidate_findings = stream_validation.get("findings")
+        if isinstance(candidate_findings, str) and candidate_findings.strip():
+            final_text = candidate_findings
+        else:
             runtime_contract_verified = False
-    else:
-        final_text = None
-        effective_model = None
-        runtime_contract_verified = False
+            stream_category = "runtime-unverified"
+    effective_model = (
+        model if stream_category in {"success", "auth", "entitlement"} else None
+    )
     attempt = _record_attempt(
         review=review,
         index=index,
@@ -4138,6 +4118,11 @@ def _claude_attempt_with_output(
         require_verified_model=True,
         output=output,
     )
+    attempt = replace(
+        attempt,
+        category=stream_category,
+        final_text=final_text if stream_category == "success" else None,
+    )
     if not post_attempt_workspace_verified:
         attempt = replace(
             attempt,
@@ -4145,17 +4130,17 @@ def _claude_attempt_with_output(
             category="permission-mismatch",
             final_text=None,
         )
-    elif completed.returncode == 0 and not runtime_contract_verified:
+    elif stream_category in {"permission-mismatch", "runtime-unverified"}:
         output.append_stderr(
-            "effective Claude system/init or terminal result did not preserve the "
-            "dontAsk-mode, tool, model, and authentication contract; refusing a "
-            "result "
-            "that may reflect managed-policy or provider override",
+            "canonical Claude stream validation did not accept the complete "
+            "versioned init, intermediate-event, terminal, model, permission, "
+            "authentication, and child-return-code contract; refusing partial "
+            "findings and model fallback",
         )
         attempt = replace(
             attempt,
-            returncode=65,
-            category="permission-mismatch",
+            returncode=(65 if completed.returncode == 0 else completed.returncode),
+            category=stream_category,
             final_text=None,
         )
     authentication_status = (
@@ -4178,6 +4163,10 @@ def _claude_attempt_with_output(
                     "verified" if post_attempt_workspace_verified else "rejected"
                 ),
                 "claude_bash_staging_contract": claude_bash_staging_contract,
+                "stream_validation": {
+                    "classification": stream_validation.get("classification"),
+                    "reasons": stream_validation.get("reasons", []),
+                },
             },
             "sandbox": {
                 "implementation": "claude-native-sandbox",
@@ -4198,6 +4187,9 @@ def _claude_attempt_with_output(
                 "effective_effort": attempt.effective_effort,
                 "category": attempt.category,
                 "returncode": attempt.returncode,
+                "stream_validation_classification": stream_validation.get(
+                    "classification"
+                ),
                 "effective_init_contract": runtime_contract_verified,
                 "post_attempt_workspace_contract": (post_attempt_workspace_verified),
                 "claude_bash_staging_contract": claude_bash_staging_contract,
