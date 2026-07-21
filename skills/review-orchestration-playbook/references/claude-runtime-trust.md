@@ -725,6 +725,26 @@ section specifies the low-level helper's private credential staging and
 writeback implementation. Do not apply its catalog, broker, carrier, lock, or
 recovery requirements to the canonical real-`HOME` lane.
 
+For a catalogued local-login artifact, the credential boundary begins with one
+outer host refresh transaction before the first carrier read. The certified
+primary and legacy lock lease remains held while the helper selects and exposes
+the credential, Claude performs any network refresh, the macOS broker or
+Linux/WSL2 supervised process becomes quiescent, durable recovery state is
+settled, and the latest rotation is verified in the host carrier. A concurrent
+helper therefore waits before credential exposure and reads the post-transaction
+host state only after acquiring its own lease. macOS snapshot and persistence
+operations and Linux/WSL2 watcher writeback reuse this outer lease; the private
+staged-carrier locks remain separate. A no-rotation attempt with proven
+quiescence or a fully verified latest host commit releases the lease. If process
+or broker quiescence is unproven, a rotation is not durably committed, a private
+carrier must be retained, or cleanup cannot be proved, the helper abandons the
+lease: it stops the heartbeat, closes owned descriptors, intentionally leaves
+the shared lock directories as a stale fence, attaches only descriptor-bound
+recovery evidence without a lexical pathname, and pauses. It never automatically
+deletes that fence or treats it as authentication failure or Copilot fallback
+evidence. Explicit API-key mode performs no local-login carrier read and does
+not enter this transaction.
+
 An explicitly supplied `ANTHROPIC_API_KEY` remains an optional override and does
 not require local-login credential access or an internal credential-lock
 protocol entry. Never pass Claude and Copilot credentials into the same child
@@ -847,19 +867,23 @@ credential; a pre-reported recovery-root scope remains cleanup-only. A bounded h
 marks the lease as release-started, not release-complete.
 The owning release call performs one further bounded
 cleanup attempt while preserving the first timeout as its primary diagnostic;
-if both joins time out, it reports the exact helper-owned lock paths as
-cleanup-inconclusive and pauses for controlled operator cleanup after confirming
-that no credential writer remains. The lease then remains terminal, so queued or
-later release calls repeat the same diagnostic instead of deleting the paths.
+if both joins time out, it reports cleanup as inconclusive and pauses for
+controlled operator cleanup after confirming that no credential writer remains.
+Intentionally retained shared refresh-lock directories never authorize a lexical
+recovery or cleanup pathname; report only descriptor-bound residue. The lease
+then remains terminal, so queued or later
+release calls repeat the same diagnostic instead of retrying deletion.
 An interruption after descriptor or lock removal starts has the same terminal
-policy. Exact recovery paths remain visible even when an earlier credential
-operation stays primary, and a forwarded signal carries them in its detail. It
-never silently labels a potentially orphaned lock as completed cleanup. Every
+policy. Recovery metadata remains visible even when an earlier credential
+operation stays primary, and a forwarded signal carries the descriptor-bound
+diagnostic in its detail. It never silently labels a
+potentially orphaned lock as completed cleanup. Every
 successful post-quiescence write advances the full baseline, including the new
 file identity, for final verification and subsequent model attempts. Supported
-Claude Code login/refresh writers therefore serialize with the commit window; observed
-concurrent changes win and successful refresh-token rotation is normally
-retained. The Keychain and POSIX file do not share one transaction. After the
+Claude Code login/refresh writers therefore serialize across the complete host
+refresh transaction rather than only the final commit; observed concurrent
+changes win and successful refresh-token rotation is normally retained. The
+Keychain and POSIX file do not share one transaction. After the
 file commit, a failed Keychain command therefore triggers locked readback: an
 already-complete update is accepted, an exact file-new/Keychain-old state gets
 one bounded Keychain retry against the original Keychain payload, and any other
@@ -1012,9 +1036,9 @@ bounded failure report; normal paths still join it and the recovery copy is
 never silently deleted. A control-flow signal is re-raised only after the
 retained path has been attached to its visible diagnostic. The parent uses the
 same artifact-certified primary and legacy host locks with heartbeat and rejects
-any external host change instead of adopting it. This
-closes the commit race with supported Claude Code login/refresh writers but
-cannot atomically close it for unrelated writers that bypass both locks. Reject
+any external host change instead of adopting it. This serializes the complete
+attempt with supported Claude Code login/refresh writers but cannot atomically
+close it for unrelated writers that bypass both locks. Reject
 unsafe ownership,
 mode, symlink, path-race, size, or JSON structure, and never persist or print
 credential contents in review state. Every retained source descriptor must close

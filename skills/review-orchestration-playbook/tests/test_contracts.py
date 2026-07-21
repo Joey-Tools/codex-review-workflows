@@ -609,8 +609,12 @@ class RepositoryContractTest(unittest.TestCase):
         ) + inspect.getsource(providers._claude_attempt_with_output)
         pwd_home_source = inspect.getsource(providers._claude_pwd_home)
         select_source = inspect.getsource(providers._select_claude_macos_credential)
-        validate_source = inspect.getsource(providers._validate_claude_local_credential)
-        macos_runtime_source = inspect.getsource(providers._claude_keychain_runtime)
+        validate_source = inspect.getsource(
+            providers._validate_claude_local_credential
+        )
+        macos_runtime_source = inspect.getsource(
+            providers._claude_keychain_runtime
+        ) + inspect.getsource(providers._claude_keychain_runtime_coordinated)
         macos_persist_source = inspect.getsource(
             providers._persist_claude_macos_refreshed_credential
         ) + inspect.getsource(providers._persist_claude_macos_refreshed_credential_impl)
@@ -691,7 +695,14 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("stage_claude_credentials", linux_runtime_source)
         self.assertIn("writer_started", linux_runtime_source)
         self.assertIn("writer_quiescent", linux_runtime_source)
-        self.assertIn("on_process_started=writer_started.set", attempt_source)
+        self.assertIn(
+            "on_process_starting=writer_start.publish_starting",
+            attempt_source,
+        )
+        self.assertIn(
+            "on_process_started=writer_start.publish_started",
+            attempt_source,
+        )
         self.assertIn("writer_quiescent.set()", attempt_source)
         self.assertIn(
             "retain_for_recovery",
@@ -2997,6 +3008,31 @@ class RepositoryContractTest(unittest.TestCase):
             skill,
         )
         self.assertIn("No named shape authorizes a substitute external reviewer", skill)
+
+    def test_retained_refresh_locks_never_authorize_lexical_paths(self) -> None:
+        required = (
+            "Intentionally retained shared refresh-lock directories never "
+            "authorize a lexical recovery or cleanup pathname; report only "
+            "descriptor-bound residue."
+        )
+        candidates = (
+            SKILL_ROOT / "SKILL.md",
+            SKILL_ROOT / "references/helper-contract.md",
+            SKILL_ROOT / "references/claude-runtime-trust.md",
+        )
+        forbidden = (
+            "Report exact helper-owned lock paths only when",
+            "paths only after a quiesced descriptor/no-follow identity proof",
+            "Exact helper-owned paths are authoritative only after",
+            "authoritative path or descriptor-bound recovery evidence",
+            "Path-owned anchors may report exact recovery paths",
+        )
+        for candidate in candidates:
+            content = candidate.read_text(encoding="utf-8")
+            normalized = " ".join(content.split())
+            self.assertIn(required, normalized, str(candidate))
+            for phrase in forbidden:
+                self.assertNotIn(phrase, normalized, str(candidate))
 
     def test_selected_pr_requires_exact_merge_base_and_head_range(self) -> None:
         agents_policy = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
