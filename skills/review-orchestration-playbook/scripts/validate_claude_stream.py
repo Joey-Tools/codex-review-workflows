@@ -269,6 +269,7 @@ def _load_contract() -> dict[str, Any]:
         "last_nonblank_event": {"type": "result"},
         "init_event_count": 1,
         "result_event_count": 1,
+        "matching_session_id_when_both_present": True,
     }
     if stream_contract != expected_stream_contract:
         raise _ContractError("stream contract does not match the validator")
@@ -697,6 +698,25 @@ _MODEL_ENTITLEMENT_DENIALS = (
         r"[\s_-]+(?:the[\s_-]+)?model\b"
     ),
     re.compile(r"\bmodel[\s_-]+access[\s_-]+(?:is[\s_-]+)?denied\b"),
+    re.compile(
+        r"\b(?:the[\s_-]+)?model[\s_-]+is[\s_-]+not[\s_-]+available"
+        r"[\s_-]+(?:for[\s_-]+your|to[\s_-]+this)[\s_-]+(?:account|user)\b"
+    ),
+    re.compile(
+        r"\b(?:the[\s_-]+)?model[\s_-]+is[\s_-]+not[\s_-]+available"
+        r"[\s_-]+on[\s_-]+your(?:[\s_-]+current)?[\s_-]+plan\b"
+    ),
+    re.compile(
+        r"\b(?:account|user)[\s_-]+has[\s_-]+no[\s_-]+access"
+        r"[\s_-]+to[\s_-]+(?:the[\s_-]+|this[\s_-]+)?model\b"
+    ),
+    re.compile(
+        r"\b(?:you[\s_-]+)?(?:do[\s_-]+not|don['’]t)[\s_-]+have"
+        r"[\s_-]+access[\s_-]+to[\s_-]+(?:the[\s_-]+|this[\s_-]+)?model\b"
+    ),
+    re.compile(
+        r"\bmodel_(?:access_denied|not_enabled|not_entitled|permission_denied)\b"
+    ),
 )
 _ORGANIZATION_POLICY_DENIALS = (
     re.compile(
@@ -710,10 +730,18 @@ _ORGANIZATION_POLICY_DENIALS = (
         r"[\s_-]+organization(?:al)?[\s_-]+policy\b"
     ),
 )
+_FALLBACK_DISQUALIFYING_SIGNAL = re.compile(
+    r"\b(?:quota|capacity|budget|usage|resources?|overload(?:ed)?|"
+    r"rate[\s_-]+limits?|temporar(?:y|ily)[\s_-]+unavailable)\b"
+)
+
+
+def _normalize_failure_message(message: str) -> str:
+    return " ".join(message.casefold().split()).strip(" .")
 
 
 def _is_authentication_error(message: str) -> bool:
-    normalized = " ".join(message.casefold().split())
+    normalized = _normalize_failure_message(message)
     return bool(
         "login expired" in normalized
         or _HTTP_401.search(normalized)
@@ -724,13 +752,49 @@ def _is_authentication_error(message: str) -> bool:
 
 
 def _is_model_entitlement_denial(message: str) -> bool:
-    normalized = " ".join(message.casefold().split())
-    return any(pattern.search(normalized) for pattern in _MODEL_ENTITLEMENT_DENIALS)
+    normalized = _normalize_failure_message(message)
+    return any(pattern.fullmatch(normalized) for pattern in _MODEL_ENTITLEMENT_DENIALS)
 
 
 def _is_organization_policy_denial(message: str) -> bool:
-    normalized = " ".join(message.casefold().split())
-    return any(pattern.search(normalized) for pattern in _ORGANIZATION_POLICY_DENIALS)
+    normalized = _normalize_failure_message(message)
+    return any(
+        pattern.fullmatch(normalized) for pattern in _ORGANIZATION_POLICY_DENIALS
+    )
+
+
+def _failure_message_categories(message: str) -> set[str]:
+    normalized = _normalize_failure_message(message)
+    authentication = _is_authentication_error(message)
+    entitlement_signal = any(
+        pattern.search(normalized) for pattern in _MODEL_ENTITLEMENT_DENIALS
+    )
+    organization_signal = any(
+        pattern.search(normalized) for pattern in _ORGANIZATION_POLICY_DENIALS
+    )
+    exact_entitlement = _is_model_entitlement_denial(message)
+    exact_organization = _is_organization_policy_denial(message)
+    disqualifying_resource = bool(_FALLBACK_DISQUALIFYING_SIGNAL.search(normalized))
+
+    recognized_categories = {
+        category
+        for category, present in (
+            ("authentication", authentication),
+            ("model-entitlement", exact_entitlement),
+            ("organization-policy", exact_organization),
+        )
+        if present
+    }
+    has_inexact_fallback_signal = (entitlement_signal and not exact_entitlement) or (
+        organization_signal and not exact_organization
+    )
+    if (
+        disqualifying_resource
+        or has_inexact_fallback_signal
+        or len(recognized_categories) > 1
+    ):
+        return {"unclassified"}
+    return recognized_categories or {"unclassified"}
 
 
 def _collect_error_messages(event: Mapping[str, Any], evidence: _Evidence) -> list[str]:
@@ -864,19 +928,9 @@ def _validate_terminal(
     if success_claim and messages:
         evidence.inconclusive.add("terminal.success-with-error")
     elif failure_claim:
-        message_categories = [
-            (
-                "authentication"
-                if _is_authentication_error(message)
-                else "model-entitlement"
-                if _is_model_entitlement_denial(message)
-                else "organization-policy"
-                if _is_organization_policy_denial(message)
-                else "unclassified"
-            )
-            for message in messages
-        ]
-        category_set = set(message_categories)
+        category_set = set().union(
+            *(_failure_message_categories(message) for message in messages)
+        )
         if category_set == {"authentication"}:
             evidence.authentication.add("terminal.authentication-error")
         elif category_set and category_set <= {
@@ -1002,6 +1056,16 @@ def validate_claude_stream(
         api_key_source=api_key_source,
         evidence=evidence,
     )
+    init_session_id = envelope.first.get("session_id")
+    terminal_session_id = envelope.last.get("session_id")
+    if (
+        type(init_session_id) is str
+        and init_session_id.strip()
+        and type(terminal_session_id) is str
+        and terminal_session_id.strip()
+        and init_session_id != terminal_session_id
+    ):
+        evidence.inconclusive.add("stream.session_id.mismatch")
     findings = _validate_terminal(
         envelope.last,
         requested_model=requested_model,

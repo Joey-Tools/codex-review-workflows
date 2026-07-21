@@ -54,7 +54,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "duration_ms": 10,
             "duration_api_ms": 5,
             "num_turns": 1,
-            "session_id": "result-session",
+            "session_id": "init-session",
             "total_cost_usd": 0.01,
             "usage": {},
             "uuid": "result-uuid",
@@ -145,6 +145,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "last_nonblank_event": {"type": "result"},
                 "init_event_count": 1,
                 "result_event_count": 1,
+                "matching_session_id_when_both_present": True,
             },
         )
         init_contract = schema["init_event"]
@@ -221,6 +222,18 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         del events[0]["session_id"]
 
         self.assertEqual(self._validate(events)["classification"], "accepted")
+
+    def test_rejects_conflicting_init_and_terminal_session_ids(self) -> None:
+        events = self._full_events()
+        events[-1]["session_id"] = "different-session"
+
+        self.assertEqual(
+            self._validate(events),
+            {
+                "classification": "inconclusive",
+                "reasons": ["stream.session_id.mismatch"],
+            },
+        )
 
     def test_nonzero_success_is_inconclusive_and_returncode_must_be_exact_int(
         self,
@@ -814,6 +827,16 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "Model entitlement denied": "terminal.model-entitlement-denial",
             "Not entitled to use model": "terminal.model-entitlement-denial",
             "Model access is denied": "terminal.model-entitlement-denial",
+            "Model is not available for your account": (
+                "terminal.model-entitlement-denial"
+            ),
+            "Model is not available on your current plan": (
+                "terminal.model-entitlement-denial"
+            ),
+            "You do not have access to this model": (
+                "terminal.model-entitlement-denial"
+            ),
+            "model_not_enabled": "terminal.model-entitlement-denial",
             "Organization policy denied model": ("terminal.organization-policy-denial"),
             "Model is disallowed by organizational policy": (
                 "terminal.organization-policy-denial"
@@ -846,6 +869,12 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         for messages in (
             ["Model entitlement denied", "upstream request failed"],
             ["Organization policy denied model", "HTTP 401 Unauthorized"],
+            ["Model entitlement denied because quota is exhausted"],
+            ["Model entitlement denied because capacity is exhausted"],
+            ["Model entitlement denied due to rate limit"],
+            ["Model entitlement denied because authentication failed"],
+            ["Organization policy denied model because usage is exhausted"],
+            ["Model is not available for your account because quota is exhausted"],
             ["Policy error"],
             ["Model unavailable"],
         ):

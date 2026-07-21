@@ -397,55 +397,66 @@ class RepositoryContractTest(unittest.TestCase):
                 journal,
             )
 
-    def test_stateful_secret_admission_is_a_separate_current_head_gate(self) -> None:
+    def test_direct_secret_admission_is_required_without_a_reviewer(self) -> None:
         repository_policy = _secret_admission_repository_policy_files(
             REPO_ROOT,
             CI_PROFILE,
         )
-        policy = {
+        required_policy = {
             **repository_policy,
             "SKILL.md": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"),
-            "helper-contract.md": (
-                SKILL_ROOT / "references/helper-contract.md"
-            ).read_text(encoding="utf-8"),
             "pr-readiness.md": (SKILL_ROOT / "references/pr-readiness.md").read_text(
                 encoding="utf-8"
             ),
+            "review-lane-contracts.md": (
+                SKILL_ROOT / "references/review-lane-contracts.md"
+            ).read_text(encoding="utf-8"),
+            "egress-consent.md": (
+                SKILL_ROOT / "references/egress-consent.md"
+            ).read_text(encoding="utf-8"),
         }
-        for name, text in policy.items():
+        for name, text in required_policy.items():
             with self.subTest(policy=name):
-                self.assertIn("stateful final", text)
-                self.assertIn("stateful admission", text)
-                self.assertLess(
-                    text.index("stateful final"),
-                    text.index("stateful admission"),
+                lowered = text.lower()
+                self.assertIn("secret-admission", text)
+                self.assertIn("admission-only-no-reviewer", text)
+                self.assertIn("exit", lowered)
+                self.assertIn("`0`", text)
+                self.assertIn("`1`", text)
+                self.assertIn("`75`", text)
+                self.assertNotIn(
+                    "Obtain one low-level stateful helper state",
+                    text,
                 )
-        exit_code_policy = ["helper-contract.md", "pr-readiness.md"]
-        if "AGENTS.md" in policy:
-            exit_code_policy.append("AGENTS.md")
-        if "project journal" in policy:
-            exit_code_policy.append("project journal")
-        for name in exit_code_policy:
-            with self.subTest(exit_code_policy=name):
-                for exit_code in ("0", "1", "3", "75"):
-                    self.assertIn(f"exit `{exit_code}`", policy[name])
 
-        self.assertIn("Admission exit `0` is `clean`", policy["SKILL.md"])
-        self.assertIn(
-            "the only status that permits PR/master/merge-ready",
-            policy["helper-contract.md"],
+        helper = (SKILL_ROOT / "references/helper-contract.md").read_text(
+            encoding="utf-8"
         )
-        self.assertIn(
-            "the only result that permits PR/master/merge-ready",
-            policy["pr-readiness.md"],
+        self.assertIn("stateful final", helper)
+        self.assertIn("stateful admission", helper)
+        self.assertLess(
+            helper.index("stateful final"), helper.index("stateful admission")
         )
-        self.assertIn("These checks are independent", policy["SKILL.md"])
-        self.assertIn("final may succeed when admission", policy["helper-contract.md"])
-        self.assertIn("`stateful final` remains independent", policy["pr-readiness.md"])
-        if "project journal" in policy:
-            journal = policy["project journal"]
-            self.assertIn("is the only permitting result", journal)
-            self.assertIn("reviewer final is independent", journal)
+        self.assertIn("retained only", helper)
+        self.assertIn("starts no reviewer", helper)
+        self.assertNotIn("only PR/master/merge-ready admission success", helper)
+
+        readiness = required_policy["pr-readiness.md"]
+        self.assertNotIn("same-state current-head exact-secret admission", readiness)
+        self.assertIn("direct current-head exact-secret admission", readiness)
+        for name in (
+            "SKILL.md",
+            "pr-readiness.md",
+            "review-lane-contracts.md",
+            "egress-consent.md",
+        ):
+            with self.subTest(cleanup_contract=name):
+                self.assertIn("temporary_cleanup_status", required_policy[name])
+        if "AGENTS.md" in repository_policy:
+            self.assertIn(
+                "temporary_cleanup_status",
+                repository_policy["AGENTS.md"],
+            )
 
     def test_admission_receipt_and_runner_policy_are_bound_to_the_launch(
         self,
@@ -2264,6 +2275,9 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertEqual(schema["stream_contract"]["init_event_count"], 1)
         self.assertEqual(schema["stream_contract"]["result_event_count"], 1)
+        self.assertTrue(
+            schema["stream_contract"]["matching_session_id_when_both_present"]
+        )
         self.assertEqual(schema["stream_contract"]["max_bytes"], 8 * 1024 * 1024)
         self.assertEqual(
             schema["stream_contract"]["floating_number_representation"], "decimal"
@@ -3005,6 +3019,9 @@ class RepositoryContractTest(unittest.TestCase):
         exact_range = "`base_sha == pr_merge_base` and `head_sha == pr_head_oid`"
         for name, content in policy_documents.items():
             with self.subTest(policy_document=name):
+                self.assertIn("pr-lifecycle-unverified", content)
+                self.assertIn("selected-pr-closed", content)
+                self.assertIn("already-merged", content)
                 self.assertIn("baseRefName", content)
                 self.assertIn("baseRefOid", content)
                 self.assertIn("headRefOid", content)
@@ -3017,9 +3034,22 @@ class RepositoryContractTest(unittest.TestCase):
 
         self.assertIn("base_sha:.base.sha", probes)
         self.assertIn(
-            "--jq '{number,url:.html_url,baseRefName:.base.ref,baseRefOid:.base.sha,headRefOid:.head.sha}'",
+            "--jq '{number,url:.html_url,state,merged,merged_at,baseRefName:.base.ref,baseRefOid:.base.sha,headRefOid:.head.sha}'",
             probes,
         )
+        self.assertIn('state == "open"', probes)
+        self.assertIn("merged == false", probes)
+        self.assertIn("merged_at == null", probes)
+        for content in (readiness, probes, contracts):
+            self.assertIn("`COMMENTED`, `APPROVED`, or `CHANGES_REQUESTED`", content)
+            self.assertIn("`DISMISSED`", content)
+            self.assertIn("triple-inconclusive", content)
+
+        interface = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
+        self.assertIn("state=open, merged=false, and merged_at=null", interface)
+        self.assertIn("pr-lifecycle-unverified", interface)
+        self.assertIn("selected-pr-closed", interface)
+        self.assertNotIn("non-PENDING", interface)
         self.assertIn("gh api --hostname <host> --method GET", probes)
         self.assertNotIn("gh pr view <number> --repo <owner>/<repo>", probes)
         self.assertIn("exactly one full merge-base result", probes)
@@ -3030,7 +3060,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("Zero/multiple merge bases", readiness)
         self.assertIn("Missing/ambiguous metadata, objects", skill)
 
-        preflight_anchor = "independently query and record current `baseRefName`"
+        preflight_anchor = "independently query and record lifecycle"
         run_lanes_anchor = "Run the requested local lanes"
         read_state_anchor = "Read required CI/check state"
         post_request_anchor = "Otherwise post the one exact `@codex review` comment"

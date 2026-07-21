@@ -5075,7 +5075,7 @@ def _secret_count_manifests(
         )
         if not locations_complete:
             location_status = "inconclusive"
-    except ReviewError:
+    except (OSError, ReviewError):
         location_status = "inconclusive"
         addition_evidence = {
             descriptor: {"locations": [], "omitted_location_count": 0}
@@ -6299,6 +6299,114 @@ def _merge_secret_count_manifest_shards(
     merged["secret_delta"] = merged_delta
     merged["secret_reductions"] = []
     return merged, True, []
+
+
+def secret_admission(
+    *,
+    repo: pathlib.Path,
+    base_ref: str,
+    head_ref: str,
+) -> tuple[int, dict[str, Any]]:
+    """Evaluate exact-secret growth for one frozen range without a reviewer run."""
+
+    try:
+        source_root = resolve_repo_root(repo)
+        base_sha = resolve_commit(source_root, base_ref, label="base ref")
+        head_sha = resolve_commit(source_root, head_ref, label="head ref")
+        _require_ancestor_range(source_root, base_sha=base_sha, head_sha=head_sha)
+        catalog = load_catalog()
+        validate_authoring_catalog_scanner_contract(catalog)
+    except OSError as error:
+        raise ReviewError(
+            "direct secret-admission input or policy could not be read"
+        ) from error
+
+    failure_class: str | None = None
+    cleanup_failure_class: str | None = None
+    temporary: tempfile.TemporaryDirectory[str] | None = None
+    try:
+        temporary = tempfile.TemporaryDirectory(prefix="isolated-secret-admission-")
+        git_view, object_directory = _create_sanitized_git_view(
+            source_root=source_root,
+            container=pathlib.Path(temporary.name),
+        )
+        public_manifest, private_manifest, _reductions = _secret_count_manifests(
+            git_view=git_view,
+            object_directory=object_directory,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            catalog=catalog,
+        )
+        merged_manifest, _was_sharded, _private_values = (
+            _merge_secret_count_manifest_shards(
+                public_manifest,
+                private_manifest,
+            )
+        )
+        secret_delta = validate_secret_delta_summary(
+            merged_manifest["secret_delta"],
+            label="admission-only secret-delta",
+        )
+    except (OSError, ReviewError):
+        failure_class = "exact-value-scan-incomplete"
+        secret_delta = {
+            "failure_class": failure_class,
+            "limitations": [
+                "The exact-value scan did not complete; merge admission is inconclusive."
+            ],
+            "location_status": "inconclusive",
+            "status": "inconclusive",
+            "violations": [],
+        }
+        secret_delta = validate_secret_delta_summary(
+            secret_delta,
+            label="admission-only secret-delta",
+        )
+    finally:
+        if temporary is not None:
+            try:
+                temporary.cleanup()
+            except OSError:
+                cleanup_failure_class = "temporary-cleanup-incomplete"
+
+    if cleanup_failure_class is not None and secret_delta["status"] == "clean":
+        failure_class = cleanup_failure_class
+        secret_delta = validate_secret_delta_summary(
+            {
+                "failure_class": failure_class,
+                "limitations": [
+                    "The temporary sanitized Git view could not be removed completely."
+                ],
+                "location_status": "inconclusive",
+                "status": "inconclusive",
+                "violations": [],
+            },
+            label="admission-only secret-delta",
+        )
+
+    status = secret_delta["status"]
+    exit_code = {"clean": 0, "violations": 1, "inconclusive": 75}[status]
+    summary: dict[str, Any] = {
+        "base_sha": base_sha,
+        "exit_code": exit_code,
+        "head_sha": head_sha,
+        "operation": "exact-secret-admission",
+        "review_contract": "admission-only-no-reviewer",
+        "review_range": f"{base_sha}..{head_sha}",
+        "reviewer_started": False,
+        "schema_version": 1,
+        "secret_delta": secret_delta,
+        "source": "direct-git-tree-scan",
+        "status": status,
+        "temporary_cleanup_status": (
+            "complete" if cleanup_failure_class is None else "inconclusive"
+        ),
+    }
+    if failure_class is not None:
+        summary["failure_class"] = failure_class
+    if cleanup_failure_class is not None:
+        summary["temporary_cleanup_failure_class"] = cleanup_failure_class
+    return exit_code, summary
 
 
 def _load_legacy_manifest(

@@ -150,6 +150,158 @@ class WorkspaceTest(unittest.TestCase):
                 cleanup_workspace(review, keep_container=False)
         self.temporary.cleanup()
 
+    def test_secret_admission_runs_without_materializing_or_reviewing(self) -> None:
+        repository_entries = tuple(sorted(path.name for path in self.repo.iterdir()))
+        with (
+            mock.patch.object(
+                workspace_runtime, "_materialize_frozen_tree"
+            ) as materialize,
+            mock.patch.object(workspace_runtime, "_write_frozen_diff") as write_diff,
+            mock.patch.object(workspace_runtime, "build_review_prompt") as build_prompt,
+        ):
+            exit_code, summary = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["status"], "clean")
+        self.assertEqual(summary["review_contract"], "admission-only-no-reviewer")
+        self.assertFalse(summary["reviewer_started"])
+        self.assertEqual(summary["review_range"], f"{self.base}..{self.head}")
+        materialize.assert_not_called()
+        write_diff.assert_not_called()
+        build_prompt.assert_not_called()
+        self.assertEqual(
+            tuple(sorted(path.name for path in self.repo.iterdir())),
+            repository_entries,
+        )
+
+    def test_secret_admission_reports_growth_and_scan_uncertainty(self) -> None:
+        added_secret_head = self.commit_bytes(
+            "credential.txt",
+            b"password: " + unregistered_generic_credential() + b"\n",
+            "Add credential",
+        )
+        exit_code, violation = workspace_runtime.secret_admission(
+            repo=self.repo,
+            base_ref=self.head,
+            head_ref=added_secret_head,
+        )
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(violation["status"], "violations")
+        self.assertFalse(violation["reviewer_started"])
+        self.assertTrue(violation["secret_delta"]["violations"])
+
+        with mock.patch.object(
+            workspace_runtime,
+            "_secret_count_manifests",
+            side_effect=ReviewError("scan failed"),
+        ):
+            exit_code, inconclusive = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+        self.assertEqual(exit_code, 75)
+        self.assertEqual(inconclusive["status"], "inconclusive")
+        self.assertEqual(inconclusive["failure_class"], "exact-value-scan-incomplete")
+        self.assertFalse(inconclusive["reviewer_started"])
+
+    def test_secret_admission_preserves_violation_when_locations_fail(self) -> None:
+        added_secret_head = self.commit_bytes(
+            "credential.txt",
+            b"password: " + unregistered_generic_credential() + b"\n",
+            "Add credential",
+        )
+        with mock.patch.object(
+            workspace_runtime,
+            "_secret_delta_addition_locations",
+            side_effect=OSError("location scan failed"),
+        ):
+            exit_code, summary = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=added_secret_head,
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(summary["status"], "violations")
+        self.assertEqual(summary["secret_delta"]["location_status"], "inconclusive")
+        self.assertTrue(summary["secret_delta"]["violations"])
+
+    def test_secret_admission_cleanup_failure_never_erases_violations(self) -> None:
+        added_secret_head = self.commit_bytes(
+            "credential.txt",
+            b"password: " + unregistered_generic_credential() + b"\n",
+            "Add credential",
+        )
+        real_container = tempfile.TemporaryDirectory()
+        self.addCleanup(real_container.cleanup)
+        temporary = mock.Mock()
+        temporary.name = real_container.name
+        temporary.cleanup.side_effect = OSError("cleanup failed")
+        with mock.patch.object(
+            workspace_runtime.tempfile,
+            "TemporaryDirectory",
+            return_value=temporary,
+        ):
+            exit_code, summary = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=added_secret_head,
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(summary["status"], "violations")
+        self.assertTrue(summary["secret_delta"]["violations"])
+        self.assertEqual(summary["temporary_cleanup_status"], "inconclusive")
+        self.assertEqual(
+            summary["temporary_cleanup_failure_class"],
+            "temporary-cleanup-incomplete",
+        )
+
+    def test_secret_admission_clean_cleanup_failure_is_inconclusive(self) -> None:
+        real_container = tempfile.TemporaryDirectory()
+        self.addCleanup(real_container.cleanup)
+        temporary = mock.Mock()
+        temporary.name = real_container.name
+        temporary.cleanup.side_effect = OSError("cleanup failed")
+        with mock.patch.object(
+            workspace_runtime.tempfile,
+            "TemporaryDirectory",
+            return_value=temporary,
+        ):
+            exit_code, summary = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+
+        self.assertEqual(exit_code, 75)
+        self.assertEqual(summary["status"], "inconclusive")
+        self.assertEqual(summary["failure_class"], "temporary-cleanup-incomplete")
+        self.assertEqual(summary["temporary_cleanup_status"], "inconclusive")
+
+    def test_secret_admission_catalog_io_error_is_an_input_error(self) -> None:
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "load_catalog",
+                side_effect=OSError("catalog read failed"),
+            ),
+            self.assertRaisesRegex(
+                ReviewError,
+                "direct secret-admission input or policy could not be read",
+            ),
+        ):
+            workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+
     def commit_bytes(self, relative: str, payload: bytes, message: str) -> str:
         destination = self.repo / relative
         destination.parent.mkdir(parents=True, exist_ok=True)

@@ -44,7 +44,8 @@
       "type": "result"
     },
     "init_event_count": 1,
-    "result_event_count": 1
+    "result_event_count": 1,
+    "matching_session_id_when_both_present": true
   },
   "init_event": {
     "required_fields": [
