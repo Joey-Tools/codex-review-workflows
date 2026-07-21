@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import dis
+import json
 import os
 import pathlib
+import select
 import signal
+import shutil
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import unittest
@@ -182,6 +187,72 @@ class ForwardedSignalMaskTest(unittest.TestCase):
 
 
 class ChildEnvironmentTest(unittest.TestCase):
+    def test_file_descriptor_owner_relinquishes_before_close(self) -> None:
+        owner = common._FileDescriptorOwner(123)
+        close_error = OSError("injected close failure")
+
+        def fail_after_observing_owner(descriptor: int) -> None:
+            self.assertEqual(descriptor, 123)
+            self.assertIsNone(owner.descriptor)
+            raise close_error
+
+        with mock.patch.object(common.os, "close", side_effect=fail_after_observing_owner):
+            with self.assertRaises(OSError) as raised:
+                owner.close()
+            owner.close()
+
+        self.assertIs(raised.exception, close_error)
+
+    @unittest.skipUnless(os.name == "posix", "descriptor duplication requires POSIX")
+    def test_pipe_normalization_closes_pending_duplicate_on_flag_failure(
+        self,
+    ) -> None:
+        import fcntl
+
+        flag_error = OSError("injected inheritable failure")
+        closed: list[int] = []
+        with (
+            mock.patch.object(common.os, "pipe", return_value=(0, 1)),
+            mock.patch.object(fcntl, "F_DUPFD_CLOEXEC", fcntl.F_DUPFD),
+            mock.patch.object(fcntl, "fcntl", return_value=10),
+            mock.patch.object(common.os, "set_inheritable", side_effect=flag_error),
+            mock.patch.object(common.os, "close", side_effect=closed.append),
+        ):
+            with self.assertRaises(OSError) as raised:
+                common._pipe_above_standard_descriptors()
+
+        self.assertIs(raised.exception, flag_error)
+        self.assertCountEqual(closed, (0, 1, 10))
+
+    @unittest.skipUnless(os.name == "posix", "descriptor duplication requires POSIX")
+    def test_pipe_normalization_does_not_retry_ambiguous_source_close(
+        self,
+    ) -> None:
+        import fcntl
+
+        close_error = OSError("injected source close failure")
+        closed: list[int] = []
+
+        def close(descriptor: int) -> None:
+            closed.append(descriptor)
+            if descriptor == 0:
+                raise close_error
+
+        with (
+            mock.patch.object(common.os, "pipe", return_value=(0, 1)),
+            mock.patch.object(fcntl, "F_DUPFD_CLOEXEC", fcntl.F_DUPFD),
+            mock.patch.object(fcntl, "fcntl", return_value=10),
+            mock.patch.object(common.os, "set_inheritable"),
+            mock.patch.object(common.os, "close", side_effect=close),
+        ):
+            with self.assertRaises(OSError) as raised:
+                common._pipe_above_standard_descriptors()
+
+        self.assertIs(raised.exception, close_error)
+        self.assertEqual(closed.count(0), 1)
+        self.assertEqual(closed.count(1), 1)
+        self.assertEqual(closed.count(10), 1)
+
     def test_process_start_owner_transitions_monotonically(self) -> None:
         owner = common.ProcessStartOwner()
 
@@ -202,13 +273,13 @@ class ChildEnvironmentTest(unittest.TestCase):
         self.assertTrue(owner.may_have_started())
         self.assertTrue(owner.started())
 
-    def test_logged_process_popen_result_interruption_keeps_start_unknown(
+    def test_logged_process_owned_spawn_result_interruption_is_reaped(
         self,
     ) -> None:
         instructions = list(dis.get_instructions(common._run_logged_process))
         result_store_offsets: set[int] = set()
         for index, instruction in enumerate(instructions):
-            if instruction.argval != "Popen":
+            if instruction.argval != "_await_owned_process_spawn":
                 continue
             for candidate_index in range(index + 1, len(instructions) - 1):
                 if not instructions[candidate_index].opname.startswith("CALL"):
@@ -224,6 +295,7 @@ class ChildEnvironmentTest(unittest.TestCase):
 
         owner = common.ProcessStartOwner()
         process = mock.Mock(pid=12345, returncode=None)
+        process.poll.return_value = 0
         interruption = common.ForwardedSignal(signal.SIGTERM)
         on_process_quiescent = mock.Mock()
         terminate = mock.Mock()
@@ -252,6 +324,7 @@ class ChildEnvironmentTest(unittest.TestCase):
             ) as popen,
             mock.patch.object(common.signal, "signal", return_value=signal.SIG_DFL),
             mock.patch.object(common, "terminate_process_group", terminate),
+            mock.patch.object(common, "_process_group_exists", return_value=False),
             mock.patch.object(common, "block_forwarded_signals", return_value=None),
         ):
             root = pathlib.Path(temporary)
@@ -275,8 +348,199 @@ class ChildEnvironmentTest(unittest.TestCase):
         self.assertEqual(owner.state, common.ProcessStartState.UNKNOWN)
         self.assertTrue(owner.may_have_started())
         self.assertFalse(owner.started())
-        terminate.assert_not_called()
+        terminate.assert_called_once_with(
+            process,
+            initial_signal=signal.SIGTERM,
+            signal_already_sent=False,
+        )
+        on_process_quiescent.assert_called_once_with()
+
+    def test_spawn_thread_start_result_interruption_is_reaped_before_exec(
+        self,
+    ) -> None:
+        interruption = common.ForwardedSignal(signal.SIGTERM)
+
+        class InterruptedStartThread(threading.Thread):
+            def start(self) -> None:
+                super().start()
+                raise interruption
+
+        owner = common.ProcessStartOwner()
+        on_process_started = mock.Mock(side_effect=owner.publish_started)
+        on_process_quiescent = mock.Mock()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            marker = root / "target-executed"
+            with (
+                mock.patch.object(
+                    common,
+                    "_PROCESS_SPAWN_THREAD",
+                    InterruptedStartThread,
+                ),
+                mock.patch.object(common.subprocess, "Popen") as popen,
+            ):
+                with self.assertRaises(common.ForwardedSignal) as raised:
+                    common.run(
+                        (
+                            sys.executable,
+                            "-c",
+                            "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()",
+                            str(marker),
+                        ),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                        on_process_starting=owner.publish_starting,
+                        on_process_started=on_process_started,
+                        on_process_quiescent=on_process_quiescent,
+                    )
+
+        self.assertIs(raised.exception, interruption)
+        self.assertFalse(marker.exists())
+        self.assertEqual(owner.state, common.ProcessStartState.NOT_STARTED)
+        popen.assert_not_called()
+        on_process_started.assert_not_called()
         on_process_quiescent.assert_not_called()
+
+    def test_signal_cancels_blocked_spawn_without_releasing_gate(self) -> None:
+        installed: dict[signal.Signals, object] = {}
+        popen_entered = threading.Event()
+        release_popen = threading.Event()
+        terminated = threading.Event()
+        process = mock.Mock(pid=12345, returncode=None)
+        process.stdin = None
+        process.stdout = None
+        process.stderr = None
+
+        def install_handler(signum, handler):
+            previous = installed.get(signum, signal.SIG_DFL)
+            installed[signum] = handler
+            return previous
+
+        def blocked_spawn(*args, **kwargs):
+            popen_entered.set()
+            release_popen.wait()
+            return process
+
+        def inject_signal() -> None:
+            self.assertTrue(popen_entered.wait(2))
+            handler = installed[signal.SIGTERM]
+            assert callable(handler)
+            handler(signal.SIGTERM, None)
+
+        trigger = threading.Thread(target=inject_signal)
+        trigger.start()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with (
+                mock.patch.object(
+                    common.subprocess,
+                    "Popen",
+                    side_effect=blocked_spawn,
+                ),
+                mock.patch.object(
+                    common.signal,
+                    "signal",
+                    side_effect=install_handler,
+                ),
+                mock.patch.object(common, "_release_exec_gate") as release_gate,
+                mock.patch.object(
+                    common,
+                    "terminate_process_group",
+                    side_effect=lambda *args, **kwargs: terminated.set(),
+                ) as terminate,
+                mock.patch.object(common, "block_forwarded_signals", return_value=None),
+            ):
+                started = time.monotonic()
+                with self.assertRaises(common.ForwardedSignal) as raised:
+                    common.run(
+                        ("reviewer",),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                    )
+                elapsed = time.monotonic() - started
+                release_popen.set()
+                self.assertTrue(terminated.wait(2))
+
+        trigger.join(timeout=2)
+        self.assertFalse(trigger.is_alive())
+        self.assertEqual(raised.exception.signum, signal.SIGTERM)
+        self.assertLess(elapsed, 2)
+        release_gate.assert_not_called()
+        terminate.assert_called_once_with(
+            process,
+            initial_signal=signal.SIGTERM,
+            signal_already_sent=False,
+        )
+
+    def test_timeout_cancels_blocked_spawn_without_releasing_gate(self) -> None:
+        popen_entered = threading.Event()
+        release_popen = threading.Event()
+        terminated = threading.Event()
+        process = mock.Mock(pid=12345, returncode=None)
+        process.stdin = None
+        process.stdout = None
+        process.stderr = None
+
+        def blocked_spawn(*args, **kwargs):
+            popen_entered.set()
+            release_popen.wait()
+            return process
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with (
+                mock.patch.object(
+                    common.subprocess,
+                    "Popen",
+                    side_effect=blocked_spawn,
+                ),
+                mock.patch.object(common, "_release_exec_gate") as release_gate,
+                mock.patch.object(
+                    common,
+                    "terminate_process_group",
+                    side_effect=lambda *args, **kwargs: terminated.set(),
+                ) as terminate,
+            ):
+                started = time.monotonic()
+                with self.assertRaises(common.ReviewTimeoutError):
+                    common.run(
+                        ("reviewer",),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                        timeout_seconds=0.05,
+                    )
+                elapsed = time.monotonic() - started
+                self.assertTrue(popen_entered.is_set())
+                release_popen.set()
+                self.assertTrue(terminated.wait(2))
+
+        self.assertLess(elapsed, 2)
+        release_gate.assert_not_called()
+        terminate.assert_called_once_with(
+            process,
+            initial_signal=signal.SIGTERM,
+            signal_already_sent=False,
+        )
+
+    def test_exec_handoff_uses_remaining_operation_deadline(self) -> None:
+        read_descriptor, write_descriptor = os.pipe()
+        try:
+            deadline = time.monotonic() + 0.05
+            started = time.monotonic()
+            with self.assertRaises(subprocess.TimeoutExpired):
+                common._await_descriptor_exec_handoff(
+                    mock.Mock(),
+                    read_descriptor,
+                    command=("reviewer",),
+                    operation_deadline=deadline,
+                    timeout_seconds=0.05,
+                )
+            elapsed = time.monotonic() - started
+        finally:
+            os.close(read_descriptor)
+            os.close(write_descriptor)
+
+        self.assertLess(elapsed, 1)
 
     def test_logged_process_mask_handoffs_survive_call_result_interruptions(
         self,
@@ -528,6 +792,7 @@ class ChildEnvironmentTest(unittest.TestCase):
             root = pathlib.Path(temporary)
             with (
                 mock.patch.object(common.subprocess, "Popen", return_value=process),
+                mock.patch.object(common, "_release_exec_gate"),
                 mock.patch.object(
                     common,
                     "_process_group_exists",
@@ -562,6 +827,7 @@ class ChildEnvironmentTest(unittest.TestCase):
             root = pathlib.Path(temporary)
             with (
                 mock.patch.object(common.subprocess, "Popen", return_value=process),
+                mock.patch.object(common, "_release_exec_gate"),
                 mock.patch.object(
                     common,
                     "terminate_process_group",
@@ -613,6 +879,7 @@ class ChildEnvironmentTest(unittest.TestCase):
             root = pathlib.Path(temporary)
             with (
                 mock.patch.object(common.subprocess, "Popen", return_value=process),
+                mock.patch.object(common, "_release_exec_gate"),
                 mock.patch.object(common, "terminate_process_group"),
                 mock.patch.object(
                     common,
@@ -657,6 +924,7 @@ class ChildEnvironmentTest(unittest.TestCase):
             root = pathlib.Path(temporary)
             with (
                 mock.patch.object(common.subprocess, "Popen", return_value=process),
+                mock.patch.object(common, "_release_exec_gate"),
                 mock.patch.object(common.signal, "signal", return_value=signal.SIG_DFL),
                 mock.patch.object(common, "terminate_process_group"),
                 mock.patch.object(
@@ -699,6 +967,7 @@ class ChildEnvironmentTest(unittest.TestCase):
             root = pathlib.Path(temporary)
             with (
                 mock.patch.object(common.subprocess, "Popen", return_value=process),
+                mock.patch.object(common, "_release_exec_gate"),
                 mock.patch.object(common.signal, "signal", return_value=signal.SIG_DFL),
                 mock.patch.object(
                     common,
@@ -978,6 +1247,61 @@ class ChildEnvironmentTest(unittest.TestCase):
 
         subprocess_run.assert_not_called()
 
+    @mock.patch.object(common.subprocess, "Popen")
+    def test_empty_logged_command_is_rejected_before_process_start(
+        self,
+        popen: mock.Mock,
+    ) -> None:
+        owner = common.ProcessStartOwner()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with self.assertRaisesRegex(ReviewError, "command must not be empty"):
+                common.run(
+                    (),
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                    on_process_starting=owner.publish_starting,
+                    on_process_started=owner.publish_started,
+                )
+
+        self.assertEqual(owner.state, common.ProcessStartState.NOT_STARTED)
+        popen.assert_not_called()
+
+    @mock.patch.object(common.subprocess, "Popen")
+    def test_empty_bounded_capture_command_is_rejected_before_process_start(
+        self,
+        popen: mock.Mock,
+    ) -> None:
+        with self.assertRaisesRegex(ReviewError, "command must not be empty"):
+            common.run_bounded_capture(
+                (),
+                timeout_seconds=5,
+                stdout_limit_bytes=4096,
+                stderr_limit_bytes=4096,
+            )
+
+        popen.assert_not_called()
+
+    @mock.patch.object(common.subprocess, "Popen")
+    def test_invalid_gated_environment_is_rejected_before_process_start(
+        self,
+        popen: mock.Mock,
+    ) -> None:
+        owner = common.ProcessStartOwner()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with self.assertRaisesRegex(ReviewError, "invalid name"):
+                common.run(
+                    ("reviewer",),
+                    env={"": "value"},
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                    on_process_starting=owner.publish_starting,
+                )
+
+        self.assertEqual(owner.state, common.ProcessStartState.NOT_STARTED)
+        popen.assert_not_called()
+
     @mock.patch.object(common.subprocess, "run")
     def test_unlogged_process_quiescent_callback_is_rejected_before_launch(
         self,
@@ -1081,6 +1405,244 @@ class ChildEnvironmentTest(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0)
         self.assertEqual(events, ["starting", "started", "quiescent"])
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "POSIX signal masks are unavailable",
+    )
+    def test_universal_gated_spawn_preserves_exact_child_signal_mask(self) -> None:
+        original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        try:
+            for requested_mask in (
+                set(original_mask),
+                set(original_mask).union({signal.SIGTERM}),
+            ):
+                with self.subTest(requested_mask=requested_mask):
+                    signal.pthread_sigmask(signal.SIG_SETMASK, requested_mask)
+                    with tempfile.TemporaryDirectory() as temporary:
+                        root = pathlib.Path(temporary)
+                        completed = common.run(
+                            (
+                                sys.executable,
+                                "-c",
+                                "import json,signal; "
+                                "print(json.dumps(sorted(int(item) for item in "
+                                "signal.pthread_sigmask(signal.SIG_BLOCK, set()))))",
+                            ),
+                            stdout_path=root / "stdout.log",
+                            stderr_path=root / "stderr.log",
+                        )
+                    self.assertEqual(
+                        set(json.loads(completed.stdout)),
+                        {int(item) for item in requested_mask},
+                    )
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+
+    @unittest.skipUnless(os.name == "posix", "exec gate requires POSIX")
+    def test_exec_gate_ignores_python_startup_environment(self) -> None:
+        true_executable = shutil.which("true")
+        self.assertIsNotNone(true_executable)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            marker = root / "sitecustomize-executed"
+            (root / "sitecustomize.py").write_text(
+                "import pathlib\n"
+                f"pathlib.Path({str(marker)!r}).touch()\n",
+                encoding="utf-8",
+            )
+            environment = dict(os.environ)
+            environment["PYTHONPATH"] = str(root)
+            completed = common.run(
+                (str(true_executable),),
+                env=environment,
+                stdout_path=root / "stdout.log",
+                stderr_path=root / "stderr.log",
+            )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertFalse(marker.exists())
+
+    def test_exec_gate_keeps_target_environment_out_of_bootstrap(self) -> None:
+        captured: dict[str, object] = {}
+        process = mock.Mock(pid=12345, returncode=0)
+        process.stdin = None
+        process.stdout = None
+        process.stderr = None
+        process.communicate.return_value = (None, None)
+
+        def spawn(command, **kwargs):
+            captured["command"] = command
+            captured["bootstrap_env"] = kwargs["env"]
+            return process
+
+        def release_gate(descriptor, environment_frame, **kwargs):
+            captured["environment_frame"] = bytes(environment_frame)
+            kwargs["before_commit"]()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with (
+                mock.patch.object(common.subprocess, "Popen", side_effect=spawn),
+                mock.patch.object(
+                    common,
+                    "_release_exec_gate",
+                    side_effect=release_gate,
+                ),
+                mock.patch.object(common, "_await_descriptor_exec_handoff"),
+                mock.patch.object(common, "_process_group_exists", return_value=False),
+            ):
+                completed = common.run(
+                    ("reviewer",),
+                    env={"CLAUDE_GATE_SECRET": "private-value"},
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(captured["bootstrap_env"], {})
+        self.assertNotIn("private-value", repr(captured["command"]))
+        self.assertIn(
+            b"CLAUDE_GATE_SECRET=private-value\x00",
+            captured["environment_frame"],
+        )
+
+    @unittest.skipUnless(os.name == "posix", "exec gate requires POSIX")
+    def test_exec_gate_defers_dynamic_loader_environment_until_commit(self) -> None:
+        compiler = shutil.which("cc")
+        if compiler is None:
+            self.skipTest("a C compiler is required for the loader boundary test")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            source = root / "preload.c"
+            library = root / (
+                "preload.dylib" if sys.platform == "darwin" else "preload.so"
+            )
+            marker = root / "loader-ran"
+            source.write_text(
+                "#include <stdio.h>\n"
+                "#include <stdlib.h>\n"
+                "__attribute__((constructor)) static void mark(void) {\n"
+                '  const char *path = getenv("CODEX_PRELOAD_MARKER");\n'
+                "  if (path != NULL) {\n"
+                '    FILE *handle = fopen(path, "wb");\n'
+                "    if (handle != NULL) { fclose(handle); }\n"
+                "  }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            compile_arguments = (
+                (compiler, "-dynamiclib", "-o", str(library), str(source))
+                if sys.platform == "darwin"
+                else (
+                    compiler,
+                    "-shared",
+                    "-fPIC",
+                    "-o",
+                    str(library),
+                    str(source),
+                )
+            )
+            compiled = subprocess.run(
+                compile_arguments,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(
+                compiled.returncode,
+                0,
+                compiled.stderr.decode("utf-8", errors="replace"),
+            )
+            loader_variable = (
+                "DYLD_INSERT_LIBRARIES"
+                if sys.platform == "darwin"
+                else "LD_PRELOAD"
+            )
+            target_environment = {
+                loader_variable: str(library),
+                "CODEX_PRELOAD_MARKER": str(marker),
+            }
+            failure = RuntimeError("injected before gate commit")
+            with (
+                mock.patch.object(
+                    common,
+                    "_release_exec_gate",
+                    side_effect=failure,
+                ),
+                self.assertRaises(RuntimeError) as raised,
+            ):
+                common.run(
+                    (sys.executable, "-I", "-S", "-c", "pass"),
+                    env=target_environment,
+                    stdout_path=root / "blocked.stdout",
+                    stderr_path=root / "blocked.stderr",
+                )
+
+            self.assertIs(raised.exception, failure)
+            self.assertFalse(marker.exists())
+
+            completed = common.run(
+                (sys.executable, "-I", "-S", "-c", "pass"),
+                env=target_environment,
+                stdout_path=root / "committed.stdout",
+                stderr_path=root / "committed.stderr",
+            )
+
+            self.assertEqual(completed.returncode, 0)
+            self.assertTrue(marker.exists())
+
+    @unittest.skipUnless(os.name == "posix", "exec gate requires POSIX")
+    def test_exec_gate_streams_environment_larger_than_pipe_capacity(self) -> None:
+        environment = {
+            f"CODEX_GATE_VALUE_{index:03d}": "x" * 1024 for index in range(64)
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            completed = common.run(
+                (
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    "-c",
+                    (
+                        "import os,sys; "
+                        "sys.exit(os.environ.get('CODEX_GATE_VALUE_063') != "
+                        "'x' * 1024)"
+                    ),
+                ),
+                env=environment,
+                stdout_path=root / "stdout.log",
+                stderr_path=root / "stderr.log",
+                timeout_seconds=5,
+            )
+
+        self.assertEqual(completed.returncode, 0)
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "SIGPIPE"),
+        "SIGPIPE disposition requires POSIX",
+    )
+    def test_exec_gate_restores_subprocess_signal_dispositions(self) -> None:
+        shell = pathlib.Path("/bin/sh")
+        self.assertTrue(shell.is_file())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            marker = root / "sigpipe-was-ignored"
+            completed = common.run(
+                (
+                    str(shell),
+                    "-c",
+                    'kill -s PIPE "$$"; : > "$1"',
+                    "sh",
+                    str(marker),
+                ),
+                stdout_path=root / "stdout.log",
+                stderr_path=root / "stderr.log",
+            )
+
+        self.assertEqual(completed.returncode, -int(signal.SIGPIPE))
+        self.assertFalse(marker.exists())
 
     def test_bounded_capture_enforces_independent_stream_limits(self) -> None:
         with self.assertRaises(common.ReviewOutputLimitError):
@@ -1216,6 +1778,109 @@ class ChildEnvironmentTest(unittest.TestCase):
         completed.stdout[:] = b"\x00" * len(completed.stdout)
         completed.stderr[:] = b"\x00" * len(completed.stderr)
 
+    @unittest.skipUnless(os.name == "posix", "descriptor reuse requires POSIX")
+    def test_bounded_capture_avoids_closed_standard_descriptor_collisions(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            result_path = root / "result"
+            script = (
+                "import os,pathlib,sys\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "from review_runtime import common\n"
+                "os.close(0)\n"
+                "os.close(1)\n"
+                "completed = common.run_bounded_capture(\n"
+                "    (sys.executable, '-c', "
+                "'import os; os.write(1, b\\\"hello\\\")'),\n"
+                "    timeout_seconds=5,\n"
+                "    stdout_limit_bytes=4096,\n"
+                "    stderr_limit_bytes=4096,\n"
+                ")\n"
+                "pathlib.Path(sys.argv[2]).write_bytes(\n"
+                "    str(completed.returncode).encode() + b'\\n' + completed.stdout\n"
+                ")\n"
+            )
+            completed = subprocess.run(
+                (sys.executable, "-c", script, str(SCRIPTS), str(result_path)),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=15,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                completed.stderr.decode("utf-8", errors="replace"),
+            )
+            self.assertEqual(result_path.read_bytes(), b"0\nhello")
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(select, "poll"),
+        "high descriptor polling requires POSIX poll",
+    )
+    def test_exec_handoff_supports_descriptor_above_fd_setsize(self) -> None:
+        import fcntl
+
+        read_descriptor, write_descriptor = os.pipe()
+        high_descriptor = -1
+        try:
+            try:
+                high_descriptor = int(
+                    fcntl.fcntl(
+                        read_descriptor,
+                        getattr(fcntl, "F_DUPFD_CLOEXEC", fcntl.F_DUPFD),
+                        1024,
+                    )
+                )
+            except OSError as error:
+                self.skipTest(f"cannot allocate a descriptor above FD_SETSIZE: {error}")
+            os.close(read_descriptor)
+            read_descriptor = -1
+            os.close(write_descriptor)
+            write_descriptor = -1
+
+            common._await_descriptor_exec_handoff(
+                mock.Mock(),
+                high_descriptor,
+                command=("reviewer",),
+            )
+        finally:
+            if read_descriptor >= 0:
+                os.close(read_descriptor)
+            if write_descriptor >= 0:
+                os.close(write_descriptor)
+            if high_descriptor >= 0:
+                os.close(high_descriptor)
+
+    @unittest.skipUnless(os.name == "posix", "exec gate requires POSIX")
+    def test_logged_command_preserves_user_pass_fd_through_exec_gate(self) -> None:
+        read_descriptor, write_descriptor = os.pipe()
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                completed = common.run(
+                    (
+                        sys.executable,
+                        "-c",
+                        "import os,sys; os.write(int(sys.argv[1]), b'OK')",
+                        str(write_descriptor),
+                    ),
+                    pass_fds=(write_descriptor,),
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                )
+            os.close(write_descriptor)
+            write_descriptor = -1
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(os.read(read_descriptor, 2), b"OK")
+        finally:
+            os.close(read_descriptor)
+            if write_descriptor >= 0:
+                os.close(write_descriptor)
+
     @mock.patch.object(common.threading, "Thread")
     def test_failed_drain_thread_start_is_not_joined(
         self, thread_factory: mock.Mock
@@ -1244,11 +1909,13 @@ class ChildEnvironmentTest(unittest.TestCase):
             root = pathlib.Path(temporary)
             with (
                 mock.patch.object(common.subprocess, "Popen", return_value=process),
+                mock.patch.object(common, "_release_exec_gate"),
+                mock.patch.object(common, "_await_descriptor_exec_handoff"),
                 mock.patch.object(common, "_process_group_exists", return_value=False),
                 mock.patch.object(common, "signal_process_group") as terminate,
                 mock.patch.object(common.os, "set_blocking"),
                 mock.patch.object(
-                    common.select, "select", return_value=([123], [], [])
+                    common, "_wait_descriptor_ready", return_value=True
                 ),
                 mock.patch.object(
                     common.os, "read", side_effect=OSError("read failed")
@@ -1265,6 +1932,35 @@ class ChildEnvironmentTest(unittest.TestCase):
 
         self.assertGreaterEqual(terminate.call_count, 1)
         terminate.assert_any_call(process, signal.SIGTERM)
+
+    def test_unbounded_logged_failure_closes_owned_stdin_stream(self) -> None:
+        process = mock.Mock(pid=12345, returncode=None)
+        process.poll.return_value = 0
+        process.stdout = None
+        process.stderr = None
+        failure = RuntimeError("injected gate failure")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with (
+                mock.patch.object(common.subprocess, "Popen", return_value=process),
+                mock.patch.object(
+                    common,
+                    "_release_exec_gate",
+                    side_effect=failure,
+                ),
+                mock.patch.object(common, "_process_group_exists", return_value=False),
+                mock.patch.object(common, "terminate_process_group"),
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    common.run(
+                        ("reviewer",),
+                        stdin=b"prompt",
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                    )
+
+        self.assertIs(raised.exception, failure)
+        process.stdin.close.assert_called_once_with()
 
     @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
     def test_timeout_does_not_wait_for_detached_descendant_output(self) -> None:
@@ -1413,6 +2109,7 @@ class ChildEnvironmentTest(unittest.TestCase):
             process.communicate.side_effect = communicate
             with (
                 mock.patch.object(common.subprocess, "Popen", return_value=process),
+                mock.patch.object(common, "_release_exec_gate"),
                 mock.patch.object(common.signal, "signal", side_effect=install_handler),
                 mock.patch.object(common, "signal_process_group") as forward,
                 mock.patch.object(common, "terminate_process_group") as terminate,
@@ -1459,6 +2156,7 @@ class ChildEnvironmentTest(unittest.TestCase):
             process.communicate.return_value = (None, None)
             with (
                 mock.patch.object(common.subprocess, "Popen", return_value=process),
+                mock.patch.object(common, "_release_exec_gate"),
                 mock.patch.object(common.signal, "signal", return_value=signal.SIG_DFL),
                 mock.patch.object(common, "terminate_process_group"),
                 mock.patch.object(
@@ -1503,6 +2201,7 @@ class ChildEnvironmentTest(unittest.TestCase):
             with (
                 mock.patch.object(common.subprocess, "Popen", side_effect=spawn),
                 mock.patch.object(common.signal, "signal", side_effect=install_handler),
+                mock.patch.object(common, "_release_exec_gate") as release_gate,
                 mock.patch.object(common, "signal_process_group") as forward,
                 mock.patch.object(common, "terminate_process_group") as terminate,
                 mock.patch.object(common, "block_forwarded_signals", return_value=None),
@@ -1515,12 +2214,64 @@ class ChildEnvironmentTest(unittest.TestCase):
                     )
 
             self.assertEqual(raised.exception.signum, signal.SIGTERM)
-            forward.assert_called_once_with(process, signal.SIGTERM)
+            release_gate.assert_not_called()
+            forward.assert_not_called()
             terminate.assert_called_once_with(
                 process,
                 initial_signal=signal.SIGTERM,
-                signal_already_sent=True,
+                signal_already_sent=False,
             )
+
+    def test_owned_spawn_signal_never_releases_exec_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            installed: dict[signal.Signals, object] = {}
+            owner = common.ProcessStartOwner()
+            process = mock.Mock(pid=12345, returncode=None)
+            process.poll.return_value = 0
+            on_process_quiescent = mock.Mock()
+
+            def install_handler(signum, handler):
+                previous = installed.get(signum, signal.SIG_DFL)
+                installed[signum] = handler
+                return previous
+
+            def spawn(*args, **kwargs):
+                handler = installed[signal.SIGTERM]
+                assert callable(handler)
+                handler(signal.SIGTERM, None)
+                return process
+
+            with (
+                mock.patch.object(common.subprocess, "Popen", side_effect=spawn),
+                mock.patch.object(common.signal, "signal", side_effect=install_handler),
+                mock.patch.object(common, "_release_exec_gate") as release_gate,
+                mock.patch.object(common, "signal_process_group") as forward,
+                mock.patch.object(common, "terminate_process_group") as terminate,
+                mock.patch.object(common, "_process_group_exists", return_value=False),
+                mock.patch.object(common, "block_forwarded_signals", return_value=None),
+            ):
+                with self.assertRaises(common.ForwardedSignal) as raised:
+                    common.run(
+                        ("reviewer",),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                        on_process_starting=owner.publish_starting,
+                        on_process_started=owner.publish_started,
+                        on_process_quiescent=on_process_quiescent,
+                    )
+
+        self.assertEqual(raised.exception.signum, signal.SIGTERM)
+        self.assertEqual(owner.state, common.ProcessStartState.UNKNOWN)
+        self.assertFalse(owner.started())
+        release_gate.assert_not_called()
+        forward.assert_not_called()
+        terminate.assert_called_once_with(
+            process,
+            initial_signal=signal.SIGTERM,
+            signal_already_sent=False,
+        )
+        on_process_quiescent.assert_called_once_with()
 
     def test_pending_signal_remains_primary_when_spawn_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1581,6 +2332,7 @@ class ChildEnvironmentTest(unittest.TestCase):
 
             with (
                 mock.patch.object(common.subprocess, "Popen", return_value=process),
+                mock.patch.object(common, "_release_exec_gate"),
                 mock.patch.object(common.signal, "signal", side_effect=install_handler),
                 mock.patch.object(common, "signal_process_group"),
                 mock.patch.object(common, "terminate_process_group") as terminate,
@@ -1817,6 +2569,127 @@ class ChildEnvironmentTest(unittest.TestCase):
             with self.assertRaises(OSError):
                 os.fstat(descriptor)
 
+    def test_logged_command_signal_during_descriptor_prep_prevents_launch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            directory_descriptor = os.open(root, os.O_RDONLY)
+            handoff_read_descriptor, handoff_write_descriptor = os.pipe()
+            installed: dict[signal.Signals, object] = {}
+            owner = common.ProcessStartOwner()
+            on_process_quiescent = mock.Mock()
+
+            def install_handler(signum, handler):
+                previous = installed.get(signum, signal.SIG_DFL)
+                installed[signum] = handler
+                return previous
+
+            def prepare_after_signal(*_args, **_kwargs):
+                handler = installed[signal.SIGTERM]
+                assert callable(handler)
+                handler(signal.SIGTERM, None)
+                return (
+                    ("reviewer",),
+                    (directory_descriptor, handoff_write_descriptor),
+                )
+
+            try:
+                with (
+                    mock.patch.object(
+                        common.os,
+                        "pipe",
+                        return_value=(
+                            handoff_read_descriptor,
+                            handoff_write_descriptor,
+                        ),
+                    ),
+                    mock.patch.object(
+                        common,
+                        "_descriptor_cwd_command",
+                        side_effect=prepare_after_signal,
+                    ),
+                    mock.patch.object(common.subprocess, "Popen") as popen,
+                    mock.patch.object(
+                        common.signal,
+                        "signal",
+                        side_effect=install_handler,
+                    ),
+                    mock.patch.object(
+                        common,
+                        "block_forwarded_signals",
+                        return_value=None,
+                    ),
+                ):
+                    with self.assertRaises(common.ForwardedSignal) as raised:
+                        common.run(
+                            ("reviewer",),
+                            cwd_fd=directory_descriptor,
+                            stdout_path=root / "stdout.log",
+                            stderr_path=root / "stderr.log",
+                            on_process_starting=owner.publish_starting,
+                            on_process_started=owner.publish_started,
+                            on_process_quiescent=on_process_quiescent,
+                        )
+            finally:
+                os.close(directory_descriptor)
+
+        self.assertEqual(raised.exception.signum, signal.SIGTERM)
+        self.assertEqual(owner.state, common.ProcessStartState.NOT_STARTED)
+        self.assertFalse(owner.may_have_started())
+        popen.assert_not_called()
+        on_process_quiescent.assert_not_called()
+        for descriptor in (handoff_read_descriptor, handoff_write_descriptor):
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_logged_command_signal_during_start_hook_prevents_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            installed: dict[signal.Signals, object] = {}
+            owner = common.ProcessStartOwner()
+            on_process_quiescent = mock.Mock()
+
+            def install_handler(signum, handler):
+                previous = installed.get(signum, signal.SIG_DFL)
+                installed[signum] = handler
+                return previous
+
+            def publish_start_after_signal() -> None:
+                owner.publish_starting()
+                handler = installed[signal.SIGTERM]
+                assert callable(handler)
+                handler(signal.SIGTERM, None)
+
+            with (
+                mock.patch.object(common.subprocess, "Popen") as popen,
+                mock.patch.object(
+                    common.signal,
+                    "signal",
+                    side_effect=install_handler,
+                ),
+                mock.patch.object(
+                    common,
+                    "block_forwarded_signals",
+                    return_value=None,
+                ),
+            ):
+                with self.assertRaises(common.ForwardedSignal) as raised:
+                    common.run(
+                        ("reviewer",),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                        on_process_starting=publish_start_after_signal,
+                        on_process_started=owner.publish_started,
+                        on_process_quiescent=on_process_quiescent,
+                    )
+
+        self.assertEqual(raised.exception.signum, signal.SIGTERM)
+        self.assertEqual(owner.state, common.ProcessStartState.UNKNOWN)
+        self.assertTrue(owner.may_have_started())
+        popen.assert_not_called()
+        on_process_quiescent.assert_not_called()
+
     def test_logged_command_publishes_successful_process_start_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -1845,6 +2718,7 @@ class ChildEnvironmentTest(unittest.TestCase):
                     return_value=signal.SIG_DFL,
                 ),
                 mock.patch.object(common, "terminate_process_group"),
+                mock.patch.object(common, "_release_exec_gate"),
                 mock.patch.object(
                     common,
                     "block_forwarded_signals",
@@ -1892,6 +2766,7 @@ class ChildEnvironmentTest(unittest.TestCase):
             on_process_started = mock.Mock(side_effect=publish_process_start)
             with (
                 mock.patch.object(common.subprocess, "Popen", side_effect=spawn),
+                mock.patch.object(common, "_release_exec_gate"),
                 mock.patch.object(common.signal, "signal", side_effect=install_handler),
                 mock.patch.object(
                     common,
