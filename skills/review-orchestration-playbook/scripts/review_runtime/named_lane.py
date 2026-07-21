@@ -8,11 +8,13 @@ import os
 import pathlib
 import re
 import secrets
+import select
 import signal
 import stat
 import sys
+import time
 from dataclasses import dataclass
-from typing import Iterable, Mapping, Sequence
+from typing import BinaryIO, Iterable, Mapping, Sequence
 
 from .common import (
     ForwardedSignal,
@@ -746,6 +748,66 @@ def _validate_positive_finite(value: float, label: str) -> float:
     return value
 
 
+def _remaining_deadline_seconds(deadline: float, label: str) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ReviewTimeoutError(f"{label} exceeded its monotonic deadline")
+    return remaining
+
+
+def _bounded_deadline(
+    timeout_seconds: float,
+    deadline_monotonic: float | None = None,
+) -> float:
+    timeout = _validate_positive_finite(float(timeout_seconds), "timeout")
+    duration_deadline = time.monotonic() + timeout
+    if deadline_monotonic is None:
+        return duration_deadline
+    absolute_deadline = _validate_positive_finite(
+        float(deadline_monotonic),
+        "deadline",
+    )
+    return min(duration_deadline, absolute_deadline)
+
+
+def _read_control_prompt(
+    stream: BinaryIO,
+    limit_bytes: int,
+    deadline: float,
+) -> bytes:
+    try:
+        descriptor = stream.fileno()
+    except (AttributeError, OSError) as error:
+        raise NamedLaneGuardError(
+            "Claude control prompt requires file-descriptor-backed stdin"
+        ) from error
+    payload = bytearray()
+    while len(payload) <= limit_bytes:
+        timeout = _remaining_deadline_seconds(
+            deadline,
+            "Claude control prompt read",
+        )
+        try:
+            readable, _, _ = select.select((descriptor,), (), (), timeout)
+        except InterruptedError:
+            continue
+        if not readable:
+            raise ReviewTimeoutError(
+                "Claude control prompt read exceeded its monotonic deadline"
+            )
+        try:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, limit_bytes + 1 - len(payload)),
+            )
+        except (BlockingIOError, InterruptedError):
+            continue
+        if not chunk:
+            break
+        payload.extend(chunk)
+    return bytes(payload)
+
+
 def _revalidate_output_parent(target: _OutputTarget) -> None:
     parent = target.path.parent
     try:
@@ -1138,7 +1200,10 @@ def run_claude(
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     stream_limit_bytes: int = DEFAULT_STREAM_LIMIT_BYTES,
     inherit_node_extra_ca_certs: bool = False,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, object]:
+    deadline = _bounded_deadline(timeout_seconds, deadline_monotonic)
+    _remaining_deadline_seconds(deadline, "Claude named lane")
     root = _resolve_worktree_root(worktree)
     if not command:
         raise NamedLaneGuardError("Claude command is required")
@@ -1161,7 +1226,6 @@ def run_claude(
         raise NamedLaneGuardError(
             "Claude executable must be an exact absolute executable regular file"
         )
-    timeout = _validate_positive_finite(float(timeout_seconds), "timeout")
     if stream_limit_bytes <= 0:
         raise NamedLaneGuardError("stream limit must be positive")
     stdout = _validate_output_path(stdout_path, root)
@@ -1175,7 +1239,10 @@ def run_claude(
                 cwd=root,
                 env=_claude_environment(inherit_node_extra_ca_certs),
                 stdin=bytearray(prompt),
-                timeout_seconds=timeout,
+                timeout_seconds=_remaining_deadline_seconds(
+                    deadline,
+                    "Claude process supervision",
+                ),
                 stdout_limit_bytes=stream_limit_bytes,
                 stderr_limit_bytes=stream_limit_bytes,
             )
@@ -1356,7 +1423,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             command.pop(0)
         if args.prompt_limit_bytes <= 0:
             raise NamedLaneGuardError("prompt limit must be positive")
-        prompt = sys.stdin.buffer.read(args.prompt_limit_bytes + 1)
+        timeout = _validate_positive_finite(float(args.timeout_seconds), "timeout")
+        deadline = time.monotonic() + timeout
+        prompt = _read_control_prompt(
+            sys.stdin.buffer,
+            args.prompt_limit_bytes,
+            deadline,
+        )
         if len(prompt) > args.prompt_limit_bytes:
             raise NamedLaneGuardError(
                 "Claude control prompt exceeded its bounded limit"
@@ -1367,9 +1440,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             stderr_path=pathlib.Path(args.stderr_path),
             command=command,
             prompt=prompt,
-            timeout_seconds=args.timeout_seconds,
+            timeout_seconds=_remaining_deadline_seconds(
+                deadline,
+                "Claude named lane",
+            ),
             stream_limit_bytes=args.stream_limit_bytes,
             inherit_node_extra_ca_certs=args.inherit_node_extra_ca_certs,
+            deadline_monotonic=deadline,
         )
         _emit(result)
         return 0 if result["status"] == "complete" else 1

@@ -1360,6 +1360,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("from review_runtime.named_lane import main", entrypoint)
         self.assertIn("DEFAULT_TIMEOUT_SECONDS = 1_800.0", runtime)
         self.assertIn("DEFAULT_STREAM_LIMIT_BYTES = 64 * 1024 * 1024", runtime)
+        self.assertIn("_read_control_prompt", runtime)
+        self.assertIn("_remaining_deadline_seconds", runtime)
+        self.assertIn("withholds EOF", canonical)
+        self.assertIn("withholds EOF", contracts)
         self.assertIn("run_bounded_capture", runtime)
         self.assertIn("whole-process-tree quiescence", canonical)
 

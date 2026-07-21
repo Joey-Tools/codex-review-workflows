@@ -1410,6 +1410,123 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertFalse(stderr.exists())
         self.assertEqual(list(self.root.glob(".named-lane-*")), [])
 
+    def test_cli_prompt_read_times_out_when_writer_withholds_eof(self) -> None:
+        marker = self.root / "prompt-reviewer-started.marker"
+        executable = self.make_executable(
+            f"import pathlib\npathlib.Path({str(marker)!r}).write_text('ran')\n"
+        )
+        stdout_path = self.root / "prompt-timeout.stdout"
+        stderr_path = self.root / "prompt-timeout.stderr"
+        started = time.monotonic()
+        process = subprocess.Popen(
+            (
+                sys.executable,
+                str(SCRIPTS / "named_lane_guard"),
+                "run-claude",
+                "--worktree",
+                str(self.repo.resolve()),
+                "--stdout-path",
+                str(stdout_path),
+                "--stderr-path",
+                str(stderr_path),
+                "--timeout-seconds",
+                "0.05",
+                "--",
+                str(executable),
+            ),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            assert process.stdin is not None
+            process.stdin.write(b"short prompt")
+            process.stdin.flush()
+            returncode = process.wait(timeout=2.0)
+            assert process.stdout is not None
+            assert process.stderr is not None
+            stdout = process.stdout.read()
+            stderr = process.stderr.read()
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2.0)
+            if process.stdin is not None:
+                process.stdin.close()
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(
+            json.loads(stderr),
+            {"status": "inconclusive", "reason": "deadline"},
+        )
+        self.assertFalse(marker.exists())
+        self.assertFalse(stdout_path.exists())
+        self.assertFalse(stderr_path.exists())
+
+    def test_cli_prompt_read_shares_deadline_with_process(self) -> None:
+        result = {"status": "complete"}
+        with (
+            mock.patch.object(
+                named_lane_runtime.time,
+                "monotonic",
+                side_effect=(100.0, 101.5),
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "_read_control_prompt",
+                return_value=b"review",
+            ) as prompt_read,
+            mock.patch.object(
+                named_lane_runtime,
+                "run_claude",
+                return_value=result,
+            ) as run,
+            mock.patch.object(named_lane_runtime, "_emit") as emit,
+        ):
+            returncode = named_lane_main(
+                (
+                    "run-claude",
+                    "--worktree",
+                    str(self.repo.resolve()),
+                    "--stdout-path",
+                    str(self.root / "prompt-budget.stdout"),
+                    "--stderr-path",
+                    str(self.root / "prompt-budget.stderr"),
+                    "--timeout-seconds",
+                    "5",
+                    "--",
+                    "/usr/bin/false",
+                )
+            )
+
+        self.assertEqual(returncode, 0)
+        emit.assert_called_once_with(result)
+        self.assertEqual(prompt_read.call_args.args[1:], (256 * 1024, 105.0))
+        self.assertEqual(run.call_args.kwargs["prompt"], b"review")
+        self.assertEqual(run.call_args.kwargs["timeout_seconds"], 3.5)
+        self.assertEqual(run.call_args.kwargs["deadline_monotonic"], 105.0)
+
+    def test_absolute_deadline_can_only_tighten_duration_limit(self) -> None:
+        with mock.patch.object(
+            named_lane_runtime.time,
+            "monotonic",
+            return_value=100.0,
+        ):
+            self.assertEqual(
+                named_lane_runtime._bounded_deadline(1.0, 1_000.0),
+                101.0,
+            )
+            self.assertEqual(
+                named_lane_runtime._bounded_deadline(10.0, 100.5),
+                100.5,
+            )
+
     def test_cli_classifies_bounded_failures_by_subcommand(self) -> None:
         cases = (
             ("deadline", lambda: ReviewTimeoutError("deadline"), 2),
@@ -1462,9 +1579,13 @@ class NamedLaneGuardTest(unittest.TestCase):
                             mock.patch(target, side_effect=error_factory())
                         )
                         if command == "run-claude":
-                            stdin = mock.Mock()
-                            stdin.buffer = io.BytesIO(b"")
-                            stack.enter_context(mock.patch.object(sys, "stdin", stdin))
+                            stack.enter_context(
+                                mock.patch.object(
+                                    named_lane_runtime,
+                                    "_read_control_prompt",
+                                    return_value=b"",
+                                )
+                            )
                         stack.enter_context(contextlib.redirect_stderr(stderr))
                         returncode = named_lane_main(argv)
 
@@ -1516,9 +1637,13 @@ class NamedLaneGuardTest(unittest.TestCase):
                         )
                     )
                     if argv[0] == "run-claude":
-                        stdin = mock.Mock()
-                        stdin.buffer = io.BytesIO(b"")
-                        stack.enter_context(mock.patch.object(sys, "stdin", stdin))
+                        stack.enter_context(
+                            mock.patch.object(
+                                named_lane_runtime,
+                                "_read_control_prompt",
+                                return_value=b"",
+                            )
+                        )
                     stack.enter_context(contextlib.redirect_stderr(stderr))
                     returncode = named_lane_main(argv)
 
