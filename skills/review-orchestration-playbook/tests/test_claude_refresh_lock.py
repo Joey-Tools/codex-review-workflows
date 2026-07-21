@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import unittest
 from unittest import mock
 
@@ -7185,6 +7186,79 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             self.assertTrue(primary.is_dir())
             self.assertTrue(legacy.is_dir())
 
+    def test_staged_recovery_legacy_cleanup_control_keeps_mask_restore_failure(
+        self,
+    ) -> None:
+        class LegacyForwardedSignal(claude_refresh_lock.ForwardedSignal):
+            add_note = None
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            carrier = root / "claude-carrier-fixture"
+            carrier.mkdir(mode=0o700)
+            config = carrier / "config"
+            config.mkdir(mode=0o700)
+            primary = config / ".oauth_refresh.lock"
+            legacy = carrier / "config.lock"
+            primary.mkdir(mode=0o700)
+            legacy.mkdir(mode=0o700)
+            first = LegacyForwardedSignal(signal.SIGTERM)
+
+            def publish_fake_mask(
+                *,
+                signal_mask_owner: claude_refresh_lock.ForwardedSignalMaskOwner,
+            ) -> None:
+                signal_mask_owner.publish(None)
+
+            with (
+                mock.patch.object(
+                    claude_refresh_lock,
+                    "block_forwarded_signals",
+                    side_effect=publish_fake_mask,
+                ),
+                mock.patch.object(
+                    claude_refresh_lock,
+                    "consume_pending_forwarded_signal",
+                    side_effect=first,
+                ),
+                mock.patch.object(
+                    claude_refresh_lock.ForwardedSignalMaskOwner,
+                    "restore",
+                    side_effect=(
+                        OSError(errno.EIO, "first restore failure"),
+                        OSError(errno.EIO, "second restore failure"),
+                    ),
+                ) as restore,
+                self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
+            ):
+                claude_refresh_lock.recover_abandoned_staged_claude_refresh_locks(
+                    carrier,
+                    config,
+                    protocol=self.PROTOCOL,
+                    writer_quiescent=True,
+                )
+
+            self.assertIs(raised.exception, first)
+            self.assertEqual(restore.call_count, 2)
+            self.assertIsInstance(
+                raised.exception.__cause__,
+                claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive,
+            )
+            self.assertIn(
+                "forwarded-signal mask remains active",
+                str(raised.exception.__cause__),
+            )
+            formatted = "".join(
+                traceback.format_exception(
+                    type(raised.exception),
+                    raised.exception,
+                    raised.exception.__traceback__,
+                )
+            )
+            self.assertIn("forwarded-signal mask remains active", formatted)
+            self.assertFalse(primary.exists())
+            self.assertFalse(legacy.exists())
+
     @unittest.skipUnless(
         os.name == "posix" and hasattr(signal, "pthread_sigmask"),
         "staged recovery signal-mask proof requires POSIX dir_fds",
@@ -7247,9 +7321,12 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             self.assertFalse(primary.exists())
             self.assertFalse(legacy.exists())
 
-    def test_staged_recovery_preserves_control_flow_over_mask_restore_failure(
+    def test_staged_recovery_legacy_control_flow_keeps_mask_restore_failure(
         self,
     ) -> None:
+        class LegacyForwardedSignal(claude_refresh_lock.ForwardedSignal):
+            add_note = None
+
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary).resolve()
             carrier = root / "claude-carrier-fixture"
@@ -7260,7 +7337,15 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             legacy = carrier / "config.lock"
             primary.mkdir(mode=0o700)
             legacy.mkdir(mode=0o700)
-            first = claude_refresh_lock.ForwardedSignal(signal.SIGTERM)
+            first = LegacyForwardedSignal(signal.SIGTERM)
+            sensitive_path = (
+                "/fixture/private/suppressed-staged-context/.oauth_refresh.lock"
+            )
+            hidden_context = RuntimeError(
+                f"fixture suppressed staged-recovery context at {sensitive_path}"
+            )
+            first.__context__ = hidden_context
+            first.__suppress_context__ = True
 
             def publish_fake_mask(
                 *,
@@ -7303,12 +7388,25 @@ class ClaudeRefreshLockTest(unittest.TestCase):
 
             self.assertIs(raised.exception, first)
             self.assertEqual(restore.call_count, 2)
-            self.assertTrue(
-                any(
-                    "forwarded-signal mask remains active" in note
-                    for note in getattr(raised.exception, "__notes__", ())
+            self.assertIsInstance(
+                raised.exception.__cause__,
+                claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive,
+            )
+            self.assertIn(
+                "forwarded-signal mask remains active",
+                str(raised.exception.__cause__),
+            )
+            self.assertIsNone(raised.exception.__cause__.__context__)
+            self.assertIs(raised.exception.__context__, hidden_context)
+            self.assertTrue(raised.exception.__suppress_context__)
+            formatted = "".join(
+                traceback.format_exception(
+                    type(raised.exception),
+                    raised.exception,
+                    raised.exception.__traceback__,
                 )
             )
+            self.assertNotIn(sensitive_path, formatted)
             self.assertTrue(primary.is_dir())
             self.assertTrue(legacy.is_dir())
 

@@ -413,6 +413,13 @@ def attach_claude_refresh_lock_recovery(
     add_note = getattr(error, "add_note", None)
     if callable(add_note):
         add_note(diagnostic)
+        return
+    node = ClaudeRefreshLockCleanupDiagnostic(diagnostic)
+    if error.__cause__ is not None:
+        node.__cause__ = error.__cause__
+    elif not error.__suppress_context__ and error.__context__ is not None:
+        node.__context__ = error.__context__
+    error.__cause__ = node
 
 
 def _attach_secondary_cleanup(
@@ -428,7 +435,7 @@ def _attach_secondary_cleanup(
     node = ClaudeRefreshLockCleanupDiagnostic(diagnostic)
     if primary.__cause__ is not None:
         node.__cause__ = primary.__cause__
-    elif primary.__context__ is not None:
+    elif not primary.__suppress_context__ and primary.__context__ is not None:
         node.__context__ = primary.__context__
     primary.__cause__ = node
 
@@ -1527,6 +1534,7 @@ def recover_abandoned_staged_claude_refresh_locks(
             if error is not None
         ]
         selected = _primary_error(candidates)
+        mask_restore_cause_attached = False
         if (
             mask_restore_inconclusive is not None
             and selected is not None
@@ -1535,11 +1543,24 @@ def recover_abandoned_staged_claude_refresh_locks(
             add_note = getattr(selected, "add_note", None)
             if callable(add_note):
                 add_note(str(mask_restore_inconclusive))
+            else:
+                if selected.__cause__ is not None:
+                    mask_restore_inconclusive.__cause__ = selected.__cause__
+                elif (
+                    not selected.__suppress_context__
+                    and selected.__context__ is not None
+                ):
+                    mask_restore_inconclusive.__context__ = selected.__context__
+                selected.__cause__ = mask_restore_inconclusive
+                mask_restore_cause_attached = True
         if selected is not None and selected is not operation_error:
             normalized = _normalize_operation_error(
                 "cannot finalize staged Claude refresh-lock recovery",
                 selected,
             )
+            if mask_restore_cause_attached:
+                assert mask_restore_inconclusive is not None
+                raise normalized from mask_restore_inconclusive
             raise normalized from None
 
 

@@ -572,6 +572,18 @@ class ProviderPolicyTest(unittest.TestCase):
             )
         )
 
+    def assert_exception_visible_exact_or_rendered(
+        self,
+        error: BaseException,
+        expected: BaseException,
+    ) -> None:
+        if providers._claude_visible_error_chain_contains(error, expected):
+            return
+        self.assertIn(
+            f"{type(expected).__name__}: {expected}",
+            self.format_exception_text(error),
+        )
+
     def assert_cleanup_diagnostic_visible(
         self,
         error: BaseException,
@@ -1196,7 +1208,10 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(primary.strerror, original_strerror)
         self.assertEqual(primary.filename, original_filename)
         self.assertEqual(primary.filename2, original_filename2)
-        self.assertIs(primary.__cause__, original_cause)
+        self.assert_cleanup_diagnostic_preserves_original_cause(
+            primary,
+            original_cause,
+        )
         self.assertIs(primary.__context__, original_context)
         self.assertIs(
             getattr(
@@ -1211,9 +1226,7 @@ class ProviderPolicyTest(unittest.TestCase):
             recovery_paths,
         )
         self.assertEqual(primary.__notes__[0], "fixture original note")
-        self.assertTrue(
-            any("cleanup failure" in note for note in primary.__notes__[1:])
-        )
+        self.assert_cleanup_diagnostic_visible(primary)
 
     def test_cleanup_diagnostic_replaces_risky_exception_group_root(
         self,
@@ -2022,7 +2035,8 @@ class ProviderPolicyTest(unittest.TestCase):
                                 formatted,
                             )
                             self.assertIn(
-                                "Selected existing exception type: RuntimeError",
+                                "Selected existing exception type: "
+                                "ClaudeRefreshLockCleanupDiagnostic",
                                 formatted,
                             )
                             self.assertIn(
@@ -2219,6 +2233,12 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_abandonment_double_control_flow_keeps_primary_recovery_metadata(
         self,
     ) -> None:
+        class LegacyForwardedSignal(providers.ForwardedSignal):
+            add_note = None
+
+        class LegacyKeyboardInterrupt(KeyboardInterrupt):
+            add_note = None
+
         def assert_acyclic(
             root: BaseException,
         ) -> dict[int, BaseException]:
@@ -2243,8 +2263,8 @@ class ProviderPolicyTest(unittest.TestCase):
 
         retained_path = "/fixture/.claude/.oauth_refresh.lock"
         primary_factories: tuple[Callable[[], BaseException], ...] = (
-            lambda: providers.ForwardedSignal(signal.SIGTERM),
-            lambda: KeyboardInterrupt("fixture primary interruption"),
+            lambda: LegacyForwardedSignal(signal.SIGTERM),
+            lambda: LegacyKeyboardInterrupt("fixture primary interruption"),
         )
 
         for primary_factory in primary_factories:
@@ -2316,27 +2336,12 @@ class ProviderPolicyTest(unittest.TestCase):
                         )
                     else:
                         self.assertIn(id(original_link), visible_exceptions)
-                    if not callable(getattr(primary, "add_note", None)):
-                        rendered_cleanup = [
-                            error
-                            for error in visible_exceptions.values()
-                            if isinstance(error, providers.ForwardedSignal)
-                            and error.signum == signal.SIGINT
-                        ]
-                        self.assertEqual(len(rendered_cleanup), 1)
-                        self.assertIsNot(rendered_cleanup[0], cleanup)
-                        self.assertEqual(
-                            str(rendered_cleanup[0]),
-                            "review orchestration received signal 2",
-                        )
-                        self.assertIs(
-                            rendered_cleanup[0].__cause__,
-                            cleanup_cause,
-                        )
-                        self.assertIs(
-                            visible_exceptions.get(id(cleanup_cause)),
-                            cleanup_cause,
-                        )
+                    self.assertLessEqual(
+                        len(visible_exceptions),
+                        providers._CLAUDE_ERROR_GRAPH_NODE_BUDGET,
+                    )
+                    self.assertNotIn(id(cleanup), visible_exceptions)
+                    self.assertNotIn(id(cleanup_cause), visible_exceptions)
                     lease.abandon.assert_called_once_with(
                         "fixture double-control-flow abandonment"
                     )
@@ -2391,6 +2396,20 @@ class ProviderPolicyTest(unittest.TestCase):
                         "Claude credential operation also had a cleanup failure",
                         visible,
                     )
+                    if descriptor_bound:
+                        self.assertNotIn(
+                            "fixture independent cleanup cause",
+                            visible,
+                        )
+                    else:
+                        self.assertIn(
+                            "ForwardedSignal: review orchestration received signal 2",
+                            visible,
+                        )
+                        self.assertIn(
+                            "RuntimeError: fixture independent cleanup cause",
+                            visible,
+                        )
 
     def test_persistence_diagnostic_fallback_preserves_control_flow(self) -> None:
         class LegacyKeyboardInterrupt(KeyboardInterrupt):
@@ -3655,24 +3674,10 @@ class ProviderPolicyTest(unittest.TestCase):
                         providers._ClaudeThreadStartState.UNKNOWN,
                     )
                     self.assertIs(outcome.error, start_error)
-                    if callable(getattr(start_error, "add_note", None)):
-                        self.assertTrue(
-                            any(
-                                "cleanup failure" in note
-                                for note in getattr(
-                                    start_error,
-                                    "__notes__",
-                                    (),
-                                )
-                            )
-                        )
-                    else:
-                        self.assertTrue(
-                            providers._claude_visible_error_chain_contains(
-                                start_error,
-                                interruption,
-                            )
-                        )
+                    self.assert_exception_visible_exact_or_rendered(
+                        start_error,
+                        interruption,
+                    )
 
     def test_claude_thread_post_outcome_store_preserves_interruption(
         self,
@@ -4507,11 +4512,9 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertTrue(injected)
         self.assertIs(raised.exception, interruption)
-        self.assertTrue(
-            providers._claude_visible_error_chain_contains(
-                raised.exception,
-                startup_error,
-            )
+        self.assert_exception_visible_exact_or_rendered(
+            raised.exception,
+            startup_error,
         )
         self.assertIn(thread, server._handler_threads)
         server.shutdown_request.assert_called_once_with(request)
@@ -4763,11 +4766,9 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertTrue(injected)
         self.assertIsNone(captured)
         self.assertIs(error, interruption)
-        self.assertTrue(
-            providers._claude_visible_error_chain_contains(
-                error,
-                startup_error,
-            )
+        self.assert_exception_visible_exact_or_rendered(
+            error,
+            startup_error,
         )
 
     def test_shutdown_start_result_preserves_error_and_quiesces(self) -> None:
@@ -4853,11 +4854,9 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertTrue(shutdown.quiescent)
         self.assertEqual(len(shutdown.errors), 1)
         self.assertIs(shutdown.errors[0], interruption)
-        self.assertTrue(
-            providers._claude_visible_error_chain_contains(
-                shutdown.errors[0],
-                startup_error,
-            )
+        self.assert_exception_visible_exact_or_rendered(
+            shutdown.errors[0],
+            startup_error,
         )
         shutdown_thread = quiesce.call_args_list[0].args[0]
         self.assertEqual(
@@ -4943,11 +4942,9 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertTrue(injected)
         self.assertIs(error, interruption)
-        self.assertTrue(
-            providers._claude_visible_error_chain_contains(
-                error,
-                startup_error,
-            )
+        self.assert_exception_visible_exact_or_rendered(
+            error,
+            startup_error,
         )
         self.assertEqual(pending, bytearray(len(pending)))
 
@@ -5463,11 +5460,9 @@ class ProviderPolicyTest(unittest.TestCase):
                         f"{kind} second handoff interruption",
                         rendered_chain,
                     )
-                    self.assertTrue(
-                        providers._claude_visible_error_chain_contains(
-                            raised_error,
-                            startup_error,
-                        )
+                    self.assert_exception_visible_exact_or_rendered(
+                        raised_error,
+                        startup_error,
                     )
                     self.assertFalse(
                         providers._claude_error_graph_contains(
@@ -6181,7 +6176,7 @@ class ProviderPolicyTest(unittest.TestCase):
             ancestor_identities=((3,),),
         )
         providers._set_claude_retained_credential_proof(error, proof)
-        error.add_note("fixture original note")
+        error.__notes__ = ["fixture original note"]
 
         providers._add_claude_persistence_note(error, error)
 
@@ -33211,6 +33206,9 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_refresh_lock_recovery_wrapper_skips_each_sealed_role(
         self,
     ) -> None:
+        class LegacyError(RuntimeError):
+            add_note = None
+
         for sealed_is_target in (True, False):
             with self.subTest(sealed_is_target=sealed_is_target):
                 sealed = providers.ForwardedSignal(
@@ -33252,7 +33250,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     getattr(target, "_codex_claude_refresh_lock_paths", None)
                 )
 
-        raw_target = RuntimeError("fixture raw recovery target")
+        raw_target = LegacyError("fixture raw recovery target")
         raw_source = RuntimeError("fixture raw recovery source")
         raw_path = "/fixture/private/raw-recovery"
         setattr(
@@ -33267,7 +33265,37 @@ class ProviderPolicyTest(unittest.TestCase):
             getattr(raw_target, "_codex_claude_refresh_lock_paths", None),
             (raw_path,),
         )
-        self.assertIn(raw_path, "\n".join(getattr(raw_target, "__notes__", [])))
+        self.assertIsInstance(
+            raw_target.__cause__,
+            claude_refresh_lock.ClaudeRefreshLockCleanupDiagnostic,
+        )
+        self.assertIn(raw_path, self.format_exception_text(raw_target))
+
+        suppressed_target = LegacyError("fixture suppressed recovery target")
+        sensitive_path = "/fixture/private/suppressed-context/.oauth_refresh.lock"
+        hidden_context = RuntimeError(f"fixture hidden context at {sensitive_path}")
+        suppressed_target.__context__ = hidden_context
+        suppressed_target.__suppress_context__ = True
+        descriptor_source = RuntimeError("fixture descriptor-bound recovery source")
+        setattr(
+            descriptor_source,
+            "_codex_claude_refresh_lock_descriptor_bound",
+            True,
+        )
+
+        providers.attach_claude_refresh_lock_recovery(
+            suppressed_target,
+            descriptor_source,
+        )
+
+        self.assertIsInstance(
+            suppressed_target.__cause__,
+            claude_refresh_lock.ClaudeRefreshLockCleanupDiagnostic,
+        )
+        self.assertIsNone(suppressed_target.__cause__.__context__)
+        self.assertIs(suppressed_target.__context__, hidden_context)
+        self.assertTrue(suppressed_target.__suppress_context__)
+        self.assertNotIn(sensitive_path, self.format_exception_text(suppressed_target))
 
     def test_terminal_handoff_binding_preserves_sealed_persistence_source(
         self,

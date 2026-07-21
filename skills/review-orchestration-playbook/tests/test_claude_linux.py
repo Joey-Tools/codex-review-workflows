@@ -2273,6 +2273,30 @@ class CredentialStagingTest(unittest.TestCase):
     SYNTH_REFRESH_A = "codex_synth_v1_refresh_a"
     SYNTH_REFRESH_B = "codex_synth_v1_refresh_b"
 
+    @staticmethod
+    def _explicit_cause_nodes(
+        error: BaseException,
+    ) -> tuple[BaseException, ...]:
+        nodes: list[BaseException] = []
+        seen: set[int] = set()
+        current: BaseException | None = error
+        while current is not None and len(nodes) < 32:
+            identity = id(current)
+            if identity in seen:
+                break
+            seen.add(identity)
+            nodes.append(current)
+            current = current.__cause__
+        return tuple(nodes)
+
+    @classmethod
+    def _visible_explicit_cause_text(cls, error: BaseException) -> str:
+        visible: list[str] = []
+        for node in cls._explicit_cause_nodes(error):
+            visible.append(str(node))
+            visible.extend(getattr(node, "__notes__", ()))
+        return "\n".join(visible)
+
     class _CoordinatorLeaseFixture:
         def __init__(
             self,
@@ -8919,7 +8943,12 @@ class CredentialStagingTest(unittest.TestCase):
                     result,
                     claude_linux.LinuxCredentialInspectionInconclusive,
                 )
-                self.assertIs(result.__cause__, mask_failure)
+                self.assertTrue(
+                    any(
+                        node is mask_failure
+                        for node in self._explicit_cause_nodes(result)
+                    )
+                )
                 cancel.assert_called_once_with()
                 retain.assert_not_called()
                 self.assertIs(
@@ -9873,7 +9902,7 @@ class CredentialStagingTest(unittest.TestCase):
                 )
                 self.assertIn(
                     str(terminal_interruptions[1]),
-                    "\n".join(getattr(retain_errors[0], "__notes__", ())),
+                    self._visible_explicit_cause_text(retain_errors[0]),
                 )
                 self.assertTrue(coordinator._source_terminal)
                 snapshot = lease.retention_snapshot()
@@ -11090,7 +11119,7 @@ class CredentialStagingTest(unittest.TestCase):
                     )
                     self.assertIn(
                         str(liveness_error),
-                        "\n".join(getattr(raised.exception, "__notes__", ())),
+                        self._visible_explicit_cause_text(raised.exception),
                     )
 
     def test_terminal_wait_control_flow_keeps_lease_recovery_evidence(
@@ -11465,11 +11494,9 @@ class CredentialStagingTest(unittest.TestCase):
                 coordinator._wait_until_terminal()
 
             self.assertIs(raised.exception, worker_control)
-            self.assertTrue(
-                any(
-                    str(attachment_control) in note
-                    for note in getattr(worker_control, "__notes__", ())
-                )
+            self.assertIn(
+                str(attachment_control),
+                self._visible_explicit_cause_text(worker_control),
             )
             self.assertEqual(coordinator._wait_until_terminal(), ())
 
