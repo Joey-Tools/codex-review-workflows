@@ -423,7 +423,9 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "modelUsage-type": ("modelUsage", []),
             "duration-bool": ("duration_ms", True),
             "turns-zero": ("num_turns", 0),
+            "cost-bool": ("total_cost_usd", True),
             "cost-negative": ("total_cost_usd", -1),
+            "cost-string": ("total_cost_usd", "0.01"),
             "session-empty": ("session_id", " "),
             "usage-array": ("usage", []),
             "uuid-empty": ("uuid", ""),
@@ -436,6 +438,30 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 events = self._full_events()
                 events[-1][field_name] = value
                 self.assert_fail_closed(self._validate(events), "inconclusive")
+
+    def test_rejects_nonfinite_and_huge_integer_total_costs(self) -> None:
+        huge_integer = 10**400
+        huge_integer_events = self._full_events()
+        huge_integer_events[-1]["total_cost_usd"] = huge_integer
+
+        self.assertEqual(
+            self._validate(huge_integer_events),
+            {
+                "classification": "inconclusive",
+                "reasons": ["terminal.total_cost_usd.malformed"],
+            },
+        )
+
+        nonfinite_raw = self._raw(self._full_events()).replace(
+            b'"total_cost_usd":0.01', b'"total_cost_usd":1e400'
+        )
+        self.assertEqual(
+            self._validate(raw=nonfinite_raw),
+            {
+                "classification": "inconclusive",
+                "reasons": ["terminal.total_cost_usd.malformed"],
+            },
+        )
 
     def test_classifies_closed_terminal_model_and_stop_mismatches(self) -> None:
         other_model = self._full_events()
@@ -595,6 +621,43 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             {"classification": "accepted", "findings": "\nNo findings.\n"},
         )
         self.assertEqual(completed.stderr, b"")
+
+    def test_cli_huge_integer_total_cost_fails_closed_without_traceback(self) -> None:
+        events = self._full_events()
+        events[-1]["total_cost_usd"] = 10**400
+        input_path = self.cwd / "huge-integer-total-cost.jsonl"
+        input_path.write_bytes(self._raw(events))
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(VALIDATOR),
+                "--cwd",
+                str(self.cwd),
+                "--model",
+                "claude-opus-4-8",
+                "--api-key-source",
+                "none",
+                "--input",
+                str(input_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+
+        self.assertEqual(completed.returncode, 3)
+        self.assertEqual(completed.stderr, b"")
+        stdout_lines = completed.stdout.decode("utf-8").splitlines()
+        self.assertEqual(len(stdout_lines), 1)
+        self.assertEqual(
+            json.loads(stdout_lines[0]),
+            {
+                "classification": "inconclusive",
+                "reasons": ["terminal.total_cost_usd.malformed"],
+            },
+        )
 
 
 if __name__ == "__main__":

@@ -109,20 +109,24 @@ jobs:
               printf -v current_snapshot '%s\n' "${targets[@]:1}"
             fi
 
+            validated_head_shas=()
             for target in "${targets[@]:1}"; do
               IFS=$'\t' read -r pull_number head_sha extra <<<"${target}"
               if [[ ! "${pull_number}" =~ ^[1-9][0-9]*$ || ! "${head_sha}" =~ ^[0-9a-f]{40}$ || -n "${extra}" ]]; then
                 echo "::error::A pull request target derived from authenticated API evidence is malformed."
                 exit 1
               fi
-              gh api --method POST "repos/${REPOSITORY}/statuses/${head_sha}" \
-                --silent \
-                -f state=success \
-                -f context=codex/review-gate \
-                -f description="Compatibility only; no reviewer or review lane."
+              validated_head_shas+=("${head_sha}")
             done
 
             if [[ "${have_previous}" == "true" && "${current_snapshot}" == "${previous_snapshot}" ]]; then
+              for head_sha in "${validated_head_shas[@]}"; do
+                gh api --method POST "repos/${REPOSITORY}/statuses/${head_sha}" \
+                  --silent \
+                  -f state=success \
+                  -f context=codex/review-gate \
+                  -f description="Compatibility only; no reviewer or review lane."
+              done
               echo "::notice::Authenticated open pull request snapshots stabilized after ${pass} passes."
               exit 0
             fi

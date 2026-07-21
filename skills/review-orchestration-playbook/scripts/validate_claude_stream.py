@@ -551,6 +551,15 @@ def _collect_error_messages(event: Mapping[str, Any], evidence: _Evidence) -> li
     return messages
 
 
+def _is_nonnegative_finite_number(value: Any) -> bool:
+    if type(value) not in (int, float) or value < 0:
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def _validate_optional_terminal_fields(
     event: Mapping[str, Any], evidence: _Evidence
 ) -> None:
@@ -565,7 +574,7 @@ def _validate_optional_terminal_fields(
             evidence.inconclusive.add("terminal.num_turns.malformed")
     if "total_cost_usd" in event:
         value = event["total_cost_usd"]
-        if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+        if not _is_nonnegative_finite_number(value):
             evidence.inconclusive.add("terminal.total_cost_usd.malformed")
     for field_name in ("session_id", "uuid"):
         if field_name in event:

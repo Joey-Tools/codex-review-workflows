@@ -693,6 +693,7 @@ class RepositoryContractTest(unittest.TestCase):
                 "([.[][]] | sort_by(.number)) as $pulls",
                 'map(select(.state == "open") | "\\(.number)\\t\\(.head.sha)")',
                 '"RETRY_PAGINATION"',
+                "validated_head_shas=()",
                 'gh api --method POST "repos/${REPOSITORY}/statuses/${head_sha}"',
                 '"${current_snapshot}" == "${previous_snapshot}"',
                 "did not stabilize after ${MAX_ENUMERATION_PASSES} authenticated enumeration passes",
@@ -714,8 +715,8 @@ class RepositoryContractTest(unittest.TestCase):
             stabilization = compatibility.index(
                 '"${current_snapshot}" == "${previous_snapshot}"'
             )
-            self.assertLess(enumeration, publication)
-            self.assertLess(publication, stabilization)
+            self.assertLess(enumeration, stabilization)
+            self.assertLess(stabilization, publication)
             self.assertNotIn("workflow_dispatch:\n    inputs:", compatibility)
             for forbidden in (
                 "pull_request:",
@@ -1064,9 +1065,9 @@ class RepositoryContractTest(unittest.TestCase):
             readiness.index(run_lanes_anchor), readiness.index(classify_anchor)
         )
         for scenario in (
-            "single, double, triple, and triple already reduced to effective double",
-            "Skip this comparison only on the no-PR path",
-            "Only actual PR absence takes the no-PR path; for requested triple that path is effective double",
+            "a selected PR in single, double, triple, and triple already reduced to effective double",
+            "No comparison exists for explicit-range-only standalone single/double with no selected PR",
+            "Only authenticated actual PR absence takes the no-PR path",
             "existing PR on an unsupported host or identity remains on the existing-PR path",
             "an authenticated provider rejection may prove no-start integration/service unavailability",
             "acknowledgement or run/review activity proves start",
@@ -1080,7 +1081,9 @@ class RepositoryContractTest(unittest.TestCase):
             "Supported: a GitHub Cloud PR where the Codex review integration is available",
             readiness,
         )
-        self.assertIn("do not require PR-only fields on the no-PR path", readiness)
+        self.assertIn(
+            "do not require PR-only fields when no PR was selected", readiness
+        )
         self.assertIn(
             "any operating identity in `{hoteng, hoteng_cisco}`",
             contracts,
@@ -1149,11 +1152,27 @@ class RepositoryContractTest(unittest.TestCase):
             probes,
         )
         self.assertIn(
-            "More than one candidate is `blocked-input`",
+            "More than one required PR candidate is `blocked-input`",
             skill,
         )
         self.assertIn(
             "An authenticated successful lookup returning `[]` proves the no-PR path",
+            probes,
+        )
+        for content in (readiness, probes):
+            self.assertIn(
+                "Explicit-range-only standalone single/double",
+                content,
+            )
+            self.assertIn("no PR probe", content)
+        self.assertIn(
+            "report the GitHub lane `blocked-input` and the overall shape `requested: triple`, `effective: triple-inconclusive`",
+            readiness,
+        )
+        self.assertIn("--method GET --paginate --slurp", probes)
+        self.assertIn("-f 'head=<head-owner>:<current-branch>'", probes)
+        self.assertNotIn(
+            "pulls?state=open&head=<head-owner>:<current-branch>",
             probes,
         )
 
@@ -1183,6 +1202,18 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn(
             "Accept a check/run only when its `head_sha` equals `headRefOid`",
             probes,
+        )
+        for anchor in (
+            "server `created_at`",
+            "strictly later than the current request",
+            '`status == "completed"`',
+            '`conclusion == "success"`',
+            "Evidence from an earlier request on the same unchanged head is stale",
+        ):
+            self.assertIn(anchor, probes)
+        self.assertIn(
+            "causally newer than this request",
+            readiness,
         )
         self.assertNotIn("expected Codex integration identity", probes)
 
@@ -1709,9 +1740,12 @@ class RepositoryContractTest(unittest.TestCase):
         for content in (skill, readiness):
             self.assertIn("selected existing PR", content)
             self.assertIn("single, double, triple", content)
-        self.assertIn("only the proven no-PR path skips", skill)
         self.assertIn(
-            "Skip this comparison only on the no-PR path, which must be proven by a successful authenticated empty discovery result",
+            "explicit-range-only standalone single/double with no selected PR and the proven no-PR path have no PR-head comparison",
+            skill,
+        )
+        self.assertIn(
+            "No comparison exists for explicit-range-only standalone single/double with no selected PR, or for the authenticated no-PR path",
             readiness,
         )
         self.assertIn(head_preflight, skill)
@@ -1725,7 +1759,7 @@ class RepositoryContractTest(unittest.TestCase):
             readiness,
         )
         self.assertIn(
-            "standalone named single, double, or triple request may perform the narrow read-only PR lookup",
+            "A standalone triple or PR-specific request may perform the narrow read-only PR lookup",
             readiness,
         )
         self.assertLess(

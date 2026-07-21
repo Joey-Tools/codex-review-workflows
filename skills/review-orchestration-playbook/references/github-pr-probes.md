@@ -13,15 +13,18 @@ Before requesting the third lane, record the PR URL, host, authenticated/operati
 
 ## Deterministic Range And PR Discovery
 
-Use the first applicable scope source: an explicit frozen `base_sha..head_sha`; otherwise an explicitly named PR; otherwise the complete set of open PRs associated with the exact current head repository/branch. Preserve an explicit range before any PR probe. When there is no explicit range or PR, exactly one associated PR selects it; more than one is `blocked-input` (the required explicit PR/range/target selector is absent), and no lane may start until the caller supplies an explicit PR or frozen range. Do not select a candidate by recency, base, number, draft state, or title.
+Use the first applicable scope source: an explicit frozen `base_sha..head_sha`; otherwise an explicitly named PR; otherwise the complete set of open PRs associated with the exact current head repository/branch. Preserve an explicit range before any PR probe. Explicit-range-only standalone single/double needs no PR probe. When a PR is required and there is no explicit PR, exactly one associated PR selects it; more than one is `blocked-input` (the required explicit PR/range/target selector is absent), and no lane whose scope depends on that selection may start until the caller supplies an explicit PR or frozen range. Do not select a candidate by recency, base, number, draft state, or title.
 
 First obtain the exact current branch and head repository owner. A detached HEAD or unknown head owner cannot drive implicit PR association. Then use an authenticated, paginated lookup and retain the returned candidate array:
 
 ```sh
 git branch --show-current
 
-gh api --hostname <host> --paginate --slurp \
-  'repos/<owner>/<repo>/pulls?state=open&head=<head-owner>:<current-branch>&per_page=100' \
+gh api --hostname <host> --method GET --paginate --slurp \
+  repos/<owner>/<repo>/pulls \
+  -f state=open \
+  -f 'head=<head-owner>:<current-branch>' \
+  -f per_page=100 \
   --jq '[.[][] | {number,html_url,base_ref:.base.ref,head_ref:.head.ref,head_sha:.head.sha,head_owner:.head.repo.owner.login}]'
 ```
 
@@ -37,7 +40,10 @@ gh pr view <number> --repo <owner>/<repo> \
   --json number,url,headRefOid,comments,reviews \
   --jq '{number,url,headRefOid,comments,reviews}'
 
-gh pr comment <number> --repo <owner>/<repo> --body '@codex review'
+gh api --hostname github.com --method POST \
+  repos/<owner>/<repo>/issues/<number>/comments \
+  -f body='@codex review' \
+  --jq '{id,html_url,created_at}'
 
 gh api --hostname <host> repos/<owner>/<repo>/pulls/<number>/reviews \
   --paginate \
@@ -49,10 +55,10 @@ gh api --hostname <host> repos/<owner>/<repo>/issues/<number>/comments \
 
 gh api --hostname github.com --paginate --slurp \
   'repos/<owner>/<repo>/commits/<head_sha>/check-runs?per_page=100' \
-  --jq '[.[].check_runs[] | {id,name,status,conclusion,head_sha,details_url,app_slug:.app.slug}]'
+  --jq '[.[].check_runs[] | {id,name,status,conclusion,head_sha,started_at,completed_at,details_url,app_slug:.app.slug}]'
 ```
 
-Treat `gh api --hostname <host> user --jq .login` as the operating identity for this invocation; `gh auth status` is supporting account/host context, not the identity value by itself. Keep the request URL/time, accepted terminal result URL/time/author, and exact `headRefOid`. Accept a review artifact only when its `commit_id` equals `headRefOid`. If Codex answers only through an issue comment, require that the request and response both post after the head became current, that the author has the exact accepted provider identity below, and that `headRefOid` stayed unchanged through acceptance. Accept a check/run only when its `head_sha` equals `headRefOid`. Re-read `headRefOid` before accepting any result. Any push invalidates earlier GitHub Codex evidence and requires a fresh request on the new head.
+Treat `gh api --hostname <host> user --jq .login` as the operating identity for this invocation; `gh auth status` is supporting account/host context, not the identity value by itself. Re-read the posted request from the authenticated API and keep its ID, URL, and server `created_at`, plus the accepted terminal result URL/time/author and exact `headRefOid`. Accept a review artifact only when its `commit_id` equals `headRefOid` and its non-null `submitted_at` is strictly later than the current request's `created_at`. If Codex answers through an issue comment, require its non-null `created_at` to be strictly later than that exact request, require both comments to post after the head became current, require the exact accepted provider identity below, and require `headRefOid` to stay unchanged through acceptance. Accept a check/run only when its `head_sha` equals `headRefOid`, `status == "completed"`, `conclusion == "success"`, and non-null `completed_at` is strictly later than the current request's `created_at`. Re-read `headRefOid` before accepting any result. Evidence from an earlier request on the same unchanged head is stale. Any push invalidates earlier GitHub Codex evidence and requires a fresh request on the new head.
 
 Posting `@codex review` is request transport, not completion or proof that the service started. Accept a provider-authored review/comment only when REST reports exact `user.login == "chatgpt-codex-connector[bot]"` and exact `user.type == "Bot"`. When app/check evidence is used, accept only exact `app.slug == "chatgpt-codex-connector"`; a matching check name is not identity evidence. These comparisons are case-sensitive; missing, unknown, or lookalike authors/apps do not prove service start, a terminal result, or an authenticated no-start rejection.
 

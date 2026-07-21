@@ -110,6 +110,8 @@ Only a terminal result from actual Anthropic Claude Code satisfies this lane. A 
 
 ## Named Triple: GitHub Cloud Codex Trigger
 
+For this lane, record the request comment's API ID and server `created_at`. Every accepted review, comment, or check artifact must have its own trusted server timestamp strictly later than this exact request; same-head evidence from an earlier request is stale. A qualifying check must be `completed` / `success` with non-null `completed_at` later than the request.
+
 After both local lanes are terminal on the frozen range, post the exact comment below on an exact-host `github.com` PR whose current head corresponds to `{head_sha}`:
 
 ```text
