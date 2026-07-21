@@ -636,12 +636,25 @@ _HTTP_401 = re.compile(
     r"|status(?:[\s_-]+code)?"
     r")\b\s*[:=]?\s*401\b"
 )
-_AUTH_CONTEXT = r"(?:oauth|auth(?:entication)?|tokens?|credentials?|login)"
+_AUTH_CONTEXT = r"(?:oauth|auth(?:entication)?|credentials?|login|api[\s_-]+keys?)"
 _REFRESH_ACTION = r"refresh(?:ed|ing)?"
 _FAILURE_SIGNAL = r"(?:fail(?:ed|ing|ure)?|error|expired|invalid|unauthorized|unable)"
+_TOKEN_REFRESH_CONTEXT = (
+    rf"(?:tokens?(?:[\s_-]+[a-z0-9]+){{0,3}}[\s_-]+{_REFRESH_ACTION}"
+    rf"|{_REFRESH_ACTION}(?:[\s_-]+[a-z0-9]+){{0,3}}[\s_-]+tokens?)"
+)
 _AUTH_REFRESH_CONTEXT = (
     rf"(?:{_AUTH_CONTEXT}(?:[\s_-]+[a-z0-9]+){{0,3}}[\s_-]+{_REFRESH_ACTION}"
-    rf"|{_REFRESH_ACTION}(?:[\s_-]+[a-z0-9]+){{0,3}}[\s_-]+{_AUTH_CONTEXT})"
+    rf"|{_REFRESH_ACTION}(?:[\s_-]+[a-z0-9]+){{0,3}}[\s_-]+{_AUTH_CONTEXT}"
+    rf"|{_TOKEN_REFRESH_CONTEXT})"
+)
+_TOKEN_AUTHENTICATION_STATE = re.compile(
+    r"\b(?:"
+    r"(?:access[\s_-]+|api[\s_-]+|bearer[\s_-]+|session[\s_-]+)?"
+    r"tokens?[\s,:;_-]+(?:expired|invalid|unauthorized)"
+    r"|(?:expired|invalid|unauthorized)[\s,:;_-]+"
+    r"(?:access[\s_-]+|api[\s_-]+|bearer[\s_-]+|session[\s_-]+)?tokens?"
+    r")\b"
 )
 _AUTHENTICATION_FAILURE = re.compile(
     rf"\b(?:"
@@ -659,6 +672,7 @@ def _is_authentication_error(message: str) -> bool:
     return bool(
         "login expired" in normalized
         or _HTTP_401.search(normalized)
+        or _TOKEN_AUTHENTICATION_STATE.search(normalized)
         or _AUTHENTICATION_FAILURE.search(normalized)
     )
 

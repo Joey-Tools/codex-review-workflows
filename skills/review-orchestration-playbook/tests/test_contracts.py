@@ -1375,6 +1375,75 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertIn(anchor, interface)
 
+    def test_base_only_retarget_precedes_scope_mismatch_and_preserves_authority(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+        probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
+            encoding="utf-8"
+        )
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
+            encoding="utf-8"
+        )
+
+        priority_anchor = (
+            "before applying the generic same-head/different-base "
+            "`scope-mismatch` branch"
+        )
+        authority_documents = (skill, readiness, probes, contracts, templates)
+        for content in authority_documents:
+            with self.subTest(authority_document=content[:40]):
+                normalized = content.lower()
+                self.assertIn(priority_anchor, normalized)
+                self.assertIn("caller-supplied", content)
+                self.assertIn("parent-derived", content)
+                self.assertIn("explicitly supplied current range", content)
+                self.assertIn("base-changed-same-head", content)
+
+        workflow = skill.split("## Workflow", 1)[1].lower()
+        self.assertLess(
+            workflow.index(priority_anchor),
+            workflow.index("otherwise a selected pr's explicit frozen range satisfies"),
+        )
+
+        selected_pr_preflight = readiness.split("After a PR is selected", 1)[1]
+        selected_pr_preflight = selected_pr_preflight.split(
+            "Reserve `blocked-authorization`", 1
+        )[0].lower()
+        self.assertLess(
+            selected_pr_preflight.index(
+                "apply the post-request base-only transition before the generic "
+                "same-head/different-base `scope-mismatch` branch"
+            ),
+            selected_pr_preflight.index("otherwise require exact equality"),
+        )
+
+        gate_sequence = readiness.split("## Gate Sequence", 1)[1].lower()
+        self.assertLess(
+            gate_sequence.index(priority_anchor),
+            gate_sequence.index("otherwise, when no explicit range exists"),
+        )
+
+        probe_classification = probes.split("Classify precisely", 1)[1].lower()
+        self.assertLess(
+            probe_classification.index("post-request base-only retarget"),
+            probe_classification.index("any other selected pr"),
+        )
+        self.assertIn(
+            "start or count no pr-specific lane from it",
+            selected_pr_preflight,
+        )
+        self.assertIn(
+            "do not fall through to `scope-mismatch`",
+            selected_pr_preflight,
+        )
+
     def test_named_single_prompt_uses_clear_context_codex_without_a_full_diff(
         self,
     ) -> None:
@@ -1682,6 +1751,7 @@ class RepositoryContractTest(unittest.TestCase):
             "Exit status zero is reserved for `accepted` output",
             "A bare child exit code 401",
             "non-authentication refresh failure",
+            "Generic token counting, usage, budget, or limit failures are not authentication evidence",
         ):
             self.assertIn(anchor, canonical)
         for content in (skill, contracts, runtime):
@@ -1766,12 +1836,16 @@ class RepositoryContractTest(unittest.TestCase):
         envelope_anchor = "A missing, duplicate, malformed, out-of-order, or trailing contract event makes the lane `inconclusive`"
         classifier_anchor = "A structurally valid terminal event that fails the success acceptance schema is passed to the failure classifier below"
         permission_anchor = "Classify a structurally valid permission denial, output truncation/abnormal stop, exact-model mismatch, or configuration/policy mismatch as `blocked`"
-        authentication_anchor = "Classify only a structurally valid recognized `Login expired`, explicit HTTP/status 401, or OAuth/token/credential/login/authentication refresh error as `blocked-authentication`"
+        authentication_anchor = "Classify only a structurally valid recognized `Login expired`, explicit HTTP/status 401, OAuth/credential/login/authentication refresh error, token refresh error, or expired/invalid/unauthorized authentication-token state as `blocked-authentication`"
+        token_non_authentication_anchor = (
+            "Generic token counting, usage, budget, or limit errors"
+        )
         for anchor in (
             envelope_anchor,
             classifier_anchor,
             permission_anchor,
             authentication_anchor,
+            token_non_authentication_anchor,
         ):
             self.assertIn(anchor, canonical)
         self.assertNotIn("out-of-order, error-bearing, or trailing", canonical)
@@ -1800,13 +1874,20 @@ class RepositoryContractTest(unittest.TestCase):
         templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
             encoding="utf-8"
         )
+        change_delivery = (
+            SKILL_ROOT.parent / "change-delivery-workflow/SKILL.md"
+        ).read_text(encoding="utf-8")
 
-        for content in (skill, contracts, reviewer):
+        for content in (skill, contracts, reviewer, change_delivery):
             self.assertIn("normally the active installed copy", content)
             self.assertIn("frozen repo-local copy", content)
             self.assertIn("missing or mismatched", content)
         self.assertIn("repo-local playbook from the frozen review head", agents_policy)
-        for content in (skill, contracts, reviewer):
+        self.assertIn(
+            "exact parent-selected authoritative playbook path/version or digest",
+            change_delivery,
+        )
+        for content in (skill, contracts, reviewer, change_delivery):
             self.assertNotIn("from its normal skill environment", content)
         for anchor in (
             "Authoritative review skill path: {review_skill_path}",

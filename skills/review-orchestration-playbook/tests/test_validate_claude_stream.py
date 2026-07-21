@@ -706,6 +706,9 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "credential refresh error",
             "authentication refresh invalid",
             "failed to refresh login token",
+            "access token invalid",
+            "unauthorized bearer token",
+            "API key invalid",
         )
         for message in authentication_messages:
             with self.subTest(authentication_message=message):
@@ -726,6 +729,11 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "refresh failed",
             "cache refresh failed",
             "display refresh error",
+            "Failed to count tokens",
+            "token counting error",
+            "token usage error",
+            "token budget failure",
+            "token limit error",
         )
         for message in non_authentication_messages:
             with self.subTest(non_authentication_message=message):
