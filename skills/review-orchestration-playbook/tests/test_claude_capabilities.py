@@ -17,6 +17,7 @@ CLAUDE_REQUIRED_OPTIONS_FIXTURE = (
     "--effort",
     "--permission-mode",
     "--output-format",
+    "--verbose",
     "--no-session-persistence",
     "--safe-mode",
     "--no-chrome",
@@ -58,30 +59,20 @@ class ClaudeCapabilitiesTest(unittest.TestCase):
             CLAUDE_REQUIRED_OPTIONS_FIXTURE,
         )
 
-    def test_version_pin_accepts_semantics_verified_release(self) -> None:
-        parsed = capabilities.parse_claude_version("2.1.212 (Claude Code)\n")
+    def test_version_range_floats_within_major_two(self) -> None:
+        for version in ("2.1.211", "2.1.212", "2.1.216", "2.99.999"):
+            with self.subTest(version=version):
+                parsed = capabilities.parse_claude_version(
+                    f"{version} (Claude Code)\n"
+                )
+                self.assertEqual(parsed.text, version)
 
-        self.assertEqual(parsed.text, "2.1.212")
-        self.assertEqual(parsed.parts, (2, 1, 212))
-
-    def test_version_pin_rejects_every_other_stable_release(self) -> None:
+    def test_version_range_rejects_old_next_major_and_ambiguous_output(self) -> None:
         for output in (
-            "2.1.211 (Claude Code)\n",
-            "2.1.213 (Claude Code)\n",
-            "2.99.999 (Claude Code)\n",
+            "2.1.210 (Claude Code)\n",
             "3.0.0 (Claude Code)\n",
-        ):
-            with self.subTest(output=output):
-                with self.assertRaisesRegex(
-                    capabilities.ClaudeCapabilityError,
-                    "review semantics are verified only for 2.1.212",
-                ):
-                    capabilities.parse_claude_version(output)
-
-    def test_version_pin_rejects_prerelease_or_ambiguous_output(self) -> None:
-        for output in (
-            "2.1.212-beta.1 (Claude Code)\n",
-            "2.1.212 (Claude Code)\nextra\n",
+            "2.1.211-beta.1 (Claude Code)\n",
+            "2.1.211 (Claude Code)\nextra\n",
         ):
             with self.subTest(output=output):
                 with self.assertRaises(capabilities.ClaudeCapabilityError):
@@ -95,6 +86,17 @@ class ClaudeCapabilitiesTest(unittest.TestCase):
             with self.subTest(output_length=len(output)):
                 with self.assertRaises(capabilities.ClaudeCapabilityError):
                     capabilities.parse_claude_version(output)
+
+    def test_capability_probe_version_matches_publisher_verified_release(self) -> None:
+        with self.assertRaisesRegex(
+            capabilities.ClaudeCapabilityError,
+            "does not match the publisher-verified release",
+        ):
+            capabilities.validate_claude_capabilities(
+                "2.1.216 (Claude Code)\n",
+                supported_help(),
+                expected_version="2.1.215",
+            )
 
     def test_help_accepts_semantic_wording_changes(self) -> None:
         options, block = capabilities.validate_claude_help(supported_help())

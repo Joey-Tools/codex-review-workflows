@@ -3,8 +3,10 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from .claude_provenance import CLAUDE_MAXIMUM_RELEASE, CLAUDE_MINIMUM_RELEASE
 
-CLAUDE_SEMANTICS_VERIFIED_VERSIONS = ((2, 1, 212),)
+CLAUDE_MINIMUM_VERSION = CLAUDE_MINIMUM_RELEASE
+CLAUDE_NEXT_MAJOR_VERSION = CLAUDE_MAXIMUM_RELEASE
 CLAUDE_VERSION_COMPONENT_MAX_DIGITS = 9
 _CLAUDE_VERSION_COMPONENT = (
     rf"(?:0|[1-9][0-9]{{0,{CLAUDE_VERSION_COMPONENT_MAX_DIGITS - 1}}})"
@@ -35,6 +37,7 @@ CLAUDE_REQUIRED_OPTIONS = (
     "--effort",
     "--permission-mode",
     "--output-format",
+    "--verbose",
     "--no-session-persistence",
     "--safe-mode",
     "--no-chrome",
@@ -448,10 +451,9 @@ def parse_claude_version(output: str) -> ClaudeVersion:
         ) from error
     assert len(parts) == 3
     typed_parts = (parts[0], parts[1], parts[2])
-    if typed_parts not in CLAUDE_SEMANTICS_VERIFIED_VERSIONS:
+    if not CLAUDE_MINIMUM_VERSION <= typed_parts < CLAUDE_NEXT_MAJOR_VERSION:
         raise ClaudeCapabilityError(
-            "Claude Code version is unsupported; review semantics are verified "
-            "only for 2.1.212"
+            "Claude Code version is outside the supported >=2.1.211,<3 range"
         )
     return ClaudeVersion(".".join(str(part) for part in typed_parts), typed_parts)
 
@@ -820,7 +822,14 @@ def validate_claude_help(help_text: str) -> tuple[tuple[str, ...], str]:
 def validate_claude_capabilities(
     version_output: str,
     help_text: str,
+    *,
+    expected_version: str | None = None,
 ) -> ClaudeCapabilities:
     version = parse_claude_version(version_output)
+    if expected_version is not None and version.text != expected_version:
+        raise ClaudeCapabilityError(
+            "Claude Code capability probe version does not match the "
+            "publisher-verified release"
+        )
     required_options, safe_mode_summary = validate_claude_help(help_text)
     return ClaudeCapabilities(version, required_options, safe_mode_summary)

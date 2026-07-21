@@ -16,9 +16,9 @@ from .common import (
     restore_signal_mask,
 )
 from .providers import CLAUDE_EGRESS_CONSENTS, run_review
-from .state import FINAL_CLEANUP_TIMEOUT_SECONDS
+from .state import FINAL_CLEANUP_TIMEOUT_SECONDS, ReviewPreparationGuard
 from .state import cleanup as cleanup_state
-from .state import final, run_state, start, status, wait
+from .state import admission, final, run_state, start, status, wait
 from .synthetic_tokens import (
     authoring_metadata,
     legacy_metadata,
@@ -28,6 +28,8 @@ from .workspace import (
     ReviewWorkspace,
     cleanup_workspace,
     prepare_workspace,
+    remove_private_review_artifacts,
+    secret_admission,
     validate_authoring_catalog_scanner_contract,
 )
 
@@ -80,8 +82,8 @@ def _add_review_arguments(parser: argparse.ArgumentParser) -> None:
         action="append",
         default=[],
         help=(
-            "Select one helper-defined legacy synthetic fixture envelope. "
-            "Repeat for multiple envelopes."
+            "Deprecated compatibility option. Known legacy IDs are validated, "
+            "but selection no longer changes secret-delta admission."
         ),
     )
 
@@ -122,7 +124,7 @@ def _build_stateful_parser() -> argparse.ArgumentParser:
     actions = parser.add_subparsers(dest="action", required=True)
     start_parser = actions.add_parser("start")
     _add_review_arguments(start_parser)
-    for action in ("status", "final", "cleanup"):
+    for action in ("status", "final", "cleanup", "admission"):
         action_parser = actions.add_parser(action)
         action_parser.add_argument("--state-dir", required=True)
     wait_parser = actions.add_parser("wait")
@@ -147,6 +149,25 @@ def _build_synthetic_tokens_parser() -> argparse.ArgumentParser:
     audit_parser.add_argument("--ref", required=True)
     audit_parser.add_argument("--exemption", required=True)
     return parser
+
+
+def _build_secret_admission_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="isolated_review secret-admission")
+    parser.add_argument("--repo", default=".", help="Source Git repository.")
+    parser.add_argument("--base-ref", required=True, help="Frozen base commit-ish.")
+    parser.add_argument("--head-ref", required=True, help="Frozen head commit-ish.")
+    return parser
+
+
+def _run_secret_admission(argv: list[str]) -> int:
+    args = _build_secret_admission_parser().parse_args(argv)
+    exit_code, summary = secret_admission(
+        repo=pathlib.Path(args.repo),
+        base_ref=args.base_ref,
+        head_ref=args.head_ref,
+    )
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return exit_code
 
 
 def _run_synthetic_tokens(argv: list[str]) -> int:
@@ -224,6 +245,7 @@ def _run_synthetic_tokens(argv: list[str]) -> int:
 
 
 def _run_foreground(args: argparse.Namespace) -> int:
+    preparation_guard = ReviewPreparationGuard()
     _validate_review_arguments(args)
     review = None
     returncode = 1
@@ -238,7 +260,8 @@ def _run_foreground(args: argparse.Namespace) -> int:
 
     def accept_workspace(prepared: ReviewWorkspace) -> None:
         nonlocal review
-        review = prepared
+        preparation_guard.accept_workspace(prepared)
+        review = preparation_guard.require_review()
 
     try:
         prepare_workspace(
@@ -246,6 +269,7 @@ def _run_foreground(args: argparse.Namespace) -> int:
             base_ref=args.base_ref,
             head_ref=args.head_ref,
             ownership_handoff=accept_workspace,
+            preparation_cleanup_handoff=(preparation_guard.accept_preparation_cleanup),
             synthetic_secret_exemptions=tuple(
                 getattr(args, "synthetic_secret_exemption", ())
             ),
@@ -281,26 +305,36 @@ def _run_foreground(args: argparse.Namespace) -> int:
         pending_signal: signal.Signals | None = None
         try:
             if review is not None:
-                if args.keep_workspace:
-                    print(
-                        f"kept review workspace: {review.container_dir}",
-                        file=sys.stderr,
-                    )
-                elif (review.container_dir / "final.txt").is_file():
-                    cleanup_error = cleanup_workspace(review, keep_container=False)
-                else:
-                    cleanup_error = cleanup_workspace(review, keep_container=True)
+                cleanup_error = preparation_guard.acquire_final_cleanup_lock()
+                if cleanup_error is None:
+                    if args.keep_workspace:
+                        cleanup_error = remove_private_review_artifacts(
+                            review.container_dir,
+                            expected=review.private_cleanup,
+                        )
+                        print(
+                            f"kept review workspace: {review.container_dir}",
+                            file=sys.stderr,
+                        )
+                    elif (review.container_dir / "final.txt").is_file():
+                        cleanup_error = cleanup_workspace(review, keep_container=False)
+                    else:
+                        cleanup_error = cleanup_workspace(review, keep_container=True)
                 if cleanup_error:
                     print(
-                        "review cleanup failed; evidence retained at "
-                        f"{review.container_dir}: {cleanup_error}",
+                        "review cleanup failed; evidence may remain near "
+                        f"{review.container_dir}; inspect cleanup state: "
+                        f"{cleanup_error}",
                         file=sys.stderr,
                     )
             pending_signal = consume_pending_forwarded_signal()
         finally:
-            restore_signal_mask(previous_mask)
-            for signum, previous_handler in previous_handlers.items():
-                signal.signal(signum, previous_handler)
+            try:
+                preparation_guard.close()
+            finally:
+                restore_signal_mask(previous_mask)
+                for signum, previous_handler in previous_handlers.items():
+                    signal.signal(signum, previous_handler)
         if pending_signal is not None:
             raise ForwardedSignal(pending_signal)
     return 1 if cleanup_error and returncode == 0 else returncode
@@ -330,6 +364,10 @@ def _run_stateful(argv: list[str], *, script_path: pathlib.Path) -> int:
     if args.action == "status":
         print(json.dumps(status(state_dir), indent=2, sort_keys=True))
         return 0
+    if args.action == "admission":
+        exit_code, summary = admission(state_dir)
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return exit_code
     if args.action == "wait":
         return wait(state_dir, timeout_seconds=args.timeout_seconds)
     if args.action == "final":
@@ -353,16 +391,31 @@ def main(argv: list[str] | None = None) -> int:
             internal.add_argument("action")
             internal.add_argument("--state-dir", required=True)
             internal.add_argument("--lock-fd", required=True, type=int)
+            internal.add_argument(
+                "--reviewer",
+                required=True,
+                choices=("codex", "claude"),
+            )
+            internal.add_argument(
+                "--egress-consent",
+                choices=CLAUDE_EGRESS_CONSENTS,
+            )
             parsed = internal.parse_args(arguments)
+            _validate_review_arguments(parsed)
             exit_code = run_state(
                 state_dir=pathlib.Path(parsed.state_dir),
+                lock_fd=parsed.lock_fd,
                 terminal_process=True,
+                expected_reviewer=parsed.reviewer,
+                expected_egress_consent=parsed.egress_consent,
             )
             os._exit(exit_code)
         if arguments and arguments[0] == "stateful":
             return _run_stateful(arguments[1:], script_path=script_path)
         if arguments and arguments[0] == "synthetic-tokens":
             return _run_synthetic_tokens(arguments[1:])
+        if arguments and arguments[0] == "secret-admission":
+            return _run_secret_admission(arguments[1:])
         return _run_foreground(_build_parser().parse_args(arguments))
     except ForwardedSignal as error:
         if error.detail:

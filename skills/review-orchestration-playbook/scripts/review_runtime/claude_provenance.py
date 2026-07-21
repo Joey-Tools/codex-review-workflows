@@ -36,7 +36,8 @@ if TYPE_CHECKING:
 CLAUDE_RELEASE_BASE_URL = "https://downloads.claude.ai/claude-code-releases"
 CLAUDE_RELEASE_KEY_FINGERPRINT = "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE"
 CLAUDE_RELEASE_KEY_PATH = pathlib.Path(__file__).with_name("claude_code_release.asc")
-CLAUDE_SUPPORTED_RELEASES = ((2, 1, 212),)
+CLAUDE_MINIMUM_RELEASE = (2, 1, 211)
+CLAUDE_MAXIMUM_RELEASE = (3, 0, 0)
 CLAUDE_MANIFEST_MAX_BYTES = 256 * 1024
 CLAUDE_SIGNATURE_MAX_BYTES = 64 * 1024
 CLAUDE_BINARY_MAX_BYTES = 1024 * 1024 * 1024
@@ -84,9 +85,7 @@ _DARWIN_HOMEBREW_DEPENDENCY_ROOTS = (
     pathlib.PurePosixPath("/usr/local/Cellar"),
 )
 
-_RELEASE_VERSION = re.compile(
-    r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$"
-)
+_RELEASE_VERSION = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _NATIVE_EXECUTABLE_MAGICS = {
     b"\x7fELF",
@@ -146,6 +145,7 @@ class VerifiedClaudeExecutable:
     manifest_url: str
     signature_url: str
     gpg_path: pathlib.Path
+    source_identity: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -297,11 +297,7 @@ def _enforce_fetch_deadline(timeout_seconds: float):  # type: ignore[no-untyped-
             except BaseException as error:
                 cleanup_errors.append(error)
         cleanup_error = next(
-            (
-                error
-                for error in cleanup_errors
-                if not isinstance(error, Exception)
-            ),
+            (error for error in cleanup_errors if not isinstance(error, Exception)),
             cleanup_errors[0] if cleanup_errors else None,
         )
         if cleanup_error is not None:
@@ -353,10 +349,10 @@ def require_supported_release_version(version: str) -> tuple[int, int, int]:
             f"Claude Code version is not strict release semver: {version!r}"
         )
     parsed = tuple(int(component) for component in match.groups())
-    if parsed not in CLAUDE_SUPPORTED_RELEASES:
+    if not (CLAUDE_MINIMUM_RELEASE <= parsed < CLAUDE_MAXIMUM_RELEASE):
         raise ClaudeProvenanceInvalid(
-            "Claude Code release is unsupported; publisher verification is "
-            f"enabled only for 2.1.212: {version}"
+            "Claude Code version is outside the supported range "
+            f">=2.1.211,<3.0.0: {version}"
         )
     return parsed  # type: ignore[return-value]
 
@@ -395,9 +391,7 @@ def _read_response_body_with_deadline(
         if callable(set_socket_timeout):
             set_socket_timeout(remaining_seconds)
 
-        chunk = read_chunk(
-            min(CLAUDE_FETCH_CHUNK_BYTES, max_bytes + 1 - len(payload))
-        )
+        chunk = read_chunk(min(CLAUDE_FETCH_CHUNK_BYTES, max_bytes + 1 - len(payload)))
         if time.monotonic() >= deadline:
             raise ClaudeProvenanceInconclusive(
                 "Claude Code release download exceeded its total timeout"
@@ -445,9 +439,7 @@ def _default_fetcher(
                     raise ClaudeProvenanceInconclusive(
                         f"Claude Code release download returned HTTP {status}"
                     )
-                content_encoding = response.headers.get(
-                    "Content-Encoding", "identity"
-                )
+                content_encoding = response.headers.get("Content-Encoding", "identity")
                 if content_encoding.lower() not in {"", "identity"}:
                     raise ClaudeProvenanceInvalid(
                         "Claude Code release download used an unexpected "
@@ -703,11 +695,13 @@ def _gpg_parent_identities(
         metadata = current.stat(follow_symlinks=False)
         if not stat.S_ISDIR(metadata.st_mode):
             return None
-        if metadata.st_uid not in {0, os.geteuid()} or (
-            metadata.st_mode & stat.S_IWOTH
-        ) or (
-            metadata.st_mode & stat.S_IWGRP
-            and not _allows_trusted_gpg_group_write(current, metadata)
+        if (
+            metadata.st_uid not in {0, os.geteuid()}
+            or (metadata.st_mode & stat.S_IWOTH)
+            or (
+                metadata.st_mode & stat.S_IWGRP
+                and not _allows_trusted_gpg_group_write(current, metadata)
+            )
         ):
             return None
         identities.append((current, _stat_identity(metadata)))
@@ -811,9 +805,8 @@ def _resolve_trusted_gpg_temp_root(
         and stat.S_ISDIR(requested_metadata.st_mode)
         and requested == resolved
     )
-    if (
-        not stat.S_ISDIR(resolved_metadata.st_mode)
-        or not (is_system_temp or is_private_temp)
+    if not stat.S_ISDIR(resolved_metadata.st_mode) or not (
+        is_system_temp or is_private_temp
     ):
         raise ClaudeProvenanceInvalid(
             "trusted GPG temporary root must be a root-owned sticky 1777 "
@@ -933,9 +926,7 @@ def _stable_trusted_gpg_candidate(
             "trusted GPG candidate has unsafe filesystem metadata"
         )
 
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
-        os, "O_NOFOLLOW", 0
-    )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(resolved, flags)
     except OSError as error:
@@ -1005,9 +996,7 @@ def _resolve_trusted_gpg_source(
     for candidate in candidates:
         if not candidate.is_absolute():
             invalid_candidates.append(
-                ClaudeProvenanceInvalid(
-                    "trusted GPG candidate path is not absolute"
-                )
+                ClaudeProvenanceInvalid("trusted GPG candidate path is not absolute")
             )
             continue
         # Group-writable parent directories are intentionally allowed for
@@ -1031,9 +1020,7 @@ def _resolve_trusted_gpg_source(
             return source
         os.close(source.descriptor)
         invalid_candidates.append(
-            ClaudeProvenanceInvalid(
-                "trusted Linux GPG candidate is not root-owned"
-            )
+            ClaudeProvenanceInvalid("trusted Linux GPG candidate is not root-owned")
         )
     if invalid_candidates:
         raise ClaudeProvenanceInvalid(
@@ -1270,8 +1257,8 @@ def _materialize_trusted_gpg_snapshot(
                 f"cannot atomically publish the private GPG snapshot: {error}"
             ) from error
 
-        verify_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
-            os, "O_NOFOLLOW", 0
+        verify_flags = (
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         )
         try:
             verification_descriptor = os.open(
@@ -1361,8 +1348,7 @@ def _clean_absolute_dependency_path(raw: str) -> pathlib.Path:
 def _darwin_sealed_dependency(path: pathlib.Path) -> bool:
     pure = pathlib.PurePosixPath(str(path))
     return any(
-        _pure_path_is_relative_to(pure, root)
-        for root in _DARWIN_SEALED_LIBRARY_ROOTS
+        _pure_path_is_relative_to(pure, root) for root in _DARWIN_SEALED_LIBRARY_ROOTS
     )
 
 
@@ -1401,15 +1387,12 @@ def _capture_gpg_dependency_chain(
                 raise ClaudeProvenanceInvalid(
                     f"GPG dynamic dependency has an untrusted owner: {current}"
                 )
-            writable_regular_or_directory = (
-                not stat.S_ISLNK(metadata.st_mode)
+            writable_regular_or_directory = not stat.S_ISLNK(metadata.st_mode) and (
+                metadata.st_mode & stat.S_IWOTH
+                or metadata.st_mode & stat.S_IWGRP
                 and (
-                    metadata.st_mode & stat.S_IWOTH
-                    or metadata.st_mode & stat.S_IWGRP
-                    and (
-                        not stat.S_ISDIR(metadata.st_mode)
-                        or not _allows_trusted_gpg_group_write(current, metadata)
-                    )
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or not _allows_trusted_gpg_group_write(current, metadata)
                 )
             )
             if writable_regular_or_directory:
@@ -1427,9 +1410,7 @@ def _capture_gpg_dependency_chain(
                     raise ClaudeProvenanceInvalid(
                         f"GPG dynamic dependency is not a file or symlink: {current}"
                     )
-            elif not (
-                stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
-            ):
+            elif not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)):
                 raise ClaudeProvenanceInvalid(
                     f"GPG dynamic dependency parent is not a directory: {current}"
                 )
@@ -1514,7 +1495,9 @@ def _run_otool(path: pathlib.Path, option: str) -> str:
         ) from error
 
 
-def _parse_otool_dependencies(path: pathlib.Path, output: str) -> tuple[pathlib.Path, ...]:
+def _parse_otool_dependencies(
+    path: pathlib.Path, output: str
+) -> tuple[pathlib.Path, ...]:
     lines = output.splitlines()
     if not lines or lines[0] != f"{path}:":
         raise ClaudeProvenanceInvalid(
@@ -1612,8 +1595,7 @@ def _validate_darwin_gpg_load_commands(
 ) -> None:
     commands = _parse_otool_load_commands(path, output)
     if any(
-        command in {"LC_RPATH", "LC_DYLD_ENVIRONMENT"}
-        for command, _name in commands
+        command in {"LC_RPATH", "LC_DYLD_ENVIRONMENT"} for command, _name in commands
     ):
         raise ClaudeProvenanceInvalid(
             "GPG uses an unsupported mutable dyld search path"
@@ -1961,6 +1943,64 @@ def _stat_identity(value: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _require_trusted_release_source_metadata(
+    path: pathlib.Path,
+    metadata: os.stat_result,
+) -> None:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ClaudeProvenanceInvalid(
+            f"Claude Code executable is not a regular file: {path}"
+        )
+    if metadata.st_uid not in {0, os.geteuid()}:
+        raise ClaudeProvenanceInvalid(
+            f"Claude Code executable has an untrusted owner: {path}"
+        )
+    if metadata.st_mode & (
+        stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX
+    ):
+        raise ClaudeProvenanceInvalid(
+            f"Claude Code executable has unsafe mode bits: {path}"
+        )
+
+
+def _trusted_release_source_parent_chain(
+    path: pathlib.Path,
+) -> tuple[tuple[pathlib.Path, tuple[int, ...]], ...]:
+    identities: list[tuple[pathlib.Path, tuple[int, ...]]] = []
+    current = path.parent
+    while True:
+        try:
+            metadata = current.stat(follow_symlinks=False)
+        except OSError as error:
+            raise ClaudeProvenanceInconclusive(
+                f"cannot inspect the Claude Code executable parent chain: {error}"
+            ) from error
+        mode = stat.S_IMODE(metadata.st_mode)
+        root_owned_sticky_temp = metadata.st_uid == 0 and mode == 0o1777
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid not in {0, os.geteuid()}
+            or (
+                metadata.st_mode
+                & (
+                    stat.S_IWGRP
+                    | stat.S_IWOTH
+                    | stat.S_ISUID
+                    | stat.S_ISGID
+                    | stat.S_ISVTX
+                )
+                and not root_owned_sticky_temp
+            )
+        ):
+            raise ClaudeProvenanceInvalid(
+                f"Claude Code executable has an unsafe parent directory: {current}"
+            )
+        identities.append((current, _directory_anchor_identity(metadata)))
+        if current.parent == current:
+            return tuple(identities)
+        current = current.parent
+
+
 def _ensure_private_cache_directory(path: pathlib.Path) -> pathlib.Path:
     try:
         path.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -2153,11 +2193,11 @@ def _sha256_file_descriptor(handle) -> tuple[str, int]:  # type: ignore[no-untyp
     return digest.hexdigest(), total
 
 
-def verify_release_executable(
+def _verify_release_executable_with_identity(
     executable: pathlib.Path,
     artifact: ClaudeReleaseArtifact,
-) -> pathlib.Path:
-    """Hash a stable executable and require the signed artifact size and digest."""
+) -> tuple[pathlib.Path, tuple[int, ...]]:
+    """Hash a stable executable and return its descriptor-bound identity."""
 
     try:
         resolved = executable.expanduser().resolve(strict=True)
@@ -2165,23 +2205,17 @@ def verify_release_executable(
         raise ClaudeProvenanceInconclusive(
             f"cannot resolve Claude Code executable {executable}: {error}"
         ) from error
+    parent_chain_before = _trusted_release_source_parent_chain(resolved)
     try:
         before = resolved.stat(follow_symlinks=False)
     except OSError as error:
         raise ClaudeProvenanceInconclusive(
             f"cannot stat Claude Code executable {resolved}: {error}"
         ) from error
-    if not stat.S_ISREG(before.st_mode):
-        raise ClaudeProvenanceInvalid(
-            f"Claude Code executable is not a regular file: {resolved}"
-        )
+    _require_trusted_release_source_metadata(resolved, before)
     if not os.access(resolved, os.X_OK):
         raise ClaudeProvenanceInvalid(
             f"Claude Code executable is not executable: {resolved}"
-        )
-    if before.st_size != artifact.size:
-        raise ClaudeProvenanceInvalid(
-            "Claude Code executable size does not match the signed release manifest"
         )
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -2193,8 +2227,14 @@ def verify_release_executable(
     try:
         with os.fdopen(descriptor, "rb", closefd=True) as handle:
             opened_before = os.fstat(handle.fileno())
-            checksum, bytes_read = _sha256_file_descriptor(handle)
+            _require_trusted_release_source_metadata(resolved, opened_before)
+            source_identity = _stat_identity(opened_before)
+            if opened_before.st_size == artifact.size:
+                checksum, bytes_read = _sha256_file_descriptor(handle)
+            else:
+                checksum, bytes_read = "", 0
             opened_after = os.fstat(handle.fileno())
+            _require_trusted_release_source_metadata(resolved, opened_after)
     except OSError as error:
         raise ClaudeProvenanceInconclusive(
             f"cannot hash a stable Claude Code executable: {error}"
@@ -2205,15 +2245,26 @@ def verify_release_executable(
         raise ClaudeProvenanceInconclusive(
             f"Claude Code executable changed after hashing: {error}"
         ) from error
+    _require_trusted_release_source_metadata(resolved, after)
+    parent_chain_after = _trusted_release_source_parent_chain(resolved)
     identities = {
         _stat_identity(before),
-        _stat_identity(opened_before),
+        source_identity,
         _stat_identity(opened_after),
         _stat_identity(after),
     }
     if len(identities) != 1:
         raise ClaudeProvenanceInconclusive(
             "Claude Code executable changed while its provenance was verified"
+        )
+    if parent_chain_before != parent_chain_after:
+        raise ClaudeProvenanceInconclusive(
+            "Claude Code executable parent chain changed while its provenance "
+            "was verified"
+        )
+    if source_identity[7] != artifact.size:
+        raise ClaudeProvenanceInvalid(
+            "Claude Code executable size does not match the signed release manifest"
         )
     if bytes_read != artifact.size:
         raise ClaudeProvenanceInconclusive(
@@ -2223,7 +2274,20 @@ def verify_release_executable(
         raise ClaudeProvenanceInvalid(
             "Claude Code executable SHA-256 does not match the signed release manifest"
         )
-    return resolved
+    return resolved, source_identity
+
+
+def verify_release_executable(
+    executable: pathlib.Path,
+    artifact: ClaudeReleaseArtifact,
+) -> pathlib.Path:
+    """Hash a stable executable and require the signed artifact size and digest."""
+
+    verified_path, _source_identity = _verify_release_executable_with_identity(
+        executable,
+        artifact,
+    )
+    return verified_path
 
 
 def _snapshot_filename(artifact: ClaudeReleaseArtifact) -> str:
@@ -2246,10 +2310,7 @@ def _snapshot_filename(artifact: ClaudeReleaseArtifact) -> str:
         raise ClaudeProvenanceInvalid(
             "Claude Code snapshot artifact has an invalid signed size"
         )
-    return (
-        f"claude-{artifact.version}-{artifact.platform_key}-"
-        f"{artifact.checksum}"
-    )
+    return f"claude-{artifact.version}-{artifact.platform_key}-{artifact.checksum}"
 
 
 def _snapshot_root_identity(value: os.stat_result) -> tuple[int, ...]:
@@ -2299,9 +2360,12 @@ def _open_private_snapshot_root(
             "Claude Code executable snapshot root must be a current-user "
             f"0700 real directory: {root}"
         )
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
-        os, "O_NOFOLLOW", 0
-    ) | getattr(os, "O_DIRECTORY", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+    )
     try:
         descriptor = os.open(root, flags)
     except OSError as error:
@@ -2372,9 +2436,7 @@ def _verify_snapshot_entry(
     name: str,
     artifact: ClaudeReleaseArtifact,
 ) -> bool:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
-        os, "O_NOFOLLOW", 0
-    )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(name, flags, dir_fd=root_descriptor)
     except FileNotFoundError:
@@ -2490,6 +2552,25 @@ def _copy_and_hash_snapshot(
     return digest.hexdigest(), total
 
 
+def _require_verified_source_identity(
+    source: pathlib.Path,
+    expected_identity: tuple[int, ...] | None,
+) -> None:
+    if expected_identity is None:
+        return
+    try:
+        current_identity = _stat_identity(source.stat(follow_symlinks=False))
+    except OSError as error:
+        raise ClaudeProvenanceInconclusive(
+            "verified Claude Code executable changed after provenance "
+            f"verification: {error}"
+        ) from error
+    if current_identity != expected_identity:
+        raise ClaudeProvenanceInconclusive(
+            "verified Claude Code executable changed after provenance verification"
+        )
+
+
 def materialize_verified_executable(
     verified: VerifiedClaudeExecutable,
     snapshot_root: pathlib.Path,
@@ -2497,26 +2578,37 @@ def materialize_verified_executable(
     """Copy a verified release into a private, digest-keyed executable snapshot."""
 
     final_name = _snapshot_filename(verified.artifact)
+    source = verified.executable.expanduser()
+    if not source.is_absolute():
+        raise ClaudeProvenanceInvalid(
+            "verified Claude Code executable path must be absolute"
+        )
+    _require_verified_source_identity(source, verified.source_identity)
+
     root, root_descriptor, root_identity = _open_private_snapshot_root(snapshot_root)
     temporary_name: str | None = None
     source_descriptor = -1
     destination_descriptor = -1
     try:
         if _verify_snapshot_entry(root_descriptor, final_name, verified.artifact):
+            _require_verified_source_identity(source, verified.source_identity)
             _require_stable_snapshot_root(root, root_identity)
             return replace(verified, executable=root / final_name)
 
-        source = verified.executable.expanduser()
-        if not source.is_absolute():
-            raise ClaudeProvenanceInvalid(
-                "verified Claude Code executable path must be absolute"
-            )
         try:
             source_before = source.stat(follow_symlinks=False)
         except OSError as error:
             raise ClaudeProvenanceInconclusive(
                 f"verified Claude Code executable changed before snapshotting: {error}"
             ) from error
+        source_identity = _stat_identity(source_before)
+        if (
+            verified.source_identity is not None
+            and source_identity != verified.source_identity
+        ):
+            raise ClaudeProvenanceInconclusive(
+                "verified Claude Code executable changed after provenance verification"
+            )
         if (
             not stat.S_ISREG(source_before.st_mode)
             or not os.access(source, os.X_OK)
@@ -2525,8 +2617,8 @@ def materialize_verified_executable(
             raise ClaudeProvenanceInconclusive(
                 "verified Claude Code executable changed before snapshotting"
             )
-        source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
-            os, "O_NOFOLLOW", 0
+        source_flags = (
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         )
         try:
             source_descriptor = os.open(source, source_flags)
@@ -2539,14 +2631,16 @@ def materialize_verified_executable(
             raise ClaudeProvenanceInconclusive(
                 f"verified Claude Code executable changed while opening: {error}"
             ) from error
-        source_identity = _stat_identity(source_before)
-        if len(
-            {
-                source_identity,
-                _stat_identity(source_opened),
-                _stat_identity(source_after_open),
-            }
-        ) != 1:
+        if (
+            len(
+                {
+                    source_identity,
+                    _stat_identity(source_opened),
+                    _stat_identity(source_after_open),
+                }
+            )
+            != 1
+        ):
             raise ClaudeProvenanceInconclusive(
                 "verified Claude Code executable changed while opening"
             )
@@ -2567,13 +2661,16 @@ def materialize_verified_executable(
             raise ClaudeProvenanceInconclusive(
                 f"verified Claude Code executable changed while copying: {error}"
             ) from error
-        if len(
-            {
-                source_identity,
-                _stat_identity(source_after_copy),
-                _stat_identity(source_named_after),
-            }
-        ) != 1:
+        if (
+            len(
+                {
+                    source_identity,
+                    _stat_identity(source_after_copy),
+                    _stat_identity(source_named_after),
+                }
+            )
+            != 1
+        ):
             raise ClaudeProvenanceInconclusive(
                 "verified Claude Code executable changed while copying"
             )
@@ -2682,11 +2779,15 @@ def verify_claude_release(
     )
     if fetched and cache_dir is not None:
         _cache_verified_manifest(cache_dir, bundle)
-    verified_path = verify_release_executable(executable, artifact)
+    verified_path, source_identity = _verify_release_executable_with_identity(
+        executable,
+        artifact,
+    )
     return VerifiedClaudeExecutable(
         executable=verified_path,
         artifact=artifact,
         manifest_url=bundle.manifest_url,
         signature_url=bundle.signature_url,
         gpg_path=gpg_path,
+        source_identity=source_identity,
     )

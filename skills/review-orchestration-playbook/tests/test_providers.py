@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 from dataclasses import replace
+import errno
 import hashlib
+import io
 import json
 import os
 import pathlib
@@ -42,6 +45,7 @@ CLAUDE_SAFE_MODE_DESCRIPTION = (
 )
 CLAUDE_REQUIRED_OPTIONS_FIXTURE = (
     "--print",
+    "--verbose",
     "--model",
     "--effort",
     "--permission-mode",
@@ -120,7 +124,7 @@ def claude_stream_fixture(
         "permissionMode": "dontAsk",
         "slash_commands": [],
         "apiKeySource": ("ANTHROPIC_API_KEY" if auth_source == "api-key" else "none"),
-        "claude_code_version": "2.1.212",
+        "claude_code_version": "2.1.216",
         "output_style": "default",
         "agents": ["claude", "Explore", "general-purpose", "Plan"],
         "skills": [],
@@ -178,6 +182,10 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         if handed_off != [self.review]:
             raise AssertionError("workspace ownership was not handed off exactly once")
+        self.private_review_artifacts = {
+            name: (self.review.container_dir / name).read_bytes()
+            for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+        }
         self.claude_pwd_home = root / "pwd-home"
         self.claude_pwd_home.mkdir(mode=0o700)
         self.claude_pwd_home_patcher = mock.patch.object(
@@ -251,16 +259,56 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         )
 
+    def _prepare_committed_review(
+        self,
+        relative_path: str,
+        payload: bytes,
+    ) -> ReviewWorkspace:
+        source_root = self.review.source_root
+        base_ref = self._git(source_root, "rev-parse", "HEAD")
+        destination = source_root / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(payload)
+        self._git(source_root, "add", "--", relative_path)
+        self._git(source_root, "commit", "-m", f"Add {relative_path}")
+        head_ref = self._git(source_root, "rev-parse", "HEAD")
+        handed_off: list[ReviewWorkspace] = []
+        review = workspace_runtime.prepare_workspace(
+            repo=source_root,
+            base_ref=base_ref,
+            head_ref=head_ref,
+            ownership_handoff=handed_off.append,
+        )
+        self.assertEqual(handed_off, [review])
+        return review
+
     def _refresh_control_artifact_state(self) -> None:
         control_dir = self.review.workspace_root / ".codex-review"
         state = workspace_runtime._build_control_artifact_state(
             control_dir=control_dir,
+            private_cleanup=self.review.private_cleanup,
         )
         workspace_runtime._write_bounded_json(
             self.review.container_dir / workspace_runtime.CONTROL_ARTIFACT_STATE_NAME,
             state,
             label="helper-private review control state",
         )
+
+    def _restore_private_review_artifacts(self) -> None:
+        for name, payload in self.private_review_artifacts.items():
+            artifact = self.review.container_dir / name
+            artifact.write_bytes(payload)
+            artifact.chmod(0o600)
+        private_cleanup = workspace_runtime._capture_private_cleanup_evidence(
+            self.review.container_dir,
+            expected_container=self.review.private_cleanup.container,
+            require_all=True,
+        )
+        self.review = replace(
+            self.review,
+            private_cleanup=private_cleanup,
+        )
+        self._refresh_control_artifact_state()
 
     def tearDown(self) -> None:
         self.trusted_release_patcher.stop()
@@ -302,6 +350,27 @@ class ProviderPolicyTest(unittest.TestCase):
             stdout_path=str(self.review.container_dir / "stdout"),
             stderr_path=str(self.review.container_dir / "stderr"),
         )
+
+    @staticmethod
+    def _bound_supervision_failure(
+        runtime: str,
+        error: Exception,
+    ):
+        def fail(**kwargs):
+            launch = kwargs["launch"]
+            stdout_path, stderr_path = providers._attempt_paths_without_io(
+                kwargs["review"],
+                kwargs["index"],
+                runtime,
+                kwargs["model"],
+            )
+            with launch.open_attempt_file(stdout_path.name):
+                pass
+            with launch.open_attempt_file(stderr_path.name):
+                pass
+            raise error
+
+        return fail
 
     def write_private_source(self, path: pathlib.Path, payload: bytes) -> None:
         path.write_bytes(payload)
@@ -436,7 +505,7 @@ class ProviderPolicyTest(unittest.TestCase):
         ):
             self.require_trusted_claude_release(
                 pathlib.Path("/bin/claude"),
-                version="2.1.212",
+                version="2.1.216",
                 platform_key="darwin-arm64",
                 gpg_temp_root=self.review.container_dir,
             )
@@ -459,7 +528,7 @@ class ProviderPolicyTest(unittest.TestCase):
         ):
             self.require_trusted_claude_release(
                 pathlib.Path("/bin/claude"),
-                version="2.1.212",
+                version="2.1.216",
                 platform_key="darwin-arm64",
                 gpg_temp_root=self.review.container_dir,
             )
@@ -482,7 +551,7 @@ class ProviderPolicyTest(unittest.TestCase):
         ):
             self.require_trusted_claude_release(
                 pathlib.Path("/bin/claude"),
-                version="2.1.212",
+                version="2.1.216",
                 platform_key="darwin-arm64",
                 gpg_temp_root=self.review.container_dir,
             )
@@ -1954,16 +2023,16 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(codex_attempt.call_count, 1)
 
     @mock.patch.object(providers, "child_environment", return_value={})
-    @mock.patch.object(
-        providers,
-        "_codex_attempt",
-        side_effect=providers.ReviewTimeoutError("review timed out"),
-    )
+    @mock.patch.object(providers, "_codex_attempt")
     def test_codex_attempt_timeout_is_inconclusive(
         self,
         codex_attempt: mock.Mock,
         _environment: mock.Mock,
     ) -> None:
+        codex_attempt.side_effect = self._bound_supervision_failure(
+            "codex",
+            providers.ReviewTimeoutError("review timed out"),
+        )
         outcome = providers.run_review(review=self.review, reviewer="codex")
 
         self.assertEqual(outcome.returncode, 75)
@@ -2115,11 +2184,7 @@ class ProviderPolicyTest(unittest.TestCase):
         "resolve_reviewer_executable",
         return_value=pathlib.Path("/bin/copilot"),
     )
-    @mock.patch.object(
-        providers,
-        "_copilot_attempt",
-        side_effect=providers.ReviewOutputLimitError("review output exceeded limit"),
-    )
+    @mock.patch.object(providers, "_copilot_attempt")
     def test_copilot_attempt_output_limit_is_inconclusive(
         self,
         copilot_attempt: mock.Mock,
@@ -2127,6 +2192,10 @@ class ProviderPolicyTest(unittest.TestCase):
         _resolve_claude: mock.Mock,
         _environment: mock.Mock,
     ) -> None:
+        copilot_attempt.side_effect = self._bound_supervision_failure(
+            "copilot",
+            providers.ReviewOutputLimitError("review output exceeded limit"),
+        )
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
@@ -2664,6 +2733,7 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         for stdout, stderr in diagnostics:
             with self.subTest(stdout=stdout, stderr=stderr):
+                self._restore_private_review_artifacts()
                 claude_attempt.reset_mock()
                 copilot_attempt.reset_mock()
                 resolve.reset_mock()
@@ -3099,61 +3169,656 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         )
 
-    @mock.patch.object(providers, "resolve_reviewer_executable")
-    def test_sensitive_content_blocks_external_reviewer_before_launch(
+    def test_secret_delta_schema_rejects_impossible_status_combinations(
         self,
-        resolve: mock.Mock,
+    ) -> None:
+        public_path = (
+            self.review.workspace_root
+            / ".codex-review"
+            / workspace_runtime.SYNTHETIC_MANIFEST_NAME
+        )
+        private_path = (
+            self.review.container_dir
+            / workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME
+        )
+        template = json.loads(public_path.read_text(encoding="utf-8"))
+        limitations = template["secret_delta"]["limitations"]
+        invalid_deltas = (
+            (
+                "missing-failure-class",
+                {
+                    "limitations": limitations,
+                    "location_status": "inconclusive",
+                    "status": "inconclusive",
+                    "violations": [],
+                },
+            ),
+            (
+                "inconclusive-with-complete-locations",
+                {
+                    "failure_class": "exact-value-scan-incomplete",
+                    "limitations": limitations,
+                    "location_status": "complete",
+                    "status": "inconclusive",
+                    "violations": [],
+                },
+            ),
+            (
+                "violations-without-a-violation",
+                {
+                    "limitations": limitations,
+                    "location_status": "complete",
+                    "status": "violations",
+                    "violations": [],
+                },
+            ),
+        )
+
+        for label, secret_delta in invalid_deltas:
+            with self.subTest(case=label):
+                manifest = json.loads(json.dumps(template))
+                manifest["secret_delta"] = secret_delta
+                encoded = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+                public_path.write_text(encoded, encoding="utf-8")
+                private_path.write_text(encoded, encoding="utf-8")
+                private_path.chmod(0o600)
+                self._refresh_control_artifact_state()
+
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "secret-delta state is invalid",
+                ):
+                    workspace_runtime.validate_external_workspace(self.review)
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_sensitive_content_reaches_external_reviewer_in_raw_form(
+        self,
+        run_model_chain: mock.Mock,
+        _resolve_claude: mock.Mock,
+        environment: mock.Mock,
     ) -> None:
         secret = "AKIA" + "A" * 16
-        (self.review.source_root / "secret.txt").write_text(
-            secret + "\n",
-            encoding="utf-8",
+        review = self._prepare_committed_review(
+            "secret.txt",
+            (secret + "\n").encode(),
         )
-        handed_off: list[ReviewWorkspace] = []
-        review = workspace_runtime.prepare_workspace(
-            repo=self.review.source_root,
-            base_ref=self.review.base_ref,
-            head_ref=self.review.head_ref,
-            include_source_wip=True,
-            ownership_handoff=handed_off.append,
-        )
-        self.assertEqual(handed_off, [review])
+        run_model_chain.return_value = ("success", "No findings.")
+
         outcome = providers.run_review(
             review=review,
             reviewer="claude",
             egress_consent="explicit-claude-with-copilot-fallback",
         )
-        self.assertEqual(outcome.returncode, 2)
-        resolve.assert_not_called()
-        self.assertFalse((review.container_dir / "egress.json").exists())
-        self.assertFalse((review.container_dir / "preflight.json").exists())
-        error = (review.container_dir / "runner-error.txt").read_text(encoding="utf-8")
-        self.assertIn("sensitive content preflight", error)
-        self.assertNotIn(secret, error)
 
-    @mock.patch.object(providers, "_codex_attempt")
-    def test_sensitive_content_blocks_codex_before_launch(
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.final_text, "No findings.")
+        run_model_chain.assert_called_once()
+        environment.assert_called_once()
+        self.assertEqual(
+            (review.workspace_root / "secret.txt").read_text(encoding="utf-8"),
+            secret + "\n",
+        )
+        self.assertIn(secret, review.diff_file.read_text(encoding="utf-8"))
+        preflight = json.loads(
+            (review.container_dir / "preflight.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            preflight["status"],
+            "review workspace containment and integrity checks passed",
+        )
+        self.assertEqual(preflight["secret_delta"]["status"], "violations")
+        self.assertNotIn(secret, json.dumps(preflight, sort_keys=True))
+        egress = json.loads(
+            (review.container_dir / "egress.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(egress["reviewer"], "low-level-helper")
+        self.assertEqual(egress["requested_helper_reviewer"], "claude")
+        self.assertEqual(
+            egress["review_contract"], providers.LOW_LEVEL_HELPER_REVIEW_CONTRACT
+        )
+        self.assertFalse(egress["named_lane_eligible"])
+        self.assertEqual(
+            egress["merge_gate"],
+            "secret-delta status is evaluated separately",
+        )
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_sensitive_content_reaches_codex_in_raw_form(
         self,
-        codex_attempt: mock.Mock,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
     ) -> None:
         secret = "AKIA" + "B" * 16
-        self.review.diff_file.write_text(
-            "diff --git a/config b/config\n-AWS_KEY=" + secret + "\n",
+        review = self._prepare_committed_review(
+            "config",
+            ("AWS_KEY=" + secret + "\n").encode(),
+        )
+        run_model_chain.return_value = ("success", "No findings.")
+
+        outcome = providers.run_review(
+            review=review,
+            reviewer="codex",
+        )
+
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.final_text, "No findings.")
+        run_model_chain.assert_called_once()
+        environment.assert_called_once()
+        self.assertIn(
+            secret,
+            (review.workspace_root / "config").read_text(encoding="utf-8"),
+        )
+        self.assertIn(secret, review.diff_file.read_text(encoding="utf-8"))
+        preflight = json.loads(
+            (review.container_dir / "preflight.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            preflight["status"],
+            "review workspace containment and integrity checks passed",
+        )
+        self.assertEqual(preflight["secret_delta"]["status"], "violations")
+        self.assertNotIn(secret, json.dumps(preflight, sort_keys=True))
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_prompt_only_provider_secret_reaches_trusted_codex(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        secret = "AKIA" + "C" * 16
+        self.review.prompt_file.write_text(
+            f"Review the removal of {secret}.\n",
             encoding="utf-8",
         )
         self._refresh_control_artifact_state()
+        run_model_chain.return_value = ("success", "No findings.")
+
         outcome = providers.run_review(
             review=self.review,
             reviewer="codex",
         )
+
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.final_text, "No findings.")
+        run_model_chain.assert_called_once()
+        environment.assert_called_once()
+        preflight = (self.review.container_dir / "preflight.json").read_text(
+            encoding="utf-8",
+        )
+        self.assertNotIn(secret, preflight)
+        self.assertIn(secret, self.review.prompt_file.read_text(encoding="utf-8"))
+        self.assertFalse(
+            any(
+                (self.review.container_dir / name).exists()
+                for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+            )
+        )
+
+    def test_bound_attempt_logs_force_owner_mode_under_restrictive_umask(
+        self,
+    ) -> None:
+        previous_umask = os.umask(0o777)
+        try:
+            with providers._open_review_launch_binding(self.review) as launch:
+                with launch.open_attempt_file("restrictive-umask.log") as handle:
+                    handle.write(b"review output\n")
+        finally:
+            os.umask(previous_umask)
+
+        attempts = self.review.container_dir / "attempts"
+        artifact = attempts / "restrictive-umask.log"
+        self.assertEqual(stat.S_IMODE(attempts.stat().st_mode), 0o700)
+        self.assertEqual(artifact.read_bytes(), b"review output\n")
+        self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o600)
+
+    @mock.patch.object(
+        providers,
+        "resolve_reviewer_executable",
+        return_value=pathlib.Path("/bin/codex"),
+    )
+    @mock.patch.object(providers, "run")
+    def test_codex_launch_uses_bound_cwd_and_frozen_prompt(
+        self,
+        run_command: mock.Mock,
+        _resolve: mock.Mock,
+    ) -> None:
+        original_prompt = self.review.prompt_file.read_bytes()
+        with providers._open_review_launch_binding(self.review) as launch:
+            launch.freeze_prompt()
+            self.review.prompt_file.write_text(
+                "replacement prompt\n",
+                encoding="utf-8",
+            )
+            run_command.return_value = Completed(
+                argv=("codex",),
+                returncode=1,
+                stdout=b"",
+                stderr=b"review failed",
+            )
+
+            providers._codex_attempt(
+                review=self.review,
+                model="gpt-5.6-sol",
+                index=1,
+                env={},
+                launch=launch,
+            )
+
+            self.assertIsNone(run_command.call_args.kwargs["cwd"])
+            self.assertEqual(
+                run_command.call_args.kwargs["cwd_fd"],
+                launch.workspace_descriptor,
+            )
+            self.assertEqual(run_command.call_args.kwargs["stdin"], original_prompt)
+
+    def test_preflight_builder_rejects_fixed_field_shadow(self) -> None:
+        with self.assertRaisesRegex(ReviewError, "shadows fixed preflight fields"):
+            providers.build_preflight_evidence(
+                self.review,
+                {"private_artifacts": "forged"},
+            )
+
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_preflight_builder_failure_scrubs_private_artifacts(
+        self,
+        run_model_chain: mock.Mock,
+    ) -> None:
+        with mock.patch.object(
+            providers,
+            "build_preflight_evidence",
+            side_effect=ReviewError("prospective preflight rejected"),
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="codex",
+            )
+
         self.assertEqual(outcome.returncode, 2)
-        codex_attempt.assert_not_called()
+        run_model_chain.assert_not_called()
+        self.assertFalse((self.review.container_dir / "preflight.json").exists())
+        self.assertFalse(
+            any(
+                (self.review.container_dir / name).exists()
+                for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+            )
+        )
+        error = (self.review.container_dir / "runner-error.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("prospective preflight rejected", error)
+
+    def test_unknown_reviewer_does_not_write_replaced_container(self) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-moved")
+        stderr = io.StringIO()
+        container.rename(moved_container)
+        container.mkdir(mode=0o700)
+        sentinel = container / "sentinel"
+        sentinel.write_text("keep me\n", encoding="utf-8")
+        try:
+            with contextlib.redirect_stderr(stderr):
+                outcome = providers.run_review(
+                    review=self.review,
+                    reviewer="unknown",
+                )
+
+            self.assertEqual(outcome.returncode, 2)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep me\n")
+            self.assertFalse((container / "runner-error.txt").exists())
+            self.assertFalse((moved_container / "runner-error.txt").exists())
+            self.assertIn("unknown reviewer", stderr.getvalue())
+            self.assertIn("runner diagnostic was not persisted", stderr.getvalue())
+        finally:
+            sentinel.unlink(missing_ok=True)
+            (container / "runner-error.txt").unlink(missing_ok=True)
+            container.rmdir()
+            moved_container.rename(container)
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_private_artifact_cleanup_failure_blocks_codex_launch(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        with mock.patch.object(
+            providers,
+            "remove_private_review_artifacts",
+            return_value="unlink denied",
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="codex",
+            )
+
+        self.assertEqual(outcome.returncode, 2)
+        run_model_chain.assert_not_called()
+        environment.assert_not_called()
         self.assertFalse((self.review.container_dir / "preflight.json").exists())
         error = (self.review.container_dir / "runner-error.txt").read_text(
             encoding="utf-8"
         )
-        self.assertIn("sensitive content preflight", error)
-        self.assertNotIn(secret, error)
+        self.assertIn("private artifact cleanup failed", error)
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_completed_private_scrub_keeps_codex_launch_descriptor_bound(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-bound")
+        original_prompt = self.review.prompt_file.read_bytes()
+        real_scrub = providers.remove_private_review_artifacts
+
+        def restore_container() -> None:
+            if container.is_dir():
+                shutil.rmtree(container)
+            if moved_container.is_dir():
+                moved_container.rename(container)
+
+        self.addCleanup(restore_container)
+
+        def scrub_then_swap(*args, **kwargs):
+            cleanup_error = real_scrub(*args, **kwargs)
+            self.assertIsNone(cleanup_error)
+            container.rename(moved_container)
+            replacement_workspace = container / "workspace"
+            replacement_control = replacement_workspace / ".codex-review"
+            replacement_control.mkdir(parents=True, mode=0o700)
+            (replacement_workspace / "fixture.txt").write_text(
+                "replacement\n",
+                encoding="utf-8",
+            )
+            (replacement_control / "review.prompt").write_text(
+                "replacement prompt\n",
+                encoding="utf-8",
+            )
+            bound_prompt = moved_container / "workspace/.codex-review/review.prompt"
+            bound_prompt.rename(bound_prompt.with_name("review.prompt.original"))
+            bound_prompt.write_text("swapped prompt\n", encoding="utf-8")
+            return None
+
+        def inspect_bound_launch(**kwargs):
+            runtime_review = kwargs["review"]
+            launch = kwargs["launch"]
+            self.assertEqual(launch.prompt, original_prompt)
+            self.assertEqual(
+                runtime_review.container_dir.resolve(),
+                moved_container.resolve(),
+            )
+            stdout_path = moved_container / "bound-launch.stdout.log"
+            stderr_path = moved_container / "bound-launch.stderr.log"
+            completed = common.run(
+                (
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; "
+                    "print(Path('fixture.txt').read_text().strip())",
+                ),
+                cwd_fd=launch.workspace_descriptor,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                timeout_seconds=5,
+                output_file_limit_bytes=64 * 1024,
+            )
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(completed.stdout, b"head endpoint\n")
+            return "success", "No findings."
+
+        run_model_chain.side_effect = inspect_bound_launch
+        with mock.patch.object(
+            providers,
+            "remove_private_review_artifacts",
+            side_effect=scrub_then_swap,
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="codex",
+            )
+
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.final_text, "No findings.")
+        environment.assert_called_once()
+        self.assertTrue((moved_container / "preflight.json").is_file())
+        self.assertFalse((container / "preflight.json").exists())
+
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_workspace_swap_between_launch_binding_and_preflight_is_rejected(
+        self,
+        run_model_chain: mock.Mock,
+    ) -> None:
+        container = self.review.container_dir
+        workspace = self.review.workspace_root
+        legal_workspace = container / "workspace-legal"
+        malicious_workspace = container / "workspace-malicious"
+        self.addCleanup(
+            lambda: shutil.rmtree(malicious_workspace)
+            if malicious_workspace.is_dir()
+            else None
+        )
+        workspace.rename(legal_workspace)
+        malicious_control = workspace / ".codex-review"
+        malicious_control.mkdir(parents=True, mode=0o700)
+        (malicious_control / "review.prompt").write_text(
+            "attacker prompt\n",
+            encoding="utf-8",
+        )
+        real_open = providers._open_review_launch_binding
+
+        def bind_then_restore(review):
+            launch = real_open(review)
+            workspace.rename(malicious_workspace)
+            legal_workspace.rename(workspace)
+            return launch
+
+        with mock.patch.object(
+            providers,
+            "_open_review_launch_binding",
+            side_effect=bind_then_restore,
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="codex",
+            )
+
+        self.assertEqual(outcome.returncode, 2)
+        run_model_chain.assert_not_called()
+        error = (container / "runner-error.txt").read_text(encoding="utf-8")
+        self.assertIn("workspace escapes its container", error)
+        self.assertFalse((container / "preflight.json").exists())
+
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_prompt_swap_between_launch_binding_and_preflight_is_rejected(
+        self,
+        run_model_chain: mock.Mock,
+    ) -> None:
+        prompt = self.review.prompt_file
+        legal_prompt = prompt.with_name("review.prompt.legal")
+        malicious_prompt = self.review.container_dir / "bound-malicious-prompt"
+        self.addCleanup(malicious_prompt.unlink, missing_ok=True)
+        prompt.rename(legal_prompt)
+        prompt.write_text("attacker prompt\n", encoding="utf-8")
+        real_open = providers._open_review_launch_binding
+
+        def bind_then_restore(review):
+            launch = real_open(review)
+            prompt.rename(malicious_prompt)
+            legal_prompt.rename(prompt)
+            self._refresh_control_artifact_state()
+            return launch
+
+        with mock.patch.object(
+            providers,
+            "_open_review_launch_binding",
+            side_effect=bind_then_restore,
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="codex",
+            )
+
+        self.assertEqual(outcome.returncode, 2)
+        run_model_chain.assert_not_called()
+        error = (self.review.container_dir / "runner-error.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("bound review prompt", error)
+        self.assertFalse((self.review.container_dir / "preflight.json").exists())
+
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_launch_binding_close_failure_closes_every_descriptor(
+        self,
+        run_model_chain: mock.Mock,
+    ) -> None:
+        real_close = providers._close_launch_descriptor
+        close_calls: list[int] = []
+
+        def fail_first_close(descriptor: int) -> None:
+            close_calls.append(descriptor)
+            if len(close_calls) == 1:
+                raise OSError(errno.EIO, "injected close failure")
+            real_close(descriptor)
+
+        with mock.patch.object(
+            providers,
+            "_close_launch_descriptor",
+            side_effect=fail_first_close,
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="codex",
+            )
+
+        self.assertEqual(outcome.returncode, 2)
+        self.assertGreaterEqual(len(close_calls), 3)
+        run_model_chain.assert_not_called()
+        error = (self.review.container_dir / "runner-error.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("cannot close bound review control directory", error)
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_claude_egress_and_launch_stay_in_bound_container_after_swap(
+        self,
+        run_model_chain: mock.Mock,
+        _resolve_claude: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-claude-bound")
+        real_scrub = providers.remove_private_review_artifacts
+
+        def restore_container() -> None:
+            if container.is_dir():
+                shutil.rmtree(container)
+            if moved_container.is_dir():
+                moved_container.rename(container)
+
+        self.addCleanup(restore_container)
+
+        def scrub_then_swap(*args, **kwargs):
+            cleanup_error = real_scrub(*args, **kwargs)
+            self.assertIsNone(cleanup_error)
+            container.rename(moved_container)
+            replacement_control = container / "workspace/.codex-review"
+            replacement_control.mkdir(parents=True, mode=0o700)
+            (replacement_control / "review.prompt").write_text(
+                "replacement prompt\n",
+                encoding="utf-8",
+            )
+            return None
+
+        run_model_chain.return_value = ("success", "No findings.")
+        with mock.patch.object(
+            providers,
+            "remove_private_review_artifacts",
+            side_effect=scrub_then_swap,
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="claude",
+                egress_consent="explicit-claude-with-copilot-fallback",
+            )
+
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.final_text, "No findings.")
+        environment.assert_called_once()
+        self.assertTrue((moved_container / "preflight.json").is_file())
+        egress = json.loads(
+            (moved_container / "egress.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(egress["reviewer"], "low-level-helper")
+        self.assertEqual(egress["requested_helper_reviewer"], "claude")
+        self.assertEqual(
+            egress["review_contract"],
+            providers.LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+        )
+        self.assertFalse(egress["named_lane_eligible"])
+        self.assertEqual(
+            egress["merge_gate"],
+            "secret-delta status is evaluated separately",
+        )
+        self.assertFalse((container / "preflight.json").exists())
+        self.assertFalse((container / "egress.json").exists())
+
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_post_preflight_failure_does_not_write_replaced_container(
+        self,
+        run_model_chain: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        container = self.review.container_dir
+        moved_container = container.with_name(f"{container.name}-moved")
+        stderr = io.StringIO()
+
+        def replace_container(**_kwargs):
+            container.rename(moved_container)
+            container.mkdir(mode=0o700)
+            (container / "sentinel").write_text("keep me\n", encoding="utf-8")
+            raise FileNotFoundError("reviewer disappeared")
+
+        run_model_chain.side_effect = replace_container
+        try:
+            with contextlib.redirect_stderr(stderr):
+                outcome = providers.run_review(
+                    review=self.review,
+                    reviewer="codex",
+                )
+
+            self.assertEqual(outcome.returncode, 127)
+            environment.assert_called_once()
+            self.assertEqual(
+                (container / "sentinel").read_text(encoding="utf-8"),
+                "keep me\n",
+            )
+            self.assertFalse((container / "runner-error.txt").exists())
+            self.assertFalse((moved_container / "runner-error.txt").exists())
+            self.assertIn("reviewer disappeared", stderr.getvalue())
+            self.assertIn("runner diagnostic was not persisted", stderr.getvalue())
+        finally:
+            if container.is_dir():
+                (container / "sentinel").unlink(missing_ok=True)
+                (container / "runner-error.txt").unlink(missing_ok=True)
+                container.rmdir()
+            if moved_container.is_dir():
+                moved_container.rename(container)
 
     @mock.patch.object(providers, "_review_environment", return_value={})
     @mock.patch.object(providers, "_run_model_chain")
@@ -3177,10 +3842,22 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertEqual(evidence["content_variant"], "head")
             self.assertEqual(evidence["snapshot_tree_sha"], review.snapshot_tree_sha)
             self.assertEqual(evidence["scope_identity"], review.scope_identity)
+            self.assertEqual(evidence["private_artifacts"], "removed")
+            self.assertEqual(
+                evidence["status"],
+                "review workspace containment and integrity checks passed",
+            )
+            self.assertEqual(evidence["secret_delta"]["status"], "clean")
             self.assertEqual(
                 evidence["scope"],
                 "detached clean head worktree, scanned endpoint Git objects, "
                 "diff, and review prompt",
+            )
+            self.assertFalse(
+                any(
+                    (self.review.container_dir / name).exists()
+                    for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+                )
             )
             diff_bytes = self.review.diff_file.read_bytes()
             self.assertEqual(
@@ -3204,7 +3881,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(outcome.final_text, "No findings.")
 
     @mock.patch.object(providers, "resolve_reviewer_executable")
-    def test_deleted_generic_token_in_diff_blocks_external_reviewer(
+    def test_tampered_deleted_generic_token_diff_blocks_external_reviewer(
         self,
         resolve: mock.Mock,
     ) -> None:
@@ -3213,7 +3890,6 @@ class ProviderPolicyTest(unittest.TestCase):
             "diff --git a/config b/config\n-AUTH_TOKEN=" + token + "\n",
             encoding="utf-8",
         )
-        self._refresh_control_artifact_state()
         outcome = providers.run_review(
             review=self.review,
             reviewer="claude",
@@ -3224,29 +3900,51 @@ class ProviderPolicyTest(unittest.TestCase):
         error = (self.review.container_dir / "runner-error.txt").read_text(
             encoding="utf-8"
         )
-        self.assertIn("review.diff (generic-secret-assignment)", error)
+        self.assertIn(
+            "external review diff does not match helper-private control state",
+            error,
+        )
         self.assertNotIn(token, error)
 
-    @mock.patch.object(providers, "resolve_reviewer_executable")
-    def test_deleted_sensitive_path_blocks_external_reviewer(
+    @mock.patch.object(providers, "_review_environment", return_value={})
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_head_side_sensitive_path_reaches_external_reviewer(
         self,
-        resolve: mock.Mock,
+        run_model_chain: mock.Mock,
+        _resolve_claude: mock.Mock,
+        environment: mock.Mock,
     ) -> None:
-        (self.review.workspace_root / ".codex-review/changed-paths.z").write_bytes(
-            b"config/.env.production\0"
+        review = self._prepare_committed_review(
+            "config/.env.production",
+            b"TRACKED_VALUE=raw\n",
         )
-        self._refresh_control_artifact_state()
+        run_model_chain.return_value = ("success", "No findings.")
+
         outcome = providers.run_review(
-            review=self.review,
+            review=review,
             reviewer="claude",
             egress_consent="explicit-claude-with-copilot-fallback",
         )
-        self.assertEqual(outcome.returncode, 2)
-        resolve.assert_not_called()
-        error = (self.review.container_dir / "runner-error.txt").read_text(
-            encoding="utf-8"
+
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.final_text, "No findings.")
+        run_model_chain.assert_called_once()
+        environment.assert_called_once()
+        self.assertEqual(
+            (review.workspace_root / "config/.env.production").read_text(
+                encoding="utf-8"
+            ),
+            "TRACKED_VALUE=raw\n",
         )
-        self.assertIn(".env.production (environment-file; changed-path)", error)
+        self.assertIn(
+            "config/.env.production",
+            review.diff_file.read_text(encoding="utf-8"),
+        )
 
     @mock.patch.object(
         providers,
@@ -3299,34 +3997,17 @@ class ProviderPolicyTest(unittest.TestCase):
                                         },
                                         "access": "read",
                                     },
-                                    *[
-                                        {
-                                            "path": {
-                                                "type": "path",
-                                                "path": str(
-                                                    (
-                                                        self.review.workspace_root
-                                                        / name
-                                                    ).resolve()
-                                                ),
-                                            },
-                                            "access": "deny",
-                                        }
-                                        for name in (".git", ".codex", ".agents")
-                                    ],
-                                    *[
-                                        {
-                                            "path": {
-                                                "type": "glob_pattern",
-                                                "pattern": str(
-                                                    self.review.workspace_root.resolve()
-                                                    / pattern
-                                                ),
-                                            },
-                                            "access": "deny",
-                                        }
-                                        for pattern in ("*.env", "**/*.env")
-                                    ],
+                                    {
+                                        "path": {
+                                            "type": "path",
+                                            "path": str(
+                                                (
+                                                    self.review.workspace_root / ".git"
+                                                ).resolve()
+                                            ),
+                                        },
+                                        "access": "deny",
+                                    },
                                 ],
                             },
                         },
@@ -3339,11 +4020,23 @@ class ProviderPolicyTest(unittest.TestCase):
 
         def complete(argv, **_kwargs):
             argv = tuple(argv)
-            final_path = pathlib.Path(argv[argv.index("-o") + 1])
-            final_path.parent.mkdir(parents=True, exist_ok=True)
-            final_path.write_text("No findings.\n", encoding="utf-8")
-            stdout = json.dumps(
-                {"type": "thread.started", "thread_id": thread_id}
+            stdout = (
+                "\n".join(
+                    json.dumps(event)
+                    for event in (
+                        {"type": "thread.started", "thread_id": thread_id},
+                        {"type": "turn.started"},
+                        {
+                            "type": "item.completed",
+                            "item": {
+                                "type": "agent_message",
+                                "text": "No findings.",
+                            },
+                        },
+                        {"type": "turn.completed"},
+                    )
+                )
+                + "\n"
             ).encode()
             return Completed(argv=argv, returncode=0, stdout=stdout, stderr=b"")
 
@@ -3381,12 +4074,32 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn('":minimal"="read"', permission_config)
         self.assertIn('":workspace_roots"={"."="read"', permission_config)
         self.assertIn('".git"="deny"', permission_config)
+        self.assertEqual(
+            parsed_permissions["filesystem"][":workspace_roots"],
+            {".": "read", ".git": "deny"},
+        )
+        for tracked_context in (".env", "nested/review.env", ".agents", ".codex"):
+            self.assertNotIn(f'"{tracked_context}"="deny"', permission_config)
         self.assertTrue(
             any("shell_environment_policy.inherit" in value for value in configs)
         )
         self.assertTrue(
             any("shell_environment_policy.set" in value for value in configs)
         )
+        shell_config = next(
+            value
+            for value in configs
+            if value.startswith("shell_environment_policy.set=")
+        )
+        parsed_shell = tomllib.loads(f"profile = {shell_config.partition('=')[2]}")[
+            "profile"
+        ]
+        self.assertEqual(
+            parsed_shell["HOME"],
+            str(self.review.container_dir / "tool-home"),
+        )
+        self.assertNotIn("CODEX_HOME", parsed_shell)
+        self.assertNotIn("OPENAI_API_KEY", parsed_shell)
         self.assertIn("project_doc_max_bytes=0", configs)
         self.assertNotIn("parent-only-secret", "\n".join(configs))
         self.assertIn("--skip-git-repo-check", argv)
@@ -3394,8 +4107,8 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn("--ignore-rules", argv)
         self.assertIn("--strict-config", argv)
         self.assertNotIn("-s", argv)
-        final_path = pathlib.Path(argv[argv.index("-o") + 1])
-        self.assertTrue(final_path.parent.is_dir())
+        self.assertNotIn("-o", argv)
+        self.assertEqual(attempt.final_text, "No findings.")
         self.assertEqual(attempt.effective_model, "gpt-5.6-sol")
         self.assertEqual(attempt.effective_effort, "xhigh")
         self.assertEqual(attempt.category, "success")
@@ -3507,26 +4220,13 @@ class ProviderPolicyTest(unittest.TestCase):
                                 "path": {"type": "path", "path": str(root)},
                                 "access": "read",
                             },
-                            *[
-                                {
-                                    "path": {
-                                        "type": "path",
-                                        "path": str((root / name).resolve()),
-                                    },
-                                    "access": "deny",
-                                }
-                                for name in (".git", ".codex", ".agents")
-                            ],
-                            *[
-                                {
-                                    "path": {
-                                        "type": "glob_pattern",
-                                        "pattern": str(root / pattern),
-                                    },
-                                    "access": "deny",
-                                }
-                                for pattern in ("*.env", "**/*.env")
-                            ],
+                            {
+                                "path": {
+                                    "type": "path",
+                                    "path": str((root / ".git").resolve()),
+                                },
+                                "access": "deny",
+                            },
                             *extra_entries,
                         ],
                     },
@@ -3622,7 +4322,7 @@ class ProviderPolicyTest(unittest.TestCase):
         run_probe.return_value = Completed(
             argv=("claude", "--version"),
             returncode=0,
-            stdout=b"2.1.212 (Claude Code)\n",
+            stdout=b"2.1.216 (Claude Code)\n",
             stderr=b"",
         )
 
@@ -3631,17 +4331,39 @@ class ProviderPolicyTest(unittest.TestCase):
             {"HOME": "/isolated/probe-home"},
         )
 
-        self.assertEqual(version.text, "2.1.212")
+        self.assertEqual(version.text, "2.1.216")
 
     @mock.patch.object(providers, "_run_claude_probe")
-    def test_claude_identity_rejects_every_other_stable_version(
+    def test_claude_identity_accepts_supported_floating_2x_versions(
+        self,
+        run_probe: mock.Mock,
+    ) -> None:
+        for rendered, expected in (
+            (b"2.1.211 (Claude Code)\n", "2.1.211"),
+            (b"2.1.216 (Claude Code)\n", "2.1.216"),
+            (b"2.99.999 (Claude Code)\n", "2.99.999"),
+        ):
+            with self.subTest(rendered=rendered):
+                run_probe.return_value = Completed(
+                    argv=("claude", "--version"),
+                    returncode=0,
+                    stdout=rendered,
+                    stderr=b"",
+                )
+                version = providers._require_claude_identity(
+                    pathlib.Path("/bin/claude"),
+                    {"HOME": "/isolated/probe-home"},
+                )
+                self.assertEqual(version.text, expected)
+
+    @mock.patch.object(providers, "_run_claude_probe")
+    def test_claude_identity_rejects_unsupported_version_bounds(
         self,
         run_probe: mock.Mock,
     ) -> None:
         for output in (
-            b"2.1.211 (Claude Code)\n",
-            b"2.1.213 (Claude Code)\n",
-            b"2.99.999 (Claude Code)\n",
+            b"2.1.210 (Claude Code)\n",
+            b"2.0.99 (Claude Code)\n",
             b"3.0.0 (Claude Code)\n",
         ):
             with self.subTest(output=output):
@@ -3651,10 +4373,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     stdout=output,
                     stderr=b"",
                 )
-                with self.assertRaisesRegex(
-                    providers.InvalidReviewerExecutable,
-                    "review semantics are verified only for 2.1.212",
-                ):
+                with self.assertRaises(providers.InvalidReviewerExecutable):
                     providers._require_claude_identity(
                         pathlib.Path("/bin/claude"),
                         {"HOME": "/isolated/probe-home"},
@@ -3789,6 +4508,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 head_ref="b" * 40,
                 diff_file=workspace_root / ".codex-review" / "review.diff",
                 prompt_file=workspace_root / ".codex-review" / "review.prompt",
+                private_cleanup=self.review.private_cleanup,
             )
             with (
                 self.subTest(path=label),
@@ -3919,7 +4639,7 @@ class ProviderPolicyTest(unittest.TestCase):
         temp_root.chmod(0o700)
         temp_root = temp_root.resolve(strict=True)
         bundle = claude_provenance.SignedClaudeManifest(
-            version="2.1.212",
+            version="2.1.216",
             manifest_url="https://downloads.claude.ai/manifest.json",
             signature_url="https://downloads.claude.ai/manifest.json.sig",
             manifest=b"{}",
@@ -3995,7 +4715,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.trusted_release.return_value = providers.VerifiedClaudeExecutable(
             executable=snapshot,
             artifact=claude_provenance.ClaudeReleaseArtifact(
-                version="2.1.212",
+                version="2.1.216",
                 platform_key="linux-x64",
                 binary="claude",
                 checksum="a" * 64,
@@ -4026,7 +4746,7 @@ class ProviderPolicyTest(unittest.TestCase):
             mock.patch.object(
                 providers,
                 "_require_claude_identity",
-                return_value=providers.ClaudeVersion("2.1.212", (2, 1, 202)),
+                return_value=providers.ClaudeVersion("2.1.216", (2, 1, 216)),
             ) as require_identity,
             mock.patch.object(
                 providers,
@@ -4084,9 +4804,13 @@ class ProviderPolicyTest(unittest.TestCase):
         assert resolved_socat is not None
         self.assertEqual(pathlib.Path(resolved_bwrap).resolve(), toolchain.bwrap)
         self.assertEqual(pathlib.Path(resolved_socat).resolve(), toolchain.socat)
+        self.assertEqual(
+            runtime_env[providers.CLAUDE_EXPECTED_VERSION_ENV_KEY],
+            "2.1.216",
+        )
         self.trusted_release.assert_called_once_with(
             candidate,
-            version="2.1.212",
+            version="2.1.216",
             platform_key="linux-x64",
             gpg_temp_root=(self.review.container_dir / "claude-runtime" / "gpg-tmp"),
             gpg_temp_root_validator=mock.ANY,
@@ -4239,7 +4963,7 @@ class ProviderPolicyTest(unittest.TestCase):
             Completed(
                 argv=("claude", "--version"),
                 returncode=0,
-                stdout=b"2.1.212 (Claude Code)\n",
+                stdout=b"2.1.216 (Claude Code)\n",
                 stderr=b"",
             ),
             Completed(
@@ -4491,7 +5215,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", selected)
         self.assertEqual(
             redact_values,
-            ("alpha", "omega"),
+            ("alpha",),
         )
         self.assertEqual(selected["HTTPS_PROXY"], "http://proxy.example.invalid:8080")
         self.assertEqual(selected["NO_PROXY"], "*")
@@ -4519,6 +5243,36 @@ class ProviderPolicyTest(unittest.TestCase):
             providers._claude_authentication_source(selected),
             "local-login",
         )
+
+    def test_losing_common_credential_is_not_forwarded_or_globally_redacted(
+        self,
+    ) -> None:
+        proxy_url = "http://reviewer:proxy-secret@proxy.example.invalid:8080"
+        environment = {
+            "ANTHROPIC_API_KEY": "winning-api-key-value",
+            "CLAUDE_CODE_OAUTH_TOKEN": "e",
+            "HTTPS_PROXY": proxy_url,
+            "HOME": str(self.claude_pwd_home),
+        }
+        selected, redact_values = providers._select_claude_authentication(environment)
+        direct_redact_values = providers.claude_output_redact_values(environment)
+
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", selected)
+        self.assertNotIn("e", redact_values)
+        self.assertIn("winning-api-key-value", redact_values)
+        self.assertIn("proxy-secret", redact_values)
+        self.assertEqual(direct_redact_values, redact_values)
+        plain_output = "Review evidence remains readable."
+        self.assertEqual(
+            common.redact_text(plain_output, redact_values),
+            plain_output,
+        )
+        redacted_proxy_output = common.redact_text(
+            f"proxy password: proxy-secret; proxy: {proxy_url}",
+            redact_values,
+        )
+        self.assertNotIn("proxy-secret", redacted_proxy_output)
+        self.assertNotIn(proxy_url, redacted_proxy_output)
 
     def test_claude_output_redaction_only_includes_credential_proxy_urls(self) -> None:
         credential_proxy = (
@@ -4579,6 +5333,31 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
             (),
         )
+
+    def test_descriptor_bound_atomic_text_write_honors_active_redactions(
+        self,
+    ) -> None:
+        secret = "oauth-token-value-12345678"
+        artifact_name = "descriptor-redaction.txt"
+        container_descriptor = os.open(
+            self.review.container_dir,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            with common.atomic_write_redactions((secret,)):
+                common.write_text_atomic_at(
+                    container_descriptor,
+                    artifact_name,
+                    f"diagnostic={secret}\n",
+                )
+        finally:
+            os.close(container_descriptor)
+
+        persisted = (self.review.container_dir / artifact_name).read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn(secret, persisted)
+        self.assertEqual(len(persisted), len(f"diagnostic={secret}\n"))
 
     def test_claude_output_redaction_recovers_whatwg_special_proxy_authority(
         self,
@@ -4741,18 +5520,22 @@ class ProviderPolicyTest(unittest.TestCase):
                 ):
                     providers.claude_output_redact_values({"HTTPS_PROXY": proxy_url})
 
-    @mock.patch.object(providers, "_run_review_impl")
+    @mock.patch.object(providers, "_run_claude_review_impl")
     @mock.patch.object(providers, "_review_environment")
     def test_claude_model_run_opts_out_of_broad_subprocess_scrub(
         self,
         review_environment: mock.Mock,
-        run_review_impl: mock.Mock,
+        run_claude_review_impl: mock.Mock,
     ) -> None:
         review_environment.side_effect = lambda **kwargs: {
             "HOME": str(self.claude_pwd_home),
             **kwargs["extra"],
         }
-        run_review_impl.return_value = providers.Outcome(0, "No findings.", tuple())
+        run_claude_review_impl.return_value = providers.Outcome(
+            0,
+            "No findings.",
+            tuple(),
+        )
 
         outcome = providers.run_review(
             review=self.review,
@@ -4763,7 +5546,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(outcome.returncode, 0)
         extra = review_environment.call_args.kwargs["extra"]
         self.assertEqual(extra["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "0")
-        claude_env = run_review_impl.call_args.kwargs["claude_env"]
+        claude_env = run_claude_review_impl.call_args.kwargs["claude_env"]
         self.assertEqual(claude_env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"], "0")
         probe_env = providers._claude_preflight_probe_environment(
             home=self.claude_pwd_home,
@@ -4931,6 +5714,44 @@ class ProviderPolicyTest(unittest.TestCase):
                 review=self.review,
                 requested_model="claude-opus-4-8",
                 authentication=auth,
+            )[2]
+        )
+
+    def test_claude_stream_binds_init_version_to_publisher_release(self) -> None:
+        auth = providers.ClaudeAuthenticationEvidence(
+            requested_source="local-login",
+            api_provider="firstParty",
+            auth_method="claude.ai",
+            api_key_source=None,
+        )
+        matching = providers._strict_jsonl_objects(
+            claude_stream_fixture(self.review),
+        )
+        mismatching = providers._strict_jsonl_objects(
+            claude_stream_fixture(
+                self.review,
+                init_updates={"claude_code_version": "2.1.215"},
+            ),
+        )
+        assert matching is not None
+        assert mismatching is not None
+
+        self.assertTrue(
+            providers._parse_claude_stream_objects(
+                matching,
+                review=self.review,
+                requested_model="claude-opus-4-8",
+                authentication=auth,
+                expected_claude_code_version="2.1.216",
+            )[2]
+        )
+        self.assertFalse(
+            providers._parse_claude_stream_objects(
+                mismatching,
+                review=self.review,
+                requested_model="claude-opus-4-8",
+                authentication=auth,
+                expected_claude_code_version="2.1.216",
             )[2]
         )
 
@@ -5126,6 +5947,116 @@ class ProviderPolicyTest(unittest.TestCase):
             ],
         )
         self.assertNotIn(f"Read(/{review_user_root}/**)", parsed["permissions"]["deny"])
+
+    @mock.patch.object(providers, "run")
+    def test_claude_run_review_accepts_complete_private_scrub_receipts(
+        self,
+        run_command: mock.Mock,
+    ) -> None:
+        temporary = self.review.container_dir / "tmp"
+        temporary.mkdir(exist_ok=True)
+        claude_env = {
+            "HOME": str(self.claude_pwd_home),
+            "TMPDIR": str(temporary),
+            "TMP": str(temporary),
+            "TEMP": str(temporary),
+            "CLAUDE_CODE_TMPDIR": str(temporary),
+            "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "0",
+        }
+
+        def resolve_claude(**_kwargs: object):
+            common.write_json(
+                self.review.container_dir / "claude-runtime.json",
+                {"schema": 1, "phase": "publisher-and-cli-contract-verified"},
+            )
+            return pathlib.Path("/bin/claude"), dict(claude_env)
+
+        def complete(argv: tuple[str, ...], **kwargs: object) -> Completed:
+            is_auth = "auth" in argv
+            payload = (
+                claude_auth_status_fixture("local-login")
+                if is_auth
+                else claude_stream_fixture(self.review)
+            )
+            if not is_auth:
+                staging = self.review.workspace_root / ".claude" / ".cc-writes"
+                staging.mkdir(parents=True, mode=0o700)
+            stdout_file = kwargs.get("stdout_file")
+            stderr_file = kwargs.get("stderr_file")
+            if stdout_file is not None and stderr_file is not None:
+                for handle, content in (
+                    (stdout_file, payload),
+                    (stderr_file, b""),
+                ):
+                    handle.seek(0)
+                    handle.truncate()
+                    handle.write(content)
+                    handle.flush()
+            else:
+                stdout_path = pathlib.Path(kwargs["stdout_path"])
+                stderr_path = pathlib.Path(kwargs["stderr_path"])
+                stdout_path.parent.mkdir(parents=True, exist_ok=True)
+                stdout_path.write_bytes(payload)
+                stderr_path.write_bytes(b"")
+            return Completed(argv=argv, returncode=0, stdout=payload, stderr=b"")
+
+        run_command.side_effect = complete
+        with (
+            mock.patch.object(
+                providers,
+                "_review_environment",
+                return_value=dict(claude_env),
+            ),
+            mock.patch.object(
+                providers,
+                "_resolve_validated_claude_executable",
+                side_effect=resolve_claude,
+            ),
+        ):
+            outcome = providers.run_review(
+                review=self.review,
+                reviewer="claude",
+                egress_consent="explicit-claude-review",
+            )
+
+        self.assertEqual(outcome.returncode, 0)
+        self.assertEqual(outcome.final_text, "No findings.")
+        self.assertEqual(run_command.call_count, 2)
+        self.assertFalse(
+            any(
+                (self.review.container_dir / name).exists()
+                for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
+            )
+        )
+        cleanup_state = workspace_runtime.load_bound_private_cleanup_state(
+            self.review.container_dir,
+            expected=self.review.private_cleanup,
+        )
+        self.assertEqual(
+            cleanup_state.private_artifacts_removed,
+            frozenset(workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES),
+        )
+        report = common.read_json(self.review.container_dir / "claude-runtime.json")
+        self.assertEqual(
+            report["capabilities"]["post_attempt_workspace_contract"],
+            "verified",
+        )
+        self.assertEqual(report["attempt"]["category"], "success")
+
+    def test_descriptor_bound_claude_attempt_requires_launch_receipt(self) -> None:
+        with providers._open_review_launch_binding(self.review) as launch:
+            with self.assertRaisesRegex(
+                ReviewError,
+                "require their validated workspace launch receipt",
+            ):
+                providers._claude_attempt(
+                    review=launch.runtime_review(self.review),
+                    model="claude-opus-4-8",
+                    index=1,
+                    env={},
+                    executable=pathlib.Path("/bin/claude"),
+                    launch=launch,
+                )
 
     @mock.patch.object(
         providers,

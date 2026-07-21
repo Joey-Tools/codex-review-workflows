@@ -1,16 +1,16 @@
 # Isolated Review Helper Contract
 
-The supported low-level helper is:
+The canonical helper is:
 
 ```bash
 $HOME/.codex/skills/review-orchestration-playbook/scripts/isolated_review
 ```
 
-It runs one diagnostic supplied-diff reviewer against one immutable artifact in a helper-owned private-minimal-Git worktree. It is retained for compatibility, helper-security maintenance, and targeted runtime debugging. It is not the canonical implementation of single, double, or triple review; no result from this helper satisfies a named review lane. New state is machine-labeled `review_contract: supplied-diff-private-git` and `named_lane_eligible: false`.
+It runs one low-level supplied-diff reviewer against one frozen Git range. It is retained for compatibility, helper-security maintenance, and targeted runtime debugging. It is diagnostic and never satisfies a named single, double, or triple review lane.
 
 ## CLI
 
-Legacy helper Codex foreground invocation:
+Foreground compatibility mode:
 
 ```bash
 isolated_review \
@@ -20,7 +20,7 @@ isolated_review \
   --head-ref <head_sha>
 ```
 
-Stateful Claude diagnostic:
+Stateful mode:
 
 ```bash
 isolated_review stateful start \
@@ -33,22 +33,11 @@ isolated_review stateful start \
 isolated_review stateful status --state-dir <state_dir>
 isolated_review stateful wait --state-dir <state_dir>
 isolated_review stateful final --state-dir <state_dir>
+isolated_review stateful admission --state-dir <state_dir>
 isolated_review stateful cleanup --state-dir <state_dir>
 ```
 
-Explicit WIP review adds one flag to the review invocation:
-
-```bash
-isolated_review stateful start \
-  --repo /path/to/repo \
-  --reviewer claude \
-  --egress-consent explicit-claude-review \
-  --include-source-wip \
-  --base-ref <base_sha> \
-  --head-ref <head_sha>
-```
-
-`--include-source-wip` is review-only consent, not a way to satisfy PR-readiness gates. All review commands otherwise default to clean mode and reject a dirty source checkout.
+Add `--include-source-wip` only with separate explicit consent to include staged, unstaged, and non-ignored untracked source state. Clean committed-head content is the default.
 
 Synthetic-token catalog inspection remains read-only:
 
@@ -60,127 +49,121 @@ isolated_review synthetic-tokens list-exemptions --json
 isolated_review synthetic-tokens audit-master --repo <path> --ref <sha> --exemption <id>
 ```
 
-Review commands accept repeatable `--synthetic-secret-exemption <id>` selections for helper-owned historical migration envelopes. Read [synthetic-token-fixtures.md](synthetic-token-fixtures.md) before changing the catalog or selecting an exemption.
+Always pass `--state-dir`; it is not positional. `stateful wait --timeout-seconds` accepts only a non-negative finite value, bounds the caller's wait, and does not kill or downgrade a healthy reviewer. `stateful cleanup` removes a retained helper workspace while preserving the state artifacts needed to explain the terminal result.
 
-`stateful start` returns the helper-generated external per-run container as `state_dir`. Always pass that exact path with `--state-dir`; it is not positional. `stateful wait --timeout-seconds` accepts only a non-negative finite value, bounds the caller's wait, and does not kill or downgrade a healthy reviewer. `stateful cleanup` explicitly removes a retained review worktree while preserving state artifacts in that container.
-
-The parent acquires an exclusive runner lock before spawn and passes its file descriptor to the child for the child's full lifetime. Cross-process `status` / `wait` trusts that lock, not PID existence, so a reused PID cannot masquerade as the review runner.
+Canonical PR/master admission uses the separate direct `isolated_review secret-admission` command, which starts no reviewer. This helper's `stateful final` / `stateful admission` pair is retained only for an independently requested low-level helper run: collect `stateful final` first, then query `stateful admission` against that same state and current head. A head change invalidates both results.
 
 ## Low-Level Helper Reviewers
 
-`--reviewer codex`:
+`--reviewer codex` uses:
 
-1. `gpt-5.6-sol`, `xhigh`
-2. `gpt-5.5`, `xhigh`, only after explicit model entitlement/policy denial
+1. `gpt-5.6-sol`, `xhigh`;
+2. `gpt-5.5`, `xhigh`, only after explicit model-entitlement or organization-policy denial.
 
-This legacy supplied-diff Codex runtime does not load the normal instruction stack or provide the separate clean Git worktree required by canonical single review. Its result is diagnostic-only.
+`--reviewer claude` uses:
 
-`--reviewer claude`:
+1. Claude Code `claude-opus-4-8`, `max`;
+2. Claude Code `claude-opus-4-7`, `max`, only after explicit model-entitlement or organization-policy denial for Opus 4.8;
+3. Copilot CLI `claude-opus-4.8`, `max`, only when separately authorized and Claude Code is deterministically unavailable or both Claude models are entitlement-blocked;
+4. Copilot CLI `claude-opus-4.7`, `max`, only after the same strict denial for Copilot Opus 4.8.
 
-1. Claude Code `claude-opus-4-8`, `max`
-2. Claude Code `claude-opus-4-7`, `max`, only after explicit organization-policy or model-entitlement denial for Opus 4.8
-3. Copilot CLI `claude-opus-4-8`, `max`, only when the verified Claude runtime is deterministically unavailable or both Claude models are entitlement-blocked and separate consent authorizes fallback
-4. Copilot CLI `claude-opus-4-7`, `max`, only after the same explicit organization-policy or model-entitlement denial
+Authentication failure, capacity, overload, rate limit, timeout, network/5xx failure, malformed output, silent model substitution, or findings never authorize a downgrade. Copilot is an independently consented helper-only fallback and never counts as Claude Code in a named review shape.
 
-The low-level Claude helper requires either `--egress-consent explicit-claude-review` or `--egress-consent explicit-claude-with-copilot-fallback`. `explicit-claude-review` authorizes Anthropic only. `explicit-claude-with-copilot-fallback` is valid only after the user separately requests and authorizes both Anthropic review and this compatibility Copilot fallback. Named single/double/triple phrases are not helper consent markers. Authentication failure never becomes fallback eligibility, and no Copilot artifact counts as Claude Code.
+Every new state and `egress.json` record is machine-labeled:
 
-Every new state and `egress.json` record exposes `review_contract: supplied-diff-private-git` and `named_lane_eligible: false`; `stateful status` returns both fields. `attempts[].runtime` remains the authoritative actual backend. Consumers must not infer a named lane from the requested helper reviewer or exit `0`. The foreground compatibility command likewise prints only the raw helper artifact, and `stateful final` prints the saved artifact rather than a named-lane envelope. Automation that needs machine-readable contract metadata must use `stateful status`; it must never ingest foreground stdout or `stateful final` as named-review evidence.
+```text
+review_contract: supplied-diff-private-git
+named_lane_eligible: false
+```
 
-Model verification normalizes punctuation only and requires exact equality. Capacity, overload, rate limits, timeouts, network/5xx errors, missing artifacts, silent substitution, and findings never trigger a model downgrade. Fallback classification uses stderr plus explicit structured CLI error events and error-schema fields only; repository-controlled partial result text never authorizes authentication, entitlement, or fallback classification.
+`stateful status` exposes those fields, while `attempts[].runtime` remains the authoritative actual backend. Consumers must not infer named-lane completion from the requested helper reviewer, exit `0`, or findings-only output. The foreground compatibility command likewise prints only the raw helper artifact and does not emit a machine envelope. Automation that needs machine-readable contract metadata must use `stateful status`; it must never ingest foreground stdout or `stateful final` as named-review evidence.
 
-## Detached Review Worktree
+## Private Git Workspace
 
-Clean and WIP are two content variants of the same low-level review workspace and runtime boundary.
+The helper requires `--base-ref` and `--head-ref`, resolves both to commits, and requires base to be an ancestor of head. It materializes a helper-owned detached worktree backed by a private minimal Git database. This `private-minimal-Git` scope contains the supplied diff plus only the endpoint tree/blob closure needed for bounded inspection; it is deliberately narrower than the complete clean Git worktree used by named lanes.
 
-The helper places the detached worktree, private Git database, control artifacts, logs, and state outside the source checkout. Its fixed base is `/tmp`, resolved to a canonical real directory that must be root-owned with exact mode `01777`. Beneath that base it creates current-user-owned exact-`0700` namespaces for `codex-isolated-review-uid-<effective-uid>` and the SHA-256 of the canonical source path, then an exact generated per-run container. Short-lived pre-container ancestry/source-inspection directories and bounded spill files use the same verified canonical base and are removed before the operation that creates them returns. No caller-controlled `TMPDIR` or source path selects another root. Claude's publisher-verified executable snapshot is also run from this container during credential-free safe-mode preflight, so a `noexec` temporary mount fails before authentication or review content is exposed.
+The modern review root lives under the system temporary root `/tmp`, outside the source checkout, in a private namespace owned by the current effective UID and bound to the canonical source path. The source checkout is read-only input and is never edited. The helper removes remote URLs, disables networked Git behavior, rejects unsafe symlinks and reserved control paths, and exposes only bounded read-only Git/source operations to the reviewer.
 
-### Clean Content
+Without `--include-source-wip`, preparation requires the clean committed endpoint. With that explicit flag, the helper creates a helper-private composite from original source `HEAD` plus staged, unstaged, and non-ignored untracked state. It records the original source `HEAD`, exact private snapshot tree, WIP digest, and source-to-snapshot path evidence. A source mutation, WIP deletion or reversion, digest mismatch, unsupported special file, or ambiguous source state fails closed. WIP evidence is diagnostic only and cannot satisfy PR-readiness or merge-ready exact-commit gates.
 
-- Resolve `--base-ref` and `--head-ref` to commits and require base to be an ancestor of head. Range admission runs through a helper-owned sanitized Git view that reads only the source object directory with commit-graph acceleration disabled; source configuration, replacement refs, `.git/info/grafts`, and cached commit-graph parent edges cannot rewrite the accepted graph. Before a false ancestry result is accepted, a bounded zero-output `rev-list --quiet --missing=error` walk must prove both endpoint histories traversable.
-- Require no staged changes, unstaged changes, conflicts, or non-ignored untracked files. Inspect actual source `HEAD`, the object directory, and exact per-worktree index through a short-lived helper-owned Git database; operational `status`, `diff`, `ls-files`, and `ls-tree` must not load source-local hooks, filters, diff drivers, aliases, or other repository configuration.
-- Reject every gitlink found in either actual source `HEAD` or the active index before source status inspection, including a staged deletion or replacement of a committed gitlink.
-- Create a helper-owned literal detached Git worktree at the exact head commit.
-- Back it with a helper-owned private minimal Git database. Never run `git worktree add` against the source common directory, register there, update a source ref, execute a source hook/filter, or write review objects into the source object database.
-- Record exact base SHA, head SHA, tree SHA, workspace mode, and control-artifact digests in helper-private state.
+Every reviewer receives a bounded findings-only prompt and supplied-diff control artifacts inside the helper workspace. Within that consented scope, tracked `.codex`, `.agents`, and environment files are intentionally readable, including tracked repository secrets. The helper does not initialize or fetch submodules; gitlink changes expose only the path, mode, and endpoint object IDs.
 
-### WIP Content
+## Claude Runtime And Authentication
 
-- `--include-source-wip` requires source `HEAD` to equal the resolved head and rejects conflicts, source/index gitlinks, and capture races.
-- Capture staged changes, unstaged changes, deletions, mode changes, symlinks, and every non-ignored untracked file into the helper-owned worktree.
-- Charge regular-file contents and symlink-target bytes against one aggregate snapshot budget. Import captured blobs through one bounded object-format-aware Git process, verify every returned object ID against a helper digest, and apply the complete NUL-delimited raw-path overlay through one index update.
-- Exclude ignored files according to the source worktree's effective path semantics without letting source configuration execute during operational inspection. A bounded config-only `git config --includes` query under the operating-system account home and actual worktree context selects only the final `core.excludesFile` plus typed `core.ignoreCase` and `core.precomposeUnicode` values. The helper secure-reads and freezes the selected excludes bytes, then gives operational Git only those validated path-semantics settings. Source hooks, aliases, filters, and diff commands remain disabled; `core.filemode=true` remains hardening so source configuration cannot hide a real mode-only WIP change.
-- Apply the clean-mode file, entry-count, byte, symlink, and secret-scan budgets.
-- Bind the snapshot to a deterministic WIP digest plus base/head/tree identity and source-state observations before and after capture.
-- Drive rendered diff, changed-path inventory, blob scan, prompt, and reviewer-visible files from that same captured artifact.
-- Preserve original source `HEAD` in the helper-private database and scan its `HEAD`-to-snapshot paths and original-`HEAD` raw blobs so a WIP deletion or reversion cannot hide sensitive content.
-- Treat the WIP digest as fixed review-only artifact evidence. It is not an authored commit and cannot count for PR-readiness or merge-ready review.
+The direct named lane and this low-level helper accept only publisher-verified strict stable Claude Code releases `>=2.1.211,<3.0.0`. For the exact selected version, verification binds the fixed Anthropic release-signing key, signed per-version manifest, platform artifact size, and SHA-256 before any credential or review content reaches Claude. Native-format and platform checks reject scripts, interpreter wrappers, prereleases, unsupported platforms, and future major versions.
 
-The worktree contains Git metadata sufficient for read-only inspection, but its database and administrative files remain helper-owned and immutable to model tools. Reviewer-visible control artifacts live outside tracked content and are independently identity/digest checked. Cleanup is idempotent, removes only helper-owned external workspace content, and never prunes or mutates the source repository or another worktree.
+The helper materializes one private digest-verified executable snapshot after signed-artifact verification. Mandatory bounded credential-free `--version` and `--help` capability probes run against that same snapshot with empty stdin, fixed `/` cwd, and no prompt, credential, repository, range, PR, or workspace input. The observed version must match the manifest-selected version, and help must advertise each invoked option plus the reviewed safe-mode contract. The helper rechecks snapshot digest and mutable-source identity before acceptance. It never downloads or installs Claude and never changes an active symlink.
 
-Source `.codex-tmp` content has no helper-status exemption. Ordinary Git ignore/status semantics apply, any reported record makes clean mode dirty, and WIP capture rejects `.codex-tmp` as reserved. Stateful artifacts retained under `/tmp` are operational evidence, not durable storage.
+Authentication uses the publisher-verified ordinary CLI in real `HOME` with exact precedence `ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` > ordinary local login. The parent opaque-forwards only the winning explicit value, removes lower-priority explicit sources, and checks `auth status --json` for the selected source without inspecting credential contents. The CLI may update ordinary CLI-owned authentication and runtime state in its trusted control plane, including credential refresh and possible cache or tool-result artifacts. Those side effects are not model-authorized review mutations. `--no-session-persistence` disables resumable session persistence; it does not make the CLI process or real `HOME` immutable, and the helper does not take or verify a complete real-`HOME` diff.
 
-Gitlinks present only in the selected artifact remain uninitialized and unfetched. A partial clone with missing required objects fails closed instead of contacting a promisor remote or prompting for authentication.
+A rejected API key yields `blocked-authentication` and asks the operator to unset or replace `ANTHROPIC_API_KEY`. A rejected OAuth token asks the operator to unset or replace `CLAUDE_CODE_OAUTH_TOKEN`. An expired or rejected ordinary login asks the operator to run `claude auth login`. Authentication is a pause boundary and never authorizes Copilot fallback. Capacity, quota, rate-limit, generic token-usage, ambiguous credential I/O, or a bare exit code is inconclusive rather than authentication evidence.
 
-## Sensitive-Content And Egress Preflight
+## Sandbox And Platform Boundary
 
-Before any network-backed Codex, Claude Code, or Copilot run, the helper checks the complete selected artifact, exact diff, changed paths, raw changed blobs, symlink targets, reviewer controls, and prompt. It rejects escaping symlinks, credential-like paths, and high-confidence secret patterns. Endpoint commit/tag metadata scanning covers human metadata plus joined raw Base64 and strict decoded bytes of structured signature blocks. WIP mode includes non-ignored untracked files and the original-source-HEAD delta evidence.
+Claude exposes exactly `Read`, `Grep`, `Glob`, and `Bash` under the helper's platform guard and native sandbox; Bash is sandboxed. Launch requests global write denial, critical sensitive-root read denial, no unsandboxed commands, and removal of secret environment variables from sandboxed tools. This is a selected-deny policy, not a global host-read whitelist. Sandboxed Bash can technically read a host path that is not covered by a selected deny; the prompt/model scope therefore forbids every read outside the detached helper workspace and its private Git scope. Record these controls as requested configuration. Capability or init output does not prove the final merged sandbox, managed permission arrays, or path-rule evaluation.
 
-The scanner reports only side/path/rule metadata, never the matched value. Exact helper-catalog synthetic fixtures may suppress only their declared finding. A successful check writes retained `preflight.json` before executable discovery or model launch.
+On macOS, the helper requires the reviewed native sandbox and a validated read-only launch profile. On Linux and positively identified WSL2, it requires the reviewed outer isolation runtime and rejects known DrvFS/Windows-backed runtime or workspace paths. Unknown platform, mount, namespace, filesystem, dependency, probe, process-containment, or cleanup evidence fails closed as blocked or inconclusive; it is never guessed safe.
 
-## Claude Combined Runtime
+For Claude, runtime preparation accepts only the same version range, signed-artifact evidence, same-snapshot version/help capability contract, requested model, and safe-mode/tool surface. Deterministic automatic absence or a cleanly missing non-security capability may reach an already-authorized helper fallback. Publisher-verification, explicit-override, sandbox, authentication, identity-race, or ambiguous-probe failures do not.
 
-This section applies only to the diagnostic helper. The named Claude lane is a separate direct launch governed by [canonical-claude-lane.md](canonical-claude-lane.md).
+## Structured Output And Attempts
 
-Only Claude Code `2.1.212` is eligible, and only after the fixed Anthropic signing-key fingerprint verifies that release's signed per-version manifest and the manifest checksum matches the native platform binary. Credential-free version/help probes validate the invoked public flags and the exact `dontAsk`/safe-mode contract before authentication or review data is exposed. Native sandbox availability and inline settings are requested fail-closed on the actual review launch. A different release remains blocked until its read-only permission, path-rule, sandbox, and output semantics receive equivalent evidence and the exact supported-version contract is deliberately updated.
+The helper records bounded stdout/stderr and complete per-attempt metadata outside reviewer-visible scope. It accepts findings only from the documented successful structured terminal shape with a nonempty result and verified requested/effective model. Explicit error states, malformed or partial output, permission denials, unexpected model usage, or nonzero ambiguous termination never become findings.
 
-Every helper Claude review uses one combined runtime:
+Each attempt records runtime, requested/effective model, requested/effective effort when observable, category, exit status, and bounded log paths. Model fallback requires strict machine-classified entitlement or organization-policy denial. Auxiliary model usage never replaces exact verification of the requested reviewer model.
 
-- on WSL2, mount provenance must prove both source checkout and external review container use supported local native Linux filesystems;
-- on Linux and WSL2, `bubblewrap` and `socat` must pass fixed-path ownership, mode, native-ELF, architecture, and bounded identity validation; their selected directories lead Claude's final `PATH`, and exact resolution is rechecked before launch;
-- cwd is the helper-owned detached review worktree and `HOME` is the current account's real home resolved from the operating-system account database, not a caller-controlled override;
-- helper-owned temporary paths hold CLI scratch and bounded artifacts;
-- the trusted ordinary Claude control plane may use supported authentication/configuration paths in real `HOME`, including admin-managed policy;
-- `dontAsk` exposes `Read`, `Grep`, and `Glob`, explicitly allows `Read(./**)`, and automatically denies unmatched permission requests; sensitive real-HOME roots, `/proc`, and `/dev` have deny-first rules;
-- `Bash` is exposed only through Claude Code's non-prompting read-only command policy; recognized Bash file readers inherit workspace rules, arbitrary interpreters are outside that set, and sandboxed Bash auto-approval is requested disabled;
-- every accepted stream begins with one `system/init` proving effective `dontAsk`, exact tools, requested model, and authentication indicator, then ends with one matching terminal result;
-- the native-sandbox request sets `failIfUnavailable`, forbids unsandboxed-command escape, removes authentication/proxy variables from sandboxed commands, requests global write denial, denies reads of the original source checkout, other review state, sensitive real-HOME roots, `/proc`, and `/dev`, and lists only the current worktree and private Git view in `allowRead`;
-- after every completed attempt, exact external-workspace validation confirms the snapshot, private Git state, diff, and prompt are unchanged before accepting a result or model fallback.
+`claude-runtime.json` records non-secret source discovery, selected version, signed-manifest and checksum state, capability evidence, authentication-source label, runtime phase, requested/effective model, terminal category, and bounded diagnostics. It never records credential values or bearer-capable metadata and does not claim future token validity.
 
-This is a selected-deny native-sandbox boundary, not a global host-read whitelist. `allowRead` records the intended review scope but does not prove every other host path unreadable; sandboxed Bash can technically read a path outside the worktree when no `denyRead` covers it. The prompt/model contract therefore forbids all outside-workspace reads. Claude Code 2.1.212 `system/init` and capability output do not prove the final merged sandbox, merged admin-managed permission arrays, or path-rule evaluation. Persist those controls only as requested configuration. Post-attempt validation proves the inspected state at validation time; it cannot prove no transient write or outside-workspace read/side effect occurred.
+## Secret Admission
 
-Absolute workspace and diff-file paths in an operator-supplied Claude prompt are projected only when they appear as standalone path tokens; lexically bounded workspace descendants without empty or upward-traversal segments are also projected. URI-embedded, suffix-extended, traversing, or otherwise ambiguous occurrences fail closed.
+Secret admission is independent of reviewer launch. Secret admission never delays, suppresses, redacts, or gates reviewer launch; a trusted reviewer receives the original consented tracked scope. The separate direct command is:
 
-Authentication precedence is:
+```bash
+isolated_review secret-admission \
+  --repo <repo> \
+  --base-ref <base_sha> \
+  --head-ref <head_sha>
+```
 
-1. `ANTHROPIC_API_KEY`
-2. `CLAUDE_CODE_OAUTH_TOKEN`
-3. ordinary local login
+It reports `review_contract: admission-only-no-reviewer`, starts no reviewer, and scans immutable Git trees without materializing a review workspace, diff, or prompt. Exit `0` means clean only with `temporary_cleanup_status: complete`; exit `1` means proved violations; exit `75` means inconclusive scan or otherwise-clean scan with incomplete temporary cleanup.
 
-The helper strips both explicit variables, tests them only for non-emptiness, and opaque-forwards only the winning value. It never parses, logs, writes to disk, projects into a temporary HOME, stages, brokers, replaces, persists, or writes back that value. Ordinary Keychain/credential-file lookup and refresh are Claude Code control-plane behavior. Before any review prompt enters the child process, bounded redacted `auth status --json` evidence must match the selected first-party provider/method/API-key-source contract. The init event cross-checks its authentication indicator; requested carrier and effective CLI fields are recorded separately.
+For each exact raw secret byte value, count occurrences globally in the complete tracked base and head trees and require `head_count <= base_count`. A first appearance or any growth blocks. Unchanged occurrences are omitted; deletions and moves pass. No unembedded counter is accepted as proof. Do not derive Base64, hex, URL-encoded, escaped, hashed, or other transformed values. Report only head-side added locations for positive-delta candidates, and classify incomplete count or location evidence as inconclusive.
 
-A rejected explicit carrier or ordinary login is `blocked-authentication`. The operator action is respectively to unset/replace `ANTHROPIC_API_KEY`, unset/replace `CLAUDE_CODE_OAUTH_TOKEN`, or run `claude auth login`. Authentication failure never authorizes Copilot fallback.
+For an independently requested stateful helper run, `stateful final` remains the reviewer-artifact operation and `stateful admission` remains an optional second query against the same state after the runner lock is released. A runner-sealed schema-v5 preflight receipt binds exact byte length and SHA-256; mutation, replacement, malformed receipt, missing seal, or a legacy schema without a receipt makes admission inconclusive without invalidating an independently valid reviewer final.
 
-Read [claude-runtime-trust.md](claude-runtime-trust.md) for provenance, selected-deny sandbox, real-HOME/tool separation, platform, network, and output details.
+## State, Retention, And Cleanup
 
-## Reviewer Output And State
+The parent acquires the runner lock before helper-private bytes are published and holds the same lease for the child lifetime. State markers bind the canonical source, review container, reviewer, egress consent, workspace identities, runtime artifacts, and cleanup ownership. `status`, `wait`, `final`, and cleanup validate those bindings with bounded no-follow reads.
 
-Reviewer stdout/stderr stream to complete per-attempt files with finite deadlines and byte ceilings. Only bounded heads/tails are retained for classification. Timeouts, overflow, drain failure, or retained descendants terminate the containment unit and produce `inconclusive`.
+New preparation publishes schema-v5 state in the external `/tmp` review root and binds a runner-sealed preflight receipt. Management-only compatibility never resumes an old reviewer: v1 is the source-local legacy workspace without private Git metadata and requires manual recovery; v2 through v4 are source-local compatibility records for the private-Git workspace shape. V2 and v3 remain readable but require manual recovery, while v4 permits bounded `status`, `final`, and cleanup; v4 admission is inconclusive because it has no v5 receipt.
 
-Only a validated non-empty terminal artifact counts as a low-level result. Every attempt records runtime, requested/effective model, requested/effective effort when observable, category, exit status, workspace content mode, exact range or WIP digest, and bounded log paths. Repository-controlled partial result text never authorizes authentication, entitlement, or fallback classification.
+Cleanup-only compatibility for the recorded `<canonical-source>/.codex-tmp/<generated-container>` layout cannot enter `run-state`. The legacy migration first proves a private source-local root, an exact-mode-`0700` state directory, and an empty owner-owned mode-`0664` `cleanup.lock`. Only after the exclusive lock is acquired, cleanup revalidates both directories and the lock identity/mode, performs `fchmod(0600)`, calls `fsync`, and requires exact mode-`0600` validation. Modern state requires a private mode-`0600` lock from creation. Any other legacy lock fails closed without workspace removal.
 
-Stateful final artifacts survive workspace cleanup inside the external per-run container, subject to `/tmp` lifetime. A retained worktree is diagnostic-only and cannot be handed to, satisfy, or supply a canonical named lane.
+Workspace and control artifacts are identity-bound, owner-private, no-follow, size-bounded, and durably published before another phase trusts them. Schema-v4 state remains readable for status/final/cleanup but cannot supply schema-v5 admission evidence. Same-effective-UID hostile mutation remains part of the host trust boundary; the helper does not overclaim portable isolation from a peer process with the same account.
 
-New external state uses an exact v2 marker/schema pair. Management-only legacy compatibility accepts v1 only at the historical exact `<canonical-source>/.codex-tmp/<generated-container>` layout with every serialized workspace path bound to that state directory. Such v1 state can be inspected, waited, finalized, or cleaned in place, including through the bounded cleanup worker, but it cannot enter `run-state`, launch another reviewer, migrate into `/tmp`, or satisfy v2 retained-workspace trust. The source-local root and exact-mode-`0700` state directory are opened and revalidated through no-follow descriptors. Cleanup state-directory identity binds path and open descriptor with stable device, inode, mode, and owner metadata; entry churn beneath the same directory inode does not invalidate that binding, while path replacement fails closed. Only this authenticated v1 path may migrate a safe legacy lock, including an empty owner-owned mode-`0664` `cleanup.lock`: after the exclusive lock is acquired, the helper revalidates both directories and the lock identity/mode before `fchmod(0600)`, `fsync`, and exact mode-`0600` validation. V2 requires a private mode-`0600` lock from the start; every unsafe, nonempty writable, linked, or replaced legacy lock fails closed without workspace removal.
+Source files are never edited. The detached workspace is removed after `stateful wait` unless `--keep-workspace` or a documented helper-only diagnostic condition retains it. `stateful cleanup` removes that workspace after diagnosis. Logs, preflight evidence, attempts metadata, `final.txt`, and cleanup errors remain in the state directory. Cleanup timeout, identity mismatch, or path replacement fails closed and leaves exact retained state for controlled diagnosis.
 
 ## Terminal States
 
-- exit `0`: a non-empty validated low-level artifact exists
-- exit `75`: transient/capacity failure; retry only the same runtime/model if policy permits
-- other nonzero: blocked or failed; inspect bounded state/log evidence
-- `stateful final` prints only the saved low-level artifact on success
-- deterministic helper runtime absence may retain the worktree only for bounded diagnosis; it never supplies named-lane evidence
-- workspace cleanup failure is terminal nonzero even when a low-level artifact exists
+### Reviewer Final
+
+- exit `0`: a nonempty terminal final artifact exists;
+- exit `75`: transient or capacity failure; retry only the same runtime/model when parent policy permits;
+- other nonzero: blocked or failed; inspect `stateful status`, attempts, and bounded logs;
+- `stateful final` prints only the saved terminal artifact on success;
+- cleanup failure remains terminal nonzero even when a reviewer produced an artifact.
+
+### Helper-State Secret Admission
+
+- exit `0`: the sealed bounded summary is valid and clean;
+- exit `1`: the valid summary reports one or more violations;
+- exit `3`: the runner lock is still held and no terminal admission evidence exists;
+- exit `75`: the audit, receipt, state, or cleanup evidence is inconclusive.
+
+A successful reviewer final remains valid review evidence when helper-state admission exits `1` or `75`. Neither helper result is a hidden PR-readiness lane.
+
+Claude Code publisher provenance is anchored to Anthropic's release-signing primary-key fingerprint `31DD DE24 DDFA B679 F42D 7BD2 BAA9 29FF 1A7E CACE`. For the exact selected version, the helper verifies `manifest.json.sig` over `manifest.json` from `downloads.claude.ai`, then requires the installed platform binary to match the manifest size and checksum. Platform signing and notarization may provide defense in depth but never substitute for the signed manifest.
 
 ## Deliberate Omissions
 
-The helper does not support generic `auto` lanes, OpenCode, Cursor Agent, `gh-copilot`, `codex-parallel`, reviewer-visible Git shims, arbitrary child argv, report sinks, legacy helper names, source-common-dir worktree registration, or helper-managed Claude credential transport. WIP capture is available only through explicit `--include-source-wip`.
+The helper does not implement a generic `auto` named lane, provider substitution for named review, implicit live-working-tree capture, arbitrary child argv, reviewer-visible Git shims, automatic installation, active-version switching, or unconsented Copilot egress. Its private-Git and explicit-WIP modes remain low-level diagnostic mechanisms only.

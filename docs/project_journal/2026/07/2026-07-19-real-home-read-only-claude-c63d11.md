@@ -3,7 +3,7 @@ id: 20260719-c63d11
 title: Use Real-HOME Read-Only Claude Reviews
 status: completed
 created: 2026-07-19
-updated: 2026-07-20
+updated: 2026-07-22
 branch: codex/claude-explicit-auth-sources-pr
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/63
 supersedes:
@@ -18,11 +18,21 @@ superseded_by:
 
 ## Summary
 
-- Claude reviews now use one combined runtime: the verified Claude Code control plane receives the current account's real `HOME`, while model tools remain read-only inside a helper-owned detached Git worktree.
+- Claude reviews use one combined runtime: the verified Claude Code control plane receives the current account's real `HOME`, while model tools remain read-only inside a helper-owned detached Git worktree.
 - Clean exact-head content is the default. Explicit `--include-source-wip` captures staged, unstaged, and non-ignored untracked files into a scanned, digest-bound review-only artifact.
-- Authentication follows `ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` > ordinary local login. The helper opaque-forwards only the winning explicit value without parsing, logging, staging, brokering, or persisting it; Claude Code continues to own ordinary local-login discovery and refresh state.
+- Authentication follows `ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` > ordinary local login. The helper opaque-forwards only the winning explicit value without parsing, logging, staging, or persisting it; Claude Code continues to own ordinary local-login discovery and refresh state.
 
 ## Current State
+
+- Current named-direct and low-level-helper policy accepts publisher-verified strict stable Claude Code `>=2.1.211,<3.0.0`. Each selected release is bound to its exact signed per-version manifest, platform artifact size, and SHA-256, then must pass credential-free `--version` and `--help` capability probes against the same private digest-verified executable snapshot before credential or review input.
+- Both Claude paths use the ordinary publisher-verified CLI with real `HOME` and authentication precedence `ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` > ordinary local login. The winning explicit value is opaque-forwarded; the CLI owns ordinary authentication refresh and runtime state.
+- The stream validator receives the exact preflight version and selected source. It maps API-key mode to init `ANTHROPIC_API_KEY` and OAuth-token/local-login modes to init `none`; earlier accepted 2.x releases use the closed legacy profile and current 2.1.216 uses the closed extended profile. Intermediate events are version-profiled, closed, and session-bound; extended success requires the reviewed `fast_mode_state`, `terminal_reason`, and latency fields, while unknown shapes remain inconclusive.
+- Named double launches actual Claude Code directly in an independent read-only clean worktree. The helper remains `review_contract: supplied-diff-private-git`, clean by default, with explicit `--include-source-wip` for staged, unstaged, and non-ignored untracked diagnostic scope; its helper-owned detached Git worktree never satisfies a named lane.
+- Current authority is `skills/review-orchestration-playbook/SKILL.md`, `references/canonical-claude-lane.md`, `references/helper-contract.md`, `references/claude-runtime-trust.md`, and the review-policy migration journal `2026-07-20-review-policy-migration-7f2001.md`.
+
+## Historical Superseded Implementation Evidence
+
+The bullets below preserve PR #63's superseded point-in-time implementation and live-probe record. Exact Claude Code 2.1.212 observations and retired helper authentication terminology are historical evidence only, not an active executable pin, authentication contract, or definition of named single, double, or triple review.
 
 - Each review workspace is a literal detached Git worktree backed by a helper-owned minimal Git database. It does not register in the source common Git directory, touch source refs, or conflict with other worktrees.
 - Default preparation rejects dirty source state. WIP capture requires explicit consent, uses the same immutable workspace and runtime boundary, and binds the complete captured content to a recorded digest.
@@ -59,7 +69,7 @@ superseded_by:
 - Cleanup-lock creation avoids a redundant `fchmod(0600)` when the newly created file already has the exact private mode. This closes a concurrent first-open metadata race without weakening the subsequent path/descriptor identity, owner, link-count, mode, and metadata-stability checks; genuinely restrictive umasks still take the corrective path.
 - Claude Code 2.1.212 creates an empty `.claude/.cc-writes` directory when its native Bash sandbox first runs. The provider records exact pre-launch absence plus any existing real `.claude` parent's filesystem identity, then uses no-follow directory descriptors to verify current-user ownership, `0700` mode, empty contents, and stable parent/child identity. The staging entry itself is atomically moved into helper-private quarantine, re-proved against the opened inode, rechecked as empty, and only then removed non-recursively. It performs the same conservative cleanup and exact workspace validation after the managed process group has completed bounded termination/I/O teardown on a supervision exception, while preserving the primary exception and recording cleanup rejection only as a secondary redacted diagnostic. A new empty parent is independently moved into helper-private quarantine and identity-checked before removal; a swapped candidate at either layer is retained there and rejected rather than restored through a replace-capable rename. Pre-existing WIP entries are not cleaned, disappeared or replaced parents are rejected, and the unchanged exact workspace validator still decides every remaining shape.
 - A final canonical local Codex review found that a helper `--prompt-file` previously replaced the default outside-workspace, read-only, and findings-only discipline before the selected-deny Claude launch. The final Claude stdin now always sandwiches projected supplemental instructions between an authoritative opening boundary and a closing reminder, so custom focus cannot remove the model-level scope contract; the complete protected prompt is still subject to the existing byte limit. Adversarial override and direct-launch wiring regressions bind this behavior.
-- After review policy migration #68, `isolated_review` is explicitly low-level diagnostic infrastructure with `review_contract: supplied-diff-private-git` and `named_lane_eligible: false`. Canonical named review uses a zero-inherited-turn Codex `reviewer` agent in one clean worktree, direct actual Claude Code in another, and current-head GitHub `@codex review` as the third lane when available. The helper's real-HOME/private-Git clean-or-explicit-WIP contract remains supported but never satisfies a named lane or PR-readiness gate.
+- After review policy migration #68, `isolated_review` became explicitly low-level diagnostic infrastructure with `review_contract: supplied-diff-private-git` and `named_lane_eligible: false`. Canonical named review used a zero-inherited-turn Codex `reviewer` agent in one clean worktree, direct actual Claude Code in another, and current-head GitHub `@codex review` as the third lane when available. The helper's real-HOME/private-Git clean-or-explicit-WIP contract remained supported but never satisfied a named lane or PR-readiness gate.
 
 ## Next Steps
 

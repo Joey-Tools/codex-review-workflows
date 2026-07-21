@@ -22,7 +22,7 @@ from review_runtime import claude_provenance  # noqa: E402
 
 def artifact_for(payload: bytes) -> claude_provenance.ClaudeReleaseArtifact:
     return claude_provenance.ClaudeReleaseArtifact(
-        version="2.1.212",
+        version="2.1.211",
         platform_key="darwin-arm64",
         binary="claude",
         checksum=hashlib.sha256(payload).hexdigest(),
@@ -46,7 +46,7 @@ def verified_for(
 def manifest_for(
     payload: bytes,
     *,
-    version: str = "2.1.212",
+    version: str = "2.1.211",
     platform_key: str = "darwin-arm64",
     binary: str = "claude",
     checksum: str | None = None,
@@ -76,52 +76,42 @@ def completed(
 
 
 class ReleaseVersionTest(unittest.TestCase):
-    def test_accepts_only_supported_release_version(self) -> None:
+    def test_accepts_supported_floating_release_versions(self) -> None:
         self.assertEqual(
-            claude_provenance.require_supported_release_version("2.1.212"),
-            (2, 1, 212),
+            claude_provenance.require_supported_release_version("2.1.211"),
+            (2, 1, 211),
+        )
+        self.assertEqual(
+            claude_provenance.require_supported_release_version("2.99.1000"),
+            (2, 99, 1000),
         )
 
-    def test_rejects_every_other_stable_release_version(self) -> None:
-        for version in (
-            "2.1.210",
-            "2.1.211",
-            "2.1.213",
-            "2.99.999",
-            "2.99.1000",
-            "1.99.999",
-            "3.0.0",
-            "4.1.0",
-        ):
+    def test_rejects_versions_outside_supported_major_range(self) -> None:
+        for version in ("2.1.210", "1.99.999", "3.0.0", "4.1.0"):
             with self.subTest(version=version):
-                with self.assertRaisesRegex(
-                    claude_provenance.ClaudeProvenanceInvalid,
-                    "publisher verification is enabled only for 2.1.212",
-                ):
+                with self.assertRaises(claude_provenance.ClaudeProvenanceInvalid):
                     claude_provenance.require_supported_release_version(version)
 
     def test_rejects_non_release_or_noncanonical_semver(self) -> None:
         for version in (
-            "2.1.212-beta.1",
-            "2.1.212+build",
-            "v2.1.212",
-            "02.1.212",
+            "2.1.211-beta.1",
+            "2.1.211+build",
+            "v2.1.211",
+            "02.1.211",
             "2.01.211",
             "2.1",
-            "2.1.212\n",
+            "2.1.211\n",
         ):
             with self.subTest(version=version):
-                with self.assertRaises(
-                    claude_provenance.ClaudeProvenanceInvalid
-                ):
+                with self.assertRaises(claude_provenance.ClaudeProvenanceInvalid):
                     claude_provenance.require_supported_release_version(version)
 
     def test_builds_exact_version_urls(self) -> None:
         self.assertEqual(
-            claude_provenance.release_artifact_urls("2.1.212"),
+            claude_provenance.release_artifact_urls("2.1.211"),
             (
-                "https://downloads.claude.ai/claude-code-releases/2.1.212/manifest.json",
-                "https://downloads.claude.ai/claude-code-releases/2.1.212/manifest.json.sig",
+                "https://downloads.claude.ai/claude-code-releases/2.1.211/manifest.json",
+                "https://downloads.claude.ai/claude-code-releases/2.1.211/manifest.json.sig",
             ),
         )
 
@@ -395,7 +385,7 @@ class SignedManifestFetchTest(unittest.TestCase):
             return b"manifest" if url.endswith("manifest.json") else b"signature"
 
         bundle = claude_provenance.fetch_signed_manifest(
-            "2.1.212",
+            "2.1.211",
             fetcher=fetcher,
             timeout_seconds=3.5,
         )
@@ -406,12 +396,12 @@ class SignedManifestFetchTest(unittest.TestCase):
             calls,
             [
                 (
-                    "https://downloads.claude.ai/claude-code-releases/2.1.212/manifest.json",
+                    "https://downloads.claude.ai/claude-code-releases/2.1.211/manifest.json",
                     claude_provenance.CLAUDE_MANIFEST_MAX_BYTES,
                     3.5,
                 ),
                 (
-                    "https://downloads.claude.ai/claude-code-releases/2.1.212/manifest.json.sig",
+                    "https://downloads.claude.ai/claude-code-releases/2.1.211/manifest.json.sig",
                     claude_provenance.CLAUDE_SIGNATURE_MAX_BYTES,
                     3.5,
                 ),
@@ -432,7 +422,7 @@ class SignedManifestFetchTest(unittest.TestCase):
             claude_provenance.ClaudeProvenanceInvalid,
             "byte limit",
         ):
-            claude_provenance.fetch_signed_manifest("2.1.212", fetcher=fetcher)
+            claude_provenance.fetch_signed_manifest("2.1.211", fetcher=fetcher)
 
     def test_classifies_fetcher_failure_as_inconclusive(self) -> None:
         def fetcher(
@@ -448,23 +438,21 @@ class SignedManifestFetchTest(unittest.TestCase):
             claude_provenance.ClaudeProvenanceInconclusive,
             "network unavailable",
         ):
-            claude_provenance.fetch_signed_manifest("2.1.212", fetcher=fetcher)
+            claude_provenance.fetch_signed_manifest("2.1.211", fetcher=fetcher)
 
     def test_rejects_non_bytes_or_empty_fetcher_result(self) -> None:
         for payload in ("manifest", b""):
             with self.subTest(payload=payload):
-                with self.assertRaises(
-                    claude_provenance.ClaudeProvenanceInvalid
-                ):
+                with self.assertRaises(claude_provenance.ClaudeProvenanceInvalid):
                     claude_provenance.fetch_signed_manifest(
-                        "2.1.212",
+                        "2.1.211",
                         fetcher=lambda *_args, **_kwargs: payload,
                     )
 
     def test_default_fetcher_rejects_redirects_from_exact_release_url(self) -> None:
         url = (
             "https://downloads.claude.ai/claude-code-releases/"
-            "2.1.212/manifest.json"
+            "2.1.211/manifest.json"
         )
         redirect = claude_provenance.urllib.error.HTTPError(
             url,
@@ -493,7 +481,7 @@ class SignedManifestFetchTest(unittest.TestCase):
     def test_default_fetcher_deadline_includes_url_open_and_headers(self) -> None:
         url = (
             "https://downloads.claude.ai/claude-code-releases/"
-            "2.1.212/manifest.json"
+            "2.1.211/manifest.json"
         )
         opener = mock.Mock()
 
@@ -523,7 +511,7 @@ class SignedManifestFetchTest(unittest.TestCase):
     def test_default_fetcher_reads_response_body_in_bounded_chunks(self) -> None:
         url = (
             "https://downloads.claude.ai/claude-code-releases/"
-            "2.1.212/manifest.json"
+            "2.1.211/manifest.json"
         )
         body = b"x" * (claude_provenance.CLAUDE_FETCH_CHUNK_BYTES + 3)
 
@@ -579,7 +567,7 @@ class SignedManifestFetchTest(unittest.TestCase):
     def test_default_fetcher_stops_slow_drip_at_total_deadline(self) -> None:
         url = (
             "https://downloads.claude.ai/claude-code-releases/"
-            "2.1.212/manifest.json.sig"
+            "2.1.211/manifest.json.sig"
         )
         clock = [10.0]
 
@@ -638,8 +626,7 @@ class SignedManifestFetchTest(unittest.TestCase):
             )
         )
         applied_timeouts = [
-            call.args[0]
-            for call in response.fp.raw._sock.settimeout.call_args_list
+            call.args[0] for call in response.fp.raw._sock.settimeout.call_args_list
         ]
         self.assertEqual(len(applied_timeouts), 3)
         for actual, expected in zip(applied_timeouts, (1.0, 0.6, 0.2)):
@@ -653,18 +640,18 @@ class ManifestParsingTest(unittest.TestCase):
     def test_parses_supported_platform_artifact(self) -> None:
         artifact = claude_provenance.parse_signed_manifest_artifact(
             manifest_for(self.payload, platform_key="linux-x64"),
-            version="2.1.212",
+            version="2.1.211",
             platform_key="linux-x64",
         )
 
-        self.assertEqual(artifact.version, "2.1.212")
+        self.assertEqual(artifact.version, "2.1.211")
         self.assertEqual(artifact.platform_key, "linux-x64")
         self.assertEqual(artifact.binary, "claude")
         self.assertEqual(artifact.size, len(self.payload))
 
     def test_rejects_duplicate_json_keys_at_any_depth(self) -> None:
         manifest = (
-            b'{"version":"2.1.212","platforms":{"darwin-arm64":'
+            b'{"version":"2.1.211","platforms":{"darwin-arm64":'
             b'{"binary":"claude","binary":"wrapper","checksum":"'
             + hashlib.sha256(self.payload).hexdigest().encode()
             + b'","size":24}}}'
@@ -676,7 +663,7 @@ class ManifestParsingTest(unittest.TestCase):
         ):
             claude_provenance.parse_signed_manifest_artifact(
                 manifest,
-                version="2.1.212",
+                version="2.1.211",
                 platform_key="darwin-arm64",
             )
 
@@ -692,7 +679,7 @@ class ManifestParsingTest(unittest.TestCase):
         ):
             claude_provenance.parse_signed_manifest_artifact(
                 manifest,
-                version="2.1.212",
+                version="2.1.211",
                 platform_key="darwin-arm64",
             )
 
@@ -703,7 +690,7 @@ class ManifestParsingTest(unittest.TestCase):
         ):
             claude_provenance.parse_signed_manifest_artifact(
                 manifest_for(self.payload, version="2.1.203"),
-                version="2.1.212",
+                version="2.1.211",
                 platform_key="darwin-arm64",
             )
 
@@ -718,7 +705,7 @@ class ManifestParsingTest(unittest.TestCase):
                     platform_key="win32-x64",
                     binary="claude.exe",
                 ),
-                version="2.1.212",
+                version="2.1.211",
                 platform_key="win32-x64",
             )
 
@@ -729,7 +716,7 @@ class ManifestParsingTest(unittest.TestCase):
         ):
             claude_provenance.parse_signed_manifest_artifact(
                 manifest_for(self.payload, binary="claude-wrapper"),
-                version="2.1.212",
+                version="2.1.211",
                 platform_key="darwin-arm64",
             )
 
@@ -740,7 +727,7 @@ class ManifestParsingTest(unittest.TestCase):
         ):
             claude_provenance.parse_signed_manifest_artifact(
                 manifest_for(self.payload, checksum="A" * 64),
-                version="2.1.212",
+                version="2.1.211",
                 platform_key="darwin-arm64",
             )
 
@@ -753,7 +740,7 @@ class ManifestParsingTest(unittest.TestCase):
                 ):
                     claude_provenance.parse_signed_manifest_artifact(
                         manifest_for(self.payload, size=size),
-                        version="2.1.212",
+                        version="2.1.211",
                         platform_key="darwin-arm64",
                     )
 
@@ -771,7 +758,7 @@ class GpgVerificationTest(unittest.TestCase):
         )
         self.root = pathlib.Path(self.temporary.name)
         self.bundle = claude_provenance.SignedClaudeManifest(
-            version="2.1.212",
+            version="2.1.211",
             manifest_url="https://downloads.claude.ai/manifest.json",
             signature_url="https://downloads.claude.ai/manifest.json.sig",
             manifest=b"{}",
@@ -1010,9 +997,7 @@ class GpgVerificationTest(unittest.TestCase):
                 )
 
     def test_darwin_dependency_cannot_declare_a_dynamic_linker(self) -> None:
-        dependency = pathlib.Path(
-            "/opt/homebrew/opt/libgcrypt/lib/libgcrypt.20.dylib"
-        )
+        dependency = pathlib.Path("/opt/homebrew/opt/libgcrypt/lib/libgcrypt.20.dylib")
         load_commands = (
             f"{dependency}:\n"
             "Load command 0\n"
@@ -1053,9 +1038,7 @@ class GpgVerificationTest(unittest.TestCase):
             claude_provenance._collect_darwin_gpg_dependencies(executable)
 
     def test_darwin_dependency_symlink_loop_is_inconclusive(self) -> None:
-        dependency = pathlib.Path(
-            "/opt/homebrew/opt/libgcrypt/lib/libgcrypt.20.dylib"
-        )
+        dependency = pathlib.Path("/opt/homebrew/opt/libgcrypt/lib/libgcrypt.20.dylib")
 
         with (
             mock.patch.object(
@@ -1122,9 +1105,7 @@ class GpgVerificationTest(unittest.TestCase):
                 "access",
                 return_value=True,
             ),
-            self.assertRaises(
-                claude_provenance.ClaudeProvenanceInvalid
-            ) as caught,
+            self.assertRaises(claude_provenance.ClaudeProvenanceInvalid) as caught,
         ):
             claude_provenance._run_otool(
                 pathlib.Path("/private/tmp/gpg-verifier"),
@@ -1568,9 +1549,7 @@ class GpgVerificationTest(unittest.TestCase):
             "run_bounded_capture",
             side_effect=claude_provenance.ReviewTimeoutError("timeout"),
         ):
-            with self.assertRaises(
-                claude_provenance.ClaudeProvenanceInconclusive
-            ):
+            with self.assertRaises(claude_provenance.ClaudeProvenanceInconclusive):
                 claude_provenance._run_gpg(
                     ["gpg"],
                     env={},
@@ -1600,9 +1579,7 @@ class GpgVerificationTest(unittest.TestCase):
                 "run_bounded_capture",
                 side_effect=OSError(errno.EIO, "injected GPG launch failure"),
             ),
-            self.assertRaises(
-                claude_provenance.ClaudeProvenanceUnavailable
-            ) as caught,
+            self.assertRaises(claude_provenance.ClaudeProvenanceUnavailable) as caught,
         ):
             claude_provenance._run_gpg(
                 ["/trusted/gpg", "--version"],
@@ -1685,9 +1662,7 @@ class GpgVerificationTest(unittest.TestCase):
             )
 
     def test_missing_trusted_gpg_candidate_is_dependency_unavailable(self) -> None:
-        with self.assertRaises(
-            claude_provenance.ClaudeProvenanceDependencyUnavailable
-        ):
+        with self.assertRaises(claude_provenance.ClaudeProvenanceDependencyUnavailable):
             claude_provenance.resolve_trusted_gpg(
                 (pathlib.Path("/definitely/missing/codex-review-gpg"),)
             )
@@ -1700,9 +1675,7 @@ class GpgVerificationTest(unittest.TestCase):
             wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             wrapper.chmod(0o700)
 
-            with self.assertRaises(
-                claude_provenance.ClaudeProvenanceInvalid
-            ) as caught:
+            with self.assertRaises(claude_provenance.ClaudeProvenanceInvalid) as caught:
                 claude_provenance.resolve_trusted_gpg((wrapper,))
 
         self.assertNotIsInstance(
@@ -1773,9 +1746,7 @@ class GpgVerificationTest(unittest.TestCase):
             mock.patch.object(
                 claude_provenance,
                 "_resolve_trusted_gpg_source",
-                side_effect=claude_provenance.ClaudeProvenanceUnavailable(
-                    "fixture"
-                ),
+                side_effect=claude_provenance.ClaudeProvenanceUnavailable("fixture"),
             ) as resolver,
             self.assertRaises(claude_provenance.ClaudeProvenanceUnavailable),
         ):
@@ -1797,9 +1768,7 @@ class GpgVerificationTest(unittest.TestCase):
             native.write_bytes(b"\x7fELF" + b"\x00" * 16)
             native.chmod(0o720)
 
-            with self.assertRaises(
-                claude_provenance.ClaudeProvenanceInvalid
-            ):
+            with self.assertRaises(claude_provenance.ClaudeProvenanceInvalid):
                 claude_provenance.resolve_trusted_gpg((native,))
 
     def test_resolve_trusted_gpg_rejects_world_writable_parent(self) -> None:
@@ -1812,9 +1781,7 @@ class GpgVerificationTest(unittest.TestCase):
             native.chmod(0o700)
             root.chmod(0o707)
 
-            with self.assertRaises(
-                claude_provenance.ClaudeProvenanceInvalid
-            ):
+            with self.assertRaises(claude_provenance.ClaudeProvenanceInvalid):
                 claude_provenance.resolve_trusted_gpg((native,))
 
     def test_resolve_trusted_gpg_rejects_generic_group_writable_parent(
@@ -1829,9 +1796,7 @@ class GpgVerificationTest(unittest.TestCase):
             native.chmod(0o700)
             root.chmod(0o770)
 
-            with self.assertRaises(
-                claude_provenance.ClaudeProvenanceInvalid
-            ):
+            with self.assertRaises(claude_provenance.ClaudeProvenanceInvalid):
                 claude_provenance.resolve_trusted_gpg((native,))
 
     def test_resolve_trusted_gpg_allows_only_homebrew_admin_group_parent(
@@ -1875,9 +1840,7 @@ class GpgVerificationTest(unittest.TestCase):
                     "_darwin_admin_gid",
                     return_value=gid + 1,
                 ),
-                self.assertRaises(
-                    claude_provenance.ClaudeProvenanceInvalid
-                ),
+                self.assertRaises(claude_provenance.ClaudeProvenanceInvalid),
             ):
                 claude_provenance.resolve_trusted_gpg((native,))
 
@@ -1941,6 +1904,47 @@ class ExecutableVerificationTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def _verify_full_release(
+        self,
+    ) -> claude_provenance.VerifiedClaudeExecutable:
+        manifest = manifest_for(self.payload)
+
+        def fetcher(
+            url: str,
+            *,
+            max_bytes: int,
+            timeout_seconds: float,
+        ) -> bytes:
+            del max_bytes, timeout_seconds
+            return manifest if url.endswith("manifest.json") else b"signature"
+
+        with mock.patch.object(
+            claude_provenance,
+            "verify_manifest_signature",
+            return_value=pathlib.Path("/trusted/gpg"),
+        ):
+            return claude_provenance.verify_claude_release(
+                self.executable,
+                version="2.1.211",
+                platform_key="darwin-arm64",
+                gpg_temp_root=self.root,
+                fetcher=fetcher,
+            )
+
+    @staticmethod
+    def _metadata_with(
+        metadata: os.stat_result,
+        *,
+        mode: int | None = None,
+        uid: int | None = None,
+    ) -> os.stat_result:
+        fields = list(metadata)
+        if mode is not None:
+            fields[0] = stat.S_IFMT(metadata.st_mode) | mode
+        if uid is not None:
+            fields[4] = uid
+        return os.stat_result(fields)
+
     def test_accepts_stable_digest_and_returns_resolved_executable(self) -> None:
         link = self.root / "claude"
         link.symlink_to(self.executable)
@@ -1951,6 +1955,197 @@ class ExecutableVerificationTest(unittest.TestCase):
         )
 
         self.assertEqual(verified, self.executable.resolve())
+
+    def test_rejects_group_or_world_writable_executable(self) -> None:
+        for mode in (0o720, 0o702, 0o777):
+            with self.subTest(mode=oct(mode)):
+                self.executable.chmod(mode)
+                with self.assertRaisesRegex(
+                    claude_provenance.ClaudeProvenanceInvalid,
+                    "unsafe mode bits",
+                ):
+                    claude_provenance.verify_release_executable(
+                        self.executable,
+                        self.artifact,
+                    )
+
+    def test_rejects_set_id_executable(self) -> None:
+        resolved = self.executable.resolve(strict=True)
+        original_stat = pathlib.Path.stat
+        for mode in (0o4700, 0o2700):
+            with self.subTest(mode=oct(mode)):
+
+                def stat_with_set_id(
+                    path: pathlib.Path,
+                    *args: object,
+                    **kwargs: object,
+                ) -> os.stat_result:
+                    metadata = original_stat(  # type: ignore[arg-type]
+                        path,
+                        *args,
+                        **kwargs,
+                    )
+                    if path == resolved:
+                        return self._metadata_with(metadata, mode=mode)
+                    return metadata
+
+                with (
+                    mock.patch.object(
+                        pathlib.Path,
+                        "stat",
+                        autospec=True,
+                        side_effect=stat_with_set_id,
+                    ),
+                    self.assertRaisesRegex(
+                        claude_provenance.ClaudeProvenanceInvalid,
+                        "unsafe mode bits",
+                    ),
+                ):
+                    claude_provenance.verify_release_executable(
+                        self.executable,
+                        self.artifact,
+                    )
+
+    def test_rejects_executable_with_untrusted_owner(self) -> None:
+        resolved = self.executable.resolve(strict=True)
+        original_stat = pathlib.Path.stat
+        foreign_uid = max(1, os.geteuid() + 1)
+
+        def stat_with_foreign_owner(
+            path: pathlib.Path,
+            *args: object,
+            **kwargs: object,
+        ) -> os.stat_result:
+            metadata = original_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+            if path == resolved:
+                return self._metadata_with(metadata, uid=foreign_uid)
+            return metadata
+
+        with (
+            mock.patch.object(
+                pathlib.Path,
+                "stat",
+                autospec=True,
+                side_effect=stat_with_foreign_owner,
+            ),
+            self.assertRaisesRegex(
+                claude_provenance.ClaudeProvenanceInvalid,
+                "untrusted owner",
+            ),
+        ):
+            claude_provenance.verify_release_executable(
+                self.executable,
+                self.artifact,
+            )
+
+    def test_rejects_group_or_world_writable_executable_parent(self) -> None:
+        for mode in (0o770, 0o707):
+            with self.subTest(mode=oct(mode)):
+                parent = self.root / f"unsafe-parent-{mode:o}"
+                parent.mkdir(mode=0o700)
+                executable = parent / "claude"
+                executable.write_bytes(self.payload)
+                executable.chmod(0o700)
+                parent.chmod(mode)
+                with self.assertRaisesRegex(
+                    claude_provenance.ClaudeProvenanceInvalid,
+                    "unsafe parent directory",
+                ):
+                    claude_provenance.verify_release_executable(
+                        executable,
+                        self.artifact,
+                    )
+
+    def test_rejects_executable_parent_with_untrusted_owner(self) -> None:
+        resolved_parent = self.executable.resolve(strict=True).parent
+        original_stat = pathlib.Path.stat
+        foreign_uid = max(1, os.geteuid() + 1)
+
+        def stat_with_foreign_owner(
+            path: pathlib.Path,
+            *args: object,
+            **kwargs: object,
+        ) -> os.stat_result:
+            metadata = original_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+            if path == resolved_parent:
+                return self._metadata_with(metadata, uid=foreign_uid)
+            return metadata
+
+        with (
+            mock.patch.object(
+                pathlib.Path,
+                "stat",
+                autospec=True,
+                side_effect=stat_with_foreign_owner,
+            ),
+            self.assertRaisesRegex(
+                claude_provenance.ClaudeProvenanceInvalid,
+                "unsafe parent directory",
+            ),
+        ):
+            claude_provenance.verify_release_executable(
+                self.executable,
+                self.artifact,
+            )
+
+    def test_allows_root_owned_sticky_temp_ancestor(self) -> None:
+        resolved_parent = self.executable.resolve(strict=True).parent
+        original_stat = pathlib.Path.stat
+
+        def stat_with_root_sticky_temp(
+            path: pathlib.Path,
+            *args: object,
+            **kwargs: object,
+        ) -> os.stat_result:
+            metadata = original_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+            if path == resolved_parent:
+                return self._metadata_with(metadata, mode=0o1777, uid=0)
+            return metadata
+
+        with mock.patch.object(
+            pathlib.Path,
+            "stat",
+            autospec=True,
+            side_effect=stat_with_root_sticky_temp,
+        ):
+            verified = claude_provenance.verify_release_executable(
+                self.executable,
+                self.artifact,
+            )
+
+        self.assertEqual(verified, self.executable.resolve())
+
+    def test_parent_identity_change_during_hash_is_inconclusive(self) -> None:
+        parent = self.root / "changing-parent"
+        parent.mkdir(mode=0o700)
+        executable = parent / "claude"
+        executable.write_bytes(self.payload)
+        executable.chmod(0o700)
+        original_hash = claude_provenance._sha256_file_descriptor
+
+        def hash_then_change_parent(handle):  # type: ignore[no-untyped-def]
+            result = original_hash(handle)
+            parent.chmod(0o500)
+            return result
+
+        try:
+            with (
+                mock.patch.object(
+                    claude_provenance,
+                    "_sha256_file_descriptor",
+                    side_effect=hash_then_change_parent,
+                ),
+                self.assertRaisesRegex(
+                    claude_provenance.ClaudeProvenanceInconclusive,
+                    "parent chain changed",
+                ),
+            ):
+                claude_provenance.verify_release_executable(
+                    executable,
+                    self.artifact,
+                )
+        finally:
+            parent.chmod(0o700)
 
     def test_missing_executable_is_inconclusive(self) -> None:
         missing = self.root / "missing-claude"
@@ -1988,9 +2183,7 @@ class ExecutableVerificationTest(unittest.TestCase):
             *args: object,
             **kwargs: object,
         ) -> os.stat_result:
-            if path == resolved_target and kwargs.get(
-                "follow_symlinks"
-            ) is False:
+            if path == resolved_target and kwargs.get("follow_symlinks") is False:
                 raise OSError("fixture stat I/O failure")
             return original_stat(path, *args, **kwargs)  # type: ignore[arg-type]
 
@@ -2011,13 +2204,50 @@ class ExecutableVerificationTest(unittest.TestCase):
                 self.artifact,
             )
 
-    def test_rejects_size_mismatch_before_hashing(self) -> None:
+    def test_rejects_stable_size_mismatch_without_hashing(self) -> None:
         wrong = claude_provenance.ClaudeReleaseArtifact(
             **{**self.artifact.__dict__, "size": self.artifact.size + 1}
         )
-        with self.assertRaisesRegex(
-            claude_provenance.ClaudeProvenanceInvalid,
-            "size does not match",
+        with (
+            mock.patch.object(
+                claude_provenance,
+                "_sha256_file_descriptor",
+                side_effect=AssertionError("stable size mismatch must not be hashed"),
+            ) as hasher,
+            self.assertRaisesRegex(
+                claude_provenance.ClaudeProvenanceInvalid,
+                "size does not match",
+            ),
+        ):
+            claude_provenance.verify_release_executable(self.executable, wrong)
+        hasher.assert_not_called()
+
+    def test_size_mismatch_race_is_inconclusive(self) -> None:
+        wrong = claude_provenance.ClaudeReleaseArtifact(
+            **{**self.artifact.__dict__, "size": self.artifact.size + 1}
+        )
+        original_open = os.open
+        resolved_target = self.executable.resolve(strict=True)
+        raced = False
+
+        def grow_before_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+            nonlocal raced
+            if pathlib.Path(path) == resolved_target and not raced:
+                raced = True
+                with self.executable.open("ab") as handle:
+                    handle.write(b"X")
+            return original_open(path, flags, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                claude_provenance.os,
+                "open",
+                side_effect=grow_before_open,
+            ),
+            self.assertRaisesRegex(
+                claude_provenance.ClaudeProvenanceInconclusive,
+                "changed while",
+            ),
         ):
             claude_provenance.verify_release_executable(self.executable, wrong)
 
@@ -2065,38 +2295,115 @@ class ExecutableVerificationTest(unittest.TestCase):
                 )
 
     def test_full_verifier_returns_authenticated_release_metadata(self) -> None:
-        manifest = manifest_for(self.payload)
+        descriptor_identity: tuple[int, ...] | None = None
+        original_hash = claude_provenance._sha256_file_descriptor
 
-        def fetcher(
-            url: str,
-            *,
-            max_bytes: int,
-            timeout_seconds: float,
-        ) -> bytes:
-            del max_bytes, timeout_seconds
-            return manifest if url.endswith("manifest.json") else b"signature"
+        def capture_descriptor_identity(handle):  # type: ignore[no-untyped-def]
+            nonlocal descriptor_identity
+            descriptor_identity = claude_provenance._stat_identity(
+                os.fstat(handle.fileno())
+            )
+            return original_hash(handle)
 
-        gpg_path = pathlib.Path("/trusted/gpg")
         with mock.patch.object(
             claude_provenance,
-            "verify_manifest_signature",
-            return_value=gpg_path,
+            "_sha256_file_descriptor",
+            side_effect=capture_descriptor_identity,
         ):
-            result = claude_provenance.verify_claude_release(
-                self.executable,
-                version="2.1.212",
-                platform_key="darwin-arm64",
-                gpg_temp_root=self.root,
-                fetcher=fetcher,
-            )
+            result = self._verify_full_release()
 
         self.assertEqual(result.executable, self.executable.resolve())
         self.assertEqual(result.artifact.checksum, self.artifact.checksum)
-        self.assertEqual(result.gpg_path, gpg_path)
+        self.assertEqual(result.gpg_path, pathlib.Path("/trusted/gpg"))
+        self.assertEqual(result.source_identity, descriptor_identity)
+        self.assertIsNotNone(result.source_identity)
+        assert result.source_identity is not None
+        self.assertEqual(
+            result.source_identity[-1],
+            self.executable.stat(follow_symlinks=False).st_ctime_ns,
+        )
         self.assertEqual(
             result.manifest_url,
-            "https://downloads.claude.ai/claude-code-releases/2.1.212/manifest.json",
+            "https://downloads.claude.ai/claude-code-releases/2.1.211/manifest.json",
         )
+
+    def test_materialization_rejects_replaced_verified_source_before_reuse(
+        self,
+    ) -> None:
+        verified = self._verify_full_release()
+        snapshot_root = self.root / "snapshots"
+        claude_provenance.materialize_verified_executable(
+            verified,
+            snapshot_root,
+        )
+        replacement = self.root / "replacement"
+        replacement.write_bytes(self.payload)
+        replacement.chmod(0o700)
+        os.replace(replacement, self.executable)
+
+        with (
+            mock.patch.object(
+                claude_provenance,
+                "_verify_snapshot_entry",
+                side_effect=AssertionError(
+                    "changed verified source must be rejected before snapshot reuse"
+                ),
+            ) as snapshot_verifier,
+            self.assertRaisesRegex(
+                claude_provenance.ClaudeProvenanceInconclusive,
+                "changed after provenance verification",
+            ),
+        ):
+            claude_provenance.materialize_verified_executable(
+                verified,
+                snapshot_root,
+            )
+
+        snapshot_verifier.assert_not_called()
+
+    def test_materialization_rejects_ctime_only_source_mutation_before_copy(
+        self,
+    ) -> None:
+        verified = self._verify_full_release()
+        self.assertIsNotNone(verified.source_identity)
+        assert verified.source_identity is not None
+        original_mode = stat.S_IMODE(
+            self.executable.stat(follow_symlinks=False).st_mode
+        )
+        alternate_mode = original_mode ^ stat.S_IXUSR
+        deadline = time.monotonic() + 2.0
+        while True:
+            self.executable.chmod(alternate_mode)
+            self.executable.chmod(original_mode)
+            mutated_identity = claude_provenance._stat_identity(
+                self.executable.stat(follow_symlinks=False)
+            )
+            if mutated_identity[-1] != verified.source_identity[-1]:
+                break
+            if time.monotonic() >= deadline:
+                self.fail("filesystem ctime did not advance after bounded mode changes")
+            time.sleep(0.01)
+        self.assertEqual(mutated_identity[:-1], verified.source_identity[:-1])
+
+        with (
+            mock.patch.object(
+                claude_provenance,
+                "_copy_and_hash_snapshot",
+                side_effect=AssertionError(
+                    "changed verified source must be rejected before copying"
+                ),
+            ) as copier,
+            self.assertRaisesRegex(
+                claude_provenance.ClaudeProvenanceInconclusive,
+                "changed after provenance verification",
+            ),
+        ):
+            claude_provenance.materialize_verified_executable(
+                verified,
+                self.root / "snapshots",
+            )
+
+        copier.assert_not_called()
 
     def test_verified_manifest_cache_avoids_repeat_network_fetch(self) -> None:
         manifest = manifest_for(self.payload)
@@ -2120,7 +2427,7 @@ class ExecutableVerificationTest(unittest.TestCase):
         ) as signature_verifier:
             claude_provenance.verify_claude_release(
                 self.executable,
-                version="2.1.212",
+                version="2.1.211",
                 platform_key="darwin-arm64",
                 gpg_temp_root=self.root,
                 fetcher=fetcher,
@@ -2128,7 +2435,7 @@ class ExecutableVerificationTest(unittest.TestCase):
             )
             claude_provenance.verify_claude_release(
                 self.executable,
-                version="2.1.212",
+                version="2.1.211",
                 platform_key="darwin-arm64",
                 gpg_temp_root=self.root,
                 fetcher=lambda *_args, **_kwargs: self.fail(
@@ -2140,7 +2447,7 @@ class ExecutableVerificationTest(unittest.TestCase):
         self.assertEqual(len(fetch_calls), 2)
         self.assertEqual(signature_verifier.call_count, 2)
         self.assertEqual(stat.S_IMODE(cache_dir.stat().st_mode), 0o700)
-        version_dir = cache_dir / "2.1.212"
+        version_dir = cache_dir / "2.1.211"
         self.assertEqual(stat.S_IMODE(version_dir.stat().st_mode), 0o700)
         for name in ("manifest.json", "manifest.json.sig", "ready.json"):
             self.assertEqual(
@@ -2166,23 +2473,21 @@ class ExecutableVerificationTest(unittest.TestCase):
             "verify_manifest_signature",
             side_effect=claude_provenance.ClaudeProvenanceInvalid("bad signature"),
         ):
-            with self.assertRaises(
-                claude_provenance.ClaudeProvenanceInvalid
-            ):
+            with self.assertRaises(claude_provenance.ClaudeProvenanceInvalid):
                 claude_provenance.verify_claude_release(
                     self.executable,
-                    version="2.1.212",
+                    version="2.1.211",
                     platform_key="darwin-arm64",
                     gpg_temp_root=self.root,
                     fetcher=fetcher,
                     cache_dir=cache_dir,
                 )
 
-        self.assertFalse((cache_dir / "2.1.212" / "ready.json").exists())
+        self.assertFalse((cache_dir / "2.1.211" / "ready.json").exists())
 
     def test_cache_is_written_only_after_strict_manifest_parsing(self) -> None:
         cache_dir = self.root / "provenance-cache"
-        malformed_manifest = b'{"version":"2.1.212","platforms":NaN}'
+        malformed_manifest = b'{"version":"2.1.211","platforms":NaN}'
 
         def fetcher(
             url: str,
@@ -2204,14 +2509,14 @@ class ExecutableVerificationTest(unittest.TestCase):
             ):
                 claude_provenance.verify_claude_release(
                     self.executable,
-                    version="2.1.212",
+                    version="2.1.211",
                     platform_key="darwin-arm64",
                     gpg_temp_root=self.root,
                     fetcher=fetcher,
                     cache_dir=cache_dir,
                 )
 
-        self.assertFalse((cache_dir / "2.1.212" / "ready.json").exists())
+        self.assertFalse((cache_dir / "2.1.211" / "ready.json").exists())
 
     def test_rejects_corrupted_complete_cache_without_network_fallback(self) -> None:
         manifest = manifest_for(self.payload)
@@ -2233,14 +2538,14 @@ class ExecutableVerificationTest(unittest.TestCase):
         ):
             claude_provenance.verify_claude_release(
                 self.executable,
-                version="2.1.212",
+                version="2.1.211",
                 platform_key="darwin-arm64",
                 gpg_temp_root=self.root,
                 fetcher=fetcher,
                 cache_dir=cache_dir,
             )
 
-        cached_manifest = cache_dir / "2.1.212" / "manifest.json"
+        cached_manifest = cache_dir / "2.1.211" / "manifest.json"
         cached_manifest.write_bytes(b"tampered")
         cached_manifest.chmod(0o600)
         with self.assertRaisesRegex(
@@ -2249,7 +2554,7 @@ class ExecutableVerificationTest(unittest.TestCase):
         ):
             claude_provenance.verify_claude_release(
                 self.executable,
-                version="2.1.212",
+                version="2.1.211",
                 platform_key="darwin-arm64",
                 gpg_temp_root=self.root,
                 fetcher=lambda *_args, **_kwargs: self.fail(
@@ -2280,10 +2585,12 @@ class ExecutableSnapshotTest(unittest.TestCase):
         )
 
         expected_name = (
-            "claude-2.1.212-darwin-arm64-"
+            "claude-2.1.211-darwin-arm64-"
             f"{hashlib.sha256(self.payload).hexdigest()}"
         )
-        self.assertEqual(result.executable, self.snapshot_root.resolve() / expected_name)
+        self.assertEqual(
+            result.executable, self.snapshot_root.resolve() / expected_name
+        )
         self.assertEqual(result.executable.read_bytes(), self.payload)
         self.assertEqual(stat.S_IMODE(self.snapshot_root.stat().st_mode), 0o700)
         self.assertEqual(stat.S_IMODE(result.executable.stat().st_mode), 0o500)
@@ -2298,7 +2605,10 @@ class ExecutableSnapshotTest(unittest.TestCase):
             self.verified,
             self.snapshot_root,
         )
-        first_identity = (first.executable.stat().st_dev, first.executable.stat().st_ino)
+        first_identity = (
+            first.executable.stat().st_dev,
+            first.executable.stat().st_ino,
+        )
 
         with mock.patch.object(
             claude_provenance,

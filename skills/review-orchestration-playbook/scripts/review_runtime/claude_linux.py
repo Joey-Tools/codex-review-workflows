@@ -1256,14 +1256,21 @@ def _run_tool_probe(
     argv: Iterable[str],
     *,
     timeout_seconds: float = TOOL_PROBE_TIMEOUT_SECONDS,
+    pass_fds: Iterable[int] = (),
 ) -> CaptureResult:
     try:
+        arguments: dict[str, object] = {
+            "env": fixed_host_tool_environment(),
+            "timeout_seconds": timeout_seconds,
+            "stdout_limit_bytes": TOOL_PROBE_OUTPUT_LIMIT_BYTES,
+            "stderr_limit_bytes": TOOL_PROBE_OUTPUT_LIMIT_BYTES,
+        }
+        inherited_fds = tuple(pass_fds)
+        if inherited_fds:
+            arguments["pass_fds"] = inherited_fds
         return runner(
             tuple(str(item) for item in argv),
-            env=fixed_host_tool_environment(),
-            timeout_seconds=timeout_seconds,
-            stdout_limit_bytes=TOOL_PROBE_OUTPUT_LIMIT_BYTES,
-            stderr_limit_bytes=TOOL_PROBE_OUTPUT_LIMIT_BYTES,
+            **arguments,
         )
     except (ReviewError, ForwardedSignal):
         raise
@@ -1372,35 +1379,52 @@ def probe_bwrap(
     """Run the namespace/capability shape used by the real sandbox."""
 
     require_supported_host(host)
-    command = (
-        str(toolchain.bwrap),
-        "--die-with-parent",
-        "--new-session",
-        "--unshare-user",
-        "--unshare-pid",
-        "--unshare-net",
-        "--unshare-ipc",
-        "--unshare-uts",
-        "--unshare-cgroup",
-        "--cap-drop",
-        "ALL",
-        "--disable-userns",
-        "--clearenv",
-        "--setenv",
-        "PATH",
-        "/usr/bin:/bin",
-        "--ro-bind",
-        "/",
-        "/",
-        "--proc",
-        "/proc",
-        "--dev",
-        "/dev",
-        "--",
-        str(toolchain.bwrap),
-        "--version",
-    )
-    result = _run_tool_probe(runner, command)
+    root_descriptor: int | None = None
+    try:
+        root_descriptor = os.open(
+            "/",
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0),
+        )
+        command = (
+            str(toolchain.bwrap),
+            "--die-with-parent",
+            "--new-session",
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-net",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-cgroup",
+            "--cap-drop",
+            "ALL",
+            "--disable-userns",
+            "--clearenv",
+            "--setenv",
+            "PATH",
+            "/usr/bin:/bin",
+            "--ro-bind-fd",
+            str(root_descriptor),
+            "/",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--",
+            str(toolchain.bwrap),
+            "--version",
+        )
+        result = _run_tool_probe(
+            runner,
+            command,
+            pass_fds=(root_descriptor,),
+        )
+    except OSError as error:
+        raise LinuxRuntimeInspectionInconclusive(
+            f"cannot prepare bubblewrap descriptor-mount probe: {error}"
+        ) from error
+    finally:
+        if root_descriptor is not None:
+            os.close(root_descriptor)
     if result.returncode != 0 or not bytes(result.stdout).lower().startswith(
         b"bubblewrap "
     ):

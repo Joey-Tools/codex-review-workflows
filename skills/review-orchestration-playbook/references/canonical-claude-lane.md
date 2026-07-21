@@ -1,6 +1,6 @@
 # Canonical Claude Code Lane
 
-Use this contract for the actual Anthropic Claude Code lane in named double and triple review. Do not route this lane through `isolated_review`: that helper materializes a supplied diff with helper-private minimal Git, records `named_lane_eligible=false`, and is diagnostic-only.
+Use this contract for the actual Anthropic Claude Code lane in named double and triple review. Do not route this lane through `isolated_review`: that helper materializes a supplied diff in a helper-owned private-Git workspace and is diagnostic-only.
 
 ## Workspace And Process
 
@@ -12,7 +12,7 @@ Use this contract for the actual Anthropic Claude Code lane in named double and 
 The canonical launch is a direct Claude Code invocation, not a call to any helper reviewer:
 
 ```text
-claude
+<resolved-publisher-verified-claude-path>
   --print
   --model <claude-opus-4-8-or-authorized-4-7>
   --effort max
@@ -32,33 +32,54 @@ claude
   --disallowedTools Edit,Write,NotebookEdit,WebFetch,WebSearch,Task
 ```
 
-Validate the installed CLI's advertised option/capability surface before launch. Pass settings inline; do not write them into the review workspace. `--safe-mode` disables automatic customizations and slash-skill loading, not the built-in `Read` tool. The prompt therefore tells Claude to read applicable tracked `AGENTS.md`, repo-local skill documents, and project guidance from the worktree explicitly. It must not read an installed skill or guidance file outside the worktree.
+Run the supported-version selection preflight below before the parent revalidates the selected CLI's provenance and constructs the fixed reviewed launch. Pass settings inline; do not write them into the review workspace. `--safe-mode` disables automatic customizations and slash-skill loading, not the built-in `Read` tool. The prompt therefore tells Claude to read applicable tracked `AGENTS.md`, repo-local skill documents, and project guidance from the worktree explicitly. It must not read an installed skill or guidance file outside the worktree.
+
+The inline settings must also set `disableBundledSkills: true`. `--safe-mode` alone is not evidence that bundled skills are absent; the explicit setting is required before the init `skills` field can be expected to be empty.
+
+## Floating-Version Compatibility Preflight
+
+Before any prompt, credential, authentication, repository, range, PR, or review-workspace input is exposed to Claude, invoke [`named_claude_preflight`](../scripts/named_claude_preflight). The machine helper accepts only a strict stable release `>=2.1.211,<3.0.0` and considers candidates in this exact order:
+
+1. an explicit absolute `--claude-path` override, optionally bound to an explicit `--claude-version` hint; then
+2. the first present controlled active-install path from `$HOME/.local/bin/claude`, `/opt/homebrew/bin/claude`, and `/usr/local/bin/claude`.
+
+An explicit override is authoritative: missing, unusable, unsupported, or hint-mismatched explicit input fails closed and never falls through to another candidate. Candidate presence is tri-state: only exact absence may advance to the next candidate; I/O, path-resolution, or filesystem-identity uncertainty stops priority fallback as `candidate-inspection-inconclusive`. Caller `PATH` entries are ignored, so a repository or task cannot inject the active candidate. The helper requires a native executable for the current supported platform before any version probe, binds the selected strict release to the fixed-key signed per-version manifest and exact platform artifact size/SHA-256, and captures the descriptor-bound strong source identity, including `ctime`. Before creating the private GPG directory, it resolves the configured system temporary parent to its canonical path and passes the verifier a real private child path; aliases such as macOS `/tmp -> /private/tmp` therefore do not weaken or falsely fail the existing requested-path-equals-resolved-path check.
+
+While that identity remains stable, the preflight materializes one private digest-verified executable snapshot. It runs both `<private-snapshot> --version` and `<private-snapshot> --help` against that same snapshot with empty stdin, fixed `/` cwd, bounded output/time, and a fixed credential-free environment, with no prompt, credential, repository, range, PR, or workspace input. The version must exactly match the manifest-selected release. The help capability probe must advertise every option used by the reviewed launch and the reviewed safe-mode contract. The helper re-verifies the snapshot after both probes, then performs a fresh descriptor-bound hash of the mutable source against the signed size and SHA-256 before acceptance and rechecks its identity; stat identity alone is not sufficient. Source-identity or digest drift is inconclusive and takes precedence over an observed wrong version. It erases the temporary snapshot before returning and never executes the mutable installation path. Scripts, interpreter wrappers, wrong signed artifacts, and caller-`PATH` candidates are never executed. It may fetch signed release metadata needed for verification, but never downloads or installs a Claude executable and never creates, changes, or repairs an active symlink.
+
+The preflight emits exactly one bounded JSON object. Missing supported candidates are blocked as `supported-version-unavailable`; stable unsupported or hint/probe mismatches are blocked under the corresponding version reason; deterministic required-option or safe-mode drift is blocked as `capability-contract-mismatch`. Deterministically invalid signed metadata, signer identity, signature, manifest, or artifact provenance is `classification: blocked` with `reason: publisher-verification-failed`. A transient native-format, candidate-presence, path-resolution, filesystem-identity, publisher dependency, snapshot, or capability-probe failure is `classification: inconclusive`; uncertain candidate inspection uses `candidate-inspection-inconclusive`. Never collapse inspection uncertainty into deterministic unavailability or continue to a lower-priority candidate after uncertain inspection. Success alone returns the fixed resolved absolute path plus non-secret source, signed-artifact, exact-version, capability, and descriptor-bound filesystem-identity metadata; the temporary probe snapshot is not a returned launch path. Do not record probe output, environment contents, credentials, or repository data.
+
+Acquiring a missing supported release is a separate host-mutation workflow requiring explicit authorization through the official installer/version manager. A named double/triple request does not authorize installation, an active-version switch, or symlink repair, and the preflight never performs those actions.
+
+Only after `classification: accepted` may the parent pass the selected `resolved_path` and signed-artifact identity to the canonical provenance revalidation and direct launch below. Failure never authorizes `isolated_review`, another provider, or a downgrade to single review. A requested double remains a double review whose Claude lane is blocked. A requested triple remains blocked when its Claude lane is blocked; if the GitHub Codex lane is independently unavailable, its effective shape may be double, but that effective double is still incomplete and blocked because Claude did not complete.
 
 ## Canonical Executable Provenance
 
-The canonical direct lane uses the user's installed actual Claude Code executable at one exact resolved path. Before exposing credentials, review metadata, or repository content, the parent must:
+The canonical direct lane uses the user's installed actual Claude Code executable at the one exact resolved path accepted by the selection preflight. Before exposing credentials, review metadata, or repository content, the parent must:
 
 1. resolve the selected executable without later `PATH` lookup and reject a missing, non-regular, non-executable, script/interpreter-wrapper, prerelease, development, unsupported-platform, or future-major candidate;
-2. obtain its version using a fixed credential-free environment and require `>=2.1.211,<3.0.0`;
-3. verify the fixed Anthropic release-signing key, signed per-version manifest, expected platform artifact, exact size, and SHA-256 of the stable resolved installed file, using `verify_claude_release` or equivalent checks;
-4. validate the advertised option/capability surface only after publisher verification; and
-5. immediately before launch, revalidate the same path identity, signed artifact size, and SHA-256, launch that exact resolved path directly, then revalidate it again after process completion. Any drift or uncertainty makes the lane inconclusive.
+2. verify the fixed Anthropic release-signing key, signed per-version manifest for the selected release, expected platform artifact, exact size, and SHA-256 of the stable resolved installed file, using `verify_claude_release` or equivalent checks before executing the candidate;
+3. require a strict stable release in `>=2.1.211,<3.0.0` from the accepted preflight's snapshot-bound version and capability evidence and construct the exact reviewed argv above; and
+4. immediately before launch, revalidate the same path identity, signed artifact size, and SHA-256, launch that exact resolved path directly, then revalidate it again after process completion. Any drift or uncertainty makes the lane inconclusive.
 
-This direct lane does not call `snapshot_verified_claude_executable`, copy the CLI into a helper-owned executable snapshot, or inherit the helper's supplied-diff/private-minimal-Git workspace, explicit-auth precedence, clean/WIP capture, post-run validation, or retained-state contracts. It intentionally trusts the host-installed executable path and ordinary host runtime to remain stable between the parent checks; those checks do not claim the stronger immutability of the helper snapshot. Record only non-secret provenance metadata such as resolved path, version, platform, artifact digest, and verification state.
+The mandatory `--version` and `--help` probes use the preflight's one private snapshot and fixed credential-free environment. They prove only the observed version and advertised reviewed capability surface; they cannot prove the actual launch argv, final merged sandbox, managed permission arrays, or path evaluation.
+
+The accepted preflight's private executable snapshot is temporary probe evidence; it is erased before return and is never the later review-launch path. The direct review launch does not reuse that snapshot and does not call `snapshot_verified_claude_executable`. It intentionally uses the revalidated host-installed executable path for the actual ordinary real-`HOME` CLI process; the before/after identity and digest checks detect drift but do not claim the stronger immutability of the helper snapshot. Record only non-secret provenance metadata such as resolved path, version, platform, artifact digest, capability profile, and verification state.
 
 ## Authentication Control Plane
 
-The canonical direct lane uses the ordinary Claude CLI authentication selected by the user: local login in real `HOME`, or an explicitly supplied API key. It does not inherit the low-level helper's `ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` > local-login selection contract, opaque-forwarding record, or retained diagnostic state, and it must not claim those helper-only guarantees. Both runtimes may preserve real `HOME` as the ordinary CLI control plane, but a helper result never becomes this named lane.
+The canonical direct lane uses ordinary Claude CLI authentication with exact precedence `ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` > ordinary local login. The parent opaque-forwards only the winning explicit value and removes the lower-priority explicit source from the child environment. Before launch, the same publisher-verified executable must report `auth status --json` consistent with that parent-selected source; credential contents are never inspected, copied, logged, or persisted by the orchestrator.
 
-Real `HOME` is a trusted control plane. The Claude CLI may read and refresh its own ordinary authentication there; that narrowly scoped CLI authentication side effect is not a model-authorized review mutation and is the only planned host write outside the lane workspace. The model prompt still forbids direct reads of real-`HOME` content, and the native sandbox must deny model-visible credential/configuration roots. Do not inspect, copy, print, or place credential contents in review state.
+Real `HOME` is a trusted control plane. The publisher-verified Claude CLI may update ordinary CLI-owned authentication and runtime state there, including credential refresh and possible cache or tool-result artifacts. These are accepted CLI control-plane side effects, not model-authorized review mutations; they do not authorize model/tool writes or deliberate host mutations. This contract does not enumerate or attest every CLI-owned `HOME` write. The model prompt still forbids direct reads of real-`HOME` content, and the native sandbox must deny model-visible credential/configuration roots. Do not inspect, copy, print, or place credential contents in review state.
 
-If organization policy forbids ordinary CLI credential refresh, use an explicitly authorized API key or report the lane blocked; do not silently introduce the helper credential wrapper. A reported `Login expired`, HTTP 401, or refresh failure is `blocked-authentication`: ask Joey to run `claude auth login` on that host and wait for an explicit retry. Ambiguous credential I/O or persistence state is `inconclusive`. Neither condition authorizes provider fallback, and post-run worktree cleanliness does not attest what the trusted authentication control plane changed.
+If organization policy forbids ordinary CLI control-plane writes, report the lane blocked. A rejected API key is `blocked-authentication` and directs Joey to unset or replace `ANTHROPIC_API_KEY`; a rejected OAuth token directs Joey to unset or replace `CLAUDE_CODE_OAUTH_TOKEN`; an expired or rejected ordinary login asks Joey to run `claude auth login` on that host and wait for an explicit retry. A reported `Login expired`, explicit HTTP/status 401, explicit OAuth/credential/login/authentication/token refresh failure, or directly adjacent expired/invalid/unauthorized authentication state is recognized structured authentication evidence. Generic token counting, usage, budget, quota, capacity, rate-limit, or limit failures are not authentication evidence and remain `inconclusive`; an authentication word separated from `error`/`failure` by one of those resource terms does not change that result. A bare child exit code 401, credential-file or other ambiguous credential I/O, a generic non-authentication refresh failure, or uncertain persistence state is also `inconclusive`. Neither condition authorizes provider fallback. `--no-session-persistence` disables resumable session persistence; it does not make the CLI process or real `HOME` immutable. The lane does not take or verify a complete real-`HOME` diff, so cache or tool-result artifacts may retain review-derived data according to upstream CLI behavior. Post-run worktree cleanliness does not attest what the trusted control plane changed or prove that no transient control-plane write occurred.
 
 ## Native Sandbox Contract
 
 The inline settings request all of the following:
 
 - hooks disabled;
+- bundled skills disabled explicitly;
 - native sandbox enabled with fail-if-unavailable;
 - sandboxed Bash never auto-approved and unsandboxed commands forbidden;
 - global write denial for model-visible tools and sandboxed commands;
@@ -72,6 +93,7 @@ Construct the inline JSON from resolved absolute paths with this shape; never in
 ```json
 {
   "disableAllHooks": true,
+  "disableBundledSkills": true,
   "permissions": {
     "deny": ["Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "Task"]
   },
@@ -103,9 +125,94 @@ Enumerate every applicable sensitive root and every Git metadata/object root rat
 
 Treat this as a selected-deny native sandbox, not a global host-read whitelist. `allowRead` records the intended review scope but does not prove every other host path is unreadable; sandboxed Bash may technically read another path not covered by `denyRead`. The prompt/model contract therefore forbids direct reads outside the worktree. Read-only Git may internally access only the worktree's registered Git metadata/object paths for the frozen range; that logical Git metadata is part of the review workspace and is not permission to inspect the source checkout, parent directory, real `HOME`, or another review.
 
-Claude Code 2.1.212 `system/init` or capability output cannot attest the final merged sandbox, managed permission arrays, or path-rule evaluation. Record the settings as requested configuration. Do not promote init output into independent proof of effective enforcement, and do not restore the retired complex outer global-read-isolation design.
+The selected supported Claude Code release's `system/init` or capability output cannot attest the final merged sandbox, managed permission arrays, or path-rule evaluation. Record the settings as requested configuration. Do not promote init output into independent proof of effective enforcement.
 
 If the required native sandbox, global write deny, sensitive-root denies, tool restrictions, actual Claude executable, or structured-output verification cannot be established, report the lane as `blocked` or `inconclusive` under the failure contract. Never weaken the boundary or substitute Copilot.
+
+## Structured Init And Terminal Evidence
+
+Parse `stream-json` as bounded strict UTF-8 JSONL. Every nonblank line must be one JSON object; reject duplicate keys, nonstandard constants, undecodable text, or non-JSON output. The first nonblank record must be the sole event with `type: system` and `subtype: init`; the last nonblank record must be the sole event with `type: result`. A missing, duplicate, malformed, out-of-order, or trailing contract event makes the lane `inconclusive`; partial findings do not count. A structurally valid terminal event that fails the success acceptance schema is passed to the failure classifier below rather than being classified by this envelope rule.
+
+Validate every record between init and result against the version-profiled closed intermediate-event contract and bind its session evidence to the leading init and trailing result. For the extended profile observed with 2.1.216, the reviewed families are `system/thinking_tokens`, assistant messages, user tool results, and `rate_limit_event`, each with its exact reviewed field and nested-shape contract. Every reported intermediate `session_id` must be a nonempty string equal to the init session, and the terminal session must match when present. An unknown intermediate event type, subtype, field, session binding, or shape is `inconclusive`; a record does not become acceptable merely because it is valid JSON or resembles a known family.
+
+Capture bounded raw stdout in parent-owned state outside the model-visible
+worktree. The canonical lane must pass those captured bytes through
+[`validate_claude_stream.py`](../scripts/validate_claude_stream.py); prose-only
+inspection or an ad hoc parser does not satisfy this gate. Keep stderr separate
+and give the validator the same resolved cwd, concrete model, and selected
+authentication source used to construct the direct Claude CLI argv:
+
+```text
+python3 <playbook>/scripts/validate_claude_stream.py
+  --cwd <resolved-clean-worktree>
+  --model <claude-opus-4-8-or-authorized-4-7>
+  --claude-code-version <preflight-version>
+  --authentication-source <api-key|oauth-token|local-login>
+  --process-returncode <exact-child-returncode>
+  --input <bounded-raw-stream-jsonl>
+```
+
+The executable/importable validator applies the versioned machine contract and
+fixed upper bounds of 8 MiB total input, 10,000 raw lines, 1 MiB per line,
+and 128 decimal digits per JSON integer. JSON floating-point tokens are parsed
+exactly as decimal values, with at most 256 characters, 128 significand digits,
+and an absolute explicit exponent no greater than 308. These parser bounds do
+not depend on Python's process-global integer-string conversion limit and prevent
+binary floating-point overflow or negative underflow from changing a metric's
+sign.
+It emits one JSON object with `classification: accepted` and the verbatim
+`findings` only after the exact child process return code is integer zero and
+every envelope, init, and terminal-success check passes. A nonzero child return
+code, including `401`, is `inconclusive` by itself; authentication classification
+requires recognized structured authentication evidence rather than an exit-code
+guess. When the fully validated stream instead supplies deterministic structured
+`blocked` or `blocked-authentication` evidence, preserve that classification even
+with a nonzero child return code; the return code never turns such a failure into
+success. An invalid or missing child return code is always `inconclusive`.
+Every failure emits a fail-closed `blocked`, `blocked-authentication`, or
+`inconclusive` classification without a `findings` field. Validator acceptance
+attests only the reported invocation fields and terminal artifact; it never
+claims proof of the final merged sandbox, managed permission arrays, or path-rule
+evaluation.
+
+The validator is a machine interface, not a help-text interface. `-h`, `--help`,
+missing or unknown arguments, and invalid choices all return nonzero, emit exactly
+one `inconclusive` JSON object on stdout, and leave stderr empty. Exit status zero is reserved for `accepted` output.
+
+Before accepting the result, compare the leading init against a reviewed, version-selected expected-init contract for the publisher-verified installed CLI. Every supported release requires all of these common observable fields:
+
+- `cwd` equals the resolved lane-unique clean worktree exactly;
+- `permissionMode` equals `dontAsk`;
+- `tools` is a duplicate-free set exactly equal to `Read`, `Grep`, `Glob`, and `Bash`;
+- `mcp_servers`, `slash_commands`, `skills`, and `plugins` are present and exactly empty arrays;
+- `model` equals the requested concrete model string exactly, without alias normalization or silent substitution;
+- `claude_code_version` equals the publisher-verified preflight version; and
+- `apiKeySource` is a string that exactly matches the parent-selected and preflight-verified authentication source: `ANTHROPIC_API_KEY` for explicit API-key mode and `none` for ordinary local login; explicit OAuth-token mode also requires `none`.
+
+The closed legacy base profile covers `>=2.1.211,<2.1.216` and adds no fields beyond that common set. The closed extended 2.x profile covers `>=2.1.216,<3.0.0` and additionally requires exact `output_style: default`, ordered `agents` equal to `claude`, `Explore`, `general-purpose`, `Plan`, ordered `capabilities` equal to `interrupt_receipt_v1`, `msg_lifecycle_v1`, `analytics_disabled: true`, boolean `product_feedback_disabled`, nonempty `uuid`, and `fast_mode_state: off`.
+
+Missing, malformed, reordered, added, or conflicting required fields fail closed as `inconclusive` and cannot count as the Claude lane. A well-formed common required field that mismatches the frozen launch is a deterministic `blocked` configuration/policy mismatch. The init top-level field set is closed for the selected profile: only its required fields plus an optional nonempty `session_id` are accepted. Any unknown init field is `inconclusive` until a reviewed version-specific schema update permits it. These observable init fields still do not prove the final merged sandbox, managed permission arrays, or path-rule evaluation.
+
+For the selected supported Claude Code terminal `result`, require this exact acceptance schema:
+
+- `type` is the string `result`, `subtype` is the string `success`, and `is_error` is the boolean `false`;
+- `result` is a required string whose `strip()` value is nonempty; preserve the original string verbatim as the findings payload;
+- `modelUsage` is a required nonempty object; every key is a nonempty model-ID string and every value is an object. Across the supported range, the only reviewed terminal aliases for requested `claude-opus-4-8` are `claude-opus-4-8` and `claude-opus-4.8`; the only aliases for requested fallback `claude-opus-4-7` are `claude-opus-4-7` and `claude-opus-4.7`. At least one key must belong to the exact requested model's set. The only reviewed auxiliary key is `claude-haiku-4-5-20251001`. A key from the other supported primary-model set is a deterministic blocked model substitution even when a requested-model key is also present; any other model-usage key is `inconclusive` until a reviewed schema update permits it. Thus a `claude-opus-4-8` request with only or with both a `claude-opus-4-7` key is never accepted;
+- `duration_ms` and `duration_api_ms`, when present, are nonnegative integers; `num_turns` is a positive integer; `total_cost_usd` is a nonnegative finite exact-decimal number within the stream parser's lexical and exponent bounds; `session_id` and `uuid` are nonempty strings; and `usage` is an object. When both init and terminal events report `session_id`, the values must match exactly or the stream is `inconclusive`. A missing optional metric is acceptable, but a present value with the wrong type or range is `inconclusive`;
+- the extended-2x success profile `>=2.1.216,<3.0.0` requires `fast_mode_state` exactly `off`, `terminal_reason` exactly `completed`, and nonnegative integer `time_to_request_ms`, `ttft_ms`, and `ttft_stream_ms`. The legacy profile `>=2.1.211,<2.1.216` forbids all five fields. An extended-2x failure terminal may contain them only as optional fields with those same strict types and known values until reviewed failure evidence proves a stronger required-field contract;
+- `stop_reason`, when present, is exactly `null` or `end_turn`. Any other value—including `max_tokens`, `stop_sequence`, `tool_use`, `pause_turn`, or `refusal`—is a deterministic blocked incomplete or abnormal terminal result and cannot supply findings;
+- `structured_output`, when present, is exactly `null` because the canonical launch does not request a structured-output schema. A non-null value is contradictory evidence and makes the lane `inconclusive`;
+- `error` and `errors`, when present, are explicitly empty: `null`, a whitespace-only string, an empty array, or an empty object;
+- `api_error_status`, when present, is `null` or a whitespace-only string; and
+- `permission_denials`, when present, is an empty array.
+
+A non-success subtype, `is_error: true`, blank/non-string `result`, missing or malformed `modelUsage`, no requested-model match, unaccepted `stop_reason`, non-null `structured_output`, nonempty `error`/`errors`, nonempty `api_error_status`, or nonempty/malformed `permission_denials` fails closed and cannot supply findings. Classify a structurally valid permission denial, output truncation/abnormal stop, exact-model mismatch, or configuration/policy mismatch as `blocked`. When a non-success terminal follows any deterministic init or terminal blocker, absence of error prose preserves `blocked` and does not add a generic unclassified reason. Classify only a structurally valid recognized `Login expired`, explicit HTTP/status 401, explicit OAuth/credential/login/authentication/token refresh error, or directly adjacent expired/invalid/unauthorized authentication state as `blocked-authentication`. Generic token counting, usage, budget, quota, capacity, rate-limit, or limit errors, credential-file/I/O errors, a bare child exit code 401, non-authentication refresh failure, malformed evidence, contradictory evidence, or mixed-category evidence are `inconclusive`.
+
+The only non-authentication error prose that authorizes the pinned-model fallback is a strict recognized model-entitlement or organization-policy denial, including exact account/plan model-access denials and reviewed structured model-entitlement codes. The validator emits `classification: blocked` with machine reason `terminal.model-entitlement-denial` or `terminal.organization-policy-denial`; a parent may advance from `claude-opus-4-8` to `claude-opus-4-7` only when every classified message belongs to those two categories. Mixed, extended, authentication, resource/quota/capacity/rate-limit, unclassified, or ambiguous evidence is `inconclusive`, and prose inspection outside the validator never authorizes fallback.
+
+The machine-readable supported-version contract is [claude-stream-schema.json](claude-stream-schema.json). Its required and optional terminal-field lists form a closed top-level allowlist. Any other terminal field, including an unknown error-bearing field, makes the lane `inconclusive` until a reviewed schema update explicitly adds it. Do not infer a model alias or harmless metadata field from punctuation, provider convention, or a later CLI version.
+
+This evidence verifies only what the CLI reports about that invocation. It does not prove the final merged native sandbox, merged admin-managed permission arrays, path-rule evaluation, or absence of unreported CLI control-plane side effects. Capability output and init evidence must never be promoted into such proof.
 
 ## Guidance And Evidence
 
@@ -119,4 +226,4 @@ The control prompt must require Claude to:
 6. avoid direct reads outside the logical review workspace and every mutation;
 7. return findings only, or exactly `No findings.` when clean.
 
-Accept only a complete structured terminal success from the actual Claude process. Verify the requested/effective model when the runtime reports it, extract the findings verbatim, and bind them to the frozen range in the parent-owned lane record. Progress, tool traces, partial JSON, silent model substitution, and helper output do not count.
+Accept only the strict init/result evidence above from the actual Claude process. Extract the terminal findings verbatim and bind them to the frozen range in the parent-owned lane record. Progress, tool traces, partial JSON, silent model substitution, and helper output do not count.
