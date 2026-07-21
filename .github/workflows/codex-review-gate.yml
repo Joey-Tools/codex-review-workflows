@@ -1,0 +1,18 @@
+name: Codex Review Gate Compatibility Status
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility-status:
+    name: codex/review-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Emit legacy required context
+        run: >-
+          echo "Compatibility-only status: no reviewer was started and no review lane was counted."

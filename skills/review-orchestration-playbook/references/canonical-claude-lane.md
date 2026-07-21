@@ -109,7 +109,7 @@ If the required native sandbox, global write deny, sensitive-root denies, tool r
 
 ## Structured Init And Terminal Evidence
 
-Parse `stream-json` as bounded strict UTF-8 JSONL. Every nonblank line must be one JSON object; reject duplicate keys, nonstandard constants, undecodable text, or non-JSON output. The first nonblank record must be the sole event with `type: system` and `subtype: init`; the last nonblank record must be the sole event with `type: result`. A missing, duplicate, malformed, out-of-order, error-bearing, or trailing contract event makes the lane `inconclusive`; partial findings do not count.
+Parse `stream-json` as bounded strict UTF-8 JSONL. Every nonblank line must be one JSON object; reject duplicate keys, nonstandard constants, undecodable text, or non-JSON output. The first nonblank record must be the sole event with `type: system` and `subtype: init`; the last nonblank record must be the sole event with `type: result`. A missing, duplicate, malformed, out-of-order, or trailing contract event makes the lane `inconclusive`; partial findings do not count. A structurally valid terminal event that fails the success acceptance schema is passed to the failure classifier below rather than being classified by this envelope rule.
 
 Before accepting the result, compare the leading init against a reviewed, version-specific expected-init contract for the publisher-verified installed CLI. For Claude Code 2.1.212, require all of these observable fields:
 
@@ -132,7 +132,7 @@ For the Claude Code 2.1.212 terminal `result`, require this exact acceptance sch
 - `api_error_status`, when present, is `null` or a whitespace-only string; and
 - `permission_denials`, when present, is an empty array.
 
-A non-success subtype, `is_error: true`, blank/non-string `result`, missing or malformed `modelUsage`, no requested-model match, nonempty `error`/`errors`, nonempty `api_error_status`, or nonempty/malformed `permission_denials` fails closed and cannot supply findings. A structured permission/configuration mismatch is `blocked`; malformed, contradictory, or otherwise untrustworthy terminal evidence is `inconclusive`. Unknown terminal fields are additive metadata only when the accepted version schema permits them and they do not carry an error, denial, model substitution, or widened runtime surface.
+A non-success subtype, `is_error: true`, blank/non-string `result`, missing or malformed `modelUsage`, no requested-model match, nonempty `error`/`errors`, nonempty `api_error_status`, or nonempty/malformed `permission_denials` fails closed and cannot supply findings. Classify a structurally valid permission denial or configuration/policy mismatch as `blocked`. Classify a structurally valid recognized login-expired, HTTP 401, or authentication-refresh error as `blocked-authentication`. Malformed, contradictory, mixed-category, or otherwise untrustworthy terminal evidence is `inconclusive`. Unknown terminal fields are additive metadata only when the accepted version schema permits them and they do not carry an error, denial, model substitution, or widened runtime surface.
 
 This evidence verifies only what the CLI reports about that invocation. It does not prove the final merged native sandbox, merged admin-managed permission arrays, path-rule evaluation, or absence of unreported CLI control-plane side effects. Capability output and init evidence must never be promoted into such proof.
 

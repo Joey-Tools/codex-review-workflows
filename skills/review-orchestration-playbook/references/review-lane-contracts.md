@@ -23,7 +23,7 @@ The reviewer prompt contains only review-control metadata:
 - full `base_sha`, full `head_sha`, and `base_sha..head_sha`;
 - the authoritative active instruction source/version, instruction-loading order, read-only and evidence limits, requested focus and non-goals, and severity/output format;
 - for both local lanes, the same discovery order: repository-wide `AGENTS.md`, changed-path metadata, applicable path-scoped `AGENTS.md`, repo-local domain skills, tracked project guidance, then hunks;
-- for Codex, an instruction to load the authoritative active playbook from its normal skill environment before that shared discovery sequence;
+- for Codex, the exact authoritative playbook path/version selected by the parent: normally the active installed copy, or the frozen repo-local copy when the repository is reviewing its own policy migration. The reviewer must load exactly that source before the shared discovery sequence, never select another installed copy independently, and report the lane blocked when the named source is missing or mismatched;
 - for Claude, the complete lane contract plus an instruction to read only tracked repository/path guidance and repo-local skills from the worktree during that sequence;
 - an instruction to discover evidence itself with bounded Git and source-inspection tools.
 - an instruction not to run `fetch`, `pull`, or any networked Git operation; the parent has already proved the frozen scope locally complete.
@@ -41,7 +41,7 @@ This rule applies even when a direct diff would fit in the current prompt. It av
 ## Codex Single-Lane Contract
 
 - Use the dedicated `reviewer` agent with `fork_turns="none"`, or the platform-equivalent zero-inherited-turn launch.
-- The reviewer reads applicable instructions and skills from its normal environment and the frozen worktree.
+- The reviewer reads the parent-named authoritative playbook source exactly, then applicable instructions and skills from the frozen worktree.
 - The reviewer has read-only Git/source tools and obtains the diff itself.
 - The existing `.git`-free supplied-diff Codex helper is a different low-level mechanism and cannot satisfy this lane.
 - Accept only the dedicated reviewer's terminal findings artifact for the exact range.

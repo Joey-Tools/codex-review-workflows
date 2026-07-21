@@ -570,10 +570,29 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("external-review-playbook", workflow)
         self.assertNotIn("copilot-review-playbook", workflow)
         if CI_PROFILE == "canonical":
-            self.assertFalse(
-                (REPO_ROOT / ".github/workflows/codex-review-gate.yml").exists(),
-                "ordinary PR events must not auto-start a retired Codex review gate",
-            )
+            compatibility = (
+                REPO_ROOT / ".github/workflows/codex-review-gate.yml"
+            ).read_text(encoding="utf-8")
+            for anchor in (
+                "Codex Review Gate Compatibility Status",
+                "pull_request:",
+                "name: codex/review-gate",
+                "no reviewer was started and no review lane was counted",
+            ):
+                self.assertIn(anchor, compatibility)
+            for forbidden in (
+                "pull_request_target:",
+                "issue_comment:",
+                "pull_request_review:",
+                "schedule:",
+                "workflow_dispatch:",
+                "statuses: write",
+                "pull-requests: write",
+                "issues: write",
+                "codex-review-gate-action",
+                "@codex review",
+            ):
+                self.assertNotIn(forbidden, compatibility)
 
     def test_ci_matches_the_reviewed_repo_profile_snapshot(self) -> None:
         actual = (REPO_ROOT / ".github/workflows/ci.yml").read_bytes()
@@ -729,10 +748,10 @@ class RepositoryContractTest(unittest.TestCase):
             "Enforce read-only reviewer behavior",
             '`fork_turns="none"`',
             "review-control metadata",
-            "authoritative active playbook version before launch",
+            "exact authoritative playbook path/version in the prompt",
             "Both local lanes follow the same discovery order",
             "path-scoped `AGENTS.md`, repo-local domain skills, tracked project guidance, then hunks",
-            "Codex first loads the authoritative active playbook",
+            "Codex must load exactly that named source",
             "Do not prepare, paste, attach, or point it to a full diff",
             "existing frozen-diff Codex helper is not this lane and does not satisfy single review",
             "actual Claude Code process in a second clean Git worktree",
@@ -749,7 +768,7 @@ class RepositoryContractTest(unittest.TestCase):
             "instruction-loading order, read-only and evidence limits",
             "for both local lanes, the same discovery order",
             "path-scoped `AGENTS.md`, repo-local domain skills, tracked project guidance, then hunks",
-            "load the authoritative active playbook",
+            "exact authoritative playbook path/version selected by the parent",
             "compute or persist a reviewer-visible full diff",
             '`fork_turns="none"`',
             "Use an actual Claude Code process in a second lane-unique clean Git worktree",
@@ -872,7 +891,7 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertNotIn("does not contain the intended frozen head", document)
         intended_range_anchor = "Preserve any parent-provided frozen `base_sha..head_sha` as the intended range"
         separate_pr_head_anchor = "record the current `headRefOid` separately as `pr_head_oid`; never overwrite the intended `head_sha` with it"
-        compare_anchor = "Compare `pr_head_oid` with the intended `head_sha` before running local lanes or consuming PR CI, conversation, or readiness state"
+        compare_anchor = "Compare `pr_head_oid` with the intended `head_sha` before running local lanes or reading PR CI, conversation, ruleset, mergeability, or other readiness state"
         run_lanes_anchor = "Run the requested local lanes"
         classify_anchor = "make only the pre-request classifications that available evidence can prove"
         eligible_anchor = (
@@ -895,12 +914,20 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertLess(
             readiness.index(compare_anchor), readiness.index(run_lanes_anchor)
         )
+        read_readiness_anchor = (
+            "Read required CI/check state and unresolved PR conversations"
+        )
+        self.assertLess(
+            readiness.index(compare_anchor), readiness.index(read_readiness_anchor)
+        )
         self.assertLess(
             readiness.index(run_lanes_anchor), readiness.index(classify_anchor)
         )
         for scenario in (
             "single, double, triple, and triple already reduced to effective double",
             "Skip this comparison only on the no-PR path",
+            "Only actual PR absence takes the no-PR effective-double path",
+            "existing PR on an unsupported host or identity remains on the existing-PR path",
             "an authenticated provider rejection may prove no-start integration/service unavailability",
             "acknowledgement or run/review activity proves start",
         ):
@@ -1117,6 +1144,53 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("one trailing terminal `result`", content)
             self.assertIn("fail closed", content.lower())
         self.assertNotIn("when the runtime reports it", canonical)
+
+    def test_canonical_claude_structured_errors_have_one_failure_classifier(
+        self,
+    ) -> None:
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+
+        envelope_anchor = "A missing, duplicate, malformed, out-of-order, or trailing contract event makes the lane `inconclusive`"
+        classifier_anchor = "A structurally valid terminal event that fails the success acceptance schema is passed to the failure classifier below"
+        permission_anchor = "Classify a structurally valid permission denial or configuration/policy mismatch as `blocked`"
+        authentication_anchor = "Classify a structurally valid recognized login-expired, HTTP 401, or authentication-refresh error as `blocked-authentication`"
+        for anchor in (
+            envelope_anchor,
+            classifier_anchor,
+            permission_anchor,
+            authentication_anchor,
+        ):
+            self.assertIn(anchor, canonical)
+        self.assertNotIn("out-of-order, error-bearing, or trailing", canonical)
+        self.assertLess(
+            canonical.index(envelope_anchor), canonical.index(classifier_anchor)
+        )
+        self.assertLess(
+            canonical.index(classifier_anchor), canonical.index(permission_anchor)
+        )
+        self.assertLess(
+            canonical.index(classifier_anchor), canonical.index(authentication_anchor)
+        )
+
+    def test_codex_authoritative_playbook_source_is_parent_selected_and_exact(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        reviewer = (REPO_ROOT / "agents/reviewer.toml").read_text(encoding="utf-8")
+        agents_policy = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+
+        for content in (skill, contracts, reviewer):
+            self.assertIn("normally the active installed copy", content)
+            self.assertIn("frozen repo-local copy", content)
+            self.assertIn("missing or mismatched", content)
+        self.assertIn("repo-local playbook from the frozen review head", agents_policy)
+        for content in (skill, contracts, reviewer):
+            self.assertNotIn("from its normal skill environment", content)
 
     def test_main_workflow_checks_existing_pr_head_before_local_lanes(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
@@ -1417,9 +1491,11 @@ class RepositoryContractTest(unittest.TestCase):
         ]
         if CI_PROFILE == "canonical":
             active_policy.append(REPO_ROOT / "README.md")
-            self.assertFalse(
-                (REPO_ROOT / ".github/workflows/codex-review-gate.yml").exists()
-            )
+            compatibility = (
+                REPO_ROOT / ".github/workflows/codex-review-gate.yml"
+            ).read_text(encoding="utf-8")
+            self.assertIn("Compatibility Status", compatibility)
+            self.assertNotIn("uses:", compatibility)
         retired = (
             "independent-codex-pr-review",
             "offline-frozen-diff-review",
