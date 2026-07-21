@@ -90,9 +90,7 @@ class ReleaseVersionTest(unittest.TestCase):
     def test_rejects_versions_outside_supported_major_range(self) -> None:
         for version in ("2.1.210", "1.99.999", "3.0.0", "4.1.0"):
             with self.subTest(version=version):
-                with self.assertRaises(
-                    claude_provenance.ClaudeProvenanceInvalid
-                ):
+                with self.assertRaises(claude_provenance.ClaudeProvenanceInvalid):
                     claude_provenance.require_supported_release_version(version)
 
     def test_rejects_non_release_or_noncanonical_semver(self) -> None:
@@ -106,9 +104,7 @@ class ReleaseVersionTest(unittest.TestCase):
             "2.1.211\n",
         ):
             with self.subTest(version=version):
-                with self.assertRaises(
-                    claude_provenance.ClaudeProvenanceInvalid
-                ):
+                with self.assertRaises(claude_provenance.ClaudeProvenanceInvalid):
                     claude_provenance.require_supported_release_version(version)
 
     def test_builds_exact_version_urls(self) -> None:
@@ -492,19 +488,14 @@ class SignedManifestFetchTest(unittest.TestCase):
     def test_rejects_non_bytes_or_empty_fetcher_result(self) -> None:
         for payload in ("manifest", b""):
             with self.subTest(payload=payload):
-                with self.assertRaises(
-                    claude_provenance.ClaudeProvenanceInvalid
-                ):
+                with self.assertRaises(claude_provenance.ClaudeProvenanceInvalid):
                     claude_provenance.fetch_signed_manifest(
                         "2.1.211",
                         fetcher=lambda *_args, **_kwargs: payload,
                     )
 
     def test_default_fetcher_rejects_redirects_from_exact_release_url(self) -> None:
-        url = (
-            "https://downloads.claude.ai/claude-code-releases/"
-            "2.1.211/manifest.json"
-        )
+        url = "https://downloads.claude.ai/claude-code-releases/2.1.211/manifest.json"
         redirect = claude_provenance.urllib.error.HTTPError(
             url,
             302,
@@ -530,10 +521,7 @@ class SignedManifestFetchTest(unittest.TestCase):
                 )
 
     def test_default_fetcher_deadline_includes_url_open_and_headers(self) -> None:
-        url = (
-            "https://downloads.claude.ai/claude-code-releases/"
-            "2.1.211/manifest.json"
-        )
+        url = "https://downloads.claude.ai/claude-code-releases/2.1.211/manifest.json"
         opener = mock.Mock()
 
         def stall_before_headers(*_args, **_kwargs):  # type: ignore[no-untyped-def]
@@ -560,10 +548,7 @@ class SignedManifestFetchTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 1.0)
 
     def test_default_fetcher_reads_response_body_in_bounded_chunks(self) -> None:
-        url = (
-            "https://downloads.claude.ai/claude-code-releases/"
-            "2.1.211/manifest.json"
-        )
+        url = "https://downloads.claude.ai/claude-code-releases/2.1.211/manifest.json"
         body = b"x" * (claude_provenance.CLAUDE_FETCH_CHUNK_BYTES + 3)
 
         class ChunkedResponse:
@@ -617,8 +602,7 @@ class SignedManifestFetchTest(unittest.TestCase):
 
     def test_default_fetcher_stops_slow_drip_at_total_deadline(self) -> None:
         url = (
-            "https://downloads.claude.ai/claude-code-releases/"
-            "2.1.211/manifest.json.sig"
+            "https://downloads.claude.ai/claude-code-releases/2.1.211/manifest.json.sig"
         )
         clock = [10.0]
 
@@ -677,8 +661,7 @@ class SignedManifestFetchTest(unittest.TestCase):
             )
         )
         applied_timeouts = [
-            call.args[0]
-            for call in response.fp.raw._sock.settimeout.call_args_list
+            call.args[0] for call in response.fp.raw._sock.settimeout.call_args_list
         ]
         self.assertEqual(len(applied_timeouts), 3)
         for actual, expected in zip(applied_timeouts, (1.0, 0.6, 0.2)):
@@ -1049,9 +1032,7 @@ class GpgVerificationTest(unittest.TestCase):
                 )
 
     def test_darwin_dependency_cannot_declare_a_dynamic_linker(self) -> None:
-        dependency = pathlib.Path(
-            "/opt/homebrew/opt/libgcrypt/lib/libgcrypt.20.dylib"
-        )
+        dependency = pathlib.Path("/opt/homebrew/opt/libgcrypt/lib/libgcrypt.20.dylib")
         load_commands = (
             f"{dependency}:\n"
             "Load command 0\n"
@@ -1092,9 +1073,7 @@ class GpgVerificationTest(unittest.TestCase):
             claude_provenance._collect_darwin_gpg_dependencies(executable)
 
     def test_darwin_dependency_symlink_loop_is_inconclusive(self) -> None:
-        dependency = pathlib.Path(
-            "/opt/homebrew/opt/libgcrypt/lib/libgcrypt.20.dylib"
-        )
+        dependency = pathlib.Path("/opt/homebrew/opt/libgcrypt/lib/libgcrypt.20.dylib")
 
         with (
             mock.patch.object(
@@ -1161,9 +1140,7 @@ class GpgVerificationTest(unittest.TestCase):
                 "access",
                 return_value=True,
             ),
-            self.assertRaises(
-                claude_provenance.ClaudeProvenanceInvalid
-            ) as caught,
+            self.assertRaises(claude_provenance.ClaudeProvenanceInvalid) as caught,
         ):
             claude_provenance._run_otool(
                 pathlib.Path("/private/tmp/gpg-verifier"),
@@ -1607,9 +1584,7 @@ class GpgVerificationTest(unittest.TestCase):
             "run_bounded_capture",
             side_effect=claude_provenance.ReviewTimeoutError("timeout"),
         ):
-            with self.assertRaises(
-                claude_provenance.ClaudeProvenanceInconclusive
-            ):
+            with self.assertRaises(claude_provenance.ClaudeProvenanceInconclusive):
                 claude_provenance._run_gpg(
                     ["gpg"],
                     env={},
@@ -1639,9 +1614,7 @@ class GpgVerificationTest(unittest.TestCase):
                 "run_bounded_capture",
                 side_effect=OSError(errno.EIO, "injected GPG launch failure"),
             ),
-            self.assertRaises(
-                claude_provenance.ClaudeProvenanceUnavailable
-            ) as caught,
+            self.assertRaises(claude_provenance.ClaudeProvenanceUnavailable) as caught,
         ):
             claude_provenance._run_gpg(
                 ["/trusted/gpg", "--version"],
@@ -1724,9 +1697,7 @@ class GpgVerificationTest(unittest.TestCase):
             )
 
     def test_missing_trusted_gpg_candidate_is_dependency_unavailable(self) -> None:
-        with self.assertRaises(
-            claude_provenance.ClaudeProvenanceDependencyUnavailable
-        ):
+        with self.assertRaises(claude_provenance.ClaudeProvenanceDependencyUnavailable):
             claude_provenance.resolve_trusted_gpg(
                 (pathlib.Path("/definitely/missing/codex-review-gpg"),)
             )
@@ -1739,9 +1710,7 @@ class GpgVerificationTest(unittest.TestCase):
             wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             wrapper.chmod(0o700)
 
-            with self.assertRaises(
-                claude_provenance.ClaudeProvenanceInvalid
-            ) as caught:
+            with self.assertRaises(claude_provenance.ClaudeProvenanceInvalid) as caught:
                 claude_provenance.resolve_trusted_gpg((wrapper,))
 
         self.assertNotIsInstance(
@@ -1812,9 +1781,7 @@ class GpgVerificationTest(unittest.TestCase):
             mock.patch.object(
                 claude_provenance,
                 "_resolve_trusted_gpg_source",
-                side_effect=claude_provenance.ClaudeProvenanceUnavailable(
-                    "fixture"
-                ),
+                side_effect=claude_provenance.ClaudeProvenanceUnavailable("fixture"),
             ) as resolver,
             self.assertRaises(claude_provenance.ClaudeProvenanceUnavailable),
         ):
@@ -1836,9 +1803,7 @@ class GpgVerificationTest(unittest.TestCase):
             native.write_bytes(b"\x7fELF" + b"\x00" * 16)
             native.chmod(0o720)
 
-            with self.assertRaises(
-                claude_provenance.ClaudeProvenanceInvalid
-            ):
+            with self.assertRaises(claude_provenance.ClaudeProvenanceInvalid):
                 claude_provenance.resolve_trusted_gpg((native,))
 
     def test_resolve_trusted_gpg_rejects_world_writable_parent(self) -> None:
@@ -1851,9 +1816,7 @@ class GpgVerificationTest(unittest.TestCase):
             native.chmod(0o700)
             root.chmod(0o707)
 
-            with self.assertRaises(
-                claude_provenance.ClaudeProvenanceInvalid
-            ):
+            with self.assertRaises(claude_provenance.ClaudeProvenanceInvalid):
                 claude_provenance.resolve_trusted_gpg((native,))
 
     def test_resolve_trusted_gpg_rejects_generic_group_writable_parent(
@@ -1868,9 +1831,7 @@ class GpgVerificationTest(unittest.TestCase):
             native.chmod(0o700)
             root.chmod(0o770)
 
-            with self.assertRaises(
-                claude_provenance.ClaudeProvenanceInvalid
-            ):
+            with self.assertRaises(claude_provenance.ClaudeProvenanceInvalid):
                 claude_provenance.resolve_trusted_gpg((native,))
 
     def test_resolve_trusted_gpg_allows_only_homebrew_admin_group_parent(
@@ -1914,9 +1875,7 @@ class GpgVerificationTest(unittest.TestCase):
                     "_darwin_admin_gid",
                     return_value=gid + 1,
                 ),
-                self.assertRaises(
-                    claude_provenance.ClaudeProvenanceInvalid
-                ),
+                self.assertRaises(claude_provenance.ClaudeProvenanceInvalid),
             ):
                 claude_provenance.resolve_trusted_gpg((native,))
 
@@ -1980,6 +1939,33 @@ class ExecutableVerificationTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def _verify_full_release(
+        self,
+    ) -> claude_provenance.VerifiedClaudeExecutable:
+        manifest = manifest_for(self.payload)
+
+        def fetcher(
+            url: str,
+            *,
+            max_bytes: int,
+            timeout_seconds: float,
+        ) -> bytes:
+            del max_bytes, timeout_seconds
+            return manifest if url.endswith("manifest.json") else b"signature"
+
+        with mock.patch.object(
+            claude_provenance,
+            "verify_manifest_signature",
+            return_value=pathlib.Path("/trusted/gpg"),
+        ):
+            return claude_provenance.verify_claude_release(
+                self.executable,
+                version="2.1.211",
+                platform_key="darwin-arm64",
+                gpg_temp_root=self.root,
+                fetcher=fetcher,
+            )
+
     def test_accepts_stable_digest_and_returns_resolved_executable(self) -> None:
         link = self.root / "claude"
         link.symlink_to(self.executable)
@@ -2027,9 +2013,7 @@ class ExecutableVerificationTest(unittest.TestCase):
             *args: object,
             **kwargs: object,
         ) -> os.stat_result:
-            if path == resolved_target and kwargs.get(
-                "follow_symlinks"
-            ) is False:
+            if path == resolved_target and kwargs.get("follow_symlinks") is False:
                 raise OSError("fixture stat I/O failure")
             return original_stat(path, *args, **kwargs)  # type: ignore[arg-type]
 
@@ -2050,13 +2034,50 @@ class ExecutableVerificationTest(unittest.TestCase):
                 self.artifact,
             )
 
-    def test_rejects_size_mismatch_before_hashing(self) -> None:
+    def test_rejects_stable_size_mismatch_without_hashing(self) -> None:
         wrong = claude_provenance.ClaudeReleaseArtifact(
             **{**self.artifact.__dict__, "size": self.artifact.size + 1}
         )
-        with self.assertRaisesRegex(
-            claude_provenance.ClaudeProvenanceInvalid,
-            "size does not match",
+        with (
+            mock.patch.object(
+                claude_provenance,
+                "_sha256_file_descriptor",
+                side_effect=AssertionError("stable size mismatch must not be hashed"),
+            ) as hasher,
+            self.assertRaisesRegex(
+                claude_provenance.ClaudeProvenanceInvalid,
+                "size does not match",
+            ),
+        ):
+            claude_provenance.verify_release_executable(self.executable, wrong)
+        hasher.assert_not_called()
+
+    def test_size_mismatch_race_is_inconclusive(self) -> None:
+        wrong = claude_provenance.ClaudeReleaseArtifact(
+            **{**self.artifact.__dict__, "size": self.artifact.size + 1}
+        )
+        original_open = os.open
+        resolved_target = self.executable.resolve(strict=True)
+        raced = False
+
+        def grow_before_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+            nonlocal raced
+            if pathlib.Path(path) == resolved_target and not raced:
+                raced = True
+                with self.executable.open("ab") as handle:
+                    handle.write(b"X")
+            return original_open(path, flags, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                claude_provenance.os,
+                "open",
+                side_effect=grow_before_open,
+            ),
+            self.assertRaisesRegex(
+                claude_provenance.ClaudeProvenanceInconclusive,
+                "changed while",
+            ),
         ):
             claude_provenance.verify_release_executable(self.executable, wrong)
 
@@ -2104,38 +2125,115 @@ class ExecutableVerificationTest(unittest.TestCase):
                 )
 
     def test_full_verifier_returns_authenticated_release_metadata(self) -> None:
-        manifest = manifest_for(self.payload)
+        descriptor_identity: tuple[int, ...] | None = None
+        original_hash = claude_provenance._sha256_file_descriptor
 
-        def fetcher(
-            url: str,
-            *,
-            max_bytes: int,
-            timeout_seconds: float,
-        ) -> bytes:
-            del max_bytes, timeout_seconds
-            return manifest if url.endswith("manifest.json") else b"signature"
+        def capture_descriptor_identity(handle):  # type: ignore[no-untyped-def]
+            nonlocal descriptor_identity
+            descriptor_identity = claude_provenance._stat_identity(
+                os.fstat(handle.fileno())
+            )
+            return original_hash(handle)
 
-        gpg_path = pathlib.Path("/trusted/gpg")
         with mock.patch.object(
             claude_provenance,
-            "verify_manifest_signature",
-            return_value=gpg_path,
+            "_sha256_file_descriptor",
+            side_effect=capture_descriptor_identity,
         ):
-            result = claude_provenance.verify_claude_release(
-                self.executable,
-                version="2.1.211",
-                platform_key="darwin-arm64",
-                gpg_temp_root=self.root,
-                fetcher=fetcher,
-            )
+            result = self._verify_full_release()
 
         self.assertEqual(result.executable, self.executable.resolve())
         self.assertEqual(result.artifact.checksum, self.artifact.checksum)
-        self.assertEqual(result.gpg_path, gpg_path)
+        self.assertEqual(result.gpg_path, pathlib.Path("/trusted/gpg"))
+        self.assertEqual(result.source_identity, descriptor_identity)
+        self.assertIsNotNone(result.source_identity)
+        assert result.source_identity is not None
+        self.assertEqual(
+            result.source_identity[-1],
+            self.executable.stat(follow_symlinks=False).st_ctime_ns,
+        )
         self.assertEqual(
             result.manifest_url,
             "https://downloads.claude.ai/claude-code-releases/2.1.211/manifest.json",
         )
+
+    def test_materialization_rejects_replaced_verified_source_before_reuse(
+        self,
+    ) -> None:
+        verified = self._verify_full_release()
+        snapshot_root = self.root / "snapshots"
+        claude_provenance.materialize_verified_executable(
+            verified,
+            snapshot_root,
+        )
+        replacement = self.root / "replacement"
+        replacement.write_bytes(self.payload)
+        replacement.chmod(0o700)
+        os.replace(replacement, self.executable)
+
+        with (
+            mock.patch.object(
+                claude_provenance,
+                "_verify_snapshot_entry",
+                side_effect=AssertionError(
+                    "changed verified source must be rejected before snapshot reuse"
+                ),
+            ) as snapshot_verifier,
+            self.assertRaisesRegex(
+                claude_provenance.ClaudeProvenanceInconclusive,
+                "changed after provenance verification",
+            ),
+        ):
+            claude_provenance.materialize_verified_executable(
+                verified,
+                snapshot_root,
+            )
+
+        snapshot_verifier.assert_not_called()
+
+    def test_materialization_rejects_ctime_only_source_mutation_before_copy(
+        self,
+    ) -> None:
+        verified = self._verify_full_release()
+        self.assertIsNotNone(verified.source_identity)
+        assert verified.source_identity is not None
+        original_mode = stat.S_IMODE(
+            self.executable.stat(follow_symlinks=False).st_mode
+        )
+        alternate_mode = original_mode ^ stat.S_IXUSR
+        deadline = time.monotonic() + 2.0
+        while True:
+            self.executable.chmod(alternate_mode)
+            self.executable.chmod(original_mode)
+            mutated_identity = claude_provenance._stat_identity(
+                self.executable.stat(follow_symlinks=False)
+            )
+            if mutated_identity[-1] != verified.source_identity[-1]:
+                break
+            if time.monotonic() >= deadline:
+                self.fail("filesystem ctime did not advance after bounded mode changes")
+            time.sleep(0.01)
+        self.assertEqual(mutated_identity[:-1], verified.source_identity[:-1])
+
+        with (
+            mock.patch.object(
+                claude_provenance,
+                "_copy_and_hash_snapshot",
+                side_effect=AssertionError(
+                    "changed verified source must be rejected before copying"
+                ),
+            ) as copier,
+            self.assertRaisesRegex(
+                claude_provenance.ClaudeProvenanceInconclusive,
+                "changed after provenance verification",
+            ),
+        ):
+            claude_provenance.materialize_verified_executable(
+                verified,
+                self.root / "snapshots",
+            )
+
+        copier.assert_not_called()
 
     def test_verified_manifest_cache_avoids_repeat_network_fetch(self) -> None:
         manifest = manifest_for(self.payload)
@@ -2205,9 +2303,7 @@ class ExecutableVerificationTest(unittest.TestCase):
             "verify_manifest_signature",
             side_effect=claude_provenance.ClaudeProvenanceInvalid("bad signature"),
         ):
-            with self.assertRaises(
-                claude_provenance.ClaudeProvenanceInvalid
-            ):
+            with self.assertRaises(claude_provenance.ClaudeProvenanceInvalid):
                 claude_provenance.verify_claude_release(
                     self.executable,
                     version="2.1.211",
@@ -2319,10 +2415,11 @@ class ExecutableSnapshotTest(unittest.TestCase):
         )
 
         expected_name = (
-            "claude-2.1.211-darwin-arm64-"
-            f"{hashlib.sha256(self.payload).hexdigest()}"
+            f"claude-2.1.211-darwin-arm64-{hashlib.sha256(self.payload).hexdigest()}"
         )
-        self.assertEqual(result.executable, self.snapshot_root.resolve() / expected_name)
+        self.assertEqual(
+            result.executable, self.snapshot_root.resolve() / expected_name
+        )
         self.assertEqual(result.executable.read_bytes(), self.payload)
         self.assertEqual(stat.S_IMODE(self.snapshot_root.stat().st_mode), 0o700)
         self.assertEqual(stat.S_IMODE(result.executable.stat().st_mode), 0o500)
@@ -2337,7 +2434,10 @@ class ExecutableSnapshotTest(unittest.TestCase):
             self.verified,
             self.snapshot_root,
         )
-        first_identity = (first.executable.stat().st_dev, first.executable.stat().st_ino)
+        first_identity = (
+            first.executable.stat().st_dev,
+            first.executable.stat().st_ino,
+        )
 
         with mock.patch.object(
             claude_provenance,

@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "event": "request-time-merge-base-changed-with-same-head",
+  "range_origin": {
+    "record_location": "parent-owned-audit",
+    "required_fields": [
+      "kind",
+      "base_sha",
+      "head_sha"
+    ],
+    "allowed_kinds": [
+      "caller-supplied",
+      "pr-derived"
+    ],
+    "original_caller_endpoints_are_immutable": true
+  },
+  "github_lane": {
+    "action": "never-post-replacement-same-head",
+    "status": "triple-inconclusive"
+  },
+  "transitions": [
+    {
+      "name": "missing-range-origin",
+      "invalidated_origin": "unknown",
+      "recovery_source": "any",
+      "current_range_equals_current_pr": "any",
+      "local_action": "stop-before-local-lanes",
+      "reason": "range-origin-unverified"
+    },
+    {
+      "name": "stale-caller-range",
+      "invalidated_origin": "caller-supplied",
+      "recovery_source": "inherited-stale",
+      "current_range_equals_current_pr": false,
+      "local_action": "stop-before-local-lanes",
+      "reason": "base-changed-same-head"
+    },
+    {
+      "name": "forbidden-parent-rewrite-of-caller-range",
+      "invalidated_origin": "caller-supplied",
+      "recovery_source": "parent-rederived-current",
+      "current_range_equals_current_pr": true,
+      "local_action": "stop-before-local-lanes",
+      "reason": "caller-authority-required"
+    },
+    {
+      "name": "caller-supplied-current-recovery",
+      "invalidated_origin": "caller-supplied",
+      "recovery_source": "caller-supplied-current",
+      "current_range_equals_current_pr": true,
+      "local_action": "run-local-lanes",
+      "reason": "local-recovery-authorized"
+    },
+    {
+      "name": "stale-pr-derived-range",
+      "invalidated_origin": "pr-derived",
+      "recovery_source": "inherited-stale",
+      "current_range_equals_current_pr": false,
+      "local_action": "stop-before-local-lanes",
+      "reason": "base-changed-same-head"
+    },
+    {
+      "name": "pr-derived-current-recovery",
+      "invalidated_origin": "pr-derived",
+      "recovery_source": "normally-rederived-current",
+      "current_range_equals_current_pr": true,
+      "local_action": "run-local-lanes",
+      "reason": "local-recovery-authorized"
+    }
+  ]
+}
