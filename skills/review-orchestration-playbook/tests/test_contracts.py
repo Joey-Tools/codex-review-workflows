@@ -871,6 +871,25 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("blocked-authorization", document)
             self.assertNotIn("does not contain the frozen head", document)
             self.assertNotIn("does not contain the intended frozen head", document)
+        intended_range_anchor = "Preserve any parent-provided frozen `base_sha..head_sha` as the intended range"
+        separate_pr_head_anchor = "Record the PR's current `headRefOid` separately as `pr_head_oid`; never overwrite the intended `head_sha` with it"
+        compare_anchor = "Compare `pr_head_oid` with the intended `head_sha` before running local lanes or posting `@codex review`"
+        run_lanes_anchor = "Run the requested local lanes"
+        for anchor in (
+            intended_range_anchor,
+            separate_pr_head_anchor,
+            compare_anchor,
+        ):
+            self.assertIn(anchor, readiness)
+        self.assertLess(
+            readiness.index(intended_range_anchor), readiness.index(compare_anchor)
+        )
+        self.assertLess(
+            readiness.index(separate_pr_head_anchor), readiness.index(compare_anchor)
+        )
+        self.assertLess(
+            readiness.index(compare_anchor), readiness.index(run_lanes_anchor)
+        )
         self.assertIn(
             "any operating identity in `{hoteng, hoteng_cisco}`",
             contracts,

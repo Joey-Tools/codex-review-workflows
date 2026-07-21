@@ -22,18 +22,19 @@ Use this reference after the local delivery gate has produced a reviewable commi
 ## Gate Sequence
 
 1. Establish or reuse the PR only when the parent request separately authorizes PR mutation. For a bare triple-review request, reuse an already-existing supported PR only; otherwise take the no-PR effective-double path. Read repository metadata, review threads, required checks, rulesets, base branch, and current head with the bounded probes in [github-pr-probes.md](github-pr-probes.md).
-2. Record the PR head and freeze the local range as `<merge_base>..<head_sha>`.
-3. Run the requested local lanes under [review-lane-contracts.md](review-lane-contracts.md). Each lane gets its own clean Git worktree, clear reviewer context, and read-only access. Never generate or inject a full diff for the reviewer.
-4. If triple was requested, classify GitHub Codex availability:
+2. Preserve any parent-provided frozen `base_sha..head_sha` as the intended range before reading or deriving PR head state. Record the PR's current `headRefOid` separately as `pr_head_oid`; never overwrite the intended `head_sha` with it. Only when a PR/full-workflow request has no preexisting frozen range may the parent derive the intended `<merge_base>..<head_sha>` from the current PR head.
+3. Compare `pr_head_oid` with the intended `head_sha` before running local lanes or posting `@codex review`. On mismatch, publish/freeze the intended head only when PR mutation is separately authorized; otherwise apply the `blocked-authorization` triple-inconclusive rule above without changing the PR.
+4. Run the requested local lanes under [review-lane-contracts.md](review-lane-contracts.md) over the preserved intended range. Each lane gets its own clean Git worktree, clear reviewer context, and read-only access. Never generate or inject a full diff for the reviewer.
+5. If triple was requested, classify GitHub Codex availability:
    - Supported: a GitHub Cloud PR where the Codex review integration is available for the active identity.
    - Unavailable: no PR, missing integration, unsupported host/service, host `sqbu-github.cisco.com`, or any operating identity in `{hoteng, hoteng_cisco}`, when the condition is directly known or proved by authenticated provider evidence.
    - Inconclusive: missing response, timeout, generic request/HTTP failure, or any state that proves neither unavailability nor a trustworthy result.
    - On unavailable, persist `requested: triple`, `effective: double`, and a concrete reason, then continue the double-review readiness gate.
-5. For a supported third lane, post the exact `@codex review` comment after `head_sha` becomes current. Record the comment URL/time. The comment write is not completion or proof of service start. An authenticated provider rejection may prove no-start integration/service unavailability; acknowledgement or run/review activity proves start. Accept only a terminal result bound to the same head.
-6. Read required CI/check state and unresolved PR conversations. Distinguish required checks from informational jobs and stale runs from current-head runs.
-7. Apply actionable findings in the implementation workspace, rerun affected tests, publish the new head, and invalidate every earlier review artifact whose range/head changed.
-8. Repeat the affected local lanes, the supported GitHub Codex request, CI checks, and conversation scan until the effective shape and all delivery gates are clean or a crisp blocker remains.
-9. Recheck base/head, mergeability, approval/ruleset requirements, and the repository's merge model immediately before reporting merge-ready or merging.
+6. For a supported third lane, post the exact `@codex review` comment after the intended `head_sha` becomes the unchanged current `pr_head_oid`. Record the comment URL/time. The comment write is not completion or proof of service start. An authenticated provider rejection may prove no-start integration/service unavailability; acknowledgement or run/review activity proves start. Accept only a terminal result bound to the same head.
+7. Read required CI/check state and unresolved PR conversations. Distinguish required checks from informational jobs and stale runs from current-head runs.
+8. Apply actionable findings in the implementation workspace, rerun affected tests, publish the new head, and invalidate every earlier review artifact whose range/head changed.
+9. Repeat the affected local lanes, the supported GitHub Codex request, CI checks, and conversation scan until the effective shape and all delivery gates are clean or a crisp blocker remains.
+10. Recheck base/head, mergeability, approval/ruleset requirements, and the repository's merge model immediately before reporting merge-ready or merging.
 
 ## GitHub Codex Evidence
 
