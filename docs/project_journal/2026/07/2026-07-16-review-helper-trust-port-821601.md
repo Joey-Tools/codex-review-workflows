@@ -3,7 +3,7 @@ id: 20260716-821601
 title: Review Helper Trust Hardening Port
 status: completed
 created: 2026-07-16
-updated: 2026-07-20
+updated: 2026-07-21
 branch: wip/review-helper-trust-port
 pr: 53
 supersedes: []
@@ -287,3 +287,41 @@ metadata behavior.
   files. Python 3.13 `py_compile`, project-journal validation, and the official
   skill validator also pass; the validator ran through a Python 3.13 `uv`
   environment because the host interpreter does not include PyYAML.
+- The final macOS broker hardening removes runtime compilation and every
+  user-owned executable carrier. A reproducible universal Mach-O with a macOS
+  13.0 deployment target is installed explicitly at a digest-keyed
+  root-owned `0555` path; runtime verification rejects unsafe ancestors,
+  symlinks, ACLs, hardlinks, digest drift, and dependency drift before
+  credential selection. Existing shared install parents are validation-only
+  and are never repaired or permission-modified by the root installer.
+  A helper-private Unix identity endpoint releases the in-memory TCP capability
+  only after same-user/group, bound session/PGID, and running CDHash checks.
+  The broker waits for the TCP authorization ACK before reading update stdin,
+  and the Seatbelt profile binds the kernel canonical socket path obtained from
+  `F_GETPATH`. Replacement sockets can cause only a fail-closed denial of
+  service. The final Python 3.13 repository suite ran 1,386 tests with 5 skips
+  and no failures; the focused provider suite ran 719 tests with 3 skips, and
+  the common suite ran 89 tests with 1 skip. Ruff lint/format, Python 3.13
+  `py_compile`, both broker architectures, Bash syntax, ShellCheck, strict code
+  signing, byte-for-byte artifact reproduction, and `git diff --check` pass.
+- The current-head integration makes runtime-process authorization a two-phase
+  prepare/commit boundary, so a late or failed identity preparation cannot
+  authorize `exec`. macOS credential selection owns and zeroizes both mutable
+  copies across every control-flow exit, and identity-server startup and cleanup
+  share one absolute deadline with cancellation precedence. The root installer
+  creates valid shared parents atomically without a post-create permission
+  transition, while broker reproducibility runs as an ordinary hosted
+  `macos-26` user and is explicitly documented as a reproducibility gate rather
+  than a trust boundary. PR readiness now ships a self-contained Python 3.13
+  independent Codex supervisor with isolated `CODEX_HOME`, bounded authenticated
+  evidence, app-server stdio, exact model/effort verification, sealed terminal
+  evidence, and exact process/checkout settlement. A cleanup-lock regression
+  also avoids a redundant same-mode `fchmod` that could change ctime during a
+  concurrent waiter's identity sampling while still repairing modes restricted
+  by an unusual umask. Final host-level Python 3.13 validation ran 1,428 main
+  tests with 5 skips and 268 independent-supervisor tests with 4 skips; the
+  repository contract suite ran 42 tests. Ruff lint and independent-package
+  format checks, Python 3.13 compileall, Bash syntax, ShellCheck, actionlint,
+  canonical CI byte comparison, broker developer byte reproduction, and
+  `git diff --check` pass. The hosted-only broker `--check` remains a required
+  CI gate because its exact Xcode path is intentionally unavailable locally.

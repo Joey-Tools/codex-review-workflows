@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import contextlib
+import ctypes
 import datetime
 import errno
 import hashlib
@@ -187,19 +188,48 @@ CLAUDE_REVIEW_BASE_MACH_SERVICES = (
     "com.apple.trustd",
     "com.apple.trustd.agent",
 )
-CLAUDE_KEYCHAIN_BROKER_COMPILER = pathlib.Path("/usr/bin/clang")
 CLAUDE_KEYCHAIN_CLIENT = pathlib.Path("/usr/bin/security")
-CLAUDE_KEYCHAIN_BROKER_SOURCE = pathlib.Path(__file__).with_name(
-    "claude_keychain_broker.c"
+CLAUDE_KEYCHAIN_BROKER_ARTIFACT = pathlib.Path(__file__).with_name(
+    "claude_keychain_broker"
+)
+CLAUDE_KEYCHAIN_BROKER_ARTIFACT_SHA256 = (
+    "e4793061f89c46965e95a2c87e557c85215b334f42ddf8b8e866814574308cbb"
+)
+CLAUDE_KEYCHAIN_BROKER_CDHASHES = frozenset(
+    {
+        bytes.fromhex("8186106f3c2ab605be123e98c7adaffd097fd081"),
+        bytes.fromhex("338249f6d5124e16da7eec083fb7c21ae53f05b3"),
+    }
+)
+CLAUDE_KEYCHAIN_BROKER_INSTALL_ROOT = pathlib.Path(
+    "/Library/Joey-Tools/CodexReview/brokers"
+)
+CLAUDE_KEYCHAIN_BROKER_INSTALL_PATH = (
+    CLAUDE_KEYCHAIN_BROKER_INSTALL_ROOT
+    / CLAUDE_KEYCHAIN_BROKER_ARTIFACT_SHA256
+    / "security"
 )
 CLAUDE_KEYCHAIN_ACCOUNT = re.compile(r"^[A-Za-z0-9._-]+$")
 CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
 CLAUDE_KEYCHAIN_BROKER_PORT_ENV = "CODEX_CLAUDE_KEYCHAIN_BROKER_PORT"
-CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV = "CODEX_CLAUDE_KEYCHAIN_BROKER_CAPABILITY"
-CLAUDE_KEYCHAIN_BROKER_CAPABILITY = re.compile(r"^[0-9a-f]{64}$")
+CLAUDE_KEYCHAIN_BROKER_EXECUTABLE_ENV = "CODEX_CLAUDE_KEYCHAIN_BROKER_EXECUTABLE"
+CLAUDE_KEYCHAIN_BROKER_IDENTITY_SOCKET_ENV = (
+    "CODEX_CLAUDE_KEYCHAIN_BROKER_IDENTITY_SOCKET"
+)
+CLAUDE_KEYCHAIN_BROKER_IDENTITY_DIRECTORY_ENV = (
+    "CODEX_CLAUDE_KEYCHAIN_BROKER_IDENTITY_DIRECTORY"
+)
 CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES = 32
-CLAUDE_KEYCHAIN_BROKER_TIMEOUT_SECONDS = 20.0
 CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES = 64 * 1024
+CLAUDE_KEYCHAIN_BROKER_ARTIFACT_LIMIT_BYTES = 1024 * 1024
+CLAUDE_KEYCHAIN_BROKER_DIRECTORY_ATTEMPTS = 4
+CLAUDE_KEYCHAIN_BROKER_DIRECTORY_PREFIX = "keychain-identity-"
+CLAUDE_KEYCHAIN_BROKER_IDENTITY_SOCKET_NAME = "identity.sock"
+CLAUDE_KEYCHAIN_BROKER_LOCAL_SOCKET_LEVEL = 0
+CLAUDE_KEYCHAIN_BROKER_LOCAL_PEERPID = 2
+CLAUDE_MACOS_CS_OPS_CDHASH = 5
+CLAUDE_MACOS_CDHASH_BYTES = 20
+CLAUDE_MACOS_PATH_BUFFER_BYTES = 1024
 CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS = 5.0
 CLAUDE_KEYCHAIN_SERVER_START_TIMEOUT_SECONDS = 5.0
 CLAUDE_KEYCHAIN_SERVER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
@@ -2806,8 +2836,22 @@ def _require_claude_keychain_executable(
         )
 
 
+def _claude_keychain_identity_directory_name() -> str:
+    try:
+        token = os.urandom(16)
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot allocate a Claude Keychain broker directory identity"
+        ) from error
+    if len(token) != 16:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude Keychain broker directory identity is incomplete"
+        )
+    return CLAUDE_KEYCHAIN_BROKER_DIRECTORY_PREFIX + token.hex()
+
+
 @contextlib.contextmanager
-def _open_or_create_claude_keychain_broker_directory(
+def _open_or_create_claude_keychain_identity_directory(
     review: ReviewWorkspace,
 ) -> Iterator[tuple[pathlib.Path, int]]:
     nofollow = getattr(os, "O_NOFOLLOW", None)
@@ -2820,71 +2864,13 @@ def _open_or_create_claude_keychain_broker_directory(
         raise ReviewError("Claude Keychain broker container path is not normalized")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_DIRECTORY", 0) | nofollow
+    ancestors = contextlib.ExitStack()
     try:
-        with _open_absolute_directory_chain_without_symlinks(container) as (
-            container_descriptor,
-            _ancestor_identities,
-        ):
-            _validate_claude_runtime_directory_descriptor(
-                container,
-                container_descriptor,
-                private=True,
-            )
-            descriptors: list[int] = []
-            current = container
-            try:
-                for component in ("claude-runtime", "keychain-broker"):
-                    parent_descriptor = (
-                        descriptors[-1] if descriptors else container_descriptor
-                    )
-                    try:
-                        os.mkdir(component, 0o700, dir_fd=parent_descriptor)
-                    except FileExistsError:
-                        pass
-                    except OSError as error:
-                        raise ClaudeExecutableInspectionInconclusive(
-                            "cannot create the Claude Keychain broker directory: "
-                            f"{error}"
-                        ) from error
-                    try:
-                        descriptor = os.open(
-                            component,
-                            flags,
-                            dir_fd=parent_descriptor,
-                        )
-                    except OSError as error:
-                        if error.errno in {errno.ELOOP, errno.ENOTDIR}:
-                            raise ReviewError(
-                                "Claude Keychain broker path must use real directories"
-                            ) from error
-                        raise ClaudeExecutableInspectionInconclusive(
-                            "cannot open the Claude Keychain broker directory chain"
-                        ) from error
-                    descriptors.append(descriptor)
-                    current /= component
-                    _validate_claude_runtime_directory_descriptor(
-                        current,
-                        descriptor,
-                        private=True,
-                    )
-                yield current, descriptors[-1]
-            except BaseException:
-                for descriptor in reversed(descriptors):
-                    with contextlib.suppress(OSError):
-                        os.close(descriptor)
-                raise
-            else:
-                close_error: OSError | None = None
-                for descriptor in reversed(descriptors):
-                    try:
-                        os.close(descriptor)
-                    except OSError as error:
-                        close_error = close_error or error
-                if close_error is not None:
-                    raise ClaudeExecutableInspectionInconclusive(
-                        "cannot close the Claude Keychain broker directory chain"
-                    ) from close_error
+        container_descriptor, _ancestor_identities = ancestors.enter_context(
+            _open_absolute_directory_chain_without_symlinks(container)
+        )
     except OSError as error:
+        ancestors.close()
         if error.errno in {errno.ELOOP, errno.ENOTDIR}:
             raise ReviewError(
                 "Claude Keychain broker container path must use real directories"
@@ -2892,66 +2878,180 @@ def _open_or_create_claude_keychain_broker_directory(
         raise ClaudeExecutableInspectionInconclusive(
             "cannot inspect the Claude Keychain broker container path"
         ) from error
+    with ancestors:
+        _validate_claude_runtime_directory_descriptor(
+            container,
+            container_descriptor,
+            private=True,
+        )
+        descriptors: list[int] = []
+        current = container
+        try:
+            try:
+                os.mkdir("claude-runtime", 0o700, dir_fd=container_descriptor)
+            except FileExistsError:
+                pass
+            except OSError as error:
+                raise ClaudeExecutableInspectionInconclusive(
+                    f"cannot create the Claude Keychain runtime directory: {error}"
+                ) from error
+            try:
+                runtime_descriptor = os.open(
+                    "claude-runtime",
+                    flags,
+                    dir_fd=container_descriptor,
+                )
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise ReviewError(
+                        "Claude Keychain broker path must use real directories"
+                    ) from error
+                raise ClaudeExecutableInspectionInconclusive(
+                    "cannot open the Claude Keychain runtime directory"
+                ) from error
+            descriptors.append(runtime_descriptor)
+            current /= "claude-runtime"
+            _validate_claude_runtime_directory_descriptor(
+                current,
+                runtime_descriptor,
+                private=True,
+            )
+            broker_name: str | None = None
+            for _attempt in range(CLAUDE_KEYCHAIN_BROKER_DIRECTORY_ATTEMPTS):
+                candidate = _claude_keychain_identity_directory_name()
+                try:
+                    os.mkdir(candidate, 0o700, dir_fd=runtime_descriptor)
+                except FileExistsError:
+                    continue
+                except OSError as error:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        f"cannot create the Claude Keychain broker directory: {error}"
+                    ) from error
+                broker_name = candidate
+                break
+            if broker_name is None:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "cannot allocate a unique Claude Keychain broker directory"
+                )
+            try:
+                broker_descriptor = os.open(
+                    broker_name,
+                    flags,
+                    dir_fd=runtime_descriptor,
+                )
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise ReviewError(
+                        "Claude Keychain broker path must use real directories"
+                    ) from error
+                raise ClaudeExecutableInspectionInconclusive(
+                    "cannot open the Claude Keychain broker directory"
+                ) from error
+            descriptors.append(broker_descriptor)
+            current /= broker_name
+            _validate_claude_runtime_directory_descriptor(
+                current,
+                broker_descriptor,
+                private=True,
+            )
+            yield current, broker_descriptor
+        except BaseException:
+            for descriptor in reversed(descriptors):
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+            raise
+        else:
+            close_error: OSError | None = None
+            for descriptor in reversed(descriptors):
+                try:
+                    os.close(descriptor)
+                except OSError as error:
+                    close_error = close_error or error
+            if close_error is not None:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "cannot close the Claude Keychain broker directory chain"
+                ) from close_error
 
 
-def _remove_claude_keychain_broker_artifact(
-    directory_descriptor: int,
-    name: str,
-) -> None:
-    try:
-        os.unlink(name, dir_fd=directory_descriptor)
-    except FileNotFoundError:
-        return
-    except IsADirectoryError as error:
-        raise ReviewError(
-            f"Claude Keychain broker artifact must not be a directory: {name}"
-        ) from error
-    except OSError as error:
-        raise ClaudeExecutableInspectionInconclusive(
-            f"cannot remove stale Claude Keychain broker artifact {name}: {error}"
-        ) from error
-
-
-def _finalize_claude_keychain_broker(
-    broker: pathlib.Path,
+def _read_verified_claude_keychain_broker(
+    path: pathlib.Path,
     *,
-    directory_descriptor: int,
-) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    require_root_owned: bool = False,
+) -> bytes:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude Keychain broker verification requires O_NOFOLLOW"
+        )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow
     try:
-        descriptor = os.open(broker.name, flags, dir_fd=directory_descriptor)
+        descriptor = os.open(path, flags)
+    except FileNotFoundError as error:
+        raise ClaudeKeychainBrokerUnavailable(
+            "Claude Keychain broker is not installed"
+        ) from error
     except OSError as error:
         if error.errno in {errno.ELOOP, errno.ENOTDIR}:
             raise ReviewError("Claude Keychain broker must be a real file") from error
         raise ClaudeExecutableInspectionInconclusive(
-            f"cannot open the compiled Claude Keychain broker: {error}"
+            f"cannot open the Claude Keychain broker artifact: {error}"
         ) from error
     try:
-        metadata = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != os.geteuid()
-            or metadata.st_nlink != 1
-        ):
-            raise ReviewError(
-                "Claude Keychain broker must be a current-user-owned regular file "
-                "with one link"
+        before = os.fstat(descriptor)
+        if require_root_owned:
+            metadata_safe = (
+                before.st_uid == 0
+                and before.st_gid == 0
+                and stat.S_IMODE(before.st_mode) == 0o555
             )
-        os.fchmod(descriptor, 0o700)
-        dirent = os.stat(
-            broker.name,
-            dir_fd=directory_descriptor,
-            follow_symlinks=False,
-        )
+        else:
+            metadata_safe = (
+                before.st_uid in {0, os.geteuid()}
+                and not stat.S_IMODE(before.st_mode) & 0o022
+            )
         if (
-            dirent.st_dev != metadata.st_dev
-            or dirent.st_ino != metadata.st_ino
+            not stat.S_ISREG(before.st_mode)
+            or not metadata_safe
+            or before.st_nlink != 1
+            or not 0 < before.st_size <= CLAUDE_KEYCHAIN_BROKER_ARTIFACT_LIMIT_BYTES
+        ):
+            raise ReviewError("Claude Keychain broker artifact has unsafe metadata")
+        _require_no_extended_acl(
+            descriptor,
+            label="Claude Keychain broker artifact",
+        )
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude Keychain broker artifact was truncated while read"
+                )
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude Keychain broker artifact grew while read"
+            )
+        after = os.fstat(descriptor)
+        dirent = os.stat(path, follow_symlinks=False)
+        if (
+            (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            or dirent.st_dev != before.st_dev
+            or dirent.st_ino != before.st_ino
             or not stat.S_ISREG(dirent.st_mode)
         ):
             raise ClaudeExecutableInspectionInconclusive(
-                "Claude Keychain broker changed while finalized"
+                "Claude Keychain broker artifact changed while verified"
             )
+        payload = b"".join(chunks)
+        if (
+            hashlib.sha256(payload).hexdigest()
+            != CLAUDE_KEYCHAIN_BROKER_ARTIFACT_SHA256
+        ):
+            raise ReviewError("Claude Keychain broker artifact digest is invalid")
     except BaseException:
         with contextlib.suppress(OSError):
             os.close(descriptor)
@@ -2961,8 +3061,194 @@ def _finalize_claude_keychain_broker(
             os.close(descriptor)
         except OSError as error:
             raise ClaudeExecutableInspectionInconclusive(
-                "cannot close the compiled Claude Keychain broker"
+                "cannot close the Claude Keychain broker artifact"
             ) from error
+    return payload
+
+
+def _validate_root_owned_claude_keychain_broker_directory(
+    path: pathlib.Path,
+    descriptor: int,
+) -> None:
+    try:
+        metadata = os.fstat(descriptor)
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot inspect installed Claude Keychain broker ancestor {path}"
+        ) from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise ReviewError(
+            "installed Claude Keychain broker ancestors must be root-owned and "
+            "not group- or world-writable"
+        )
+    _require_no_extended_acl(
+        descriptor,
+        label=f"installed Claude Keychain broker ancestor {path}",
+    )
+
+
+def _require_installed_claude_keychain_broker() -> None:
+    broker = CLAUDE_KEYCHAIN_BROKER_INSTALL_PATH
+    try:
+        with _open_absolute_directory_chain_without_symlinks(
+            broker.parent,
+            descriptor_validator=(
+                _validate_root_owned_claude_keychain_broker_directory
+            ),
+        ):
+            _read_verified_claude_keychain_broker(
+                broker,
+                require_root_owned=True,
+            )
+            _native_macho_dependencies(
+                broker,
+                label="installed Claude Keychain broker",
+            )
+    except FileNotFoundError as error:
+        raise ClaudeKeychainBrokerUnavailable(
+            "Claude Keychain broker is not installed"
+        ) from error
+    except ClaudeCredentialUnsafe as error:
+        raise ReviewError(
+            "installed Claude Keychain broker path must not contain symlinks"
+        ) from error
+
+
+def _darwin_volume_inode_path(metadata: os.stat_result) -> pathlib.Path:
+    if sys.platform != "darwin":
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude Keychain broker volume identities require macOS"
+        )
+    result = pathlib.Path("/.vol") / str(metadata.st_dev) / str(metadata.st_ino)
+    try:
+        resolved = os.stat(result, follow_symlinks=False)
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot resolve the Claude Keychain broker volume identity"
+        ) from error
+    if (resolved.st_dev, resolved.st_ino) != (metadata.st_dev, metadata.st_ino):
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude Keychain broker volume identity does not match its directory"
+        )
+    return result
+
+
+def _claude_macos_descriptor_path(descriptor: int) -> pathlib.Path:
+    try:
+        darwin_fcntl = importlib.import_module("fcntl")
+        getpath = darwin_fcntl.F_GETPATH
+        raw = darwin_fcntl.fcntl(
+            descriptor,
+            getpath,
+            b"\x00" * CLAUDE_MACOS_PATH_BUFFER_BYTES,
+        )
+    except (AttributeError, ImportError, OSError) as error:
+        raise ClaudeCredentialInspectionInconclusive(
+            "cannot resolve the Claude Keychain broker identity directory"
+        ) from error
+    if not isinstance(raw, bytes):
+        raise ClaudeCredentialInspectionInconclusive(
+            "Claude Keychain broker identity directory resolution is invalid"
+        )
+    encoded = raw.split(b"\x00", 1)[0]
+    if not encoded:
+        raise ClaudeCredentialInspectionInconclusive(
+            "Claude Keychain broker identity directory resolution is empty"
+        )
+    path = pathlib.Path(os.fsdecode(encoded))
+    if not path.is_absolute():
+        raise ClaudeCredentialInspectionInconclusive(
+            "Claude Keychain broker identity directory resolution is not absolute"
+        )
+    return path
+
+
+def _require_claude_keychain_identity_directory(path: pathlib.Path) -> pathlib.Path:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        directory_descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ClaudeCredentialInspectionInconclusive(
+            "cannot inspect the Claude Keychain broker identity directory"
+        ) from error
+    try:
+        _validate_claude_runtime_directory_descriptor(
+            path,
+            directory_descriptor,
+            private=True,
+        )
+        canonical_path = _claude_macos_descriptor_path(directory_descriptor)
+        descriptor_metadata = os.fstat(directory_descriptor)
+        canonical_metadata = os.stat(canonical_path, follow_symlinks=False)
+        if (
+            canonical_metadata.st_dev,
+            canonical_metadata.st_ino,
+        ) != (
+            descriptor_metadata.st_dev,
+            descriptor_metadata.st_ino,
+        ) or not stat.S_ISDIR(canonical_metadata.st_mode):
+            raise ClaudeCredentialInspectionInconclusive(
+                "Claude Keychain broker identity directory changed while resolved"
+            )
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(directory_descriptor)
+        raise
+    else:
+        try:
+            os.close(directory_descriptor)
+        except OSError as error:
+            raise ClaudeCredentialInspectionInconclusive(
+                "cannot close the Claude Keychain broker identity directory"
+            ) from error
+    return canonical_path
+
+
+def _require_claude_keychain_identity_socket(path: pathlib.Path) -> pathlib.Path:
+    canonical_directory = _require_claude_keychain_identity_directory(path.parent)
+    canonical_path = canonical_directory / path.name
+    try:
+        metadata = os.stat(path, follow_symlinks=False)
+        canonical_metadata = os.stat(canonical_path, follow_symlinks=False)
+    except OSError as error:
+        raise ClaudeCredentialInspectionInconclusive(
+            "cannot inspect the Claude Keychain broker identity socket"
+        ) from error
+    if (
+        not stat.S_ISSOCK(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or not stat.S_ISSOCK(canonical_metadata.st_mode)
+        or (metadata.st_dev, metadata.st_ino)
+        != (canonical_metadata.st_dev, canonical_metadata.st_ino)
+    ):
+        raise ReviewError(
+            "Claude local-login sandbox requires a valid Keychain broker "
+            "identity socket"
+        )
+    return canonical_path
+
+
+def _allocate_claude_keychain_identity_directory(
+    review: ReviewWorkspace,
+) -> pathlib.Path:
+    with _open_or_create_claude_keychain_identity_directory(review) as (
+        identity_dir,
+        identity_directory_descriptor,
+    ):
+        _validate_claude_runtime_directory_descriptor(
+            identity_dir,
+            identity_directory_descriptor,
+            private=True,
+        )
+        identity_directory_metadata = os.fstat(identity_directory_descriptor)
+        return _darwin_volume_inode_path(identity_directory_metadata)
 
 
 def _prepare_claude_keychain_broker(
@@ -2976,86 +3262,27 @@ def _prepare_claude_keychain_broker(
         CLAUDE_KEYCHAIN_CLIENT,
         requirement="Claude local-login review requires /usr/bin/security",
     )
-    compiler = CLAUDE_KEYCHAIN_BROKER_COMPILER
-    _require_claude_keychain_executable(
-        compiler,
-        requirement="Claude local-login review requires /usr/bin/clang",
-    )
-    try:
-        source_metadata = CLAUDE_KEYCHAIN_BROKER_SOURCE.stat()
-    except FileNotFoundError as error:
-        raise ReviewError("Claude Keychain broker source is unavailable") from error
-    except OSError as error:
-        raise ClaudeExecutableInspectionInconclusive(
-            f"cannot inspect the Claude Keychain broker source: {error}"
-        ) from error
-    if not stat.S_ISREG(source_metadata.st_mode):
-        raise ReviewError("Claude Keychain broker source is unavailable")
     home_raw = result.get("HOME")
     if not home_raw:
         raise ReviewError("Claude Keychain broker requires an isolated HOME")
     home = pathlib.Path(home_raw).resolve()
     if not is_relative_to(home, review.container_dir.resolve()):
         raise ReviewError("Claude Keychain broker requires a helper-owned HOME")
-    with _open_or_create_claude_keychain_broker_directory(review) as (
-        broker_dir,
-        broker_directory_descriptor,
-    ):
-        broker = broker_dir / "security"
-        stdout_path = broker_dir / "build.stdout.log"
-        stderr_path = broker_dir / "build.stderr.log"
-        for artifact_name in (broker.name, stdout_path.name, stderr_path.name):
-            _remove_claude_keychain_broker_artifact(
-                broker_directory_descriptor,
-                artifact_name,
-            )
-        try:
-            completed = run(
-                (
-                    str(compiler),
-                    "-Wall",
-                    "-Wextra",
-                    "-Werror",
-                    "-Wno-deprecated-declarations",
-                    str(CLAUDE_KEYCHAIN_BROKER_SOURCE),
-                    "-o",
-                    str(broker),
-                ),
-                cwd=broker_dir,
-                env=child_environment(container_dir=review.container_dir),
-                stdout_path=stdout_path,
-                stderr_path=stderr_path,
-                timeout_seconds=CLAUDE_KEYCHAIN_BROKER_TIMEOUT_SECONDS,
-                output_file_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
-            )
-        except OSError as error:
-            raise ClaudeExecutableInspectionInconclusive(
-                f"cannot build the Claude Keychain broker: {error}"
-            ) from error
-        if completed.returncode != 0:
-            detail = completed.stderr.decode("utf-8", errors="replace").strip()
-            raise ClaudeExecutableInspectionInconclusive(
-                "failed to build the Claude Keychain broker"
-                + (f": {detail}" if detail else "")
-            )
-        _finalize_claude_keychain_broker(
-            broker,
-            directory_descriptor=broker_directory_descriptor,
-        )
-        _validate_claude_runtime_directory_descriptor(
-            broker_dir,
-            broker_directory_descriptor,
-            private=True,
-        )
-        _native_macho_dependencies(broker, label="Claude Keychain broker")
-        _validate_claude_runtime_directory_descriptor(
-            broker_dir,
-            broker_directory_descriptor,
-            private=True,
-        )
+    _require_installed_claude_keychain_broker()
     result["USER"] = _claude_keychain_account()
+    result[CLAUDE_KEYCHAIN_BROKER_EXECUTABLE_ENV] = str(
+        CLAUDE_KEYCHAIN_BROKER_INSTALL_PATH
+    )
+    result.pop(CLAUDE_KEYCHAIN_BROKER_IDENTITY_DIRECTORY_ENV, None)
+    result.pop(CLAUDE_KEYCHAIN_BROKER_IDENTITY_SOCKET_ENV, None)
+    result.pop(CLAUDE_KEYCHAIN_BROKER_PORT_ENV, None)
     result["PATH"] = os.pathsep.join(
-        value for value in (str(broker_dir), result.get("PATH")) if value
+        value
+        for value in (
+            str(CLAUDE_KEYCHAIN_BROKER_INSTALL_PATH.parent),
+            result.get("PATH"),
+        )
+        if value
     )
     return result
 
@@ -3214,6 +3441,8 @@ def _open_absolute_directory_without_symlinks(path: pathlib.Path) -> int:
 @contextlib.contextmanager
 def _open_absolute_directory_chain_without_symlinks(
     path: pathlib.Path,
+    *,
+    descriptor_validator: Callable[[pathlib.Path, int], None] | None = None,
 ) -> Iterator[tuple[int, tuple[tuple[int, ...], ...]]]:
     if not path.is_absolute() or any(part in {".", ".."} for part in path.parts):
         raise ClaudeCredentialUnsafe(
@@ -3231,6 +3460,9 @@ def _open_absolute_directory_chain_without_symlinks(
         descriptors.append(root_descriptor)
         pending_descriptor = None
         identities.append(_claude_linux_directory_identity(os.fstat(root_descriptor)))
+        if descriptor_validator is not None:
+            descriptor_validator(pathlib.Path("/"), root_descriptor)
+        current = pathlib.Path("/")
         for component in components:
             parent_descriptor = descriptors[-1]
             before_metadata = os.stat(
@@ -3263,6 +3495,9 @@ def _open_absolute_directory_chain_without_symlinks(
                     "a retained Claude artifact ancestor changed while opened"
                 )
             identities.append(opened_identity)
+            current /= component
+            if descriptor_validator is not None:
+                descriptor_validator(current, next_descriptor)
         yield descriptors[-1], tuple(identities)
         if _claude_linux_directory_identity(os.fstat(descriptors[0])) != identities[0]:
             raise ClaudeCredentialInspectionInconclusive(
@@ -6578,6 +6813,150 @@ def _update_claude_runtime_report_preserving_persistence(
         raise failure from report_error
 
 
+def _claude_macos_process_cdhash(process_id: int) -> bytes | None:
+    if sys.platform != "darwin":
+        raise ClaudeCredentialInspectionInconclusive(
+            "Claude Keychain broker process identity requires macOS"
+        )
+    if process_id <= 0:
+        return None
+    library = ctypes.CDLL(None, use_errno=True)
+    try:
+        csops = library.csops
+    except AttributeError as error:
+        raise ClaudeCredentialInspectionInconclusive(
+            "macOS csops is unavailable for Claude Keychain broker identity"
+        ) from error
+    csops.argtypes = (
+        ctypes.c_int,
+        ctypes.c_uint,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    )
+    csops.restype = ctypes.c_int
+    code_hash = (ctypes.c_ubyte * CLAUDE_MACOS_CDHASH_BYTES)()
+    ctypes.set_errno(0)
+    result = csops(
+        process_id,
+        CLAUDE_MACOS_CS_OPS_CDHASH,
+        ctypes.byref(code_hash),
+        ctypes.sizeof(code_hash),
+    )
+    if result == 0:
+        return bytes(code_hash)
+    error_number = ctypes.get_errno() or errno.EIO
+    if error_number == errno.ESRCH:
+        return None
+    raise ClaudeCredentialInspectionInconclusive(
+        "cannot inspect the running Claude Keychain broker code identity"
+    ) from OSError(error_number, os.strerror(error_number))
+
+
+def _claude_keychain_peer_process_id(connection: socket.socket) -> int | None:
+    if sys.platform != "darwin":
+        raise ClaudeCredentialInspectionInconclusive(
+            "Claude Keychain broker peer credentials require macOS"
+        )
+    peer_pid = connection.getsockopt(
+        CLAUDE_KEYCHAIN_BROKER_LOCAL_SOCKET_LEVEL,
+        CLAUDE_KEYCHAIN_BROKER_LOCAL_PEERPID,
+    )
+    if not isinstance(peer_pid, int) or peer_pid <= 0:
+        return None
+    library = ctypes.CDLL(None, use_errno=True)
+    try:
+        getpeereid = library.getpeereid
+    except AttributeError as error:
+        raise ClaudeCredentialInspectionInconclusive(
+            "macOS getpeereid is unavailable for Claude Keychain broker identity"
+        ) from error
+    getpeereid.argtypes = (
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_uint),
+        ctypes.POINTER(ctypes.c_uint),
+    )
+    getpeereid.restype = ctypes.c_int
+    peer_uid = ctypes.c_uint()
+    peer_gid = ctypes.c_uint()
+    ctypes.set_errno(0)
+    if (
+        getpeereid(
+            connection.fileno(),
+            ctypes.byref(peer_uid),
+            ctypes.byref(peer_gid),
+        )
+        != 0
+    ):
+        error_number = ctypes.get_errno() or errno.EIO
+        raise ClaudeCredentialInspectionInconclusive(
+            "cannot inspect the Claude Keychain broker peer credentials"
+        ) from OSError(error_number, os.strerror(error_number))
+    if peer_uid.value != os.geteuid() or peer_gid.value != os.getegid():
+        return None
+    return peer_pid
+
+
+class _ClaudeKeychainIdentityHandler(socketserver.BaseRequestHandler):
+    def handle(self) -> None:
+        server = self.server
+        if not isinstance(server, _ClaudeKeychainIdentityServer):
+            return
+        self.request.settimeout(2.0)
+        try:
+            peer_pid = _claude_keychain_peer_process_id(self.request)
+            if peer_pid is None:
+                return
+            if not server.credential_server.authorize_identity_peer(peer_pid):
+                return
+            self.request.sendall(server.credential_server.capability)
+        except (BrokenPipeError, ConnectionError, TimeoutError):
+            return
+        except BaseException as error:
+            server.credential_server.record_handler_error(error)
+
+
+class _ClaudeKeychainIdentityServer(socketserver.UnixStreamServer):
+    allow_reuse_address = False
+
+    def __init__(
+        self,
+        socket_path: pathlib.Path,
+        credential_server: _ClaudeKeychainCredentialServer,
+    ) -> None:
+        self.credential_server = credential_server
+        self._serve_condition = threading.Condition()
+        self._serving = False
+        self._serve_stopped = False
+        self._serve_error: BaseException | None = None
+        super().__init__(str(socket_path), _ClaudeKeychainIdentityHandler)
+
+    def service_actions(self) -> None:
+        with self._serve_condition:
+            if not self._serving:
+                self._serving = True
+                self._serve_condition.notify_all()
+
+    def record_serve_stopped(self, error: BaseException | None) -> None:
+        with self._serve_condition:
+            self._serve_stopped = True
+            self._serve_error = error
+            self._serve_condition.notify_all()
+
+    def wait_until_serving(self, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._serve_condition:
+            while not self._serving and not self._serve_stopped:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._serve_condition.wait(timeout=remaining)
+            return self._serving and not self._serve_stopped
+
+    def serve_error(self) -> BaseException | None:
+        with self._serve_condition:
+            return self._serve_error
+
+
 class _ClaudeKeychainCredentialHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         server = self.server
@@ -6593,6 +6972,12 @@ class _ClaudeKeychainCredentialHandler(socketserver.BaseRequestHandler):
         authorized = hmac.compare_digest(raw_capability, server.capability)
         raw_capability[:] = b"\x00" * len(raw_capability)
         if not authorized:
+            with contextlib.suppress(OSError):
+                self.request.sendall(b"\x01")
+            return
+        try:
+            self.request.sendall(b"\x00")
+        except OSError:
             return
         operation = _recv_exact(self.request, 1)
         if operation == b"R":
@@ -6656,6 +7041,34 @@ class _ClaudeKeychainCredentialHandler(socketserver.BaseRequestHandler):
             updated_credential[:] = b"\x00" * len(updated_credential)
 
 
+@dataclass(frozen=True)
+class _ClaudeRuntimeProcessBinding:
+    process_id: int
+    session_id: int
+    process_group: int
+
+
+def _inspect_claude_runtime_process(process_id: int) -> _ClaudeRuntimeProcessBinding:
+    if process_id <= 0:
+        raise ReviewError("Claude Keychain broker runtime process is invalid")
+    try:
+        session_id = os.getsid(process_id)
+        process_group = os.getpgid(process_id)
+    except OSError as error:
+        raise ClaudeCredentialInspectionInconclusive(
+            "cannot inspect the Claude Keychain broker runtime process"
+        ) from error
+    if session_id != process_id or process_group != process_id:
+        raise ReviewError(
+            "Claude Keychain broker runtime must start as its own session"
+        )
+    return _ClaudeRuntimeProcessBinding(
+        process_id=process_id,
+        session_id=session_id,
+        process_group=process_group,
+    )
+
+
 class _ClaudeKeychainCredentialServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
@@ -6665,6 +7078,7 @@ class _ClaudeKeychainCredentialServer(socketserver.ThreadingTCPServer):
         self,
         credential: bytearray | None,
         capability: bytes,
+        allowed_broker_cdhashes: frozenset[bytes],
         update_callback: Callable[
             [
                 bytearray,
@@ -6675,28 +7089,107 @@ class _ClaudeKeychainCredentialServer(socketserver.ThreadingTCPServer):
         ]
         | None,
     ) -> None:
-        super().__init__(("127.0.0.1", 0), _ClaudeKeychainCredentialHandler)
-        self.credential = bytearray(credential) if credential is not None else None
-        self.capability = capability
-        self.credential_lock = threading.Lock()
-        self.consumed = False
-        self.update_callback = update_callback
-        self.update_lock = threading.Lock()
-        self.updated = False
-        self._handler_condition = threading.Condition()
-        self._handler_threads: set[threading.Thread] = set()
-        self._handler_sockets: dict[threading.Thread, socket.socket] = {}
-        self._handler_errors: list[BaseException] = []
-        self._closing = False
-        self._abandoned = threading.Event()
-        self._pending_update_lock = threading.Lock()
-        self._pending_update: tuple[int, bytearray] | None = None
-        self._pending_generation = 0
-        self._updates_closed = False
-        self._serve_condition = threading.Condition()
-        self._serving = False
-        self._serve_stopped = False
-        self._serve_error: BaseException | None = None
+        if not allowed_broker_cdhashes or any(
+            len(code_hash) != CLAUDE_MACOS_CDHASH_BYTES
+            for code_hash in allowed_broker_cdhashes
+        ):
+            raise ReviewError("Claude Keychain broker code identities are unavailable")
+        self.credential: bytearray | None = None
+        try:
+            super().__init__(("127.0.0.1", 0), _ClaudeKeychainCredentialHandler)
+            self.credential = bytearray(credential) if credential is not None else None
+            self.capability = capability
+            self.credential_lock = threading.Lock()
+            self.consumed = False
+            self.update_callback = update_callback
+            self.update_lock = threading.Lock()
+            self.updated = False
+            self._handler_condition = threading.Condition()
+            self._handler_threads: set[threading.Thread] = set()
+            self._handler_sockets: dict[threading.Thread, socket.socket] = {}
+            self._handler_errors: list[BaseException] = []
+            self._closing = False
+            self._abandoned = threading.Event()
+            self._pending_update_lock = threading.Lock()
+            self._pending_update: tuple[int, bytearray] | None = None
+            self._pending_generation = 0
+            self._updates_closed = False
+            self._serve_condition = threading.Condition()
+            self._serving = False
+            self._serve_stopped = False
+            self._serve_error: BaseException | None = None
+            self._runtime_session_lock = threading.Lock()
+            self._runtime_session_id: int | None = None
+            self.allowed_broker_cdhashes = allowed_broker_cdhashes
+        except BaseException:
+            if self.credential is not None:
+                self.credential[:] = b"\x00" * len(self.credential)
+            with contextlib.suppress(BaseException):
+                self.server_close()
+            raise
+
+    def bind_runtime_process(self, binding: _ClaudeRuntimeProcessBinding) -> None:
+        if (
+            binding.process_id <= 0
+            or binding.session_id != binding.process_id
+            or binding.process_group != binding.process_id
+        ):
+            raise ReviewError(
+                "Claude Keychain broker runtime must start as its own session"
+            )
+        if not self._runtime_session_lock.acquire(blocking=False):
+            raise ClaudeCredentialInspectionInconclusive(
+                "Claude Keychain broker runtime binding is busy"
+            )
+        try:
+            if self._runtime_session_id is not None:
+                raise ReviewError(
+                    "Claude Keychain broker runtime process was already bound"
+                )
+            self._runtime_session_id = binding.process_id
+        finally:
+            self._runtime_session_lock.release()
+
+    def authorize_identity_peer(self, process_id: int) -> bool:
+        with self._runtime_session_lock:
+            expected_session = self._runtime_session_id
+        if expected_session is None:
+            return False
+        try:
+            session_before = os.getsid(process_id)
+            process_group_before = os.getpgid(process_id)
+        except ProcessLookupError:
+            return False
+        except OSError as error:
+            raise ClaudeCredentialInspectionInconclusive(
+                "cannot inspect the Claude Keychain broker peer session"
+            ) from error
+        if (
+            session_before != expected_session
+            or process_group_before != expected_session
+        ):
+            return False
+        code_hash = _claude_macos_process_cdhash(process_id)
+        if code_hash is None or not any(
+            hmac.compare_digest(code_hash, expected)
+            for expected in self.allowed_broker_cdhashes
+        ):
+            return False
+        try:
+            return (
+                os.getsid(process_id) == expected_session
+                and os.getpgid(process_id) == expected_session
+            )
+        except ProcessLookupError:
+            return False
+        except OSError as error:
+            raise ClaudeCredentialInspectionInconclusive(
+                "cannot revalidate the Claude Keychain broker peer session"
+            ) from error
+
+    def record_handler_error(self, error: BaseException) -> None:
+        with self._handler_condition:
+            self._handler_errors.append(error)
 
     def process_request(
         self,
@@ -7310,34 +7803,413 @@ def _bounded_claude_keychain_quiescence_recovery(
     return result[0] if result else None
 
 
+@dataclass(frozen=True)
+class _ClaudeKeychainBrokerEndpoint:
+    port: int
+    identity_socket: pathlib.Path
+    prepare_runtime_process: Callable[[int], _ClaudeRuntimeProcessBinding]
+    bind_runtime_process: Callable[[_ClaudeRuntimeProcessBinding], None]
+
+
+class _ClaudeKeychainRuntimeEnvironment(dict[str, str]):
+    def __init__(
+        self,
+        values: dict[str, str],
+        prepare_runtime_process: Callable[[int], _ClaudeRuntimeProcessBinding],
+        bind_runtime_process: Callable[[_ClaudeRuntimeProcessBinding], None],
+    ) -> None:
+        super().__init__(values)
+        self.prepare_runtime_process = prepare_runtime_process
+        self.bind_runtime_process = bind_runtime_process
+
+
+@dataclass(frozen=True)
+class _ClaudeKeychainIdentityRuntime:
+    server: _ClaudeKeychainIdentityServer
+    thread: threading.Thread
+    socket_path: pathlib.Path
+    socket_identity: tuple[int, int]
+
+
+def _verify_claude_keychain_identity_socket_for_cleanup(
+    socket_path: pathlib.Path,
+    socket_identity: tuple[int, int],
+    *,
+    missing_is_error: bool,
+) -> BaseException | None:
+    try:
+        current = os.stat(socket_path, follow_symlinks=False)
+    except FileNotFoundError:
+        if not missing_is_error:
+            return None
+        return ClaudeCredentialInspectionInconclusive(
+            "Claude Keychain broker identity socket disappeared during cleanup"
+        )
+    except OSError as error:
+        failure = ClaudeCredentialInspectionInconclusive(
+            "cannot inspect the Claude Keychain broker identity socket during cleanup"
+        )
+        failure.__cause__ = error
+        return failure
+    if (current.st_dev, current.st_ino) != socket_identity or not stat.S_ISSOCK(
+        current.st_mode
+    ):
+        return ClaudeCredentialInspectionInconclusive(
+            "Claude Keychain broker identity socket changed during cleanup"
+        )
+    return None
+
+
+def _close_unstarted_claude_keychain_identity_server(
+    server: _ClaudeKeychainIdentityServer,
+    socket_path: pathlib.Path,
+    socket_identity: tuple[int, int],
+) -> tuple[BaseException, ...]:
+    errors: list[BaseException] = []
+    try:
+        server.server_close()
+    except BaseException as error:
+        errors.append(error)
+    cleanup_error = _verify_claude_keychain_identity_socket_for_cleanup(
+        socket_path,
+        socket_identity,
+        missing_is_error=False,
+    )
+    if cleanup_error is not None:
+        errors.append(cleanup_error)
+    return tuple(errors)
+
+
+def _raise_claude_identity_cleanup_control_flow(
+    primary: BaseException | None,
+    cleanup_errors: tuple[BaseException, ...] | list[BaseException],
+) -> None:
+    selected = (
+        primary
+        if primary is not None and _is_claude_control_flow_error(primary)
+        else next(
+            (
+                error
+                for error in cleanup_errors
+                if _is_claude_control_flow_error(error)
+            ),
+            None,
+        )
+    )
+    if selected is None:
+        return
+    for error in (primary, *cleanup_errors):
+        if error is None or error is selected:
+            continue
+        _attach_claude_credential_cleanup_failure(selected, error)
+    raise selected
+
+
+def _start_claude_keychain_identity_server(
+    credential_server: _ClaudeKeychainCredentialServer,
+    socket_path: pathlib.Path,
+) -> _ClaudeKeychainIdentityRuntime:
+    startup_deadline = (
+        time.monotonic() + CLAUDE_KEYCHAIN_SERVER_START_TIMEOUT_SECONDS
+    )
+    if not socket_path.is_absolute() or socket_path.name != (
+        CLAUDE_KEYCHAIN_BROKER_IDENTITY_SOCKET_NAME
+    ):
+        raise ReviewError("Claude Keychain broker identity socket path is invalid")
+    _require_claude_keychain_identity_directory(socket_path.parent)
+    try:
+        identity_server = _ClaudeKeychainIdentityServer(
+            socket_path,
+            credential_server,
+        )
+    except OSError as error:
+        raise ClaudeCredentialInspectionInconclusive(
+            f"Claude Keychain broker cannot bind its identity socket: {error}"
+        ) from error
+    socket_identity: tuple[int, int] | None = None
+    try:
+        initial_metadata = os.stat(socket_path, follow_symlinks=False)
+        if (
+            not stat.S_ISSOCK(initial_metadata.st_mode)
+            or initial_metadata.st_uid != os.geteuid()
+        ):
+            raise ReviewError(
+                "Claude Keychain broker identity endpoint must be a socket"
+            )
+        socket_identity = (initial_metadata.st_dev, initial_metadata.st_ino)
+        os.chmod(socket_path, 0o600, follow_symlinks=False)
+        socket_metadata = os.stat(socket_path, follow_symlinks=False)
+        if (
+            not stat.S_ISSOCK(socket_metadata.st_mode)
+            or socket_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(socket_metadata.st_mode) != 0o600
+            or (socket_metadata.st_dev, socket_metadata.st_ino) != socket_identity
+        ):
+            raise ReviewError(
+                "Claude Keychain broker identity endpoint must be a socket"
+            )
+    except BaseException as error:
+        if socket_identity is not None:
+            cleanup_errors = _close_unstarted_claude_keychain_identity_server(
+                identity_server,
+                socket_path,
+                socket_identity,
+            )
+        else:
+            cleanup_errors = ()
+            try:
+                identity_server.server_close()
+            except BaseException as cleanup_error:
+                cleanup_errors = (cleanup_error,)
+        _raise_claude_identity_cleanup_control_flow(error, cleanup_errors)
+        if isinstance(error, ReviewError):
+            for cleanup_error in cleanup_errors:
+                _attach_claude_credential_cleanup_failure(error, cleanup_error)
+            raise
+        failure = ClaudeCredentialInspectionInconclusive(
+            "Claude Keychain broker cannot secure its identity endpoint"
+        )
+        for cleanup_error in cleanup_errors:
+            _attach_claude_credential_cleanup_failure(failure, cleanup_error)
+        raise failure from error
+
+    def serve() -> None:
+        serve_error: BaseException | None = None
+        try:
+            identity_server.serve_forever(
+                poll_interval=CLAUDE_KEYCHAIN_SERVER_POLL_INTERVAL_SECONDS
+            )
+        except BaseException as error:
+            serve_error = error
+        finally:
+            identity_server.record_serve_stopped(serve_error)
+
+    try:
+        thread = threading.Thread(
+            target=serve,
+            daemon=True,
+            name="claude-review-keychain-identity",
+        )
+    except BaseException as error:
+        cleanup_errors = _close_unstarted_claude_keychain_identity_server(
+            identity_server,
+            socket_path,
+            socket_identity,
+        )
+        _raise_claude_identity_cleanup_control_flow(error, cleanup_errors)
+        failure = ClaudeCredentialInspectionInconclusive(
+            f"Claude Keychain broker identity service cannot construct: {error}"
+        )
+        for cleanup_error in cleanup_errors:
+            _attach_claude_credential_cleanup_failure(failure, cleanup_error)
+        raise failure from error
+    try:
+        thread.start()
+    except BaseException as error:
+        cleanup_errors: list[BaseException] = []
+        if _claude_thread_may_have_started(thread):
+            cleanup_errors.extend(
+                _stop_claude_keychain_identity_server(
+                    _ClaudeKeychainIdentityRuntime(
+                        server=identity_server,
+                        thread=thread,
+                        socket_path=socket_path,
+                        socket_identity=socket_identity,
+                    ),
+                    deadline=startup_deadline,
+                )
+            )
+        else:
+            cleanup_errors.extend(
+                _close_unstarted_claude_keychain_identity_server(
+                    identity_server,
+                    socket_path,
+                    socket_identity,
+                )
+            )
+        _raise_claude_identity_cleanup_control_flow(error, cleanup_errors)
+        failure = ClaudeCredentialInspectionInconclusive(
+            f"Claude Keychain broker identity service cannot start: {error}"
+        )
+        for cleanup_error in cleanup_errors:
+            _attach_claude_credential_cleanup_failure(failure, cleanup_error)
+        raise failure from error
+    runtime = _ClaudeKeychainIdentityRuntime(
+        server=identity_server,
+        thread=thread,
+        socket_path=socket_path,
+        socket_identity=socket_identity,
+    )
+    try:
+        entered_serve_loop = identity_server.wait_until_serving(
+            max(0.0, startup_deadline - time.monotonic())
+        )
+    except BaseException as error:
+        cleanup_errors = _stop_claude_keychain_identity_server(
+            runtime,
+            deadline=startup_deadline,
+        )
+        _raise_claude_identity_cleanup_control_flow(error, cleanup_errors)
+        failure = ClaudeCredentialInspectionInconclusive(
+            "Claude Keychain broker identity service startup could not be observed"
+        )
+        for cleanup_error in cleanup_errors:
+            _attach_claude_credential_cleanup_failure(failure, cleanup_error)
+        raise failure from error
+    if not entered_serve_loop or time.monotonic() > startup_deadline:
+        failure = ClaudeCredentialInspectionInconclusive(
+            "Claude Keychain broker identity service did not enter its serve loop "
+            "before its startup deadline"
+        )
+        cleanup_errors = _stop_claude_keychain_identity_server(
+            runtime,
+            deadline=startup_deadline,
+        )
+        _raise_claude_identity_cleanup_control_flow(None, cleanup_errors)
+        for cleanup_error in cleanup_errors:
+            _attach_claude_credential_cleanup_failure(failure, cleanup_error)
+        serve_error = identity_server.serve_error()
+        if serve_error is not None:
+            failure.__cause__ = serve_error
+        raise failure
+    return runtime
+
+
+def _stop_claude_keychain_identity_server(
+    runtime: _ClaudeKeychainIdentityRuntime,
+    *,
+    deadline: float | None = None,
+) -> tuple[BaseException, ...]:
+    if deadline is None:
+        deadline = time.monotonic() + CLAUDE_KEYCHAIN_SERVER_SHUTDOWN_TIMEOUT_SECONDS
+    errors: list[BaseException] = []
+
+    def remaining() -> float:
+        return max(0.0, deadline - time.monotonic())
+
+    def request_shutdown() -> None:
+        try:
+            runtime.server.shutdown()
+        except BaseException as error:
+            errors.append(error)
+
+    shutdown_thread: threading.Thread | None = None
+    try:
+        shutdown_thread = threading.Thread(
+            target=request_shutdown,
+            daemon=True,
+            name="claude-review-keychain-identity-shutdown",
+        )
+        shutdown_thread.start()
+    except BaseException as error:
+        errors.append(error)
+    if shutdown_thread is not None and _claude_thread_may_have_started(shutdown_thread):
+        try:
+            shutdown_thread.join(timeout=remaining())
+        except BaseException as error:
+            errors.append(error)
+    try:
+        runtime.server.server_close()
+    except BaseException as error:
+        errors.append(error)
+    try:
+        runtime.thread.join(timeout=remaining())
+    except BaseException as error:
+        errors.append(error)
+    shutdown_stopped = False
+    serve_stopped = False
+    try:
+        shutdown_stopped = (
+            shutdown_thread is not None and not shutdown_thread.is_alive()
+        )
+    except BaseException as error:
+        errors.append(error)
+    try:
+        serve_stopped = not runtime.thread.is_alive()
+    except BaseException as error:
+        errors.append(error)
+    if not shutdown_stopped or not serve_stopped:
+        errors.append(
+            ClaudeCredentialInspectionInconclusive(
+                "Claude Keychain broker identity service did not stop"
+            )
+        )
+    try:
+        serve_error = runtime.server.serve_error()
+    except BaseException as error:
+        errors.append(error)
+    else:
+        if serve_error is not None:
+            errors.append(serve_error)
+    cleanup_error = _verify_claude_keychain_identity_socket_for_cleanup(
+        runtime.socket_path,
+        runtime.socket_identity,
+        missing_is_error=True,
+    )
+    if cleanup_error is not None:
+        errors.append(cleanup_error)
+    return tuple(errors)
+
+
 @contextlib.contextmanager
 def _claude_keychain_credential_server(
     credential: bytearray | None,
     capability: bytes,
+    *,
+    identity_socket: pathlib.Path,
+    allowed_broker_cdhashes: frozenset[bytes] = CLAUDE_KEYCHAIN_BROKER_CDHASHES,
     update_callback: Callable[
-        [bytearray, Callable[[Callable[[], bool]], bool]],
+        [
+            bytearray,
+            Callable[[Callable[[], bool]], bool],
+            Callable[[], bool],
+        ],
         bool,
     ]
     | None = None,
     quiescence_callbacks: _ClaudeKeychainQuiescenceCallbacks | None = None,
-) -> Iterator[int]:
+) -> Iterator[_ClaudeKeychainBrokerEndpoint]:
     if len(capability) != CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES:
+        if credential is not None:
+            credential[:] = b"\x00" * len(credential)
         raise ReviewError("Claude Keychain broker capability has an invalid length")
     try:
         server = _ClaudeKeychainCredentialServer(
             credential,
             capability,
+            allowed_broker_cdhashes,
             update_callback,
         )
-    except OSError as error:
-        failure_type = (
-            ClaudeLoopbackUnavailable
-            if _claude_loopback_bind_is_deterministically_unavailable(error)
-            else ClaudeCredentialInspectionInconclusive
+    except BaseException as error:
+        if credential is not None:
+            credential[:] = b"\x00" * len(credential)
+        if isinstance(error, OSError):
+            failure_type = (
+                ClaudeLoopbackUnavailable
+                if _claude_loopback_bind_is_deterministically_unavailable(error)
+                else ClaudeCredentialInspectionInconclusive
+            )
+            raise failure_type(
+                f"Claude Keychain broker cannot bind loopback: {error}"
+            ) from error
+        raise
+    try:
+        identity_runtime = _start_claude_keychain_identity_server(
+            server,
+            identity_socket,
         )
-        raise failure_type(
-            f"Claude Keychain broker cannot bind loopback: {error}"
-        ) from error
+    except BaseException as error:
+        try:
+            server.server_close()
+        except BaseException as cleanup_error:
+            _attach_claude_credential_cleanup_failure(error, cleanup_error)
+        try:
+            server.scrub_initial_credential()
+        except BaseException as cleanup_error:
+            _attach_claude_credential_cleanup_failure(error, cleanup_error)
+        if credential is not None:
+            credential[:] = b"\x00" * len(credential)
+        raise
     serve_gate = threading.Event()
     serve_cancelled = threading.Event()
 
@@ -7395,12 +8267,18 @@ def _claude_keychain_credential_server(
                 failure.__cause__ = serve_error
             raise failure
         runtime_exposed = True
-        yield int(server.server_address[1])
+        yield _ClaudeKeychainBrokerEndpoint(
+            port=int(server.server_address[1]),
+            identity_socket=identity_socket,
+            prepare_runtime_process=_inspect_claude_runtime_process,
+            bind_runtime_process=server.bind_runtime_process,
+        )
     except BaseException as error:
         primary_error = error
         raise
     finally:
         shutdown_errors: list[BaseException] = []
+        shutdown_errors.extend(_stop_claude_keychain_identity_server(identity_runtime))
         if not serve_admitted:
             serve_cancelled.set()
         serve_gate.set()
@@ -7645,6 +8523,23 @@ def _claude_keychain_credential_server(
 
 
 @contextlib.contextmanager
+def _owned_claude_macos_credentials(
+    review: ReviewWorkspace,
+) -> Iterator[tuple[_ClaudeLocalCredential, bytearray]]:
+    selected: _ClaudeLocalCredential | None = None
+    expected_credential: bytearray | None = None
+    try:
+        selected = _select_claude_macos_credential(review)
+        expected_credential = bytearray(selected.payload)
+        yield selected, expected_credential
+    finally:
+        if expected_credential is not None:
+            expected_credential[:] = b"\x00" * len(expected_credential)
+        if selected is not None:
+            selected.payload[:] = b"\x00" * len(selected.payload)
+
+
+@contextlib.contextmanager
 def _claude_keychain_runtime(
     review: ReviewWorkspace,
     env: dict[str, str],
@@ -7658,18 +8553,42 @@ def _claude_keychain_runtime(
         raise ClaudeExecutableInspectionInconclusive(
             "Claude local-login credential-lock protocol is unavailable"
         )
-    selected = _select_claude_macos_credential(review)
-    expected_credential = bytearray(selected.payload)
+    broker_raw = result.get(CLAUDE_KEYCHAIN_BROKER_EXECUTABLE_ENV)
+    if not broker_raw:
+        raise ReviewError("Claude Keychain broker executable identity is unavailable")
+    broker = pathlib.Path(broker_raw)
+    if not broker.is_absolute() or broker.name != "security":
+        raise ReviewError("Claude Keychain broker executable identity is invalid")
+    identity_directory = _allocate_claude_keychain_identity_directory(review)
+    result[CLAUDE_KEYCHAIN_BROKER_IDENTITY_DIRECTORY_ENV] = str(identity_directory)
+    identity_socket = identity_directory / CLAUDE_KEYCHAIN_BROKER_IDENTITY_SOCKET_NAME
+    with _owned_claude_macos_credentials(review) as (selected, expected_credential):
+        with _claude_keychain_runtime_selected(
+            review,
+            result,
+            refresh_lock_protocol,
+            selected,
+            expected_credential,
+            identity_socket,
+        ) as runtime_environment:
+            yield runtime_environment
+
+
+@contextlib.contextmanager
+def _claude_keychain_runtime_selected(
+    review: ReviewWorkspace,
+    result: dict[str, str],
+    refresh_lock_protocol: ClaudeRefreshLockProtocol,
+    selected: _ClaudeLocalCredential,
+    expected_credential: bytearray,
+    identity_socket: pathlib.Path,
+) -> Iterator[dict[str, str]]:
     carrier_snapshot = selected.carrier_snapshot
     if carrier_snapshot is None:
-        expected_credential[:] = b"\x00" * len(expected_credential)
-        selected.payload[:] = b"\x00" * len(selected.payload)
         raise ReviewError("Claude macOS carrier snapshot is unavailable")
     try:
         fail_closed_recovery_root = _claude_macos_recovery_root(review)
     except BaseException as error:
-        expected_credential[:] = b"\x00" * len(expected_credential)
-        selected.payload[:] = b"\x00" * len(selected.payload)
         if _is_claude_control_flow_error(error):
             raise
         failure = ClaudeCredentialInspectionInconclusive(
@@ -9272,6 +10191,7 @@ def _claude_keychain_runtime(
         with _claude_keychain_credential_server(
             selected.payload,
             capability,
+            identity_socket=identity_socket,
             update_callback=stage_refreshed_credential,
             quiescence_callbacks=_ClaudeKeychainQuiescenceCallbacks(
                 abandon=abandon_unquiescent_handler,
@@ -9281,9 +10201,11 @@ def _claude_keychain_runtime(
                 fail_closed_error=unquiescent_fail_closed_error,
                 fail_closed_fallback_error=fail_closed_scope_failure,
             ),
-        ) as port:
-            result[CLAUDE_KEYCHAIN_BROKER_PORT_ENV] = str(port)
-            result[CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV] = capability.hex()
+        ) as endpoint:
+            result[CLAUDE_KEYCHAIN_BROKER_PORT_ENV] = str(endpoint.port)
+            result[CLAUDE_KEYCHAIN_BROKER_IDENTITY_SOCKET_ENV] = str(
+                endpoint.identity_socket
+            )
             _update_claude_runtime_report(
                 review,
                 {
@@ -9295,7 +10217,11 @@ def _claude_keychain_runtime(
                     }
                 },
             )
-            yield result
+            yield _ClaudeKeychainRuntimeEnvironment(
+                result,
+                endpoint.prepare_runtime_process,
+                endpoint.bind_runtime_process,
+            )
     except BaseException as error:
         primary_error = error
         raise
@@ -14287,15 +15213,19 @@ def _with_claude_review_tool_path(
             raise ClaudeReviewToolUnavailable(str(error)) from error
     entries: list[pathlib.Path] = []
     if not _is_claude_linux_host() and not env.get("ANTHROPIC_API_KEY"):
-        broker_dir = (
-            review.container_dir.resolve() / "claude-runtime" / "keychain-broker"
-        )
-        security = broker_dir / "security"
-        if not security.is_file() or not os.access(security, os.X_OK):
+        broker_raw = env.get(CLAUDE_KEYCHAIN_BROKER_EXECUTABLE_ENV)
+        security = pathlib.Path(broker_raw) if broker_raw else None
+        if (
+            security is None
+            or not security.is_absolute()
+            or security.name != "security"
+            or security != CLAUDE_KEYCHAIN_BROKER_INSTALL_PATH
+        ):
             raise ReviewError(
                 "Claude local-login sandbox requires the restricted Keychain broker"
             )
-        entries.append(broker_dir)
+        _require_installed_claude_keychain_broker()
+        entries.append(security.parent)
     entries.append(rg.absolute().parent)
     result = dict(env)
     result["PATH"] = os.pathsep.join(dict.fromkeys(str(entry) for entry in entries))
@@ -14697,33 +15627,35 @@ def _claude_review_sandbox_profile(
             tls_dirs.update((path.absolute(), resolved))
     auth_executables: tuple[pathlib.Path, ...] = ()
     keychain_broker_port: int | None = None
+    keychain_broker_identity_socket: pathlib.Path | None = None
+    canonical_keychain_broker_identity_socket: pathlib.Path | None = None
     if not env.get("ANTHROPIC_API_KEY"):
-        broker_dir = container / "claude-runtime" / "keychain-broker"
-        security_candidate = next(
-            (
-                pathlib.Path(entry) / "security"
-                for entry in env.get("PATH", "").split(os.pathsep)
-                if entry
-                and (pathlib.Path(entry) / "security").is_file()
-                and os.access(pathlib.Path(entry) / "security", os.X_OK)
-            ),
-            None,
+        broker_raw = env.get(CLAUDE_KEYCHAIN_BROKER_EXECUTABLE_ENV)
+        if not broker_raw:
+            raise ReviewError(
+                "Claude local-login sandbox requires the restricted Keychain broker"
+            )
+        security_candidate = pathlib.Path(broker_raw)
+        path_entries = tuple(
+            pathlib.Path(entry)
+            for entry in env.get("PATH", "").split(os.pathsep)
+            if entry
         )
         if (
-            security_candidate is None
-            or security_candidate.resolve() != (broker_dir / "security").resolve()
+            not security_candidate.is_absolute()
+            or security_candidate.name != "security"
+            or security_candidate != CLAUDE_KEYCHAIN_BROKER_INSTALL_PATH
+            or not path_entries
+            or path_entries[0] != security_candidate.parent
         ):
             raise ReviewError(
                 "Claude local-login sandbox requires the restricted Keychain broker"
             )
+        _require_installed_claude_keychain_broker()
         auth_executables = _native_macho_dependencies(
-            broker_dir / "security",
+            security_candidate,
             label="Claude Keychain broker",
         )
-        if any(
-            not is_relative_to(path.resolve(), container) for path in auth_executables
-        ):
-            raise ReviewError("Claude Keychain broker must be helper-owned")
         try:
             keychain_broker_port = int(env[CLAUDE_KEYCHAIN_BROKER_PORT_ENV])
         except (KeyError, ValueError) as error:
@@ -14734,12 +15666,31 @@ def _claude_review_sandbox_profile(
             raise ReviewError(
                 "Claude local-login sandbox requires a valid Keychain broker port"
             )
-        if not CLAUDE_KEYCHAIN_BROKER_CAPABILITY.fullmatch(
-            env.get(CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV, "")
+        identity_socket_raw = env.get(CLAUDE_KEYCHAIN_BROKER_IDENTITY_SOCKET_ENV)
+        if not identity_socket_raw:
+            raise ReviewError(
+                "Claude local-login sandbox requires a Keychain broker identity socket"
+            )
+        keychain_broker_identity_socket = pathlib.Path(identity_socket_raw)
+        identity_directory_raw = env.get(CLAUDE_KEYCHAIN_BROKER_IDENTITY_DIRECTORY_ENV)
+        identity_directory = (
+            pathlib.Path(identity_directory_raw) if identity_directory_raw else None
+        )
+        if (
+            not keychain_broker_identity_socket.is_absolute()
+            or identity_directory is None
+            or not identity_directory.is_absolute()
+            or keychain_broker_identity_socket.parent != identity_directory
+            or keychain_broker_identity_socket.name
+            != CLAUDE_KEYCHAIN_BROKER_IDENTITY_SOCKET_NAME
         ):
             raise ReviewError(
-                "Claude local-login sandbox requires a valid Keychain broker capability"
+                "Claude local-login sandbox requires a valid Keychain broker "
+                "identity socket"
             )
+        canonical_keychain_broker_identity_socket = (
+            _require_claude_keychain_identity_socket(keychain_broker_identity_socket)
+        )
     rg_candidate = _trusted_claude_ripgrep()
     if rg_candidate is None:
         raise ClaudeReviewToolUnavailable(
@@ -14810,6 +15761,11 @@ def _claude_review_sandbox_profile(
     network_filters = f'(remote ip "localhost:{proxy_port}")'
     if keychain_broker_port is not None:
         network_filters += f'(remote ip "localhost:{keychain_broker_port}")'
+    if canonical_keychain_broker_identity_socket is not None:
+        network_filters += _sandbox_path_filter(
+            "literal",
+            canonical_keychain_broker_identity_socket,
+        )
     return (
         CLAUDE_PROBE_SANDBOX_PROFILE
         + f"(allow file-read-metadata {metadata_filters})"
@@ -17320,6 +18276,16 @@ def _claude_attempt(
                     stderr_path=stderr_path,
                     timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
                     output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+                    prepare_process_spawned=getattr(
+                        runtime_env,
+                        "prepare_runtime_process",
+                        None,
+                    ),
+                    on_process_spawned=getattr(
+                        runtime_env,
+                        "bind_runtime_process",
+                        None,
+                    ),
                 )
         except ClaudeCredentialInspectionInconclusive as error:
             persistence_failed = completed is not None

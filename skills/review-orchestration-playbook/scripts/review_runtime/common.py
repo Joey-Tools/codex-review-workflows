@@ -394,6 +394,8 @@ def run(
     capture_limit_bytes: int = 4 * 1024 * 1024,
     timeout_seconds: float | None = None,
     output_file_limit_bytes: int | None = None,
+    prepare_process_spawned: Callable[[int], object] | None = None,
+    on_process_spawned: Callable[[object], None] | None = None,
     on_process_started: Callable[[], None] | None = None,
 ) -> Completed:
     command = tuple(str(item) for item in argv)
@@ -405,10 +407,26 @@ def run(
         raise ReviewError("output_file_limit_bytes requires logged output paths")
     if output_file_limit_bytes is not None and timeout_seconds is None:
         raise ReviewError("output_file_limit_bytes requires timeout_seconds")
+    if (prepare_process_spawned is None) != (on_process_spawned is None):
+        raise ReviewError(
+            "prepare_process_spawned and on_process_spawned must be provided together"
+        )
+    if prepare_process_spawned is not None and (
+        stdout_path is None or stderr_path is None
+    ):
+        raise ReviewError("process spawn preparation requires logged output paths")
     if timeout_seconds is not None and (stdout_path is None or stderr_path is None):
         raise ReviewError("timeout_seconds requires logged output paths")
     if on_process_started is not None and (stdout_path is None or stderr_path is None):
         raise ReviewError("on_process_started requires logged output paths")
+    if prepare_process_spawned is not None and os.name != "posix":
+        raise ReviewError("process spawn preparation requires POSIX")
+    if prepare_process_spawned is not None and (
+        timeout_seconds is None or not math.isfinite(timeout_seconds)
+    ):
+        raise ReviewError(
+            "process spawn preparation requires a finite timeout or deadline"
+        )
     if output_file_limit_bytes is not None and output_file_limit_bytes <= 0:
         raise ReviewError("output_file_limit_bytes must be positive")
     try:
@@ -442,6 +460,8 @@ def run(
                     timeout_seconds=timeout_seconds,
                     stdout_file_limit_bytes=output_file_limit_bytes,
                     stderr_file_limit_bytes=output_file_limit_bytes,
+                    prepare_process_spawned=prepare_process_spawned,
+                    on_process_spawned=on_process_spawned,
                     on_process_started=on_process_started,
                 )
             result = Completed(
@@ -757,10 +777,27 @@ def _run_logged_process(
     stderr_file_limit_bytes: int | None = None,
     regular_file_limit_bytes: int | None = None,
     regular_file_limit_path: pathlib.Path | None = None,
+    prepare_process_spawned: Callable[[int], object] | None = None,
+    on_process_spawned: Callable[[object], None] | None = None,
     on_process_started: Callable[[], None] | None = None,
 ) -> int:
     if timeout_seconds is not None and deadline is not None:
         raise ReviewError("logged process timeout forms are mutually exclusive")
+    if (prepare_process_spawned is None) != (on_process_spawned is None):
+        raise ReviewError(
+            "prepare_process_spawned and on_process_spawned must be provided together"
+        )
+    if prepare_process_spawned is not None:
+        if os.name != "posix":
+            raise ReviewError("process spawn preparation requires POSIX")
+        timeout_or_deadline = deadline if deadline is not None else timeout_seconds
+        if timeout_or_deadline is None or not math.isfinite(timeout_or_deadline):
+            raise ReviewError(
+                "process spawn preparation requires a finite timeout or deadline"
+            )
+        if deadline is None:
+            assert timeout_seconds is not None
+            deadline = time.monotonic() + timeout_seconds
     deadline_supplied = deadline is not None
     process: subprocess.Popen[bytes] | None = None
     pending_signal: signal.Signals | None = None
@@ -800,6 +837,42 @@ def _run_logged_process(
             raise_pending_forwarded_signal()
             raise timeout_expired()
         return remaining
+
+    def prepare_and_commit_process_spawn(process_pid: int) -> None:
+        if prepare_process_spawned is None or on_process_spawned is None:
+            return
+        preparation_errors: list[BaseException] = []
+        preparation_results: list[object] = []
+        preparation_finished = threading.Event()
+
+        def prepare() -> None:
+            try:
+                preparation_results.append(prepare_process_spawned(process_pid))
+            except BaseException as error:
+                preparation_errors.append(error)
+            finally:
+                preparation_finished.set()
+
+        preparation_thread = threading.Thread(
+            target=prepare,
+            daemon=True,
+            name="codex-review-process-spawn-preparation",
+        )
+        preparation_thread.start()
+        while True:
+            remaining = remaining_before_deadline()
+            if preparation_finished.wait(
+                timeout=min(PROCESS_GROUP_POLL_SECONDS, remaining)
+            ):
+                break
+        # Late preparation is inert: only this parent thread can commit or authorize exec.
+        remaining_before_deadline()
+        if preparation_errors:
+            raise preparation_errors[0]
+        if len(preparation_results) != 1:
+            raise ReviewError("process spawn preparation returned no binding")
+        on_process_spawned(preparation_results[0])
+        remaining_before_deadline()
 
     def read_wrapper_status(*, stop_after_ready: bool) -> bytearray:
         assert exec_status_read_fd is not None
@@ -938,7 +1011,7 @@ def _run_logged_process(
             ready_status = read_wrapper_status(stop_after_ready=True)
             if ready_status != b"R":
                 raise_wrapper_failure(ready_status)
-            remaining_before_deadline()
+            prepare_and_commit_process_spawn(process.pid)
             assert launch_write_fd is not None
             try:
                 try:

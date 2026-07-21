@@ -1,0 +1,348 @@
+from __future__ import annotations
+
+import os
+import pathlib
+import shutil
+import stat
+import time
+import unittest
+from unittest import mock
+
+from review_supervisor.constants import SCHEMA_VERSION
+from review_supervisor.gitraw import (
+    add_detached_worktree,
+    enumerate_registration,
+    initialize_index,
+    inspect_repository,
+)
+from review_supervisor.ledger import acquire_retention_lease, read_attempt_state
+from review_supervisor.models import Identity
+from review_supervisor.recovery_cleanup import (
+    RootSpec,
+    _KIND_DIRECTORY,
+    _index_manifest_records,
+    build_custodied_manifest,
+    delete_custodied_roots,
+)
+from review_supervisor.runtime import _cleanup_worktree, _registration_json
+from review_supervisor.secureio import canonical_json, identity_from_stat
+
+from tests.support import owned_temporary_directory
+from tests.test_git_checkout import GIT, _build_repository
+
+
+ENTRYPOINT = (
+    pathlib.Path(__file__).resolve().parent.parent / "independent-codex-pr-review"
+)
+
+
+class _CountingRecord:
+    def __init__(
+        self,
+        *,
+        path: bytes,
+        identity: Identity,
+        counters: dict[str, int],
+    ) -> None:
+        self.root_index = 0
+        self.kind = _KIND_DIRECTORY
+        self.identity = identity
+        self._path = path
+        self._counters = counters
+
+    @property
+    def path(self) -> bytes:
+        self._counters["path_reads"] += 1
+        return self._path
+
+
+class _CountingRecords:
+    def __init__(self, records: list[_CountingRecord], counters: dict[str, int]):
+        self._records = records
+        self._counters = counters
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    def __iter__(self):
+        self._counters["iterations"] += 1
+        return iter(self._records)
+
+
+class ManifestTraversalTests(unittest.TestCase):
+    def test_large_manifest_index_is_linear(self) -> None:
+        child_count = 10_000
+        counters = {"iterations": 0, "path_reads": 0}
+        identity = Identity(
+            device=1,
+            inode=1,
+            mode=stat.S_IFDIR | 0o700,
+            link_count=1,
+            uid=os.getuid(),
+            size=0,
+        )
+        records = [
+            _CountingRecord(path=b"", identity=identity, counters=counters),
+            *(
+                _CountingRecord(
+                    path=f"directory-{index:05d}".encode("ascii"),
+                    identity=identity,
+                    counters=counters,
+                )
+                for index in range(child_count)
+            ),
+        ]
+
+        index = _index_manifest_records(
+            _CountingRecords(records, counters),  # type: ignore[arg-type]
+            root_count=1,
+            entry_cap=len(records),
+            deadline=time.monotonic() + 5.0,
+        )
+
+        self.assertEqual(counters["iterations"], 2)
+        self.assertLessEqual(counters["path_reads"], len(records) * 8)
+        self.assertEqual(len(index[(0, b"")]), child_count)
+        self.assertEqual(sum(len(children) for children in index.values()), child_count)
+
+    def test_delete_deadline_after_identity_check_changes_nothing(self) -> None:
+        with owned_temporary_directory("manifest-deadline-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+            target = parent / "target"
+            target.mkdir(mode=0o700)
+            payload = target / "payload.txt"
+            payload.write_bytes(b"retained\n")
+            payload.chmod(0o600)
+            control = root / "control"
+            control.mkdir(mode=0o700)
+            parent_fd = os.open(
+                parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            try:
+                manifest = build_custodied_manifest(
+                    roots=(
+                        RootSpec(
+                            label="checkout",
+                            parent_fd=parent_fd,
+                            parent_identity=identity_from_stat(os.fstat(parent_fd)),
+                            name=b"target",
+                            expected_identity=identity_from_stat(os.stat(target)),
+                        ),
+                    ),
+                    manifest_path=control / "manifest.bin",
+                    entry_cap=10,
+                    payload_cap=4096,
+                    deadline=time.monotonic() + 5.0,
+                )
+                with manifest:
+                    clock_reads = 0
+
+                    def monotonic() -> float:
+                        nonlocal clock_reads
+                        clock_reads += 1
+                        return 0.0 if clock_reads < 6 else 2.0
+
+                    manifest.deadline = 1.0
+                    with mock.patch(
+                        "review_supervisor.recovery_cleanup.time.monotonic",
+                        side_effect=monotonic,
+                    ):
+                        with self.assertRaisesRegex(TimeoutError, "deadline expired"):
+                            delete_custodied_roots(manifest)
+                self.assertTrue(target.is_dir())
+                self.assertEqual(payload.read_bytes(), b"retained\n")
+            finally:
+                os.close(parent_fd)
+
+
+@unittest.skipUnless(GIT.is_file(), "/usr/bin/git is required")
+class TargetedRecoveryTests(unittest.TestCase):
+    def _prepare(self, root: pathlib.Path, *, cleanup_status: str = "clean"):
+        repo, base_sha, head_sha = _build_repository(root)
+        info = inspect_repository(
+            repo=repo,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            git_executable=str(GIT),
+        )
+        checkout_parent = root / "checkouts"
+        checkout_parent.mkdir(mode=0o700)
+        worktree = checkout_parent / "review-fixture"
+        registration = add_detached_worktree(info, worktree)
+        initialize_index(info, registration)
+        count, path_bytes = enumerate_registration(registration.registration)
+        registration_value = _registration_json(registration)
+        registration_value["descendant_count"] = count
+        registration_value["descendant_path_bytes"] = path_bytes
+        namespace = checkout_parent / ".review-control-fixture"
+        namespace.mkdir(mode=0o700)
+        retention = root / "retention"
+        retention.mkdir(mode=0o700)
+        attempt_id = f"1-{'b' * 32}"
+        attempt = retention / f"attempt-{attempt_id}"
+        attempt.mkdir(mode=0o700)
+        state = {
+            "schema_version": SCHEMA_VERSION,
+            "attempt_id": attempt_id,
+            "record_generation": 1,
+            "previous_record_sha256": None,
+            "phase": "reviewed",
+            "repo": str(repo),
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "git_executable": str(GIT),
+            "worktree_path": str(worktree),
+            "control_namespace": str(namespace),
+            "targeted_manifest_published": str(namespace / "manifest.bin"),
+            "registration": registration_value,
+            "worktree_status": "active",
+            "checkout_settlement": "outstanding",
+            "checkout_physical_remaining_by_fs": {"fixture": 1},
+            "reservation_status": "outstanding",
+            "cleanup_status": cleanup_status,
+            "checkout_parent_binding": {
+                "path": str(checkout_parent),
+                "identity": identity_from_stat(os.stat(checkout_parent)).to_json(),
+            },
+            "common_git_dir_binding": {
+                "path": str(info.common_git_dir),
+                "identity": identity_from_stat(os.stat(info.common_git_dir)).to_json(),
+            },
+            "admission": {
+                "targeted_manifest_entry_bound": 10_000,
+                "targeted_manifest_payload_bound": 8 * 1024 * 1024,
+            },
+            "unsupported_clauses": [
+                {"clause": "automatic-targeted-mixed-worktree-removal"},
+                {"clause": "optional-fixture-clause"},
+            ],
+        }
+        state_path = attempt / "state.json"
+        state_path.write_bytes(canonical_json(state))
+        state_path.chmod(0o600)
+        disk, _, digest = read_attempt_state(attempt)
+        return retention, attempt, worktree, registration, namespace, disk, digest
+
+    def _cleanup(self, retention, attempt, state, digest):
+        with acquire_retention_lease(
+            retention,
+            deadline=time.monotonic() + 5.0,
+        ) as lease:
+            return _cleanup_worktree(
+                entrypoint=ENTRYPOINT,
+                attempt_dir=attempt,
+                lease_fd=lease.fd,
+                state=state,
+                state_digest=digest,
+            )
+
+    def test_checkout_only_is_removed_from_external_manifest(self) -> None:
+        with owned_temporary_directory("checkout-only-") as root:
+            (
+                retention,
+                attempt,
+                worktree,
+                registration,
+                namespace,
+                state,
+                digest,
+            ) = self._prepare(root, cleanup_status="logs-truncated")
+            diagnostic = attempt / "codex.stderr.0.gz"
+            diagnostic.write_bytes(b"retained diagnostics\n")
+            diagnostic.chmod(0o600)
+            shutil.rmtree(registration.registration)
+
+            state, _ = self._cleanup(retention, attempt, state, digest)
+
+            self.assertEqual(state["checkout_settlement"], "exact")
+            self.assertEqual(
+                state["checkout_cleanup_evidence"]["branch"], "checkout-only"
+            )
+            self.assertEqual(state["cleanup_status"], "logs-truncated")
+            self.assertFalse(state["cleanup_warning"]["outstanding"])
+            self.assertTrue(state["cleanup_warning"]["non_ttl"])
+            self.assertEqual(state["targeted_cleanup"]["stage"], "complete")
+            self.assertFalse(worktree.exists())
+            self.assertFalse(namespace.exists())
+            self.assertTrue(diagnostic.is_file())
+            clauses = {item["clause"] for item in state["unsupported_clauses"]}
+            self.assertEqual(clauses, {"optional-fixture-clause"})
+
+    def test_registration_only_is_removed_from_external_manifest(self) -> None:
+        with owned_temporary_directory("registration-only-") as root:
+            (
+                retention,
+                attempt,
+                worktree,
+                registration,
+                namespace,
+                state,
+                digest,
+            ) = self._prepare(root)
+            shutil.rmtree(worktree)
+
+            state, _ = self._cleanup(retention, attempt, state, digest)
+
+            self.assertEqual(state["checkout_settlement"], "exact")
+            self.assertEqual(
+                state["checkout_cleanup_evidence"]["branch"],
+                "registration-only",
+            )
+            self.assertEqual(state["cleanup_status"], "cleanup-warning")
+            self.assertFalse(registration.registration.exists())
+            self.assertFalse(namespace.exists())
+            proof = state["checkout_cleanup_evidence"]["deletion_proof"]
+            self.assertTrue(proof["parent_fsync_complete"])
+            self.assertTrue(proof["exact_names_absent"])
+
+    def test_absent_registration_record_rejects_alias_before_settlement(self) -> None:
+        with owned_temporary_directory("registration-alias-") as root:
+            retention, attempt, worktree, registration, _, state, digest = (
+                self._prepare(root)
+            )
+            state["registration"] = None
+            state["record_generation"] += 1
+            state["previous_record_sha256"] = digest
+            state_path = attempt / "state.json"
+            state_path.write_bytes(canonical_json(state))
+            state_path.chmod(0o600)
+            state, _, digest = read_attempt_state(attempt)
+
+            state, _ = self._cleanup(retention, attempt, state, digest)
+
+            self.assertEqual(state["checkout_settlement"], "outstanding")
+            self.assertEqual(state["worktree_status"], "manual-recovery-required")
+            evidence = state["cleanup_recovery_evidence"]["registration_scan"]
+            self.assertIn(registration.registration.name, evidence["alias_matches"])
+            self.assertTrue(worktree.exists())
+            self.assertTrue(registration.registration.exists())
+
+    def test_persisted_intent_without_live_descriptors_requires_manual_recovery(
+        self,
+    ) -> None:
+        with owned_temporary_directory("custody-lost-") as root:
+            retention, attempt, worktree, _, _, state, digest = self._prepare(root)
+            state["worktree_cleanup_intent"] = {
+                "version": 1,
+                "stage": "intent-persisted",
+                "outstanding": True,
+            }
+            state["record_generation"] += 1
+            state["previous_record_sha256"] = digest
+            state_path = attempt / "state.json"
+            state_path.write_bytes(canonical_json(state))
+            state_path.chmod(0o600)
+            state, _, digest = read_attempt_state(attempt)
+
+            state, _ = self._cleanup(retention, attempt, state, digest)
+
+            self.assertEqual(state["worktree_status"], "manual-recovery-required")
+            self.assertEqual(state["checkout_settlement"], "outstanding")
+            self.assertTrue(state["cleanup_warning"]["outstanding"])
+            self.assertTrue(worktree.exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

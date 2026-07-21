@@ -489,6 +489,38 @@ class StatefulLifecycleTest(unittest.TestCase):
         finally:
             os.umask(previous_umask)
 
+    def test_private_lock_creation_avoids_redundant_mode_transition(self) -> None:
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        with mock.patch.object(state.os, "fchmod", wraps=os.fchmod) as fchmod:
+            with state.open_private_lock_file(
+                lock_path,
+                label="test cleanup lock",
+            ) as cleanup_lock:
+                self.assertEqual(
+                    stat.S_IMODE(os.fstat(cleanup_lock.fileno()).st_mode),
+                    0o600,
+                )
+
+        fchmod.assert_not_called()
+
+    def test_private_lock_creation_repairs_mode_restricted_by_umask(self) -> None:
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        previous_umask = os.umask(0o700)
+        try:
+            with mock.patch.object(state.os, "fchmod", wraps=os.fchmod) as fchmod:
+                with state.open_private_lock_file(
+                    lock_path,
+                    label="test cleanup lock",
+                ) as cleanup_lock:
+                    self.assertEqual(
+                        stat.S_IMODE(os.fstat(cleanup_lock.fileno()).st_mode),
+                        0o600,
+                    )
+        finally:
+            os.umask(previous_umask)
+
+        fchmod.assert_called_once_with(mock.ANY, 0o600)
+
     def test_private_lock_existing_open_does_not_recreate_deleted_file(self) -> None:
         lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
         lock_path.write_bytes(b"")

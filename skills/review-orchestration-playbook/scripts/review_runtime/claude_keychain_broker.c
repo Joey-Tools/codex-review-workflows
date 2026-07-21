@@ -2,22 +2,26 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <pwd.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ptrace.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 // This executable is exposed to Claude Code as `security`, but it supports only
 // the exact local-login lookup and stdin refresh-update forms used by supported
-// Claude Code releases. The parent helper keeps credentials in memory during the
-// review, validates refresh updates, and performs guarded post-review write-back
-// to the selected host credential source. Other Keychain operations are rejected.
+// Claude Code releases. The parent helper keeps credentials in memory during
+// the review, validates refresh updates, and performs guarded post-review
+// write-back to the selected host credential source. Other Keychain operations
+// are rejected.
 static const char *const kService = "Claude Code-credentials";
 static const char *const kPortEnvironment = "CODEX_CLAUDE_KEYCHAIN_BROKER_PORT";
-static const char *const kCapabilityEnvironment =
-    "CODEX_CLAUDE_KEYCHAIN_BROKER_CAPABILITY";
+static const char *const kIdentitySocketEnvironment =
+    "CODEX_CLAUDE_KEYCHAIN_BROKER_IDENTITY_SOCKET";
 static const uint32_t kMaximumCredentialLength = 1024U * 1024U;
 static const size_t kCapabilityLength = 32U;
 
@@ -94,19 +98,25 @@ static int hex_nibble(char value) {
 }
 
 static int broker_capability(unsigned char output[32]) {
-  const char *raw = getenv(kCapabilityEnvironment);
-  if (raw == NULL || strlen(raw) != kCapabilityLength * 2U) {
+  const char *path = getenv(kIdentitySocketEnvironment);
+  if (path == NULL || *path == '\0' ||
+      strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
     return -1;
   }
-  for (size_t index = 0; index < kCapabilityLength; index++) {
-    int high = hex_nibble(raw[index * 2U]);
-    int low = hex_nibble(raw[index * 2U + 1U]);
-    if (high < 0 || low < 0) {
-      return -1;
-    }
-    output[index] = (unsigned char)((high << 4) | low);
+  int client = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (client < 0) {
+    return -1;
   }
-  return 0;
+  struct sockaddr_un address = {.sun_family = AF_UNIX};
+  memcpy(address.sun_path, path, strlen(path) + 1U);
+  socklen_t length =
+      (socklen_t)(offsetof(struct sockaddr_un, sun_path) + strlen(path) + 1U);
+  int result = connect(client, (struct sockaddr *)&address, length) == 0 &&
+                       read_all(client, output, kCapabilityLength) == 0
+                   ? 0
+                   : -1;
+  close(client);
+  return result;
 }
 
 static int decode_hex(const char *hex, size_t hex_length,
@@ -170,8 +180,7 @@ static int read_update_script(const char *account, unsigned char **credential,
   char prefix[512] = {0};
   int prefix_length = snprintf(
       prefix, sizeof(prefix),
-      "add-generic-password -U -a \"%s\" -s \"%s\" -X \"", account,
-      kService);
+      "add-generic-password -U -a \"%s\" -s \"%s\" -X \"", account, kService);
   if (prefix_length < 0 || (size_t)prefix_length >= sizeof(prefix) ||
       used <= (size_t)prefix_length + 1U ||
       memcmp(script, prefix, (size_t)prefix_length) != 0) {
@@ -204,6 +213,9 @@ static void clear_credential(unsigned char **credential, uint32_t length) {
 }
 
 int main(int argc, char *argv[]) {
+  if (ptrace(PT_DENY_ATTACH, 0, 0, 0) != 0) {
+    return 1;
+  }
   struct passwd *user = getpwuid(getuid());
   if (user == NULL || user->pw_name == NULL) {
     return 1;
@@ -216,9 +228,7 @@ int main(int argc, char *argv[]) {
                 strcmp(argv[6], kService) == 0;
   unsigned char *updated_credential = NULL;
   uint32_t updated_length = 0;
-  int is_update =
-      argc == 2 && strcmp(argv[1], "-i") == 0 &&
-      read_update_script(account, &updated_credential, &updated_length) == 0;
+  int is_update = argc == 2 && strcmp(argv[1], "-i") == 0;
   if (!is_read && !is_update) {
     return 64;
   }
@@ -253,8 +263,19 @@ int main(int argc, char *argv[]) {
     return 1;
   }
   memset(capability, 0, sizeof(capability));
+  unsigned char authorization = 1;
+  if (read_all(client, &authorization, 1) != 0 || authorization != 0) {
+    clear_credential(&updated_credential, updated_length);
+    close(client);
+    return 1;
+  }
 
   if (is_update) {
+    if (read_update_script(account, &updated_credential, &updated_length) !=
+        0) {
+      close(client);
+      return 64;
+    }
     uint32_t network_length = htonl(updated_length);
     unsigned char status = 1;
     int sent =

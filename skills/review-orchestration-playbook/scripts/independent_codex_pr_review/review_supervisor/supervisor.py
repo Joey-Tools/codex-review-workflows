@@ -1,0 +1,2553 @@
+from __future__ import annotations
+
+import math
+import os
+import pathlib
+import re
+import shutil
+import signal
+import socket
+import stat
+import sys
+import time
+import uuid
+from dataclasses import dataclass
+from typing import Any
+
+from .constants import (
+    CHECKOUT_SECONDS,
+    FINAL_MESSAGE_BYTES,
+    HANDOFF_SECONDS,
+    LOG_AGGREGATE_BYTES,
+    PROCESS_ENVELOPE_BYTES,
+    RELEASED_TTL_SECONDS,
+    REVIEWER_LAUNCH_SECONDS,
+    REVIEWER_RUNTIME_SECONDS,
+    UNSUPPORTED_CLAUSES,
+)
+from .custody import CustodyHandles, authenticate_helper_state
+from .errors import SupervisorError, blocked, inconclusive
+from .gitraw import enumerate_tree, inspect_repository, manifest_digest
+from .ledger import (
+    RetentionLease,
+    acquire_retention_lease,
+    calculate_admission,
+    create_reserved_attempt,
+    read_attempt_state,
+    reconcile_ledger,
+)
+from .models import Identity
+from .process import (
+    SpawnedProcess,
+    await_exec,
+    fork_exec,
+    process_start_identity,
+    reap,
+    require_authenticated_no_child_process_profile,
+    signal_anchored_group,
+    wait_terminal,
+)
+from .prompt import (
+    prove_exec_budget,
+    prompt_evidence,
+    render_prompt,
+    reviewer_argv,
+    validate_final_message,
+)
+from .recovery_cleanup import (
+    RootSpec,
+    build_custodied_manifest,
+    delete_custodied_roots,
+    remove_published_manifest,
+)
+from .runtime import (
+    _cleanup_worktree,
+    _compact_terminal,
+    _kill_direct,
+    _settle_process,
+    _validate_terminal_lifecycle,
+    build_final_authorization_rewrite,
+    commit_via_helper,
+    complete_final_authorization_rewrite,
+    publish_prompt_via_helper,
+    validate_final_authorization_rewrite,
+)
+from .secureio import (
+    allocated_bytes,
+    boot_identifier,
+    canonical_json,
+    ensure_no_path_value,
+    fsync_directory,
+    identity_from_stat,
+    measure_filesystem,
+    open_absolute_directory_chain,
+    open_regular_nofollow,
+    read_fd_exact,
+    require_private_directory,
+    sha256_bytes,
+)
+from .wire import receive_record, send_blob, send_record, socket_pair
+
+
+ATTEMPT_NAME_PATTERN = re.compile(r"attempt-([0-9]+-[0-9a-f]{32})\Z")
+PROCESS_LOG_PATTERN = re.compile(r"codex\.(?:stdout|stderr)\.[0-9]+\.gz\Z")
+RECOVERY_TEMP_PATTERN = re.compile(
+    r"(?:\.state\.json|\.final\.txt)\.tmp-[0-9]+-[0-9a-f]{16}\Z"
+)
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+HANDOFF_TOKEN_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+RUNTIME_CLEANUP_MANIFEST = "runtime-cleanup.manifest"
+RUNTIME_CLEANUP_ENTRY_CAP = 10_000
+RUNTIME_CLEANUP_PAYLOAD_CAP = 2 * 1024 * 1024
+IDENTITY_KEYS = frozenset({"device", "inode", "mode", "link_count", "uid", "size"})
+FINAL_AUTHORIZATION_KEYS = frozenset(
+    {
+        "predecessor_generation",
+        "predecessor_sha256",
+        "supervisor",
+        "supervisor_exit_code",
+        "handoff_token_sha256",
+        "final_seal",
+        "binding_sha256",
+    }
+)
+
+
+@dataclass(frozen=True)
+class PreparedRun:
+    helper: Any
+    repository: Any
+    base_manifest: Any
+    head_manifest: Any
+    admission: Any
+    attempt_id: str
+    worktree_path: pathlib.Path
+    attempt_dir: pathlib.Path
+    final_fifo: pathlib.Path
+    prompt: bytes
+    prompt_evidence: dict[str, int | str]
+    codex_executable: str
+    exec_budget: dict[str, int]
+
+
+def _resolve_codex(value: str | None) -> str:
+    candidate = value or shutil.which("codex")
+    if candidate is None:
+        raise blocked(
+            "Codex executable is unavailable in the trusted reviewer environment",
+            stage="runtime-selection",
+            code="codex-unavailable",
+        )
+    path = pathlib.Path(candidate)
+    if not path.is_absolute():
+        located = shutil.which(candidate)
+        if located is None:
+            raise blocked(
+                "Codex executable cannot be resolved to an absolute path",
+                stage="runtime-selection",
+                code="codex-unavailable",
+            )
+        path = pathlib.Path(located)
+    return str(path)
+
+
+def prepare_run(
+    *,
+    helper_state: pathlib.Path,
+    repo: pathlib.Path,
+    base_sha: str,
+    head_sha: str,
+    pr_url: str,
+    retention_root: pathlib.Path,
+    checkout_parent: pathlib.Path,
+    git_executable: str,
+    codex_executable: str | None,
+    snapshot: Any,
+) -> PreparedRun:
+    helper = authenticate_helper_state(
+        state_dir=helper_state,
+        repo=repo,
+        base_sha=base_sha,
+        head_sha=head_sha,
+    )
+    repository = inspect_repository(
+        repo=repo,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        git_executable=git_executable,
+    )
+    base_manifest = enumerate_tree(repository, base_sha)
+    head_manifest = enumerate_tree(repository, head_sha)
+    admission = calculate_admission(
+        snapshot=snapshot,
+        retention_root=retention_root,
+        checkout_parent=checkout_parent,
+        common_git_dir=repository.common_git_dir,
+        manifest=head_manifest,
+        diff_length=helper.diff_length,
+    )
+    attempt_id = f"{int(time.time())}-{uuid.uuid4().hex}"
+    worktree_path = checkout_parent / f"review-{attempt_id}"
+    attempt_dir = retention_root / f"attempt-{attempt_id}"
+    final_fifo = attempt_dir / "final.fifo"
+    prompt = render_prompt(
+        repo=worktree_path,
+        pr_url=pr_url,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        diff_length=helper.diff_length,
+        diff_sha256=helper.diff_sha256,
+    )
+    evidence = prompt_evidence(prompt)
+    codex = _resolve_codex(codex_executable)
+    argv = reviewer_argv(
+        codex_executable=codex,
+        worktree=worktree_path,
+        final_fifo=final_fifo,
+        prompt=prompt,
+    )
+    ensure_no_path_value(os.environ.values(), pathlib.Path(helper.workspace_root))
+    exec_budget = prove_exec_budget(argv)
+    return PreparedRun(
+        helper=helper,
+        repository=repository,
+        base_manifest=base_manifest,
+        head_manifest=head_manifest,
+        admission=admission,
+        attempt_id=attempt_id,
+        worktree_path=worktree_path,
+        attempt_dir=attempt_dir,
+        final_fifo=final_fifo,
+        prompt=prompt,
+        prompt_evidence=evidence,
+        codex_executable=codex,
+        exec_budget=exec_budget,
+    )
+
+
+def _default_entrypoint() -> pathlib.Path:
+    return (
+        pathlib.Path(__file__).resolve().parent.parent / "independent-codex-pr-review"
+    ).resolve(strict=True)
+
+
+def _prepare_with_reclamation(
+    *,
+    entrypoint: pathlib.Path,
+    lease: RetentionLease,
+    helper_state: pathlib.Path,
+    repo: pathlib.Path,
+    base_sha: str,
+    head_sha: str,
+    pr_url: str,
+    retention_root: pathlib.Path,
+    checkout_parent: pathlib.Path,
+    git_executable: str,
+    codex_executable: str | None,
+) -> PreparedRun:
+    reconcile_ledger(retention_root)
+    _reclaim_released_attempts(
+        entrypoint=entrypoint,
+        root=retention_root,
+        lease=lease,
+        trigger="ttl",
+        released_before=time.time() - RELEASED_TTL_SECONDS,
+    )
+    while True:
+        snapshot = reconcile_ledger(retention_root)
+        try:
+            return prepare_run(
+                helper_state=helper_state,
+                repo=repo,
+                base_sha=base_sha,
+                head_sha=head_sha,
+                pr_url=pr_url,
+                retention_root=retention_root,
+                checkout_parent=checkout_parent,
+                git_executable=git_executable,
+                codex_executable=codex_executable,
+                snapshot=snapshot,
+            )
+        except SupervisorError as error:
+            if error.failure.code not in {
+                "blocked-retention",
+                "blocked-worktree-capacity",
+            }:
+                raise
+            if (
+                snapshot.retained_worktree_attempt is not None
+                or error.failure.message.startswith("checkout accounting cap")
+            ):
+                raise
+            reclaimed = _reclaim_released_attempts(
+                entrypoint=entrypoint,
+                root=retention_root,
+                lease=lease,
+                trigger="admission-pressure",
+                limit=1,
+            )
+            if not reclaimed:
+                raise
+
+
+def preflight(
+    *,
+    helper_state: pathlib.Path,
+    repo: pathlib.Path,
+    base_sha: str,
+    head_sha: str,
+    pr_url: str,
+    retention_root: pathlib.Path,
+    checkout_parent: pathlib.Path,
+    git_executable: str,
+    codex_executable: str | None,
+) -> dict[str, Any]:
+    require_private_directory(retention_root, create=True)
+    require_private_directory(checkout_parent, create=True)
+    with acquire_retention_lease(
+        retention_root, deadline=time.monotonic() + 30
+    ) as lease:
+        prepared = _prepare_with_reclamation(
+            entrypoint=_default_entrypoint(),
+            lease=lease,
+            helper_state=helper_state,
+            repo=repo,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            pr_url=pr_url,
+            retention_root=retention_root,
+            checkout_parent=checkout_parent,
+            git_executable=git_executable,
+            codex_executable=codex_executable,
+        )
+        return {
+            "status": "ready",
+            "review_status": "not-run",
+            "created_attempt": False,
+            "repo": str(prepared.repository.repo),
+            "review_range": prepared.helper.review_range,
+            "helper_state": str(helper_state),
+            "diff_length": prepared.helper.diff_length,
+            "diff_sha256": prepared.helper.diff_sha256,
+            "entry_count": prepared.head_manifest.entry_count,
+            "base_manifest_sha256": manifest_digest(prepared.base_manifest),
+            "head_manifest_sha256": manifest_digest(prepared.head_manifest),
+            "admission": prepared.admission.to_json(),
+            "prompt": prepared.prompt_evidence,
+            "exec_budget": prepared.exec_budget,
+            "unsupported_clauses": list(UNSUPPORTED_CLAUSES),
+        }
+
+
+def _spawn_attempt_supervisor(
+    *,
+    entrypoint: pathlib.Path,
+    attempt_dir: pathlib.Path,
+    control_child: socket.socket,
+    lease_fd: int,
+    token: str,
+) -> SpawnedProcess:
+    devnull = os.open("/dev/null", os.O_RDWR | os.O_CLOEXEC)
+    try:
+        argv = (
+            sys.executable,
+            str(entrypoint),
+            "_attempt-supervisor",
+            "--entrypoint",
+            str(entrypoint),
+            "--attempt-dir",
+            str(attempt_dir),
+            "--control-fd",
+            "3",
+            "--lease-fd",
+            "4",
+            "--handoff-token",
+            token,
+        )
+        return fork_exec(
+            argv,
+            cwd=attempt_dir,
+            stdin_fd=devnull,
+            stdout_fd=devnull,
+            stderr_fd=devnull,
+            pass_fds=(control_child.fileno(), lease_fd),
+            own_process_group=True,
+        )
+    finally:
+        os.close(devnull)
+
+
+def _terminate_incomplete_handoff(process: SpawnedProcess) -> int:
+    deadline = time.monotonic() + 5
+    signal_anchored_group(process, signal.SIGTERM)
+    time.sleep(0.05)
+    signal_anchored_group(process, signal.SIGKILL)
+    wait_terminal(process.pid, deadline=deadline)
+    return reap(process.pid, deadline=deadline)
+
+
+def _acquire_source_custody_via_helper(
+    *,
+    entrypoint: pathlib.Path,
+    prepared: PreparedRun,
+    deadline: float,
+) -> CustodyHandles:
+    parent, child = socket_pair()
+    token = os.urandom(32).hex()
+    process: SpawnedProcess | None = None
+    received_fds: tuple[int, ...] = ()
+    devnull = os.open("/dev/null", os.O_RDWR | os.O_CLOEXEC)
+    try:
+        argv = (
+            sys.executable,
+            str(entrypoint),
+            "_custody-helper",
+            "--control-fd",
+            "3",
+            "--state-dir",
+            prepared.helper.state_dir,
+            "--repo",
+            str(prepared.repository.repo),
+            "--base",
+            prepared.helper.base_sha,
+            "--head",
+            prepared.helper.head_sha,
+            "--token",
+            token,
+        )
+        process = fork_exec(
+            argv,
+            cwd=prepared.attempt_dir,
+            stdin_fd=devnull,
+            stdout_fd=devnull,
+            stderr_fd=devnull,
+            pass_fds=(child.fileno(),),
+            own_process_group=False,
+        )
+        child.close()
+        await_exec(process, deadline=deadline)
+        ready, _ = receive_record(parent, deadline=deadline)
+        if ready.get("type") != "custody-helper-ready" or ready.get("token") != token:
+            raise ValueError("custody helper ready record is invalid")
+        send_record(
+            parent,
+            {
+                "type": "acquire-source-custody",
+                "token": token,
+                "expected": prepared.helper.to_json(),
+            },
+            deadline=deadline,
+        )
+        result, received_fds = receive_record(
+            parent,
+            deadline=deadline,
+            expected_fds=2,
+        )
+        if (
+            result.get("type") != "source-custody-result"
+            or result.get("token") != token
+            or result.get("ok") is not True
+            or result.get("evidence") != prepared.helper.to_json()
+        ):
+            raise ValueError(
+                f"custody helper failed: {result.get('error', 'invalid result')}"
+            )
+        cleanup_lock_fd, source_fd = received_fds
+        if (
+            identity_from_stat(os.fstat(cleanup_lock_fd))
+            != prepared.helper.cleanup_lock_identity
+        ):
+            raise ValueError("custody helper returned the wrong cleanup-lock identity")
+        if identity_from_stat(os.fstat(source_fd)) != prepared.helper.source_identity:
+            raise ValueError("custody helper returned the wrong source identity")
+        send_record(
+            parent,
+            {"type": "source-custody-received", "token": token},
+            deadline=deadline,
+        )
+        wait_terminal(process.pid, deadline=deadline)
+        exit_code = reap(process.pid)
+        process = None
+        if exit_code != 0:
+            raise ValueError("custody helper exited nonzero after descriptor transfer")
+        received_fds = ()
+        return CustodyHandles(
+            cleanup_lock_fd=cleanup_lock_fd,
+            source_fd=source_fd,
+            evidence=prepared.helper,
+        )
+    finally:
+        os.close(devnull)
+        parent.close()
+        child.close()
+        for fd in received_fds:
+            os.close(fd)
+        if process is not None:
+            _kill_direct(process)
+
+
+def _prequiescence_abort(
+    *,
+    entrypoint: pathlib.Path,
+    attempt_dir: pathlib.Path,
+    lease: RetentionLease,
+    message: str,
+) -> None:
+    try:
+        state, _, digest = read_attempt_state(attempt_dir)
+        state, digest = commit_via_helper(
+            entrypoint=entrypoint,
+            attempt_dir=attempt_dir,
+            lease_fd=lease.fd,
+            state=state,
+            state_digest=digest,
+            updates={
+                "phase": "prelaunch-aborted",
+                "handoff": "aborted",
+                "process_owner": "outer",
+                "launch_status": "prelaunch-aborted",
+                "review_status": "not-run",
+                "closure": "proven-by-owner",
+                "failure_stage": "handoff",
+                "failure": {
+                    "status": "inconclusive",
+                    "code": "handoff-incomplete",
+                    "message": message,
+                },
+                "cleanup_status": "cleanup-pending",
+            },
+            deadline=time.monotonic() + 30,
+        )
+        prompt_path = pathlib.Path(state["prompt_path"])
+        try:
+            fd, identity = open_regular_nofollow(prompt_path, expected_uid=os.getuid())
+            os.close(fd)
+            if state.get("prompt_identity") and identity != Identity(
+                **state["prompt_identity"]
+            ):
+                raise ValueError("prompt identity changed before pre-handoff cleanup")
+            os.unlink(prompt_path)
+            fsync_directory(prompt_path.parent)
+        except FileNotFoundError:
+            pass
+        state, digest = _cleanup_worktree(
+            entrypoint=entrypoint,
+            attempt_dir=attempt_dir,
+            lease_fd=lease.fd,
+            state=state,
+            state_digest=digest,
+        )
+        _settle_process(
+            entrypoint=entrypoint,
+            attempt_dir=attempt_dir,
+            lease_fd=lease.fd,
+            state=state,
+            state_digest=digest,
+        )
+    except BaseException:
+        return
+
+
+def _process_charge_fields(
+    attempt_dir: pathlib.Path,
+    charge: int,
+) -> dict[str, Any]:
+    if type(charge) is not int or not 0 <= charge <= PROCESS_ENVELOPE_BYTES:
+        raise ValueError("retained process charge is outside its envelope")
+    identity = measure_filesystem(attempt_dir).identity
+    return {
+        "retained_process_bytes": charge,
+        "process_physical_remaining_by_fs": {identity: charge} if charge else {},
+    }
+
+
+def _process_accounting_is_exact(
+    attempt_dir: pathlib.Path,
+    state: dict[str, Any],
+) -> bool:
+    try:
+        measured = allocated_bytes(attempt_dir, entry_cap=1_000)
+        expected = _process_charge_fields(attempt_dir, measured)
+    except (OSError, ValueError):
+        return False
+    return bool(
+        state.get("retained_process_bytes") == measured
+        and state.get("process_physical_remaining_by_fs")
+        == expected["process_physical_remaining_by_fs"]
+    )
+
+
+def _commit_conservative_process_rewrite(
+    *,
+    entrypoint: pathlib.Path,
+    attempt_dir: pathlib.Path,
+    lease_fd: int,
+    state: dict[str, Any],
+    state_digest: str,
+    updates: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    if state.get("process_settlement") != "exact":
+        raise ValueError("only exact process state can be rewritten conservatively")
+    return commit_via_helper(
+        entrypoint=entrypoint,
+        attempt_dir=attempt_dir,
+        lease_fd=lease_fd,
+        state=state,
+        state_digest=state_digest,
+        updates={
+            **updates,
+            **_process_charge_fields(attempt_dir, PROCESS_ENVELOPE_BYTES),
+        },
+        deadline=time.monotonic() + 30,
+    )
+
+
+def _settle_rewritten_process_charge(
+    *,
+    entrypoint: pathlib.Path,
+    attempt_dir: pathlib.Path,
+    lease_fd: int,
+    state: dict[str, Any],
+    state_digest: str,
+) -> tuple[dict[str, Any], str]:
+    if state.get("process_settlement") != "exact":
+        raise ValueError("rewritten process state is not exactly settleable")
+    for _ in range(8):
+        measured = allocated_bytes(attempt_dir, entry_cap=1_000)
+        expected = _process_charge_fields(attempt_dir, measured)
+        if (
+            state.get("retained_process_bytes") == measured
+            and state.get("process_physical_remaining_by_fs")
+            == expected["process_physical_remaining_by_fs"]
+        ):
+            return state, state_digest
+        state, state_digest = commit_via_helper(
+            entrypoint=entrypoint,
+            attempt_dir=attempt_dir,
+            lease_fd=lease_fd,
+            state=state,
+            state_digest=state_digest,
+            updates=expected,
+            deadline=time.monotonic() + 30,
+        )
+    raise ValueError("rewritten process allocation accounting did not converge")
+
+
+def _begin_final_authorization_rewrite(
+    *,
+    entrypoint: pathlib.Path,
+    attempt_dir: pathlib.Path,
+    lease_fd: int,
+    state: dict[str, Any],
+    state_digest: str,
+    operation: str,
+    updates: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    existing = state.get("final_authorization_rewrite")
+    if existing is not None:
+        existing = validate_final_authorization_rewrite(state)
+        if existing["status"] != "complete":
+            raise ValueError("final authorization rewrite is already pending")
+    rewrite = build_final_authorization_rewrite(
+        attempt_dir=attempt_dir,
+        state=state,
+        state_digest=state_digest,
+        operation=operation,
+    )
+    return _commit_conservative_process_rewrite(
+        entrypoint=entrypoint,
+        attempt_dir=attempt_dir,
+        lease_fd=lease_fd,
+        state=state,
+        state_digest=state_digest,
+        updates={**updates, "final_authorization_rewrite": rewrite},
+    )
+
+
+def _complete_unauthed_final_authorization_rewrite(
+    *,
+    entrypoint: pathlib.Path,
+    attempt_dir: pathlib.Path,
+    lease_fd: int,
+    state: dict[str, Any],
+    state_digest: str,
+) -> tuple[dict[str, Any], str]:
+    rewrite = validate_final_authorization_rewrite(state)
+    if rewrite["authorization_required"]:
+        raise ValueError("authorized rewrite requires final authorization publication")
+    completed = complete_final_authorization_rewrite(rewrite)
+    if rewrite != completed:
+        state, state_digest = commit_via_helper(
+            entrypoint=entrypoint,
+            attempt_dir=attempt_dir,
+            lease_fd=lease_fd,
+            state=state,
+            state_digest=state_digest,
+            updates={"final_authorization_rewrite": completed},
+            deadline=time.monotonic() + 30,
+        )
+    return _settle_rewritten_process_charge(
+        entrypoint=entrypoint,
+        attempt_dir=attempt_dir,
+        lease_fd=lease_fd,
+        state=state,
+        state_digest=state_digest,
+    )
+
+
+def _require_reviewer_closure_evidence(state: dict[str, Any]) -> None:
+    if state.get("launch_status") != "completed":
+        raise ValueError("reviewer launch was not durably completed")
+    if (
+        state.get("handoff") != "complete"
+        or state.get("process_owner") != "attempt-supervisor"
+        or state.get("closure") != "proven-by-owner"
+    ):
+        raise ValueError("reviewer handoff or closure is not exact")
+    leader = state.get("leader")
+    if (
+        not isinstance(leader, dict)
+        or set(leader) != {"pid", "pgid", "start_identity"}
+        or type(leader.get("pid")) is not int
+        or leader["pid"] <= 1
+        or leader.get("pgid") != leader["pid"]
+        or not isinstance(leader.get("start_identity"), str)
+        or not leader["start_identity"]
+    ):
+        raise ValueError("reviewer leader binding is malformed")
+    try:
+        require_authenticated_no_child_process_profile(state)
+    except ChildProcessError as error:
+        raise ValueError("reviewer no-child profile binding is malformed") from error
+    runtime_binding = state.get("runtime_process_binding")
+    if (
+        not isinstance(runtime_binding, dict)
+        or set(runtime_binding) != {"session_id", "profile_sha256"}
+        or runtime_binding.get("session_id") != leader["pid"]
+        or not isinstance(runtime_binding.get("profile_sha256"), str)
+        or SHA256_PATTERN.fullmatch(runtime_binding["profile_sha256"]) is None
+    ):
+        raise ValueError("reviewer runtime binding is malformed")
+    process_history = state.get("process_history")
+    leader_exit = state.get("leader_exit")
+    if (
+        not isinstance(process_history, list)
+        or len(process_history) not in {1, 2}
+        or not isinstance(process_history[-1], dict)
+        or set(process_history[-1])
+        != {"stage", "leader", "runtime_binding", "exit_code", "closure"}
+        or process_history[-1].get("stage") != "reviewer"
+        or process_history[-1].get("leader") != leader
+        or process_history[-1].get("runtime_binding") != runtime_binding
+        or type(leader_exit) is not int
+        or process_history[-1].get("exit_code") != leader_exit
+        or process_history[-1].get("closure") != "proven-by-owner"
+    ):
+        raise ValueError("reviewer closure history is malformed")
+    if len(process_history) == 2:
+        refresh = process_history[0]
+        if (
+            not isinstance(refresh, dict)
+            or set(refresh)
+            != {"stage", "leader", "runtime_binding", "exit_code", "closure"}
+            or refresh.get("stage") != "auth-refresh"
+            or refresh.get("exit_code") != 0
+            or refresh.get("closure") != "proven-by-owner"
+        ):
+            raise ValueError("auth-refresh closure history is malformed")
+
+
+def _terminal_handoff_token(
+    state: dict[str, Any],
+    supervisor_binding: dict[str, Any],
+    supervisor_exit_code: int,
+) -> str:
+    if state.get("phase") != "reviewed" or state.get("launch_status") != "completed":
+        raise ValueError("terminal review was not durably completed")
+    _require_reviewer_closure_evidence(state)
+    if (
+        state.get("handoff") != "complete"
+        or state.get("process_owner") != "attempt-supervisor"
+    ):
+        raise ValueError("terminal review has no complete supervisor handoff")
+    if state.get("supervisor") != supervisor_binding:
+        raise ValueError("terminal review supervisor binding changed")
+    if (
+        state.get("closure") != "proven-by-owner"
+        or state.get("abandonment") is not False
+    ):
+        raise ValueError("terminal review closure is not exact")
+    if type(supervisor_exit_code) is not int or supervisor_exit_code != 0:
+        raise ValueError("attempt supervisor did not exit zero")
+    if state.get("review_status") not in {"clean", "findings"}:
+        raise ValueError("attempt supervisor produced no review result")
+    if (
+        state.get("process_settlement") != "exact"
+        or state.get("checkout_settlement") != "exact"
+        or state.get("worktree_status") != "removed"
+        or state.get("source_custody_released") is not True
+        or state.get("admission_status") != "completed"
+        or state.get("reservation_status") != "settled"
+    ):
+        raise ValueError("terminal review ledgers or custody are incomplete")
+    leader = state.get("leader")
+    if (
+        not isinstance(leader, dict)
+        or set(leader) != {"pid", "pgid", "start_identity"}
+        or type(leader.get("pid")) is not int
+        or leader["pid"] <= 1
+        or leader.get("pgid") != leader["pid"]
+        or not isinstance(leader.get("start_identity"), str)
+        or not leader["start_identity"]
+    ):
+        raise ValueError("terminal reviewer leader binding is malformed")
+    try:
+        require_authenticated_no_child_process_profile(state)
+    except ChildProcessError as error:
+        raise ValueError(
+            "terminal reviewer no-child profile binding is malformed"
+        ) from error
+    runtime_binding = state.get("runtime_process_binding")
+    if (
+        not isinstance(runtime_binding, dict)
+        or set(runtime_binding) != {"session_id", "profile_sha256"}
+        or runtime_binding.get("session_id") != leader["pid"]
+        or not isinstance(runtime_binding.get("profile_sha256"), str)
+        or SHA256_PATTERN.fullmatch(runtime_binding["profile_sha256"]) is None
+    ):
+        raise ValueError("terminal reviewer runtime binding is malformed")
+    process_history = state.get("process_history")
+    if (
+        not isinstance(process_history, list)
+        or len(process_history) not in {1, 2}
+        or not isinstance(process_history[-1], dict)
+        or set(process_history[-1])
+        != {"stage", "leader", "runtime_binding", "exit_code", "closure"}
+        or process_history[-1].get("stage") != "reviewer"
+        or process_history[-1].get("leader") != leader
+        or process_history[-1].get("runtime_binding") != runtime_binding
+        or process_history[-1].get("exit_code") != 0
+        or process_history[-1].get("closure") != "proven-by-owner"
+        or state.get("leader_exit") != 0
+    ):
+        raise ValueError("terminal reviewer closure history is malformed")
+    if len(process_history) == 2:
+        refresh = process_history[0]
+        if (
+            not isinstance(refresh, dict)
+            or set(refresh)
+            != {"stage", "leader", "runtime_binding", "exit_code", "closure"}
+            or refresh.get("stage") != "auth-refresh"
+            or refresh.get("exit_code") != 0
+            or refresh.get("closure") != "proven-by-owner"
+        ):
+            raise ValueError("terminal auth-refresh closure history is malformed")
+    if state.get("terminal_commit_authorized") is not True:
+        raise ValueError("terminal review was not authorized")
+    seal = state.get("final_seal")
+    terminal_authorization = state.get("terminal_authorization")
+    authorized_at = (
+        terminal_authorization.get("authorized_at")
+        if isinstance(terminal_authorization, dict)
+        else None
+    )
+    if (
+        not isinstance(seal, dict)
+        or set(seal) != {"path", "identity", "length", "sha256"}
+        or not isinstance(seal.get("identity"), dict)
+        or set(seal["identity"]) != IDENTITY_KEYS
+        or type(seal.get("length")) is not int
+        or not 1 <= seal["length"] <= FINAL_MESSAGE_BYTES
+        or not isinstance(seal.get("sha256"), str)
+        or SHA256_PATTERN.fullmatch(seal["sha256"]) is None
+        or not isinstance(terminal_authorization, dict)
+        or set(terminal_authorization) != {"leader_exit", "final_seal", "authorized_at"}
+        or type(terminal_authorization.get("leader_exit")) is not int
+        or terminal_authorization["leader_exit"] != 0
+        or terminal_authorization.get("final_seal") != seal
+        or type(authorized_at) not in {int, float}
+        or not math.isfinite(authorized_at)
+    ):
+        raise ValueError(
+            "terminal authorization is not bound to a zero-exit final seal"
+        )
+    handoff_token = state.get("handoff_token")
+    if (
+        not isinstance(handoff_token, str)
+        or HANDOFF_TOKEN_PATTERN.fullmatch(handoff_token) is None
+    ):
+        raise ValueError("terminal handoff token is malformed")
+    return handoff_token
+
+
+def _final_authorization_record(
+    *,
+    state: dict[str, Any],
+    state_digest: str,
+    supervisor_binding: dict[str, Any],
+    supervisor_exit_code: int,
+    handoff_token: str,
+) -> dict[str, Any]:
+    generation = state.get("record_generation")
+    if type(generation) is not int or generation < 1:
+        raise ValueError("terminal predecessor generation is malformed")
+    if SHA256_PATTERN.fullmatch(state_digest) is None:
+        raise ValueError("terminal predecessor digest is malformed")
+    payload = {
+        "predecessor_generation": generation,
+        "predecessor_sha256": state_digest,
+        "supervisor": supervisor_binding,
+        "supervisor_exit_code": supervisor_exit_code,
+        "handoff_token_sha256": sha256_bytes(handoff_token.encode("ascii")),
+        "final_seal": state["final_seal"],
+    }
+    return {
+        **payload,
+        "binding_sha256": sha256_bytes(canonical_json(payload)),
+    }
+
+
+def _publish_final_authorization(
+    *,
+    entrypoint: pathlib.Path,
+    attempt_dir: pathlib.Path,
+    lease: RetentionLease,
+    state: dict[str, Any],
+    state_digest: str,
+    supervisor_binding: dict[str, Any],
+    supervisor_exit_code: int,
+) -> tuple[dict[str, Any], str]:
+    handoff_token = _terminal_handoff_token(
+        state, supervisor_binding, supervisor_exit_code
+    )
+    for _ in range(8):
+        measured = allocated_bytes(attempt_dir, entry_cap=1_000)
+        authorization = _final_authorization_record(
+            state=state,
+            state_digest=state_digest,
+            supervisor_binding=supervisor_binding,
+            supervisor_exit_code=supervisor_exit_code,
+            handoff_token=handoff_token,
+        )
+        rewrite = state.get("final_authorization_rewrite")
+        rewrite_updates = (
+            {
+                "final_authorization_rewrite": complete_final_authorization_rewrite(
+                    validate_final_authorization_rewrite(state)
+                )
+            }
+            if rewrite is not None
+            else {}
+        )
+        state, state_digest = commit_via_helper(
+            entrypoint=entrypoint,
+            attempt_dir=attempt_dir,
+            lease_fd=lease.fd,
+            state=state,
+            state_digest=state_digest,
+            updates={
+                "supervisor_exit_code": supervisor_exit_code,
+                "final_authorization": authorization,
+                **rewrite_updates,
+                **_process_charge_fields(attempt_dir, measured),
+            },
+            deadline=time.monotonic() + 30,
+            request_type="final-authorization-commit",
+        )
+        if allocated_bytes(attempt_dir, entry_cap=1_000) == state.get(
+            "retained_process_bytes"
+        ):
+            return state, state_digest
+    raise ValueError("final authorization allocation accounting did not converge")
+
+
+def run(
+    *,
+    entrypoint: pathlib.Path,
+    helper_state: pathlib.Path,
+    repo: pathlib.Path,
+    base_sha: str,
+    head_sha: str,
+    pr_url: str,
+    retention_root: pathlib.Path,
+    checkout_parent: pathlib.Path,
+    git_executable: str,
+    codex_executable: str | None,
+) -> tuple[int, dict[str, Any]]:
+    require_private_directory(retention_root, create=True)
+    require_private_directory(checkout_parent, create=True)
+    lease = acquire_retention_lease(retention_root, deadline=time.monotonic() + 30)
+    attempt_dir: pathlib.Path | None = None
+    supervisor: SpawnedProcess | None = None
+    supervisor_binding: dict[str, Any] | None = None
+    parent, child = socket_pair()
+    custody = None
+    ownership_complete = False
+    incomplete_handoff_writers_stopped = True
+    try:
+        prepared = _prepare_with_reclamation(
+            entrypoint=entrypoint,
+            lease=lease,
+            helper_state=helper_state,
+            repo=repo,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            pr_url=pr_url,
+            retention_root=retention_root,
+            checkout_parent=checkout_parent,
+            git_executable=git_executable,
+            codex_executable=codex_executable,
+        )
+        attempt_dir, state, state_digest = create_reserved_attempt(
+            lease=lease,
+            checkout_parent=checkout_parent,
+            prompt=prepared.prompt,
+            prompt_sha256=prepared.prompt_evidence["sha256"],
+            custody=prepared.helper,
+            admission=prepared.admission,
+            base_manifest_sha256=manifest_digest(prepared.base_manifest),
+            head_manifest_sha256=manifest_digest(prepared.head_manifest),
+            repo=prepared.repository.repo,
+            common_git_dir=prepared.repository.common_git_dir,
+            pr_url=pr_url,
+            git_executable=prepared.repository.git_executable,
+            codex_executable=prepared.codex_executable,
+            exec_budget=prepared.exec_budget,
+            attempt_id=prepared.attempt_id,
+        )
+        state, state_digest = publish_prompt_via_helper(
+            entrypoint=entrypoint,
+            attempt_dir=attempt_dir,
+            lease_fd=lease.fd,
+            state=state,
+            state_digest=state_digest,
+            prompt=prepared.prompt,
+            deadline=time.monotonic() + 30,
+        )
+        handoff_deadline = time.monotonic() + HANDOFF_SECONDS
+        token = os.urandom(32).hex()
+        supervisor = _spawn_attempt_supervisor(
+            entrypoint=entrypoint,
+            attempt_dir=attempt_dir,
+            control_child=child,
+            lease_fd=lease.fd,
+            token=token,
+        )
+        incomplete_handoff_writers_stopped = False
+        child.close()
+        await_exec(supervisor, deadline=handoff_deadline)
+        ready, _ = receive_record(parent, deadline=handoff_deadline)
+        if (
+            ready.get("type") != "attempt-supervisor-ready"
+            or ready.get("token") != token
+            or ready.get("pid") != supervisor.pid
+        ):
+            raise ValueError("attempt supervisor ready record is invalid")
+        supervisor_binding = {
+            "pid": supervisor.pid,
+            "start_identity": ready.get("start_identity"),
+        }
+        custody = _acquire_source_custody_via_helper(
+            entrypoint=entrypoint,
+            prepared=prepared,
+            deadline=handoff_deadline,
+        )
+        send_record(
+            parent,
+            {
+                "type": "source-custody",
+                "token": token,
+                "helper_custody": prepared.helper.to_json(),
+            },
+            deadline=handoff_deadline,
+            fds=(custody.cleanup_lock_fd, custody.source_fd),
+        )
+        custody_accepted, _ = receive_record(parent, deadline=handoff_deadline)
+        if custody_accepted != {"type": "source-custody-accepted", "token": token}:
+            raise ValueError("attempt supervisor did not accept source custody")
+        state, state_digest = commit_via_helper(
+            entrypoint=entrypoint,
+            attempt_dir=attempt_dir,
+            lease_fd=lease.fd,
+            state=state,
+            state_digest=state_digest,
+            updates={
+                "handoff": "pending",
+                "handoff_token": token,
+                "supervisor": {
+                    "pid": supervisor.pid,
+                    "start_identity": ready.get("start_identity"),
+                },
+                "source_custody_transferred": True,
+            },
+            deadline=handoff_deadline,
+        )
+        send_record(
+            parent, {"type": "prompt-offer", "token": token}, deadline=handoff_deadline
+        )
+        send_blob(parent, token, prepared.prompt, deadline=handoff_deadline)
+        accepted, _ = receive_record(parent, deadline=handoff_deadline)
+        if (
+            accepted.get("type") != "handoff-accepted"
+            or accepted.get("state_sha256") is None
+        ):
+            raise ValueError("attempt supervisor handoff acceptance is invalid")
+        disk_state, _, disk_digest = read_attempt_state(attempt_dir)
+        if (
+            disk_digest != accepted["state_sha256"]
+            or disk_state.get("handoff") != "accepted"
+        ):
+            raise ValueError("durable handoff acceptance readback failed")
+        send_record(
+            parent, {"type": "handoff-start", "token": token}, deadline=handoff_deadline
+        )
+        complete, _ = receive_record(parent, deadline=handoff_deadline)
+        if complete.get("type") != "handoff-complete" or complete.get("token") != token:
+            raise ValueError("attempt supervisor ownership completion is invalid")
+        disk_state, _, disk_digest = read_attempt_state(attempt_dir)
+        if (
+            disk_digest != complete.get("state_sha256")
+            or disk_state.get("handoff") != "complete"
+            or disk_state.get("process_owner") != "attempt-supervisor"
+        ):
+            raise ValueError("durable ownership-completion readback failed")
+        ownership_complete = True
+        send_record(
+            parent,
+            {
+                "type": "handoff-complete-ack",
+                "token": token,
+                "state_sha256": disk_digest,
+            },
+            deadline=handoff_deadline,
+        )
+        custody.close()
+        custody = None
+        lease.close()
+
+        terminal_deadline = (
+            time.monotonic()
+            + CHECKOUT_SECONDS
+            + REVIEWER_LAUNCH_SECONDS
+            + REVIEWER_RUNTIME_SECONDS
+            + 10 * 60
+        )
+        terminal, _ = receive_record(parent, deadline=terminal_deadline)
+        if terminal.get("type") != "attempt-terminal" or terminal.get("token") != token:
+            raise ValueError("attempt supervisor terminal record is invalid")
+        wait_terminal(supervisor.pid, deadline=time.monotonic() + 30)
+        exit_code = reap(supervisor.pid)
+        supervisor = None
+        summary = terminal.get("summary")
+        if not isinstance(summary, dict):
+            raise ValueError("attempt terminal summary is malformed")
+        if exit_code == 0:
+            if supervisor_binding is None:
+                raise ValueError("completed supervisor has no authenticated binding")
+            with acquire_retention_lease(
+                retention_root, deadline=time.monotonic() + 30
+            ) as completion_lease:
+                completed_state, _, completed_digest = read_attempt_state(attempt_dir)
+                if _compact_terminal(completed_state) != summary:
+                    raise ValueError(
+                        "attempt terminal summary differs from durable terminal state"
+                    )
+                completed_state, completed_digest = _publish_final_authorization(
+                    entrypoint=entrypoint,
+                    attempt_dir=attempt_dir,
+                    lease=completion_lease,
+                    state=completed_state,
+                    state_digest=completed_digest,
+                    supervisor_binding=supervisor_binding,
+                    supervisor_exit_code=exit_code,
+                )
+                if not _has_exact_final_authorization(
+                    attempt_dir,
+                    completed_state,
+                ):
+                    raise ValueError("published final authorization is not exact")
+                summary = _compact_terminal(
+                    completed_state,
+                    final_authorization_exact=True,
+                )
+        return exit_code, summary
+    except BaseException as error:
+        if custody is not None:
+            custody.close()
+            custody = None
+        parent.close()
+        if supervisor is not None:
+            if ownership_complete:
+                try:
+                    wait_terminal(supervisor.pid, deadline=time.monotonic() + 30)
+                    reap(supervisor.pid)
+                except BaseException:
+                    # After ownership linearizes, only the attempt supervisor may
+                    # terminate its child PGID. Closing liveness makes it abandon
+                    # and settle; killing it here could orphan a reviewer.
+                    pass
+            else:
+                try:
+                    _terminate_incomplete_handoff(supervisor)
+                    incomplete_handoff_writers_stopped = True
+                except BaseException:
+                    incomplete_handoff_writers_stopped = False
+            supervisor = None
+        if (
+            attempt_dir is not None
+            and not ownership_complete
+            and incomplete_handoff_writers_stopped
+            and lease.fd >= 0
+        ):
+            _prequiescence_abort(
+                entrypoint=entrypoint,
+                attempt_dir=attempt_dir,
+                lease=lease,
+                message=f"{type(error).__name__}: {error}",
+            )
+        failure = error.failure if isinstance(error, SupervisorError) else None
+        return 2, {
+            "overall_status": failure.status if failure else "inconclusive",
+            "review_status": failure.review_status if failure else "not-run",
+            "failure_stage": failure.stage if failure else "outer-supervisor",
+            "failure_code": failure.code if failure else "outer-supervisor-failed",
+            "message": failure.message
+            if failure
+            else f"{type(error).__name__}: {error}",
+            "attempt_dir": str(attempt_dir) if attempt_dir else None,
+            "unsupported_clauses": list(UNSUPPORTED_CLAUSES),
+        }
+    finally:
+        parent.close()
+        child.close()
+        if custody is not None:
+            custody.close()
+        lease.close()
+
+
+def _normalize_absolute(path: pathlib.Path) -> pathlib.Path:
+    normalized = pathlib.Path(os.path.abspath(os.fspath(path)))
+    if not normalized.is_absolute():
+        raise ValueError("path did not normalize to an absolute path")
+    return normalized
+
+
+def _validate_attempt_directory(
+    retention_root: pathlib.Path,
+    attempt_dir: pathlib.Path,
+) -> tuple[pathlib.Path, pathlib.Path]:
+    root = _normalize_absolute(retention_root)
+    attempt = _normalize_absolute(attempt_dir)
+    require_private_directory(root)
+    match = ATTEMPT_NAME_PATTERN.fullmatch(attempt.name)
+    if attempt.parent != root or match is None:
+        raise ValueError(
+            "attempt directory is not an exact child of the retention root"
+        )
+    identity = require_private_directory(attempt)
+    if stat.S_IMODE(identity.mode) != 0o700:
+        raise ValueError("attempt directory mode is not 0700")
+    state, _, _ = read_attempt_state(attempt)
+    if state.get("attempt_id") != match.group(1):
+        raise ValueError("attempt directory name does not match durable state")
+    return root, attempt
+
+
+def _list_attempt_directories(retention_root: pathlib.Path) -> tuple[pathlib.Path, ...]:
+    root = _normalize_absolute(retention_root)
+    require_private_directory(root)
+    root_fd, _ = open_absolute_directory_chain(root)
+    try:
+        names = tuple(os.fsencode(value) for value in os.listdir(root_fd))
+        if len(names) > 10_001:
+            raise ValueError("retention root contains too many entries")
+        attempts: list[pathlib.Path] = []
+        for name in names:
+            if name == b"retention.lock":
+                continue
+            text = os.fsdecode(name)
+            metadata = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            if ATTEMPT_NAME_PATTERN.fullmatch(text) is None or not stat.S_ISDIR(
+                metadata.st_mode
+            ):
+                raise ValueError("retention root contains an unrecognized entry")
+            if (
+                metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
+                raise ValueError("retained attempt has unsafe ownership or mode")
+            attempts.append(root / text)
+        return tuple(sorted(attempts))
+    finally:
+        os.close(root_fd)
+
+
+def _owner_liveness(state: dict[str, Any], current_boot: str) -> dict[str, Any]:
+    same_boot = state.get("boot_id") == current_boot
+    supervisor = state.get("supervisor")
+    if not same_boot or not isinstance(supervisor, dict):
+        return {"same_boot": same_boot, "supervisor_identity": "not-applicable"}
+    pid = supervisor.get("pid")
+    expected = supervisor.get("start_identity")
+    if type(pid) is not int or pid <= 1 or not isinstance(expected, str):
+        return {"same_boot": True, "supervisor_identity": "invalid"}
+    try:
+        actual = process_start_identity(pid)
+    except (OSError, ValueError, ProcessLookupError):
+        return {"same_boot": True, "supervisor_identity": "absent-or-unverifiable"}
+    return {
+        "same_boot": True,
+        "supervisor_identity": "matching-live" if actual == expected else "mismatch",
+    }
+
+
+def status(
+    *,
+    retention_root: pathlib.Path,
+    attempt_dir: pathlib.Path | None = None,
+) -> dict[str, Any]:
+    root = _normalize_absolute(retention_root)
+    paths = (
+        (_validate_attempt_directory(root, attempt_dir)[1],)
+        if attempt_dir is not None
+        else _list_attempt_directories(root)
+    )
+    current_boot = boot_identifier()
+    attempts: list[dict[str, Any]] = []
+    for path in paths:
+        state, raw, digest = read_attempt_state(path)
+        final_authorization_exact = _has_exact_final_authorization(path, state)
+        attempts.append(
+            {
+                **_compact_terminal(
+                    state,
+                    final_authorization_exact=final_authorization_exact,
+                ),
+                "phase": state.get("phase"),
+                "handoff": state.get("handoff"),
+                "closure": state.get("closure"),
+                "process_settlement": state.get("process_settlement"),
+                "checkout_settlement": state.get("checkout_settlement"),
+                "retention_state": state.get("retention_state"),
+                "record_generation": state.get("record_generation"),
+                "state_length": len(raw),
+                "state_sha256": digest,
+                "owner": _owner_liveness(state, current_boot),
+            }
+        )
+    return {
+        "status": "ok",
+        "retention_root": str(root),
+        "attempt_count": len(attempts),
+        "attempts": attempts,
+    }
+
+
+def _validate_final_authorization(
+    attempt: pathlib.Path,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    _validate_terminal_lifecycle(attempt, state)
+    supervisor_binding = state.get("supervisor")
+    if (
+        not isinstance(supervisor_binding, dict)
+        or set(supervisor_binding) != {"pid", "start_identity"}
+        or type(supervisor_binding.get("pid")) is not int
+        or supervisor_binding["pid"] <= 1
+        or not isinstance(supervisor_binding.get("start_identity"), str)
+        or not supervisor_binding["start_identity"]
+    ):
+        raise ValueError("attempt supervisor binding is malformed")
+    supervisor_exit_code = state.get("supervisor_exit_code")
+    handoff_token = _terminal_handoff_token(
+        state, supervisor_binding, supervisor_exit_code
+    )
+    authorization = state.get("final_authorization")
+    if (
+        not isinstance(authorization, dict)
+        or set(authorization) != FINAL_AUTHORIZATION_KEYS
+    ):
+        raise ValueError("final authorization record is malformed")
+    generation = state.get("record_generation")
+    predecessor_generation = authorization.get("predecessor_generation")
+    predecessor_sha256 = authorization.get("predecessor_sha256")
+    if (
+        type(generation) is not int
+        or type(predecessor_generation) is not int
+        or predecessor_generation != generation - 1
+        or not isinstance(predecessor_sha256, str)
+        or SHA256_PATTERN.fullmatch(predecessor_sha256) is None
+        or state.get("previous_record_sha256") != predecessor_sha256
+    ):
+        raise ValueError("final authorization is not bound to the direct predecessor")
+    if (
+        authorization.get("supervisor") != supervisor_binding
+        or type(authorization.get("supervisor_exit_code")) is not int
+        or authorization["supervisor_exit_code"] != supervisor_exit_code
+        or authorization.get("handoff_token_sha256")
+        != sha256_bytes(handoff_token.encode("ascii"))
+        or authorization.get("final_seal") != state.get("final_seal")
+    ):
+        raise ValueError("final authorization binding differs from terminal state")
+    payload = {
+        key: value for key, value in authorization.items() if key != "binding_sha256"
+    }
+    if authorization.get("binding_sha256") != sha256_bytes(canonical_json(payload)):
+        raise ValueError("final authorization binding digest is invalid")
+    measured = allocated_bytes(attempt, entry_cap=1_000)
+    expected_charge = _process_charge_fields(attempt, measured)
+    if (
+        state.get("retained_process_bytes") != measured
+        or state.get("process_physical_remaining_by_fs")
+        != expected_charge["process_physical_remaining_by_fs"]
+    ):
+        raise ValueError("final attempt allocation is not exactly settled")
+    rewrite = state.get("final_authorization_rewrite")
+    if rewrite is not None:
+        validated_rewrite = validate_final_authorization_rewrite(state)
+        if validated_rewrite.get("status") != "complete":
+            raise ValueError("final authorization rewrite remains pending")
+    return state["final_seal"]
+
+
+def _has_exact_final_authorization(
+    attempt: pathlib.Path,
+    state: dict[str, Any],
+) -> bool:
+    try:
+        _validate_final_authorization(attempt, state)
+    except Exception:
+        return False
+    return True
+
+
+def final_result(
+    *,
+    retention_root: pathlib.Path,
+    attempt_dir: pathlib.Path,
+) -> dict[str, Any]:
+    _, attempt = _validate_attempt_directory(retention_root, attempt_dir)
+    state, _, state_digest = read_attempt_state(attempt)
+    if (
+        state.get("process_settlement") != "exact"
+        or state.get("review_status") not in {"clean", "findings"}
+        or state.get("terminal_commit_authorized") is not True
+    ):
+        raise blocked(
+            "attempt has no exactly settled authorized review artifact",
+            stage="output",
+            code="final-evidence-unavailable",
+        )
+    try:
+        seal = _validate_final_authorization(attempt, state)
+    except (OSError, TypeError, ValueError) as error:
+        raise inconclusive(
+            f"durable final authorization is invalid: {error}",
+            stage="output",
+            code="final-authorization-invalid",
+        ) from error
+    if not isinstance(seal, dict) or not isinstance(seal.get("identity"), dict):
+        raise inconclusive(
+            "durable final seal is malformed",
+            stage="output",
+            code="final-seal-invalid",
+        )
+    final_path = pathlib.Path(seal.get("path", ""))
+    if final_path != attempt / "final.txt":
+        raise inconclusive(
+            "durable final seal path escaped the attempt directory",
+            stage="output",
+            code="final-seal-invalid",
+        )
+    fd, identity = open_regular_nofollow(final_path, expected_uid=os.getuid())
+    try:
+        expected_identity = Identity(**seal["identity"])
+        if identity != expected_identity or seal.get("length") != identity.size:
+            raise ValueError("final artifact identity or length differs from its seal")
+        content = read_fd_exact(
+            fd,
+            max_bytes=FINAL_MESSAGE_BYTES,
+            expected_size=identity.size,
+        )
+    finally:
+        os.close(fd)
+    digest = sha256_bytes(content)
+    if seal.get("sha256") != digest:
+        raise inconclusive(
+            "final artifact digest differs from its durable seal",
+            stage="output",
+            code="final-seal-invalid",
+        )
+    review_status, message = validate_final_message(content)
+    if review_status != state["review_status"]:
+        raise inconclusive(
+            "final artifact classification differs from durable state",
+            stage="output",
+            code="final-classification-invalid",
+        )
+    return {
+        "status": "ok",
+        "attempt_id": state["attempt_id"],
+        "review_status": review_status,
+        "review_range": state.get("review_range"),
+        "final_message": message,
+        "final_seal": seal,
+        "state_sha256": state_digest,
+    }
+
+
+def _validate_process_inventory(
+    attempt_dir: pathlib.Path,
+    state: dict[str, Any],
+    *,
+    allow_fifo: bool,
+) -> dict[str, Any]:
+    directory_fd, identity = open_absolute_directory_chain(attempt_dir)
+    try:
+        if identity.uid != os.getuid() or stat.S_IMODE(identity.mode) != 0o700:
+            raise ValueError("attempt inventory root identity is unsafe")
+        names = tuple(os.fsencode(value) for value in os.listdir(directory_fd))
+        if len(names) > 1_000:
+            raise ValueError("attempt inventory exceeds its entry cap")
+        log_bytes = 0
+        temporary_names: list[str] = []
+        observed: list[str] = []
+        runtime_identity: dict[str, Any] | None = None
+        runtime_allocated_bytes = 0
+        for raw_name in names:
+            name = os.fsdecode(raw_name)
+            metadata = os.stat(raw_name, dir_fd=directory_fd, follow_symlinks=False)
+            if metadata.st_uid != os.getuid():
+                raise ValueError(f"attempt artifact has unexpected owner: {name}")
+            observed.append(name)
+            if name == "final.fifo":
+                if not allow_fifo or not stat.S_ISFIFO(metadata.st_mode):
+                    raise ValueError("unexpected or unsafe final FIFO")
+                continue
+            if name == "review-runtime":
+                if (
+                    runtime_identity is not None
+                    or not stat.S_ISDIR(metadata.st_mode)
+                    or stat.S_IMODE(metadata.st_mode) != 0o700
+                ):
+                    raise ValueError("retained review runtime identity is unsafe")
+                runtime_identity = identity_from_stat(metadata).to_json()
+                runtime_allocated_bytes = allocated_bytes(
+                    attempt_dir / name,
+                    entry_cap=RUNTIME_CLEANUP_ENTRY_CAP,
+                )
+                continue
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise ValueError(
+                    f"attempt artifact is not a single-link regular file: {name}"
+                )
+            if name == "state.json":
+                continue
+            if RECOVERY_TEMP_PATTERN.fullmatch(name):
+                temporary_names.append(name)
+                continue
+            if name == RUNTIME_CLEANUP_MANIFEST:
+                if metadata.st_size > RUNTIME_CLEANUP_PAYLOAD_CAP:
+                    raise ValueError("runtime cleanup manifest exceeds its bound")
+                temporary_names.append(name)
+                continue
+            if name == "prompt.txt":
+                if metadata.st_size > state.get("prompt_length", -1):
+                    raise ValueError("retained prompt exceeds its reserved length")
+                continue
+            if name == "final.txt":
+                if not 1 <= metadata.st_size <= FINAL_MESSAGE_BYTES:
+                    raise ValueError("retained final artifact exceeds its bound")
+                continue
+            if PROCESS_LOG_PATTERN.fullmatch(name):
+                log_bytes += metadata.st_size
+                if log_bytes > LOG_AGGREGATE_BYTES:
+                    raise ValueError(
+                        "retained compressed logs exceed their aggregate cap"
+                    )
+                continue
+            raise ValueError(
+                f"attempt inventory contains an unrecognized artifact: {name}"
+            )
+        if "state.json" not in observed:
+            raise ValueError("attempt inventory has no state record")
+        return {
+            "entry_count": len(names),
+            "allocated_bytes": allocated_bytes(attempt_dir, entry_cap=1_000),
+            "compressed_log_bytes": log_bytes,
+            "temporary_names": sorted(temporary_names),
+            "runtime_identity": runtime_identity,
+            "runtime_allocated_bytes": runtime_allocated_bytes,
+        }
+    finally:
+        os.close(directory_fd)
+
+
+def _remove_recovery_artifacts(
+    attempt_dir: pathlib.Path,
+    state: dict[str, Any],
+    inventory: dict[str, Any],
+) -> dict[str, Any]:
+    directory_fd, _ = open_absolute_directory_chain(attempt_dir)
+    prompt_result = "absent"
+    removed_temporaries: list[str] = []
+    runtime_cleanup: dict[str, Any] | None = None
+    try:
+        for name in inventory["temporary_names"]:
+            raw_name = os.fsencode(name)
+            metadata = os.stat(raw_name, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1
+            ):
+                raise ValueError("interrupted state temporary is unsafe")
+            os.unlink(raw_name, dir_fd=directory_fd)
+            removed_temporaries.append(name)
+        prompt_path = pathlib.Path(state["prompt_path"])
+        if prompt_path != attempt_dir / "prompt.txt":
+            raise ValueError("reserved prompt path escaped the attempt directory")
+        try:
+            metadata = os.stat(
+                b"prompt.txt", dir_fd=directory_fd, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1
+            ):
+                raise ValueError("recoverable prompt artifact is unsafe")
+            fd = os.open(
+                b"prompt.txt",
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            try:
+                content = read_fd_exact(
+                    fd,
+                    max_bytes=state["prompt_length"],
+                    expected_size=metadata.st_size,
+                )
+            finally:
+                os.close(fd)
+            prompt_result = (
+                "exact"
+                if len(content) == state["prompt_length"]
+                and sha256_bytes(content) == state["prompt_sha256"]
+                else "partial"
+            )
+            os.unlink(b"prompt.txt", dir_fd=directory_fd)
+        os.fsync(directory_fd)
+        runtime_identity = inventory.get("runtime_identity")
+        if runtime_identity is not None:
+            if not isinstance(runtime_identity, dict):
+                raise ValueError("retained runtime inventory is malformed")
+            parent_identity = identity_from_stat(os.fstat(directory_fd))
+            manifest = build_custodied_manifest(
+                roots=(
+                    RootSpec(
+                        label="retained-review-runtime",
+                        parent_fd=directory_fd,
+                        parent_identity=parent_identity,
+                        name=b"review-runtime",
+                        expected_identity=Identity(**runtime_identity),
+                    ),
+                ),
+                manifest_path=attempt_dir / RUNTIME_CLEANUP_MANIFEST,
+                entry_cap=RUNTIME_CLEANUP_ENTRY_CAP,
+                payload_cap=RUNTIME_CLEANUP_PAYLOAD_CAP,
+                deadline=time.monotonic() + 30,
+            )
+            deleted = False
+            try:
+                runtime_cleanup = delete_custodied_roots(
+                    manifest,
+                    deadline=time.monotonic() + 30,
+                )
+                deleted = True
+            finally:
+                manifest.close()
+                if deleted:
+                    remove_published_manifest(manifest.seal)
+            os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    return {
+        "prompt_reconciliation": prompt_result,
+        "removed_state_temporaries": removed_temporaries,
+        "retained_runtime_cleanup": runtime_cleanup,
+    }
+
+
+def _remove_exact_settled_runtime(
+    attempt_dir: pathlib.Path,
+    inventory: dict[str, Any],
+) -> dict[str, Any]:
+    directory_fd, _ = open_absolute_directory_chain(attempt_dir)
+    removed_temporaries: list[str] = []
+    runtime_cleanup: dict[str, Any] | None = None
+    try:
+        for name in inventory["temporary_names"]:
+            raw_name = os.fsencode(name)
+            metadata = os.stat(raw_name, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1
+            ):
+                raise ValueError("exact-settled cleanup temporary is unsafe")
+            os.unlink(raw_name, dir_fd=directory_fd)
+            removed_temporaries.append(name)
+        runtime_identity = inventory.get("runtime_identity")
+        if runtime_identity is not None:
+            if not isinstance(runtime_identity, dict):
+                raise ValueError("exact-settled runtime identity is malformed")
+            parent_identity = identity_from_stat(os.fstat(directory_fd))
+            manifest = build_custodied_manifest(
+                roots=(
+                    RootSpec(
+                        label="exact-settled-review-runtime",
+                        parent_fd=directory_fd,
+                        parent_identity=parent_identity,
+                        name=b"review-runtime",
+                        expected_identity=Identity(**runtime_identity),
+                    ),
+                ),
+                manifest_path=attempt_dir / RUNTIME_CLEANUP_MANIFEST,
+                entry_cap=RUNTIME_CLEANUP_ENTRY_CAP,
+                payload_cap=RUNTIME_CLEANUP_PAYLOAD_CAP,
+                deadline=time.monotonic() + 30,
+            )
+            deleted = False
+            try:
+                runtime_cleanup = delete_custodied_roots(
+                    manifest,
+                    deadline=time.monotonic() + 30,
+                )
+                deleted = True
+            finally:
+                manifest.close()
+                if deleted:
+                    remove_published_manifest(manifest.seal)
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    return {
+        "removed_state_temporaries": removed_temporaries,
+        "retained_runtime_cleanup": runtime_cleanup,
+    }
+
+
+def _recover_exact_settled_runtime(
+    *,
+    entrypoint: pathlib.Path,
+    attempt: pathlib.Path,
+    lease: RetentionLease,
+    state: dict[str, Any],
+    state_digest: str,
+    inventory: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    rewrite = state.get("final_authorization_rewrite")
+    if rewrite is None:
+        state, state_digest = _begin_final_authorization_rewrite(
+            entrypoint=entrypoint,
+            attempt_dir=attempt,
+            lease_fd=lease.fd,
+            state=state,
+            state_digest=state_digest,
+            operation="runtime-cleanup",
+            updates={},
+        )
+        rewrite = validate_final_authorization_rewrite(state)
+    else:
+        rewrite = validate_final_authorization_rewrite(state)
+        if rewrite["status"] == "complete":
+            state, state_digest = _begin_final_authorization_rewrite(
+                entrypoint=entrypoint,
+                attempt_dir=attempt,
+                lease_fd=lease.fd,
+                state=state,
+                state_digest=state_digest,
+                operation="runtime-cleanup",
+                updates={},
+            )
+            rewrite = validate_final_authorization_rewrite(state)
+        elif rewrite["operation"] != "runtime-cleanup":
+            raise ValueError("another process rewrite operation is outstanding")
+
+    _remove_exact_settled_runtime(attempt, inventory)
+    state, state_digest = _settle_rewritten_process_charge(
+        entrypoint=entrypoint,
+        attempt_dir=attempt,
+        lease_fd=lease.fd,
+        state=state,
+        state_digest=state_digest,
+    )
+    if rewrite["authorization_required"]:
+        state, state_digest = _publish_final_authorization(
+            entrypoint=entrypoint,
+            attempt_dir=attempt,
+            lease=lease,
+            state=state,
+            state_digest=state_digest,
+            supervisor_binding=state.get("supervisor"),
+            supervisor_exit_code=state.get("supervisor_exit_code"),
+        )
+        if not _has_exact_final_authorization(attempt, state):
+            raise ValueError("runtime-cleanup final authorization is not exact")
+    else:
+        state, state_digest = _complete_unauthed_final_authorization_rewrite(
+            entrypoint=entrypoint,
+            attempt_dir=attempt,
+            lease_fd=lease.fd,
+            state=state,
+            state_digest=state_digest,
+        )
+    return state, state_digest
+
+
+def _finish_release_authorization_rewrite(
+    *,
+    entrypoint: pathlib.Path,
+    attempt: pathlib.Path,
+    lease: RetentionLease,
+    state: dict[str, Any],
+    state_digest: str,
+) -> tuple[dict[str, Any], str, bool]:
+    rewrite = validate_final_authorization_rewrite(state)
+    if rewrite["operation"] != "release":
+        raise ValueError("release recovery has another rewrite operation")
+    state, state_digest = _settle_rewritten_process_charge(
+        entrypoint=entrypoint,
+        attempt_dir=attempt,
+        lease_fd=lease.fd,
+        state=state,
+        state_digest=state_digest,
+    )
+    if rewrite["authorization_required"]:
+        state, state_digest = _publish_final_authorization(
+            entrypoint=entrypoint,
+            attempt_dir=attempt,
+            lease=lease,
+            state=state,
+            state_digest=state_digest,
+            supervisor_binding=state.get("supervisor"),
+            supervisor_exit_code=state.get("supervisor_exit_code"),
+        )
+        if not _has_exact_final_authorization(attempt, state):
+            raise ValueError("released final authorization is not exact")
+        return state, state_digest, True
+    state, state_digest = _complete_unauthed_final_authorization_rewrite(
+        entrypoint=entrypoint,
+        attempt_dir=attempt,
+        lease_fd=lease.fd,
+        state=state,
+        state_digest=state_digest,
+    )
+    if not _process_accounting_is_exact(attempt, state):
+        raise ValueError("released process accounting is not exact")
+    return state, state_digest, False
+
+
+def recover(
+    *,
+    entrypoint: pathlib.Path,
+    retention_root: pathlib.Path,
+    attempt_dir: pathlib.Path,
+) -> tuple[int, dict[str, Any]]:
+    root, attempt = _validate_attempt_directory(retention_root, attempt_dir)
+    with acquire_retention_lease(root, deadline=time.monotonic() + 30) as lease:
+        state, _, digest = read_attempt_state(attempt)
+        settlements_exact = (
+            state.get("process_settlement") == "exact"
+            and state.get("checkout_settlement") == "exact"
+        )
+        process_accounting_exact = _process_accounting_is_exact(attempt, state)
+        terminal_review = state.get("review_status") in {"clean", "findings"}
+        final_authorization_exact = (
+            _has_exact_final_authorization(attempt, state) if terminal_review else False
+        )
+        rewrite = state.get("final_authorization_rewrite")
+        if rewrite is not None:
+            try:
+                rewrite = validate_final_authorization_rewrite(state)
+            except ValueError as error:
+                raise inconclusive(
+                    f"durable process rewrite state is invalid: {error}",
+                    stage="recovery",
+                    code="recovery-rewrite-invalid",
+                ) from error
+        if (
+            isinstance(rewrite, dict)
+            and rewrite.get("operation") == "release"
+            and (
+                rewrite.get("status") != "complete"
+                or not process_accounting_exact
+                or (
+                    rewrite.get("authorization_required")
+                    and not final_authorization_exact
+                )
+            )
+        ):
+            try:
+                state, digest, final_authorization_exact = (
+                    _finish_release_authorization_rewrite(
+                        entrypoint=entrypoint,
+                        attempt=attempt,
+                        lease=lease,
+                        state=state,
+                        state_digest=digest,
+                    )
+                )
+            except ValueError as error:
+                raise inconclusive(
+                    f"release authorization recovery is invalid: {error}",
+                    stage="recovery",
+                    code="recovery-release-rewrite-invalid",
+                ) from error
+            return 0, {
+                "status": "recovered",
+                "attempt": _compact_terminal(
+                    state,
+                    final_authorization_exact=final_authorization_exact,
+                ),
+                "state_sha256": digest,
+            }
+        exact_inventory: dict[str, Any] | None = None
+        if settlements_exact and (
+            process_accounting_exact
+            or (
+                isinstance(rewrite, dict)
+                and rewrite.get("operation") == "runtime-cleanup"
+            )
+        ):
+            exact_inventory = _validate_process_inventory(
+                attempt,
+                state,
+                allow_fifo=False,
+            )
+        exact_cleanup_authorized = (
+            not terminal_review
+            or final_authorization_exact
+            or (
+                isinstance(rewrite, dict)
+                and rewrite.get("operation") == "runtime-cleanup"
+            )
+        )
+        exact_cleanup_needed = (
+            exact_inventory is not None
+            and exact_cleanup_authorized
+            and (
+                exact_inventory.get("runtime_identity") is not None
+                or bool(exact_inventory.get("temporary_names"))
+                or (
+                    isinstance(rewrite, dict)
+                    and rewrite.get("operation") == "runtime-cleanup"
+                    and (
+                        rewrite.get("status") != "complete"
+                        or (
+                            rewrite.get("authorization_required")
+                            and not final_authorization_exact
+                        )
+                        or not process_accounting_exact
+                    )
+                )
+            )
+        )
+        if exact_cleanup_needed:
+            try:
+                state, digest = _recover_exact_settled_runtime(
+                    entrypoint=entrypoint,
+                    attempt=attempt,
+                    lease=lease,
+                    state=state,
+                    state_digest=digest,
+                    inventory=exact_inventory,
+                )
+            except ValueError as error:
+                raise inconclusive(
+                    f"exact-settled runtime cleanup is invalid: {error}",
+                    stage="recovery",
+                    code="recovery-runtime-cleanup-invalid",
+                ) from error
+            final_authorization_exact = (
+                _has_exact_final_authorization(attempt, state)
+                if terminal_review
+                else False
+            )
+            return 0, {
+                "status": "recovered",
+                "attempt": _compact_terminal(
+                    state,
+                    final_authorization_exact=final_authorization_exact,
+                ),
+                "state_sha256": digest,
+            }
+        if (
+            settlements_exact
+            and process_accounting_exact
+            and (not terminal_review or final_authorization_exact)
+        ):
+            return 0, {
+                "status": "already-settled",
+                "attempt": _compact_terminal(
+                    state,
+                    final_authorization_exact=final_authorization_exact,
+                ),
+            }
+        recorded_boot = state.get("boot_id")
+        current_boot = boot_identifier()
+        if not isinstance(recorded_boot, str):
+            raise inconclusive(
+                "attempt has no authenticated recorded boot identity",
+                stage="recovery",
+                code="recovery-boot-identity-invalid",
+            )
+        if recorded_boot == current_boot:
+            raise blocked(
+                "same-boot successor recovery cannot prove closure of the original owner and children",
+                stage="recovery",
+                code="same-boot-owner-required",
+            )
+        phase = state.get("phase")
+        post_review = phase in {
+            "review-finished",
+            "terminal-authorization-pending",
+            "reviewed",
+            "post-review-aborted",
+        }
+        if post_review:
+            try:
+                _require_reviewer_closure_evidence(state)
+            except ValueError as error:
+                raise inconclusive(
+                    f"post-review recovery closure evidence is invalid: {error}",
+                    stage="recovery",
+                    code="recovery-reviewer-closure-invalid",
+                ) from error
+        inventory = _validate_process_inventory(attempt, state, allow_fifo=True)
+        process_was_exact = state.get("process_settlement") == "exact"
+        if process_was_exact:
+            state, digest = _commit_conservative_process_rewrite(
+                entrypoint=entrypoint,
+                attempt_dir=attempt,
+                lease_fd=lease.fd,
+                state=state,
+                state_digest=digest,
+                updates={},
+            )
+        reconciliation = _remove_recovery_artifacts(attempt, state, inventory)
+        if phase in {"reserved", "worktree-adding", "validating", "prelaunch-aborted"}:
+            recovered_phase = "prelaunch-aborted"
+            launch_status = "prelaunch-aborted"
+            review_status = "not-run"
+        elif phase == "spawn-intent":
+            recovered_phase = "spawn-intent"
+            launch_status = "uncertain"
+            review_status = "inconclusive"
+        elif phase == "launched":
+            recovered_phase = "launched"
+            launch_status = "launched"
+            review_status = "inconclusive"
+        elif post_review:
+            recovered_phase = "post-review-aborted"
+            launch_status = "completed"
+            review_status = "inconclusive"
+        else:
+            raise inconclusive(
+                f"attempt phase is not recoverable: {phase!r}",
+                stage="recovery",
+                code="recovery-phase-invalid",
+            )
+        state, digest = commit_via_helper(
+            entrypoint=entrypoint,
+            attempt_dir=attempt,
+            lease_fd=lease.fd,
+            state=state,
+            state_digest=digest,
+            updates={
+                "phase": recovered_phase,
+                "launch_status": launch_status,
+                "review_status": review_status,
+                "closure": (
+                    "proven-by-owner" if post_review else "proven-by-boot-change"
+                ),
+                "abandonment": True,
+                "failure_stage": "boot-change-recovery",
+                "failure": {
+                    "status": "inconclusive"
+                    if review_status == "inconclusive"
+                    else "blocked",
+                    "code": "owner-lost-across-boot-change",
+                    "message": "Recorded owner and child processes cannot survive the authenticated boot change.",
+                },
+                "recovery": {
+                    "recorded_boot_id": recorded_boot,
+                    "current_boot_id": current_boot,
+                    "supervisor_closure": "proven-by-boot-change",
+                    "process_inventory": inventory,
+                    **reconciliation,
+                },
+                "cleanup_status": (
+                    state.get("cleanup_status")
+                    if state.get("checkout_settlement") == "exact"
+                    else "cleanup-pending"
+                ),
+                "admission_status": "completed",
+                "terminal_at": time.time(),
+            },
+            deadline=time.monotonic() + 30,
+        )
+        if state.get("checkout_settlement") != "exact":
+            try:
+                state, digest = _cleanup_worktree(
+                    entrypoint=entrypoint,
+                    attempt_dir=attempt,
+                    lease_fd=lease.fd,
+                    state=state,
+                    state_digest=digest,
+                )
+            except BaseException as cleanup_error:
+                state, digest = commit_via_helper(
+                    entrypoint=entrypoint,
+                    attempt_dir=attempt,
+                    lease_fd=lease.fd,
+                    state=state,
+                    state_digest=digest,
+                    updates={
+                        "worktree_status": "manual-recovery-required",
+                        "cleanup_status": "cleanup-warning",
+                        "failure_stage": "worktree-recovery",
+                        "cleanup_error": (
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        ),
+                    },
+                    deadline=time.monotonic() + 30,
+                )
+        if state.get("process_settlement") != "exact":
+            state, digest = _settle_process(
+                entrypoint=entrypoint,
+                attempt_dir=attempt,
+                lease_fd=lease.fd,
+                state=state,
+                state_digest=digest,
+            )
+        else:
+            state, digest = _settle_rewritten_process_charge(
+                entrypoint=entrypoint,
+                attempt_dir=attempt,
+                lease_fd=lease.fd,
+                state=state,
+                state_digest=digest,
+            )
+        return (
+            1 if state.get("worktree_status") == "manual-recovery-required" else 0,
+            {
+                "status": "recovered",
+                "attempt": _compact_terminal(state),
+                "state_sha256": digest,
+            },
+        )
+
+
+def release(
+    *,
+    entrypoint: pathlib.Path,
+    retention_root: pathlib.Path,
+    attempt_dir: pathlib.Path,
+    reason: str,
+) -> tuple[int, dict[str, Any]]:
+    if reason not in {"resolved", "handoff-complete"}:
+        raise ValueError("release reason must be resolved or handoff-complete")
+    root, attempt = _validate_attempt_directory(retention_root, attempt_dir)
+    with acquire_retention_lease(root, deadline=time.monotonic() + 30) as lease:
+        state, _, digest = read_attempt_state(attempt)
+        final_authorization_exact = _has_exact_final_authorization(attempt, state)
+        process_accounting_exact = _process_accounting_is_exact(attempt, state)
+        rewrite = state.get("final_authorization_rewrite")
+        if rewrite is not None:
+            rewrite = validate_final_authorization_rewrite(state)
+            if rewrite["operation"] != "release":
+                if rewrite["status"] != "complete":
+                    raise ValueError("another process rewrite operation is outstanding")
+                rewrite = None
+        retention_state = state.get("retention_state")
+        if retention_state in {"released", "reclaiming", "reclaimed"}:
+            if state.get("release_reason") != reason:
+                raise ValueError("attempt was already released for a different reason")
+        if retention_state in {"reclaiming", "reclaimed"}:
+            return 0, {
+                "status": f"already-{retention_state}",
+                "attempt": _compact_terminal(
+                    state,
+                    final_authorization_exact=final_authorization_exact,
+                ),
+            }
+        already_released = retention_state == "released"
+        if (
+            retention_state not in {"held", "released"}
+            or state.get("process_settlement") != "exact"
+        ):
+            raise blocked(
+                "only exactly settled held process evidence can be released",
+                stage="retention",
+                code="evidence-not-releasable",
+            )
+        if (
+            already_released
+            and rewrite is not None
+            and rewrite["status"] == "complete"
+            and (not rewrite["authorization_required"] or final_authorization_exact)
+            and process_accounting_exact
+        ):
+            return 0, {
+                "status": "already-released",
+                "attempt": _compact_terminal(
+                    state,
+                    final_authorization_exact=final_authorization_exact,
+                ),
+                "state_sha256": digest,
+            }
+        if already_released and rewrite is None and final_authorization_exact:
+            return 0, {
+                "status": "already-released",
+                "attempt": _compact_terminal(
+                    state,
+                    final_authorization_exact=True,
+                ),
+                "state_sha256": digest,
+            }
+        released_at = _released_at(state) if already_released else time.time()
+        if rewrite is None:
+            state, digest = _begin_final_authorization_rewrite(
+                entrypoint=entrypoint,
+                attempt_dir=attempt,
+                lease_fd=lease.fd,
+                state=state,
+                state_digest=digest,
+                operation="release",
+                updates={
+                    "retention_state": "released",
+                    "released_at": released_at,
+                    "release_reason": reason,
+                },
+            )
+            rewrite = validate_final_authorization_rewrite(state)
+        state, digest, final_authorization_exact = (
+            _finish_release_authorization_rewrite(
+                entrypoint=entrypoint,
+                attempt=attempt,
+                lease=lease,
+                state=state,
+                state_digest=digest,
+            )
+        )
+        return 0, {
+            "status": "already-released" if already_released else "released",
+            "attempt": _compact_terminal(
+                state,
+                final_authorization_exact=final_authorization_exact,
+            ),
+            "state_sha256": digest,
+        }
+
+
+def _released_at(state: dict[str, Any]) -> float:
+    value = state.get("released_at")
+    if type(value) not in {int, float} or not math.isfinite(value) or value < 0:
+        raise ValueError("released attempt timestamp is malformed")
+    if state.get("release_reason") not in {"resolved", "handoff-complete"}:
+        raise ValueError("released attempt reason is malformed")
+    return float(value)
+
+
+def _released_attempt_candidates(
+    root: pathlib.Path,
+    *,
+    released_before: float | None,
+) -> tuple[pathlib.Path, ...]:
+    candidates: list[tuple[float, str, pathlib.Path]] = []
+    for attempt in _list_attempt_directories(root):
+        state, _, _ = read_attempt_state(attempt)
+        retention_state = state.get("retention_state")
+        if retention_state not in {"released", "reclaiming", "reclaimed"}:
+            continue
+        released_at = _released_at(state)
+        if (
+            state.get("process_settlement") != "exact"
+            or state.get("checkout_settlement") != "exact"
+            or state.get("worktree_status") == "manual-recovery-required"
+        ):
+            if retention_state in {"reclaiming", "reclaimed"}:
+                raise ValueError("interrupted reclaim is no longer exactly eligible")
+            continue
+        if (
+            retention_state == "released"
+            and released_before is not None
+            and released_at > released_before
+        ):
+            continue
+        candidates.append((released_at, attempt.name, attempt))
+    return tuple(value[2] for value in sorted(candidates))
+
+
+def _remove_reclaim_artifacts(attempt: pathlib.Path) -> None:
+    attempt_fd, _ = open_absolute_directory_chain(attempt)
+    try:
+        names = tuple(os.fsencode(value) for value in os.listdir(attempt_fd))
+        if len(names) > 1_000:
+            raise ValueError("reclaiming attempt exceeds cleanup entry cap")
+        if b"state.json" not in names:
+            raise ValueError("reclaiming attempt lost its durable state")
+        for name in sorted(value for value in names if value != b"state.json"):
+            metadata = os.stat(name, dir_fd=attempt_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1
+            ):
+                raise ValueError(
+                    "reclaiming attempt contains a non-regular or unsafe artifact"
+                )
+            os.unlink(name, dir_fd=attempt_fd)
+        os.fsync(attempt_fd)
+    finally:
+        os.close(attempt_fd)
+
+
+def _remove_reclaimed_attempt(root: pathlib.Path, attempt: pathlib.Path) -> None:
+    root_fd, _ = open_absolute_directory_chain(root)
+    attempt_fd: int | None = None
+    try:
+        attempt_fd = os.open(
+            os.fsencode(attempt.name),
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=root_fd,
+        )
+        names = tuple(os.fsencode(value) for value in os.listdir(attempt_fd))
+        if names != (b"state.json",):
+            raise ValueError(
+                "reclaimed attempt contains artifacts beyond durable state"
+            )
+        metadata = os.stat(b"state.json", dir_fd=attempt_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+        ):
+            raise ValueError("reclaimed attempt state is unsafe")
+        os.unlink(b"state.json", dir_fd=attempt_fd)
+        os.fsync(attempt_fd)
+        os.close(attempt_fd)
+        attempt_fd = None
+        os.rmdir(os.fsencode(attempt.name), dir_fd=root_fd)
+        os.fsync(root_fd)
+    finally:
+        if attempt_fd is not None:
+            os.close(attempt_fd)
+        os.close(root_fd)
+
+
+def _reclaim_attempt_locked(
+    *,
+    entrypoint: pathlib.Path,
+    root: pathlib.Path,
+    attempt: pathlib.Path,
+    lease: RetentionLease,
+    trigger: str,
+) -> dict[str, Any]:
+    if trigger not in {"explicit", "ttl", "admission-pressure"}:
+        raise ValueError("reclaim trigger is invalid")
+    state, _, digest = read_attempt_state(attempt)
+    retention_state = state.get("retention_state")
+    if retention_state not in {"released", "reclaiming", "reclaimed"}:
+        raise blocked(
+            "attempt evidence has not been explicitly released",
+            stage="retention",
+            code="release-required",
+        )
+    _released_at(state)
+    rewrite = state.get("final_authorization_rewrite")
+    if rewrite is not None:
+        rewrite = validate_final_authorization_rewrite(state)
+        if rewrite["status"] != "complete" or (
+            rewrite["authorization_required"]
+            and not _has_exact_final_authorization(attempt, state)
+        ):
+            raise blocked(
+                "attempt release authorization rewrite is not complete",
+                stage="retention",
+                code="release-authorization-pending",
+            )
+        if (
+            retention_state == "released"
+            and not rewrite["authorization_required"]
+            and not _process_accounting_is_exact(attempt, state)
+        ):
+            raise blocked(
+                "attempt release accounting rewrite is not complete",
+                stage="retention",
+                code="release-accounting-pending",
+            )
+    if (
+        state.get("process_settlement") != "exact"
+        or state.get("checkout_settlement") != "exact"
+    ):
+        raise blocked(
+            "attempt cannot be reclaimed before both ledgers settle exactly",
+            stage="retention",
+            code="settlement-required",
+        )
+    if state.get("worktree_status") == "manual-recovery-required":
+        raise blocked(
+            "manual worktree recovery remains outstanding",
+            stage="retention",
+            code="manual-worktree-recovery-required",
+        )
+    attempt_id = state["attempt_id"]
+    if retention_state == "reclaimed":
+        if (
+            state.get("retained_process_bytes") != 0
+            or state.get("process_physical_remaining_by_fs") != {}
+        ):
+            raise ValueError("reclaimed attempt retained a nonzero process charge")
+        _remove_reclaimed_attempt(root, attempt)
+        return {
+            "attempt_id": attempt_id,
+            "state_sha256_before_removal": digest,
+        }
+
+    _validate_process_inventory(attempt, state, allow_fifo=False)
+    started_at = state.get("reclaim_started_at")
+    if type(started_at) not in {int, float}:
+        started_at = time.time()
+    original_trigger = state.get("reclaim_trigger")
+    state, digest = _commit_conservative_process_rewrite(
+        entrypoint=entrypoint,
+        attempt_dir=attempt,
+        lease_fd=lease.fd,
+        state=state,
+        state_digest=digest,
+        updates={
+            "retention_state": "reclaiming",
+            "reclaim_started_at": started_at,
+            "reclaim_trigger": original_trigger or trigger,
+        },
+    )
+    _validate_process_inventory(attempt, state, allow_fifo=False)
+    _remove_reclaim_artifacts(attempt)
+    state, digest = commit_via_helper(
+        entrypoint=entrypoint,
+        attempt_dir=attempt,
+        lease_fd=lease.fd,
+        state=state,
+        state_digest=digest,
+        updates={
+            "retention_state": "reclaimed",
+            "reclaimed_at": time.time(),
+            "retained_process_bytes": 0,
+            "process_physical_remaining_by_fs": {},
+        },
+        deadline=time.monotonic() + 30,
+    )
+    _remove_reclaimed_attempt(root, attempt)
+    return {
+        "attempt_id": attempt_id,
+        "state_sha256_before_removal": digest,
+    }
+
+
+def _reclaim_released_attempts(
+    *,
+    entrypoint: pathlib.Path,
+    root: pathlib.Path,
+    lease: RetentionLease,
+    trigger: str,
+    released_before: float | None = None,
+    limit: int | None = None,
+) -> tuple[str, ...]:
+    if limit is not None and limit < 1:
+        raise ValueError("reclaim limit must be positive")
+    reclaimed: list[str] = []
+    for attempt in _released_attempt_candidates(root, released_before=released_before):
+        result = _reclaim_attempt_locked(
+            entrypoint=entrypoint,
+            root=root,
+            attempt=attempt,
+            lease=lease,
+            trigger=trigger,
+        )
+        reclaimed.append(result["attempt_id"])
+        if limit is not None and len(reclaimed) >= limit:
+            break
+    return tuple(reclaimed)
+
+
+def _remove_empty_attempt_residue(root: pathlib.Path, attempt: pathlib.Path) -> bool:
+    root_fd, _ = open_absolute_directory_chain(root)
+    attempt_fd: int | None = None
+    try:
+        try:
+            attempt_fd = os.open(
+                os.fsencode(attempt.name),
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=root_fd,
+            )
+        except FileNotFoundError:
+            return True
+        metadata = os.fstat(attempt_fd)
+        if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
+            raise ValueError("empty cleanup residue has unsafe ownership or mode")
+        if os.listdir(attempt_fd):
+            return False
+        os.close(attempt_fd)
+        attempt_fd = None
+        os.rmdir(os.fsencode(attempt.name), dir_fd=root_fd)
+        os.fsync(root_fd)
+        return True
+    finally:
+        if attempt_fd is not None:
+            os.close(attempt_fd)
+        os.close(root_fd)
+
+
+def cleanup(
+    *,
+    entrypoint: pathlib.Path,
+    retention_root: pathlib.Path,
+    attempt_dir: pathlib.Path,
+) -> tuple[int, dict[str, Any]]:
+    root = _normalize_absolute(retention_root)
+    attempt = _normalize_absolute(attempt_dir)
+    require_private_directory(root)
+    if attempt.parent != root or ATTEMPT_NAME_PATTERN.fullmatch(attempt.name) is None:
+        raise ValueError(
+            "attempt directory is not an exact child of the retention root"
+        )
+    with acquire_retention_lease(root, deadline=time.monotonic() + 30) as lease:
+        try:
+            _validate_attempt_directory(root, attempt)
+        except FileNotFoundError:
+            if _remove_empty_attempt_residue(root, attempt):
+                return 0, {
+                    "status": "already-reclaimed",
+                    "attempt_id": ATTEMPT_NAME_PATTERN.fullmatch(attempt.name).group(1),
+                    "attempt_dir": str(attempt),
+                }
+            raise
+        result = _reclaim_attempt_locked(
+            entrypoint=entrypoint,
+            root=root,
+            attempt=attempt,
+            lease=lease,
+            trigger="explicit",
+        )
+        return 0, {
+            "status": "reclaimed",
+            "attempt_id": result["attempt_id"],
+            "attempt_dir": str(attempt),
+            "state_sha256_before_removal": result["state_sha256_before_removal"],
+        }

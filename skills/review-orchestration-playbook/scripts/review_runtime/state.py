@@ -196,7 +196,7 @@ def open_private_lock_file(
                 opened_metadata.st_ino,
             ):
                 raise ReviewError(f"{label} changed before it could be opened safely")
-        if created:
+        if created and stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600:
             os.fchmod(descriptor, 0o600)
         handle = os.fdopen(descriptor, "r+b", buffering=0)
         descriptor = None

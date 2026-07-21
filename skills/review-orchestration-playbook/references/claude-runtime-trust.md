@@ -782,6 +782,108 @@ credential JSON. This macOS file source is based on observed current Claude Code
 compatibility behavior; Anthropic's public authentication documentation does
 not guarantee it as the macOS storage contract.
 
+The broker is a reviewed, prebuilt universal Mach-O with arm64 and x86_64
+slices, hardened-runtime ad-hoc signatures, and a macOS 13.0 deployment target.
+Its source and tracked artifact live beside `providers.py`. Runtime code pins the
+artifact SHA-256 and both slice CDHashes, but never invokes a compiler or
+installer. Before credential selection, it requires the exact artifact at
+`/Library/Joey-Tools/CodexReview/brokers/<sha256>/security`; every ancestor must
+be a real root-owned directory with no group/world write or extended ACL, and
+the leaf must be a root-owned single-link regular file with mode `0555`, no
+extended ACL, the pinned digest, and an accepted native dependency closure.
+Missing installation is runtime-unavailable. Unsafe metadata, identity drift,
+or a digest/code-identity mismatch is blocked or inspection-inconclusive and
+never exposes credentials or enables an authentication fallback.
+
+Build and install are explicit maintenance operations:
+
+```bash
+skills/review-orchestration-playbook/scripts/build_claude_keychain_broker_macos.sh \
+  --developer-check
+skills/review-orchestration-playbook/scripts/install_claude_keychain_broker_macos.sh \
+  --install \
+  < skills/review-orchestration-playbook/scripts/review_runtime/claude_keychain_broker
+```
+
+The build script has no artifact-output mode. It pins both source and artifact
+digests, compiles both slices with the fixed deployment target, combines them,
+applies the fixed identifier and hardened-runtime ad-hoc signature, and requires
+the rebuilt SHA-256 and bytes to equal the tracked artifact. It also pins Xcode
+26.6 build 17F113, the macOS 26.5 SDK, Apple clang/linker, codesign, and every
+build-tool digest, and rechecks those pins after compilation.
+
+The mandatory `broker-reproducibility` job runs `--check` as the ordinary
+GitHub-hosted `macos-26` runner user. It requires the exact hosted-runner context,
+pinned toolchain and tool digests, source/artifact digests, and byte-for-byte
+reproduction, and never returns a skip code. This is a required reproducibility
+gate, not an independent trust root or security boundary. It establishes no
+trusted-builder, root-sealed, or root-owned provenance. Required review and
+branch protection protect changes to the workflow, build script, source,
+artifact, and pins that define the gate. `--developer-check` is only a local
+convenience for reproducing the pinned bytes; it is not the required hosted gate
+and establishes no provenance.
+
+The shell opens the tracked artifact for stdin before the non-root installer
+entry invokes `sudo`. The entry freezes the reviewed production functions into
+the root command value already held in memory; root therefore never resolves or
+reopens either the checkout script or artifact path. The root worker accepts no
+path or policy parameters and runs under a scrubbed environment. It writes the
+already-opened bytes into a private `0600` staging file inside the digest
+directory, verifies the exact size, pinned digest, and all-architecture code
+signature, then applies the final root-owned `0555`, single-link, no-ACL
+metadata before an atomic no-clobber rename. It creates missing digest-keyed
+directories with safe metadata but only validates existing shared parents; it
+never changes an existing directory's owner, mode, or ACL. An artifact rotation
+uses a separately reviewed release procedure to create the candidate and must
+update every coupled pin in the same reviewed change: `providers.py` runtime
+artifact SHA-256 and both slice CDHashes; installer expected SHA-256 and byte
+size; build-script source/artifact SHA-256, Xcode/SDK version and build pins,
+tool versions, and clang/ld/lipo/vtool/`codesign_allocate`/codesign digests; and
+`test_installer.py` expected SHA-256, size, and native architecture/signature
+identity expectations. The ordinary-user GitHub-hosted `macos-26` `--check`,
+macOS tests, required review/branch protection, and explicit digest-keyed
+installation must then pass. The verifier never emits or overwrites a candidate
+and must not replace or reinterpret a different installed digest in place.
+
+The capability is never placed in the Claude environment. A private Unix
+identity endpoint releases it only to a same-user/same-group process whose PID
+is in the committed Claude session and process group and whose running CDHash
+matches one pinned broker slice; session and process-group membership are
+rechecked after CDHash inspection. The Seatbelt rule uses the kernel canonical
+socket path obtained from the open directory descriptor, while the broker
+connects through the stable volume/inode path. The broker then presents the
+capability to the loopback credential server and must receive an authorization
+ACK before reading `security -i` stdin or requesting the initial credential.
+Replacing the Unix socket can therefore cause denial of service but cannot
+obtain a usable capability or credential payload.
+
+Runtime process binding is deliberately two phase. First, a deadline-bounded
+daemon worker performs only pure PID/session/process-group inspection and returns
+an immutable binding; it receives no credential-service object, owns no server
+lock, and cannot commit or retain service state. After that worker finishes in
+time, the parent thread rechecks the absolute attempt deadline and performs the
+nonblocking credential-server commit. A busy or changed binding fails closed.
+Only the parent thread can then send exec authorization, after another deadline
+check. A late inspection result is inert: it cannot mutate, authorize, or retain
+the credential service after the parent has timed out or begun cleanup.
+
+Credential selection and the immediate comparison copy live inside one outer
+`try/finally` zeroization owner. That owner is established before runtime locks,
+events, random capability material, durable-stage state, or broker initialization
+and scrubs both buffers on selection-copy failure, initialization failure,
+control-flow exit, and ordinary teardown.
+
+Identity-service startup observation and failure cleanup share one absolute
+deadline, including the shutdown request and joins. Once bind may have happened,
+every startup failure first runs bounded cleanup. Forwarded signals and other
+control-flow exceptions win over ordinary inspection/cleanup diagnostics, while
+the losing diagnostics remain attached. Every model attempt allocates a fresh
+private identity directory; no later attempt reuses the endpoint. Cleanup
+verifies the originally bound socket's device/inode identity but never unlinks
+that pathname after a separate stat; whole-run private-directory cleanup owns
+removal. A replaced or missing entry is inspection-inconclusive and is never
+deleted by name.
+
 For each structurally valid source, require non-empty access and refresh tokens
 that encode as UTF-8 without unpaired surrogates, and parse the access-token
 expiry. Access-token expiry alone is not login expiry. Select
@@ -1149,7 +1251,8 @@ described as an enforced final launch.
 | --- | --- | --- |
 | No automatic candidate, supported platform unavailable, or an accepted-range automatic candidate cleanly lacks a required non-security capability or secure runtime dependency | `runtime-unavailable` | Only for explicit double/triple-review consent |
 | A helper-owned Keychain-broker, TCP-proxy, or Unix-proxy bind fails with an explicit OS policy or socket-capability errno | `runtime-unavailable` | Only for explicit double/triple-review consent |
-| The Keychain-broker source and compiler exist, but the compiler cannot start or the broker build returns nonzero | `inconclusive`; report the build gate and pause | No |
+| The pinned root-owned Keychain broker is missing | `runtime-unavailable` before credential selection | Only for explicit double/triple-review consent |
+| The installed Keychain broker or an ancestor has unsafe metadata, identity drift, an unexpected digest/CDHash, or an invalid native dependency closure | `blocked` or `inconclusive`; report the exact verification gate and pause | No |
 | Local/API authentication is missing, malformed, unsafe, refresh-token-less, or actually rejected as `Login expired`, HTTP 401, or refresh failure | `blocked-authentication`; request `claude auth login` for local login or unset/replace the explicit API key, then pause | No |
 | Signed artifact has no exact credential-lock protocol entry, either macOS carrier changed, lock contention/heartbeat failed, or credential inspection was unstable | `inconclusive`; report the exact coordination/inspection gate and pause without a login prompt | No |
 | The current macOS update would consume the reserved eighth generation or final 1 MiB | `inconclusive`; atomically close later `W` admission, durably stage that current update in the terminal recovery slot, invalidate any older staged host-writeback candidate, and NACK without publication or host writeback; NACK later requests before their callbacks or filesystem work | No |

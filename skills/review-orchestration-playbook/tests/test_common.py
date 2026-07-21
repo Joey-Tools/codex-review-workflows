@@ -170,6 +170,340 @@ class ChildEnvironmentTest(unittest.TestCase):
             )
         self.assertEqual(raised.exception.limit_kind, "stream")
 
+    def test_process_spawn_callback_validation_happens_before_launch(self) -> None:
+        prepare = mock.Mock(return_value=mock.sentinel.binding)
+        callback = mock.Mock()
+        command = (sys.executable, "-c", "raise SystemExit('must not execute')")
+        with (
+            mock.patch.object(common.subprocess, "run") as subprocess_run,
+            mock.patch.object(common.subprocess, "Popen") as popen,
+            self.assertRaisesRegex(
+                ReviewError,
+                "process spawn preparation requires logged output paths",
+            ),
+        ):
+            common.run(
+                command,
+                timeout_seconds=5,
+                prepare_process_spawned=prepare,
+                on_process_spawned=callback,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            stdout_path = root / "stdout.log"
+            stderr_path = root / "stderr.log"
+            for index, timeout_seconds in enumerate((None, math.inf, math.nan)):
+                stdout_path.write_bytes(b"existing stdout")
+                stderr_path.write_bytes(b"existing stderr")
+                with (
+                    self.subTest(index=index),
+                    mock.patch.object(common.subprocess, "Popen") as popen,
+                    self.assertRaisesRegex(
+                        ReviewError,
+                        "requires a finite timeout or deadline",
+                    ),
+                ):
+                    common.run(
+                        command,
+                        stdout_path=stdout_path,
+                        stderr_path=stderr_path,
+                        timeout_seconds=timeout_seconds,
+                        prepare_process_spawned=prepare,
+                        on_process_spawned=callback,
+                    )
+
+                popen.assert_not_called()
+                self.assertEqual(stdout_path.read_bytes(), b"existing stdout")
+                self.assertEqual(stderr_path.read_bytes(), b"existing stderr")
+
+            for callbacks in (
+                {"prepare_process_spawned": prepare},
+                {"on_process_spawned": callback},
+            ):
+                with (
+                    self.subTest(callbacks=tuple(callbacks)),
+                    mock.patch.object(common.subprocess, "Popen") as popen,
+                    self.assertRaisesRegex(
+                        ReviewError,
+                        "must be provided together",
+                    ),
+                ):
+                    common.run(
+                        command,
+                        stdout_path=stdout_path,
+                        stderr_path=stderr_path,
+                        timeout_seconds=5,
+                        **callbacks,
+                    )
+                popen.assert_not_called()
+
+            with (
+                mock.patch.object(common.os, "name", "nt"),
+                mock.patch.object(common.subprocess, "Popen") as popen,
+                self.assertRaisesRegex(ReviewError, "requires POSIX"),
+            ):
+                common.run(
+                    command,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    timeout_seconds=5,
+                    prepare_process_spawned=prepare,
+                    on_process_spawned=callback,
+                )
+
+            popen.assert_not_called()
+
+        subprocess_run.assert_not_called()
+        prepare.assert_not_called()
+        callback.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "requires the POSIX launch gate")
+    def test_internal_process_spawn_callback_requires_finite_timeout_form(
+        self,
+    ) -> None:
+        prepare = mock.Mock(return_value=mock.sentinel.binding)
+        callback = mock.Mock()
+        command = (sys.executable, "-c", "raise SystemExit('must not execute')")
+        cases = ({}, {"timeout_seconds": math.inf}, {"deadline": math.nan})
+        with (
+            tempfile.TemporaryFile() as stdout_handle,
+            tempfile.TemporaryFile() as stderr_handle,
+        ):
+            for arguments in cases:
+                with (
+                    self.subTest(arguments=arguments),
+                    mock.patch.object(common.subprocess, "Popen") as popen,
+                    self.assertRaisesRegex(
+                        ReviewError,
+                        "requires a finite timeout or deadline",
+                    ),
+                ):
+                    common._run_logged_process(
+                        command,
+                        cwd=None,
+                        env=None,
+                        stdin=None,
+                        stdout_handle=stdout_handle,
+                        stderr_handle=stderr_handle,
+                        prepare_process_spawned=prepare,
+                        on_process_spawned=callback,
+                        **arguments,
+                    )
+
+                popen.assert_not_called()
+
+        prepare.assert_not_called()
+        callback.assert_not_called()
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(os, "getsid")
+        and hasattr(os, "getpgid")
+        and hasattr(os, "getpgrp"),
+        "requires POSIX session inspection",
+    )
+    def test_process_spawn_callback_precedes_launch_and_started_callback(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            events: list[str] = []
+            callback_state: dict[str, int] = {}
+            real_read = common.os.read
+            real_write = common.os.write
+
+            def track_ready(descriptor: int, size: int) -> bytes:
+                payload = real_read(descriptor, size)
+                if payload == b"R":
+                    events.append("ready")
+                return payload
+
+            def track_launch(descriptor: int, payload: bytes) -> int:
+                if payload == b"L":
+                    events.append("launch")
+                return real_write(descriptor, payload)
+
+            def prepare_process(process_pid: int) -> tuple[int, int, int]:
+                events.append("prepared")
+                callback_state.update(
+                    pid=process_pid,
+                    sid=os.getsid(process_pid),
+                    pgid=os.getpgid(process_pid),
+                )
+                return (
+                    callback_state["pid"],
+                    callback_state["sid"],
+                    callback_state["pgid"],
+                )
+
+            def commit_process(binding: object) -> None:
+                events.append("committed")
+                self.assertEqual(
+                    binding,
+                    (
+                        callback_state["pid"],
+                        callback_state["sid"],
+                        callback_state["pgid"],
+                    ),
+                )
+
+            def process_started() -> None:
+                events.append("started")
+
+            prepare_process_spawned = mock.Mock(side_effect=prepare_process)
+            on_process_spawned = mock.Mock(side_effect=commit_process)
+            on_process_started = mock.Mock(side_effect=process_started)
+            wrapper_command = common._absolute_deadline_wrapper_command
+            with (
+                mock.patch.object(common.os, "read", side_effect=track_ready),
+                mock.patch.object(common.os, "write", side_effect=track_launch),
+                mock.patch.object(
+                    common,
+                    "_absolute_deadline_wrapper_command",
+                    wraps=wrapper_command,
+                ) as launch_gate,
+            ):
+                completed = common.run(
+                    (
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os; "
+                            "print(os.getpid(), os.getsid(0), os.getpgrp(), flush=True)"
+                        ),
+                    ),
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                    timeout_seconds=5,
+                    prepare_process_spawned=prepare_process_spawned,
+                    on_process_spawned=on_process_spawned,
+                    on_process_started=on_process_started,
+                )
+
+        target_pid, target_sid, target_pgid = (
+            int(value) for value in completed.stdout.split()
+        )
+        self.assertEqual(
+            events,
+            ["ready", "prepared", "committed", "launch", "started"],
+        )
+        self.assertEqual(
+            callback_state,
+            {"pid": target_pid, "sid": target_sid, "pgid": target_pgid},
+        )
+        self.assertEqual(target_pid, target_sid)
+        self.assertEqual(target_pid, target_pgid)
+        launch_gate.assert_called_once()
+        self.assertTrue(math.isfinite(launch_gate.call_args.kwargs["deadline"]))
+        prepare_process_spawned.assert_called_once_with(target_pid)
+        on_process_spawned.assert_called_once_with(
+            (target_pid, target_sid, target_pgid)
+        )
+        on_process_started.assert_called_once_with()
+
+    @unittest.skipUnless(os.name == "posix", "requires the POSIX launch gate")
+    def test_process_spawn_callback_failure_prevents_target_exec(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            marker = root / "target-ran"
+            launch_authorizations: list[bytes] = []
+            real_write = common.os.write
+
+            def track_launch(descriptor: int, payload: bytes) -> int:
+                if payload == b"L":
+                    launch_authorizations.append(payload)
+                return real_write(descriptor, payload)
+
+            prepare_process_spawned = mock.Mock(return_value=mock.sentinel.binding)
+            on_process_spawned = mock.Mock(
+                side_effect=RuntimeError("session binding failed")
+            )
+            on_process_started = mock.Mock()
+            with (
+                mock.patch.object(common.os, "write", side_effect=track_launch),
+                self.assertRaisesRegex(RuntimeError, "session binding failed"),
+            ):
+                common.run(
+                    (
+                        sys.executable,
+                        "-c",
+                        (
+                            "import pathlib,sys; "
+                            "pathlib.Path(sys.argv[1]).write_text('launched')"
+                        ),
+                        str(marker),
+                    ),
+                    stdout_path=root / "stdout.log",
+                    stderr_path=root / "stderr.log",
+                    timeout_seconds=5,
+                    prepare_process_spawned=prepare_process_spawned,
+                    on_process_spawned=on_process_spawned,
+                    on_process_started=on_process_started,
+                )
+
+            self.assertFalse(marker.exists())
+            self.assertEqual(launch_authorizations, [])
+            prepare_process_spawned.assert_called_once()
+            self.assertIsInstance(prepare_process_spawned.call_args.args[0], int)
+            on_process_spawned.assert_called_once_with(mock.sentinel.binding)
+            on_process_started.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "requires the POSIX launch gate")
+    def test_process_spawn_callback_cannot_outlive_launch_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            marker = root / "target-ran"
+            callback_entered = threading.Event()
+            release_callback = threading.Event()
+            callback_finished = threading.Event()
+            launch_authorizations: list[bytes] = []
+            real_write = common.os.write
+
+            def blocking_preparation(_process_pid: int) -> object:
+                callback_entered.set()
+                release_callback.wait(timeout=5)
+                callback_finished.set()
+                return mock.sentinel.late_binding
+
+            def track_launch(descriptor: int, payload: bytes) -> int:
+                if payload == b"L":
+                    launch_authorizations.append(payload)
+                return real_write(descriptor, payload)
+
+            started_at = time.monotonic()
+            on_process_spawned = mock.Mock()
+            try:
+                with (
+                    mock.patch.object(common.os, "write", side_effect=track_launch),
+                    self.assertRaises(common.ReviewTimeoutError),
+                ):
+                    common.run(
+                        (
+                            sys.executable,
+                            "-c",
+                            (
+                                "import pathlib,sys; "
+                                "pathlib.Path(sys.argv[1]).write_text('launched')"
+                            ),
+                            str(marker),
+                        ),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                        timeout_seconds=2.0,
+                        prepare_process_spawned=blocking_preparation,
+                        on_process_spawned=on_process_spawned,
+                    )
+            finally:
+                release_callback.set()
+
+            self.assertTrue(callback_entered.is_set())
+            self.assertTrue(callback_finished.wait(timeout=2))
+            self.assertLess(time.monotonic() - started_at, 4)
+            self.assertFalse(marker.exists())
+            self.assertEqual(launch_authorizations, [])
+            on_process_spawned.assert_not_called()
+
     @unittest.skipUnless(os.name == "posix", "requires POSIX descriptor passing")
     def test_absolute_deadline_rejects_parent_scheduling_gap(
         self,

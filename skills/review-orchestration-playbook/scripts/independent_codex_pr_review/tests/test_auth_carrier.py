@@ -1,0 +1,345 @@
+from __future__ import annotations
+
+import base64
+import json
+import os
+import pathlib
+import tempfile
+import unittest
+from unittest import mock
+
+import review_supervisor.auth_carrier as auth_carrier
+
+from review_supervisor.auth_carrier import (
+    AuthCarrierError,
+    AuthCarrierRefreshRequired,
+    load_external_auth,
+    revalidate_external_auth_source,
+)
+
+
+def jwt(payload: dict[str, object]) -> str:
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("ascii")
+    ).rstrip(b"=")
+    return "header." + encoded.decode("ascii") + ".signature"
+
+
+class AuthCarrierTests(unittest.TestCase):
+    def write_auth(
+        self,
+        root: pathlib.Path,
+        *,
+        expiration: int,
+        mode: int = 0o600,
+    ) -> pathlib.Path:
+        path = root / "auth.json"
+        value = {
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": jwt({"exp": expiration}),
+                "account_id": "account-1",
+                "id_token": jwt(
+                    {
+                        "https://api.openai.com/auth": {
+                            "chatgpt_account_id": "account-1",
+                            "chatgpt_plan_type": "pro",
+                        }
+                    }
+                ),
+                "refresh_token": "unused-refresh-value",
+            },
+        }
+        path.write_text(json.dumps(value), encoding="utf-8")
+        path.chmod(mode)
+        return path
+
+    def test_loads_only_fresh_external_access_token_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = self.write_auth(pathlib.Path(raw_root), expiration=10_000)
+            evidence = load_external_auth(
+                path,
+                now=1_000,
+                minimum_remaining_seconds=2_700,
+            )
+        self.assertEqual(evidence.auth.chatgpt_account_id, "account-1")
+        self.assertEqual(evidence.auth.chatgpt_plan_type, "pro")
+        self.assertEqual(evidence.access_token_expires_at, 10_000)
+        self.assertNotIn(evidence.auth.access_token, repr(evidence))
+        self.assertNotIn("unused-refresh-value", repr(evidence))
+        self.assertNotIn("account-1", json.dumps(evidence.to_json()))
+
+    def test_rejects_expiry_mode_links_duplicates_and_malformed_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = pathlib.Path(raw_root)
+            expired = self.write_auth(root, expiration=2_000)
+            with self.assertRaises(AuthCarrierRefreshRequired):
+                load_external_auth(expired, now=1_000, minimum_remaining_seconds=2_700)
+
+            expired.chmod(0o644)
+            with self.assertRaises(AuthCarrierError):
+                load_external_auth(expired, now=1_000, minimum_remaining_seconds=60)
+            expired.chmod(0o600)
+
+            linked = root / "linked.json"
+            os.link(expired, linked)
+            with self.assertRaises(AuthCarrierError):
+                load_external_auth(expired, now=1_000, minimum_remaining_seconds=60)
+            linked.unlink()
+
+            expired.write_text('{"tokens":{},"tokens":{}}', encoding="utf-8")
+            with self.assertRaises(AuthCarrierError):
+                load_external_auth(expired, now=1_000, minimum_remaining_seconds=60)
+
+            expired.write_text(
+                json.dumps(
+                    {
+                        "tokens": {
+                            "access_token": "not-a-jwt",
+                            "account_id": "account-1",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(AuthCarrierError):
+                load_external_auth(expired, now=1_000, minimum_remaining_seconds=60)
+
+    def test_rejects_wrong_mode_and_malformed_stale_carriers_before_refresh(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = pathlib.Path(raw_root)
+            path = self.write_auth(root, expiration=2_000)
+            original = json.loads(path.read_text(encoding="utf-8"))
+            cases = (
+                {**original, "auth_mode": "apikey"},
+                {
+                    **original,
+                    "tokens": {**original["tokens"], "id_token": {}},
+                },
+                {
+                    **original,
+                    "tokens": {
+                        **original["tokens"],
+                        "account_id": None,
+                        "id_token": None,
+                    },
+                },
+                {
+                    **original,
+                    "tokens": {**original["tokens"], "refresh_token": ""},
+                },
+            )
+            for value in cases:
+                with self.subTest(auth_mode=value.get("auth_mode")):
+                    path.write_text(json.dumps(value), encoding="utf-8")
+                    path.chmod(0o600)
+                    with self.assertRaises(AuthCarrierError) as raised:
+                        load_external_auth(
+                            path,
+                            now=1_000,
+                            minimum_remaining_seconds=2_700,
+                        )
+                    self.assertNotIsInstance(
+                        raised.exception,
+                        AuthCarrierRefreshRequired,
+                    )
+
+    def test_revalidates_the_exact_auth_generation_before_use(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = pathlib.Path(raw_root)
+            path = self.write_auth(root, expiration=10_000)
+            evidence = load_external_auth(
+                path,
+                now=1_000,
+                minimum_remaining_seconds=2_700,
+            )
+            revalidate_external_auth_source(path, evidence, now=1_000)
+
+            replacement = root / "replacement.json"
+            replacement.write_bytes(path.read_bytes())
+            replacement.chmod(0o600)
+            os.replace(replacement, path)
+            with self.assertRaisesRegex(AuthCarrierError, "generation changed"):
+                revalidate_external_auth_source(path, evidence, now=1_000)
+
+    def test_revalidation_requires_the_full_bounded_runtime_lifetime(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = self.write_auth(pathlib.Path(raw_root), expiration=10_000)
+            evidence = load_external_auth(
+                path,
+                now=1_000,
+                minimum_remaining_seconds=2_700,
+            )
+
+            revalidate_external_auth_source(path, evidence, now=7_300)
+            with self.assertRaisesRegex(
+                AuthCarrierError,
+                "no longer covers the bounded review runtime",
+            ):
+                revalidate_external_auth_source(path, evidence, now=7_300.001)
+            with (
+                mock.patch.object(
+                    auth_carrier.time,
+                    "time",
+                    return_value=7_300.001,
+                ),
+                self.assertRaisesRegex(
+                    AuthCarrierError,
+                    "no longer covers the bounded review runtime",
+                ),
+            ):
+                revalidate_external_auth_source(path, evidence)
+
+    def test_revalidation_fails_closed_for_invalid_clock_values(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = self.write_auth(pathlib.Path(raw_root), expiration=10_000)
+            evidence = load_external_auth(
+                path,
+                now=1_000,
+                minimum_remaining_seconds=2_700,
+            )
+
+            for invalid_now in (True, float("nan"), float("inf")):
+                with (
+                    self.subTest(now=invalid_now),
+                    self.assertRaisesRegex(AuthCarrierError, "clock value is invalid"),
+                ):
+                    revalidate_external_auth_source(
+                        path,
+                        evidence,
+                        now=invalid_now,
+                    )
+            with (
+                mock.patch.object(
+                    auth_carrier.time,
+                    "time",
+                    side_effect=OSError("clock unavailable"),
+                ),
+                self.assertRaisesRegex(AuthCarrierError, "clock is unavailable"),
+            ):
+                revalidate_external_auth_source(path, evidence)
+
+    def test_rejects_same_inode_write_during_descriptor_read(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = self.write_auth(pathlib.Path(raw_root), expiration=10_000)
+            original_read = auth_carrier.read_fd_exact
+            before = path.stat()
+
+            def mutate_after_read(
+                fd: int,
+                *,
+                max_bytes: int,
+                expected_size: int | None = None,
+            ) -> bytes:
+                raw = original_read(
+                    fd,
+                    max_bytes=max_bytes,
+                    expected_size=expected_size,
+                )
+                with path.open("r+b") as carrier:
+                    offset = raw.index(b"account-1")
+                    carrier.seek(offset)
+                    carrier.write(b"account-2")
+                    carrier.flush()
+                    os.fsync(carrier.fileno())
+                os.utime(
+                    path,
+                    ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000),
+                )
+                return raw
+
+            with (
+                mock.patch.object(
+                    auth_carrier,
+                    "read_fd_exact",
+                    side_effect=mutate_after_read,
+                ),
+                self.assertRaisesRegex(AuthCarrierError, "changed while it was read"),
+            ):
+                load_external_auth(
+                    path,
+                    now=1_000,
+                    minimum_remaining_seconds=2_700,
+                )
+
+            after = path.stat()
+            self.assertEqual(
+                (after.st_dev, after.st_ino), (before.st_dev, before.st_ino)
+            )
+            self.assertEqual(after.st_size, before.st_size)
+
+    def test_rejects_same_inode_write_between_post_read_fd_and_path_checks(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = self.write_auth(pathlib.Path(raw_root), expiration=10_000)
+            original_lstat = os.lstat
+            before = path.stat()
+            auth_lstat_calls = 0
+
+            def race_lstat(candidate: os.PathLike[str] | str) -> os.stat_result:
+                nonlocal auth_lstat_calls
+                if pathlib.Path(candidate) == path:
+                    auth_lstat_calls += 1
+                    if auth_lstat_calls == 3:
+                        with path.open("r+b") as carrier:
+                            carrier.seek(0)
+                            first = carrier.read(1)
+                            carrier.seek(0)
+                            carrier.write(first)
+                            carrier.flush()
+                            os.fsync(carrier.fileno())
+                        os.utime(
+                            path,
+                            ns=(
+                                before.st_atime_ns,
+                                before.st_mtime_ns + 1_000_000_000,
+                            ),
+                        )
+                return original_lstat(candidate)
+
+            with (
+                mock.patch.object(auth_carrier.os, "lstat", side_effect=race_lstat),
+                self.assertRaisesRegex(AuthCarrierError, "changed while it was read"),
+            ):
+                load_external_auth(
+                    path,
+                    now=1_000,
+                    minimum_remaining_seconds=2_700,
+                )
+
+            after = path.stat()
+            self.assertEqual(auth_lstat_calls, 3)
+            self.assertEqual(
+                (after.st_dev, after.st_ino), (before.st_dev, before.st_ino)
+            )
+            self.assertEqual(after.st_size, before.st_size)
+
+    def test_failure_traceback_does_not_retain_raw_auth_payload(self) -> None:
+        marker = "sensitive-refresh-marker"
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = pathlib.Path(raw_root)
+            path = self.write_auth(root, expiration=10_000)
+            value = json.loads(path.read_text(encoding="utf-8"))
+            value["tokens"]["refresh_token"] = marker
+            value["tokens"]["access_token"] = "malformed"
+            path.write_text(json.dumps(value), encoding="utf-8")
+            path.chmod(0o600)
+
+            with self.assertRaises(AuthCarrierError) as raised:
+                load_external_auth(path, now=1_000, minimum_remaining_seconds=60)
+
+        traceback = raised.exception.__traceback__
+        while traceback is not None:
+            rendered = repr(traceback.tb_frame.f_locals)
+            self.assertNotIn(marker, rendered)
+            self.assertNotIn('"tokens"', rendered)
+            traceback = traceback.tb_next
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+
+
+if __name__ == "__main__":
+    unittest.main()

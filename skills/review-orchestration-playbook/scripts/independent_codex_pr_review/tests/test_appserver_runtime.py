@@ -1,0 +1,203 @@
+from __future__ import annotations
+
+import io
+import os
+import unittest
+
+from review_supervisor.appserver_protocol import (
+    AppServerProtocolError,
+    AppServerSessionConfig,
+    decode_json_line,
+    encode_json_line,
+)
+from review_supervisor.appserver_runtime import (
+    build_prelaunch_appserver_input,
+    run_appserver_stdio_session,
+)
+from review_supervisor.evidence import (
+    AuthenticatedManifest,
+    ManifestEntry,
+    manifest_sha256,
+)
+from review_supervisor.secureio import sha256_bytes
+
+from tests.test_appserver_protocol import (
+    CODEX_HOME,
+    NEUTRAL_CWD,
+    final_item,
+    in_progress_turn,
+    initialize_result,
+    safe_config_result,
+    thread_start_result,
+)
+from tests.support import owned_temporary_directory
+
+
+def valid_transcript(config: AppServerSessionConfig) -> bytes:
+    thread_result = thread_start_result(config)
+    turn = in_progress_turn()
+    item = final_item()
+    messages = (
+        {"id": 1, "result": initialize_result()},
+        {"id": 2, "result": safe_config_result()},
+        {
+            "id": 3,
+            "result": {
+                "data": [
+                    {
+                        "cwd": NEUTRAL_CWD,
+                        "errors": [],
+                        "hooks": [],
+                        "warnings": [],
+                    }
+                ]
+            },
+        },
+        {"method": "thread/started", "params": {"thread": thread_result["thread"]}},
+        {"id": 4, "result": thread_result},
+        {"id": 5, "result": {"turn": turn}},
+        {
+            "method": "turn/started",
+            "params": {"threadId": "thread-1", "turn": turn},
+        },
+        {
+            "method": "item/started",
+            "params": {
+                "item": item,
+                "startedAtMs": 999,
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+            },
+        },
+        {
+            "method": "item/completed",
+            "params": {
+                "completedAtMs": 1000,
+                "item": item,
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+            },
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-1", "items": [item], "status": "completed"},
+            },
+        },
+    )
+    return b"".join(encode_json_line(message) for message in messages)
+
+
+class ShortWriter(io.BytesIO):
+    def write(self, value: bytes) -> int:
+        super().write(value[:-1])
+        return len(value) - 1
+
+
+class AppServerRuntimeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.config = AppServerSessionConfig(
+            neutral_cwd=NEUTRAL_CWD,
+            expected_codex_home=CODEX_HOME,
+        )
+
+    def test_drives_fake_streams_to_exact_terminal_result(self) -> None:
+        reader = io.BytesIO(valid_transcript(self.config))
+        writer = io.BytesIO()
+        result = run_appserver_stdio_session(
+            reader=reader,
+            writer=writer,
+            prompt=b"self-contained evidence",
+            config=self.config,
+        )
+        self.assertEqual(result.review_status, "clean")
+        self.assertEqual(result.final_text, "No findings.")
+
+        outbound = [
+            decode_json_line(line)
+            for line in writer.getvalue().splitlines(keepends=True)
+        ]
+        self.assertEqual(
+            [message["method"] for message in outbound],
+            [
+                "initialize",
+                "initialized",
+                "config/read",
+                "hooks/list",
+                "thread/start",
+                "turn/start",
+            ],
+        )
+        self.assertNotIn(b"jsonrpc", writer.getvalue())
+        thread_request = outbound[4]
+        self.assertEqual(thread_request["params"]["dynamicTools"], [])
+        self.assertFalse(thread_request["params"]["allowProviderModelFallback"])
+        self.assertNotIn("/worktree", writer.getvalue().decode())
+
+    def test_builds_complete_model_input_before_any_stream_activity(self) -> None:
+        with owned_temporary_directory("appserver-input-") as root:
+            control = root / ".codex-review"
+            control.mkdir()
+            diff = b"diff --git a/a.py b/a.py\n+fixed\n"
+            (control / "review.diff").write_bytes(diff)
+            entry = ManifestEntry(
+                path=".codex-review/review.diff",
+                kind="regular",
+                size=len(diff),
+                sha256=sha256_bytes(diff),
+            )
+            manifest = AuthenticatedManifest.authenticate(
+                (entry,),
+                expected_sha256=manifest_sha256((entry,)),
+            )
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                prepared = build_prelaunch_appserver_input(
+                    root_fd=root_fd,
+                    manifest=manifest,
+                    pr_url="https://github.example/owner/repo/pull/1",
+                    base_sha="1" * 40,
+                    head_sha="2" * 40,
+                    forbidden_paths=(root,),
+                )
+            finally:
+                os.close(root_fd)
+        self.assertEqual(prepared.evidence_bundle.artifacts[0].content.encode(), diff)
+        self.assertIn(b'"role":"primary_diff"', prepared.prompt)
+        self.assertNotIn(str(root).encode(), prepared.prompt)
+
+    def test_rejects_abnormal_eof_trailing_record_and_short_write(self) -> None:
+        with self.assertRaises(AppServerProtocolError) as raised:
+            run_appserver_stdio_session(
+                reader=io.BytesIO(),
+                writer=io.BytesIO(),
+                prompt=b"evidence",
+                config=self.config,
+            )
+        self.assertEqual(raised.exception.code, "abnormal-eof")
+
+        transcript = valid_transcript(self.config) + encode_json_line(
+            {"method": "warning", "params": {}}
+        )
+        with self.assertRaises(AppServerProtocolError) as raised:
+            run_appserver_stdio_session(
+                reader=io.BytesIO(transcript),
+                writer=io.BytesIO(),
+                prompt=b"evidence",
+                config=self.config,
+            )
+        self.assertEqual(raised.exception.code, "trailing-record")
+
+        with self.assertRaises(AppServerProtocolError) as raised:
+            run_appserver_stdio_session(
+                reader=io.BytesIO(valid_transcript(self.config)),
+                writer=ShortWriter(),
+                prompt=b"evidence",
+                config=self.config,
+            )
+        self.assertEqual(raised.exception.code, "short-write")
+
+
+if __name__ == "__main__":
+    unittest.main()

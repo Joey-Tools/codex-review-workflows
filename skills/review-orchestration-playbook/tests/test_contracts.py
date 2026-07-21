@@ -829,7 +829,9 @@ class RepositoryContractTest(unittest.TestCase):
         validate_source = inspect.getsource(
             providers._validate_claude_local_credential
         )
-        macos_runtime_source = inspect.getsource(providers._claude_keychain_runtime)
+        macos_runtime_source = inspect.getsource(
+            providers._claude_keychain_runtime
+        ) + inspect.getsource(providers._claude_keychain_runtime_selected)
         macos_persist_source = inspect.getsource(
             providers._persist_claude_macos_refreshed_credential
         ) + inspect.getsource(
@@ -1212,14 +1214,21 @@ class RepositoryContractTest(unittest.TestCase):
             """  test:
     name: test
     if: ${{ always() }}
-    needs: platform_tests
+    needs:
+      - platform_tests
+      - broker_reproducibility
+      - independent_supervisor_tests
     runs-on: ubuntu-latest
     steps:
       - name: Require every platform test to pass
         env:
           PLATFORM_TESTS_RESULT: ${{ needs.platform_tests.result }}
+          BROKER_REPRODUCIBILITY_RESULT: ${{ needs.broker_reproducibility.result }}
+          INDEPENDENT_SUPERVISOR_RESULT: ${{ needs.independent_supervisor_tests.result }}
         run: |
           test "$PLATFORM_TESTS_RESULT" = "success"
+          test "$BROKER_REPRODUCIBILITY_RESULT" = "success"
+          test "$INDEPENDENT_SUPERVISOR_RESULT" = "success"
 """,
             canonical,
         )
@@ -1231,6 +1240,8 @@ class RepositoryContractTest(unittest.TestCase):
       - platform_tests
       - python-39-compatibility
       - platform-safety
+      - broker_reproducibility
+      - independent_supervisor_tests
     runs-on: ubuntu-latest
     steps:
       - name: Require every platform test to pass
@@ -1238,13 +1249,40 @@ class RepositoryContractTest(unittest.TestCase):
           PLATFORM_TESTS_RESULT: ${{ needs.platform_tests.result }}
           PYTHON_39_RESULT: ${{ needs.python-39-compatibility.result }}
           PLATFORM_SAFETY_RESULT: ${{ needs.platform-safety.result }}
+          BROKER_REPRODUCIBILITY_RESULT: ${{ needs.broker_reproducibility.result }}
+          INDEPENDENT_SUPERVISOR_RESULT: ${{ needs.independent_supervisor_tests.result }}
         run: |
           test "$PLATFORM_TESTS_RESULT" = "success"
           test "$PYTHON_39_RESULT" = "success"
           test "$PLATFORM_SAFETY_RESULT" = "success"
+          test "$BROKER_REPRODUCIBILITY_RESULT" = "success"
+          test "$INDEPENDENT_SUPERVISOR_RESULT" = "success"
 """,
             private,
         )
+
+    def test_broker_reproducibility_never_runs_checkout_code_as_root(self) -> None:
+        script = (
+            SCRIPTS / "build_claude_keychain_broker_macos.sh"
+        ).read_text(encoding="utf-8")
+        for profile in ("canonical", "private"):
+            workflow = (CI_FIXTURE_ROOT / f"{profile}.yml").read_text(
+                encoding="utf-8"
+            )
+            start = workflow.index("  broker_reproducibility:")
+            end = workflow.index("\n  independent_supervisor_tests:", start)
+            broker_job = workflow[start:end]
+            with self.subTest(profile=profile):
+                self.assertNotIn("sudo", broker_job)
+                self.assertNotIn("/private/var/root", broker_job)
+                self.assertIn("--check", broker_job)
+                self.assertIn("runs-on: macos-26", broker_job)
+
+        self.assertNotIn("require_root_sealed", script)
+        self.assertNotIn("EUID", script)
+        self.assertNotIn("--output", script)
+        self.assertIn("not a security boundary", script)
+        self.assertIn("byte-reproducible", script)
 
     def test_helper_declares_and_tests_its_minimum_python_runtime(self) -> None:
         entrypoint = (SCRIPTS / "isolated_review").read_text(encoding="utf-8")
@@ -1275,10 +1313,18 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertIn("Require its retained `preflight.json`", readiness)
 
-    def test_independent_codex_process_is_ephemeral_lightweight_and_bounded(
+    def test_independent_codex_supervisor_is_self_contained_and_bounded(
         self,
     ) -> None:
-        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        tool_root = SCRIPTS / "independent_codex_pr_review"
+        entrypoint = tool_root / "independent-codex-pr-review"
+        readme = (tool_root / "README.md").read_text(encoding="utf-8")
+        constants = (tool_root / "review_supervisor/constants.py").read_text(
+            encoding="utf-8"
+        )
+        workflow = (SKILL_SCOPE_ROOT / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
         readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
             encoding="utf-8"
         )
@@ -1286,556 +1332,34 @@ class RepositoryContractTest(unittest.TestCase):
             encoding="utf-8"
         )
 
+        self.assertTrue(entrypoint.is_file())
+        self.assertTrue(entrypoint.stat().st_mode & 0o111)
+        self.assertTrue((tool_root / "review_supervisor/cli.py").is_file())
+        self.assertTrue((tool_root / "tests/test_supervisor.py").is_file())
+        self.assertEqual(
+            entrypoint.read_text(encoding="utf-8").splitlines()[0],
+            "#!/usr/bin/env python3.13",
+        )
+        self.assertIn('MODEL = "gpt-5.6-sol"', constants)
+        self.assertIn('REASONING_EFFORT = "xhigh"', constants)
+        self.assertIn("MAX_EVIDENCE_BUNDLE_BYTES", constants)
+        self.assertIn("app-server", readme)
+        self.assertIn("owner-only `CODEX_HOME`", readme)
+        self.assertIn("bounded evidence bundle", readme)
+        self.assertIn("sealed", readme)
+        self.assertIn("settlement", readme)
+        self.assertIn("independent_supervisor_tests", workflow)
+        self.assertIn('python-version: "3.13"', workflow)
         self.assertIn(
-            "codex exec --ephemeral --strict-config --json --sandbox read-only",
-            readiness,
+            "scripts/independent_codex_pr_review",
+            workflow,
         )
-        self.assertIn("clean detached worktree", readiness)
-        self.assertIn("normal `~/.codex` configuration", readiness)
-        self.assertIn("Rules, MCP servers, Plugins", readiness)
-        self.assertIn("tracked project instructions", readiness)
-        self.assertIn("`--ignore-user-config` / `--ignore-rules`", readiness)
-        self.assertIn("do not resume a prior session", readiness)
-        self.assertIn("state-changing MCP/Plugin actions", readiness)
-        self.assertIn("read-only review evidence only", readiness)
-        self.assertNotIn("Disable project-instruction injection", readiness)
-        self.assertIn("Parent-Process Output Budget", readiness)
-        self.assertIn("bounded owner-private memory", readiness)
-        self.assertIn("exact UTF-8 bytes", readiness)
-        self.assertIn("length and SHA-256", readiness)
-        self.assertIn("without creating a task directory or prompt path", readiness)
-        self.assertIn("authoritative `phase=reserved` record", readiness)
-        self.assertIn("Only after that record is durable", readiness)
-        self.assertIn("create no prompt artifact, checkout, or reviewer", readiness)
-        self.assertIn("64 MiB per blob", readiness)
-        self.assertIn("512 MiB aggregate raw blobs", readiness)
-        self.assertIn("100,000 entries", readiness)
-        self.assertIn("128 MiB tree metadata", readiness)
-        self.assertIn("retention root, checkout root, and common Git directory", readiness)
-        self.assertIn("group their unallocated physical headroom by filesystem identity", readiness)
-        self.assertIn("combining process, checkout-root, and Git-admin remainders", readiness)
-        self.assertIn("different retention-root filesystem receives its own floor check", readiness)
-        self.assertIn("1 GiB aggregate checkout-accounting admission cap", readiness)
-        self.assertIn("1 GiB per-filesystem host free-space floor", readiness)
-        self.assertIn("not an OS quota", readiness)
-        self.assertIn("quota-backed strict profile", readiness)
-        self.assertIn("one 10-minute checkout deadline", readiness)
-        self.assertIn("a checkout-worker PGID", readiness)
-        self.assertIn("short-lived clean-exec phase-commit helpers", readiness)
-        self.assertIn("All potentially blocking Git, materialization", readiness)
-        self.assertIn("state write/rename/`fsync`", readiness)
-        self.assertIn("pauses at supervisor-controlled phase gates", readiness)
-        self.assertIn("never inherits the retention lock", readiness)
-        self.assertIn("same-open-file-description BSD `flock`", readiness)
-        self.assertIn("expected predecessor generation/SHA-256", readiness)
-        self.assertIn("reaps it before releasing the worker", readiness)
-        self.assertIn("successor cannot acquire the lock", readiness)
-        self.assertIn("worktree add --detach --no-checkout", readiness)
-        self.assertIn("`read-tree --reset <head_sha>` without `-u`", readiness)
-        self.assertIn("bounded `cat-file --batch`", readiness)
-        self.assertIn("never execute `post-checkout`, filters, LFS", readiness)
-        self.assertIn("filesystem's name-equivalence semantics", readiness)
-        self.assertIn("exclusive no-follow skeleton", readiness)
-        self.assertIn("ordinary placeholders for both regular and symlink leaves", readiness)
-        self.assertIn("`RENAME_EXCHANGE` or `RENAME_SWAP`", readiness)
-        self.assertIn("Never use unlink-then-symlink", readiness)
-        self.assertIn("`blocked-checkout-atomic-symlink`", readiness)
-        self.assertIn("`blocked-checkout-name-semantics`", readiness)
-        self.assertIn(
-            "every materialized tracked path and `.codex-review/review.diff`, including unchanged nearby evidence",
-            readiness,
-        )
-        self.assertIn("`blocked-checkout-attributes`", readiness)
-        self.assertIn("rather than running `git status` or `diff-files`", readiness)
-        self.assertIn("fixed native trampoline", readiness)
-        self.assertIn("separate 30-second supervisor ownership-handoff", readiness)
-        self.assertIn("While the attempt is still `reserved`", readiness)
-        self.assertIn("one small native attempt supervisor", readiness)
-        self.assertIn("outer-liveness/control channel", readiness)
-        self.assertIn("exec acknowledgement and authenticated ready with no side effects", readiness)
-        self.assertIn("`handoff=pending`", readiness)
-        self.assertIn("`handoff=accepted`", readiness)
-        self.assertIn("irreversibly stops publishing attempt state", readiness)
-        self.assertIn("authenticated start ACK", readiness)
-        self.assertIn("`handoff=complete` plus `process_owner=attempt-supervisor`", readiness)
-        self.assertIn("closes only its lock reference", readiness)
-        self.assertIn("retains the sole liveness/control peer plus supervisor handle", readiness)
-        self.assertIn("remains outside the reviewer PGID", readiness)
-        self.assertIn(
-            "common direct parent of the checkout worker, every phase helper, the FIFO reader, and the Codex leader",
-            readiness,
-        )
-        self.assertIn("remains the sole state writer", readiness)
-        self.assertIn("Outer EOF is an irreversible latch", readiness)
-        self.assertIn("missing or invalid authorization forces `inconclusive`", readiness)
-        self.assertIn("later EOF does not revoke an accepted result", readiness)
-        self.assertIn("anchored checkout PGID", readiness)
-        self.assertIn("terminates and reaps any active launch helper/reader", readiness)
-        self.assertIn("obtaining its direct unreaped child PID/PGID", readiness)
-        self.assertIn("error-only descriptor is close-on-exec", readiness)
-        self.assertIn("EOF proves Codex exec only while that same child", readiness)
-        self.assertIn("Failure or uncertainty before complete retains the full envelope", readiness)
-        self.assertIn("distinct 30-second reviewer-launch deadline", readiness)
-        self.assertIn("30-minute deadline", readiness)
-        self.assertIn("one positional `PROMPT` after `--`", readiness)
-        self.assertIn("stdin to `/dev/null`", readiness)
-        self.assertIn("only fd 0/1/2 remain", readiness)
-        self.assertIn("final FIFO by pathname only", readiness)
-        self.assertIn("descriptors close-on-exec at the Codex boundary", readiness)
-
-        self.assertIn("separate supervisor-owned task-scoped sinks", readiness)
-        self.assertIn("--output-last-message <task-scoped-fifo>", readiness)
-        self.assertIn("fresh owner-only FIFO", readiness)
-        self.assertIn("supervised reader uses no dummy writer or `O_RDWR`", readiness)
-        self.assertIn("before reading payload", readiness)
-        self.assertIn("verifies pathname absence and link count zero", readiness)
-        self.assertIn("later writers cannot reopen by pathname", readiness)
-        self.assertIn("Controlled reader cancellation on a proven-no-child path", readiness)
-        self.assertIn("direct ordinary-file target is not sealable evidence", readiness)
-        self.assertIn("4 MiB of uncompressed input", readiness)
-        self.assertIn("losslessly compress ordered segments", readiness)
-        self.assertIn("30-minute deadline", readiness)
-        self.assertIn("128 MiB", readiness)
-        self.assertIn("256 MiB aggregate on-disk", readiness)
-        self.assertIn("inclusive 65,536-byte final-artifact maximum", readiness)
-        self.assertIn("Never evict older segments", readiness)
-        self.assertIn("never use process-wide `RLIMIT_FSIZE`", readiness)
-        self.assertIn("leader in its own process group", readiness)
-        self.assertIn("bounded-grace `KILL`", readiness)
-        self.assertIn("leader unreaped as a PID-reuse anchor", readiness)
-        self.assertIn("does not contain descendants", readiness)
-        self.assertIn("observe it without reaping", readiness)
-        self.assertIn("still-anchored PGID", readiness)
-        self.assertIn("drain once more, and only then reap", readiness)
-        self.assertIn("`logs-truncated`", readiness)
-        self.assertIn("`cleanup-warning`", readiness)
-        self.assertIn("Never signal the bare recorded PGID after reap", readiness)
-        self.assertIn("Neither cleanup/logging condition invalidates", readiness)
-        self.assertIn("open/changing final transport", readiness)
-        self.assertIn("final 8 KiB of stderr", readiness)
-        self.assertIn("report effective values as unobserved", readiness)
-        self.assertIn("not by itself a failure", readiness)
-        self.assertIn("Never present requested values as observed effective values", readiness)
-        self.assertIn("claim silent-substitution detection", readiness)
-        self.assertIn("review and cleanup/logging status separately", readiness)
-        self.assertIn("Delete diagnostic logs after a clean no-findings result only", readiness)
-        self.assertIn("cleanup is clean and both readers reached EOF", readiness)
-        self.assertIn("Retain bounded compressed logs", readiness)
-        self.assertIn("any path that may still be open", readiness)
-        self.assertIn("one private retention root capped at 512 MiB", readiness)
-        self.assertIn("interprocess-exclusive retention-root BSD `flock`", readiness)
-        self.assertIn("generation/digest-chained authoritative attempt-state record", readiness)
-        self.assertIn("`reserved` -> `worktree-adding` -> `validating`", readiness)
-        self.assertIn("`prelaunch-aborted` with review status `not-run`", readiness)
-        self.assertIn("remains `spawn-intent` plus launch-uncertain", readiness)
-        self.assertIn("never `prelaunch-aborted`", readiness)
-        self.assertIn("exhaustive matrix", readiness)
-        self.assertIn("Recovery follows the exhaustive matrix", readiness)
-        self.assertIn(
-            "after complete, a live same-boot supervisor with the original identity is the sole owner",
-            readiness,
-        )
-        self.assertIn("different same-boot owner retains the full 257 MiB envelope", readiness)
-        self.assertIn("verified recorded boot-ID change", readiness)
-        self.assertIn("exact-settlement tuple for every phase", readiness)
-        self.assertIn(
-            "process settlement remains independent from checkout and cleanup/logging settlement",
-            readiness,
-        )
-        self.assertIn("publication lease continues excluding successor owners", readiness)
-        self.assertIn("non-TTL `retained-worktree` record", readiness)
-        self.assertIn("starts its 7-day TTL at `released_at`", readiness)
-        self.assertIn("Pending-handoff and unresolved evidence has no age-based eviction", readiness)
-        self.assertIn("`git worktree unlock <exact-path>`", readiness)
-        self.assertIn("`git worktree remove --force <exact-path>`", readiness)
-        self.assertIn("re-prove both exact names", readiness)
-        self.assertIn("`retained-worktree`", readiness)
-        self.assertIn("`blocked-worktree-capacity`", readiness)
-        self.assertIn("do not age it out under the process-artifact TTL", readiness)
-        self.assertIn("do not invalidate an already sealed final artifact", readiness)
-        self.assertIn("admission, launch, review, cleanup/logging", readiness)
-        self.assertIn("worktree, reservation, and failure-stage statuses", readiness)
-        self.assertIn("exact detached-worktree path and allocated bytes when retained", readiness)
-        self.assertIn("`blocked-retention`", readiness)
-
-        self.assertIn("`codex exec --ephemeral`", skill)
-        self.assertIn("independent ephemeral gate", skill)
-        self.assertIn("intentionally does not persist", skill)
-        self.assertIn("persisted rollout verifies", skill)
-        self.assertIn("full instruction/process isolation", skill)
-        self.assertIn("proof against silent model substitution", skill)
-
-        self.assertIn(
-            "codex exec --ephemeral --strict-config --json --sandbox read-only",
-            contracts,
-        )
-        self.assertIn("clean detached worktree", contracts)
-        self.assertIn("normal user configuration", contracts)
-        self.assertIn("Rules, MCP servers, Plugins", contracts)
-        self.assertIn("committed `AGENTS.md` and `.codex/**`", contracts)
-        self.assertIn("do not pass `--ignore-user-config`", contracts)
-        self.assertIn("state-changing MCP/Plugin actions", contracts)
-        self.assertIn("read-only review evidence only", contracts)
-        self.assertIn("accepted prompt-injection", contracts)
-        self.assertIn("stricter repo-local contract", contracts)
-        self.assertIn("Never describe this profile as neutralizing", contracts)
-        self.assertIn("bounded outer-owner-private memory", contracts)
-        self.assertIn("NUL-free valid UTF-8", contracts)
-        self.assertIn("host's measured exec-argument budget", contracts)
-        self.assertIn("exact in-memory bytes", contracts)
-        self.assertIn("create no task directory or prompt path before admission", contracts)
-        self.assertIn("durably committed `phase=reserved`", contracts)
-        self.assertIn("`openat(O_CREAT|O_EXCL|O_NOFOLLOW, 0600)`", contracts)
-        self.assertIn("closes its prompt descriptor before exit", contracts)
-        self.assertIn("does not transfer an FD", contracts)
-        self.assertIn("separate bounded lock-custody verifier helper", contracts)
-        self.assertIn("never reconstructs input from the artifact", contracts)
-        self.assertIn("UTF-8/argv readback", contracts)
-        self.assertIn("after handoff only those transferred bytes are argv", contracts)
-        self.assertIn("`ls-tree -rz -l --full-tree -r`", contracts)
-        self.assertIn("64 MiB per ordinary blob", contracts)
-        self.assertIn("512 MiB of aggregate raw blob bytes", contracts)
-        self.assertIn("100,000 entries", contracts)
-        self.assertIn("128 MiB of tree metadata", contracts)
-        self.assertIn("16 KiB per symlink target", contracts)
-        self.assertIn("`checkout_root_bound =", contracts)
-        self.assertIn("`git_admin_bound =", contracts)
-        self.assertIn("unique_parent_directory_count + gitlink_count", contracts)
-        self.assertIn("A_git * (entry_count + 16)", contracts)
-        self.assertIn("Their sum is `checkout_accounting_bound`", contracts)
-        self.assertIn("add the proposed 257 MiB process-artifact envelope", contracts)
-        self.assertIn("Charges from all three roles are combined", contracts)
-        self.assertIn("separate 1 GiB aggregate checkout-accounting cap", contracts)
-        self.assertIn("1 GiB host free-space floor", contracts)
-        self.assertIn("not an OS quota", contracts)
-        self.assertIn("zero transient physical overshoot", contracts)
-        self.assertIn("quota-backed strict profile", contracts)
-        self.assertIn("one 10-minute monotonic deadline", contracts)
-        self.assertIn("one dedicated checkout-worker process group", contracts)
-        self.assertIn("short-lived clean-exec phase-commit helpers", contracts)
-        self.assertIn("fixed PID-first native trampoline", contracts)
-        self.assertIn("authenticated post-exec ready record", contracts)
-        self.assertIn("no mere EOF is helper exec evidence", contracts)
-        self.assertIn("bidirectional startup/phase-control descriptor", contracts)
-        self.assertIn("same locked open-file-description", contracts)
-        self.assertIn("BSD `flock` retention lock", contracts)
-        self.assertIn("must not reopen the lock path", contracts)
-        self.assertIn("`fcntl`/`lockf`", contracts)
-        self.assertIn("Every potentially blocking checkout operation", contracts)
-        self.assertIn("pauses at explicit supervisor-controlled phase gates", contracts)
-        self.assertIn("neither mutates the ledger nor inherits the retention-lock descriptor", contracts)
-        self.assertIn("never in the outer process", contracts)
-        self.assertIn("starts exactly one phase helper with bounded record bytes", contracts)
-        self.assertIn("exact expected predecessor generation/SHA-256", contracts)
-        self.assertIn("keeps the lease through temp write", contracts)
-        self.assertIn("reap before releasing the worker", contracts)
-        self.assertIn("never calls `LOCK_UN` while a phase helper lives", contracts)
-        self.assertIn("successor owner from acquiring the lock", contracts)
-        self.assertIn(
-            "supervisor is the checkout worker's direct parent, supervises the single monotonic deadline",
-            contracts,
-        )
-        self.assertIn("distinct post-spawn `launched`-commit failure", contracts)
-        self.assertIn("worktree add --detach --no-checkout", contracts)
-        self.assertIn("`read-tree --reset <head_sha>` without `-u`", contracts)
-        self.assertIn("raw `cat-file --batch`", contracts)
-        self.assertIn("sole entry is the expected `.git` marker", contracts)
-        self.assertIn("reject a frozen-tree `.git` path", contracts)
-        self.assertIn("`GIT_NO_LAZY_FETCH=1` instead of fetching", contracts)
-        self.assertIn("Never use `cat-file --filters`", contracts)
-        self.assertIn("`GIT_LFS_SKIP_SMUDGE=1` is not a substitute", contracts)
-        self.assertIn("target filesystem's case-folding and Unicode-normalization behavior", contracts)
-        self.assertIn("`blocked-checkout-name-semantics`", contracts)
-        self.assertIn(
-            "reject every manifest-path, component, or staging-name alias", contracts
-        )
-        self.assertIn(
-            "aliases `.git` or the synthetic `.codex-review` namespace", contracts
-        )
-        self.assertIn("authoritative metadata-only skeleton", contracts)
-        self.assertIn("ordinary placeholder for every regular-file and symlink leaf", contracts)
-        self.assertIn("No final symlink exists in phase 1", contracts)
-        self.assertIn(
-            "before any ordinary-file or retained-diff payload is consumed",
-            contracts,
-        )
-        self.assertIn("device/inode identity", contracts)
-        self.assertIn("aliased tree entries name identical objects", contracts)
-        self.assertIn("alias-free reserved sibling name", contracts)
-        self.assertIn("`renameat2(..., RENAME_EXCHANGE)`", contracts)
-        self.assertIn("`renameatx_np(..., RENAME_SWAP)`", contracts)
-        self.assertIn("never fall back to unlink-then-symlink", contracts)
-        self.assertIn("`blocked-checkout-atomic-symlink`", contracts)
-        self.assertIn("complete symlink graph", contracts)
-        self.assertIn("Git regular-file modes `100644` and `100755`", contracts)
-        self.assertIn("use `fchmod`", contracts)
-        self.assertIn("set mode `0644` or `0755`", contracts)
-        self.assertIn("no setuid/setgid/sticky bits", contracts)
-        self.assertIn("`100644`/`100755` executable-bit mapping", contracts)
-        self.assertNotIn("each final symlink with `symlinkat`", contracts)
-        self.assertIn(
-            "every frozen-head manifest path, including unchanged nearby evidence",
-            contracts,
-        )
-        self.assertIn("synthetic `.codex-review/review.diff` destination", contracts)
-        self.assertIn("`blocked-checkout-attributes`", contracts)
-        self.assertIn("effective `filter` or `working-tree-encoding`", contracts)
-        self.assertIn("other than `unspecified` or `unset`", contracts)
-        self.assertIn("without `git status`, `diff-files`", contracts)
-        self.assertIn("`git ls-files --stage -z`", contracts)
-        self.assertIn("covers only checkout materialization", contracts)
-        self.assertIn(
-            "Codex executable selected from the trusted reviewer environment",
-            contracts,
-        )
-        self.assertNotIn("exact prevalidated absolute Codex executable", contracts)
-        self.assertIn("fixed native trampoline", contracts)
-        self.assertIn("without waiting for exec", contracts)
-        self.assertIn("30-second supervisor exec/ownership handoff", contracts)
-        self.assertIn("host monotonic clock per stage", contracts)
-        self.assertIn("30-second reviewer launch", contracts)
-        self.assertIn("each deadline is distinct", contracts)
-        self.assertNotIn("shared 30-second spawn-handoff", contracts)
-        self.assertIn("before `worktree-adding`", contracts)
-        self.assertIn("does not include the already-complete ownership handoff or checkout", contracts)
-        self.assertIn(
-            "30-minute reviewer-runtime deadline begins only after durable `launched`",
-            contracts,
-        )
-        self.assertIn(
-            "Persist and fsync `spawn-intent` only after checkout/diff integrity",
-            contracts,
-        )
-        self.assertIn("supervisor starts the bounded native reader through the PID-first trampoline", contracts)
-        self.assertIn("authenticated post-exec ready record before its first side effect", contracts)
-        self.assertIn("one error-only close-on-exec acknowledgement descriptor", contracts)
-        self.assertIn("every controlled non-exec exit", contracts)
-        self.assertIn("Treat EOF as successful Codex exec only when", contracts)
-        self.assertIn("nonterminal direct-child status probe", contracts)
-        self.assertIn("same unreaped child is still live", contracts)
-        self.assertIn("EOF with terminal or concurrent child death", contracts)
-        self.assertIn("execs and exits before success can be proved", contracts)
-        self.assertIn("failure to commit `launched` before the reviewer-launch deadline", contracts)
-        self.assertIn("keeps durable `spawn-intent`", contracts)
-        self.assertIn("anchored child PID/PGID plus reader handle", contracts)
-        self.assertIn("sole positional `PROMPT` after `--`", contracts)
-        self.assertIn("Bind fd 0 to `/dev/null`", contracts)
-        self.assertIn("unpreflighted `<stdin>` block", contracts)
-        self.assertIn("wait for caller EOF", contracts)
-        self.assertIn("empty inherited-descriptor allowlist", contracts)
-        self.assertIn("supervisor-only and close-on-exec", contracts)
-        self.assertIn("final FIFO by pathname only", contracts)
-        self.assertIn("successful, failed, timed-out, abandoned, or uncertain reviewer-launch cleanup path", contracts)
-        self.assertIn("no supervisor prompt descriptor exists", contracts)
-        self.assertIn("both Codex and reader `/dev/null` source descriptors", contracts)
-        self.assertIn("Codex acknowledgement descriptor", contracts)
-        self.assertIn("sole reader-liveness peer", contracts)
-        self.assertIn("raw reader diagnostic writer descriptors", contracts)
-        self.assertIn("no process output streams into the outer transcript", contracts)
-        self.assertIn("--output-last-message <task-scoped-fifo>", contracts)
-        self.assertIn("fresh owner-only FIFO", contracts)
-        self.assertIn("bounded native reader through the PID-first trampoline", contracts)
-        self.assertIn("bind fd 0 to `/dev/null`", contracts)
-        self.assertIn("bind fd 1/fd 2 only to bounded helper diagnostics", contracts)
-        self.assertIn("allowlist one explicit control descriptor above 2", contracts)
-        self.assertIn("main watchdog thread", contracts)
-        self.assertIn("supervisor-liveness channel", contracts)
-        self.assertIn("supervisor keeps the sole peer open until the reader is reaped", contracts)
-        self.assertNotIn("close that descriptor before the open", contracts)
-        self.assertNotIn(
-            "parent retains its matching startup-control endpoint only through the ready handshake",
-            contracts,
-        )
-        self.assertIn("blocking read-only FIFO open", contracts)
-        self.assertIn("Forbid `O_RDWR`, a dummy writer", contracts)
-        self.assertIn("pre-writer zero-byte read can never be mistaken", contracts)
-        self.assertIn("publishes nothing until true reader EOF", contracts)
-        self.assertIn("Controlled reader cancellation after Codex is proved never to have begun", contracts)
-        self.assertIn("terminates and reaps that helper", contracts)
-        self.assertIn("uses the liveness peer and returned handle", contracts)
-        self.assertIn("direct ordinary-file target is not a valid final transport", contracts)
-        self.assertIn("distinct fresh temporary ordinary artifact", contracts)
-        self.assertIn("30-minute deadline", contracts)
-        self.assertIn("4 MiB uncompressed segment size", contracts)
-        self.assertIn("128 MiB admitted-byte limit", contracts)
-        self.assertIn("256 MiB aggregate on-disk hard limit", contracts)
-        self.assertIn(
-            "inclusive 65,536-byte maximum for the final-message artifact",
-            contracts,
-        )
-        self.assertIn("compress it losslessly", contracts)
-        self.assertIn("compression temporaries", contracts)
-        self.assertIn("never discard an older segment", contracts)
-        self.assertIn("per-stream or aggregate hard limit", contracts)
-        self.assertIn("send `TERM`", contracts)
-        self.assertIn("send `KILL`", contracts)
-        self.assertIn("keep the leader unreaped so its PID cannot be reused", contracts)
-        self.assertIn("bounded FIFO/pipe reader", contracts)
-        self.assertIn(
-            "Do not set process-wide file-size limits such as `RLIMIT_FSIZE`",
-            contracts,
-        )
-        self.assertIn("unrelated internal files", contracts)
-        self.assertIn("terminate the reviewer with `SIGXFSZ`", contracts)
-        self.assertIn("direct-path monitoring or a post-exit size check alone", contracts)
-        self.assertIn("leader in its own process group", contracts)
-        self.assertIn("record its PID and PGID", contracts)
-        self.assertIn("does not require a container", contracts)
-        self.assertIn("descendant inventory", contracts)
-        self.assertIn("may escape by creating a new session", contracts)
-        self.assertIn("never claim full process containment", contracts)
-        self.assertNotIn("OS-enforced job, cgroup, or container", contracts)
-        self.assertNotIn("OS-enforced job/cgroup/container", readiness)
-        self.assertIn("do not wait indefinitely", contracts)
-        self.assertIn("never accept a final-message artifact", contracts)
-        self.assertIn("leader exits zero", contracts)
-        self.assertIn("final transport reaches EOF and is sealed", contracts)
-        self.assertIn("still-open or changing final transport", contracts)
-        self.assertIn("descendant-held diagnostic sink does not invalidate", contracts)
-        self.assertIn("does not invalidate an otherwise complete final artifact", contracts)
-        self.assertIn("record both `logs-truncated` and `cleanup-warning`", contracts)
-        self.assertIn(
-            "A final reader that still lacks EOF remains incomplete and makes the review `inconclusive`",
-            contracts,
-        )
-        self.assertIn(
-            "A leftover PGID or unclosed diagnostic sink is cleanup/logging health",
-            contracts,
-        )
-        self.assertIn(
-            "A valid sealed artifact may be `clean` or `findings` alongside `cleanup-warning` or `logs-truncated`",
-            contracts,
-        )
-        self.assertIn("Never signal a bare recorded PGID after reap", contracts)
-        self.assertIn("may have been reused by an unrelated process group", contracts)
-        self.assertIn("Observe an ordinary leader terminal state without reaping it", contracts)
-        self.assertIn("one bounded post-signal drain", contracts)
-        self.assertIn("Reap the leader only after those signal and drain phases", contracts)
-        self.assertIn("review status and cleanup status independently", contracts)
-        self.assertIn("neither cleanup condition upgrades it", contracts)
-        self.assertIn("reject any stale or partial result", contracts)
-        self.assertIn("On a nonzero leader exit", contracts)
-        self.assertIn("read at most the final 8 KiB of stderr", contracts)
-        self.assertIn("byte-count-limited read", contracts)
-        self.assertIn("truncates before parent-transcript insertion", contracts)
-        self.assertIn("line-count-only command", contracts)
-        self.assertIn("single long JSON or trace line", contracts)
-        self.assertIn(
-            "only to diagnose an explicit configuration conflict or hook/notify execution",
-            contracts,
-        )
-        self.assertNotIn("runtime-verification failure as `blocked`", contracts)
-        self.assertIn("otherwise report `inconclusive`", contracts)
-        self.assertIn("Never read the complete stderr", contracts)
-        self.assertIn("Parse effective runtime metadata", contracts)
-        self.assertIn("absence of separately observable effective metadata", contracts)
-        self.assertIn("does not invalidate its sealed artifact", contracts)
-        self.assertIn("Do not present requested values as effective values", contracts)
-        self.assertIn("claim silent-substitution detection", contracts)
-        self.assertIn("helper-backed Codex lane keeps", contracts)
-        self.assertIn("Remove logs after a clean no-findings result only when", contracts)
-        self.assertIn("cleanup status is clean", contracts)
-        self.assertIn("every diagnostic reader reached EOF", contracts)
-        self.assertIn("Retain paths that may still be open", contracts)
-        self.assertIn("any cleanup/logging warning", contracts)
-        self.assertIn("512 MiB aggregate on-disk hard cap", contracts)
-        self.assertIn("interprocess-exclusive BSD `flock`", contracts)
-        self.assertIn(
-            "full 257 MiB envelope for every outstanding process reservation",
-            contracts,
-        )
-        self.assertIn("Account the separate per-filesystem checkout charges", contracts)
-        self.assertIn("reclaim only eligible safely closed evidence oldest first", contracts)
-        self.assertIn("Admission precedence is deterministic", contracts)
-        self.assertIn("`launch_status: not-attempted`", contracts)
-        self.assertIn("`review_status: not-run`", contracts)
-        self.assertIn("one authoritative `phase=reserved` attempt-state record", contracts)
-        self.assertIn("grouped-checkout charges and settlements", contracts)
-        self.assertIn("do not carry an independently mutable phase", contracts)
-        self.assertIn("recorded boot identifier", contracts)
-        self.assertIn("`record_generation`", contracts)
-        self.assertIn("`previous_record_sha256`", contracts)
-        self.assertIn("increments the exact predecessor generation by one", contracts)
-        self.assertIn("exact intended prompt/worktree/synthetic-diff paths", contracts)
-        self.assertIn("`reserved` proves that no worktree operation or reviewer began", contracts)
-        self.assertIn(
-            "recorded prompt path and handoff may each be absent, partial, or complete",
-            contracts,
-        )
-        self.assertIn("`reserved` -> `worktree-adding` -> `validating`", contracts)
-        self.assertIn("with terminal `prelaunch-aborted`", contracts)
-        self.assertIn("Persist and fsync `spawn-intent`", contracts)
-        self.assertIn("Complete the supervisor handoff in `reserved`", contracts)
-        self.assertIn("an invariant predecessor of every later phase", contracts)
-        self.assertIn("before `worktree-adding`", contracts)
-        self.assertIn("common direct parent and sole state writer", contracts)
-        self.assertIn("A primitive failure before any reviewer child exists", contracts)
-        self.assertIn("acknowledgement proves Codex never began", contracts)
-        self.assertIn("Once the supervisor's native primitive returns the Codex direct-child handle", contracts)
-        self.assertIn("After successful exec acknowledgement", contracts)
-        self.assertIn("commits PID/PGID and `launched`", contracts)
-        self.assertIn("If that `launched` commit is interrupted or unverifiable", contracts)
-        self.assertIn("keep the last durable phase at `spawn-intent`", contracts)
-        self.assertIn("reject all review output", contracts)
-        self.assertIn("`closure=proven-by-owner`", contracts)
-        self.assertIn("`review_status=inconclusive`", contracts)
-        self.assertIn("`process_settlement=exact`", contracts)
-        self.assertIn("Recovery honors a complete evidence-bearing owner tuple as terminal", contracts)
-        self.assertIn("never restores the full process charge", contracts)
-        self.assertLess(
-            contracts.index("Start one small native attempt supervisor"),
-            contracts.index("Persist and fsync `spawn-intent`"),
-        )
-        self.assertIn("closes the current owner's retention-root lock reference in a `finally` path", contracts)
-        self.assertIn("a settled boot-change recovery tuple", contracts)
-        self.assertIn("A no-admission path may unlock after proving", contracts)
-        self.assertIn("Once the authoritative reservation state is committed", contracts)
-        self.assertIn("publication lease continues to exclude successor owners", contracts)
-        self.assertIn("only the durably handed-off live supervisor", contracts)
-        self.assertIn("different same-boot owner", contracts)
-        self.assertIn("verified recorded boot-ID change", contracts)
-        self.assertIn("`closure=proven-by-boot-change`", contracts)
-        self.assertIn("`prior_boot_id=<recorded>`", contracts)
-        self.assertIn("`current_boot_id=<verified-different>`", contracts)
-        self.assertIn("`retained_process_bytes=<exact>`", contracts)
-        self.assertIn("only after every helper and subprocess from that phase", contracts)
-        self.assertIn("non-TTL `retained-worktree` record", contracts)
-        self.assertIn("settle its 257 MiB reservation to exact retained process bytes", contracts)
-        self.assertIn("If launch or process-artifact closure is uncertain", contracts)
-        self.assertIn("No prelaunch state is review evidence", contracts)
-        self.assertIn("`prelaunch-aborted` never reports `clean` or `findings`", contracts)
-        self.assertIn("Report `admission_status`, `launch_status`, `review_status`", contracts)
-        self.assertIn("Recovery is exhaustive across every durable nonterminal phase", contracts)
-        self.assertIn("Every exact settlement is one complete authoritative tuple", contracts)
-        self.assertIn("`process_settlement=exact` may coexist with `checkout_settlement=outstanding`", contracts)
-        self.assertIn("Exact-settled process evidence enters `held`, not `released`", contracts)
-        self.assertNotIn("`launched` follows active-attempt recovery", contracts)
-        self.assertIn("Never use an unlocked check-then-create sequence", contracts)
-        self.assertIn("`active/unsafe` -> `held` -> `released` -> `reclaimed`", contracts)
-        self.assertIn("terminal status and age never release it", contracts)
-        self.assertIn("`handoff-complete`", contracts)
-        self.assertIn("a requested, reported, or pending handoff remains held", contracts)
-        self.assertIn("7-day TTL starts at `released_at`", contracts)
-        self.assertIn("Never reclaim active/unsafe or held/unresolved evidence at any age", contracts)
-        self.assertIn("1 MiB for the final artifact, prompt, metadata", contracts)
-        self.assertIn(
-            "Never unlink a retained evidence path or ordinary artifact that may still be open",
-            contracts,
-        )
-        self.assertIn("verified handshake-time FIFO de-naming", contracts)
-        self.assertIn("does not release evidence or move the attempt out of `active/unsafe`", contracts)
-        self.assertNotIn("resolved/handed-off or whose TTL expired", contracts)
-        self.assertIn("`git worktree unlock <exact-path>`", contracts)
-        self.assertIn("`git worktree remove --force <exact-path>`", contracts)
-        self.assertIn("raw-object materialization intentionally need not satisfy", contracts)
-        self.assertIn("re-prove both exact names", contracts)
-        self.assertIn("`retained-worktree`", contracts)
-        self.assertIn("allocated-byte count to the terminal disk-footprint report", contracts)
-        self.assertIn("`blocked-worktree-capacity`", contracts)
-        self.assertIn("Do not age the retained worktree out", contracts)
-        self.assertIn("separate 1 GiB aggregate checkout-accounting cap", contracts)
-        self.assertIn("one-retained-worktree admission rule", contracts)
-        self.assertIn("Neither checkout cleanup condition invalidates", contracts)
+        for value in (readiness, contracts):
+            self.assertIn("independent-codex-pr-review", value)
+            self.assertIn("app-server", value)
+            self.assertIn("gpt-5.6-sol", value)
+            self.assertIn("xhigh", value)
+            self.assertNotIn("codex exec --ephemeral", value)
 
     def test_checkout_charge_release_requires_durable_namespace_barriers(
         self,
@@ -2986,7 +2510,17 @@ class RepositoryContractTest(unittest.TestCase):
                 backend_atomic_capture_or_exclusion=True,
             ),
         )
-    def test_independent_codex_trust_profile_is_lightweight(self) -> None:
+    def test_independent_codex_trust_profile_is_isolated_and_verified(
+        self,
+    ) -> None:
+        tool_root = SCRIPTS / "independent_codex_pr_review"
+        readme = (tool_root / "README.md").read_text(encoding="utf-8")
+        protocol = (tool_root / "review_supervisor/appserver_protocol.py").read_text(
+            encoding="utf-8"
+        )
+        constants = (tool_root / "review_supervisor/constants.py").read_text(
+            encoding="utf-8"
+        )
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
             encoding="utf-8"
@@ -2995,107 +2529,20 @@ class RepositoryContractTest(unittest.TestCase):
             encoding="utf-8"
         )
 
-        for value in (readiness, contracts):
-            self.assertIn(
-                "codex exec --ephemeral --strict-config --json --sandbox read-only",
-                value,
-            )
-            self.assertIn("`CODEX_HOME`", value)
-            self.assertIn("Rules, MCP servers, Plugins", value)
-            self.assertIn("tracked project instructions", value)
-            self.assertIn("dotted", value)
-            self.assertIn("project_root_markers=[\".git\"]", value)
-            self.assertIn("features.hooks=false", value)
-            self.assertIn("notify=[]", value)
-            self.assertIn("linked-worktree", value)
-            self.assertIn("reviewer", value)
-            self.assertIn("TOML", value)
-            self.assertIn("direct-argv", value)
-            self.assertIn("`codex debug prompt-input`", value)
-            self.assertIn("additional", value)
-            self.assertIn("Session", value)
-            self.assertIn("configured MCP", value)
-            self.assertIn("organization-managed configuration", value)
-            self.assertIn("higher-priority managed policy may prevail", value.lower())
-            self.assertIn("configuration conflict", value)
-            self.assertIn("hook or notify execution", value)
-            self.assertIn("prelaunch `blocked`", value)
-            self.assertIn("`inconclusive`", value)
-            self.assertIn("Do not add", value)
-
-        self.assertIn("normal `~/.codex` configuration", readiness)
-        self.assertIn("create a second `CODEX_HOME`", readiness)
-        self.assertIn(
-            "projects={\"/absolute/worktree\"={trust_level=\"trusted\"}}",
-            readiness,
-        )
-        self.assertIn("one `-c` value each", readiness)
-        self.assertIn("Never use a dotted `projects.<path>.trust_level` key", readiness)
-        self.assertIn("actual strict ephemeral reviewer", readiness)
-        self.assertIn("without a shell or `eval`", readiness)
-        self.assertIn("requested per-invocation values", readiness)
-        self.assertIn("accepts that possibility", readiness)
-        self.assertIn(
-            "Do not claim that argv presence or any independent attestation proves the effective configuration",
-            readiness,
-        )
-        self.assertIn("Do not add a separate probe", readiness)
-        self.assertIn("difference between requested and observed runtime values", readiness)
-        self.assertIn("not by itself a blocker", readiness)
-        self.assertIn("normal user configuration", contracts)
-        self.assertIn("create a second `CODEX_HOME`", contracts)
-        self.assertIn(
-            "projects={\"/ABS/WORKTREE\"={trust_level=\"trusted\"}}",
-            contracts,
-        )
-        self.assertIn("Do not modify `~/.codex/config.toml`", contracts)
-        self.assertIn("`features.hooks=false`", contracts)
-        self.assertIn("`notify=[]`", contracts)
-        self.assertIn("Linked-worktree lifecycle hooks may be sourced", contracts)
-        self.assertIn("configured separately from the hooks feature", contracts)
-        self.assertIn("recursively preserves other ordinary user `projects` entries", contracts)
-        self.assertIn("requested values for this invocation", contracts)
-        self.assertIn("accepts that possibility", contracts)
-        self.assertIn("not an independently attested effective configuration", contracts)
-        self.assertIn("Use only the actual `codex exec", contracts)
-        self.assertIn("Do not add another probe", contracts)
-        self.assertIn("difference between requested and observed runtime values", contracts)
-        self.assertIn("not by itself `blocked`", contracts)
-
-        for value in (skill, readiness, contracts):
-            self.assertNotIn("independent-codex-runtime-policy.json", value)
-            self.assertNotIn("review_runtime.independent_codex", value)
-            self.assertNotIn("revalidate_independent_codex", value)
-            self.assertNotIn("runtime-policy entry", value)
-            self.assertNotIn("reject any observed mismatch", value)
-        for value in (readiness, contracts):
-            self.assertNotIn("app-server", value)
-            self.assertNotIn("configRequirements/read", value)
-            self.assertNotIn("config/read", value)
-            self.assertNotIn("codex features list", value)
-            self.assertNotIn("managed-profile", value)
-            self.assertNotIn("config_toml_base64", value)
-            self.assertNotIn("requirements_toml_base64", value)
-            self.assertNotIn("JWT", value)
-            self.assertNotIn("jwt", value)
-            self.assertNotIn("cloud-bundle", value)
-            self.assertNotIn("version_stdout", value)
-            self.assertNotIn("release_asset_sha256", value)
-            self.assertNotIn("exact prevalidated absolute Codex executable", value)
-            self.assertNotIn("validated Codex executable identity", value)
-            self.assertNotIn("reject an observed model or effort mismatch", value)
-            self.assertNotIn("runtime-verification failure as `blocked`", value)
-        self.assertNotIn("without a shell or PATH lookup", readiness)
-        self.assertNotIn("Pass the pinned model and effort explicitly", readiness)
-        self.assertNotIn("Reject observed structured runtime metadata", readiness)
-        self.assertIn(
-            "configuration conflict before reviewer execution, classify the attempt as prelaunch `blocked` / `not-run`",
-            skill,
-        )
-        self.assertIn(
-            "once launch is possible, or whenever hook/notify execution is observed, the attempt is `inconclusive`",
-            skill,
-        )
+        for value in (readme, readiness, contracts):
+            self.assertIn("app-server", value)
+            self.assertIn("CODEX_HOME", value)
+            self.assertIn("gpt-5.6-sol", value)
+            self.assertIn("xhigh", value)
+        self.assertIn("--strict-config", readme)
+        self.assertIn("Do not use tools", constants)
+        self.assertIn('"sessionFlags"', protocol)
+        self.assertIn('"config/read"', protocol)
+        self.assertIn("isolated", readiness.lower())
+        self.assertIn("sealed", contracts.lower())
+        self.assertNotIn("codex exec --ephemeral", skill)
+        self.assertNotIn("codex exec --ephemeral", readiness)
+        self.assertNotIn("codex exec --ephemeral", contracts)
 
         for removed in (
             "references/independent-codex-runtime-policy.json",
@@ -3221,6 +2668,11 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("absence of staging names or any other entry", contracts)
 
     def test_independent_reviewer_keeps_read_only_input_boundary(self) -> None:
+        tool_root = SCRIPTS / "independent_codex_pr_review"
+        readme = (tool_root / "README.md").read_text(encoding="utf-8")
+        constants = (tool_root / "review_supervisor/constants.py").read_text(
+            encoding="utf-8"
+        )
         readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
             encoding="utf-8"
         )
@@ -3229,134 +2681,99 @@ class RepositoryContractTest(unittest.TestCase):
         )
 
         for value in (readiness, contracts):
-            self.assertIn(
-                "codex exec --ephemeral --strict-config --json --sandbox read-only",
-                value,
-            )
-            self.assertIn("stdin", value)
-            self.assertIn("`/dev/null`", value)
-            self.assertIn("`--add-dir`", value)
-            self.assertIn("outside", value)
-            self.assertIn("descriptor", value)
-            self.assertIn("only fd 0/1/2 remain", value)
-        self.assertIn("forbids reviewer reads outside the detached checkout", contracts)
-        self.assertIn("using the detached worktree as cwd", readiness)
+            self.assertIn("app-server", value)
+            self.assertIn("bounded evidence", value)
+            self.assertIn("no-execution", value)
+            self.assertNotIn("codex exec --ephemeral", value)
+        self.assertIn("Do not use tools", constants)
+        self.assertIn("filesystem capability", readme)
+        self.assertIn("never give the reviewer a checkout path", readiness)
 
     def test_final_artifact_is_durable_before_terminal_review_state(self) -> None:
+        tool_root = SCRIPTS / "independent_codex_pr_review"
+        secureio = (tool_root / "review_supervisor/secureio.py").read_text(
+            encoding="utf-8"
+        )
+        runtime = (tool_root / "review_supervisor/runtime.py").read_text(
+            encoding="utf-8"
+        )
+        supervisor = (tool_root / "review_supervisor/supervisor.py").read_text(
+            encoding="utf-8"
+        )
         contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
             encoding="utf-8"
         )
 
-        handshake = contracts.index("Immediately after the first handshake")
-        identity = contracts.index(
-            "compares `fstat` of its open read descriptor with no-follow `fstatat`",
-            handshake,
-        )
-        unlink = contracts.index("calls `unlinkat` on that exact name", identity)
-        post_unlink = contracts.index(
-            "requires no-follow pathname absence and link count zero", unlink
-        )
-        unlink_fsync = contracts.index(
-            "`fsync`s the already-open containing directory", post_unlink
-        )
-        transfer = contracts.index(
-            "Only after that durable name removal may payload transfer begin",
-            unlink_fsync,
-        )
-        irreversible_eof = contracts.index(
-            "irreversible transport boundary", transfer
-        )
-        eof = contracts.index("publishes nothing until true reader EOF", irreversible_eof)
-        temp_fsync = contracts.index("first `fsync` the still-open temporary file", eof)
-        no_replace = contracts.index(
-            "then atomically publish it in the same directory without replacement",
-            temp_fsync,
-        )
-        directory_fsync = contracts.index(
-            "then `fsync` the already-open containing directory", no_replace
-        )
-        exact_readback = contracts.index(
-            "then reopen the final path with `openat(O_RDONLY|O_NOFOLLOW|O_CLOEXEC)`",
-            directory_fsync,
-        )
-        seal_record = contracts.index("authenticated final-seal record", exact_readback)
-        authorization = contracts.index(
-            "terminal-commit authorization linearization point", seal_record
-        )
-        authorized_state = contracts.index(
-            "durable `terminal-commit-authorized` generation", authorization
-        )
-        terminal_state = contracts.index(
-            "A `clean` or `findings` terminal helper requires", authorized_state
-        )
+        for operation in (
+            "os.fsync(temp_fd)",
+            "rename_noreplace(parent_fd, temp_name, parent_fd, name)",
+            "os.fsync(parent_fd)",
+            "os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW",
+            "if written_identity != read_identity",
+            "if actual != data",
+        ):
+            self.assertIn(operation, secureio)
 
-        self.assertLess(handshake, identity)
-        self.assertLess(identity, unlink)
-        self.assertLess(unlink, post_unlink)
-        self.assertLess(post_unlink, unlink_fsync)
-        self.assertLess(unlink_fsync, transfer)
-        self.assertLess(transfer, irreversible_eof)
-        self.assertLess(irreversible_eof, eof)
-        self.assertLess(eof, temp_fsync)
-        self.assertLess(temp_fsync, no_replace)
-        self.assertLess(no_replace, directory_fsync)
-        self.assertLess(directory_fsync, exact_readback)
-        self.assertLess(exact_readback, seal_record)
-        delegated_eof = contracts.index(
-            "temporarily delegates sole EOF-observation authority", seal_record
+        final_publish = runtime.index(
+            "final_identity = publish_bytes(final_path, final_bytes, mode=0o600)"
         )
-        supervisor_quiet = contracts.index(
-            "does not poll, read, or act on its original outer-liveness endpoint",
-            delegated_eof,
+        pending = runtime.index('"phase": "terminal-authorization-pending"', final_publish)
+        authorization = runtime.index(
+            "state, state_digest = authorize_terminal_via_helper(", pending
         )
-        durable_resolution = contracts.index(
-            "After the authorization helper is reaped", authorized_state
-        )
-        self.assertLess(seal_record, authorization)
-        self.assertLess(delegated_eof, supervisor_quiet)
-        self.assertLess(supervisor_quiet, authorization)
-        self.assertLess(authorization, authorized_state)
-        self.assertLess(authorized_state, durable_resolution)
-        self.assertLess(authorized_state, terminal_state)
-        self.assertIn("`renameat2(..., RENAME_NOREPLACE)`", contracts)
-        self.assertIn("`renameatx_np(..., RENAME_EXCL)`", contracts)
-        self.assertIn("same device/inode, regular type, link count one", contracts)
-        self.assertIn("independently repeats the no-follow identity/length/digest/exact-byte readback", contracts)
-        self.assertIn("final device/inode/length/SHA-256 seal metadata", contracts)
-        self.assertIn("strictly precede a trusted evidence-bearing terminal tuple", contracts)
-        self.assertIn("artifact verification, authorization, tuple publication", contracts)
-        self.assertIn(
-            "Controlled reader cancellation after Codex is proved never to have begun",
-            contracts,
-        )
-        self.assertIn("`prelaunch-aborted` path with `review_status=not-run`", contracts)
+        reviewed = runtime.index('"phase": "reviewed"', authorization)
+        self.assertLess(final_publish, pending)
+        self.assertLess(pending, authorization)
+        self.assertLess(authorization, reviewed)
+
+        for operation in (
+            "_verify_final_seal(final_path, requested_seal)",
+            '"predecessor_sha256": digest',
+            '"readback": "exact-nofollow-under-publication-lease"',
+            "terminal_commit_authorized=True",
+        ):
+            self.assertIn(operation, runtime)
+        self.assertIn('"predecessor_sha256": state_digest', supervisor)
+        self.assertIn('request_type="final-authorization-commit"', supervisor)
+        self.assertIn("_has_exact_final_authorization(", supervisor)
+        self.assertIn("final device/inode/length/SHA-256", contracts)
+        self.assertIn("predecessor", contracts)
+        self.assertIn("final-seal", contracts)
 
     def test_final_artifact_uses_inclusive_65536_byte_limit(self) -> None:
-        candidates = {
-            "pr-readiness": (
-                SKILL_ROOT / "references/pr-readiness.md"
-            ).read_text(encoding="utf-8"),
-            "review-lane-contracts": (
-                SKILL_ROOT / "references/review-lane-contracts.md"
-            ).read_text(encoding="utf-8"),
-        }
+        tool_root = SCRIPTS / "independent_codex_pr_review"
+        constants = (tool_root / "review_supervisor/constants.py").read_text(
+            encoding="utf-8"
+        )
+        final_transport = (tool_root / "review_supervisor/final_transport.py").read_text(
+            encoding="utf-8"
+        )
+        protocol = (tool_root / "review_supervisor/appserver_protocol.py").read_text(
+            encoding="utf-8"
+        )
+        prompt = (tool_root / "review_supervisor/prompt.py").read_text(
+            encoding="utf-8"
+        )
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
 
-        for name, content in candidates.items():
-            with self.subTest(contract=name):
-                budget = content.index("remaining budget")
-                probe = content.index("one-byte overflow probe", budget)
-                accepted = content.index("65,536", probe)
-                overflow = content.index("one returned byte", probe)
-                inconclusive = content.index("`inconclusive`", overflow)
-
-                self.assertLess(budget, probe)
-                self.assertLess(probe, accepted)
-                self.assertLess(probe, overflow)
-                self.assertLess(overflow, inconclusive)
-                self.assertIn("1..65,536", content)
-                self.assertIn("65,535", content)
-                self.assertIn("65,537", content)
-                self.assertNotIn("below 64 KiB", content)
+        self.assertIn("FINAL_MESSAGE_BYTES = 65_536", constants)
+        self.assertIn("remaining = FINAL_MESSAGE_BYTES", final_transport)
+        self.assertIn("overflow = os.read(fifo_fd, 1)", final_transport)
+        self.assertIn(
+            'if len(text.encode("utf-8", "strict")) > FINAL_MESSAGE_BYTES:',
+            protocol,
+        )
+        self.assertIn("if not 1 <= len(value) <= FINAL_MESSAGE_BYTES:", prompt)
+        for phrase in (
+            "remaining budget",
+            "one-byte overflow probe",
+            "1..65,536",
+            "65,535",
+            "65,537",
+        ):
+            self.assertIn(phrase, contracts)
 
         cases = {
             "65535-eof": (
@@ -3388,6 +2805,19 @@ class RepositoryContractTest(unittest.TestCase):
                 )
 
     def test_attempt_supervisor_closes_reader_and_reviewer_after_outer_death(self) -> None:
+        tool_root = SCRIPTS / "independent_codex_pr_review"
+        runtime = (tool_root / "review_supervisor/runtime.py").read_text(
+            encoding="utf-8"
+        )
+        direct_gate = (tool_root / "review_supervisor/direct_gate.py").read_text(
+            encoding="utf-8"
+        )
+        review_execution = (
+            tool_root / "review_supervisor/review_execution.py"
+        ).read_text(encoding="utf-8")
+        direct_gate_tests = (tool_root / "tests/test_direct_gate.py").read_text(
+            encoding="utf-8"
+        )
         readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
             encoding="utf-8"
         )
@@ -3398,143 +2828,49 @@ class RepositoryContractTest(unittest.TestCase):
         for value in (readiness, contracts):
             self.assertIn("attempt supervisor", value)
             self.assertIn("outer-liveness", value)
-            self.assertIn("common direct parent", value)
-            self.assertIn("full", value)
-        self.assertIn("terminates and reaps any active launch helper/reader", readiness)
-        self.assertIn("blocked worker, FIFO reader, or reviewer", contracts)
-        self.assertIn("main watchdog thread", contracts)
-        self.assertIn("worker thread", contracts)
-        self.assertIn("supervisor dies before Codex opens the FIFO", contracts)
-        self.assertIn("whole reader process", contracts)
-        self.assertIn("blocked worker thread", contracts)
-        self.assertIn("reader process never forks", contracts)
-        self.assertIn("sole supervisor-owned peer is inherited by no other process", contracts)
-        self.assertIn("Close the reader peer only after the reader is reaped", contracts)
-        self.assertIn("Reader closure or liveness EOF alone never proves", contracts)
-        self.assertNotIn("closes its sole control descriptor and blocks", readiness)
-        self.assertNotIn("parent closes its matching control endpoint on every handoff outcome", readiness)
+            self.assertIn("app-server stdio", value)
 
-        reserved_handoff = contracts.index(
-            "While the durable phase is still `reserved`"
+        attempt_main = runtime.index("def attempt_supervisor_main(")
+        handoff_complete = runtime.index('"handoff": "complete"', attempt_main)
+        ownership = runtime.index(
+            '"process_owner": "attempt-supervisor"', handoff_complete
         )
-        prompt_helpers_reaped = contracts.index(
-            "all outer-owned prompt/preflight helpers have been reaped",
-            reserved_handoff,
+        checkout = runtime.index(
+            "state, state_digest = _run_checkout(", ownership
         )
-        worktree_boundary = contracts.index(
-            "before `worktree-adding`", prompt_helpers_reaped
+        reviewer = runtime.index(
+            "state, state_digest, final_text = run_reviewer(", checkout
         )
-        supervisor_ready = contracts.index(
-            "authenticated ready record", worktree_boundary
-        )
-        pending_handoff = contracts.index("`handoff=pending`", supervisor_ready)
-        handoff_offer = contracts.index(
-            "The authenticated offer carries", pending_handoff
-        )
-        accepted_handoff = contracts.index("`handoff=accepted`", handoff_offer)
-        acceptance_verified = contracts.index(
-            "outer process verifies acceptance", accepted_handoff
-        )
-        publication_quiescence = contracts.index(
-            "irreversible publication quiescence", acceptance_verified
-        )
-        start_ack = contracts.index("authenticated start ACK", publication_quiescence)
-        complete_handoff = contracts.index(
-            "`handoff=complete` and `process_owner=attempt-supervisor`", start_ack
-        )
-        completion_record = contracts.index("returns a completion record", complete_handoff)
-        no_early_children = contracts.index(
-            "Before it, no checkout worker", completion_record
-        )
-        common_parent = contracts.index(
-            "afterward the supervisor is their common direct parent", no_early_children
-        )
-        self.assertLess(reserved_handoff, prompt_helpers_reaped)
-        self.assertLess(prompt_helpers_reaped, worktree_boundary)
-        self.assertLess(supervisor_ready, pending_handoff)
-        self.assertLess(pending_handoff, handoff_offer)
-        self.assertLess(handoff_offer, accepted_handoff)
-        self.assertLess(accepted_handoff, acceptance_verified)
-        self.assertLess(acceptance_verified, publication_quiescence)
-        self.assertLess(publication_quiescence, start_ack)
-        self.assertLess(start_ack, complete_handoff)
-        self.assertLess(complete_handoff, completion_record)
-        self.assertLess(completion_record, no_early_children)
-        self.assertLess(no_early_children, common_parent)
+        self.assertLess(handoff_complete, ownership)
+        self.assertLess(ownership, checkout)
+        self.assertLess(checkout, reviewer)
 
-        handoff_invariant = contracts.index(
-            "durable `handoff=complete` with `process_owner=attempt-supervisor` is an invariant predecessor"
-        )
-        spawn_intent = contracts.index(
-            "Persist and fsync `spawn-intent` only after", handoff_invariant
-        )
-        reader_start = contracts.index(
-            "starting the FIFO reader and Codex trampoline", spawn_intent
-        )
-        self.assertLess(handoff_invariant, spawn_intent)
-        self.assertLess(spawn_intent, reader_start)
-
-        outer_eof = contracts.index("Outer-liveness EOF after complete handoff")
-        pgid_termination = contracts.index(
-            "terminates/reaps the active checkout or reviewer PGID", outer_eof
-        )
-        reader_cancellation = contracts.index(
-            "drains or cancels readers", pgid_termination
-        )
-        settlement = contracts.index("and settles instead of abandoning", reader_cancellation)
-        self.assertLess(outer_eof, pgid_termination)
-        self.assertLess(pgid_termination, reader_cancellation)
-        self.assertLess(reader_cancellation, settlement)
+        for invariant in (
+            'raise OuterAbandoned("outer liveness peer closed")',
+            "liveness_checkpoint=lambda: _require_outer_liveness(outer)",
+            "abandoned = True",
+            "state, state_digest = _record_failure(",
+            "abandoned=abandoned",
+        ):
+            self.assertIn(invariant, runtime)
+        for invariant in (
+            "if launched is not None and not process_state.leader_reaped:",
+            "process_state.exit_code = _terminate_process(",
+            "process_state.process_group_empty = True",
+            "process_state.pipes_closed = True",
+        ):
+            self.assertIn(invariant, direct_gate)
+        for invariant in (
+            "receipt.leader_reaped is not True",
+            "receipt.process_group_empty is not True",
+            "receipt.stdio_closed is not True",
+        ):
+            self.assertIn(invariant, review_execution)
         self.assertIn(
-            "An authenticated start ACK only authorizes the bounded complete-state attempt",
-            contracts,
+            "def test_liveness_checkpoint_aborts_and_reaps_the_launched_process",
+            direct_gate_tests,
         )
-        self.assertIn("does not transfer ownership or stop the deadline", contracts)
-        self.assertIn(
-            "Outer EOF observed after that ACK but before durable completion is latched for later abandonment",
-            contracts,
-        )
-        self.assertIn(
-            "complete publication, exact readback, and helper reap succeed before the deadline",
-            contracts,
-        )
-        self.assertIn(
-            "helper blocks, fails, times out, or leaves completion unverifiable",
-            contracts,
-        )
-        self.assertIn(
-            "terminates and reaps every live trampoline, handoff helper, or state helper it owns",
-            contracts,
-        )
-        self.assertIn(
-            "closes every control, custody, and writer endpoint plus its publication lease",
-            contracts,
-        )
-        self.assertIn("so a successor can eventually acquire the lock", contracts)
-        self.assertIn(
-            "the last durable incomplete-handoff generation and full charges remain fail-closed",
-            contracts,
-        )
-        self.assertIn("any latched EOF immediately enters the complete-handoff abandonment path", contracts)
-        self.assertIn(
-            "From quiescence until durable `handoff=complete`",
-            contracts,
-        )
-        self.assertIn("the outer process cannot publish or exact-settle", contracts)
-        self.assertIn(
-            "retains the sole liveness/control peer and supervisor handle",
-            contracts,
-        )
-        self.assertIn("Successful handoff never closes that peer", contracts)
-        self.assertIn("full envelope remains outstanding", contracts)
-        self.assertIn("terminal-commit authorization", contracts)
-        self.assertIn(
-            "EOF observed by the helper before the linearization point refuses authorization",
-            contracts,
-        )
-        self.assertIn("EOF after the successful live-peer observation does not revoke", contracts)
-        self.assertIn("every owned helper/direct child is reaped", contracts)
-        self.assertIn("does not prove that an escaped descendant", contracts)
+        self.assertNotIn("codex exec --ephemeral", contracts)
 
     def test_process_and_checkout_share_physical_free_space_projection(self) -> None:
         readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
@@ -3610,6 +2946,19 @@ class RepositoryContractTest(unittest.TestCase):
         )
 
     def test_prompt_artifact_is_reserved_before_materialization(self) -> None:
+        tool_root = SCRIPTS / "independent_codex_pr_review"
+        supervisor = (tool_root / "review_supervisor/supervisor.py").read_text(
+            encoding="utf-8"
+        )
+        ledger = (tool_root / "review_supervisor/ledger.py").read_text(
+            encoding="utf-8"
+        )
+        runtime = (tool_root / "review_supervisor/runtime.py").read_text(
+            encoding="utf-8"
+        )
+        runtime_tests = (tool_root / "tests/test_runtime_helpers.py").read_text(
+            encoding="utf-8"
+        )
         readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
             encoding="utf-8"
         )
@@ -3617,47 +2966,62 @@ class RepositoryContractTest(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertLess(
-            readiness.index("bounded owner-private memory"),
-            readiness.index("interprocess-exclusive retention-root BSD `flock`"),
+        run_start = supervisor.index("def run(")
+        preparation = supervisor.index(
+            "prepared = _prepare_with_reclamation(", run_start
         )
-        self.assertLess(
-            readiness.index("authoritative `phase=reserved` record"),
-            readiness.index("Only after that record is durable"),
+        reservation = supervisor.index(
+            "attempt_dir, state, state_digest = create_reserved_attempt(",
+            preparation,
         )
-        self.assertLess(
-            readiness.index("Only after that record is durable"),
-            readiness.index("prompt verification must finish"),
+        publication = supervisor.index(
+            "state, state_digest = publish_prompt_via_helper(", reservation
         )
-        self.assertLess(
-            readiness.index("prompt verification must finish"),
-            readiness.index("While the attempt is still `reserved`"),
+        supervisor_spawn = supervisor.index(
+            "supervisor = _spawn_attempt_supervisor(", publication
         )
-        self.assertIn("create no prompt artifact, checkout, or reviewer", readiness)
-        self.assertIn("recorded prompt path absent, partial, or exact", readiness)
+        self.assertLess(preparation, reservation)
+        self.assertLess(reservation, publication)
+        self.assertLess(publication, supervisor_spawn)
 
-        self.assertLess(
-            contracts.index("bounded outer-owner-private memory"),
-            contracts.index("Before creating any attempt directory or prompt path"),
+        create_start = ledger.index("def create_reserved_attempt(")
+        create_end = ledger.index("\ndef ", create_start + 1)
+        create_body = ledger[create_start:create_end]
+        for invariant in (
+            '"phase": "reserved"',
+            '"worktree_status": "absent"',
+            '"launch_status": "not-attempted"',
+            '"prompt_length": len(prompt)',
+            '"prompt_sha256": prompt_sha256',
+            'atomic_write_json(attempt_dir / "state.json", state, replace=False)',
+        ):
+            self.assertIn(invariant, create_body)
+        self.assertNotIn("publish_bytes(", create_body)
+
+        helper_start = runtime.index("def prompt_helper_main(")
+        helper_end = runtime.index("\ndef publish_prompt_via_helper(", helper_start)
+        helper_body = runtime[helper_start:helper_end]
+        evidence = helper_body.index("evidence = prompt_evidence(prompt)")
+        predecessor = helper_body.index(
+            'if digest != request.get("predecessor_sha256"):', evidence
         )
-        self.assertLess(
-            contracts.index("After admission succeeds"),
-            contracts.index("Only after `reserved` is durable"),
+        reservation_match = helper_body.index(
+            '"length": state["prompt_length"]', predecessor
         )
-        self.assertLess(
-            contracts.index("Only after `reserved` is durable"),
-            contracts.index("Prelaunch then follows"),
-        )
-        self.assertIn("creates no prompt artifact, worktree, or reviewer", contracts)
+        publish = helper_body.index("identity = publish_bytes(prompt_path, prompt)")
+        commit = helper_body.index("next_state, next_digest = commit_state(", publish)
+        self.assertLess(evidence, predecessor)
+        self.assertLess(predecessor, reservation_match)
+        self.assertLess(reservation_match, publish)
+        self.assertLess(publish, commit)
+
+        for value in (readiness, contracts):
+            self.assertIn("phase=reserved", value)
+            self.assertIn("prompt", value)
         self.assertIn(
-            "recorded prompt path and handoff may each be absent, partial, or complete",
-            contracts,
+            "def test_prompt_verifier_uses_private_handoff_bytes_and_durable_identity",
+            runtime_tests,
         )
-        self.assertIn("retains the full process charge", contracts)
-        self.assertIn("records the verified device/inode identity", contracts)
-        self.assertIn("does not transfer an FD", contracts)
-        self.assertIn("separate bounded lock-custody verifier helper", contracts)
-        self.assertIn("never reconstructs input from the artifact", contracts)
 
     def test_phase_writer_holds_publication_lease_until_exit(self) -> None:
         readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(

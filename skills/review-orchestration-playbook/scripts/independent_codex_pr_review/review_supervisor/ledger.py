@@ -1,0 +1,987 @@
+from __future__ import annotations
+
+import fcntl
+import math
+import os
+import pathlib
+import re
+import stat
+import time
+import uuid
+from dataclasses import dataclass
+from typing import Any, Callable, Iterable
+
+from .constants import (
+    CHECKOUT_ACCOUNTING_CAP_BYTES,
+    CHECKOUT_SYNTHETIC_PATH_BYTES_BOUND,
+    HOST_FREE_SPACE_FLOOR_BYTES,
+    MIB,
+    PROCESS_ENVELOPE_BYTES,
+    PRIMARY_DIFF_RELATIVE_PATH,
+    REGISTRATION_DESCENDANT_COUNT_CAP,
+    REGISTRATION_PATH_BYTES_CAP,
+    RETENTION_CAP_BYTES,
+    SCHEMA_VERSION,
+    TARGETED_MANIFEST_FORMAT_HEADER_BOUND,
+    TARGETED_MANIFEST_RECORD_BYTES,
+    UNSUPPORTED_CLAUSES,
+)
+from .errors import SupervisorError, blocked, inconclusive
+from .models import Admission, FilesystemMeasure, HelperCustody, TreeManifest
+from .process import require_authenticated_no_child_process_profile
+from .secureio import (
+    acquire_flock,
+    align_up,
+    allocated_bytes,
+    atomic_write_json,
+    boot_identifier,
+    canonical_json,
+    checked_add,
+    checked_mul,
+    decode_json_bytes,
+    directory_identities_match,
+    identity_from_stat,
+    measure_filesystem,
+    open_absolute_directory_chain,
+    open_regular_at,
+    read_fd_exact,
+    require_private_directory,
+    sha256_bytes,
+)
+
+
+MAX_ATTEMPT_STATE_BYTES = 1024 * 1024
+ATTEMPT_DIRECTORY_PATTERN = re.compile(rb"attempt-([0-9]+)-[0-9a-f]{32}\Z")
+ATOMIC_STATE_TEMP_PATTERN = re.compile(
+    rb"\.state\.json\.tmp-([1-9][0-9]*)-[0-9a-f]{16}\Z"
+)
+INITIAL_CRASH_RECLAIM_AGE_SECONDS = 30.0
+INITIAL_CRASH_TIMESTAMP_SKEW_SECONDS = 300.0
+INITIAL_CRASH_TEMP_CAP = 8
+
+
+class EntryCountMismatch(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class ParentAggregation:
+    unique_parent_directory_count: int
+    unique_parent_path_bytes: int
+    consumed_paths: int
+
+
+@dataclass(frozen=True)
+class ProjectionInvariants:
+    checkout_allocation_unit: int
+    entry_count: int
+    metadata_bytes: int
+    checkout_base_bound_without_parents: int
+    git_admin_bound: int
+    review_diff_bound: int
+
+
+@dataclass(frozen=True)
+class LedgerSnapshot:
+    process_logical_bytes: int
+    checkout_logical_bytes: int
+    process_physical_remaining_by_fs: dict[str, int]
+    checkout_physical_remaining_by_fs: dict[str, int]
+    retained_worktree_attempt: str | None
+    attempt_count: int
+
+
+@dataclass
+class RetentionLease:
+    root: pathlib.Path
+    fd: int
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+    def __enter__(self) -> "RetentionLease":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
+
+def acquire_retention_lease(root: pathlib.Path, *, deadline: float) -> RetentionLease:
+    require_private_directory(root, create=True)
+    root_fd, _ = open_absolute_directory_chain(root)
+    try:
+        try:
+            lock_fd, identity = open_regular_at(
+                root_fd,
+                b"retention.lock",
+                expected_uid=os.getuid(),
+            )
+        except FileNotFoundError:
+            lock_fd = os.open(
+                b"retention.lock",
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+                dir_fd=root_fd,
+            )
+            os.fsync(lock_fd)
+            os.fsync(root_fd)
+            identity = identity_from_stat(os.fstat(lock_fd))
+        if not stat.S_ISREG(identity.mode) or stat.S_IMODE(identity.mode) != 0o600:
+            os.close(lock_fd)
+            raise ValueError("retention lock has an unsafe identity or mode")
+        acquire_flock(lock_fd, fcntl.LOCK_EX, deadline=deadline)
+        return RetentionLease(root=root, fd=lock_fd)
+    except Exception as error:
+        raise inconclusive(
+            f"cannot acquire independent-review retention lock: {error}",
+            stage="admission",
+            code="retention-lock-unavailable",
+        ) from error
+    finally:
+        os.close(root_fd)
+
+
+def read_attempt_state(attempt_dir: pathlib.Path) -> tuple[dict[str, Any], bytes, str]:
+    attempt_fd, _ = open_absolute_directory_chain(attempt_dir)
+    try:
+        state_fd, identity = open_regular_at(
+            attempt_fd,
+            b"state.json",
+            expected_uid=os.getuid(),
+        )
+        try:
+            if identity.size > MAX_ATTEMPT_STATE_BYTES:
+                raise ValueError("attempt state exceeds its byte limit")
+            raw = read_fd_exact(
+                state_fd,
+                max_bytes=MAX_ATTEMPT_STATE_BYTES,
+                expected_size=identity.size,
+            )
+        finally:
+            os.close(state_fd)
+    finally:
+        os.close(attempt_fd)
+    state = decode_json_bytes(raw)
+    if not isinstance(state, dict) or state.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError("attempt state schema is invalid")
+    return state, raw, sha256_bytes(raw)
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _reclaim_initial_crash_attempt(
+    *,
+    root_fd: int,
+    name: bytes,
+    directory_metadata: os.stat_result,
+    match: re.Match[bytes],
+    entries: tuple[bytes, ...],
+    now: float,
+) -> bool:
+    if not entries:
+        os.rmdir(name, dir_fd=root_fd)
+        os.fsync(root_fd)
+        return True
+    if b"state.json" in entries:
+        return False
+    if len(entries) > INITIAL_CRASH_TEMP_CAP:
+        raise ValueError("initial attempt crash residue exceeds its entry cap")
+    attempt_timestamp = int(match.group(1))
+    if (
+        attempt_timestamp > now
+        or abs(directory_metadata.st_mtime - attempt_timestamp)
+        > INITIAL_CRASH_TIMESTAMP_SKEW_SECONDS
+    ):
+        raise ValueError("initial attempt crash residue has an invalid timestamp")
+
+    attempt_fd = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=root_fd,
+    )
+    identities: list[tuple[bytes, Any]] = []
+    authenticated_state: bytes | None = None
+    try:
+        descriptor = identity_from_stat(os.fstat(attempt_fd))
+        if not directory_identities_match(
+            descriptor, identity_from_stat(directory_metadata)
+        ):
+            raise ValueError("initial attempt directory identity changed")
+        newest_timestamp = max(directory_metadata.st_mtime, directory_metadata.st_ctime)
+        for entry in entries:
+            temp_match = ATOMIC_STATE_TEMP_PATTERN.fullmatch(entry)
+            if temp_match is None:
+                raise ValueError("state-less attempt contains an unknown entry")
+            metadata = os.stat(entry, dir_fd=attempt_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_size > MAX_ATTEMPT_STATE_BYTES
+            ):
+                raise ValueError(
+                    "initial attempt state temporary has an unsafe identity"
+                )
+            if (
+                metadata.st_mtime
+                < attempt_timestamp - INITIAL_CRASH_TIMESTAMP_SKEW_SECONDS
+                or metadata.st_mtime
+                > attempt_timestamp + INITIAL_CRASH_TIMESTAMP_SKEW_SECONDS
+            ):
+                raise ValueError("initial attempt state temporary has an invalid age")
+            newest_timestamp = max(
+                newest_timestamp,
+                metadata.st_mtime,
+                metadata.st_ctime,
+            )
+            pid = int(temp_match.group(1))
+            if pid > 2_147_483_647:
+                raise ValueError("initial attempt state writer PID is invalid")
+            if _pid_exists(pid):
+                raise ValueError("initial attempt state writer may still be alive")
+            temp_fd, identity = open_regular_at(
+                attempt_fd,
+                entry,
+                expected_uid=os.getuid(),
+            )
+            try:
+                raw = read_fd_exact(
+                    temp_fd,
+                    max_bytes=MAX_ATTEMPT_STATE_BYTES,
+                    expected_size=identity.size,
+                )
+            finally:
+                os.close(temp_fd)
+            if identity != identity_from_stat(metadata):
+                raise ValueError("initial attempt state temporary identity changed")
+            candidate = decode_json_bytes(raw)
+            attempt_id = os.fsdecode(name).removeprefix("attempt-")
+            created_at = (
+                candidate.get("created_at") if isinstance(candidate, dict) else None
+            )
+            if (
+                not isinstance(candidate, dict)
+                or canonical_json(candidate) != raw
+                or candidate.get("schema_version") != SCHEMA_VERSION
+                or candidate.get("attempt_id") != attempt_id
+                or type(candidate.get("record_generation")) is not int
+                or candidate["record_generation"] != 1
+                or candidate.get("previous_record_sha256") is not None
+                or type(created_at) not in {int, float}
+                or (isinstance(created_at, float) and not math.isfinite(created_at))
+                or created_at < attempt_timestamp
+                or created_at > attempt_timestamp + INITIAL_CRASH_TIMESTAMP_SKEW_SECONDS
+                or candidate.get("phase") != "reserved"
+                or candidate.get("launch_status") != "not-attempted"
+                or candidate.get("reservation_status") != "outstanding"
+                or candidate.get("closure") != "unproven"
+                or candidate.get("process_settlement") != "outstanding"
+                or candidate.get("checkout_settlement") != "outstanding"
+                or candidate.get("retention_state") != "active/unsafe"
+                or candidate.get("leader") is not None
+            ):
+                raise ValueError(
+                    "initial attempt state temporary content is not authentic"
+                )
+            if authenticated_state is not None and raw != authenticated_state:
+                raise ValueError("initial attempt state temporaries disagree")
+            authenticated_state = raw
+            identities.append((entry, identity))
+        if now - newest_timestamp < INITIAL_CRASH_RECLAIM_AGE_SECONDS:
+            raise ValueError("initial attempt crash residue is not old enough")
+        if tuple(
+            sorted(os.fsencode(value) for value in os.listdir(attempt_fd))
+        ) != tuple(sorted(entries)):
+            raise ValueError("initial attempt crash residue changed during inspection")
+        for entry, expected in identities:
+            current = identity_from_stat(
+                os.stat(entry, dir_fd=attempt_fd, follow_symlinks=False)
+            )
+            if current != expected:
+                raise ValueError(
+                    "initial attempt state temporary changed before reclaim"
+                )
+        for entry, _ in identities:
+            os.unlink(entry, dir_fd=attempt_fd)
+        os.fsync(attempt_fd)
+        if os.listdir(attempt_fd):
+            raise ValueError("initial attempt crash residue is not empty after reclaim")
+    finally:
+        os.close(attempt_fd)
+    os.rmdir(name, dir_fd=root_fd)
+    os.fsync(root_fd)
+    return True
+
+
+def _attempt_directories(root: pathlib.Path) -> tuple[pathlib.Path, ...]:
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        names = tuple(os.fsencode(name) for name in os.listdir(root_fd))
+        if len(names) > 10_000:
+            raise ValueError("retention root contains too many entries")
+        attempts: list[pathlib.Path] = []
+        for name in names:
+            if name == b"retention.lock":
+                continue
+            metadata = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            if not name.startswith(b"attempt-") or not stat.S_ISDIR(metadata.st_mode):
+                raise ValueError("retention root contains an unrecognized entry")
+            if (
+                metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
+                raise ValueError("retained attempt has unsafe ownership or mode")
+            attempt_match = ATTEMPT_DIRECTORY_PATTERN.fullmatch(name)
+            if attempt_match is not None:
+                attempt_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=root_fd,
+                )
+                try:
+                    entries = tuple(
+                        sorted(os.fsencode(value) for value in os.listdir(attempt_fd))
+                    )
+                finally:
+                    os.close(attempt_fd)
+                if _reclaim_initial_crash_attempt(
+                    root_fd=root_fd,
+                    name=name,
+                    directory_metadata=metadata,
+                    match=attempt_match,
+                    entries=entries,
+                    now=time.time(),
+                ):
+                    continue
+            attempts.append(root / os.fsdecode(name))
+        return tuple(sorted(attempts))
+    finally:
+        os.close(root_fd)
+
+
+def reconcile_ledger(root: pathlib.Path) -> LedgerSnapshot:
+    process_bytes = 0
+    checkout_bytes = 0
+    process_physical: dict[str, int] = {}
+    checkout_physical: dict[str, int] = {}
+    retained_worktree: str | None = None
+    attempts = _attempt_directories(root)
+    for attempt_dir in attempts:
+        try:
+            state, _, _ = read_attempt_state(attempt_dir)
+            attempt_id = state.get("attempt_id")
+            if (
+                not isinstance(attempt_id, str)
+                or attempt_dir.name != f"attempt-{attempt_id}"
+            ):
+                raise ValueError("attempt directory does not match state identity")
+            process_remaining = state.get("process_physical_remaining_by_fs", {})
+            checkout_remaining = state.get("checkout_physical_remaining_by_fs", {})
+            if not isinstance(process_remaining, dict) or not isinstance(
+                checkout_remaining, dict
+            ):
+                raise ValueError("physical charge map is malformed")
+            for identity, charge in (
+                *process_remaining.items(),
+                *checkout_remaining.items(),
+            ):
+                if (
+                    not isinstance(identity, str)
+                    or type(charge) is not int
+                    or charge < 0
+                ):
+                    raise ValueError("physical charge map entry is malformed")
+
+            retention_state = state.get("retention_state")
+            if retention_state not in {
+                "active/unsafe",
+                "held",
+                "released",
+                "reclaiming",
+                "reclaimed",
+            }:
+                raise ValueError("attempt retention state is invalid")
+            attempt_fs = measure_filesystem(attempt_dir)
+            process_settlement = state.get("process_settlement")
+            if process_settlement == "outstanding":
+                process_charge = PROCESS_ENVELOPE_BYTES
+            elif process_settlement == "exact":
+                if state.get("closure") != "proven-by-boot-change" and (
+                    state.get("leader_started") is True
+                    or state.get("launch_status") == "launched"
+                    or state.get("leader") is not None
+                ):
+                    try:
+                        require_authenticated_no_child_process_profile(state)
+                    except ChildProcessError as error:
+                        raise ValueError(
+                            "exact launched process settlement lacks authenticated "
+                            "no-child-process profile evidence"
+                        ) from error
+                recorded_process_charge = state.get("retained_process_bytes")
+                if (
+                    type(recorded_process_charge) is not int
+                    or recorded_process_charge < 0
+                    or recorded_process_charge > PROCESS_ENVELOPE_BYTES
+                ):
+                    raise ValueError("exact process settlement is malformed")
+                if retention_state == "reclaimed":
+                    if recorded_process_charge != 0 or process_remaining:
+                        raise ValueError("reclaimed process settlement is not zero")
+                    if sorted(os.listdir(attempt_dir)) != ["state.json"]:
+                        raise ValueError("reclaimed tombstone still contains artifacts")
+                    process_charge = 0
+                else:
+                    measured_process_charge = allocated_bytes(
+                        attempt_dir, entry_cap=1_000
+                    )
+                    if measured_process_charge > PROCESS_ENVELOPE_BYTES:
+                        raise ValueError(
+                            "retained process artifacts exceed their envelope"
+                        )
+                    process_charge = max(
+                        recorded_process_charge, measured_process_charge
+                    )
+            else:
+                raise ValueError("attempt process settlement is invalid")
+            process_bytes = checked_add(process_bytes, process_charge)
+            if process_charge:
+                process_physical[attempt_fs.identity] = checked_add(
+                    process_physical.get(attempt_fs.identity, 0), process_charge
+                )
+
+            checkout_settlement = state.get("checkout_settlement")
+            if checkout_settlement == "outstanding":
+                admission = state.get("admission")
+                if not isinstance(admission, dict):
+                    raise ValueError(
+                        "outstanding checkout charge has no admission record"
+                    )
+                checkout_charge = admission.get("checkout_accounting_bound")
+                if type(checkout_charge) is not int or checkout_charge < 0:
+                    raise ValueError("outstanding checkout charge is malformed")
+                checkout_bytes = checked_add(checkout_bytes, checkout_charge)
+                if (
+                    state.get("worktree_status")
+                    in {
+                        "retained-worktree",
+                        "manual-recovery-required",
+                        "cleanup-warning",
+                    }
+                    or state.get("registration") is not None
+                    or state.get("phase")
+                    in {
+                        "worktree-adding",
+                        "validating",
+                        "spawn-intent",
+                        "launched",
+                    }
+                ):
+                    if retained_worktree is not None:
+                        raise ValueError(
+                            "more than one retained worktree record exists"
+                        )
+                    retained_worktree = attempt_id
+            elif checkout_settlement != "exact":
+                raise ValueError("attempt checkout settlement is invalid")
+
+            for identity, charge in checkout_remaining.items():
+                checkout_physical[identity] = checked_add(
+                    checkout_physical.get(identity, 0), charge
+                )
+        except (OSError, ValueError, OverflowError) as error:
+            raise inconclusive(
+                f"retention reconciliation is uncertain for {attempt_dir.name}: {error}",
+                stage="admission",
+                code="retention-reconciliation-uncertain",
+            ) from error
+    return LedgerSnapshot(
+        process_logical_bytes=process_bytes,
+        checkout_logical_bytes=checkout_bytes,
+        process_physical_remaining_by_fs=process_physical,
+        checkout_physical_remaining_by_fs=checkout_physical,
+        retained_worktree_attempt=retained_worktree,
+        attempt_count=len(attempts),
+    )
+
+
+def aggregate_unique_parents(
+    paths: Iterable[bytes],
+    *,
+    expected_count: int,
+    projector: Callable[[int, int, int], None],
+) -> ParentAggregation:
+    if expected_count < 0:
+        raise ValueError("expected path count is negative")
+    parent_count = 0
+    parent_bytes = 0
+    consumed = 0
+    previous: bytes | None = None
+    projector(parent_count, parent_bytes, consumed)
+    iterator = iter(paths)
+    while True:
+        try:
+            current = next(iterator)
+        except StopIteration:
+            break
+        consumed += 1
+        if consumed > expected_count:
+            raise EntryCountMismatch("path stream contains an extra record")
+        if not isinstance(current, bytes):
+            raise ValueError("path stream record is not bytes")
+        if not current or current[0] == 0x2F or current[-1] == 0x2F:
+            raise ValueError("path has a leading or trailing slash")
+        prefix_equal = True
+        ordering: int | None = None
+        last_was_slash = False
+        for index, byte in enumerate(current):
+            if byte == 0:
+                raise ValueError("path contains NUL")
+            previous_byte = (
+                previous[index]
+                if previous is not None and index < len(previous)
+                else None
+            )
+            equal_here = previous_byte == byte
+            if ordering is None and previous is not None and not equal_here:
+                ordering = (
+                    -1
+                    if byte < (previous_byte if previous_byte is not None else -1)
+                    else 1
+                )
+            shared_through = prefix_equal and equal_here
+            if byte == 0x2F:
+                if index == 0 or last_was_slash:
+                    raise ValueError("path contains an empty component")
+                if not shared_through:
+                    parent_count = checked_add(parent_count, 1)
+                    parent_bytes = checked_add(parent_bytes, index)
+                    projector(parent_count, parent_bytes, consumed)
+                last_was_slash = True
+            else:
+                last_was_slash = False
+            prefix_equal = prefix_equal and equal_here
+        if previous is not None:
+            if ordering is None:
+                ordering = 1 if len(current) > len(previous) else 0
+            if ordering <= 0:
+                raise ValueError("path stream is not in strict full raw-byte order")
+        previous = current
+    if consumed != expected_count:
+        raise EntryCountMismatch(
+            "path stream ended before the authenticated entry count"
+        )
+    return ParentAggregation(parent_count, parent_bytes, consumed)
+
+
+def _projection_invariants(
+    *,
+    manifest: TreeManifest,
+    checkout_fs: FilesystemMeasure,
+    git_fs: FilesystemMeasure,
+    diff_length: int,
+) -> ProjectionInvariants:
+    a_checkout = checkout_fs.allocation_unit
+    a_git = git_fs.allocation_unit
+    entry_count = manifest.entry_count
+    blob_allocation = 0
+    for entry in manifest.entries:
+        entry_size = entry.size
+        if entry_size is not None:
+            blob_allocation = checked_add(
+                blob_allocation,
+                align_up(entry_size, a_checkout),
+                a_checkout,
+            )
+    checkout_base = checked_add(
+        64 * MIB,
+        manifest.metadata_bytes,
+        blob_allocation,
+        checked_mul(a_checkout, manifest.gitlink_count),
+    )
+    git_admin_bound = checked_add(
+        64 * MIB,
+        manifest.metadata_bytes,
+        checked_mul(a_git, checked_add(entry_count, 16)),
+    )
+    review_diff_bound = checked_add(
+        align_up(diff_length, a_checkout),
+        checked_mul(2, a_checkout),
+    )
+    return ProjectionInvariants(
+        checkout_allocation_unit=a_checkout,
+        entry_count=entry_count,
+        metadata_bytes=manifest.metadata_bytes,
+        checkout_base_bound_without_parents=checkout_base,
+        git_admin_bound=git_admin_bound,
+        review_diff_bound=review_diff_bound,
+    )
+
+
+def _projection_for(
+    *,
+    invariants: ProjectionInvariants,
+    parent_count: int,
+    parent_bytes: int,
+) -> dict[str, int]:
+    a_checkout = invariants.checkout_allocation_unit
+    entry_count = invariants.entry_count
+    checkout_manifest_entry_bound = checked_add(1, entry_count, parent_count, 3)
+    targeted_manifest_entry_bound = checked_add(
+        checkout_manifest_entry_bound,
+        1,
+        REGISTRATION_DESCENDANT_COUNT_CAP,
+    )
+    targeted_manifest_payload_bound = checked_add(
+        TARGETED_MANIFEST_FORMAT_HEADER_BOUND,
+        invariants.metadata_bytes,
+        parent_bytes,
+        CHECKOUT_SYNTHETIC_PATH_BYTES_BOUND,
+        REGISTRATION_PATH_BYTES_CAP,
+        checked_mul(TARGETED_MANIFEST_RECORD_BYTES, targeted_manifest_entry_bound),
+    )
+    targeted_manifest_file_bound = checked_add(
+        align_up(targeted_manifest_payload_bound, a_checkout),
+        a_checkout,
+    )
+    targeted_manifest_bound = checked_add(
+        checked_mul(2, targeted_manifest_file_bound),
+        checked_mul(2, a_checkout),
+    )
+    checkout_root_bound = checked_add(
+        invariants.checkout_base_bound_without_parents,
+        checked_mul(a_checkout, parent_count),
+        targeted_manifest_bound,
+        invariants.review_diff_bound,
+    )
+    return {
+        "checkout_base_bound_without_parents": invariants.checkout_base_bound_without_parents,
+        "checkout_root_bound": checkout_root_bound,
+        "git_admin_bound": invariants.git_admin_bound,
+        "checkout_accounting_bound": checked_add(
+            checkout_root_bound, invariants.git_admin_bound
+        ),
+        "review_diff_bound": invariants.review_diff_bound,
+        "targeted_manifest_entry_bound": targeted_manifest_entry_bound,
+        "targeted_manifest_payload_bound": targeted_manifest_payload_bound,
+        "targeted_manifest_file_bound": targeted_manifest_file_bound,
+        "targeted_manifest_bound": targeted_manifest_bound,
+    }
+
+
+def calculate_admission(
+    *,
+    snapshot: LedgerSnapshot,
+    retention_root: pathlib.Path,
+    checkout_parent: pathlib.Path,
+    common_git_dir: pathlib.Path,
+    manifest: TreeManifest,
+    diff_length: int,
+) -> Admission:
+    if snapshot.retained_worktree_attempt is not None:
+        raise blocked(
+            f"retained worktree blocks admission: {snapshot.retained_worktree_attempt}",
+            stage="admission",
+            code="blocked-worktree-capacity",
+        )
+    retention_fs = measure_filesystem(retention_root)
+    checkout_fs = measure_filesystem(checkout_parent)
+    git_fs = measure_filesystem(common_git_dir)
+    if (
+        checked_add(snapshot.process_logical_bytes, PROCESS_ENVELOPE_BYTES)
+        > RETENTION_CAP_BYTES
+    ):
+        raise blocked(
+            "independent-review process retention cap would be exceeded",
+            stage="admission",
+            code="blocked-retention",
+        )
+    process_physical = dict(snapshot.process_physical_remaining_by_fs)
+    process_physical[retention_fs.identity] = checked_add(
+        process_physical.get(retention_fs.identity, 0),
+        PROCESS_ENVELOPE_BYTES,
+    )
+    if (
+        retention_fs.free_bytes - process_physical[retention_fs.identity]
+        < HOST_FREE_SPACE_FLOOR_BYTES
+    ):
+        raise blocked(
+            "retention filesystem cannot preserve the 1 GiB process-only floor",
+            stage="admission",
+            code="blocked-retention",
+        )
+
+    try:
+        invariants = _projection_invariants(
+            manifest=manifest,
+            checkout_fs=checkout_fs,
+            git_fs=git_fs,
+            diff_length=diff_length,
+        )
+    except OverflowError as error:
+        raise inconclusive(
+            f"checkout invariant accounting overflow: {error}",
+            stage="admission",
+            code="checkout-accounting-overflow",
+        ) from error
+
+    grouped_base = dict(process_physical)
+    for identity, charge in snapshot.checkout_physical_remaining_by_fs.items():
+        grouped_base[identity] = checked_add(grouped_base.get(identity, 0), charge)
+    measures = {
+        retention_fs.identity: retention_fs,
+        checkout_fs.identity: checkout_fs,
+        git_fs.identity: git_fs,
+    }
+    latest: dict[str, int] = {}
+
+    def projector(parent_count: int, parent_bytes: int, consumed: int) -> None:
+        nonlocal latest
+        try:
+            latest = _projection_for(
+                invariants=invariants,
+                parent_count=parent_count,
+                parent_bytes=parent_bytes,
+            )
+            projected_checkout = checked_add(
+                snapshot.checkout_logical_bytes,
+                latest["checkout_accounting_bound"],
+            )
+            if projected_checkout > CHECKOUT_ACCOUNTING_CAP_BYTES:
+                raise blocked(
+                    "checkout accounting cap would be exceeded",
+                    stage="admission",
+                    code="blocked-worktree-capacity",
+                )
+            grouped = dict(grouped_base)
+            grouped[checkout_fs.identity] = checked_add(
+                grouped.get(checkout_fs.identity, 0),
+                latest["checkout_root_bound"],
+            )
+            grouped[git_fs.identity] = checked_add(
+                grouped.get(git_fs.identity, 0),
+                latest["git_admin_bound"],
+            )
+            for identity, charge in grouped.items():
+                measure = measures.get(identity)
+                if (
+                    measure is not None
+                    and measure.free_bytes - charge < HOST_FREE_SPACE_FLOOR_BYTES
+                ):
+                    raise blocked(
+                        "combined process/checkout projection cannot preserve the 1 GiB floor",
+                        stage="admission",
+                        code="blocked-worktree-capacity",
+                    )
+        except OverflowError as error:
+            raise inconclusive(
+                f"checkout accounting overflow after {consumed} paths: {error}",
+                stage="admission",
+                code="checkout-accounting-overflow",
+            ) from error
+
+    try:
+        parents = aggregate_unique_parents(
+            (entry.path for entry in manifest.entries),
+            expected_count=manifest.entry_count,
+            projector=projector,
+        )
+    except SupervisorError:
+        raise
+    except (ValueError, OverflowError) as error:
+        raise inconclusive(
+            f"frozen path accounting failed closed: {error}",
+            stage="admission",
+            code=(
+                "fail-closed-entry-count-mismatch"
+                if isinstance(error, EntryCountMismatch)
+                else "frozen-path-accounting-invalid"
+            ),
+        ) from error
+    return Admission(
+        retention_fs=retention_fs,
+        checkout_fs=checkout_fs,
+        git_fs=git_fs,
+        entry_count=manifest.entry_count,
+        tree_metadata_bytes=manifest.metadata_bytes,
+        unique_parent_directory_count=parents.unique_parent_directory_count,
+        unique_parent_path_bytes=parents.unique_parent_path_bytes,
+        gitlink_count=manifest.gitlink_count,
+        process_charge=PROCESS_ENVELOPE_BYTES,
+        **latest,
+    )
+
+
+def _group_charges(entries: Iterable[tuple[str, int]]) -> dict[str, int]:
+    grouped: dict[str, int] = {}
+    for identity, charge in entries:
+        grouped[identity] = checked_add(grouped.get(identity, 0), charge)
+    return grouped
+
+
+def create_reserved_attempt(
+    *,
+    lease: RetentionLease,
+    checkout_parent: pathlib.Path,
+    prompt: bytes,
+    prompt_sha256: str,
+    custody: HelperCustody,
+    admission: Admission,
+    base_manifest_sha256: str,
+    head_manifest_sha256: str,
+    repo: pathlib.Path,
+    common_git_dir: pathlib.Path,
+    pr_url: str,
+    git_executable: str,
+    codex_executable: str,
+    exec_budget: dict[str, int],
+    attempt_id: str | None = None,
+) -> tuple[pathlib.Path, dict[str, Any], str]:
+    attempt_id = attempt_id or f"{int(time.time())}-{uuid.uuid4().hex}"
+    attempt_dir = lease.root / f"attempt-{attempt_id}"
+    worktree_path = checkout_parent / f"review-{attempt_id}"
+    control_namespace = checkout_parent / f".review-control-{attempt_id}"
+    prompt_path = attempt_dir / "prompt.txt"
+    final_fifo = attempt_dir / "final.fifo"
+    binding_fds: list[int] = []
+    try:
+        retention_fd, retention_identity = open_absolute_directory_chain(lease.root)
+        binding_fds.append(retention_fd)
+        checkout_parent_fd, checkout_parent_identity = open_absolute_directory_chain(
+            checkout_parent
+        )
+        binding_fds.append(checkout_parent_fd)
+        common_git_fd, common_git_identity = open_absolute_directory_chain(
+            common_git_dir
+        )
+        binding_fds.append(common_git_fd)
+    finally:
+        for binding_fd in binding_fds:
+            os.close(binding_fd)
+    state = {
+        "schema_version": SCHEMA_VERSION,
+        "attempt_id": attempt_id,
+        "record_generation": 1,
+        "previous_record_sha256": None,
+        "boot_id": boot_identifier(),
+        "created_at": time.time(),
+        "phase": "reserved",
+        "handoff": "none",
+        "process_owner": "outer",
+        "admission_status": "reserved",
+        "launch_status": "not-attempted",
+        "runtime_stage": None,
+        "review_status": "not-run",
+        "cleanup_status": "pending",
+        "worktree_status": "absent",
+        "reservation_status": "outstanding",
+        "failure_stage": None,
+        "closure": "unproven",
+        "process_settlement": "outstanding",
+        "checkout_settlement": "outstanding",
+        "retained_process_bytes": None,
+        "retention_state": "active/unsafe",
+        "released_at": None,
+        "release_reason": None,
+        "repo": str(repo),
+        "retention_root_binding": {
+            "path": str(lease.root),
+            "identity": retention_identity.to_json(),
+        },
+        "checkout_parent_binding": {
+            "path": str(checkout_parent),
+            "identity": checkout_parent_identity.to_json(),
+        },
+        "common_git_dir_binding": {
+            "path": str(common_git_dir),
+            "identity": common_git_identity.to_json(),
+        },
+        "pr_url": pr_url,
+        "git_executable": git_executable,
+        "codex_executable": codex_executable,
+        "requested_model": "gpt-5.6-sol",
+        "requested_reasoning_effort": "xhigh",
+        "exec_budget": exec_budget,
+        "review_range": custody.review_range,
+        "base_sha": custody.base_sha,
+        "head_sha": custody.head_sha,
+        "base_manifest_sha256": base_manifest_sha256,
+        "head_manifest_sha256": head_manifest_sha256,
+        "prompt_path": str(prompt_path),
+        "prompt_length": len(prompt),
+        "prompt_sha256": prompt_sha256,
+        "worktree_path": str(worktree_path),
+        "control_namespace": str(control_namespace),
+        "targeted_manifest_temporary": str(control_namespace / "manifest.tmp"),
+        "targeted_manifest_published": str(control_namespace / "manifest.bin"),
+        "final_fifo_path": str(final_fifo),
+        "helper_custody": custody.to_json(),
+        "diff_length": custody.diff_length,
+        "diff_sha256": custody.diff_sha256,
+        "diff_destination": PRIMARY_DIFF_RELATIVE_PATH,
+        "admission": admission.to_json(),
+        "process_physical_remaining_by_fs": {
+            admission.retention_fs.identity: PROCESS_ENVELOPE_BYTES,
+        },
+        "checkout_physical_remaining_by_fs": _group_charges(
+            (
+                (admission.checkout_fs.identity, admission.checkout_root_bound),
+                (admission.git_fs.identity, admission.git_admin_bound),
+            )
+        ),
+        "registration": None,
+        "leader": None,
+        "runtime_process_binding": None,
+        "no_child_process_profile": None,
+        "process_history": [],
+        "final_seal": None,
+        "observed_runtime": {},
+        "unsupported_clauses": list(UNSUPPORTED_CLAUSES),
+    }
+    try:
+        os.mkdir(attempt_dir, 0o700)
+        _, digest = atomic_write_json(attempt_dir / "state.json", state, replace=False)
+        return attempt_dir, state, digest
+    except Exception as error:
+        raise inconclusive(
+            f"cannot durably reserve the independent review attempt: {error}",
+            stage="reservation",
+            code="reservation-durability-uncertain",
+        ) from error
+
+
+def commit_state(
+    attempt_dir: pathlib.Path,
+    current: dict[str, Any],
+    current_digest: str,
+    **updates: Any,
+) -> tuple[dict[str, Any], str]:
+    disk, _, disk_digest = read_attempt_state(attempt_dir)
+    if disk_digest != current_digest or disk != current:
+        raise ValueError("attempt state predecessor changed")
+    next_state = dict(current)
+    next_state.update(updates)
+    next_state["record_generation"] = current["record_generation"] + 1
+    next_state["previous_record_sha256"] = current_digest
+    _, next_digest = atomic_write_json(
+        attempt_dir / "state.json", next_state, replace=True
+    )
+    readback, raw, readback_digest = read_attempt_state(attempt_dir)
+    if (
+        readback != next_state
+        or readback_digest != next_digest
+        or raw != canonical_json(next_state)
+    ):
+        raise ValueError("attempt state exact readback failed")
+    return next_state, next_digest
