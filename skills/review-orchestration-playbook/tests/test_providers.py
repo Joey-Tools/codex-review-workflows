@@ -19080,34 +19080,17 @@ class ProviderPolicyTest(unittest.TestCase):
                                         },
                                         "access": "read",
                                     },
-                                    *[
-                                        {
-                                            "path": {
-                                                "type": "path",
-                                                "path": str(
-                                                    (
-                                                        self.review.workspace_root
-                                                        / name
-                                                    ).resolve()
-                                                ),
-                                            },
-                                            "access": "deny",
-                                        }
-                                        for name in (".git", ".codex", ".agents")
-                                    ],
-                                    *[
-                                        {
-                                            "path": {
-                                                "type": "glob_pattern",
-                                                "pattern": str(
-                                                    self.review.workspace_root.resolve()
-                                                    / pattern
-                                                ),
-                                            },
-                                            "access": "deny",
-                                        }
-                                        for pattern in ("*.env", "**/*.env")
-                                    ],
+                                    {
+                                        "path": {
+                                            "type": "path",
+                                            "path": str(
+                                                (
+                                                    self.review.workspace_root / ".git"
+                                                ).resolve()
+                                            ),
+                                        },
+                                        "access": "deny",
+                                    },
                                 ],
                             },
                         },
@@ -19174,12 +19157,32 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn('":minimal"="read"', permission_config)
         self.assertIn('":workspace_roots"={"."="read"', permission_config)
         self.assertIn('".git"="deny"', permission_config)
+        self.assertEqual(
+            parsed_permissions["filesystem"][":workspace_roots"],
+            {".": "read", ".git": "deny"},
+        )
+        for tracked_context in (".env", "nested/review.env", ".agents", ".codex"):
+            self.assertNotIn(f'"{tracked_context}"="deny"', permission_config)
         self.assertTrue(
             any("shell_environment_policy.inherit" in value for value in configs)
         )
         self.assertTrue(
             any("shell_environment_policy.set" in value for value in configs)
         )
+        shell_config = next(
+            value
+            for value in configs
+            if value.startswith("shell_environment_policy.set=")
+        )
+        parsed_shell = tomllib.loads(f"profile = {shell_config.partition('=')[2]}")[
+            "profile"
+        ]
+        self.assertEqual(
+            parsed_shell["HOME"],
+            str(self.review.container_dir / "tool-home"),
+        )
+        self.assertNotIn("CODEX_HOME", parsed_shell)
+        self.assertNotIn("OPENAI_API_KEY", parsed_shell)
         self.assertIn("project_doc_max_bytes=0", configs)
         self.assertNotIn("parent-only-secret", "\n".join(configs))
         self.assertIn("--skip-git-repo-check", argv)
@@ -19416,26 +19419,13 @@ class ProviderPolicyTest(unittest.TestCase):
                             "access": "read",
                         },
                         {"path": {"type": "path", "path": str(root)}, "access": "read"},
-                        *[
-                            {
-                                "path": {
-                                    "type": "path",
-                                    "path": str((root / name).resolve()),
-                                },
-                                "access": "deny",
-                            }
-                            for name in (".git", ".codex", ".agents")
-                        ],
-                        *[
-                            {
-                                "path": {
-                                    "type": "glob_pattern",
-                                    "pattern": str(root / pattern),
-                                },
-                                "access": "deny",
-                            }
-                            for pattern in ("*.env", "**/*.env")
-                        ],
+                        {
+                            "path": {
+                                "type": "path",
+                                "path": str((root / ".git").resolve()),
+                            },
+                            "access": "deny",
+                        },
                         {
                             "path": {"type": "path", "path": str(root.parent)},
                             "access": "read",
@@ -19444,12 +19434,94 @@ class ProviderPolicyTest(unittest.TestCase):
                 },
             },
         }
-        self.assertFalse(
-            providers._codex_permissions_match(
-                payload,
-                review_root=self.review.workspace_root,
-            )
+        for extra_path in (root.parent, pathlib.Path.home().resolve()):
+            with self.subTest(extra_path=extra_path):
+                payload["permission_profile"]["file_system"]["entries"][-1]["path"][
+                    "path"
+                ] = str(extra_path)
+                self.assertFalse(
+                    providers._codex_permissions_match(
+                        payload,
+                        review_root=self.review.workspace_root,
+                    )
+                )
+
+    def test_codex_rejects_profiles_that_hide_frozen_tracked_context(self) -> None:
+        root = self.review.workspace_root.resolve()
+
+        def payload(extra_entry: dict[str, object]) -> dict[str, object]:
+            return {
+                "approval_policy": "never",
+                "sandbox_policy": {"type": "read-only"},
+                "permission_profile": {
+                    "type": "managed",
+                    "network": "restricted",
+                    "file_system": {
+                        "type": "restricted",
+                        "glob_scan_max_depth": 8,
+                        "entries": [
+                            {
+                                "path": {
+                                    "type": "special",
+                                    "value": {"kind": "minimal"},
+                                },
+                                "access": "read",
+                            },
+                            {
+                                "path": {"type": "path", "path": str(root)},
+                                "access": "read",
+                            },
+                            {
+                                "path": {
+                                    "type": "path",
+                                    "path": str((root / ".git").resolve()),
+                                },
+                                "access": "deny",
+                            },
+                            extra_entry,
+                        ],
+                    },
+                },
+            }
+
+        hidden_context_entries = (
+            {
+                "path": {
+                    "type": "path",
+                    "path": str((root / ".codex").resolve()),
+                },
+                "access": "deny",
+            },
+            {
+                "path": {
+                    "type": "path",
+                    "path": str((root / ".agents").resolve()),
+                },
+                "access": "deny",
+            },
+            {
+                "path": {
+                    "type": "glob_pattern",
+                    "pattern": str(root / "*.env"),
+                },
+                "access": "deny",
+            },
+            {
+                "path": {
+                    "type": "glob_pattern",
+                    "pattern": str(root / "**/*.env"),
+                },
+                "access": "deny",
+            },
         )
+        for entry in hidden_context_entries:
+            with self.subTest(entry=entry):
+                self.assertFalse(
+                    providers._codex_permissions_match(
+                        payload(entry),
+                        review_root=root,
+                    )
+                )
 
     def test_codex_allows_only_one_direct_arg_transport_file(self) -> None:
         root = self.review.workspace_root.resolve()
@@ -19478,26 +19550,13 @@ class ProviderPolicyTest(unittest.TestCase):
                                 "path": {"type": "path", "path": str(root)},
                                 "access": "read",
                             },
-                            *[
-                                {
-                                    "path": {
-                                        "type": "path",
-                                        "path": str((root / name).resolve()),
-                                    },
-                                    "access": "deny",
-                                }
-                                for name in (".git", ".codex", ".agents")
-                            ],
-                            *[
-                                {
-                                    "path": {
-                                        "type": "glob_pattern",
-                                        "pattern": str(root / pattern),
-                                    },
-                                    "access": "deny",
-                                }
-                                for pattern in ("*.env", "**/*.env")
-                            ],
+                            {
+                                "path": {
+                                    "type": "path",
+                                    "path": str((root / ".git").resolve()),
+                                },
+                                "access": "deny",
+                            },
                             *extra_entries,
                         ],
                     },

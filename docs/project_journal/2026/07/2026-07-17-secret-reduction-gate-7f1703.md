@@ -26,6 +26,8 @@ superseded_by:
 
 After the consented egress boundary passes, the reviewer receives the frozen tracked diff, necessary tracked context, and explicitly supplied prompt in their original form, including repository secrets. Secret scanning is not an egress filter. A secret-admission violation or inconclusive count must not prevent the reviewer from starting or invalidate its terminal artifact.
 
+Necessary tracked context means the complete frozen head tree, including tracked `.env`, `.agents`, and `.codex` paths. The Codex permission profile denies only `.git` beneath that frozen root; it must not recreate secret redaction through path-level deny rules. The snapshot boundary still excludes source-worktree untracked files, the host home, unrelated repositories, and reviewer/runtime credential sources.
+
 This authorization remains scoped. It does not permit automatic discovery or collection of reviewer/runtime authentication credential sources, untracked private files, unrelated repositories, broad workspace dumps, or unrelated host-local artifacts.
 
 ### Unified Exact Raw Counter
@@ -113,6 +115,7 @@ Implementation and final combined code validation now match this decision, inclu
 ## Validation Criteria
 
 - Trusted reviewer launch succeeds with unchanged, moved, newly added, and growing tracked exact secrets when the egress boundary itself is valid.
+- The Codex reviewer can read tracked `.env`, `.agents`, and `.codex` context from the frozen head while `.git`, source-worktree untracked files, the host home, and unrelated repositories remain outside its readable scope.
 - PR/master admission passes unchanged counts, reductions, and cross-path/surface/offset moves.
 - PR/master admission blocks first appearance and global growth.
 - Former legacy values receive the same baseline without explicit exemption selection.

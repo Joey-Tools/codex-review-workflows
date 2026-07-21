@@ -444,6 +444,44 @@ class WorkspaceTest(unittest.TestCase):
         cleanup_workspace(review, keep_container=False)
         self.assertFalse(review.container_dir.exists())
 
+    def test_prepare_keeps_tracked_review_context_and_excludes_untracked_files(
+        self,
+    ) -> None:
+        tracked_context = {
+            ".env": "tracked root environment context\n",
+            "config/prod.env": "tracked nested environment context\n",
+            ".agents/AGENTS.md": "tracked agent context\n",
+            ".codex/skills/example/SKILL.md": "tracked Codex context\n",
+        }
+        for relative, content in tracked_context.items():
+            destination = self.repo / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(content, encoding="utf-8")
+        git(self.repo, "add", *tracked_context)
+        git(self.repo, "commit", "-m", "Add tracked review context")
+        context_head = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "untracked-private-sentinel.txt").write_text(
+            "must stay outside the frozen review workspace\n",
+            encoding="utf-8",
+        )
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.head,
+            head_ref=context_head,
+        )
+        self.reviews.append(review)
+
+        for relative, content in tracked_context.items():
+            self.assertEqual(
+                (review.workspace_root / relative).read_text(encoding="utf-8"),
+                content,
+            )
+        self.assertFalse(
+            (review.workspace_root / "untracked-private-sentinel.txt").exists()
+        )
+        self.assertFalse((review.workspace_root / ".git").exists())
+
     def test_changed_path_proof_preserves_both_sides_of_rename(self) -> None:
         git(self.repo, "mv", "example.txt", "renamed.txt")
         git(self.repo, "commit", "-m", "Rename example")

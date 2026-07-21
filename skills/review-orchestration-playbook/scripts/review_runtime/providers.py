@@ -11284,15 +11284,8 @@ def _codex_permissions_match(
     expected_paths = {
         str(review_root.resolve()): "read",
         str((review_root / ".git").resolve()): "deny",
-        str((review_root / ".codex").resolve()): "deny",
-        str((review_root / ".agents").resolve()): "deny",
-    }
-    expected_globs = {
-        str(review_root.resolve() / "*.env"): "deny",
-        str(review_root.resolve() / "**/*.env"): "deny",
     }
     remaining_paths = dict(expected_paths)
-    remaining_globs = dict(expected_globs)
     minimal_seen = False
     arg_transport_seen = False
     codex_arg_root = (
@@ -11315,13 +11308,7 @@ def _codex_permissions_match(
             minimal_seen = True
             continue
         if path_type == "glob_pattern":
-            pattern = path_value.get("pattern")
-            if (
-                not isinstance(pattern, str)
-                or remaining_globs.pop(pattern, None) != access
-            ):
-                return False
-            continue
+            return False
         if path_type != "path":
             return False
         value = path_value.get("path")
@@ -11342,7 +11329,7 @@ def _codex_permissions_match(
             arg_transport_seen = True
             continue
         return False
-    return minimal_seen and not remaining_paths and not remaining_globs
+    return minimal_seen and not remaining_paths
 
 
 def _attempt_paths_without_io(
@@ -11692,10 +11679,7 @@ def _codex_attempt_with_output(
     )
     permission_profile = (
         '{"filesystem"={"glob_scan_max_depth"=8,":minimal"="read",'
-        '":workspace_roots"={"."="read",".git"="deny",'
-        '".codex"="deny",".agents"="deny","*.env"="deny",'
-        '"**/*.env"="deny"}'
-        "}}"
+        '":workspace_roots"={"."="read",".git"="deny"}}}'
     )
     prompt = _review_prompt_bytes(review, launch)
     completed = run(

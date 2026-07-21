@@ -306,6 +306,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("including repository secrets", skill)
         self.assertIn("including tracked repository secrets", helper_contract)
         self.assertIn(
+            "tracked `.codex`, `.agents`, and environment files are intentionally readable",
+            helper_contract,
+        )
+        self.assertIn(
             "do not redact, rewrite, or suppress reviewer-visible tracked content",
             skill,
         )
@@ -327,6 +331,10 @@ class RepositoryContractTest(unittest.TestCase):
         if "project journal" in repository_policy:
             journal = repository_policy["project journal"]
             self.assertIn("including repository secrets", journal)
+            self.assertIn(
+                "including tracked `.env`, `.agents`, and `.codex` paths",
+                journal,
+            )
             self.assertIn(
                 "must not prevent the reviewer from starting",
                 journal,
