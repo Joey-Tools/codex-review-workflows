@@ -12,11 +12,17 @@ superseded_by: 20260717-c17a11
 
 # Default Claude Reviews To Local Login
 
+> Historical helper record: `20260717-c17a11`, then `20260720-7f2001`,
+> superseded this workstream. The implementation details below describe the
+> low-level `isolated_review` helper at that point in time. They do not define
+> named single, double, or triple review and do not apply to the canonical
+> direct Claude lane.
+
 ## Summary
 
-- Claude-family reviews now use the ordinary local Claude login by default while retaining an optional `ANTHROPIC_API_KEY` override.
+- The low-level helper changed to use ordinary local Claude login by default while retaining an optional `ANTHROPIC_API_KEY` override.
 
-## Current State
+## Historical Helper State
 
 - Claude Code runs with verified `--safe-mode`, restricted read-only tools, disabled setting sources, an isolated home, a capability-authenticated memory-only parent query plus native broker restricted to Claude's current-account Keychain item, and an Anthropic-only local CONNECT proxy.
 - Before every model attempt, a stale access token is refreshed only when it cannot cover that attempt's 30-minute timeout plus the 2-minute safety margin. The fixed-input, no-tools safe-mode warmup uses the current attempt's model and the publisher-verified executable snapshot without workspace access, then the helper re-reads and validates the Keychain item. The final read-only broker performs another single-attempt validation, serves the credential once, blocks OAuth refresh egress, and rejects every Keychain update command. Later Opus attempts repeat the same refresh-if-needed sequence.
@@ -29,7 +35,7 @@ superseded_by: 20260717-c17a11
 - The parent helper honors the original `NO_PROXY` / `no_proxy` list when choosing direct versus corporate-proxy routing for each pinned Anthropic target.
 - HTTPS corporate proxy tunnels drain OpenSSL's already-decrypted pending data before waiting on the underlying socket.
 - HTTPS corporate proxy validation honors a copied `GIT_SSL_CAINFO` bundle when it is the configured trust source.
-- Missing Claude authentication can fall back to GitHub Copilot only for explicitly authorized double or triple reviews.
+- Historical helper-only behavior allowed a supplemental GitHub Copilot attempt only under separate explicit Copilot consent. It never satisfied a named double or triple review; current named shapes require actual Claude Code and are defined by `20260720-7f2001`.
 - A transient or unclassified authentication-warmup failure is inconclusive and cannot trigger Copilot fallback; only a classified authentication failure is treated as unavailable local login.
 - A missing/non-native trusted `rg` or automatically discovered non-native Claude candidate is treated as Claude runtime unavailability and follows the authorized Copilot fallback rule; an invalid explicit Claude path remains a configuration error.
 - Trusted `rg` discovery skips invalid or non-native candidates and continues to the next pinned path.
