@@ -103,7 +103,7 @@ class StatefulLifecycleTest(unittest.TestCase):
             {
                 "version": 1,
                 "reviewer": "claude",
-                "egress_consent": "double-review",
+                "egress_consent": "explicit-claude-with-copilot-fallback",
                 "workspace": self.review.to_json(),
                 "keep_workspace": False,
                 "pid": 99999999,
@@ -161,7 +161,9 @@ class StatefulLifecycleTest(unittest.TestCase):
         summary = state.status(self.review.container_dir)
         self.assertFalse(summary["running"])
         self.assertEqual(summary["exit_code"], 0)
-        self.assertEqual(summary["egress_consent"], "double-review")
+        self.assertEqual(summary["review_contract"], "supplied-diff-no-git")
+        self.assertFalse(summary["named_lane_eligible"])
+        self.assertEqual(summary["egress_consent"], "explicit-claude-with-copilot-fallback")
         self.assertEqual(len(summary["attempts"]), 1)
 
         exit_code, text = state.final(self.review.container_dir)
@@ -170,7 +172,7 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertFalse(self.review.workspace_root.exists())
         self.assertTrue(self.review.container_dir.exists())
 
-    def test_codex_unavailable_retains_preflight_workspace_until_cleanup(self) -> None:
+    def test_codex_unavailable_retains_helper_workspace_until_cleanup(self) -> None:
         self.write_codex_unavailable_state()
         self.write_passed_preflight(
             primary_diff=self.primary_diff_attestation(),
@@ -179,7 +181,7 @@ class StatefulLifecycleTest(unittest.TestCase):
         exit_code, text = state.final(self.review.container_dir)
 
         self.assertEqual(exit_code, 127)
-        self.assertIn("retained for clean-context fallback", text)
+        self.assertIn("legacy helper workspace retained for diagnosis only", text)
         self.assertTrue(self.review.workspace_root.exists())
         summary = state.status(self.review.container_dir)
         self.assertTrue(summary["fallback_workspace_retained"])
@@ -966,7 +968,7 @@ time.sleep(0.2)
             {
                 "version": 1,
                 "reviewer": "claude",
-                "egress_consent": "double-review",
+                "egress_consent": "explicit-claude-with-copilot-fallback",
                 "workspace": self.review.to_json(),
             },
         )
@@ -1002,7 +1004,7 @@ time.sleep(0.2)
             {
                 "version": 1,
                 "reviewer": "claude",
-                "egress_consent": "double-review",
+                "egress_consent": "explicit-claude-with-copilot-fallback",
                 "workspace": self.review.to_json(),
             },
         )

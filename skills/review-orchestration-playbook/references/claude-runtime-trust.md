@@ -1,12 +1,19 @@
 # Claude Runtime Trust And Platform Capabilities
 
-This document defines the trust and compatibility contract enforced by the
-Claude Code runtime used by `isolated_review`. A documented platform or version
-is supported only when every applicable gate below passes.
+This document primarily defines the trust and compatibility contract enforced
+by the low-level Claude Code runtime used by `isolated_review`. A documented
+platform or version is supported only when every applicable gate below passes.
+The canonical named-double lane launches actual Claude Code directly under
+[canonical-claude-lane.md](canonical-claude-lane.md); it reuses applicable
+publisher-verification primitives, version bounds, native-sandbox boundary, and
+failure vocabulary here, but never the helper's executable snapshot, dependency
+closure, supplied-diff workspace, outer sandbox, credential carrier, catalog,
+guarded writeback, recovery, or prompt contract.
 
 ## Contents
 
 - [Policy Summary](#policy-summary)
+- [Canonical Lane Applicability](#canonical-lane-applicability)
 - [Acceptance Sequence](#acceptance-sequence)
 - [Publisher Provenance](#publisher-provenance)
 - [Capability Probes](#capability-probes)
@@ -18,11 +25,47 @@ is supported only when every applicable gate below passes.
 
 ## Policy Summary
 
+### Canonical Lane Applicability
+
+The direct canonical lane and the low-level helper are separate launch paths.
+For named double/triple review, follow `canonical-claude-lane.md`: use a clean
+Git worktree, no prepared diff, explicit tracked guidance reads, and a direct
+fresh `claude` process. Its **Canonical Executable Provenance** section owns the
+direct lane's complete executable contract: verify the installed file against
+the signed release manifest, revalidate that exact resolved path immediately
+before and after launch, and do not create a helper snapshot. Sections below
+that describe executable snapshots or dependency closures, `.git`-free
+materialization, supplied-diff prompts, helper-private credential carriers, or
+helper-owned outer sandboxes remain helper-only and cannot make an
+`isolated_review` artifact count as the canonical lane.
+
+The canonical lane uses ordinary Claude CLI authentication in trusted real
+`HOME`, or an explicitly authorized API key. The CLI may perform its own normal
+credential refresh in that control plane. The canonical lane does not use or
+claim the helper's credential-lock catalog, broker, staged carrier, guarded
+writeback, or recovery guarantees. Authentication rejection is still
+`blocked-authentication`, ambiguous credential persistence is inconclusive, and
+neither condition authorizes another provider.
+
+### Native Selected-Deny Read Boundary For Claude Code 2.1.212
+
+For the accepted real-`HOME` native-sandbox review design, keep these layers distinct:
+
+- Real `HOME` is the trusted ordinary Claude CLI control plane. The canonical lane's clean detached Git worktree, or the low-level helper's explicitly labeled detached scope, is the authorized review scope for its respective launch path.
+- The model may receive `Read`, `Grep`, `Glob`, and sandboxed `Bash`, with read-only behavior required by the prompt and permission contract.
+- Launch must request global `denyWrite` and critical-sensitive-root `denyRead` for credential/configuration roots, the original source checkout, other review-state roots, `/proc`, and `/dev`; those requested controls define the native-sandbox enforcement boundary. A canonical worktree's registered Git metadata/object paths remain part of its logical read-only scope even when their physical storage is outside the worktree directory.
+- Native-sandbox `allowRead` entries are exceptions within a selected-deny policy, not a global host-read whitelist. Sandboxed Bash can technically read a host path that is outside the detached worktree when that path is not covered by `denyRead`. The prompt/model scope therefore explicitly forbids all outside-workspace reads; do not describe the selected-deny policy as re-opening only the current workspace or private Git view.
+- Claude Code 2.1.212 capability probes and the first `system/init` event report only their documented fields. They do not prove the final merged native-sandbox configuration, merged admin-managed permission arrays, or path-rule evaluation. Persist sandbox controls as requested configuration and do not promote init/capability output into independent evidence of effective enforcement.
+- Post-attempt worktree validation can prove the inspected worktree and private Git state are unchanged at validation time. It cannot prove that no transient write or outside-workspace read/side effect occurred.
+
+This boundary is an accepted model-behavior tradeoff, not full host-read isolation. A stronger outer sandbox may add protection, but must not be inferred from selected `denyRead` / `allowRead` settings or init output.
+
 - Accept installed Claude Code release versions `>=2.1.211,<3.0.0` after all
-  provenance, platform, capability, credential, and isolation checks pass.
-  Local-login refresh writeback additionally requires an exact
-  version/platform/SHA-256 entry from the signed artifact in the credential-lock
-  protocol catalog. An explicit API key does not require that internal protocol.
+  applicable provenance, platform, capability, authentication, and isolation
+  checks pass. For the low-level helper only, local-login refresh writeback
+  additionally requires an exact version/platform/SHA-256 entry from the signed
+  artifact in the credential-lock protocol catalog. The canonical direct lane
+  uses the ordinary control-plane contract above instead.
 - Do not pin the helper to `latest`, `stable`, or one current patch release. The
   helper never upgrades Claude Code and reviews the installed release it finds.
 - The former exact patch pin was a compact trust-and-compatibility shortcut for
@@ -42,7 +85,7 @@ is supported only when every applicable gate below passes.
   per-version manifest as publisher provenance. A version string, executable
   bit, native file format, install path, or self-reported identity is not
   publisher provenance.
-- After the signed manifest, size, and SHA-256 checks pass, materialize a
+- For the low-level helper, after the signed manifest, size, and SHA-256 checks pass, materialize a
   helper-owned private executable snapshot and stop executing the source path.
   Only the snapshot may run the help probe, dependency discovery, credential-
   bearing preparation, or final review.
@@ -71,6 +114,12 @@ is supported only when every applicable gate below passes.
   signed Claude runtime's permission engine additionally separates files that
   the runtime must read for authentication from files its model-visible `Read`
   tool may access. Neither layer substitutes for the other.
+- Except for the explicitly shared applicability rules above, this document
+  describes the low-level supplied-diff helper runtime. Its compatibility
+  Copilot backend is not the actual Claude Code lane required by named
+  double/triple review. Named-shape consent does not authorize provider
+  substitution; any supplemental Copilot run requires a separate explicit user
+  request and never completes the named shape.
 
 ## Acceptance Sequence
 
@@ -653,6 +702,11 @@ filesystem boundary.
 
 ## Credentials
 
+Except for the canonical direct-lane authentication contract above, this
+section specifies the low-level helper's private credential staging and
+writeback implementation. Do not apply its catalog, broker, carrier, lock, or
+recovery requirements to the canonical real-`HOME` lane.
+
 For a catalogued local-login artifact, the credential boundary begins with one
 outer host refresh transaction before the first carrier read. The certified
 primary and legacy lock lease remains held while the helper selects and exposes
@@ -1063,12 +1117,12 @@ reached:
 These records are evidence about which gates ran; an early phase must never be
 described as an enforced final launch.
 
-## Failure Classification And Fallback
+## Failure Classification And Low-Level Fallback
 
 | Condition | Terminal classification | Copilot fallback |
 | --- | --- | --- |
-| No automatic candidate, supported platform unavailable, or an accepted-range automatic candidate cleanly lacks a required non-security capability or secure runtime dependency | `runtime-unavailable` | Only for explicit double/triple-review consent |
-| A helper-owned Keychain-broker, TCP-proxy, or Unix-proxy bind fails with an explicit OS policy or socket-capability errno | `runtime-unavailable` | Only for explicit double/triple-review consent |
+| No automatic candidate, supported platform unavailable, or an accepted-range automatic candidate cleanly lacks a required non-security capability or secure runtime dependency | `runtime-unavailable` | Only after a separate explicit supplemental Copilot request; never satisfies named double |
+| A helper-owned Keychain-broker, TCP-proxy, or Unix-proxy bind fails with an explicit OS policy or socket-capability errno | `runtime-unavailable` | Only after a separate explicit supplemental Copilot request; never satisfies named double |
 | The Keychain-broker source and compiler exist, but the compiler cannot start or the broker build returns nonzero | `inconclusive`; report the build gate and pause | No |
 | Local/API authentication is missing, malformed, unsafe, refresh-token-less, or actually rejected as `Login expired`, HTTP 401, or refresh failure | `blocked-authentication`; request `claude auth login` for local login or unset/replace the explicit API key, then pause | No |
 | Signed artifact has no exact credential-lock protocol entry, either macOS carrier changed, lock contention/heartbeat failed, or credential inspection was unstable | `inconclusive`; report the exact coordination/inspection gate and pause without a login prompt | No |
@@ -1080,7 +1134,7 @@ described as an enforced final launch.
 | Explicit override has the wrong version, platform, binary shape, capability contract, or lacks trusted GPG, probe sandbox, or trusted review tool prerequisites | `blocked` configuration error | No |
 | Wrong publisher fingerprint, invalid signature, checksum mismatch, contradictory safe-mode semantics, unsafe runtime metadata, or an isolation-boundary mismatch | `blocked` security error | No |
 | Manifest/probe timeout, output overflow, executable resolve/stat I/O failure, other inspection I/O failure, file race, transient network failure, unknown/resource/capacity/address-contention bind failure, Unix-socket permissioning failure, broker/proxy thread-start or serve-start uncertainty, post-ready serve-loop failure, or missing trustworthy terminal artifact | `inconclusive` | No |
-| Explicit model entitlement or organization-policy denial from a final review invocation after exact effective-model verification | Existing same-lane model/backend fallback policy | Only as already authorized by the lane contract |
+| Explicit model entitlement or organization-policy denial from a final review invocation after exact effective-model verification | Existing same-Claude-runtime model fallback; a different backend is supplemental only | Only after a separate explicit supplemental Copilot request; never satisfies named double |
 
 Authentication failure never becomes runtime unavailability. The helper reports
 `blocked-authentication`, tells the operator to run `claude auth login` for local
@@ -1093,10 +1147,13 @@ evidence. Primary authentication evidence wins over mixed transient or
 entitlement words, while repository-controlled partial result text is never
 classified and cannot authorize an authentication, model, or Copilot fallback.
 Only a strict entitlement result from a launched final review can advance to the
-later Opus model or, after the complete Claude chain is entitlement-blocked, to
-an already-consented Copilot backend. Missing or mismatched model metadata stops
-the lane as `runtime-unverified` or `model-mismatch` and never authorizes
-fallback. `explicit-claude-review` remains Anthropic-only.
+later Opus model. After the complete Claude chain is entitlement-blocked, the
+low-level helper may enter its compatibility Copilot backend only when the user
+separately requested that supplemental provider; named double/triple consent is
+not that request, and the result never completes the Claude Code lane. Missing
+or mismatched model metadata stops the lane as `runtime-unverified` or
+`model-mismatch` and never authorizes fallback. `explicit-claude-review` remains
+Anthropic-only.
 
 An unsupported future patch inside the version range may be treated as automatic
 runtime unavailability only when it cleanly lacks a required public capability.
@@ -1120,7 +1177,8 @@ A resolve, stat, open, copy, launch, or non-authentication I/O failure is
 inconclusive. A final-runtime credential refresh failure is instead
 `blocked-authentication`. The generic provenance-operation exception therefore
 never authorizes Copilot
-fallback; only its dedicated deterministic-dependency subtype may do so.
+fallback; only its dedicated deterministic-dependency subtype may enter the
+compatibility path after a separate explicit supplemental Copilot request.
 
 Persist the detected runtime version, platform and architecture, source and
 verified-snapshot paths, manifest and signature URLs, signing-key fingerprint,
