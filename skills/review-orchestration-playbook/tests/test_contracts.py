@@ -569,6 +569,11 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("review-orchestration-playbook/tests", workflow)
         self.assertNotIn("external-review-playbook", workflow)
         self.assertNotIn("copilot-review-playbook", workflow)
+        if CI_PROFILE == "canonical":
+            self.assertFalse(
+                (REPO_ROOT / ".github/workflows/codex-review-gate.yml").exists(),
+                "ordinary PR events must not auto-start a retired Codex review gate",
+            )
 
     def test_ci_matches_the_reviewed_repo_profile_snapshot(self) -> None:
         actual = (REPO_ROOT / ".github/workflows/ci.yml").read_bytes()
@@ -869,9 +874,7 @@ class RepositoryContractTest(unittest.TestCase):
         separate_pr_head_anchor = "record the current `headRefOid` separately as `pr_head_oid`; never overwrite the intended `head_sha` with it"
         compare_anchor = "Compare `pr_head_oid` with the intended `head_sha` before running local lanes or consuming PR CI, conversation, or readiness state"
         run_lanes_anchor = "Run the requested local lanes"
-        classify_anchor = (
-            "make only the pre-request classifications that available evidence can prove"
-        )
+        classify_anchor = "make only the pre-request classifications that available evidence can prove"
         eligible_anchor = (
             "Unknown pre-request integration/service status does not block the request"
         )
@@ -1086,14 +1089,23 @@ class RepositoryContractTest(unittest.TestCase):
             "sole event with `type: system` and `subtype: init`",
             "last nonblank record",
             "sole event with `type: result`",
-            "`subtype: success`",
-            "`is_error: false`",
+            "`subtype` is the string `success`",
+            "`is_error` is the boolean `false`",
             "`cwd` equals the resolved lane-unique clean worktree exactly",
             "`permissionMode` equals `dontAsk`",
             "duplicate-free set exactly equal to `Read`, `Grep`, `Glob`, and `Bash`",
             "`mcp_servers`, `slash_commands`, `skills`, and `plugins`",
             "`claude_code_version` equals the publisher-verified preflight version",
-            "`apiKeySource` matches the parent-selected and preflight-verified authentication source",
+            "`apiKeySource` is a string that exactly matches the parent-selected and preflight-verified authentication source",
+            "`ANTHROPIC_API_KEY` for explicit API-key mode and `none` for ordinary local login",
+            "`result` is a required string whose `strip()` value is nonempty",
+            "`modelUsage` is a required nonempty object",
+            "every key is a nonempty model-ID string",
+            "every value is an object",
+            "`error` and `errors`, when present, are explicitly empty",
+            "`api_error_status`, when present, is `null` or a whitespace-only string",
+            "`permission_denials`, when present, is an empty array",
+            "nonempty/malformed `permission_denials` fails closed",
             "A verified CLI version with no reviewed expected-init schema is also inconclusive",
             "does not prove the final merged native sandbox",
             "merged admin-managed permission arrays",
@@ -1105,6 +1117,22 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("one trailing terminal `result`", content)
             self.assertIn("fail closed", content.lower())
         self.assertNotIn("when the runtime reports it", canonical)
+
+    def test_main_workflow_checks_existing_pr_head_before_local_lanes(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+
+        head_preflight = "compare it with the intended `head_sha` before creating or running any local lane"
+        run_codex = "Run the fresh-context Codex lane"
+        for content in (skill, readiness):
+            self.assertIn("every existing PR", content)
+            self.assertIn("single, double, triple", content)
+        self.assertIn("only the no-PR path skips", skill)
+        self.assertIn("Skip this comparison only on the no-PR path", readiness)
+        self.assertIn(head_preflight, skill)
+        self.assertLess(skill.index(head_preflight), skill.index(run_codex))
 
     def test_named_lanes_block_lazy_fetch_before_reviewer_launch(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
@@ -1389,6 +1417,9 @@ class RepositoryContractTest(unittest.TestCase):
         ]
         if CI_PROFILE == "canonical":
             active_policy.append(REPO_ROOT / "README.md")
+            self.assertFalse(
+                (REPO_ROOT / ".github/workflows/codex-review-gate.yml").exists()
+            )
         retired = (
             "independent-codex-pr-review",
             "offline-frozen-diff-review",

@@ -109,7 +109,7 @@ If the required native sandbox, global write deny, sensitive-root denies, tool r
 
 ## Structured Init And Terminal Evidence
 
-Parse `stream-json` as bounded strict UTF-8 JSONL. Every nonblank line must be one JSON object; reject duplicate keys, nonstandard constants, undecodable text, or non-JSON output. The first nonblank record must be the sole event with `type: system` and `subtype: init`; the last nonblank record must be the sole event with `type: result`. The terminal result must report `subtype: success`, `is_error: false`, nonempty findings text, `modelUsage` containing the requested/effective primary model, and no explicit error, failure status, or permission denial. A missing, duplicate, malformed, out-of-order, error-bearing, or trailing contract event makes the lane `inconclusive`; partial findings do not count.
+Parse `stream-json` as bounded strict UTF-8 JSONL. Every nonblank line must be one JSON object; reject duplicate keys, nonstandard constants, undecodable text, or non-JSON output. The first nonblank record must be the sole event with `type: system` and `subtype: init`; the last nonblank record must be the sole event with `type: result`. A missing, duplicate, malformed, out-of-order, error-bearing, or trailing contract event makes the lane `inconclusive`; partial findings do not count.
 
 Before accepting the result, compare the leading init against a reviewed, version-specific expected-init contract for the publisher-verified installed CLI. For Claude Code 2.1.212, require all of these observable fields:
 
@@ -119,9 +119,20 @@ Before accepting the result, compare the leading init against a reviewed, versio
 - `mcp_servers`, `slash_commands`, `skills`, and `plugins` are present and exactly empty arrays;
 - `model` matches the requested concrete model without silent substitution;
 - `claude_code_version` equals the publisher-verified preflight version; and
-- `apiKeySource` matches the parent-selected and preflight-verified authentication source (`ANTHROPIC_API_KEY` for the explicit API-key mode, otherwise the documented local-login value).
+- `apiKeySource` is a string that exactly matches the parent-selected and preflight-verified authentication source: `ANTHROPIC_API_KEY` for explicit API-key mode and `none` for ordinary local login in Claude Code 2.1.212.
 
 Missing, malformed, or conflicting required fields fail closed as `inconclusive` and cannot count as the Claude lane. A well-formed required field that mismatches the frozen launch is a deterministic `blocked` configuration/policy mismatch. A verified CLI version with no reviewed expected-init schema is also inconclusive. Additive metadata may be recorded only when it does not alter a required field or widen the observable runtime surface.
+
+For the Claude Code 2.1.212 terminal `result`, require this exact acceptance schema:
+
+- `type` is the string `result`, `subtype` is the string `success`, and `is_error` is the boolean `false`;
+- `result` is a required string whose `strip()` value is nonempty; preserve the original string verbatim as the findings payload;
+- `modelUsage` is a required nonempty object; every key is a nonempty model-ID string, every value is an object, and at least one key matches the requested concrete model under the version-reviewed model-ID equivalence. Auxiliary model-usage entries may be retained as metadata but can never select a substitute effective model;
+- `error` and `errors`, when present, are explicitly empty: `null`, a whitespace-only string, an empty array, or an empty object;
+- `api_error_status`, when present, is `null` or a whitespace-only string; and
+- `permission_denials`, when present, is an empty array.
+
+A non-success subtype, `is_error: true`, blank/non-string `result`, missing or malformed `modelUsage`, no requested-model match, nonempty `error`/`errors`, nonempty `api_error_status`, or nonempty/malformed `permission_denials` fails closed and cannot supply findings. A structured permission/configuration mismatch is `blocked`; malformed, contradictory, or otherwise untrustworthy terminal evidence is `inconclusive`. Unknown terminal fields are additive metadata only when the accepted version schema permits them and they do not carry an error, denial, model substitution, or widened runtime surface.
 
 This evidence verifies only what the CLI reports about that invocation. It does not prove the final merged native sandbox, merged admin-managed permission arrays, path-rule evaluation, or absence of unreported CLI control-plane side effects. Capability output and init evidence must never be promoted into such proof.
 
