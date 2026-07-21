@@ -1970,6 +1970,8 @@ class RepositoryContractTest(unittest.TestCase):
                 "never downloads",
                 "active symlink",
                 "<resolved-exact-claude-path>",
+                "a fresh descriptor-bound hash of the mutable source against the signed size and SHA-256 before acceptance",
+                "stat identity alone is not sufficient",
             ):
                 self.assertIn(anchor, content)
             self.assertIn(
@@ -1996,7 +1998,7 @@ class RepositoryContractTest(unittest.TestCase):
                 "including `ctime`",
                 "private digest-verified executable snapshot",
                 "never against the mutable installation path",
-                "Source-identity drift is inconclusive and takes precedence over an observed wrong version",
+                "Source-identity or digest drift is inconclusive and takes precedence over an observed wrong version",
             ):
                 self.assertIn(anchor, content)
         for anchor in (
@@ -2035,6 +2037,7 @@ class RepositoryContractTest(unittest.TestCase):
             '"publisher-verification-failed"',
             "verify_claude_release(",
             "materialize_verified_executable(",
+            "def _verified_source_matches_signed_artifact(",
             "version_probe(snapshot.executable)",
             '"ctime_ns"',
             '"executable-identity-drift"',
@@ -2053,7 +2056,7 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertLess(
             module.index(
-                "if after_resolved != resolved or after_identity != verified.identity:"
+                "if after_resolved != resolved or not _verified_source_matches_signed_artifact("
             ),
             module.index("if observed_version != REQUIRED_CLAUDE_VERSION:"),
         )

@@ -75,7 +75,7 @@ class NamedClaudePreflightTest(unittest.TestCase):
         return preflight_module.VerifiedCandidate(
             resolved_path=resolved,
             platform_key="darwin-arm64",
-            checksum="a" * 64,
+            checksum=hashlib.sha256(resolved.read_bytes()).hexdigest(),
             artifact_size=resolved.stat().st_size,
             identity=preflight_module._identity(resolved),
             probe_result=probe_result
@@ -616,19 +616,21 @@ class NamedClaudePreflightTest(unittest.TestCase):
             self.assertEqual(value["classification"], "inconclusive")
             self.assertEqual(value["reason"], "publisher-verification-inconclusive")
 
-    def test_ctime_detects_in_place_rewrite_with_restored_size_and_mtime(self) -> None:
+    def test_final_digest_revalidation_detects_stat_identity_collision(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             home = root / "home"
             exact = home / ".local/share/claude/versions/2.1.212"
             self._write_candidate(exact)
+            original_identity = preflight_module._identity
+            verified_identity: dict[str, int] = {}
 
             def rewrite_after_binding(
                 path: pathlib.Path,
                 _version_probe: preflight_module.VersionProbe,
             ) -> preflight_module.VerifiedCandidate:
                 before = path.stat(follow_symlinks=False)
-                identity = preflight_module._identity(path)
+                identity = original_identity(path)
                 payload = path.read_bytes()
                 replacement = bytes([payload[0] ^ 1]) + payload[1:]
                 path.write_bytes(replacement)
@@ -638,10 +640,11 @@ class NamedClaudePreflightTest(unittest.TestCase):
                     ns=(before.st_atime_ns, before.st_mtime_ns),
                     follow_symlinks=False,
                 )
+                verified_identity.update(identity)
                 return preflight_module.VerifiedCandidate(
                     resolved_path=path,
                     platform_key="darwin-arm64",
-                    checksum="a" * 64,
+                    checksum=hashlib.sha256(payload).hexdigest(),
                     artifact_size=len(payload),
                     identity=identity,
                     probe_result=preflight_module.ProbeResult(
@@ -651,10 +654,20 @@ class NamedClaudePreflightTest(unittest.TestCase):
                     ),
                 )
 
-            value = preflight_module.preflight(
-                home=home,
-                verifier=rewrite_after_binding,
-            )
+            def colliding_identity(path: pathlib.Path) -> dict[str, int]:
+                if verified_identity and path.resolve(strict=True) == exact.resolve():
+                    return dict(verified_identity)
+                return original_identity(path)
+
+            with mock.patch.object(
+                preflight_module,
+                "_identity",
+                side_effect=colliding_identity,
+            ):
+                value = preflight_module.preflight(
+                    home=home,
+                    verifier=rewrite_after_binding,
+                )
 
             self.assertEqual(value["classification"], "inconclusive")
             self.assertEqual(value["reason"], "executable-identity-drift")

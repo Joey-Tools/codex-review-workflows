@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Callable, Mapping, Sequence, TextIO
 
 from .claude_provenance import (
+    ClaudeReleaseArtifact,
     ClaudeProvenanceDependencyUnavailable,
     ClaudeProvenanceInconclusive,
     ClaudeProvenanceInvalid,
@@ -200,6 +201,32 @@ def _identity_from_tuple(identity: tuple[int, ...]) -> dict[str, int]:
             "publisher verifier returned an invalid source identity"
         )
     return dict(zip(names, identity, strict=True))
+
+
+def _verified_source_matches_signed_artifact(
+    resolved: pathlib.Path,
+    verified: VerifiedCandidate,
+) -> bool:
+    """Rehash the mutable source before accepting its preflight evidence."""
+
+    artifact = ClaudeReleaseArtifact(
+        version=REQUIRED_CLAUDE_VERSION,
+        platform_key=verified.platform_key,
+        binary="claude",
+        checksum=verified.checksum,
+        size=verified.artifact_size,
+    )
+    try:
+        revalidated = verify_release_executable(resolved, artifact)
+        current_identity = _identity(revalidated)
+    except (
+        ClaudeProvenanceInconclusive,
+        ClaudeProvenanceInvalid,
+        ClaudeProvenanceUnavailable,
+        OSError,
+    ):
+        return False
+    return revalidated == resolved and current_identity == verified.identity
 
 
 def _candidate_exists(path: pathlib.Path) -> bool:
@@ -558,11 +585,12 @@ def preflight(
 
     try:
         after_resolved = _resolve_candidate(candidate)
-        after_identity = _identity(after_resolved)
     except (_CandidateUnavailable, _CandidateInspectionInconclusive):
         after_resolved = pathlib.Path()
-        after_identity = {}
-    if after_resolved != resolved or after_identity != verified.identity:
+    if after_resolved != resolved or not _verified_source_matches_signed_artifact(
+        after_resolved,
+        verified,
+    ):
         return _result(
             "inconclusive",
             "executable-identity-drift",
