@@ -10,7 +10,7 @@ import stat
 import sys
 import tempfile
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 from .common import (
     ForwardedSignal,
@@ -32,6 +32,27 @@ DEFAULT_PROMPT_LIMIT_BYTES = 256 * 1024
 GIT_OUTPUT_LIMIT_BYTES = 32 * 1024 * 1024
 SYMLINK_TARGET_LIMIT_BYTES = 16 * 1024
 FULL_OBJECT_ID = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
+CLAUDE_ENV_PASSTHROUGH_KEYS = (
+    "ALL_PROXY",
+    "COLORTERM",
+    "CURL_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "NO_COLOR",
+    "NO_PROXY",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "TERM",
+    "all_proxy",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+)
 
 
 class NamedLaneGuardError(ReviewError):
@@ -48,12 +69,15 @@ class WorktreeValidation:
 
 def _git_environment() -> dict[str, str]:
     environment = {
+        "GIT_ASKPASS": "/usr/bin/false",
+        "GIT_ATTR_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_SYSTEM": os.devnull,
         "GIT_NO_LAZY_FETCH": "1",
         "GIT_NO_REPLACE_OBJECTS": "1",
         "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_PAGER": "cat",
         "GIT_TERMINAL_PROMPT": "0",
         "LANG": "C",
         "LC_ALL": "C",
@@ -149,6 +173,93 @@ def _parse_tree(
     return entries
 
 
+def _validate_index_flags(payload: bytes) -> None:
+    valid_tags = frozenset(b"HSMRCK?hsmrck")
+    for record in payload.split(b"\0"):
+        if not record:
+            continue
+        if len(record) < 3 or record[1:2] != b" " or record[0] not in valid_tags:
+            raise NamedLaneGuardError("malformed Git index flag record")
+        tag = record[0:1]
+        if tag == b"S" or tag.islower():
+            raise NamedLaneGuardError(
+                "Git index must not contain assume-unchanged or skip-worktree entries"
+            )
+
+
+def _validate_initialized_submodules(
+    root: pathlib.Path,
+    frozen_head: str,
+    tree: Mapping[pathlib.PurePosixPath, tuple[str, str, str]],
+    gitlinks: frozenset[pathlib.PurePosixPath],
+) -> None:
+    gitmodules = tree.get(pathlib.PurePosixPath(".gitmodules"))
+    if not gitlinks or gitmodules is None:
+        return
+    mode, object_type, _object_id = gitmodules
+    if mode not in {"100644", "100755"} or object_type != "blob":
+        raise NamedLaneGuardError("frozen .gitmodules must be a regular blob")
+    configured_names: set[bytes] = set()
+    definitions = _git_capture(
+        root,
+        (
+            "config",
+            "--null",
+            f"--blob={frozen_head}:.gitmodules",
+            "--get-regexp",
+            r"^submodule\..*\.path$",
+        ),
+    )
+    for record in definitions.split(b"\0"):
+        if not record:
+            continue
+        key, separator, raw_path = record.partition(b"\n")
+        lower_key = key.lower()
+        if (
+            not separator
+            or not lower_key.startswith(b"submodule.")
+            or not lower_key.endswith(b".path")
+        ):
+            raise NamedLaneGuardError("malformed frozen submodule path record")
+        relative_path = pathlib.PurePosixPath(os.fsdecode(raw_path))
+        if relative_path in gitlinks:
+            configured_names.add(key[len(b"submodule.") : -len(b".path")])
+
+    for key in _git_capture(
+        root,
+        ("config", "--local", "--null", "--name-only", "--list"),
+    ).split(b"\0"):
+        if not key:
+            continue
+        lower_key = key.lower()
+        for suffix in (b".active", b".url"):
+            if not lower_key.startswith(b"submodule.") or not lower_key.endswith(
+                suffix
+            ):
+                continue
+            name = key[len(b"submodule.") : -len(suffix)]
+            if name in configured_names:
+                raise NamedLaneGuardError(
+                    "tracked gitlinks must not be initialized as submodules"
+                )
+
+
+def _status_has_disallowed_changes(
+    payload: bytes,
+    safe_gitlinks: frozenset[pathlib.PurePosixPath],
+) -> bool:
+    for record in payload.split(b"\0"):
+        if not record:
+            continue
+        if len(record) < 4 or record[2:3] != b" ":
+            raise NamedLaneGuardError("malformed Git status record")
+        path = pathlib.PurePosixPath(os.fsdecode(record[3:]))
+        if record[0:2] == b" D" and path in safe_gitlinks:
+            continue
+        return True
+    return False
+
+
 def _relative_target_stays_inside(
     link_path: pathlib.PurePosixPath,
     target_text: str,
@@ -226,6 +337,51 @@ def _validate_materialized_symlink(
         )
 
 
+def _validate_materialized_gitlink(
+    root: pathlib.Path,
+    relative_path: pathlib.PurePosixPath,
+) -> str:
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    current_descriptor = -1
+    try:
+        current_descriptor = os.open(root, directory_flags)
+        for component in relative_path.parts:
+            try:
+                next_descriptor = os.open(
+                    component,
+                    directory_flags,
+                    dir_fd=current_descriptor,
+                )
+            except FileNotFoundError:
+                return "absent"
+            except OSError as error:
+                raise NamedLaneGuardError(
+                    "tracked gitlink must be absent or an empty real directory: "
+                    f"{relative_path.as_posix()}"
+                ) from error
+            os.close(current_descriptor)
+            current_descriptor = next_descriptor
+        if not stat.S_ISDIR(os.fstat(current_descriptor).st_mode):
+            raise NamedLaneGuardError(
+                "tracked gitlink must be absent or an empty real directory: "
+                f"{relative_path.as_posix()}"
+            )
+        with os.scandir(current_descriptor) as entries:
+            materialized = next(entries, None) is not None
+    except OSError as error:
+        raise NamedLaneGuardError(
+            f"tracked gitlink cannot be inspected safely: {relative_path.as_posix()}"
+        ) from error
+    finally:
+        if current_descriptor >= 0:
+            os.close(current_descriptor)
+    if materialized:
+        raise NamedLaneGuardError(
+            f"tracked gitlink must remain uninitialized: {relative_path.as_posix()}"
+        )
+    return "empty"
+
+
 def _normalize_guidance_path(value: str) -> pathlib.PurePosixPath:
     path = pathlib.PurePosixPath(value)
     if path.is_absolute() or not path.parts or ".." in path.parts:
@@ -276,14 +432,42 @@ def validate_worktree(
     ).strip()
     if not actual_head or actual_head != frozen_head:
         raise NamedLaneGuardError("worktree HEAD does not match the frozen head")
-    if _git_capture(
-        root,
-        ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
-    ):
-        raise NamedLaneGuardError("worktree must be clean before reviewer launch")
     tree = _parse_tree(
         _git_capture(root, ("ls-tree", "-r", "-z", "--full-tree", frozen_head))
     )
+    gitlinks = frozenset(path for path, entry in tree.items() if entry[0] == "160000")
+    for path in gitlinks:
+        mode, object_type, _object_id = tree[path]
+        if mode != "160000" or object_type != "commit":
+            raise NamedLaneGuardError("frozen Git gitlink entry has an invalid type")
+    _validate_initialized_submodules(root, frozen_head, tree, gitlinks)
+    _validate_index_flags(
+        _git_capture(
+            root,
+            ("ls-files", "--cached", "--full-name", "-v", "-z", "--"),
+        )
+    )
+    status = _git_capture(
+        root,
+        (
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+            "--ignore-submodules=none",
+            "--no-renames",
+            "--",
+        ),
+    )
+    gitlink_states = {
+        path: _validate_materialized_gitlink(root, path) for path in gitlinks
+    }
+    absent_gitlinks = frozenset(
+        path for path, state in gitlink_states.items() if state == "absent"
+    )
+    if _status_has_disallowed_changes(status, absent_gitlinks):
+        raise NamedLaneGuardError("worktree must be clean before reviewer launch")
     symlinks = [path for path, entry in tree.items() if entry[0] == "120000"]
     for path in symlinks:
         mode, object_type, object_id = tree[path]
@@ -315,13 +499,20 @@ def _validate_positive_finite(value: float, label: str) -> float:
 def _validate_output_path(path: pathlib.Path, worktree: pathlib.Path) -> pathlib.Path:
     if not path.is_absolute():
         raise NamedLaneGuardError("output paths must be absolute")
-    resolved = path.resolve(strict=False)
-    if is_relative_to(resolved, worktree):
-        raise NamedLaneGuardError("Claude output paths must stay outside the worktree")
-    parent = resolved.parent
     try:
-        parent_metadata = parent.lstat()
-        parent_resolved = parent.resolve(strict=True)
+        path.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "Claude output path is not safely accessible"
+        ) from error
+    else:
+        raise NamedLaneGuardError("Claude output path must not already exist")
+    lexical_parent = path.parent
+    try:
+        parent_metadata = lexical_parent.lstat()
+        parent_resolved = lexical_parent.resolve(strict=True)
     except (OSError, RuntimeError) as error:
         raise NamedLaneGuardError(
             "Claude output parent is not safely accessible"
@@ -330,11 +521,48 @@ def _validate_output_path(path: pathlib.Path, worktree: pathlib.Path) -> pathlib
         parent_metadata.st_mode
     ):
         raise NamedLaneGuardError("Claude output parent must be a real directory")
-    if parent_resolved != parent:
+    if parent_resolved != lexical_parent:
         raise NamedLaneGuardError("Claude output parent must not traverse a symlink")
-    if resolved.exists() or resolved.is_symlink():
-        raise NamedLaneGuardError("Claude output path must not already exist")
-    return resolved
+    canonical = parent_resolved / path.name
+    if is_relative_to(canonical, worktree):
+        raise NamedLaneGuardError("Claude output paths must stay outside the worktree")
+    return canonical
+
+
+def _claude_environment() -> dict[str, str]:
+    if os.name != "posix":
+        raise NamedLaneGuardError("named Claude lanes require a POSIX account")
+    try:
+        import pwd
+
+        account = pwd.getpwuid(os.getuid())
+    except (ImportError, KeyError, OSError) as error:
+        raise NamedLaneGuardError(
+            "current POSIX account cannot be resolved safely"
+        ) from error
+    environment = {
+        "GIT_ASKPASS": "/usr/bin/false",
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_PAGER": "cat",
+        "GIT_TERMINAL_PROMPT": "0",
+        "HOME": account.pw_dir,
+        "LOGNAME": account.pw_name,
+        "PAGER": "cat",
+        "PATH": TRUSTED_PATH,
+        "SHELL": account.pw_shell,
+        "USER": account.pw_name,
+    }
+    for key in CLAUDE_ENV_PASSTHROUGH_KEYS:
+        value = os.environ.get(key)
+        if value is not None:
+            environment[key] = value
+    return environment
 
 
 def _write_private_bytes(path: pathlib.Path, payload: bytes | bytearray) -> None:
@@ -400,7 +628,7 @@ def run_claude(
     capture = run_bounded_capture(
         command,
         cwd=root,
-        env=dict(os.environ),
+        env=_claude_environment(),
         stdin=bytearray(prompt),
         timeout_seconds=timeout,
         stdout_limit_bytes=stream_limit_bytes,
@@ -511,32 +739,57 @@ def main(argv: Sequence[str] | None = None) -> int:
         _emit(result)
         return 0 if result["status"] == "complete" else 1
     except ForwardedSignal as error:
+        status = (
+            "blocked-safety"
+            if args.command_name == "validate-worktree"
+            else "inconclusive"
+        )
         _emit(
-            {"status": "inconclusive", "reason": "forwarded-signal"},
+            {"status": status, "reason": "forwarded-signal"},
             stream=sys.stderr,
         )
         return 128 + int(error.signum)
     except ReviewTimeoutError:
+        status = (
+            "blocked-safety"
+            if args.command_name == "validate-worktree"
+            else "inconclusive"
+        )
         _emit(
-            {"status": "inconclusive", "reason": "deadline"},
+            {"status": status, "reason": "deadline"},
             stream=sys.stderr,
         )
         return 2
     except ReviewOutputLimitError:
+        status = (
+            "blocked-safety"
+            if args.command_name == "validate-worktree"
+            else "inconclusive"
+        )
         _emit(
-            {"status": "inconclusive", "reason": "output-limit"},
+            {"status": status, "reason": "output-limit"},
             stream=sys.stderr,
         )
         return 2
     except ReviewOutputDrainError:
+        status = (
+            "blocked-safety"
+            if args.command_name == "validate-worktree"
+            else "inconclusive"
+        )
         _emit(
-            {"status": "inconclusive", "reason": "output-drain"},
+            {"status": status, "reason": "output-drain"},
             stream=sys.stderr,
         )
         return 2
     except ReviewProcessLeakError:
+        status = (
+            "blocked-safety"
+            if args.command_name == "validate-worktree"
+            else "inconclusive"
+        )
         _emit(
-            {"status": "inconclusive", "reason": "process-leak"},
+            {"status": status, "reason": "process-leak"},
             stream=sys.stderr,
         )
         return 2

@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import os
 import pathlib
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
@@ -16,9 +21,14 @@ sys.path.insert(0, str(SCRIPTS))
 from review_runtime.common import (  # noqa: E402
     ReviewOutputLimitError,
     ReviewTimeoutError,
+    ForwardedSignal,
+    TRUSTED_PATH,
 )
 from review_runtime.named_lane import (  # noqa: E402
     NamedLaneGuardError,
+    _validate_materialized_gitlink,
+    _validate_materialized_symlink,
+    main as named_lane_main,
     run_claude,
     validate_worktree,
 )
@@ -76,6 +86,46 @@ class NamedLaneGuardTest(unittest.TestCase):
         executable.chmod(0o755)
         return executable.resolve()
 
+    def add_gitlink(self, path: str = "vendor") -> str:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        target = self.commit("gitlink target")
+        git(
+            self.repo,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000",
+            target,
+            path,
+        )
+        git(self.repo, "commit", "-m", "add gitlink")
+        return git(self.repo, "rev-parse", "HEAD")
+
+    def add_deinitialized_gitlink(self, path: str = "vendor") -> str:
+        source = self.root / "submodule-source"
+        source.mkdir()
+        git(source, "init", "-b", "master")
+        git(source, "config", "user.name", "Named Lane Test")
+        git(source, "config", "user.email", "named-lane@example.invalid")
+        git(source, "config", "commit.gpgsign", "false")
+        (source / "tracked.txt").write_text("submodule\n", encoding="utf-8")
+        git(source, "add", "tracked.txt")
+        git(source, "commit", "-m", "submodule fixture")
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit("superproject fixture")
+        git(
+            self.repo,
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            str(source),
+            path,
+        )
+        git(self.repo, "commit", "-m", "add registered gitlink")
+        git(self.repo, "submodule", "deinit", "-f", "--", path)
+        return git(self.repo, "rev-parse", "HEAD")
+
     def test_safe_internal_source_symlink_is_allowed(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
         (self.repo / "target.txt").write_text("tracked\n", encoding="utf-8")
@@ -116,7 +166,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 with self.assertRaisesRegex(NamedLaneGuardError, "escapes"):
                     validate_worktree(self.repo.resolve(), head)
 
-    def test_transitive_escape_through_ignored_link_is_rejected(self) -> None:
+    def test_ignored_transitive_link_is_rejected_at_pristine_gate(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
         (self.repo / ".gitignore").write_text("bridge\n", encoding="utf-8")
         (self.repo / "review-link").symlink_to("bridge")
@@ -124,7 +174,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         (self.repo / "bridge").symlink_to(self.root / "outside")
         self.assertEqual(git(self.repo, "status", "--porcelain"), "")
 
-        with self.assertRaisesRegex(NamedLaneGuardError, "resolves outside"):
+        with self.assertRaisesRegex(NamedLaneGuardError, "must be clean"):
             validate_worktree(self.repo.resolve(), head)
 
     def test_guidance_symlink_is_rejected_even_when_it_stays_inside(self) -> None:
@@ -150,6 +200,113 @@ class NamedLaneGuardTest(unittest.TestCase):
         with self.assertRaisesRegex(
             NamedLaneGuardError, "differs from the frozen tree"
         ):
+            _validate_materialized_symlink(
+                self.repo.resolve(),
+                pathlib.PurePosixPath("source-link"),
+                "target.txt",
+            )
+        with self.assertRaisesRegex(NamedLaneGuardError, "assume-unchanged"):
+            validate_worktree(self.repo.resolve(), head)
+
+    def test_skip_worktree_index_bit_is_rejected(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        head = self.commit()
+        git(self.repo, "update-index", "--skip-worktree", "AGENTS.md")
+
+        with self.assertRaisesRegex(NamedLaneGuardError, "skip-worktree"):
+            validate_worktree(self.repo.resolve(), head)
+
+    def test_ignored_artifact_is_rejected_even_when_default_status_is_clean(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        (self.repo / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+        head = self.commit()
+        (self.repo / "ignored.txt").write_text("artifact\n", encoding="utf-8")
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+
+        with self.assertRaisesRegex(NamedLaneGuardError, "must be clean"):
+            validate_worktree(self.repo.resolve(), head)
+
+    def test_gitlink_may_be_absent_or_an_empty_real_directory(self) -> None:
+        head = self.add_deinitialized_gitlink()
+        self.assertEqual(list((self.repo / "vendor").iterdir()), [])
+        (self.repo / "vendor").chmod(0o700)
+        os.utime(self.repo / "vendor", None)
+        empty = validate_worktree(self.repo.resolve(), head)
+        self.assertEqual(empty.head_sha, head)
+
+        (self.repo / "vendor").rmdir()
+        missing = validate_worktree(self.repo.resolve(), head)
+        self.assertEqual(missing.head_sha, head)
+
+    def test_gitlink_rejects_materialized_content_symlink_and_regular_file(
+        self,
+    ) -> None:
+        self.add_gitlink()
+        gitlink = self.repo / "vendor"
+        gitlink.mkdir()
+        (gitlink / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
+        with self.assertRaisesRegex(NamedLaneGuardError, "uninitialized"):
+            _validate_materialized_gitlink(
+                self.repo.resolve(), pathlib.PurePosixPath("vendor")
+            )
+
+        (gitlink / ".git").unlink()
+        gitlink.rmdir()
+        gitlink.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaisesRegex(NamedLaneGuardError, "empty real directory"):
+            _validate_materialized_gitlink(
+                self.repo.resolve(), pathlib.PurePosixPath("vendor")
+            )
+
+        gitlink.unlink()
+        ancestor = self.repo / "nested"
+        ancestor.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaisesRegex(NamedLaneGuardError, "empty real directory"):
+            _validate_materialized_gitlink(
+                self.repo.resolve(), pathlib.PurePosixPath("nested/vendor")
+            )
+
+        gitlink.write_text("not a submodule\n", encoding="utf-8")
+        with self.assertRaisesRegex(NamedLaneGuardError, "empty real directory"):
+            _validate_materialized_gitlink(
+                self.repo.resolve(), pathlib.PurePosixPath("vendor")
+            )
+
+    def test_initialized_clean_submodule_is_rejected_end_to_end(self) -> None:
+        head = self.add_deinitialized_gitlink()
+        git(
+            self.repo,
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "--",
+            "vendor",
+        )
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+
+        with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
+            validate_worktree(self.repo.resolve(), head)
+
+    def test_initialized_unpopulated_submodule_is_rejected_end_to_end(self) -> None:
+        head = self.add_deinitialized_gitlink()
+        git(
+            self.repo,
+            "config",
+            "submodule.unrelated.url",
+            str(self.root / "unrelated"),
+        )
+        clean = validate_worktree(self.repo.resolve(), head)
+        self.assertEqual(clean.head_sha, head)
+
+        git(self.repo, "submodule", "init", "--", "vendor")
+        self.assertEqual(list((self.repo / "vendor").iterdir()), [])
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+
+        with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
             validate_worktree(self.repo.resolve(), head)
 
     def test_guard_does_not_scan_ordinary_file_contents(self) -> None:
@@ -174,6 +331,12 @@ class NamedLaneGuardTest(unittest.TestCase):
             validate_worktree(self.repo.resolve(), first)
 
         tracked.write_text("dirty\n", encoding="utf-8")
+        with self.assertRaisesRegex(NamedLaneGuardError, "must be clean"):
+            validate_worktree(self.repo.resolve(), second)
+
+        tracked.write_text("two\n", encoding="utf-8")
+        untracked = self.repo / "untracked.txt"
+        untracked.write_text("artifact\n", encoding="utf-8")
         with self.assertRaisesRegex(NamedLaneGuardError, "must be clean"):
             validate_worktree(self.repo.resolve(), second)
 
@@ -207,6 +370,74 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(stderr.read_bytes(), b"err")
         self.assertEqual(stat.S_IMODE(stdout.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(stderr.stat().st_mode), 0o600)
+
+    @unittest.skipUnless(os.name == "posix", "account environment requires POSIX")
+    def test_process_receives_only_the_named_lane_environment_allowlist(
+        self,
+    ) -> None:
+        import pwd
+
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable(
+            "import json, os, sys\n"
+            "json.dump(dict(os.environ), sys.stdout, sort_keys=True)\n"
+        )
+        stdout = self.root / "environment.json"
+        stderr = self.root / "environment.err"
+        allowed = {
+            "LANG": "en_US.UTF-8",
+            "TERM": "xterm-256color",
+            "https_proxy": "http://proxy.example.invalid:8080",
+            "REQUESTS_CA_BUNDLE": "/etc/example-ca.pem",
+        }
+        denied = {
+            "ANTHROPIC_API_KEY": "secret",
+            "CLAUDE_CONFIG_DIR": "/private/claude",
+            "GITHUB_TOKEN": "secret",
+            "GH_TOKEN": "secret",
+            "AWS_SECRET_ACCESS_KEY": "secret",
+            "NODE_OPTIONS": "--require=/private/hook.js",
+            "NODE_EXTRA_CA_CERTS": "/private/node-ca.pem",
+            "LD_PRELOAD": "/private/preload.so",
+            "DYLD_INSERT_LIBRARIES": "/private/inject.dylib",
+            "TMPDIR": "/private/tmpdir",
+            "XDG_CONFIG_HOME": "/private/config",
+        }
+        with mock.patch.dict(os.environ, {**allowed, **denied}, clear=True):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=stdout,
+                stderr_path=stderr,
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=16 * 1024,
+            )
+
+        child = json.loads(stdout.read_text(encoding="utf-8"))
+        account = pwd.getpwuid(os.getuid())
+        for key, value in allowed.items():
+            self.assertEqual(child[key], value)
+        self.assertEqual(child["HOME"], account.pw_dir)
+        self.assertEqual(child["USER"], account.pw_name)
+        self.assertEqual(child["LOGNAME"], account.pw_name)
+        self.assertEqual(child["SHELL"], account.pw_shell)
+        self.assertEqual(child["PATH"], TRUSTED_PATH)
+        for key in denied:
+            self.assertNotIn(key, child)
+        self.assertEqual(child["GIT_NO_LAZY_FETCH"], "1")
+        self.assertEqual(child["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(child["GIT_NO_REPLACE_OBJECTS"], "1")
+        self.assertEqual(child["GIT_OPTIONAL_LOCKS"], "0")
+        self.assertEqual(child["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(child["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(child["GIT_CONFIG_SYSTEM"], os.devnull)
+        self.assertEqual(child["GIT_ASKPASS"], "/usr/bin/false")
+        self.assertEqual(child["GIT_ATTR_NOSYSTEM"], "1")
+        self.assertEqual(child["GIT_PAGER"], "cat")
+        self.assertEqual(child["PAGER"], "cat")
+        self.assertNotIn("GIT_ALLOW_PROTOCOL", child)
 
     def test_stream_limit_accepts_exact_limit_and_rejects_one_more_byte(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
@@ -355,6 +586,108 @@ class NamedLaneGuardTest(unittest.TestCase):
                 timeout_seconds=1.0,
                 stream_limit_bytes=64,
             )
+
+    def test_process_rejects_dangling_output_leaf_and_symlink_parent(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("pass\n")
+        dangling = self.root / "dangling-output"
+        dangling.symlink_to(self.root / "missing-target")
+
+        with self.assertRaisesRegex(NamedLaneGuardError, "already exist"):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=dangling,
+                stderr_path=self.root / "dangling.err",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=1.0,
+                stream_limit_bytes=64,
+            )
+
+        real_parent = self.root / "real-output"
+        real_parent.mkdir()
+        linked_parent = self.root / "linked-output"
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+        with self.assertRaisesRegex(
+            NamedLaneGuardError, "real directory|traverse a symlink"
+        ):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=linked_parent / "stdout",
+                stderr_path=self.root / "linked.err",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=1.0,
+                stream_limit_bytes=64,
+            )
+
+        real_ancestor = self.root / "real-ancestor"
+        nested_parent = real_ancestor / "nested"
+        nested_parent.mkdir(parents=True)
+        linked_ancestor = self.root / "linked-ancestor"
+        linked_ancestor.symlink_to(real_ancestor, target_is_directory=True)
+        with self.assertRaisesRegex(NamedLaneGuardError, "traverse a symlink"):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=linked_ancestor / "nested" / "stdout",
+                stderr_path=self.root / "ancestor.err",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=1.0,
+                stream_limit_bytes=64,
+            )
+
+    def test_validate_cli_classifies_bounded_output_failure_as_blocked_safety(
+        self,
+    ) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch(
+                "review_runtime.named_lane.validate_worktree",
+                side_effect=ReviewOutputLimitError("too much output"),
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(
+                (
+                    "validate-worktree",
+                    "--worktree",
+                    str(self.repo.resolve()),
+                    "--head",
+                    "0" * 40,
+                )
+            )
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(
+            json.loads(stderr.getvalue()),
+            {"status": "blocked-safety", "reason": "output-limit"},
+        )
+
+        stderr = io.StringIO()
+        with (
+            mock.patch(
+                "review_runtime.named_lane.validate_worktree",
+                side_effect=ForwardedSignal(signal.SIGTERM),
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(
+                (
+                    "validate-worktree",
+                    "--worktree",
+                    str(self.repo.resolve()),
+                    "--head",
+                    "0" * 40,
+                )
+            )
+
+        self.assertEqual(returncode, 128 + signal.SIGTERM)
+        self.assertEqual(
+            json.loads(stderr.getvalue()),
+            {"status": "blocked-safety", "reason": "forwarded-signal"},
+        )
 
 
 if __name__ == "__main__":

@@ -32,8 +32,8 @@ superseded_by:
 ## Evidence
 
 - Fresh-context review of `Joey-Tools/codex-private-workflows#128` found the three boundary gaps before merge.
-- Fourteen focused guard tests cover safe and escaping symlinks, safe symlink ancestors versus a replaced leaf, guidance regular-file enforcement, exact frozen-head and clean-worktree checks, bounded Claude process outcomes, TERM-resistant timeout cleanup, and the documented detached-descendant boundary.
+- Twenty-three focused named-lane guard tests passed. They cover hidden index bits, ignored artifacts, absent, empty, init-only, and populated gitlink boundaries, allowlisted environment variables, output symlink leaf and parent rejection, blocked-safety behavior in `validate-worktree`, inconclusive `run-claude` outcomes, and the daemonized-descendant contract.
 - The detached-boundary regression atomically publishes its child PID before a pipe handshake permits the child to detach; its `finally` path recovers that PID from the file after either normal return or an exception.
-- Thirty-nine canonical-profile contract tests cover current-request GitHub evidence correlation, the narrow guard boundary, and direct-Claude process limits; private-profile coverage runs again after source sync.
-- The final 1,074-test review-policy suite exercised the complete test surface with four environment-limited errors across two loopback-dependent methods; both exact methods passed when rerun with loopback access.
+- Forty-three canonical-profile contract tests passed, covering current-request GitHub evidence correlation, the narrow guard boundary, and direct-Claude process limits; private-profile coverage runs again after source sync.
+- The full review-policy suite covered 1,087 tests; three ended in sandbox-only loopback bind errors and 22 were skipped. The exact loopback-enabled test then passed outside the sandbox, confirming that the three errors were environmental rather than functional.
 - Both modified skills passed the installed OpenAI quick validator. Python compilation, Ruff lint/format checks, project-journal validation, and `git diff --check` passed.

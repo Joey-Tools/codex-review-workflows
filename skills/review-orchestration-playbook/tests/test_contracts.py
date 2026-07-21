@@ -1117,6 +1117,176 @@ class RepositoryContractTest(unittest.TestCase):
             contracts,
         )
 
+    def test_named_lane_pristine_guard_covers_hidden_ignored_and_gitlinks(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(encoding="utf-8")
+        policy = (skill, contracts, canonical)
+
+        for content in policy:
+            for anchor in (
+                "assume-unchanged",
+                "skip-worktree",
+                "ignored",
+                "uninitialized",
+                "materialized",
+            ):
+                with self.subTest(anchor=anchor):
+                    self.assertIn(anchor, content)
+        self.assertIn("absent or empty uninitialized gitlink", skill)
+        self.assertIn("path is absent or is an empty directory", contracts)
+        self.assertIn("may consume only that exact status record", contracts)
+        self.assertIn("every materialized or initialized submodule", canonical)
+
+        for anchor in (
+            "_validate_index_flags",
+            '"ls-files", "--cached", "--full-name", "-v", "-z", "--"',
+            '"--ignored=matching"',
+            '"--ignore-submodules=none"',
+            '"--no-renames"',
+            'entry[0] == "160000"',
+            "_validate_initialized_submodules",
+            "_validate_materialized_gitlink",
+            "_status_has_disallowed_changes",
+        ):
+            self.assertIn(anchor, runtime)
+
+    def test_named_lane_guard_is_property_scoped_not_a_content_snapshot(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "compares only properties relevant to clean state and safety", skill
+        )
+        self.assertIn("Keep the guard property-scoped", contracts)
+        self.assertIn("must not treat `mtime`, `ctime`", contracts)
+        self.assertIn("must not snapshot or rehash ordinary file contents", contracts)
+        self.assertIn("does not compare `mtime`/`ctime`", canonical)
+        self.assertIn("or snapshot ordinary file contents", canonical)
+        for overstrict_implementation in (
+            "st_mtime",
+            "st_ctime",
+            '"hash-object"',
+        ):
+            self.assertNotIn(overstrict_implementation, runtime)
+
+    def test_direct_claude_guard_has_minimal_environment_and_output_paths(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(encoding="utf-8")
+
+        for content in (skill, contracts, canonical):
+            for anchor in (
+                "real `HOME`",
+                "PATH",
+                "locale/UI",
+                "proxy",
+                "CA",
+                "Claude/Anthropic",
+                "cloud-provider",
+                "dynamic-loader",
+                "tool-control",
+            ):
+                with self.subTest(anchor=anchor):
+                    self.assertIn(anchor, content)
+        for anchor in (
+            "pwd.getpwuid(os.getuid())",
+            "GIT_NO_LAZY_FETCH=1",
+            "GIT_TERMINAL_PROMPT=0",
+            "GIT_NO_REPLACE_OBJECTS=1",
+            "GIT_CONFIG_GLOBAL=/dev/null",
+            "GIT_CONFIG_NOSYSTEM=1",
+            "GIT_OPTIONAL_LOCKS=0",
+            "GIT_ASKPASS=/usr/bin/false",
+            "GIT_ATTR_NOSYSTEM=1",
+            "GIT_PAGER=cat",
+            "PAGER=cat",
+            "ambient Claude or Anthropic API/config variable",
+        ):
+            self.assertIn(anchor, canonical)
+        for anchor in (
+            "caller supplies a canonical real parent directory",
+            "absent, non-symlink leaf",
+        ):
+            self.assertIn(anchor, skill)
+        self.assertIn("already-canonical real directory", canonical)
+        self.assertIn("leaf must be absent and non-symlink", canonical)
+
+        self.assertIn("CLAUDE_ENV_PASSTHROUGH_KEYS", runtime)
+        self.assertIn("pwd.getpwuid(os.getuid())", runtime)
+        self.assertIn("env=_claude_environment()", runtime)
+        self.assertNotIn("env=dict(os.environ)", runtime)
+        for key in (
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "TERM",
+            "COLORTERM",
+            "NO_COLOR",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "REQUESTS_CA_BUNDLE",
+            "CURL_CA_BUNDLE",
+            "GIT_SSL_CAINFO",
+        ):
+            with self.subTest(key=key):
+                self.assertIn(f'"{key}"', runtime)
+        self.assertNotIn('"NODE_EXTRA_CA_CERTS",', runtime)
+        self.assertIn("Claude output path must not already exist", runtime)
+        self.assertIn("Claude output parent must be a real directory", runtime)
+        self.assertIn("Claude output parent must not traverse a symlink", runtime)
+
+    def test_named_lane_guard_failure_classification_is_subcommand_specific(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(encoding="utf-8")
+
+        for content in (skill, contracts, canonical):
+            self.assertIn("blocked-safety", content)
+            self.assertIn("run-claude", content)
+            self.assertIn("inconclusive", content)
+        self.assertIn("Every bounded Git/preflight error", skill)
+        self.assertIn("Every bounded Git, output-limit, deadline", contracts)
+        self.assertIn("Every `run-claude` supervision failure", contracts)
+        self.assertIn("Every bounded preflight failure", canonical)
+        self.assertIn("Every `run-claude` supervision failure", canonical)
+        self.assertIn('args.command_name == "validate-worktree"', runtime)
+        self.assertIn('"blocked-safety"', runtime)
+        self.assertIn('"inconclusive"', runtime)
+
     def test_direct_claude_guard_has_finite_process_boundaries(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
