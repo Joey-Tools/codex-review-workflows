@@ -110,9 +110,13 @@ Only a terminal result from actual Anthropic Claude Code satisfies this lane. A 
 
 ## Named Triple: GitHub Cloud Codex Trigger
 
-For this lane, record the request comment's API ID and server `created_at`. Every accepted review, comment, or check artifact must have its own trusted server timestamp strictly later than this exact request; same-head evidence from an earlier request is stale. A qualifying check must be `completed` / `success` with non-null `completed_at` later than the request.
+For this lane, inspect complete authenticated request history and the bounded audit record before posting. For one unchanged current head, allow at most one acceptable exact `@codex review` request and never post a second one; reuse the recorded request when it already exists. Multiple same-head requests, a second request that races with preflight, or evidence that cannot exclude an older request whose run/result might overlap makes the lane `triple-inconclusive`. Re-read complete authenticated request history immediately before accepting any result.
 
-After both local lanes are terminal on the frozen range, post the exact comment below on an exact-host `github.com` PR whose current head corresponds to `{head_sha}`:
+Record the accepted request comment's API ID and server `created_at`. Server timestamps prove ordering, not request/run lineage. Review/comment APIs expose no request/run identifier, so a review/comment is `triple-inconclusive` whenever an older request might overlap, even if its trusted server timestamp is strictly later than the current request. Subject to proved request isolation, a qualifying check must be `completed` / `success` with both non-null `started_at` and `completed_at` strictly later than the current request's `created_at`. Same-head evidence from an earlier request is stale.
+
+Before counting either local lane for a selected PR, independently read authenticated `baseRefName`, `baseRefOid`, and `headRefOid`, require locally complete base/head commits with lazy fetching disabled, and require `git merge-base --all pr_base_oid pr_head_oid` to produce exactly one full `pr_merge_base`. A selected PR's explicit frozen range satisfies PR-specific readiness or triple completion only when `base_sha == pr_merge_base` and `head_sha == pr_head_oid`. A same-head/different-base range is `blocked-input` (`scope-mismatch`): preserve the caller's range, do not silently rewrite it, and never describe its local review results as whole-PR coverage. Explicit-range-only standalone single/double with no selected PR is unaffected.
+
+After both local lanes are terminal on that exact whole-PR frozen range, post the exact comment below only when complete authenticated history proves that no accepted exact request exists for the unchanged head of the exact-host `github.com` PR corresponding to `{head_sha}`. Otherwise reuse the one recorded request and do not post another:
 
 ```text
 @codex review

@@ -6,10 +6,10 @@ from __future__ import annotations
 import argparse
 import io
 import json
-import math
 import re
 import sys
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, BinaryIO, Mapping
 
@@ -25,6 +25,9 @@ SCHEMA_PATH = (
 )
 MAX_SCHEMA_BYTES = 256 * 1024
 MAX_JSON_INTEGER_DIGITS = 128
+MAX_JSON_FLOAT_CHARACTERS = 256
+MAX_JSON_FLOAT_SIGNIFICAND_DIGITS = 128
+MAX_JSON_FLOAT_EXPLICIT_EXPONENT_MAGNITUDE = 308
 
 TERMINAL_REQUIRED_FIELDS = frozenset(("type", "subtype", "is_error"))
 TERMINAL_VARIANT_FIELDS = frozenset(("result", "modelUsage"))
@@ -85,6 +88,10 @@ class _IntegerDigitLimitError(ValueError):
     pass
 
 
+class _FloatLimitError(ValueError):
+    pass
+
+
 class _ContractError(ValueError):
     pass
 
@@ -118,12 +125,44 @@ def _bounded_parse_int(value: str) -> int:
     return int(value)
 
 
+_JSON_FLOAT = re.compile(
+    r"-?(?P<integer>0|[1-9]\d*)"
+    r"(?:\.(?P<fraction>\d+))?"
+    r"(?:[eE](?P<exponent_sign>[+-]?)(?P<exponent>\d+))?\Z"
+)
+
+
+def _bounded_parse_float(value: str) -> Decimal:
+    if len(value) > MAX_JSON_FLOAT_CHARACTERS:
+        raise _FloatLimitError(value)
+    match = _JSON_FLOAT.fullmatch(value)
+    if match is None:
+        raise _FloatLimitError(value)
+    significand_digits = match.group("integer") + (match.group("fraction") or "")
+    if len(significand_digits) > MAX_JSON_FLOAT_SIGNIFICAND_DIGITS:
+        raise _FloatLimitError(value)
+    exponent_digits = (match.group("exponent") or "0").lstrip("0") or "0"
+    exponent_bound = str(MAX_JSON_FLOAT_EXPLICIT_EXPONENT_MAGNITUDE)
+    if len(exponent_digits) > len(exponent_bound) or (
+        len(exponent_digits) == len(exponent_bound) and exponent_digits > exponent_bound
+    ):
+        raise _FloatLimitError(value)
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation as error:
+        raise _FloatLimitError(value) from error
+    if not parsed.is_finite():
+        raise _FloatLimitError(value)
+    return parsed
+
+
 def _strict_json_loads(text: str) -> Any:
     return json.loads(
         text,
         object_pairs_hook=_reject_duplicate_keys,
         parse_constant=_reject_nonstandard_constant,
         parse_int=_bounded_parse_int,
+        parse_float=_bounded_parse_float,
     )
 
 
@@ -194,6 +233,12 @@ def _load_contract() -> dict[str, Any]:
         "nonstandard_constants": "reject",
         "unpaired_surrogates": "reject",
         "max_integer_digits": MAX_JSON_INTEGER_DIGITS,
+        "floating_number_representation": "decimal",
+        "max_float_characters": MAX_JSON_FLOAT_CHARACTERS,
+        "max_float_significand_digits": MAX_JSON_FLOAT_SIGNIFICAND_DIGITS,
+        "max_float_explicit_exponent_magnitude": (
+            MAX_JSON_FLOAT_EXPLICIT_EXPONENT_MAGNITUDE
+        ),
         "max_bytes": DEFAULT_STREAM_LIMITS.max_bytes,
         "max_lines": DEFAULT_STREAM_LIMITS.max_lines,
         "max_line_bytes": DEFAULT_STREAM_LIMITS.max_line_bytes,
@@ -528,11 +573,22 @@ _HTTP_401 = re.compile(
     r"\b(?:"
     r"http(?:/\d+(?:\.\d+)?)?(?:[\s_-]+status(?:[\s_-]+code)?)?"
     r"|status(?:[\s_-]+code)?"
-    r"|code"
     r")\b\s*[:=]?\s*401\b"
 )
-_REFRESH_FAILURE = re.compile(
-    r"\brefresh\b.*\b(?:fail(?:ed|ure)?|error|expired|invalid|unauthorized)\b"
+_AUTH_CONTEXT = r"(?:oauth|auth(?:entication)?|tokens?|credentials?|login)"
+_REFRESH_ACTION = r"refresh(?:ed|ing)?"
+_FAILURE_SIGNAL = r"(?:fail(?:ed|ing|ure)?|error|expired|invalid|unauthorized|unable)"
+_AUTH_REFRESH_CONTEXT = (
+    rf"(?:{_AUTH_CONTEXT}(?:[\s_-]+[a-z0-9]+){{0,3}}[\s_-]+{_REFRESH_ACTION}"
+    rf"|{_REFRESH_ACTION}(?:[\s_-]+[a-z0-9]+){{0,3}}[\s_-]+{_AUTH_CONTEXT})"
+)
+_AUTH_REFRESH_FAILURE = re.compile(
+    rf"\b(?:"
+    rf"{_AUTH_REFRESH_CONTEXT}\b(?:[\s,:;_-]+[a-z0-9]+){{0,4}}"
+    rf"[\s,:;_-]+{_FAILURE_SIGNAL}"
+    rf"|{_FAILURE_SIGNAL}\b(?:[\s,:;_-]+[a-z0-9]+){{0,4}}"
+    rf"[\s,:;_-]+{_AUTH_REFRESH_CONTEXT}"
+    rf")\b"
 )
 
 
@@ -541,7 +597,7 @@ def _is_authentication_error(message: str) -> bool:
     return bool(
         "login expired" in normalized
         or _HTTP_401.search(normalized)
-        or _REFRESH_FAILURE.search(normalized)
+        or _AUTH_REFRESH_FAILURE.search(normalized)
     )
 
 
@@ -575,12 +631,11 @@ def _collect_error_messages(event: Mapping[str, Any], evidence: _Evidence) -> li
 
 
 def _is_nonnegative_finite_number(value: Any) -> bool:
-    if type(value) not in (int, float) or value < 0:
-        return False
-    try:
-        return math.isfinite(value)
-    except OverflowError:
-        return False
+    if type(value) is int:
+        return value >= 0
+    if type(value) is Decimal:
+        return value.is_finite() and value >= 0
+    return False
 
 
 def _validate_optional_terminal_fields(
@@ -802,7 +857,15 @@ def validate_claude_stream_bytes(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = _MachineArgumentParser(
-        description="Validate canonical Claude Code 2.1.212 stream-json output."
+        add_help=False,
+        description="Validate canonical Claude Code 2.1.212 stream-json output.",
+    )
+    parser.add_argument(
+        "-h",
+        "--help",
+        action="store_true",
+        dest="help_requested",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--cwd", required=True, help="Expected resolved review cwd")
     parser.add_argument(
@@ -828,6 +891,8 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     try:
         args = _build_parser().parse_args(argv)
+        if args.help_requested:
+            raise _CliArgumentError("help is not a machine-validation request")
     except _CliArgumentError:
         result = _failure("inconclusive", {"validator.arguments-invalid"})
         print(json.dumps(result, ensure_ascii=True, separators=(",", ":")))

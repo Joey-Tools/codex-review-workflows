@@ -4,7 +4,7 @@ Use these recipes when `$review-orchestration-playbook` needs PR metadata, revie
 
 ## GitHub Codex Availability And Current-Head Evidence
 
-Before requesting the third lane, record the PR URL, host, authenticated/operating identity, and `headRefOid`.
+Before requesting the third lane, record the PR URL, host, authenticated/operating identity, `baseRefName`, `baseRefOid`, and `headRefOid`, then independently validate the selected PR's unique local merge base.
 
 - The only supported host is exact `github.com`. Every other host is unsupported, including `sqbu-github.cisco.com` and every GitHub Enterprise host.
 - Treat any operating identity in `{hoteng, hoteng_cisco}` as unsupported. Another identity on `github.com` is only an eligible candidate; it does not by itself prove that the integration or service is available.
@@ -13,7 +13,7 @@ Before requesting the third lane, record the PR URL, host, authenticated/operati
 
 ## Deterministic Range And PR Discovery
 
-Resolve the local range and PR selector independently. Preserve an explicit frozen `base_sha..head_sha` as the authoritative local-lane range before any PR probe. Explicit-range-only standalone single/double needs no PR probe. A frozen range never selects a PR: PR-specific work and triple use an explicitly named PR, otherwise the complete set of open PRs associated with the exact current head repository/branch. Exactly one associated PR selects it. More than one is `blocked-input` for the GitHub/PR-specific lane because the required explicit PR selector is absent; the caller must name the PR, and a frozen range does not cure that ambiguity. Fully scoped local lanes may still run, while any lane that still depends on PR selection stays blocked. Do not select a candidate by recency, base, number, draft state, or title.
+Resolve the local range and PR selector independently. Preserve an explicit frozen `base_sha..head_sha` as the authoritative local-lane range before any PR probe. Explicit-range-only standalone single/double needs no PR probe. A frozen range never selects a PR: PR-specific work and triple use an explicitly named PR, otherwise the complete set of open PRs associated with the exact current head repository/branch. Exactly one associated PR selects it. More than one is `blocked-input` for the GitHub/PR-specific lane because the required explicit PR selector is absent; the caller must name the PR, and a frozen range does not cure that ambiguity. Fully scoped local lanes may still run, while any lane that still depends on PR selection stays blocked. Do not select a candidate by recency, base, number, draft state, or title. Once a PR is selected, its explicit frozen range satisfies PR-specific readiness or triple completion only when `base_sha == pr_merge_base` and `head_sha == pr_head_oid`.
 
 First obtain the exact current branch and head repository owner. A detached HEAD or unknown head owner cannot drive implicit PR association. Then use an authenticated, paginated lookup and retain the returned candidate array:
 
@@ -25,20 +25,34 @@ gh api --hostname <host> --method GET --paginate --slurp \
   -f state=open \
   -f 'head=<head-owner>:<current-branch>' \
   -f per_page=100 \
-  --jq '[.[][] | {number,html_url,base_ref:.base.ref,head_ref:.head.ref,head_sha:.head.sha,head_owner:.head.repo.owner.login}]'
+  --jq '[.[][] | {number,html_url,base_ref:.base.ref,base_sha:.base.sha,head_ref:.head.ref,head_sha:.head.sha,head_owner:.head.repo.owner.login}]'
 ```
 
 An authenticated successful lookup returning `[]` proves the no-PR path. A failed, partial, unauthenticated, or ambiguous probe does not. No PR does not define the local review range: require either an explicit committed range or an explicitly named target/base, then resolve and freeze `<merge_base>..HEAD`. Never guess the target/base from repository defaults, upstream configuration, branch names, or conventions. Missing scope input from an otherwise clean checkout is `blocked-input`; use `blocked-authorization` only when the intended scope includes dirty/untracked state and an unauthorized branch or anchor commit would be required to represent it.
 
-Use typed metadata before and after the request:
+For the selected PR, obtain authenticated typed metadata independently from the caller's range:
+
+```sh
+gh pr view <number> --repo <owner>/<repo> \
+  --json number,url,baseRefName,baseRefOid,headRefOid \
+  --jq '{number,url,base_ref:.baseRefName,base_sha:.baseRefOid,head_sha:.headRefOid}'
+
+GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 git cat-file -e '<pr_base_oid>^{commit}'
+GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 git cat-file -e '<pr_head_oid>^{commit}'
+GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 git merge-base --all <pr_base_oid> <pr_head_oid>
+```
+
+Require non-empty `baseRefName`, full immutable base/head OIDs, locally complete commit objects, and exactly one full merge-base result; record it as `pr_merge_base`. Missing or ambiguous metadata, missing local objects, and zero or multiple merge bases are `blocked-input` (`scope-unverified`), not permission to guess or fetch lazily. If no explicit range exists, freeze `pr_merge_base..pr_head_oid`. If one exists, require exact endpoint equality. A same-head/different-base range is `blocked-input` (`scope-mismatch`): preserve the caller's range, do not silently rewrite it, do not start or count PR-specific lanes from it, and never describe any range-only findings as whole-PR coverage. Explicit-range-only standalone single/double with no selected PR remains unaffected.
+
+Use typed metadata before and after the request, including the selected PR's base identity:
 
 ```sh
 gh auth status --hostname <host>
 gh api --hostname <host> user --jq .login
 
 gh pr view <number> --repo <owner>/<repo> \
-  --json number,url,headRefOid,comments,reviews \
-  --jq '{number,url,headRefOid,comments,reviews}'
+  --json number,url,baseRefName,baseRefOid,headRefOid,comments,reviews \
+  --jq '{number,url,baseRefName,baseRefOid,headRefOid,comments,reviews}'
 
 gh api --hostname github.com --method POST \
   repos/<owner>/<repo>/issues/<number>/comments \
@@ -58,7 +72,7 @@ gh api --hostname github.com --paginate --slurp \
   --jq '[.[].check_runs[] | {id,name,status,conclusion,head_sha,started_at,completed_at,details_url,app_slug:.app.slug}]'
 ```
 
-Treat `gh api --hostname <host> user --jq .login` as the operating identity for this invocation; `gh auth status` is supporting account/host context, not the identity value by itself. Re-read the exact request from the authenticated API and keep its ID, URL, and server `created_at`, the surrounding before/after `headRefOid` observations, and the accepted terminal result URL/time/author.
+Treat `gh api --hostname <host> user --jq .login` as the operating identity for this invocation; `gh auth status` is supporting account/host context, not the identity value by itself. Re-read the exact request from the authenticated API and keep its ID, URL, and server `created_at`, the surrounding before/after `baseRefName` / `baseRefOid` / `headRefOid` observations, and the accepted terminal result URL/time/author. Immediately before accepting the result, revalidate both endpoint objects, recompute the unique `pr_merge_base`, and require the frozen range still to equal `pr_merge_base..pr_head_oid`; a changed head or merge base invalidates whole-PR lane evidence.
 
 Before posting, inspect authenticated complete issue-comment history and the bounded audit record. For one unchanged `headRefOid`, exactly one exact `@codex review` request may be accepted. Never post a second exact request while that head is unchanged: if the recorded request already exists, keep waiting for or validating it. Re-read complete authenticated request history immediately before accepting any result. If multiple exact requests were posted on the same head—including a second request that raced with preflight—or history/audit evidence cannot exclude an older request whose run/result could overlap, timestamps alone cannot select a winner and the lane is `triple-inconclusive`. A new push starts a new head epoch, but a result without request/run association still cannot be attributed to the new request while an older request might overlap.
 
@@ -68,11 +82,12 @@ Posting `@codex review` is request transport, not completion or proof that the s
 
 An authenticated response from that exact accepted provider identity, bound to the unchanged current head, may prove no-start unavailability when it explicitly rejects the request because the integration is missing/unsupported or the service is unavailable. An acknowledgement, review activity, or check/run from the exact accepted provider/app identity proves service start. No response, unknown author/app, absent review/comment, request-comment failure, rate limit, permission error, timeout, or generic HTTP/network failure proves neither unavailable nor clean; report `triple-inconclusive`.
 
-Classify precisely, applying existing-PR head alignment before the availability branch:
+Classify precisely, applying selected-PR range alignment before the availability branch:
 
+- Any selected PR whose explicit range has `head_sha == pr_head_oid` but `base_sha != pr_merge_base` is readiness `blocked-input` (`scope-mismatch`). Do not rewrite the explicit range or count its local findings as whole-PR review evidence.
 - Any existing PR with current `headRefOid != head_sha` and no separate PR-mutation authorization is a readiness `blocked-authorization` result. For a still-eligible PR, report `requested: triple`, `effective: triple-inconclusive`, and GitHub lane status `blocked-authorization`.
 - For the same mismatch on an already unsupported PR, keep `requested: triple`, `effective: double`, and report readiness `blocked-authorization`; do not treat the mismatch as making the already-unavailable lane triple-inconclusive or as permitting readiness to continue.
-- Only after an existing PR is head-aligned, classify unsupported host/identity or authenticated no-start missing-integration/service-unavailable evidence as third-lane unavailable and effective double. No PR is also effective double without a head comparison.
+- Only after an existing PR is head-aligned and its frozen range is exactly `pr_merge_base..pr_head_oid`, classify unsupported host/identity or authenticated no-start missing-integration/service-unavailable evidence as third-lane unavailable and effective double. No PR is also effective double without a selected-PR range comparison.
 - Service ran and returned findings: available lane with findings; fix and rerequest after the new head.
 - Missing or ambiguous evidence that proves neither unavailable nor started: `requested: triple`, `effective: triple-inconclusive`.
 - A started service with ambiguous authorship, stale head, malformed result, or transiently incomplete evidence: `requested: triple`, `effective: triple-inconclusive`; do not reinterpret it as effective double or clean evidence.
@@ -82,7 +97,7 @@ Classify precisely, applying existing-PR head alignment before the availability 
 Start with stable typed `gh` forms:
 
 - `gh pr view --json ...`
-- `gh pr view <number> --json number,url,state,isDraft,baseRefName,headRefName,headRefOid,mergeStateStatus,mergeable,reviewDecision,statusCheckRollup`
+- `gh pr view <number> --json number,url,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,mergeStateStatus,mergeable,reviewDecision,statusCheckRollup`
 - `gh pr checks <number>`
 - `gh pr status`
 - `gh api repos/<owner>/<repo>/branches/<base>/protection`

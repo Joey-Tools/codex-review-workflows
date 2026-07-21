@@ -1147,7 +1147,7 @@ class RepositoryContractTest(unittest.TestCase):
             "An authenticated successful lookup returning `[]` proves the no-PR path",
             probes,
         )
-        for content in (readiness, probes):
+        for content in (readiness, probes, contracts):
             self.assertIn(
                 "Explicit-range-only standalone single/double",
                 content,
@@ -1213,23 +1213,71 @@ class RepositoryContractTest(unittest.TestCase):
             "Evidence from an earlier request on the same unchanged head is stale",
         ):
             self.assertIn(anchor, probes)
-        for content in (skill, readiness, probes, agents_policy):
+        request_isolation_documents = {
+            "skill": skill,
+            "PR readiness": readiness,
+            "GitHub probes": probes,
+            "lane contracts": contracts,
+            "prompt templates": templates,
+            "repository policy": agents_policy,
+        }
+        full_history_documents = {
+            "PR readiness": readiness,
+            "GitHub probes": probes,
+            "lane contracts": contracts,
+            "prompt templates": templates,
+        }
+        if CI_PROFILE == "canonical":
+            readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+            migration_journal = (
+                REPO_ROOT
+                / "docs/project_journal/2026/07/"
+                / "2026-07-20-review-policy-migration-7f2001.md"
+            ).read_text(encoding="utf-8")
+            request_isolation_documents.update(
+                {
+                    "README": readme,
+                    "migration journal": migration_journal,
+                }
+            )
+            full_history_documents.update(
+                {
+                    "README": readme,
+                    "migration journal": migration_journal,
+                }
+            )
+        for name, content in request_isolation_documents.items():
             normalized = content.lower()
-            self.assertIn("at most one", normalized)
-            self.assertIn("never post a second", normalized)
-            self.assertIn(
-                "timestamps prove ordering, not request/run lineage", normalized
-            )
-        for content in (readiness, probes):
-            self.assertIn("older request", content)
-            self.assertIn("might overlap", content)
-            self.assertIn("triple-inconclusive", content)
-            self.assertIn("non-null `started_at`", content)
-            self.assertIn(
-                "Re-read complete authenticated request history immediately before accepting",
-                content,
-            )
+            with self.subTest(request_isolation_document=name):
+                self.assertIn("at most one", normalized)
+                self.assertIn("never post a second", normalized)
+                self.assertIn(
+                    "timestamps prove ordering, not request/run lineage",
+                    normalized,
+                )
+        for name, content in full_history_documents.items():
+            with self.subTest(full_history_document=name):
+                self.assertIn("older request", content)
+                self.assertIn("might overlap", content)
+                self.assertIn("triple-inconclusive", content)
+                self.assertRegex(
+                    content,
+                    r"both(?: its)? non-null `started_at` and `completed_at`(?: are| must be)? strictly later than",
+                )
+                self.assertIn(
+                    "Re-read complete authenticated request history immediately before accepting",
+                    content,
+                )
+        for content in (readiness, probes, contracts):
             self.assertIn("race", content)
+        self.assertIn(
+            "post the exact comment below only when complete authenticated history proves that no accepted exact request exists for the unchanged head",
+            templates,
+        )
+        self.assertIn(
+            "Otherwise reuse the one recorded request and do not post another",
+            templates,
+        )
         self.assertIn(
             "both non-null `started_at` and `completed_at` are strictly later than the current request's `created_at`",
             probes,
@@ -1381,6 +1429,82 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn(anchor, contract)
         self.assertNotIn("Primary diff:", contract)
 
+    def test_named_claude_exact_version_preflight_is_fail_closed(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        helper_path = SCRIPTS / "named_claude_preflight"
+        helper = helper_path.read_text(encoding="utf-8")
+        module = (SCRIPTS / "review_runtime/named_claude_preflight.py").read_text(
+            encoding="utf-8"
+        )
+
+        for content in (skill, contracts, canonical):
+            for anchor in (
+                "named_claude_preflight",
+                "2.1.212",
+                "$HOME/.local/share/claude/versions/2.1.212",
+                "exact-version-unavailable",
+                "exact-version-mismatch",
+                "fixed credential-free environment",
+                "never downloads",
+                "active symlink",
+                "<resolved-exact-claude-path>",
+            ):
+                self.assertIn(anchor, content)
+            normalized = content.lower()
+            self.assertIn("separate", normalized)
+            self.assertIn("explicit", normalized)
+            self.assertIn("official installer", normalized)
+            self.assertIn("does not authorize installation", normalized)
+            self.assertIn("double", content)
+            self.assertIn("blocked", content)
+            self.assertIn("triple", content)
+        for anchor in (
+            "explicit absolute `--claude-path` override",
+            "An explicit override is authoritative",
+            "including an active `2.1.216`",
+            "empty stdin",
+            "fixed `/` cwd",
+            "no prompt, credential, repository, range, PR, or workspace input",
+            "one bounded JSON object",
+            "fixed resolved absolute path",
+            "effective shape may be double",
+            "effective double is still incomplete and blocked",
+            "Caller `PATH` entries are ignored",
+            "before any candidate execution",
+            "Only that publisher-verified artifact may receive the version probe",
+            "Scripts, interpreter wrappers, wrong signed artifacts, and caller-`PATH` candidates are never executed",
+        ):
+            self.assertIn(anchor, canonical)
+        self.assertTrue(helper_path.is_file())
+        self.assertTrue(helper.startswith("#!/usr/bin/env python3\n"))
+        for anchor in (
+            'REQUIRED_CLAUDE_VERSION = "2.1.212"',
+            '"explicit-override"',
+            '"side-by-side-exact"',
+            '"active-installed"',
+            '"HOME": "/nonexistent"',
+            'VERSION_PROBE_CWD = pathlib.Path("/")',
+            "stdin=None",
+            '"classification": classification',
+            '"exact-version-unavailable"',
+            '"exact-version-mismatch"',
+            "verify_claude_release(",
+            '"/opt/homebrew/bin/claude"',
+            '"/usr/local/bin/claude"',
+        ):
+            self.assertIn(anchor, module)
+        self.assertNotIn("shutil.which", module)
+        self.assertLess(
+            module.index("verified = verifier(resolved)"),
+            module.index("completed = version_probe"),
+        )
+
     def test_canonical_claude_stream_evidence_is_unique_exact_and_fail_closed(
         self,
     ) -> None:
@@ -1424,6 +1548,12 @@ class RepositoryContractTest(unittest.TestCase):
             "does not prove the final merged native sandbox",
             "merged admin-managed permission arrays",
             "path-rule evaluation",
+            "floating-point tokens are parsed",
+            "negative underflow",
+            "`-h`, `--help`",
+            "Exit status zero is reserved for `accepted` output",
+            "A bare child exit code 401",
+            "non-authentication refresh failure",
         ):
             self.assertIn(anchor, canonical)
         for content in (skill, contracts, runtime):
@@ -1444,6 +1574,10 @@ class RepositoryContractTest(unittest.TestCase):
             "max_bytes: int = 8 * 1024 * 1024",
             "object_pairs_hook=_reject_duplicate_keys",
             "parse_constant=_reject_nonstandard_constant",
+            "parse_float=_bounded_parse_float",
+            "MAX_JSON_FLOAT_CHARACTERS",
+            "MAX_JSON_FLOAT_SIGNIFICAND_DIGITS",
+            "MAX_JSON_FLOAT_EXPLICIT_EXPONENT_MAGNITUDE",
             '"accepted": 0',
             '"blocked": 1',
             '"blocked-authentication": 2',
@@ -1462,7 +1596,7 @@ class RepositoryContractTest(unittest.TestCase):
         envelope_anchor = "A missing, duplicate, malformed, out-of-order, or trailing contract event makes the lane `inconclusive`"
         classifier_anchor = "A structurally valid terminal event that fails the success acceptance schema is passed to the failure classifier below"
         permission_anchor = "Classify a structurally valid permission denial, output truncation/abnormal stop, exact-model mismatch, or configuration/policy mismatch as `blocked`"
-        authentication_anchor = "Classify a structurally valid recognized login-expired, HTTP 401, or authentication-refresh error as `blocked-authentication`"
+        authentication_anchor = "Classify only a structurally valid recognized `Login expired`, explicit HTTP/status 401, or OAuth/token/credential/login/authentication refresh error as `blocked-authentication`"
         for anchor in (
             envelope_anchor,
             classifier_anchor,
@@ -1533,6 +1667,14 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(schema["stream_contract"]["init_event_count"], 1)
         self.assertEqual(schema["stream_contract"]["result_event_count"], 1)
         self.assertEqual(schema["stream_contract"]["max_bytes"], 8 * 1024 * 1024)
+        self.assertEqual(
+            schema["stream_contract"]["floating_number_representation"], "decimal"
+        )
+        self.assertEqual(schema["stream_contract"]["max_float_characters"], 256)
+        self.assertEqual(schema["stream_contract"]["max_float_significand_digits"], 128)
+        self.assertEqual(
+            schema["stream_contract"]["max_float_explicit_exponent_magnitude"], 308
+        )
         init_contract = schema["init_event"]
         self.assertEqual(init_contract["additional_fields"], True)
         self.assertEqual(
@@ -2227,6 +2369,73 @@ class RepositoryContractTest(unittest.TestCase):
             skill,
         )
         self.assertIn("No named shape authorizes a substitute external reviewer", skill)
+
+    def test_selected_pr_requires_exact_merge_base_and_head_range(self) -> None:
+        agents_policy = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
+            encoding="utf-8"
+        )
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+        probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
+            encoding="utf-8"
+        )
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
+            encoding="utf-8"
+        )
+        policy_documents = {
+            "repository policy": agents_policy,
+            "skill": skill,
+            "PR readiness": readiness,
+            "lane contracts": contracts,
+            "prompt templates": templates,
+        }
+        if CI_PROFILE == "canonical":
+            policy_documents["README"] = (REPO_ROOT / "README.md").read_text(
+                encoding="utf-8"
+            )
+
+        exact_range = "`base_sha == pr_merge_base` and `head_sha == pr_head_oid`"
+        for name, content in policy_documents.items():
+            with self.subTest(policy_document=name):
+                self.assertIn("baseRefName", content)
+                self.assertIn("baseRefOid", content)
+                self.assertIn("headRefOid", content)
+                self.assertIn("git merge-base --all", content)
+                self.assertIn(exact_range, content)
+                self.assertIn("same-head/different-base", content)
+                self.assertIn("`blocked-input` (`scope-mismatch`)", content)
+                self.assertIn("do not silently rewrite", content)
+                self.assertIn("whole-PR coverage", content)
+
+        self.assertIn("base_sha:.base.sha", probes)
+        self.assertIn("--json number,url,baseRefName,baseRefOid,headRefOid", probes)
+        self.assertIn("exactly one full merge-base result", probes)
+        self.assertIn("head_sha == pr_head_oid", probes)
+        self.assertIn("base_sha != pr_merge_base", probes)
+        self.assertIn("GIT_NO_LAZY_FETCH=1", probes)
+        self.assertIn("GIT_TERMINAL_PROMPT=0", probes)
+        self.assertIn("Zero/multiple merge bases", readiness)
+        self.assertIn("Missing/ambiguous metadata, objects", skill)
+
+        preflight_anchor = "independently query and record current `baseRefName`"
+        run_lanes_anchor = "Run the requested local lanes"
+        read_state_anchor = "Read required CI/check state"
+        post_request_anchor = "Otherwise post the one exact `@codex review` comment"
+        for later_anchor in (run_lanes_anchor, read_state_anchor, post_request_anchor):
+            self.assertLess(
+                readiness.index(preflight_anchor), readiness.index(later_anchor)
+            )
+
+        for content in (agents_policy, skill, readiness, contracts, probes, templates):
+            self.assertIn(
+                "explicit-range-only standalone single/double with no selected pr",
+                content.lower(),
+            )
 
 
 if __name__ == "__main__":

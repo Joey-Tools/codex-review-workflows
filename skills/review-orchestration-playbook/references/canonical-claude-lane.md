@@ -12,7 +12,7 @@ Use this contract for the actual Anthropic Claude Code lane in named double and 
 The canonical launch is a direct Claude Code invocation, not a call to any helper reviewer:
 
 ```text
-claude
+<resolved-exact-claude-path>
   --print
   --model <claude-opus-4-8-or-authorized-4-7>
   --effort max
@@ -32,17 +32,33 @@ claude
   --disallowedTools Edit,Write,NotebookEdit,WebFetch,WebSearch,Task
 ```
 
-Validate the installed CLI's advertised option/capability surface before launch. Pass settings inline; do not write them into the review workspace. `--safe-mode` disables automatic customizations and slash-skill loading, not the built-in `Read` tool. The prompt therefore tells Claude to read applicable tracked `AGENTS.md`, repo-local skill documents, and project guidance from the worktree explicitly. It must not read an installed skill or guidance file outside the worktree.
+Run the exact-version selection preflight below before the parent revalidates the selected CLI's provenance or validates its advertised option/capability surface. Pass settings inline; do not write them into the review workspace. `--safe-mode` disables automatic customizations and slash-skill loading, not the built-in `Read` tool. The prompt therefore tells Claude to read applicable tracked `AGENTS.md`, repo-local skill documents, and project guidance from the worktree explicitly. It must not read an installed skill or guidance file outside the worktree.
 
 The inline settings must also set `disableBundledSkills: true`. `--safe-mode` alone is not evidence that bundled skills are absent; the explicit setting is required before the init `skills` field can be expected to be empty.
 
+## Exact-Version Selection Preflight
+
+Before any prompt, credential, authentication, repository, range, PR, or review-workspace input is exposed to Claude, invoke [`named_claude_preflight`](../scripts/named_claude_preflight). The machine helper hardcodes required version `2.1.212` and considers candidates in this exact order:
+
+1. an explicit absolute `--claude-path` override, when supplied;
+2. the side-by-side install at `$HOME/.local/share/claude/versions/2.1.212`, when present; then
+3. the first present controlled active-install path from `$HOME/.local/bin/claude`, `/opt/homebrew/bin/claude`, and `/usr/local/bin/claude`.
+
+An explicit override is authoritative: missing, unusable, or wrong-version explicit input fails closed and never falls through to another candidate. A present side-by-side path is likewise selected rather than bypassed. Caller `PATH` entries are ignored, so a repository or task cannot inject the active candidate. If a resolved native-installer symlink target itself declares `versions/<semver>` other than `2.1.212`, the helper blocks the mismatch without executing it. Otherwise, before any candidate execution, the helper requires a native executable for the current supported platform and verifies its size and SHA-256 against the fixed-key signed Anthropic manifest for required version `2.1.212`. Only that publisher-verified artifact may receive the version probe. Candidate version probing then runs only `<verified-candidate> --version`, with empty stdin, fixed `/` cwd, bounded output/time, and a fixed credential-free environment; it receives no prompt, credential, repository, range, PR, or workspace input. Scripts, interpreter wrappers, wrong signed artifacts, and caller-`PATH` candidates are never executed. The helper may fetch signed release metadata needed for verification, but never downloads or installs a Claude executable and never creates, changes, or repairs an active symlink.
+
+If exact `2.1.212` is absent, the named-review workflow stops at the blocked result. Acquiring that binary is a separate host-mutation workflow that requires explicit authorization and must use the official installer/version manager to create a side-by-side exact-version installation before retrying preflight. A named double/triple request by itself does not authorize installation, an active-version switch, or symlink repair, and the preflight never performs those actions.
+
+The helper emits exactly one bounded JSON object. Missing or unusable exact-version selection is `classification: blocked` with `reason: exact-version-unavailable`; a declared, signed-artifact, or probed version other than `2.1.212`, including an active `2.1.216`, is `classification: blocked` with `reason: exact-version-mismatch`. A publisher-verification dependency/network failure, probe failure, or identity race that cannot support a deterministic result is `inconclusive`. Success alone returns a fixed resolved absolute path plus non-secret source, signed-artifact, version, and filesystem-identity metadata. Do not record candidate output, environment contents, credentials, or repository data.
+
+Only after `classification: accepted` may the parent pass the selected `resolved_path` and signed-artifact identity to the canonical provenance revalidation, version-specific capability verification, and direct launch below. Failure never authorizes use of `2.1.216`, the broader low-level helper version range, `isolated_review`, another provider, or a downgrade to single review. A requested double remains a double review whose Claude lane is blocked. A requested triple remains blocked when its Claude lane is blocked; if the GitHub Codex lane is independently unavailable, its effective shape may be double, but that effective double is still incomplete and blocked because Claude did not complete.
+
 ## Canonical Executable Provenance
 
-The canonical direct lane uses the user's installed actual Claude Code executable at one exact resolved path. Before exposing credentials, review metadata, or repository content, the parent must:
+The canonical direct lane uses the user's installed actual Claude Code executable at the one exact resolved path accepted by the selection preflight. Before exposing credentials, review metadata, or repository content, the parent must:
 
 1. resolve the selected executable without later `PATH` lookup and reject a missing, non-regular, non-executable, script/interpreter-wrapper, prerelease, development, unsupported-platform, or future-major candidate;
-2. obtain its version using a fixed credential-free environment and require exactly Claude Code `2.1.212` for this named direct lane;
-3. verify the fixed Anthropic release-signing key, signed per-version manifest, expected platform artifact, exact size, and SHA-256 of the stable resolved installed file, using `verify_claude_release` or equivalent checks;
+2. verify the fixed Anthropic release-signing key, signed per-version manifest for exact `2.1.212`, expected platform artifact, exact size, and SHA-256 of the stable resolved installed file, using `verify_claude_release` or equivalent checks before executing the candidate;
+3. only after publisher verification, obtain its version using a fixed credential-free environment and require exactly Claude Code `2.1.212` for this named direct lane;
 4. validate the advertised option/capability surface only after publisher verification; and
 5. immediately before launch, revalidate the same path identity, signed artifact size, and SHA-256, launch that exact resolved path directly, then revalidate it again after process completion. Any drift or uncertainty makes the lane inconclusive.
 
@@ -54,7 +70,7 @@ The canonical direct lane uses the ordinary Claude CLI authentication selected b
 
 Real `HOME` is a trusted control plane. The publisher-verified Claude CLI may update ordinary CLI-owned authentication and runtime state there, including credential refresh and possible cache or tool-result artifacts. These are accepted CLI control-plane side effects, not model-authorized review mutations; they do not authorize model/tool writes or deliberate host mutations. This contract does not enumerate or attest every CLI-owned `HOME` write. The model prompt still forbids direct reads of real-`HOME` content, and the native sandbox must deny model-visible credential/configuration roots. Do not inspect, copy, print, or place credential contents in review state.
 
-If organization policy forbids ordinary CLI control-plane writes, use an explicitly authorized API key only when that mode satisfies the same policy, or report the lane blocked; do not silently introduce the helper credential wrapper. A reported `Login expired`, HTTP 401, or refresh failure is `blocked-authentication`: ask Joey to run `claude auth login` on that host and wait for an explicit retry. Ambiguous credential I/O or persistence state is `inconclusive`. Neither condition authorizes provider fallback. `--no-session-persistence` disables resumable session persistence; it does not make the CLI process or real `HOME` immutable. The lane does not take or verify a complete real-`HOME` diff, so cache or tool-result artifacts may retain review-derived data according to upstream CLI behavior. Post-run worktree cleanliness does not attest what the trusted control plane changed or prove that no transient control-plane write occurred.
+If organization policy forbids ordinary CLI control-plane writes, use an explicitly authorized API key only when that mode satisfies the same policy, or report the lane blocked; do not silently introduce the helper credential wrapper. A reported `Login expired`, an explicit HTTP/status 401, or a refresh failure that explicitly names OAuth, a token, credentials, login, or authentication is `blocked-authentication`: ask Joey to run `claude auth login` on that host and wait for an explicit retry. A bare child exit code 401, a generic non-authentication refresh failure, ambiguous credential I/O, or uncertain persistence state is `inconclusive`. Neither condition authorizes provider fallback. `--no-session-persistence` disables resumable session persistence; it does not make the CLI process or real `HOME` immutable. The lane does not take or verify a complete real-`HOME` diff, so cache or tool-result artifacts may retain review-derived data according to upstream CLI behavior. Post-run worktree cleanliness does not attest what the trusted control plane changed or prove that no transient control-plane write occurred.
 
 ## Native Sandbox Contract
 
@@ -132,9 +148,12 @@ python3 <playbook>/scripts/validate_claude_stream.py
 
 The executable/importable validator applies the versioned machine contract and
 fixed upper bounds of 8 MiB total input, 10,000 raw lines, 1 MiB per line,
-and 128 decimal digits per JSON integer. The integer bound is enforced by the
-validator's parser and does not depend on Python's process-global integer-string
-conversion limit.
+and 128 decimal digits per JSON integer. JSON floating-point tokens are parsed
+exactly as decimal values, with at most 256 characters, 128 significand digits,
+and an absolute explicit exponent no greater than 308. These parser bounds do
+not depend on Python's process-global integer-string conversion limit and prevent
+binary floating-point overflow or negative underflow from changing a metric's
+sign.
 It emits one JSON object with `classification: accepted` and the verbatim
 `findings` only after every envelope, init, and terminal-success check passes.
 Every failure emits a fail-closed `blocked`, `blocked-authentication`, or
@@ -142,6 +161,10 @@ Every failure emits a fail-closed `blocked`, `blocked-authentication`, or
 attests only the reported invocation fields and terminal artifact; it never
 claims proof of the final merged sandbox, managed permission arrays, or path-rule
 evaluation.
+
+The validator is a machine interface, not a help-text interface. `-h`, `--help`,
+missing or unknown arguments, and invalid choices all return nonzero, emit exactly
+one `inconclusive` JSON object on stdout, and leave stderr empty. Exit status zero is reserved for `accepted` output.
 
 Before accepting the result, compare the leading init against a reviewed, version-specific expected-init contract for the publisher-verified installed CLI. For Claude Code 2.1.212, require all of these observable fields:
 
@@ -160,14 +183,14 @@ For the Claude Code 2.1.212 terminal `result`, require this exact acceptance sch
 - `type` is the string `result`, `subtype` is the string `success`, and `is_error` is the boolean `false`;
 - `result` is a required string whose `strip()` value is nonempty; preserve the original string verbatim as the findings payload;
 - `modelUsage` is a required nonempty object; every key is a nonempty model-ID string and every value is an object. For Claude Code 2.1.212, the only reviewed terminal aliases for requested `claude-opus-4-8` are `claude-opus-4-8` and `claude-opus-4.8`; the only aliases for requested fallback `claude-opus-4-7` are `claude-opus-4-7` and `claude-opus-4.7`. At least one key must belong to the exact requested model's set. The only reviewed auxiliary key is `claude-haiku-4-5-20251001`. A key from the other supported primary-model set is a deterministic blocked model substitution even when a requested-model key is also present; any other model-usage key is `inconclusive` until a reviewed schema update permits it. Thus a `claude-opus-4-8` request with only or with both a `claude-opus-4-7` key is never accepted;
-- `duration_ms` and `duration_api_ms`, when present, are nonnegative integers; `num_turns` is a positive integer; `total_cost_usd` is a nonnegative finite number; `session_id` and `uuid` are nonempty strings; and `usage` is an object. A missing optional metric is acceptable, but a present value with the wrong type or range is `inconclusive`;
+- `duration_ms` and `duration_api_ms`, when present, are nonnegative integers; `num_turns` is a positive integer; `total_cost_usd` is a nonnegative finite exact-decimal number within the stream parser's lexical and exponent bounds; `session_id` and `uuid` are nonempty strings; and `usage` is an object. A missing optional metric is acceptable, but a present value with the wrong type or range is `inconclusive`;
 - `stop_reason`, when present, is exactly `null` or `end_turn`. Any other value—including `max_tokens`, `stop_sequence`, `tool_use`, `pause_turn`, or `refusal`—is a deterministic blocked incomplete or abnormal terminal result and cannot supply findings;
 - `structured_output`, when present, is exactly `null` because the canonical launch does not request a structured-output schema. A non-null value is contradictory evidence and makes the lane `inconclusive`;
 - `error` and `errors`, when present, are explicitly empty: `null`, a whitespace-only string, an empty array, or an empty object;
 - `api_error_status`, when present, is `null` or a whitespace-only string; and
 - `permission_denials`, when present, is an empty array.
 
-A non-success subtype, `is_error: true`, blank/non-string `result`, missing or malformed `modelUsage`, no requested-model match, unaccepted `stop_reason`, non-null `structured_output`, nonempty `error`/`errors`, nonempty `api_error_status`, or nonempty/malformed `permission_denials` fails closed and cannot supply findings. Classify a structurally valid permission denial, output truncation/abnormal stop, exact-model mismatch, or configuration/policy mismatch as `blocked`. When a non-success terminal already contains deterministic blocked evidence such as an exact-model mismatch, absence of error prose does not add a generic unclassified reason. Classify a structurally valid recognized login-expired, HTTP 401, or authentication-refresh error as `blocked-authentication`. Malformed, contradictory, mixed-category, or otherwise untrustworthy terminal evidence is `inconclusive`.
+A non-success subtype, `is_error: true`, blank/non-string `result`, missing or malformed `modelUsage`, no requested-model match, unaccepted `stop_reason`, non-null `structured_output`, nonempty `error`/`errors`, nonempty `api_error_status`, or nonempty/malformed `permission_denials` fails closed and cannot supply findings. Classify a structurally valid permission denial, output truncation/abnormal stop, exact-model mismatch, or configuration/policy mismatch as `blocked`. When a non-success terminal already contains deterministic blocked evidence such as an exact-model mismatch, absence of error prose does not add a generic unclassified reason. Classify only a structurally valid recognized `Login expired`, explicit HTTP/status 401, or OAuth/token/credential/login/authentication refresh error as `blocked-authentication`. A bare child exit code 401, non-authentication refresh failure, malformed evidence, contradictory evidence, or mixed-category evidence is `inconclusive`.
 
 The machine-readable Claude Code 2.1.212 contract is [claude-2.1.212-stream-schema.json](claude-2.1.212-stream-schema.json). Its required and optional terminal-field lists form a closed top-level allowlist. Any other terminal field, including an unknown error-bearing field, makes the lane `inconclusive` until a reviewed schema update explicitly adds it. Do not infer a model alias or harmless metadata field from punctuation, provider convention, or a later CLI version.
 

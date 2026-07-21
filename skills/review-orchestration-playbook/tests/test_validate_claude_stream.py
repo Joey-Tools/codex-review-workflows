@@ -129,6 +129,10 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "nonstandard_constants": "reject",
                 "unpaired_surrogates": "reject",
                 "max_integer_digits": 128,
+                "floating_number_representation": "decimal",
+                "max_float_characters": 256,
+                "max_float_significand_digits": 128,
+                "max_float_explicit_exponent_magnitude": 308,
                 "max_bytes": 8388608,
                 "max_lines": 10000,
                 "max_line_bytes": 1048576,
@@ -467,7 +471,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 events[-1][field_name] = value
                 self.assert_fail_closed(self._validate(events), "inconclusive")
 
-    def test_rejects_nonfinite_and_oversized_integer_total_costs(self) -> None:
+    def test_total_cost_uses_bounded_exact_decimal_parsing(self) -> None:
         huge_integer = 10**400
         huge_integer_events = self._full_events()
         huge_integer_events[-1]["total_cost_usd"] = huge_integer
@@ -480,15 +484,38 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             },
         )
 
-        nonfinite_raw = self._raw(self._full_events()).replace(
-            b'"total_cost_usd":0.01', b'"total_cost_usd":1e400'
-        )
+        bounded_cases = {
+            "negative-within-bound": (
+                b"-1e-308",
+                "terminal.total_cost_usd.malformed",
+            ),
+            "negative-underflow-lexeme": (b"-1e-999999", "stream.invalid-json"),
+            "positive-exponent-over-bound": (b"1e309", "stream.invalid-json"),
+            "negative-exponent-over-bound": (b"1e-309", "stream.invalid-json"),
+            "significand-over-bound": (
+                b"0." + (b"1" * 128),
+                "stream.invalid-json",
+            ),
+            "token-over-character-bound": (
+                b"1e" + (b"0" * 256) + b"1",
+                "stream.invalid-json",
+            ),
+        }
+        raw = self._raw(self._full_events())
+        for name, (replacement, reason) in bounded_cases.items():
+            with self.subTest(name=name):
+                candidate = raw.replace(
+                    b'"total_cost_usd":0.01', b'"total_cost_usd":' + replacement
+                )
+                self.assertEqual(
+                    self._validate(raw=candidate),
+                    {"classification": "inconclusive", "reasons": [reason]},
+                )
+
+        max_exponent = raw.replace(b'"total_cost_usd":0.01', b'"total_cost_usd":1e308')
         self.assertEqual(
-            self._validate(raw=nonfinite_raw),
-            {
-                "classification": "inconclusive",
-                "reasons": ["terminal.total_cost_usd.malformed"],
-            },
+            self._validate(raw=max_exponent),
+            {"classification": "accepted", "findings": "\nNo findings.\n"},
         )
 
     def test_classifies_closed_terminal_model_and_stop_mismatches(self) -> None:
@@ -536,8 +563,12 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "HTTP/1.1 401 Unauthorized",
             "status 401",
             "status code: 401",
-            "error code=401",
             "refresh token failed",
+            "OAuth refresh failed",
+            "token refresh failure",
+            "credential refresh error",
+            "authentication refresh invalid",
+            "failed to refresh login token",
         )
         for message in authentication_messages:
             with self.subTest(authentication_message=message):
@@ -549,10 +580,15 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         non_authentication_messages = (
             "401",
             "request 401 failed",
+            "error code=401",
+            "child exit code 401",
             "abc401",
             "1401",
             "HTTP 1401",
             "upstream request failed",
+            "refresh failed",
+            "cache refresh failed",
+            "display refresh error",
         )
         for message in non_authentication_messages:
             with self.subTest(non_authentication_message=message):
@@ -563,6 +599,12 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         self.assert_fail_closed(
             self._validate(failure_with(api_error_status="401")),
             "blocked-authentication",
+        )
+        self.assert_fail_closed(
+            self._validate(
+                failure_with(errors=["HTTP 401 Unauthorized", "child exit code 1"])
+            ),
+            "inconclusive",
         )
         contradictory_success = self._full_events()
         contradictory_success[-1]["error"] = "HTTP 401"
@@ -674,8 +716,63 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         )
         self.assertEqual(completed.stderr, b"")
 
+    def test_cli_exit_zero_is_unique_to_accepted_output(self) -> None:
+        blocked = self._full_events()
+        blocked[0]["permissionMode"] = "default"
+        authentication = [
+            copy.deepcopy(self.init_event),
+            {
+                "type": "result",
+                "subtype": "error",
+                "is_error": True,
+                "error": "HTTP 401 Unauthorized",
+            },
+        ]
+        inconclusive = self._full_events()
+        inconclusive[-1]["result"] = " "
+        cases = {
+            "blocked": (blocked, 1),
+            "blocked-authentication": (authentication, 2),
+            "inconclusive": (inconclusive, 3),
+        }
+
+        for expected_classification, (events, expected_returncode) in cases.items():
+            with self.subTest(classification=expected_classification):
+                input_path = self.cwd / f"{expected_classification}.jsonl"
+                input_path.write_bytes(self._raw(events))
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(VALIDATOR),
+                        "--cwd",
+                        str(self.cwd),
+                        "--model",
+                        "claude-opus-4-8",
+                        "--api-key-source",
+                        "none",
+                        "--input",
+                        str(input_path),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=5,
+                )
+
+                self.assertEqual(completed.returncode, expected_returncode)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(completed.stderr, b"")
+                stdout_lines = completed.stdout.decode("utf-8").splitlines()
+                self.assertEqual(len(stdout_lines), 1)
+                self.assertEqual(
+                    json.loads(stdout_lines[0])["classification"],
+                    expected_classification,
+                )
+
     def test_cli_argument_failures_emit_one_inconclusive_json_on_stdout(self) -> None:
         cases = {
+            "short-help": ["-h"],
+            "long-help": ["--help"],
             "missing-required": ["--model", "claude-opus-4-8"],
             "invalid-choice": [
                 "--cwd",
