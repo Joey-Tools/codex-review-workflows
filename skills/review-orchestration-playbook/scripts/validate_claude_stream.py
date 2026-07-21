@@ -587,7 +587,7 @@ def _validate_init(
             evidence.inconclusive.add("init.tools.malformed")
         else:
             if len(tools) != len(set(tools)):
-                evidence.blocked.add("init.tools.duplicate")
+                evidence.inconclusive.add("init.tools.duplicate")
             if frozenset(tools) != EXPECTED_TOOLS:
                 evidence.blocked.add("init.tools.mismatch")
 

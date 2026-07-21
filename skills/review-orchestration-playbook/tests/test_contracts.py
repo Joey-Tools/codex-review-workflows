@@ -1972,6 +1972,14 @@ class RepositoryContractTest(unittest.TestCase):
                 "<resolved-exact-claude-path>",
             ):
                 self.assertIn(anchor, content)
+            self.assertIn(
+                "no separate mandatory `--help` or advertised-capability probe",
+                content,
+            )
+            self.assertNotIn("capability verification", content)
+            self.assertNotIn(
+                "validate the advertised option/capability surface", content
+            )
             normalized = content.lower()
             self.assertIn("separate", normalized)
             self.assertIn("explicit", normalized)
@@ -3031,6 +3039,7 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertIn("`blocked-input` (`scope-mismatch`)", content)
                 self.assertIn("do not silently rewrite", content)
                 self.assertIn("whole-PR coverage", content)
+                self.assertIn("point-in-time snapshots", content.lower())
 
         self.assertIn("base_sha:.base.sha", probes)
         self.assertIn(
@@ -3049,6 +3058,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("state=open, merged=false, and merged_at=null", interface)
         self.assertIn("pr-lifecycle-unverified", interface)
         self.assertIn("selected-pr-closed", interface)
+        self.assertIn("point-in-time snapshots", interface)
         self.assertNotIn("non-PENDING", interface)
         self.assertIn("gh api --hostname <host> --method GET", probes)
         self.assertNotIn("gh pr view <number> --repo <owner>/<repo>", probes)
@@ -3059,6 +3069,8 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("GIT_TERMINAL_PROMPT=0", probes)
         self.assertIn("Zero/multiple merge bases", readiness)
         self.assertIn("Missing/ambiguous metadata, objects", skill)
+        self.assertIn("point-in-time snapshots", probes.lower())
+        self.assertIn("do not prove", probes.lower())
 
         preflight_anchor = "independently query and record lifecycle"
         run_lanes_anchor = "Run the requested local lanes"

@@ -517,7 +517,9 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
 
         self.assert_fail_closed(self._validate(duplicate_init), "inconclusive")
         self.assert_fail_closed(self._validate(duplicate_result), "inconclusive")
-        self.assert_fail_closed(self._validate(duplicate_tools), "blocked")
+        outcome = self._validate(duplicate_tools)
+        self.assert_fail_closed(outcome, "inconclusive")
+        self.assertIn("init.tools.duplicate", outcome["reasons"])
 
     def test_rejects_misordered_or_trailing_contract_events(self) -> None:
         init_not_first = [
