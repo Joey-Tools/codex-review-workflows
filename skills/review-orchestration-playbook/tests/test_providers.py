@@ -466,15 +466,17 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_bound_attempt_logs_force_owner_mode_under_restrictive_umask(
         self,
     ) -> None:
-        with providers._open_review_launch_binding(self.review) as launch:
-            previous_umask = os.umask(0o777)
-            try:
+        previous_umask = os.umask(0o777)
+        try:
+            with providers._open_review_launch_binding(self.review) as launch:
                 with launch.open_attempt_file("restrictive-umask.log") as handle:
                     handle.write(b"review output\n")
-            finally:
-                os.umask(previous_umask)
+        finally:
+            os.umask(previous_umask)
 
+        attempts = self.review.container_dir / "attempts"
         artifact = self.review.container_dir / "attempts" / "restrictive-umask.log"
+        self.assertEqual(stat.S_IMODE(attempts.stat().st_mode), 0o700)
         self.assertEqual(artifact.read_bytes(), b"review output\n")
         self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o600)
 

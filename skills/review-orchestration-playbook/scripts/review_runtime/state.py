@@ -2477,6 +2477,15 @@ def _admission_status_for_loaded_state(
             failure_class="legacy-state-no-admission",
             secret_delta=None,
         )
+    if running:
+        return _admission_result(
+            state_dir=state_dir,
+            review_range=review_range,
+            status="pending",
+            exit_code=3,
+            failure_class="preflight-not-ready",
+            secret_delta=None,
+        )
     if marker.preflight_receipt_error is not None:
         return _admission_result(
             state_dir=state_dir,
@@ -2487,17 +2496,15 @@ def _admission_status_for_loaded_state(
             secret_delta=None,
         )
     if marker.preflight_receipt is None:
-        if running:
-            failure_class = "preflight-not-ready"
-        elif marker.version == BOUND_STATE_MARKER_SCHEMA_VERSION:
+        if marker.version == BOUND_STATE_MARKER_SCHEMA_VERSION:
             failure_class = "legacy-state-no-preflight-receipt"
         else:
             failure_class = "preflight-unsealed"
         return _admission_result(
             state_dir=state_dir,
             review_range=review_range,
-            status="pending" if running else "inconclusive",
-            exit_code=3 if running else 75,
+            status="inconclusive",
+            exit_code=75,
             failure_class=failure_class,
             secret_delta=None,
         )

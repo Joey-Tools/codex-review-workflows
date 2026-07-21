@@ -1704,6 +1704,30 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertEqual(pending["exit_code"], 3)
         self.assertEqual(pending["failure_class"], "preflight-not-ready")
 
+    def test_admission_with_sealed_receipt_stays_pending_while_runner_is_held(
+        self,
+    ) -> None:
+        self.write_completed_state()
+        self.write_preflight(self.clean_secret_delta())
+
+        lock_path = self.review.container_dir / state.LOCK_FILE
+        with lock_path.open("r+b") as runner_lock:
+            state.fcntl.flock(runner_lock.fileno(), state.fcntl.LOCK_EX)
+            pending = state.admission_status(self.review.container_dir)
+            lifecycle = state.status(self.review.container_dir)
+
+        self.assertEqual(pending["status"], "pending")
+        self.assertEqual(pending["exit_code"], 3)
+        self.assertEqual(pending["failure_class"], "preflight-not-ready")
+        self.assertIsNone(pending["secret_delta"])
+        self.assertTrue(lifecycle["running"])
+        self.assertTrue(lifecycle["runner_lock_held"])
+        self.assertEqual(lifecycle["admission"], pending)
+
+        terminal = state.admission_status(self.review.container_dir)
+        self.assertEqual(terminal["status"], "clean")
+        self.assertEqual(terminal["exit_code"], 0)
+
     def test_admission_rejects_malformed_range_and_symlink_evidence(self) -> None:
         self.write_completed_state()
         preflight_path = self.review.container_dir / state.PREFLIGHT_FILE

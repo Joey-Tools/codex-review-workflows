@@ -814,12 +814,25 @@ def _ensure_bound_directory_at(
     *,
     label: str,
 ) -> int:
+    created = False
     try:
         os.mkdir(name, mode=0o700, dir_fd=parent_descriptor)
+        created = True
     except FileExistsError:
         pass
     except OSError as error:
         raise ReviewError(f"cannot create bound {label}: {error}") from error
+    if created:
+        try:
+            # mkdir mode is masked by the process umask. This name was just
+            # created below the already-bound owner-private container, before
+            # any reviewer starts; the no-follow open and identity checks
+            # immediately below remain authoritative.
+            os.chmod(name, 0o700, dir_fd=parent_descriptor)
+        except OSError as error:
+            raise ReviewError(
+                f"cannot protect newly created bound {label}: {error}"
+            ) from error
     descriptor = _open_bound_directory_at(
         parent_descriptor,
         name,
