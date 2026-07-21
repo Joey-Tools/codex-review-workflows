@@ -13,7 +13,13 @@ from enum import Enum, auto
 from types import MappingProxyType
 from typing import Iterator, NoReturn
 
-from .common import ForwardedSignal, ReviewError
+from .common import (
+    ForwardedSignal,
+    ForwardedSignalMaskOwner,
+    ReviewError,
+    block_forwarded_signals,
+    consume_pending_forwarded_signal,
+)
 
 
 DEFAULT_LOCK_TIMEOUT_SECONDS = 5.0
@@ -356,17 +362,22 @@ def _descriptor_bound_refresh_lock_recovery_diagnostic() -> str:
     )
 
 
-def _new_cleanup_inconclusive_fallback(
+def _new_descriptor_bound_cleanup_inconclusive(
+    message: str,
 ) -> ClaudeRefreshLockCleanupInconclusive:
-    diagnostic = ClaudeRefreshLockCleanupInconclusive(
-        _descriptor_bound_refresh_lock_recovery_diagnostic()
-    )
+    diagnostic = ClaudeRefreshLockCleanupInconclusive(message)
     setattr(
         diagnostic,
         "_codex_claude_refresh_lock_descriptor_bound",
         True,
     )
     return diagnostic
+
+
+def _new_cleanup_inconclusive_fallback() -> ClaudeRefreshLockCleanupInconclusive:
+    return _new_descriptor_bound_cleanup_inconclusive(
+        _descriptor_bound_refresh_lock_recovery_diagnostic()
+    )
 
 
 def attach_claude_refresh_lock_recovery(
@@ -778,6 +789,230 @@ def _open_directory_anchor(
         raise
 
 
+def _open_directory_component_at(
+    *,
+    parent_descriptor: int,
+    name: str,
+    label: str,
+) -> tuple[int, _DirectoryIdentity]:
+    """Open one real directory component relative to an anchored parent."""
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor: int | None = None
+    operation_error: BaseException | None = None
+    try:
+        try:
+            before = os.stat(
+                name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise _safe_filesystem_error(
+                f"cannot inspect Claude {label}",
+                error,
+            ) from None
+        if not stat.S_ISDIR(before.st_mode):
+            raise ClaudeRefreshLockUnsafe(
+                f"Claude {label} path contains a non-directory component"
+            )
+        try:
+            descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+            current = os.fstat(descriptor)
+            after = os.stat(
+                name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise _safe_filesystem_error(
+                f"cannot inspect Claude {label}",
+                error,
+            ) from None
+        identity = _directory_identity(current)
+        if not (
+            _matches_directory_identity(before, identity)
+            and _matches_directory_identity(after, identity)
+        ):
+            raise ClaudeRefreshLockUnsafe(f"Claude {label} changed during inspection")
+        return descriptor, identity
+    except BaseException as error:
+        operation_error = error
+        raise
+    finally:
+        if descriptor is not None and operation_error is not None:
+            try:
+                os.close(descriptor)
+            except BaseException as cleanup_error:
+                _attach_cleanup_or_raise(
+                    operation_error,
+                    cleanup_error,
+                    message="cannot close Claude directory component anchor",
+                )
+
+
+def _open_absolute_directory_anchor_chain(
+    path: pathlib.Path,
+    *,
+    require_private: bool,
+    label: str,
+) -> _DirectoryAnchor:
+    """Anchor an absolute directory without following any path component."""
+
+    if not path.is_absolute() or path.anchor != os.sep:
+        raise ClaudeRefreshLockUnsafe(f"Claude {label} path must be absolute")
+    components = path.parts[1:]
+    if not components or any(
+        component in ("", os.curdir, os.pardir) for component in components
+    ):
+        raise ClaudeRefreshLockUnsafe(
+            f"Claude {label} path contains an unsafe component"
+        )
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor: int | None = None
+    operation_error: BaseException | None = None
+    try:
+        try:
+            descriptor = os.open(os.sep, flags)
+        except OSError as error:
+            raise _safe_filesystem_error(
+                f"cannot inspect Claude {label} path root",
+                error,
+            ) from None
+        identity: _DirectoryIdentity | None = None
+        for component in components:
+            child_descriptor, identity = _open_directory_component_at(
+                parent_descriptor=descriptor,
+                name=component,
+                label=label,
+            )
+            parent_descriptor = descriptor
+            descriptor = child_descriptor
+            try:
+                os.close(parent_descriptor)
+            except BaseException as cleanup_error:
+                close_unknown = _new_descriptor_bound_cleanup_inconclusive(
+                    "cannot confirm closure of a Claude directory-chain "
+                    "descriptor; no authoritative pathname is available. "
+                    "Pause before controlled recovery."
+                )
+                _attach_cleanup_or_raise(
+                    close_unknown,
+                    cleanup_error,
+                    message="cannot close Claude directory-chain descriptor",
+                )
+                raise close_unknown
+        assert identity is not None
+        try:
+            descriptor_metadata = os.fstat(descriptor)
+            path_metadata = os.stat(path, follow_symlinks=False)
+        except OSError as error:
+            raise _safe_filesystem_error(
+                f"cannot recheck Claude {label}",
+                error,
+            ) from None
+        if not (
+            _matches_directory_identity(descriptor_metadata, identity)
+            and _matches_directory_identity(path_metadata, identity)
+        ):
+            raise ClaudeRefreshLockUnsafe(f"Claude {label} changed during inspection")
+        if require_private and (identity.uid != os.getuid() or identity.mode & 0o022):
+            raise ClaudeRefreshLockUnsafe(
+                f"Claude {label} must be current-user-owned and not writable by others"
+            )
+        if not require_private:
+            private_owner = identity.uid == os.getuid() and not (identity.mode & 0o022)
+            sticky_system_tmp = identity.uid == 0 and identity.mode == 0o1777
+            if not (private_owner or sticky_system_tmp):
+                raise ClaudeRefreshLockUnsafe(f"Claude {label} is writable by others")
+        return _DirectoryAnchor(
+            path=path,
+            descriptor=descriptor,
+            identity=identity,
+        )
+    except BaseException as error:
+        operation_error = error
+        raise
+    finally:
+        if descriptor is not None and operation_error is not None:
+            try:
+                os.close(descriptor)
+            except BaseException as cleanup_error:
+                _attach_cleanup_or_raise(
+                    operation_error,
+                    cleanup_error,
+                    message="cannot close Claude directory-chain anchor",
+                )
+
+
+def _open_child_directory_anchor(
+    path: pathlib.Path,
+    *,
+    name: str,
+    parent: _DirectoryAnchor,
+    require_private: bool,
+    label: str,
+) -> _DirectoryAnchor:
+    """Anchor one child beneath an already anchored private directory."""
+
+    descriptor: int | None = None
+    operation_error: BaseException | None = None
+    try:
+        _assert_anchor(parent, label=f"{label} parent")
+        descriptor, identity = _open_directory_component_at(
+            parent_descriptor=parent.descriptor,
+            name=name,
+            label=label,
+        )
+        _assert_anchor(parent, label=f"{label} parent")
+        try:
+            path_metadata = os.stat(path, follow_symlinks=False)
+        except OSError as error:
+            raise _safe_filesystem_error(
+                f"cannot recheck Claude {label}",
+                error,
+            ) from None
+        if not _matches_directory_identity(path_metadata, identity):
+            raise ClaudeRefreshLockUnsafe(f"Claude {label} changed during inspection")
+        if require_private and (identity.uid != os.getuid() or identity.mode & 0o022):
+            raise ClaudeRefreshLockUnsafe(
+                f"Claude {label} must be current-user-owned and not writable by others"
+            )
+        if not require_private:
+            private_owner = identity.uid == os.getuid() and not (identity.mode & 0o022)
+            sticky_system_tmp = identity.uid == 0 and identity.mode == 0o1777
+            if not (private_owner or sticky_system_tmp):
+                raise ClaudeRefreshLockUnsafe(f"Claude {label} is writable by others")
+        return _DirectoryAnchor(
+            path=path,
+            descriptor=descriptor,
+            identity=identity,
+        )
+    except BaseException as error:
+        operation_error = error
+        raise
+    finally:
+        if descriptor is not None and operation_error is not None:
+            try:
+                os.close(descriptor)
+            except BaseException as cleanup_error:
+                _attach_cleanup_or_raise(
+                    operation_error,
+                    cleanup_error,
+                    message="cannot close Claude child-directory anchor",
+                )
+
+
 def _open_directory_anchor_at(
     path: pathlib.Path,
     descriptor: int,
@@ -1187,8 +1422,15 @@ def recover_abandoned_staged_claude_refresh_locks(
     config_anchor: _DirectoryAnchor | None = None
     locks: list[_HeldLock] = []
     operation_error: BaseException | None = None
+    signal_mask_owner = ForwardedSignalMaskOwner()
     try:
-        carrier_anchor = _open_directory_anchor(
+        block_forwarded_signals(signal_mask_owner=signal_mask_owner)
+        if not signal_mask_owner.active:
+            raise ClaudeRefreshLockCleanupInconclusive(
+                "cannot establish a caller-owned forwarded-signal mask before "
+                "staged Claude refresh-lock recovery"
+            )
+        carrier_anchor = _open_absolute_directory_anchor_chain(
             carrier_path,
             require_private=True,
             label="staged credential carrier",
@@ -1197,8 +1439,10 @@ def recover_abandoned_staged_claude_refresh_locks(
             raise ClaudeRefreshLockUnsafe(
                 "staged Claude credential carrier must have mode 0700"
             )
-        config_anchor = _open_directory_anchor(
+        config_anchor = _open_child_directory_anchor(
             config_path,
+            name=config_path.name,
+            parent=carrier_anchor,
             require_private=True,
             label="staged config directory",
         )
@@ -1249,19 +1493,54 @@ def recover_abandoned_staged_claude_refresh_locks(
                 os.close(descriptor)
             except BaseException as error:
                 cleanup_errors.append(error)
-        cleanup_error = _primary_error(cleanup_errors)
-        if cleanup_error is not None:
-            if operation_error is None:
-                normalized = _normalize_operation_error(
-                    "cannot close staged Claude recovery descriptor",
-                    cleanup_error,
-                )
-                raise normalized from None
-            _attach_cleanup_or_raise(
-                operation_error,
-                cleanup_error,
-                message="cannot close staged Claude recovery descriptor",
+        try:
+            pending_signal = (
+                consume_pending_forwarded_signal() if signal_mask_owner.active else None
             )
+        except BaseException as error:
+            cleanup_errors.append(error)
+            pending_signal = None
+        if pending_signal is not None:
+            # Publish the first observed deferred signal before unmasking, so a
+            # signal delivered by restore remains a secondary control flow.
+            cleanup_errors.append(ForwardedSignal(pending_signal))
+        for _attempt in range(2):
+            if not signal_mask_owner.active:
+                break
+            try:
+                signal_mask_owner.restore()
+            except BaseException as error:
+                cleanup_errors.append(error)
+        mask_restore_inconclusive: ClaudeRefreshLockCleanupInconclusive | None = None
+        if signal_mask_owner.active:
+            mask_restore_inconclusive = ClaudeRefreshLockCleanupInconclusive(
+                "the forwarded-signal mask remains active after two restore "
+                "attempts following staged Claude refresh-lock recovery"
+            )
+        candidates = [
+            error
+            for error in (
+                mask_restore_inconclusive,
+                operation_error,
+                *cleanup_errors,
+            )
+            if error is not None
+        ]
+        selected = _primary_error(candidates)
+        if (
+            mask_restore_inconclusive is not None
+            and selected is not None
+            and selected is not mask_restore_inconclusive
+        ):
+            add_note = getattr(selected, "add_note", None)
+            if callable(add_note):
+                add_note(str(mask_restore_inconclusive))
+        if selected is not None and selected is not operation_error:
+            normalized = _normalize_operation_error(
+                "cannot finalize staged Claude refresh-lock recovery",
+                selected,
+            )
+            raise normalized from None
 
 
 def _acquire_one(

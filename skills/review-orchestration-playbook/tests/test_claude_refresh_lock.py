@@ -6698,7 +6698,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = pathlib.Path(temporary)
+            root = pathlib.Path(temporary).resolve()
             carrier = root / "claude-carrier-fixture"
             carrier.mkdir(mode=0o700)
             config = carrier / "config"
@@ -6731,7 +6731,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 self.subTest(case=case),
                 tempfile.TemporaryDirectory() as temporary,
             ):
-                root = pathlib.Path(temporary)
+                root = pathlib.Path(temporary).resolve()
                 carrier = root / "claude-carrier-fixture"
                 carrier.mkdir(mode=0o700)
                 config = carrier / "config"
@@ -6760,7 +6760,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            carrier = pathlib.Path(temporary) / "account-home"
+            carrier = pathlib.Path(temporary).resolve() / "account-home"
             carrier.mkdir(mode=0o700)
             config = carrier / ".claude"
             config.mkdir(mode=0o700)
@@ -6784,7 +6784,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            carrier = pathlib.Path(temporary) / "not-a-claude-carrier"
+            carrier = pathlib.Path(temporary).resolve() / "not-a-claude-carrier"
             carrier.mkdir(mode=0o700)
             config = carrier / "config"
             config.mkdir(mode=0o700)
@@ -6806,7 +6806,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
 
     def test_staged_recovery_rejects_symlink_lock_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = pathlib.Path(temporary)
+            root = pathlib.Path(temporary).resolve()
             carrier = root / "claude-carrier-fixture"
             carrier.mkdir(mode=0o700)
             config = carrier / "config"
@@ -6834,7 +6834,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            carrier = pathlib.Path(temporary) / "claude-carrier-fixture"
+            carrier = pathlib.Path(temporary).resolve() / "claude-carrier-fixture"
             carrier.mkdir(mode=0o700)
             config = carrier / "config"
             config.mkdir(mode=0o700)
@@ -6862,7 +6862,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 self.subTest(unsafe_directory=unsafe_directory),
                 tempfile.TemporaryDirectory() as temporary,
             ):
-                carrier = pathlib.Path(temporary) / "claude-carrier-fixture"
+                carrier = pathlib.Path(temporary).resolve() / "claude-carrier-fixture"
                 carrier.mkdir(mode=0o700)
                 config = carrier / "config"
                 config.mkdir(mode=0o700)
@@ -6892,7 +6892,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 self.subTest(symlinked_directory=symlinked_directory),
                 tempfile.TemporaryDirectory() as temporary,
             ):
-                root = pathlib.Path(temporary)
+                root = pathlib.Path(temporary).resolve()
                 if symlinked_directory == "carrier":
                     real_carrier = root / "real-carrier"
                     real_carrier.mkdir(mode=0o700)
@@ -6925,6 +6925,597 @@ class ClaudeRefreshLockTest(unittest.TestCase):
 
                 self.assertTrue(primary.is_dir())
                 self.assertTrue(legacy.is_dir())
+
+    def test_staged_recovery_rejects_symlinked_ancestor_without_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            real_parent = root / "real-parent"
+            real_parent.mkdir(mode=0o700)
+            real_carrier = real_parent / "claude-carrier-fixture"
+            real_carrier.mkdir(mode=0o700)
+            real_config = real_carrier / "config"
+            real_config.mkdir(mode=0o700)
+            primary = real_config / ".oauth_refresh.lock"
+            legacy = real_carrier / "config.lock"
+            primary.mkdir(mode=0o700)
+            legacy.mkdir(mode=0o700)
+            linked_parent = root / "linked-parent"
+            linked_parent.symlink_to(real_parent, target_is_directory=True)
+            carrier = linked_parent / real_carrier.name
+            config = carrier / "config"
+
+            with self.assertRaises(claude_refresh_lock.ClaudeRefreshLockError):
+                claude_refresh_lock.recover_abandoned_staged_claude_refresh_locks(
+                    carrier,
+                    config,
+                    protocol=self.PROTOCOL,
+                    writer_quiescent=True,
+                )
+
+            self.assertTrue(linked_parent.is_symlink())
+            self.assertTrue(primary.is_dir())
+            self.assertTrue(legacy.is_dir())
+
+    def test_staged_recovery_fails_closed_when_carrier_and_config_retarget(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            carrier = root / "claude-carrier-fixture"
+            carrier.mkdir(mode=0o700)
+            config = carrier / "config"
+            config.mkdir(mode=0o700)
+            primary_name = ".oauth_refresh.lock"
+            legacy_name = "config.lock"
+            (config / primary_name).mkdir(mode=0o700)
+            (carrier / legacy_name).mkdir(mode=0o700)
+
+            replacement = root / "replacement-carrier"
+            replacement.mkdir(mode=0o700)
+            replacement_config = replacement / "config"
+            replacement_config.mkdir(mode=0o700)
+            (replacement_config / primary_name).mkdir(mode=0o700)
+            (replacement / legacy_name).mkdir(mode=0o700)
+
+            retained_carrier = root / "retained-carrier"
+            retained_config = root / "retained-config"
+            carrier_identity = carrier.stat()
+            real_stat = claude_refresh_lock.os.stat
+            config_probe_count = 0
+            retargeted = False
+            restored = False
+
+            def retarget_around_config_probe(
+                path: os.PathLike[str] | str | int,
+                *args: object,
+                **kwargs: object,
+            ) -> os.stat_result:
+                nonlocal config_probe_count, restored, retargeted
+                raw_path = os.fspath(path) if not isinstance(path, int) else path
+                dir_fd = kwargs.get("dir_fd")
+                relative_to_carrier = False
+                if raw_path == "config" and isinstance(dir_fd, int):
+                    parent_metadata = os.fstat(dir_fd)
+                    relative_to_carrier = (
+                        parent_metadata.st_dev == carrier_identity.st_dev
+                        and parent_metadata.st_ino == carrier_identity.st_ino
+                    )
+                config_probe = (
+                    dir_fd is None and pathlib.Path(raw_path) == config
+                ) or relative_to_carrier
+                if not config_probe:
+                    return real_stat(path, *args, **kwargs)
+
+                config_probe_count += 1
+                if config_probe_count == 1:
+                    carrier.rename(retained_carrier)
+                    replacement.rename(carrier)
+                    retargeted = True
+                metadata = real_stat(path, *args, **kwargs)
+                if config_probe_count == 2:
+                    carrier.rename(replacement)
+                    retained_carrier.rename(carrier)
+                    config.rename(retained_config)
+                    (replacement / "config").rename(config)
+                    restored = True
+                return metadata
+
+            with (
+                mock.patch.object(
+                    claude_refresh_lock.os,
+                    "stat",
+                    side_effect=retarget_around_config_probe,
+                ),
+                self.assertRaises(claude_refresh_lock.ClaudeRefreshLockError),
+            ):
+                claude_refresh_lock.recover_abandoned_staged_claude_refresh_locks(
+                    carrier,
+                    config,
+                    protocol=self.PROTOCOL,
+                    writer_quiescent=True,
+                )
+
+            self.assertTrue(retargeted)
+            self.assertTrue(restored)
+            self.assertTrue((retained_config / primary_name).is_dir())
+            self.assertTrue((carrier / legacy_name).is_dir())
+            self.assertTrue((config / primary_name).is_dir())
+            self.assertTrue((replacement / legacy_name).is_dir())
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "staged recovery descriptor-chain proof requires POSIX dir_fds",
+    )
+    def test_staged_recovery_fails_closed_when_chain_close_is_unknown(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            carrier = root / "claude-carrier-fixture"
+            carrier.mkdir(mode=0o700)
+            config = carrier / "config"
+            config.mkdir(mode=0o700)
+            primary = config / ".oauth_refresh.lock"
+            legacy = carrier / "config.lock"
+            primary.mkdir(mode=0o700)
+            legacy.mkdir(mode=0o700)
+            real_open = os.open
+            real_close = os.close
+            opened_descriptors: list[int] = []
+            close_attempts: dict[int, int] = {}
+            failed_descriptor: int | None = None
+
+            def record_open(
+                path: os.PathLike[str] | str,
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+                opened_descriptors.append(descriptor)
+                return descriptor
+
+            def fail_first_close(descriptor: int) -> None:
+                nonlocal failed_descriptor
+                close_attempts[descriptor] = close_attempts.get(descriptor, 0) + 1
+                if failed_descriptor is None:
+                    failed_descriptor = descriptor
+                    raise OSError(errno.EIO, "injected close failure")
+                real_close(descriptor)
+
+            try:
+                with (
+                    mock.patch.object(
+                        claude_refresh_lock.os,
+                        "open",
+                        side_effect=record_open,
+                    ),
+                    mock.patch.object(
+                        claude_refresh_lock.os,
+                        "close",
+                        side_effect=fail_first_close,
+                    ),
+                    self.assertRaises(
+                        claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive
+                    ) as raised,
+                ):
+                    claude_refresh_lock.recover_abandoned_staged_claude_refresh_locks(
+                        carrier,
+                        config,
+                        protocol=self.PROTOCOL,
+                        writer_quiescent=True,
+                    )
+
+                self.assertIn("cannot confirm closure", str(raised.exception))
+                self.assertIs(
+                    getattr(
+                        raised.exception,
+                        "_codex_claude_refresh_lock_descriptor_bound",
+                        None,
+                    ),
+                    True,
+                )
+                self.assertIsNone(
+                    getattr(
+                        raised.exception,
+                        "_codex_claude_refresh_lock_paths",
+                        None,
+                    )
+                )
+                self.assertIsNotNone(failed_descriptor)
+                assert failed_descriptor is not None
+                self.assertEqual(close_attempts[failed_descriptor], 1)
+                os.fstat(failed_descriptor)
+                for descriptor in opened_descriptors:
+                    if descriptor == failed_descriptor:
+                        continue
+                    with self.assertRaises(OSError) as closed:
+                        os.fstat(descriptor)
+                    self.assertEqual(closed.exception.errno, errno.EBADF)
+                self.assertTrue(primary.is_dir())
+                self.assertTrue(legacy.is_dir())
+            finally:
+                for descriptor in opened_descriptors:
+                    try:
+                        real_close(descriptor)
+                    except OSError:
+                        pass
+
+    def test_staged_recovery_fails_closed_before_open_when_signal_mask_fails(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            carrier = root / "claude-carrier-fixture"
+            carrier.mkdir(mode=0o700)
+            config = carrier / "config"
+            config.mkdir(mode=0o700)
+            primary = config / ".oauth_refresh.lock"
+            legacy = carrier / "config.lock"
+            primary.mkdir(mode=0o700)
+            legacy.mkdir(mode=0o700)
+
+            with (
+                mock.patch.object(
+                    claude_refresh_lock,
+                    "block_forwarded_signals",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    claude_refresh_lock.os,
+                    "open",
+                    side_effect=AssertionError(
+                        "opened a recovery descriptor before signal masking"
+                    ),
+                ),
+                self.assertRaises(
+                    claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive
+                ),
+            ):
+                claude_refresh_lock.recover_abandoned_staged_claude_refresh_locks(
+                    carrier,
+                    config,
+                    protocol=self.PROTOCOL,
+                    writer_quiescent=True,
+                )
+
+            self.assertTrue(primary.is_dir())
+            self.assertTrue(legacy.is_dir())
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "staged recovery signal-mask proof requires POSIX dir_fds",
+    )
+    def test_staged_recovery_reports_persistent_signal_mask_restore_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            carrier = root / "claude-carrier-fixture"
+            carrier.mkdir(mode=0o700)
+            config = carrier / "config"
+            config.mkdir(mode=0o700)
+            primary = config / ".oauth_refresh.lock"
+            legacy = carrier / "config.lock"
+            primary.mkdir(mode=0o700)
+            legacy.mkdir(mode=0o700)
+
+            def publish_fake_mask(
+                *,
+                signal_mask_owner: claude_refresh_lock.ForwardedSignalMaskOwner,
+            ) -> None:
+                signal_mask_owner.publish(None)
+
+            with (
+                mock.patch.object(
+                    claude_refresh_lock,
+                    "block_forwarded_signals",
+                    side_effect=publish_fake_mask,
+                ),
+                mock.patch.object(
+                    claude_refresh_lock,
+                    "consume_pending_forwarded_signal",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    claude_refresh_lock.ForwardedSignalMaskOwner,
+                    "restore",
+                    side_effect=(
+                        OSError(errno.EIO, "first restore failure"),
+                        OSError(errno.EIO, "second restore failure"),
+                    ),
+                ) as restore,
+                self.assertRaises(
+                    claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive
+                ) as raised,
+            ):
+                claude_refresh_lock.recover_abandoned_staged_claude_refresh_locks(
+                    carrier,
+                    config,
+                    protocol=self.PROTOCOL,
+                    writer_quiescent=True,
+                )
+
+            self.assertIn(
+                "forwarded-signal mask remains active",
+                str(raised.exception),
+            )
+            self.assertEqual(restore.call_count, 2)
+            self.assertFalse(primary.exists())
+            self.assertFalse(legacy.exists())
+
+    def test_staged_recovery_preserves_control_flow_over_mask_restore_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            carrier = root / "claude-carrier-fixture"
+            carrier.mkdir(mode=0o700)
+            config = carrier / "config"
+            config.mkdir(mode=0o700)
+            primary = config / ".oauth_refresh.lock"
+            legacy = carrier / "config.lock"
+            primary.mkdir(mode=0o700)
+            legacy.mkdir(mode=0o700)
+            first = claude_refresh_lock.ForwardedSignal(signal.SIGTERM)
+
+            def publish_fake_mask(
+                *,
+                signal_mask_owner: claude_refresh_lock.ForwardedSignalMaskOwner,
+            ) -> None:
+                signal_mask_owner.publish(None)
+
+            with (
+                mock.patch.object(
+                    claude_refresh_lock,
+                    "block_forwarded_signals",
+                    side_effect=publish_fake_mask,
+                ),
+                mock.patch.object(
+                    claude_refresh_lock,
+                    "_open_absolute_directory_anchor_chain",
+                    side_effect=first,
+                ),
+                mock.patch.object(
+                    claude_refresh_lock,
+                    "consume_pending_forwarded_signal",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    claude_refresh_lock.ForwardedSignalMaskOwner,
+                    "restore",
+                    side_effect=(
+                        OSError(errno.EIO, "first restore failure"),
+                        OSError(errno.EIO, "second restore failure"),
+                    ),
+                ) as restore,
+                self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
+            ):
+                claude_refresh_lock.recover_abandoned_staged_claude_refresh_locks(
+                    carrier,
+                    config,
+                    protocol=self.PROTOCOL,
+                    writer_quiescent=True,
+                )
+
+            self.assertIs(raised.exception, first)
+            self.assertEqual(restore.call_count, 2)
+            self.assertTrue(
+                any(
+                    "forwarded-signal mask remains active" in note
+                    for note in getattr(raised.exception, "__notes__", ())
+                )
+            )
+            self.assertTrue(primary.is_dir())
+            self.assertTrue(legacy.is_dir())
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "sigpending")
+        and hasattr(signal, "sigwait"),
+        "staged recovery signal deferral requires POSIX signal masks",
+    )
+    def test_staged_recovery_defers_open_signal_until_all_fds_close(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            carrier = root / "claude-carrier-fixture"
+            carrier.mkdir(mode=0o700)
+            config = carrier / "config"
+            config.mkdir(mode=0o700)
+            primary = config / ".oauth_refresh.lock"
+            legacy = carrier / "config.lock"
+            primary.mkdir(mode=0o700)
+            legacy.mkdir(mode=0o700)
+            directory_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            external_descriptor = os.open(carrier, directory_flags)
+            real_open = os.open
+            real_close = os.close
+            opened_descriptors: list[int] = []
+            signal_sent = False
+            previous_handler = signal.getsignal(signal.SIGTERM)
+
+            def raise_forwarded_signal(signum: int, _frame: object) -> None:
+                raise claude_refresh_lock.ForwardedSignal(signal.Signals(signum))
+
+            def open_then_signal(
+                path: os.PathLike[str] | str,
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal signal_sent
+                descriptor = real_open(
+                    path,
+                    flags,
+                    mode,
+                    dir_fd=dir_fd,
+                )
+                opened_descriptors.append(descriptor)
+                if not signal_sent:
+                    signal_sent = True
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return descriptor
+
+            try:
+                signal.signal(signal.SIGTERM, raise_forwarded_signal)
+                with (
+                    mock.patch.object(
+                        claude_refresh_lock.os,
+                        "open",
+                        side_effect=open_then_signal,
+                    ),
+                    self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
+                ):
+                    claude_refresh_lock.recover_abandoned_staged_claude_refresh_locks(
+                        carrier,
+                        config,
+                        protocol=self.PROTOCOL,
+                        writer_quiescent=True,
+                    )
+
+                self.assertEqual(raised.exception.signum, signal.SIGTERM)
+                self.assertTrue(signal_sent)
+                self.assertFalse(primary.exists())
+                self.assertFalse(legacy.exists())
+                os.fstat(external_descriptor)
+                for descriptor in opened_descriptors:
+                    with self.assertRaises(OSError) as closed:
+                        os.fstat(descriptor)
+                    self.assertEqual(closed.exception.errno, errno.EBADF)
+            finally:
+                signal.signal(signal.SIGTERM, previous_handler)
+                for descriptor in opened_descriptors:
+                    try:
+                        real_close(descriptor)
+                    except OSError:
+                        pass
+                real_close(external_descriptor)
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "sigpending")
+        and hasattr(signal, "sigwait"),
+        "staged recovery signal deferral requires POSIX signal masks",
+    )
+    def test_staged_recovery_defers_close_signal_until_all_fds_close(
+        self,
+    ) -> None:
+        for boundary in ("entry", "result"):
+            with (
+                self.subTest(boundary=boundary),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = pathlib.Path(temporary).resolve()
+                carrier = root / "claude-carrier-fixture"
+                carrier.mkdir(mode=0o700)
+                config = carrier / "config"
+                config.mkdir(mode=0o700)
+                primary = config / ".oauth_refresh.lock"
+                legacy = carrier / "config.lock"
+                primary.mkdir(mode=0o700)
+                legacy.mkdir(mode=0o700)
+                directory_flags = (
+                    os.O_RDONLY
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                external_descriptor = os.open(carrier, directory_flags)
+                real_open = os.open
+                real_close = os.close
+                opened_descriptors: list[int] = []
+                interrupted = False
+                previous_handler = signal.getsignal(signal.SIGTERM)
+
+                def raise_forwarded_signal(
+                    signum: int,
+                    _frame: object,
+                ) -> None:
+                    raise claude_refresh_lock.ForwardedSignal(signal.Signals(signum))
+
+                def record_open(
+                    path: os.PathLike[str] | str,
+                    flags: int,
+                    mode: int = 0o777,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    descriptor = real_open(
+                        path,
+                        flags,
+                        mode,
+                        dir_fd=dir_fd,
+                    )
+                    opened_descriptors.append(descriptor)
+                    return descriptor
+
+                def interrupt_parent_close(descriptor: int) -> None:
+                    nonlocal interrupted
+                    if not interrupted:
+                        interrupted = True
+                        if boundary == "result":
+                            real_close(descriptor)
+                        os.kill(os.getpid(), signal.SIGTERM)
+                        if boundary == "entry":
+                            real_close(descriptor)
+                        return
+                    real_close(descriptor)
+
+                try:
+                    signal.signal(signal.SIGTERM, raise_forwarded_signal)
+                    with (
+                        mock.patch.object(
+                            claude_refresh_lock.os,
+                            "open",
+                            side_effect=record_open,
+                        ),
+                        mock.patch.object(
+                            claude_refresh_lock.os,
+                            "close",
+                            side_effect=interrupt_parent_close,
+                        ),
+                        self.assertRaises(
+                            claude_refresh_lock.ForwardedSignal
+                        ) as raised,
+                    ):
+                        claude_refresh_lock.recover_abandoned_staged_claude_refresh_locks(
+                            carrier,
+                            config,
+                            protocol=self.PROTOCOL,
+                            writer_quiescent=True,
+                        )
+
+                    self.assertEqual(raised.exception.signum, signal.SIGTERM)
+                    self.assertTrue(interrupted)
+                    self.assertGreaterEqual(len(opened_descriptors), 2)
+                    self.assertFalse(primary.exists())
+                    self.assertFalse(legacy.exists())
+                    os.fstat(external_descriptor)
+                    for descriptor in opened_descriptors:
+                        with self.assertRaises(OSError) as closed:
+                            os.fstat(descriptor)
+                        self.assertEqual(closed.exception.errno, errno.EBADF)
+                finally:
+                    signal.signal(signal.SIGTERM, previous_handler)
+                    for descriptor in opened_descriptors:
+                        try:
+                            real_close(descriptor)
+                        except OSError:
+                            pass
+                    real_close(external_descriptor)
 
     def test_legacy_contention_releases_the_new_primary_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
