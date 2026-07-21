@@ -2705,7 +2705,11 @@ class PublicPoolScannerTest(unittest.TestCase):
     def test_diff_source_proof_watermark_preserves_per_assignment_limit(
         self,
     ) -> None:
-        accepted = self.accepted[0]
+        accepted = accepted_legacy_value(
+            EXPECTED_PUBLIC_VALUES[0],
+            rule="generic-secret-assignment",
+        )
+        accepted_values = (accepted,)
         payload = (
             b"@@ -1,3 +1,1 @@\n"
             b"-#"
@@ -2729,7 +2733,7 @@ class PublicPoolScannerTest(unittest.TestCase):
         ):
             scan = workspace._scan_secret_value(
                 payload,
-                accepted_values=self.accepted,
+                accepted_values=accepted_values,
                 diff_surface=True,
                 _event_budget=budget,
             )
