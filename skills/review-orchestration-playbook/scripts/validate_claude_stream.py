@@ -53,8 +53,9 @@ LAUNCH_PROFILES = {
     },
 }
 EMPTY_INIT_SURFACES = ("mcp_servers", "slash_commands", "skills", "plugins")
+CLAUDE_AUTH_ENV_NAME = "ANTHROPIC_API_KEY"
 AUTHENTICATION_SOURCE_TO_API_KEY_SOURCE = {
-    "api-key": "ANTHROPIC_API_KEY",
+    "api-key": CLAUDE_AUTH_ENV_NAME,
     "oauth-token": "none",
     "local-login": "none",
 }

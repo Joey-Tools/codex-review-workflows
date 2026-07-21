@@ -1076,8 +1076,9 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         self.assertEqual(outcome["classification"], "accepted")
 
     def test_authentication_source_maps_to_exact_init_api_key_source(self) -> None:
+        self.assertEqual(validator.CLAUDE_AUTH_ENV_NAME, "ANTHROPIC_API_KEY")
         cases = {
-            "api-key": "ANTHROPIC_API_KEY",
+            "api-key": validator.CLAUDE_AUTH_ENV_NAME,
             "oauth-token": "none",
             "local-login": "none",
         }
@@ -1097,8 +1098,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
     def test_authentication_source_rejects_init_mapping_mismatch(self) -> None:
         cases = {
             "api-key": "none",
-            "oauth-token": "ANTHROPIC_API_KEY",
-            "local-login": "ANTHROPIC_API_KEY",
+            "oauth-token": validator.CLAUDE_AUTH_ENV_NAME,
+            "local-login": validator.CLAUDE_AUTH_ENV_NAME,
         }
 
         for authentication_source, init_api_key_source in cases.items():
