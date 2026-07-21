@@ -6,7 +6,7 @@ These contracts apply to the canonical single, double, and triple review shapes.
 
 For every local logical lane:
 
-- Resolve and record full `base_sha` and `head_sha`; verify that both commits exist and that the chosen range is correct for the target branch. If implementation changes are uncommitted, create an intentional review-anchor commit on the review branch first. Never derive a formal named-lane range from a dirty working tree or untracked files.
+- Resolve and record full `base_sha` and `head_sha`; verify that both commits exist and that the chosen range is correct for the target branch. Never derive a formal named-lane range from a dirty working tree or untracked files. When implementation or delivery mutation is already authorized, uncommitted changes may first be captured in an intentional review-anchor commit on the review branch. A standalone report-only named review does not authorize that branch or commit: without an existing committed range, report review preparation as `blocked-authorization` and request the range or explicit anchor authorization.
 - Create a lane-unique clean Git worktree at `head_sha`. Do not reuse the implementation checkout or another reviewer's checkout.
 - Before launch, require `git status --porcelain` to be empty, `HEAD` to equal `head_sha`, both frozen commits to resolve, and read-only `git diff base_sha..head_sha` queries to work.
 - With `GIT_NO_LAZY_FETCH=1` and `GIT_TERMINAL_PROMPT=0`, use parent-owned read-only Git plumbing to verify local object completeness for the exact range and both endpoint trees without rendering or persisting a full diff. If any required object is missing, hydrate it deliberately before freezing or report the lane blocked. Do not launch a reviewer that could trigger a promisor-remote fetch, credential helper, or interactive authentication while inspecting the frozen scope.
@@ -67,6 +67,7 @@ This rule applies even when a direct diff would fit in the current prompt. It av
 - Reject stale evidence after any push.
 - Host `sqbu-github.cisco.com` and any operating identity in `{hoteng, hoteng_cisco}` are unsupported for this lane; a requested triple review uses effective double and records the reason.
 - Missing integration, unsupported host/identity, or an unavailable GitHub Codex service produces effective double only when directly known or proved by authenticated provider evidence. Findings from a running service do not.
+- An existing supported PR whose current `headRefOid` does not equal the frozen `head_sha` remains a triple candidate, not an unavailable lane. If the parent did not separately authorize publishing or changing the PR head, leave the PR unchanged and report `requested: triple`, `effective: triple-inconclusive`, with GitHub lane status `blocked-authorization`.
 - Missing response, timeout, generic request/HTTP failure, or guessed integration state is `effective: triple-inconclusive`, not unavailable.
 - Once acknowledgement or run/review activity proves service start, malformed, stale, ambiguous, or transiently incomplete evidence is `effective: triple-inconclusive`, not effective double.
 

@@ -6,7 +6,9 @@ Use this reference after the local delivery gate has produced a reviewable commi
 
 - Confirm repository owner/name, base branch, head repository/branch, draft/ready state, current head commit, dirty state, and merge model.
 - Joey-owned/default-authorized repositories may be pushed and opened/updated only when the parent request explicitly asks for a PR, full workflow, merge-ready, or stop-before-merge. A bare named-review request, including `triple review`, does not authorize creating a branch, pushing commits, opening a PR, or updating an existing PR's branch or metadata.
+- A bare named-review request also does not authorize an anchor commit. If its implementation checkout is dirty and no committed review range exists, report review preparation as `blocked-authorization`; do not review the dirty state or mutate it.
 - A bare triple-review request authorizes only the scoped GitHub Codex request comment on an already-existing supported PR. If no such PR exists, keep the operation report-only, run the two local lanes, and report `requested: triple`, `effective: double`, with `no existing PR` as the reason. Do not create or mutate a PR to manufacture the third lane.
+- If that existing supported PR's current `headRefOid` does not equal the intended frozen `head_sha` and PR mutation was not separately authorized, leave it unchanged and report `requested: triple`, `effective: triple-inconclusive`, with GitHub lane status `blocked-authorization`. This is a head-alignment blocker, not GitHub Codex unavailability.
 - For any other target, stop and request explicit confirmation listing the exact repository, base, head, and draft/ready state.
 - PR creation/update authorization does not authorize merge. Merge only when the parent request explicitly includes it.
 

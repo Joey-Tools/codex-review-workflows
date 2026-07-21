@@ -39,6 +39,7 @@ Posting `@codex review` is request transport, not completion or proof that the s
 Classify precisely:
 
 - No PR, unsupported host/identity, or authenticated no-start missing-integration/service-unavailable evidence: third lane unavailable; effective double.
+- Existing supported PR with current `headRefOid != head_sha` and no separate PR-mutation authorization: leave the PR unchanged; report `requested: triple`, `effective: triple-inconclusive`, and GitHub lane status `blocked-authorization`.
 - Service ran and returned findings: available lane with findings; fix and rerequest after the new head.
 - Missing or ambiguous evidence that proves neither unavailable nor started: `requested: triple`, `effective: triple-inconclusive`.
 - A started service with ambiguous authorship, stale head, malformed result, or transiently incomplete evidence: `requested: triple`, `effective: triple-inconclusive`; do not reinterpret it as effective double or clean evidence.

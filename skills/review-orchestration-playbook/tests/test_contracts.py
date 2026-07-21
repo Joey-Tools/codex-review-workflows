@@ -752,6 +752,64 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertIn(anchor, contracts)
 
+    def test_report_only_review_never_implicitly_authorizes_an_anchor_commit(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        agents_policy = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        interface = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
+
+        causal_anchors = (
+            (
+                skill,
+                "For a standalone report-only named review, do not create a branch or commit: report review preparation as `blocked-authorization`",
+            ),
+            (
+                contracts,
+                "without an existing committed range, report review preparation as `blocked-authorization`",
+            ),
+            (
+                readiness,
+                "implementation checkout is dirty and no committed review range exists, report review preparation as `blocked-authorization`",
+            ),
+            (
+                readme,
+                "If no committed range exists, report `blocked-authorization` rather than review or mutate a dirty checkout",
+            ),
+            (
+                agents_policy,
+                "Without an existing committed range, report `blocked-authorization` instead of reviewing or mutating a dirty checkout",
+            ),
+            (
+                interface,
+                "without an existing committed range, stop as blocked-authorization",
+            ),
+        )
+        for document, anchor in causal_anchors:
+            with self.subTest(anchor=anchor):
+                self.assertIn(anchor, document)
+
+        active_documents = (
+            skill,
+            contracts,
+            readiness,
+            readme,
+            agents_policy,
+            interface,
+        )
+        for document in active_documents:
+            self.assertNotIn(
+                "If implementation changes are uncommitted, create an intentional review-anchor commit",
+                document,
+            )
+
     def test_github_codex_fallback_and_pr_readiness_preserve_the_shape(
         self,
     ) -> None:
@@ -765,6 +823,10 @@ class RepositoryContractTest(unittest.TestCase):
         probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
             encoding="utf-8"
         )
+        templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
+            encoding="utf-8"
+        )
+        agents_policy = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
         interface = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
 
         for anchor in (
@@ -789,6 +851,24 @@ class RepositoryContractTest(unittest.TestCase):
             contracts,
         )
         self.assertIn("effective: triple-inconclusive", contracts)
+        self.assertIn(
+            "with GitHub lane status `blocked-authorization`",
+            contracts,
+        )
+        exact_head_documents = (
+            agents_policy,
+            skill,
+            contracts,
+            readiness,
+            templates,
+        )
+        for document in exact_head_documents:
+            self.assertIn("`headRefOid` does not equal", document)
+        self.assertIn("`headRefOid != head_sha`", probes)
+        for document in (*exact_head_documents, probes):
+            self.assertIn("blocked-authorization", document)
+            self.assertNotIn("does not contain the frozen head", document)
+            self.assertNotIn("does not contain the intended frozen head", document)
         self.assertIn(
             "any operating identity in `{hoteng, hoteng_cisco}`",
             contracts,
@@ -906,6 +986,8 @@ class RepositoryContractTest(unittest.TestCase):
             "requested triple; effective double",
             "Posting the comment requests the third lane but does not complete it",
             "trustworthy terminal current-head result",
+            "effective: triple-inconclusive",
+            "GitHub lane status `blocked-authorization`",
         ):
             self.assertIn(anchor, triple)
         self.assertNotIn("equivalent", triple)
