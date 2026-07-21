@@ -2152,18 +2152,23 @@ class ExecutableVerificationTest(unittest.TestCase):
         verified = self._verify_full_release()
         self.assertIsNotNone(verified.source_identity)
         assert verified.source_identity is not None
-        current = self.executable.stat(follow_symlinks=False)
-        self.executable.write_bytes(self.payload)
-        os.utime(
-            self.executable,
-            ns=(current.st_atime_ns, verified.source_identity[-2]),
-            follow_symlinks=False,
+        original_mode = stat.S_IMODE(
+            self.executable.stat(follow_symlinks=False).st_mode
         )
-        mutated_identity = claude_provenance._stat_identity(
-            self.executable.stat(follow_symlinks=False)
-        )
+        alternate_mode = original_mode ^ stat.S_IXUSR
+        deadline = time.monotonic() + 2.0
+        while True:
+            self.executable.chmod(alternate_mode)
+            self.executable.chmod(original_mode)
+            mutated_identity = claude_provenance._stat_identity(
+                self.executable.stat(follow_symlinks=False)
+            )
+            if mutated_identity[-1] != verified.source_identity[-1]:
+                break
+            if time.monotonic() >= deadline:
+                self.fail("filesystem ctime did not advance after bounded mode changes")
+            time.sleep(0.01)
         self.assertEqual(mutated_identity[:-1], verified.source_identity[:-1])
-        self.assertNotEqual(mutated_identity[-1], verified.source_identity[-1])
 
         with (
             mock.patch.object(
