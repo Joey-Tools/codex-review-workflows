@@ -10166,7 +10166,7 @@ class CredentialStagingTest(unittest.TestCase):
             heartbeat.join(timeout=1.0)
             self.assertFalse(heartbeat.is_alive())
 
-    def test_dead_worker_takeover_waits_for_lease_terminal_proof(self) -> None:
+    def test_dead_worker_takeover_bounds_unprovable_lease_terminal(self) -> None:
         with self._host_cleanup_coordinator_fixture(with_lease=True) as (
             _root,
             _source,
@@ -10175,55 +10175,37 @@ class CredentialStagingTest(unittest.TestCase):
             lease,
         ):
             assert lease is not None
-            allow_terminal_proof = threading.Event()
-            settlement_attempted = threading.Event()
-            repeated_failures_observed = threading.Event()
+            limit = claude_linux.CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS
+            snapshot_attempts = 0
             settlement_attempts = 0
-            backoff_attempts = 0
-            failure_target = claude_linux.CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS + 3
             results: list[claude_linux._ClaudeRefreshLockCleanupResult] = []
             errors: list[BaseException] = []
             real_retention_snapshot = lease.retention_snapshot
             real_settle_descriptor_bound = lease._settle_descriptor_bound_retention
-            real_sleep = claude_linux.time.sleep
 
-            def publish_repeated_failure_observation() -> None:
-                if (
-                    settlement_attempts >= failure_target
-                    and backoff_attempts >= failure_target
-                ):
-                    repeated_failures_observed.set()
-
-            def withheld_terminal_snapshot() -> (
+            def fail_snapshot_with_escape_hatch() -> (
                 claude_refresh_lock.ClaudeRefreshLockRetentionSnapshot
             ):
-                snapshot = real_retention_snapshot()
-                if allow_terminal_proof.is_set():
-                    return snapshot
-                return dataclasses.replace(snapshot, terminal=False)
+                nonlocal snapshot_attempts
+                snapshot_attempts += 1
+                if snapshot_attempts <= limit:
+                    raise OSError(
+                        f"injected persistent terminal snapshot {snapshot_attempts}"
+                    )
+                return dataclasses.replace(
+                    real_retention_snapshot(),
+                    terminal=False,
+                )
 
-            def fail_settlement_until_gate(reason: str) -> BaseException:
+            def fail_settlement_with_escape_hatch(reason: str) -> BaseException:
                 nonlocal settlement_attempts
                 settlement_attempts += 1
-                settlement_attempted.set()
-                publish_repeated_failure_observation()
-                if not allow_terminal_proof.is_set():
+                if settlement_attempts <= limit:
                     raise OSError(
                         "injected persistent descriptor settlement failure "
                         f"{settlement_attempts}"
                     )
                 return real_settle_descriptor_bound(reason)
-
-            def fail_backoff_until_gate(seconds: float) -> None:
-                nonlocal backoff_attempts
-                self.assertEqual(seconds, 0.1)
-                backoff_attempts += 1
-                publish_repeated_failure_observation()
-                if not allow_terminal_proof.is_set():
-                    raise OSError(
-                        f"injected persistent retry backoff failure {backoff_attempts}"
-                    )
-                real_sleep(seconds)
 
             def release() -> None:
                 try:
@@ -10243,97 +10225,392 @@ class CredentialStagingTest(unittest.TestCase):
                     claude_linux._HostRefreshLockCleanupPhase.WORKER_ENTERED
                 )
             release_thread = threading.Thread(target=release, daemon=True)
-            returned_before_proof = False
-            try:
-                with (
-                    mock.patch.object(
-                        lease,
-                        "retention_snapshot",
-                        side_effect=withheld_terminal_snapshot,
-                    ),
-                    mock.patch.object(
-                        lease,
-                        "_settle_descriptor_bound_retention",
-                        side_effect=fail_settlement_until_gate,
-                    ),
-                    mock.patch.object(
-                        coordinator,
-                        "_fail_closed_worker",
-                        side_effect=retain_source_without_settling_lease,
-                    ),
-                    mock.patch.object(
-                        coordinator,
-                        "_finalize_worker_retention",
-                        return_value=None,
-                    ),
-                    mock.patch.object(
-                        claude_linux.time,
-                        "sleep",
-                        side_effect=fail_backoff_until_gate,
-                    ),
-                ):
-                    release_thread.start()
-                    self.assertTrue(settlement_attempted.wait(timeout=0.5))
-                    self.assertTrue(repeated_failures_observed.wait(timeout=1.0))
-                    release_thread.join(timeout=0.05)
-                    returned_before_proof = not release_thread.is_alive()
-                    self.assertIsNot(
-                        coordinator._phase_snapshot(),
-                        claude_linux._HostRefreshLockCleanupPhase.TERMINAL,
-                    )
-                    allow_terminal_proof.set()
-                    release_thread.join(timeout=1.0)
-            finally:
-                allow_terminal_proof.set()
+            with (
+                mock.patch.object(
+                    lease,
+                    "retention_snapshot",
+                    side_effect=fail_snapshot_with_escape_hatch,
+                ),
+                mock.patch.object(
+                    lease,
+                    "_settle_descriptor_bound_retention",
+                    side_effect=fail_settlement_with_escape_hatch,
+                ),
+                mock.patch.object(
+                    coordinator,
+                    "_fail_closed_worker",
+                    side_effect=retain_source_without_settling_lease,
+                ),
+                mock.patch.object(
+                    coordinator,
+                    "_finalize_worker_retention",
+                    return_value=None,
+                ),
+                mock.patch.object(claude_linux.time, "sleep", return_value=None),
+                mock.patch.object(lease, "_release", wraps=lease._release) as release,
+            ):
+                release_thread.start()
                 release_thread.join(timeout=1.0)
+                release.assert_not_called()
 
-            self.assertFalse(returned_before_proof)
             self.assertFalse(release_thread.is_alive())
             self.assertEqual(errors, [])
             self.assertEqual(len(results), 1)
-            self.assertTrue(results[0].terminal)
+            self.assertFalse(results[0].terminal)
+            self.assertIsNotNone(results[0].error)
+            assert results[0].error is not None
+            self.assertTrue(
+                getattr(
+                    results[0].error,
+                    "_codex_claude_refresh_lock_descriptor_bound",
+                    False,
+                )
+            )
+            self.assertEqual(snapshot_attempts, limit)
+            self.assertEqual(settlement_attempts, limit)
             self.assertIs(
                 coordinator._phase_snapshot(),
                 claude_linux._HostRefreshLockCleanupPhase.TERMINAL,
             )
-            self.assertTrue(lease.retention_snapshot().terminal)
-            settlement_errors = [
-                error
-                for error in coordinator._errors
-                if str(error).startswith(
-                    "injected persistent descriptor settlement failure"
+            self.assertFalse(coordinator._synchronous_cleanup_claimed)
+            self.assertFalse(lease.retention_snapshot().terminal)
+            self.assertTrue(all(path.is_dir() for path in lease.paths))
+            descriptors = {
+                *(lock.descriptor for lock in lease._locks),
+                lease._legacy_parent_anchor.descriptor,
+                lease._config_anchor.descriptor,
+            }
+            for descriptor in descriptors:
+                os.fstat(descriptor)
+
+    def test_terminal_proof_accepts_successful_descriptor_settlement_without_snapshot_reread(
+        self,
+    ) -> None:
+        with self._host_cleanup_coordinator_fixture(with_lease=True) as (
+            _root,
+            _source,
+            _anchor,
+            coordinator,
+            lease,
+        ):
+            assert lease is not None
+            real_settle = lease._settle_descriptor_bound_retention
+            with (
+                mock.patch.object(
+                    lease,
+                    "retention_snapshot",
+                    side_effect=OSError("injected unavailable terminal snapshot"),
+                ) as snapshot,
+                mock.patch.object(
+                    lease,
+                    "_settle_descriptor_bound_retention",
+                    wraps=real_settle,
+                ) as settle,
+                mock.patch.object(claude_linux.time, "sleep", return_value=None),
+            ):
+                terminal_proof = coordinator._wait_for_cleanup_terminal_proof(
+                    lease,
+                    retry_scope="fixture",
                 )
-            ]
-            backoff_errors = [
-                error
-                for error in coordinator._errors
-                if str(error).startswith("injected persistent retry backoff failure")
-            ]
-            self.assertLessEqual(
-                len(settlement_errors),
-                claude_linux.CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS,
-            )
-            self.assertLessEqual(
-                len(backoff_errors),
-                claude_linux.CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS,
-            )
-            self.assertEqual(
-                sum(
-                    "additional synchronous descriptor settlement failures "
-                    "were suppressed" in str(error)
-                    for error in coordinator._errors
+
+            self.assertTrue(terminal_proof.terminal)
+            self.assertIsNotNone(terminal_proof.diagnostic)
+            self.assertEqual(snapshot.call_count, 1)
+            self.assertEqual(settle.call_count, 1)
+            retention = lease.retention_snapshot()
+            self.assertTrue(retention.terminal)
+            self.assertFalse(retention.verified_closed)
+            self.assertTrue(all(path.is_dir() for path in lease.paths))
+
+    def test_release_uses_cached_descriptor_settlement_without_snapshot_reread(
+        self,
+    ) -> None:
+        with self._host_cleanup_coordinator_fixture(with_lease=True) as (
+            _root,
+            _source,
+            _anchor,
+            coordinator,
+            lease,
+        ):
+            assert lease is not None
+            real_settle = lease._settle_descriptor_bound_retention
+
+            def retain_source_without_settling_lease() -> None:
+                coordinator._retaining = True
+                coordinator._retention_reason = "injected cached terminal proof"
+                coordinator._retain_source_anchor()
+
+            with coordinator._state_lock:
+                coordinator._phase = (
+                    claude_linux._HostRefreshLockCleanupPhase.WORKER_ENTERED
+                )
+            with (
+                mock.patch.object(
+                    lease,
+                    "retention_snapshot",
+                    side_effect=OSError("injected unavailable terminal snapshot"),
+                ) as snapshot,
+                mock.patch.object(
+                    lease,
+                    "_settle_descriptor_bound_retention",
+                    wraps=real_settle,
+                ) as settle,
+                mock.patch.object(
+                    coordinator,
+                    "_fail_closed_worker",
+                    side_effect=retain_source_without_settling_lease,
                 ),
-                1,
-            )
-            self.assertEqual(
-                sum(
-                    "additional synchronous retry backoff failures were "
-                    "suppressed" in str(error)
-                    for error in coordinator._errors
+                mock.patch.object(
+                    coordinator,
+                    "_finalize_worker_retention",
+                    return_value=None,
                 ),
-                1,
+                mock.patch.object(claude_linux.time, "sleep", return_value=None),
+            ):
+                result = coordinator.release_after_proven_cleanup()
+
+            self.assertTrue(result.terminal)
+            self.assertIsNotNone(result.error)
+            self.assertEqual(snapshot.call_count, 1)
+            self.assertEqual(settle.call_count, 1)
+            diagnostic = coordinator._cleanup_terminal_diagnostic_snapshot()
+            self.assertIsNotNone(diagnostic)
+            self.assertTrue(
+                getattr(
+                    diagnostic,
+                    "_codex_claude_refresh_lock_descriptor_bound",
+                    False,
+                )
             )
-            self.assertLessEqual(len(coordinator._errors), 32)
+            self.assertTrue(lease.retention_snapshot().terminal)
+
+    def test_terminal_proof_never_reconciles_foreign_unresolved_handoff(
+        self,
+    ) -> None:
+        with self._host_cleanup_coordinator_fixture(with_lease=True) as (
+            _root,
+            _source,
+            _anchor,
+            coordinator,
+            lease,
+        ):
+            assert lease is not None
+            handoff = claude_refresh_lock._OperationLockHandoff(
+                lease._operation_lock
+            )
+            lease._publish_operation_handoff(handoff)
+            handoff.acquire(
+                timeout=0.01,
+                first_control_flow=claude_refresh_lock._FirstControlFlowWinner(
+                    lease._descriptor_bound_cleanup_fallback
+                ),
+            )
+            descriptors = {
+                *(lock.descriptor for lock in lease._locks),
+                lease._legacy_parent_anchor.descriptor,
+                lease._config_anchor.descriptor,
+            }
+            descriptor_identities = {
+                descriptor: (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino)
+                for descriptor in descriptors
+            }
+            outcomes: list[claude_linux._HostRefreshLockCleanupTerminalProof] = []
+            failures: list[BaseException] = []
+
+            def wait_from_foreign_thread() -> None:
+                try:
+                    outcomes.append(
+                        coordinator._wait_for_cleanup_terminal_proof(
+                            lease,
+                            retry_scope="fixture",
+                        )
+                    )
+                except BaseException as error:
+                    failures.append(error)
+
+            worker = threading.Thread(target=wait_from_foreign_thread, daemon=True)
+            try:
+                with (
+                    mock.patch.object(
+                        lease,
+                        "_reconcile_pending_operation_handoff",
+                        wraps=lease._reconcile_pending_operation_handoff,
+                    ) as reconcile,
+                    mock.patch.object(
+                        lease,
+                        "_settle_descriptor_bound_retention",
+                        wraps=lease._settle_descriptor_bound_retention,
+                    ) as settle,
+                    mock.patch.object(
+                        claude_linux.time,
+                        "sleep",
+                        return_value=None,
+                    ),
+                ):
+                    worker.start()
+                    worker.join(timeout=1.0)
+                    self.assertFalse(worker.is_alive())
+                    self.assertEqual(failures, [])
+                    self.assertEqual(len(outcomes), 1)
+                    self.assertFalse(outcomes[0].terminal)
+                    self.assertIsNotNone(outcomes[0].diagnostic)
+                    self.assertEqual(
+                        settle.call_count,
+                        claude_linux.CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS,
+                    )
+                    reconcile.assert_not_called()
+                self.assertIs(lease._pending_operation_handoff, handoff)
+                self.assertTrue(handoff.needs_reconciliation)
+                self.assertIsNot(handoff.owner_thread, worker)
+                self.assertTrue(all(path.is_dir() for path in lease.paths))
+                self.assertEqual(
+                    {
+                        descriptor: (
+                            os.fstat(descriptor).st_dev,
+                            os.fstat(descriptor).st_ino,
+                        )
+                        for descriptor in descriptors
+                    },
+                    descriptor_identities,
+                )
+            finally:
+                lease._reconcile_pending_operation_handoff()
+
+    def test_bounded_terminal_proof_replays_first_control_flow(self) -> None:
+        for first_control_flow in (
+            KeyboardInterrupt("injected terminal snapshot interrupt"),
+            SystemExit("injected terminal snapshot exit"),
+        ):
+            with self.subTest(control_flow=type(first_control_flow).__name__):
+                with self._host_cleanup_coordinator_fixture(with_lease=True) as (
+                    _root,
+                    _source,
+                    _anchor,
+                    coordinator,
+                    lease,
+                ):
+                    assert lease is not None
+                    limit = claude_linux.CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS
+                    snapshot_attempts = 0
+                    settlement_attempts = 0
+                    caught: list[BaseException] = []
+                    real_retention_snapshot = lease.retention_snapshot
+
+                    def fail_snapshot() -> (
+                        claude_refresh_lock.ClaudeRefreshLockRetentionSnapshot
+                    ):
+                        nonlocal snapshot_attempts
+                        snapshot_attempts += 1
+                        if snapshot_attempts == 1:
+                            raise first_control_flow
+                        if snapshot_attempts <= limit:
+                            raise OSError("injected later snapshot failure")
+                        return real_retention_snapshot()
+
+                    def fail_settlement(_reason: str) -> BaseException:
+                        nonlocal settlement_attempts
+                        settlement_attempts += 1
+                        raise OSError("injected descriptor settlement failure")
+
+                    def retain_source_without_settling_lease() -> None:
+                        coordinator._retaining = True
+                        coordinator._retention_reason = "injected terminal proof failure"
+                        coordinator._retain_source_anchor()
+
+                    def release() -> None:
+                        try:
+                            coordinator.release_after_proven_cleanup()
+                        except BaseException as error:
+                            caught.append(error)
+
+                    with coordinator._state_lock:
+                        coordinator._phase = (
+                            claude_linux._HostRefreshLockCleanupPhase.WORKER_ENTERED
+                        )
+                    release_thread = threading.Thread(target=release, daemon=True)
+                    with (
+                        mock.patch.object(
+                            lease,
+                            "retention_snapshot",
+                            side_effect=fail_snapshot,
+                        ),
+                        mock.patch.object(
+                            lease,
+                            "_settle_descriptor_bound_retention",
+                            side_effect=fail_settlement,
+                        ),
+                        mock.patch.object(
+                            coordinator,
+                            "_fail_closed_worker",
+                            side_effect=retain_source_without_settling_lease,
+                        ),
+                        mock.patch.object(
+                            coordinator,
+                            "_finalize_worker_retention",
+                            return_value=None,
+                        ),
+                        mock.patch.object(
+                            claude_linux.time,
+                            "sleep",
+                            return_value=None,
+                        ),
+                    ):
+                        release_thread.start()
+                        release_thread.join(timeout=1.0)
+
+                    self.assertFalse(release_thread.is_alive())
+                    self.assertEqual(caught, [first_control_flow])
+                    self.assertEqual(snapshot_attempts, limit)
+                    self.assertEqual(settlement_attempts, limit)
+                    self.assertIs(
+                        coordinator._phase_snapshot(),
+                        claude_linux._HostRefreshLockCleanupPhase.TERMINAL,
+                    )
+                    self.assertTrue(
+                        getattr(
+                            first_control_flow,
+                            "_codex_claude_refresh_lock_descriptor_bound",
+                            False,
+                        )
+                    )
+                    self.assertTrue(all(path.is_dir() for path in lease.paths))
+
+    def test_terminal_control_flow_uses_cached_empty_recovery_without_snapshot(
+        self,
+    ) -> None:
+        with self._host_cleanup_coordinator_fixture(with_lease=True) as (
+            _root,
+            _source,
+            _anchor,
+            coordinator,
+            lease,
+        ):
+            assert lease is not None
+            control_flow = KeyboardInterrupt(
+                "injected terminal control with no recovery diagnostic"
+            )
+            with coordinator._state_lock:
+                coordinator._terminal_errors = ()
+                coordinator._cleanup_terminal_proven = True
+                coordinator._cleanup_terminal_diagnostic = None
+                coordinator._phase = (
+                    claude_linux._HostRefreshLockCleanupPhase.TERMINAL
+                )
+
+            with (
+                mock.patch.object(
+                    lease,
+                    "retention_snapshot",
+                    side_effect=AssertionError(
+                        "terminal control replay must not re-read lease state"
+                    ),
+                ) as snapshot,
+                self.assertRaises(KeyboardInterrupt) as raised,
+            ):
+                coordinator._wait_until_terminal(local_errors=[control_flow])
+
+            self.assertIs(raised.exception, control_flow)
+            snapshot.assert_not_called()
 
     def test_dead_worker_takeover_waits_for_source_terminal_proof(self) -> None:
         class GatedSourceHandoffWatcher:
@@ -10939,7 +11216,7 @@ class CredentialStagingTest(unittest.TestCase):
             )
             source_anchor.close_if_detached()
 
-    def test_worker_waits_for_lease_terminal_proof(self) -> None:
+    def test_worker_bounds_unprovable_lease_terminal(self) -> None:
         with self._host_cleanup_coordinator_fixture(with_lease=True) as (
             _root,
             _source,
@@ -10948,99 +11225,87 @@ class CredentialStagingTest(unittest.TestCase):
             lease,
         ):
             assert lease is not None
-            allow_terminal_proof = threading.Event()
-            settlement_attempted = threading.Event()
-            retain_results: list[tuple[BaseException, ...]] = []
+            limit = claude_linux.CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS
+            snapshot_attempts = 0
+            settlement_attempts = 0
             retain_failures: list[BaseException] = []
-            real_retention_snapshot = lease.retention_snapshot
-            real_abandon = lease.abandon
-            real_release = lease.release
-            real_settle = lease._settle_descriptor_bound_retention
 
-            def withheld_terminal_snapshot() -> (
+            def fail_snapshot() -> (
                 claude_refresh_lock.ClaudeRefreshLockRetentionSnapshot
             ):
-                snapshot = real_retention_snapshot()
-                if allow_terminal_proof.is_set():
-                    return snapshot
-                return dataclasses.replace(snapshot, terminal=False)
+                nonlocal snapshot_attempts
+                snapshot_attempts += 1
+                raise OSError(
+                    f"injected persistent worker terminal snapshot {snapshot_attempts}"
+                )
 
-            def fail_abandon_until_gate(reason: str) -> BaseException | None:
-                if not allow_terminal_proof.is_set():
-                    raise OSError("injected worker abandonment failure")
-                return real_abandon(reason)
+            def fail_settlement(_reason: str) -> BaseException:
+                nonlocal settlement_attempts
+                settlement_attempts += 1
+                raise OSError(
+                    f"injected persistent worker settlement {settlement_attempts}"
+                )
 
-            def fail_release_until_gate() -> None:
-                if not allow_terminal_proof.is_set():
-                    raise OSError("injected worker release failure")
-                real_release()
-
-            def fail_settlement_until_gate(reason: str) -> BaseException:
-                settlement_attempted.set()
-                if not allow_terminal_proof.is_set():
-                    raise OSError("injected worker settlement failure")
-                return real_settle(reason)
+            def retain_without_settling(
+                _decision: claude_linux._HostRefreshLockCleanupDecision,
+            ) -> None:
+                lease._deletion_prohibited = True
+                lease._heartbeat_stop.set()
+                coordinator._retaining = True
+                coordinator._retain_source_anchor()
 
             def retain() -> None:
                 try:
-                    retain_results.append(
-                        coordinator.retain(
-                            reason="injected ordinary-worker terminal proof"
-                        )
+                    coordinator.retain(
+                        reason="injected ordinary-worker terminal proof"
                     )
                 except BaseException as error:
                     retain_failures.append(error)
 
             retain_thread = threading.Thread(target=retain, daemon=True)
-            returned_before_proof = False
-            try:
-                with (
-                    mock.patch.object(
-                        lease,
-                        "retention_snapshot",
-                        side_effect=withheld_terminal_snapshot,
-                    ),
-                    mock.patch.object(
-                        lease,
-                        "abandon",
-                        side_effect=fail_abandon_until_gate,
-                    ),
-                    mock.patch.object(
-                        lease,
-                        "release",
-                        side_effect=fail_release_until_gate,
-                    ),
-                    mock.patch.object(
-                        lease,
-                        "_settle_descriptor_bound_retention",
-                        side_effect=fail_settlement_until_gate,
-                    ),
-                ):
-                    coordinator._thread.start()
-                    retain_thread.start()
-                    self.assertTrue(settlement_attempted.wait(timeout=0.5))
-                    retain_thread.join(timeout=0.1)
-                    returned_before_proof = not retain_thread.is_alive()
-                    self.assertIsNot(
-                        coordinator._phase_snapshot(),
-                        claude_linux._HostRefreshLockCleanupPhase.TERMINAL,
-                    )
-                    self.assertFalse(coordinator._terminal.is_set())
-                    allow_terminal_proof.set()
-                    retain_thread.join(timeout=1.0)
-            finally:
-                allow_terminal_proof.set()
+            with (
+                mock.patch.object(
+                    lease,
+                    "retention_snapshot",
+                    side_effect=fail_snapshot,
+                ),
+                mock.patch.object(
+                    lease,
+                    "_settle_descriptor_bound_retention",
+                    side_effect=fail_settlement,
+                ),
+                mock.patch.object(
+                    coordinator,
+                    "_execute_worker_decision",
+                    side_effect=retain_without_settling,
+                ),
+                mock.patch.object(
+                    coordinator,
+                    "_finalize_worker_retention",
+                    return_value=None,
+                ),
+                mock.patch.object(claude_linux.time, "sleep", return_value=None),
+            ):
+                coordinator._thread.start()
+                retain_thread.start()
                 retain_thread.join(timeout=1.0)
 
-            self.assertFalse(returned_before_proof)
             self.assertFalse(retain_thread.is_alive())
-            self.assertEqual(retain_failures, [])
-            self.assertEqual(len(retain_results), 1)
+            self.assertEqual(len(retain_failures), 1)
+            self.assertIsInstance(
+                retain_failures[0],
+                claude_linux.LinuxCredentialInspectionInconclusive,
+            )
+            self.assertIn("proven terminal", str(retain_failures[0]))
+            self.assertEqual(snapshot_attempts, limit)
+            self.assertEqual(settlement_attempts, limit)
             self.assertIs(
                 coordinator._phase_snapshot(),
                 claude_linux._HostRefreshLockCleanupPhase.TERMINAL,
             )
-            self.assertTrue(lease.retention_snapshot().terminal)
+            self.assertFalse(lease.retention_snapshot().terminal)
+            self.assertTrue(lease._deletion_prohibited)
+            self.assertTrue(all(path.is_dir() for path in lease.paths))
 
     def test_cancel_without_lease_preserves_wait_control_flow(
         self,
@@ -11152,6 +11417,8 @@ class CredentialStagingTest(unittest.TestCase):
                     raise control_flow
                 with coordinator._state_lock:
                     coordinator._terminal_errors = ()
+                    coordinator._cleanup_terminal_proven = True
+                    coordinator._cleanup_terminal_diagnostic = recovery
                     coordinator._phase = (
                         claude_linux._HostRefreshLockCleanupPhase.TERMINAL
                     )
@@ -11464,7 +11731,7 @@ class CredentialStagingTest(unittest.TestCase):
             )
             self.assertEqual(coordinator._errors, [])
 
-    def test_claimed_worker_control_survives_owner_lease_read_failure(
+    def test_claimed_worker_control_survives_cached_recovery_read_failure(
         self,
     ) -> None:
         with self._host_cleanup_coordinator_fixture(with_lease=False) as (
@@ -11475,7 +11742,9 @@ class CredentialStagingTest(unittest.TestCase):
             _lease,
         ):
             worker_control = KeyboardInterrupt("injected terminal worker interruption")
-            attachment_control = SystemExit("injected owner lease-read interruption")
+            attachment_control = SystemExit(
+                "injected cached recovery-read interruption"
+            )
             with coordinator._state_lock:
                 coordinator._errors.append(worker_control)
                 coordinator._worker_first_control_flow = worker_control
@@ -11484,9 +11753,8 @@ class CredentialStagingTest(unittest.TestCase):
 
             with (
                 mock.patch.object(
-                    claude_linux._HostRefreshLockCleanupOwner,
-                    "lease",
-                    new_callable=mock.PropertyMock,
+                    coordinator,
+                    "_cleanup_terminal_diagnostic_snapshot",
                     side_effect=attachment_control,
                 ),
                 self.assertRaises(KeyboardInterrupt) as raised,
@@ -12942,6 +13210,47 @@ class CredentialStagingTest(unittest.TestCase):
         self.assertIn("credential cleanup also failed", str(diagnostic).lower())
         self.assertIn("cleanup failed", str(diagnostic))
         self.assertIs(diagnostic.__cause__, previous_cause)
+
+    def test_cleanup_note_legacy_fallback_respects_context_visibility(self) -> None:
+        class LegacyError(RuntimeError):
+            add_note = None
+
+        sensitive_path = "/fixture/private/suppressed-linux-context/.credentials.json"
+        for suppress_context in (False, True):
+            with self.subTest(suppress_context=suppress_context):
+                marker = sensitive_path if suppress_context else "visible-linux-context"
+                original_context = RuntimeError(marker)
+                primary = LegacyError("primary failure")
+                primary.__context__ = original_context
+                primary.__suppress_context__ = suppress_context
+
+                claude_linux._add_cleanup_note(
+                    primary,
+                    OSError("cleanup failed"),
+                )
+
+                diagnostic = primary.__cause__
+                self.assertIsInstance(
+                    diagnostic,
+                    claude_linux.LinuxCredentialCleanupDiagnostic,
+                )
+                assert diagnostic is not None
+                if suppress_context:
+                    self.assertIsNone(diagnostic.__context__)
+                else:
+                    self.assertIs(diagnostic.__context__, original_context)
+                self.assertIs(primary.__context__, original_context)
+                formatted = "".join(
+                    traceback.format_exception(
+                        type(primary),
+                        primary,
+                        primary.__traceback__,
+                    )
+                )
+                if suppress_context:
+                    self.assertNotIn(marker, formatted)
+                else:
+                    self.assertIn(marker, formatted)
 
     def test_host_lock_recovery_is_visible_on_python_310_fallback(self) -> None:
         class LegacyInterrupt(KeyboardInterrupt):

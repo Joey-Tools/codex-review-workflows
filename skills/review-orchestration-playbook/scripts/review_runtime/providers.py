@@ -615,9 +615,11 @@ def _claude_cleanup_error_without_primary_backlink(
         secondary.__cause__, BaseException
     ) and not _claude_error_graph_contains(secondary.__cause__, primary):
         rendered.__cause__ = secondary.__cause__
-    if isinstance(
-        secondary.__context__, BaseException
-    ) and not _claude_error_graph_contains(secondary.__context__, primary):
+    if (
+        not secondary.__suppress_context__
+        and isinstance(secondary.__context__, BaseException)
+        and not _claude_error_graph_contains(secondary.__context__, primary)
+    ):
         rendered.__context__ = secondary.__context__
         if rendered.__cause__ is None:
             rendered.__suppress_context__ = False
@@ -5086,7 +5088,7 @@ def _add_claude_persistence_note(
     diagnostic = ClaudeCredentialPersistenceDiagnostic(note)
     if error.__cause__ is not None:
         diagnostic.__cause__ = error.__cause__
-    elif error.__context__ is not None:
+    elif not error.__suppress_context__ and error.__context__ is not None:
         diagnostic.__context__ = error.__context__
     error.__cause__ = diagnostic
 

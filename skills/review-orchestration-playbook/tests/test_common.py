@@ -7,6 +7,7 @@ import signal
 import sys
 import tempfile
 import time
+import traceback
 import unittest
 from unittest import mock
 
@@ -795,6 +796,74 @@ class ChildEnvironmentTest(unittest.TestCase):
             "first process cleanup (OSError): first secondary",
         )
         self.assertIs(first.__cause__, original_cause)
+
+    def test_process_secondary_failure_legacy_fallback_keeps_context_suppressed(
+        self,
+    ) -> None:
+        class LegacyError(RuntimeError):
+            add_note = None
+
+        sensitive_path = "/fixture/private/suppressed-process-context/auth.json"
+        hidden_context = RuntimeError(f"hidden process context at {sensitive_path}")
+        primary = LegacyError("primary failure")
+        primary.__context__ = hidden_context
+        primary.__suppress_context__ = True
+
+        common._attach_process_secondary_failure(
+            primary,
+            OSError("secondary cleanup failure"),
+            context="process cleanup",
+        )
+
+        self.assertIsInstance(
+            primary.__cause__,
+            common.ReviewProcessSecondaryFailureDiagnostic,
+        )
+        self.assertIsNone(primary.__cause__.__context__)
+        self.assertIs(primary.__context__, hidden_context)
+        self.assertTrue(primary.__suppress_context__)
+        formatted = "".join(
+            traceback.format_exception(
+                type(primary),
+                primary,
+                primary.__traceback__,
+            )
+        )
+        self.assertNotIn(sensitive_path, formatted)
+
+    def test_process_secondary_failure_legacy_fallback_keeps_visible_context(
+        self,
+    ) -> None:
+        class LegacyError(RuntimeError):
+            add_note = None
+
+        original_context = RuntimeError("visible process context")
+        primary = LegacyError("primary failure")
+        primary.__context__ = original_context
+
+        common._attach_process_secondary_failure(
+            primary,
+            OSError("secondary cleanup failure"),
+            context="process cleanup",
+        )
+
+        diagnostic = primary.__cause__
+        self.assertIsInstance(
+            diagnostic,
+            common.ReviewProcessSecondaryFailureDiagnostic,
+        )
+        assert diagnostic is not None
+        self.assertIs(diagnostic.__context__, original_context)
+        self.assertIn(
+            "visible process context",
+            "".join(
+                traceback.format_exception(
+                    type(primary),
+                    primary,
+                    primary.__traceback__,
+                )
+            ),
+        )
 
     def test_process_quiescent_callback_failure_is_fail_closed(self) -> None:
         marker = RuntimeError("injected quiescent callback failure")

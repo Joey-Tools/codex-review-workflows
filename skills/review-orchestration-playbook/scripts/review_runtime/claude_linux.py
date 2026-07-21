@@ -2242,7 +2242,7 @@ def _attach_secondary_failure(
     diagnostic = diagnostic_type(note)
     if error.__cause__ is not None:
         diagnostic.__cause__ = error.__cause__
-    elif error.__context__ is not None:
+    elif not error.__suppress_context__ and error.__context__ is not None:
         diagnostic.__context__ = error.__context__
     error.__cause__ = diagnostic
 
@@ -2463,6 +2463,12 @@ def _primary_cleanup_error(
 class _ClaudeRefreshLockCleanupResult:
     error: BaseException | None
     terminal: bool
+
+
+@dataclass(frozen=True)
+class _HostRefreshLockCleanupTerminalProof:
+    terminal: bool
+    diagnostic: BaseException | None
 
 
 def _normalize_claude_refresh_lock_release_error(
@@ -4396,6 +4402,8 @@ class _HostRefreshLockCleanupCoordinator:
         self._worker_first_control_flow: BaseException | None = None
         self._worker_control_flow_delivered = False
         self._synchronous_cleanup_claimed = False
+        self._cleanup_terminal_proven = False
+        self._cleanup_terminal_diagnostic: BaseException | None = None
         self._worker_signal_mask: set[signal.Signals] | None = None
         self._thread = threading.Thread(
             target=self._run,
@@ -4414,6 +4422,14 @@ class _HostRefreshLockCleanupCoordinator:
     def _source_retention_required_snapshot(self) -> bool:
         with self._state_lock:
             return self._source_retention_required
+
+    def _cleanup_terminal_proven_snapshot(self) -> bool:
+        with self._state_lock:
+            return self._cleanup_terminal_proven
+
+    def _cleanup_terminal_diagnostic_snapshot(self) -> BaseException | None:
+        with self._state_lock:
+            return self._cleanup_terminal_diagnostic
 
     def _mark_source_retention_required_locked(
         self,
@@ -4690,12 +4706,17 @@ class _HostRefreshLockCleanupCoordinator:
             retention_reason=reason,
         )
         errors = self._wait_until_terminal(local_errors=list(decision_errors))
-        lease = self.owner.lease
-        if lease is not None and not lease.retention_snapshot().terminal:
-            raise LinuxCredentialInspectionInconclusive(
+        if not self._cleanup_terminal_proven_snapshot():
+            failure = LinuxCredentialInspectionInconclusive(
                 "host refresh-lock retention coordinator returned before "
-                "descriptor cleanup became terminal"
+                "descriptor cleanup was proven terminal"
             )
+            failure.__cause__ = _primary_cleanup_error(list(errors))
+            _attach_host_refresh_lock_recovery(
+                failure,
+                self._cleanup_terminal_diagnostic_snapshot(),
+            )
+            raise failure
         return errors
 
     def release_after_proven_cleanup(
@@ -4703,16 +4724,25 @@ class _HostRefreshLockCleanupCoordinator:
     ) -> _ClaudeRefreshLockCleanupResult:
         decision_errors = self._decide(_HostRefreshLockCleanupDecision.NORMAL_RELEASE)
         errors = self._wait_until_terminal(local_errors=list(decision_errors))
-        lease = self.owner.lease
-        terminal = lease is None or lease.retention_snapshot().terminal
         return _ClaudeRefreshLockCleanupResult(
             error=_primary_cleanup_error(list(errors)),
-            terminal=terminal,
+            terminal=self._cleanup_terminal_proven_snapshot(),
         )
 
     def cancel_without_lease(self) -> None:
         decision_errors = self._decide(_HostRefreshLockCleanupDecision.CANCEL)
-        self._wait_until_terminal(local_errors=list(decision_errors))
+        errors = self._wait_until_terminal(local_errors=list(decision_errors))
+        if not self._cleanup_terminal_proven_snapshot():
+            failure = LinuxCredentialInspectionInconclusive(
+                "host refresh-lock cancellation returned before descriptor "
+                "cleanup was proven terminal"
+            )
+            failure.__cause__ = _primary_cleanup_error(list(errors))
+            _attach_host_refresh_lock_recovery(
+                failure,
+                self._cleanup_terminal_diagnostic_snapshot(),
+            )
+            raise failure
 
     def _decide(
         self,
@@ -4782,10 +4812,8 @@ class _HostRefreshLockCleanupCoordinator:
                 except BaseException:
                     pass
         try:
-            lease = self.owner.lease
-            if lease is not None:
-                diagnostic = lease.retention_snapshot().diagnostic
-                _attach_host_refresh_lock_recovery(selected, diagnostic)
+            diagnostic = self._cleanup_terminal_diagnostic_snapshot()
+            _attach_host_refresh_lock_recovery(selected, diagnostic)
         except BaseException as recovery_error:
             if recovery_error is not selected:
                 try:
@@ -4872,6 +4900,7 @@ class _HostRefreshLockCleanupCoordinator:
         self,
         *,
         publish_ready_hint: bool,
+        cleanup_terminal_proof: _HostRefreshLockCleanupTerminalProof,
     ) -> None:
         events = (
             (self._ready, self._terminal) if publish_ready_hint else (self._terminal,)
@@ -4886,6 +4915,8 @@ class _HostRefreshLockCleanupCoordinator:
                 break
         with self._state_lock:
             self._terminal_errors = tuple(self._errors)
+            self._cleanup_terminal_proven = cleanup_terminal_proof.terminal
+            self._cleanup_terminal_diagnostic = cleanup_terminal_proof.diagnostic
             self._phase = _HostRefreshLockCleanupPhase.TERMINAL
             self._synchronous_cleanup_claimed = False
 
@@ -4954,15 +4985,23 @@ class _HostRefreshLockCleanupCoordinator:
         stable_lease: ClaudeRefreshLockLease | None,
         *,
         retry_scope: str,
-    ) -> None:
+    ) -> _HostRefreshLockCleanupTerminalProof:
         retry_error_counts: dict[str, int] = {}
         retry_error_summaries: dict[str, BaseException] = {}
         settlement_diagnostic = LinuxCredentialInspectionInconclusive(
             f"{retry_scope} host cleanup could not prove refresh-lock "
             "retention; preserving descriptor-bound residue"
         )
+        setattr(
+            settlement_diagnostic,
+            "_codex_claude_refresh_lock_descriptor_bound",
+            True,
+        )
         settlement_diagnostic_recorded = False
-        settlement_succeeded = False
+        lease_snapshot_attempts = 0
+        lease_settlement_attempts = 0
+        lease_proof_exhausted = False
+        lease_diagnostic: BaseException | None = None
         source_retention_attempts = 0
         source_settlement_attempts = 0
         source_settlement_diagnostic = LinuxCredentialInspectionInconclusive(
@@ -4980,6 +5019,8 @@ class _HostRefreshLockCleanupCoordinator:
             "_codex_claude_source_descriptor_residue",
             True,
         )
+
+        lease_terminal = stable_lease is None
 
         while True:
             source_retention_required = self._source_retention_required_snapshot()
@@ -5038,10 +5079,38 @@ class _HostRefreshLockCleanupCoordinator:
                         failure.__cause__ = source_settlement_diagnostic
                         raise failure
             source_terminal = not source_retention_required or self._source_terminal
-            lease_terminal = stable_lease is None
-            if stable_lease is not None:
+            if not source_terminal:
                 try:
-                    lease_terminal = stable_lease.retention_snapshot().terminal
+                    time.sleep(0.1)
+                except BaseException as error:
+                    self._record_bounded_cleanup_retry_error(
+                        error,
+                        stage="retry-backoff",
+                        summary_label=f"{retry_scope} retry backoff",
+                        counts=retry_error_counts,
+                        summaries=retry_error_summaries,
+                    )
+                    try:
+                        self._synchronous_retry_wait.wait(timeout=0.1)
+                    except BaseException as fallback_error:
+                        self._record_bounded_cleanup_retry_error(
+                            fallback_error,
+                            stage="retry-backoff",
+                            summary_label=f"{retry_scope} retry backoff",
+                            counts=retry_error_counts,
+                            summaries=retry_error_summaries,
+                        )
+                continue
+            if (
+                stable_lease is not None
+                and not lease_terminal
+                and not lease_proof_exhausted
+                and lease_snapshot_attempts
+                < CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS
+            ):
+                lease_snapshot_attempts += 1
+                try:
+                    lease_snapshot = stable_lease.retention_snapshot()
                 except BaseException as error:
                     self._record_bounded_cleanup_retry_error(
                         error,
@@ -5050,13 +5119,27 @@ class _HostRefreshLockCleanupCoordinator:
                         counts=retry_error_counts,
                         summaries=retry_error_summaries,
                     )
-            if source_terminal and lease_terminal:
-                return
-            if stable_lease is not None and not lease_terminal:
+                else:
+                    lease_terminal = lease_snapshot.terminal
+                    if lease_terminal:
+                        lease_diagnostic = lease_snapshot.diagnostic
+            if lease_terminal:
+                return _HostRefreshLockCleanupTerminalProof(
+                    terminal=True,
+                    diagnostic=lease_diagnostic,
+                )
+            if (
+                stable_lease is not None
+                and not lease_terminal
+                and not lease_proof_exhausted
+            ):
                 if not settlement_diagnostic_recorded:
                     self._record_worker_error_once(settlement_diagnostic)
                     settlement_diagnostic_recorded = True
-                if not settlement_succeeded:
+                if lease_settlement_attempts < (
+                    CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS
+                ):
+                    lease_settlement_attempts += 1
                     try:
                         recovery = stable_lease._settle_descriptor_bound_retention(
                             str(settlement_diagnostic)
@@ -5070,7 +5153,7 @@ class _HostRefreshLockCleanupCoordinator:
                             summaries=retry_error_summaries,
                         )
                     else:
-                        settlement_succeeded = True
+                        lease_diagnostic = recovery
                         try:
                             _attach_host_refresh_lock_recovery(
                                 settlement_diagnostic,
@@ -5086,7 +5169,23 @@ class _HostRefreshLockCleanupCoordinator:
                                 counts=retry_error_counts,
                                 summaries=retry_error_summaries,
                             )
-                        continue
+                        lease_terminal = True
+                if lease_terminal:
+                    return _HostRefreshLockCleanupTerminalProof(
+                        terminal=True,
+                        diagnostic=lease_diagnostic,
+                    )
+                lease_proof_exhausted = (
+                    lease_snapshot_attempts
+                    >= CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS
+                    and lease_settlement_attempts
+                    >= CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS
+                )
+                if lease_proof_exhausted:
+                    return _HostRefreshLockCleanupTerminalProof(
+                        terminal=False,
+                        diagnostic=settlement_diagnostic,
+                    )
             try:
                 time.sleep(0.1)
             except BaseException as error:
@@ -5162,12 +5261,13 @@ class _HostRefreshLockCleanupCoordinator:
                     "watcher required a cleanup handoff"
                 )
             )
-        self._wait_for_cleanup_terminal_proof(
+        cleanup_terminal_proof = self._wait_for_cleanup_terminal_proof(
             stable_lease,
             retry_scope="synchronous",
         )
         self._publish_synchronous_terminal_truth(
             publish_ready_hint=publish_ready_hint,
+            cleanup_terminal_proof=cleanup_terminal_proof,
         )
 
     def _take_over_dead_worker_cleanup(self) -> None:
@@ -5712,7 +5812,7 @@ class _HostRefreshLockCleanupCoordinator:
                     self._finalize_worker_retention()
                 except BaseException as retry_error:
                     self._record_worker_error_once(retry_error)
-            self._wait_for_cleanup_terminal_proof(
+            cleanup_terminal_proof = self._wait_for_cleanup_terminal_proof(
                 stable_lease,
                 retry_scope="worker",
             )
@@ -5725,6 +5825,10 @@ class _HostRefreshLockCleanupCoordinator:
                 break
             with self._state_lock:
                 self._terminal_errors = tuple(self._errors)
+                self._cleanup_terminal_proven = cleanup_terminal_proof.terminal
+                self._cleanup_terminal_diagnostic = (
+                    cleanup_terminal_proof.diagnostic
+                )
                 self._phase = _HostRefreshLockCleanupPhase.TERMINAL
 
 
@@ -5806,15 +5910,13 @@ def _retain_unmasked_credential_cleanup(
             )
         )
         mask_errors.extend(coordinator_errors)
-        cleanup_host_refresh_lock = host_refresh_lock_coordinator.owner.lease
-        if cleanup_host_refresh_lock is not None:
-            terminal_diagnostic = (
-                cleanup_host_refresh_lock.retention_snapshot().diagnostic
-            )
-            _attach_host_refresh_lock_recovery(
-                retention_error,
-                terminal_diagnostic,
-            )
+        coordinator_error = _primary_cleanup_error(list(coordinator_errors))
+        if coordinator_error is not None:
+            _add_cleanup_note(retention_error, coordinator_error)
+        _attach_host_refresh_lock_recovery(
+            retention_error,
+            host_refresh_lock_coordinator._cleanup_terminal_diagnostic_snapshot(),
+        )
         return retention_error
 
     watcher_is_started = watcher_started
@@ -6548,12 +6650,10 @@ def _stage_claude_credentials_anchored(
                     writeback_error = _primary_cleanup_error(
                         [coordinator_error, *coordinator_errors]
                     )
-                    terminal_diagnostic = (
-                        cleanup_host_refresh_lock.retention_snapshot().diagnostic
-                    )
                     _attach_host_refresh_lock_recovery(
                         writeback_error,
-                        terminal_diagnostic,
+                        host_refresh_lock_coordinator
+                        ._cleanup_terminal_diagnostic_snapshot(),
                     )
                 elif retain_for_recovery or not carrier_cleanup_proven:
                     if retain_for_recovery:
@@ -6575,12 +6675,10 @@ def _stage_claude_credentials_anchored(
                     selected_coordinator_error = _primary_cleanup_error(
                         [coordinator_error, *coordinator_errors]
                     )
-                    terminal_diagnostic = (
-                        cleanup_host_refresh_lock.retention_snapshot().diagnostic
-                    )
                     _attach_host_refresh_lock_recovery(
                         selected_coordinator_error,
-                        terminal_diagnostic,
+                        host_refresh_lock_coordinator
+                        ._cleanup_terminal_diagnostic_snapshot(),
                     )
                     if retain_for_recovery:
                         writeback_error = selected_coordinator_error
@@ -6600,12 +6698,10 @@ def _stage_claude_credentials_anchored(
                             "reach a terminal release state"
                         )
                     if host_refresh_lock_error is not None:
-                        terminal_diagnostic = (
-                            cleanup_host_refresh_lock.retention_snapshot().diagnostic
-                        )
                         _attach_host_refresh_lock_recovery(
                             host_refresh_lock_error,
-                            terminal_diagnostic,
+                            host_refresh_lock_coordinator
+                            ._cleanup_terminal_diagnostic_snapshot(),
                         )
                         writeback_error = _primary_cleanup_error(
                             [

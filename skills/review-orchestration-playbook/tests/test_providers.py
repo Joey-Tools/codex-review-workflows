@@ -2230,6 +2230,35 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIsNone(rendered.__context__)
         self.assertFalse(providers._claude_error_graph_contains(rendered, primary))
 
+    def test_cleanup_error_detach_respects_context_visibility(self) -> None:
+        sensitive_path = "/fixture/private/suppressed-detached-context/auth.json"
+        for suppress_context in (False, True):
+            with self.subTest(suppress_context=suppress_context):
+                primary = RuntimeError("fixture primary")
+                marker = sensitive_path if suppress_context else "visible-detached-context"
+                original_context = RuntimeError(marker)
+                secondary = OSError("fixture cleanup failure")
+                secondary.__cause__ = primary
+                secondary.__context__ = original_context
+                secondary.__suppress_context__ = suppress_context
+
+                rendered = providers._claude_cleanup_error_without_primary_backlink(
+                    secondary,
+                    primary,
+                )
+
+                self.assertIsNot(rendered, secondary)
+                self.assertIsNone(rendered.__cause__)
+                if suppress_context:
+                    self.assertIsNone(rendered.__context__)
+                else:
+                    self.assertIs(rendered.__context__, original_context)
+                formatted = self.format_exception_text(rendered)
+                if suppress_context:
+                    self.assertNotIn(marker, formatted)
+                else:
+                    self.assertIn(marker, formatted)
+
     def test_abandonment_double_control_flow_keeps_primary_recovery_metadata(
         self,
     ) -> None:
@@ -2434,6 +2463,43 @@ class ProviderPolicyTest(unittest.TestCase):
             )
         )
         self.assert_persistence_diagnostic_visible(interruption)
+
+    def test_persistence_diagnostic_legacy_fallback_respects_context_visibility(
+        self,
+    ) -> None:
+        class LegacyError(RuntimeError):
+            add_note = None
+
+        sensitive_path = "/fixture/private/suppressed-provider-context/auth.json"
+        for suppress_context in (False, True):
+            with self.subTest(suppress_context=suppress_context):
+                marker = sensitive_path if suppress_context else "visible-provider-context"
+                original_context = RuntimeError(marker)
+                primary = LegacyError("primary persistence failure")
+                primary.__context__ = original_context
+                primary.__suppress_context__ = suppress_context
+
+                providers._add_claude_persistence_note(
+                    primary,
+                    OSError("secondary persistence failure"),
+                )
+
+                diagnostic = primary.__cause__
+                self.assertIsInstance(
+                    diagnostic,
+                    providers.ClaudeCredentialPersistenceDiagnostic,
+                )
+                assert diagnostic is not None
+                if suppress_context:
+                    self.assertIsNone(diagnostic.__context__)
+                else:
+                    self.assertIs(diagnostic.__context__, original_context)
+                self.assertIs(primary.__context__, original_context)
+                formatted = self.format_exception_text(primary)
+                if suppress_context:
+                    self.assertNotIn(marker, formatted)
+                else:
+                    self.assertIn(marker, formatted)
 
     def attempt(
         self,

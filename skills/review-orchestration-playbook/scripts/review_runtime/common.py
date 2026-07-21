@@ -1096,7 +1096,7 @@ def _attach_process_secondary_failure(
     node = ReviewProcessSecondaryFailureDiagnostic(diagnostic)
     if primary.__cause__ is not None:
         node.__cause__ = primary.__cause__
-    elif primary.__context__ is not None:
+    elif not primary.__suppress_context__ and primary.__context__ is not None:
         node.__context__ = primary.__context__
     primary.__cause__ = node
 
