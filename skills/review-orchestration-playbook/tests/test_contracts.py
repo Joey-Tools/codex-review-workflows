@@ -3025,6 +3025,37 @@ class RepositoryContractTest(unittest.TestCase):
             contracts,
         )
 
+    def test_formal_guard_paths_resolve_from_manifest_bundle_root(self) -> None:
+        self.assertTrue((SKILL_SCOPE_ROOT / "agents").is_dir())
+        self.assertTrue((SKILL_SCOPE_ROOT / "skills").is_dir())
+        guard_relative = pathlib.Path(
+            "skills/review-orchestration-playbook/scripts/named_lane_guard"
+        )
+        guard = SKILL_SCOPE_ROOT / guard_relative
+        self.assertEqual(guard, SCRIPTS / "named_lane_guard")
+        self.assertTrue(guard.is_file())
+
+        expected = (
+            "<trusted-bundle-absolute-path>/"
+            "skills/review-orchestration-playbook/scripts/named_lane_guard"
+        )
+        flattened = "<trusted-bundle-absolute-path>/scripts/named_lane_guard"
+        for document in (
+            SKILL_ROOT / "SKILL.md",
+            SKILL_ROOT / "references/canonical-claude-lane.md",
+        ):
+            content = document.read_text(encoding="utf-8")
+            self.assertNotIn(flattened, content)
+            formal_lines = [
+                line
+                for line in content.splitlines()
+                if "<trusted-bundle-absolute-path>" in line
+                and "named_lane_guard" in line
+            ]
+            self.assertTrue(formal_lines)
+            for line in formal_lines:
+                self.assertIn(expected, line)
+
     def test_repo_visible_git_includes_are_blocked_without_expansion(self) -> None:
         agents = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
             encoding="utf-8"
