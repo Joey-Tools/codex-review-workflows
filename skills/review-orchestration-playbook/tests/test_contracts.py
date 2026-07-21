@@ -1383,6 +1383,33 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("16 KiB", content)
             self.assertIn("64 MiB", content)
 
+    def test_named_lane_runtime_import_closure_matches_control_manifest(self) -> None:
+        probe = "\n".join(
+            (
+                "import json",
+                "import sys",
+                "sys.dont_write_bytecode = True",
+                f"sys.path.insert(0, {str(SCRIPTS)!r})",
+                "import review_runtime.named_lane",
+                "print(json.dumps(sorted(name for name in sys.modules "
+                "if name == 'review_runtime' or name.startswith('review_runtime.'))))",
+            )
+        )
+        completed = subprocess.run(
+            (sys.executable, "-I", "-c", probe),
+            cwd=REPO_ROOT,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            completed.stdout.strip(),
+            '["review_runtime", "review_runtime.common", "review_runtime.named_lane"]',
+        )
+
     def test_self_policy_migration_uses_an_external_trusted_control_plane(
         self,
     ) -> None:
