@@ -278,6 +278,33 @@ class CliLifecycleTests(unittest.TestCase):
             )
         _assert_low_level_contract(self, json.loads(output.getvalue()))
 
+    def test_invalid_pr_url_fails_before_creating_runtime_directories(self) -> None:
+        with owned_temporary_directory("cli-invalid-pr-") as root:
+            retention = root / "retention"
+            checkout = root / "checkout"
+            code, payload = _invoke(
+                "preflight",
+                "--helper-state",
+                str(root / "helper-state"),
+                "--repo",
+                str(root / "repo"),
+                "--base",
+                "1" * 40,
+                "--head",
+                "2" * 40,
+                "--pr-url",
+                "https://github.example/owner/repo/pull/1?inject=true",
+                "--retention-root",
+                str(retention),
+                "--checkout-parent",
+                str(checkout),
+            )
+            self.assertEqual(code, 2)
+            self.assertEqual(payload["failure_stage"], "cli")
+            self.assertEqual(payload["failure_code"], "cli-failed")
+            self.assertFalse(retention.exists())
+            self.assertFalse(checkout.exists())
+
     def test_final_revalidates_the_sealed_artifact(self) -> None:
         with owned_temporary_directory("cli-final-") as root:
             retention = root / "retention"

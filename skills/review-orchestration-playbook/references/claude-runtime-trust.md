@@ -840,7 +840,10 @@ The broker is a reviewed, prebuilt universal Mach-O with arm64 and x86_64
 slices, hardened-runtime ad-hoc signatures, and a macOS 13.0 deployment target.
 Its source and tracked artifact live beside `providers.py`. Runtime code pins the
 artifact SHA-256 and both slice CDHashes, but never invokes a compiler or
-installer. Before credential selection, it requires the exact artifact at
+installer. The broker uses C11 `memset_s` to clear userspace credential,
+capability, script, and overflow-probe buffers before release or return. This
+does not claim that compiler registers, kernel buffers, or external process
+buffers are wiped. Before credential selection, it requires the exact artifact at
 `/Library/Joey-Tools/CodexReview/brokers/<sha256>/security`; every ancestor must
 be a real root-owned directory with no group/world write or extended ACL, and
 the leaf must be a root-owned single-link regular file with mode `0555`, no

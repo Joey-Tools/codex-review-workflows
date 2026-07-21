@@ -55,6 +55,7 @@ from .prompt import (
     prompt_evidence,
     render_prompt,
     reviewer_argv,
+    validate_canonical_pr_url,
     validate_final_message,
 )
 from .recovery_cleanup import (
@@ -200,6 +201,7 @@ def prepare_run(
     codex_executable: str | None,
     snapshot: Any,
 ) -> PreparedRun:
+    pr_url = validate_canonical_pr_url(pr_url)
     helper = authenticate_helper_state(
         state_dir=helper_state,
         repo=repo,
@@ -339,6 +341,7 @@ def preflight(
     git_executable: str,
     codex_executable: str | None,
 ) -> dict[str, Any]:
+    pr_url = validate_canonical_pr_url(pr_url)
     require_private_directory(retention_root, create=True)
     require_private_directory(checkout_parent, create=True)
     with acquire_retention_lease(
@@ -1013,6 +1016,7 @@ def run(
     git_executable: str,
     codex_executable: str | None,
 ) -> tuple[int, dict[str, Any]]:
+    pr_url = validate_canonical_pr_url(pr_url)
     require_private_directory(retention_root, create=True)
     require_private_directory(checkout_parent, create=True)
     lease = acquire_retention_lease(retention_root, deadline=time.monotonic() + 30)

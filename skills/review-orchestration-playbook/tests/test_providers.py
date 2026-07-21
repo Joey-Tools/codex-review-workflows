@@ -1371,6 +1371,19 @@ class ProviderPolicyTest(unittest.TestCase):
             providers.CLAUDE_KEYCHAIN_BROKER_ARTIFACT_SHA256,
         )
 
+    def test_claude_keychain_broker_source_uses_nonoptimizable_clearing(
+        self,
+    ) -> None:
+        source = providers.CLAUDE_KEYCHAIN_BROKER_ARTIFACT.with_suffix(".c")
+        text = source.read_text(encoding="utf-8")
+        self.assertLess(
+            text.index("#define __STDC_WANT_LIB_EXT1__ 1"),
+            text.index("#include <string.h>"),
+        )
+        self.assertIn("memset_s(", text)
+        self.assertNotIn("memset(", text)
+        self.assertIn("clear_sensitive(&overflow, sizeof(overflow));", text)
+
     @unittest.skipUnless(sys.platform == "darwin", "requires macOS toolchain")
     def test_claude_keychain_broker_artifact_native_identity_is_pinned(
         self,
@@ -1409,8 +1422,8 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
         )
         for architecture, expected_cdhash in (
-            ("arm64", "8186106f3c2ab605be123e98c7adaffd097fd081"),
-            ("x86_64", "338249f6d5124e16da7eec083fb7c21ae53f05b3"),
+            ("arm64", "8af40bf4caf7e2398fb59182082ea57caa12ed9a"),
+            ("x86_64", "a5de7fbd8785b8baddb34da1d8477aa4f741efa0"),
         ):
             with self.subTest(architecture=architecture):
                 signature = subprocess.run(
@@ -1463,6 +1476,26 @@ class ProviderPolicyTest(unittest.TestCase):
                     version_detail,
                     r"tool LD\s+version 1267\.0",
                 )
+
+                undefined_symbols = subprocess.run(
+                    (
+                        "/usr/bin/xcrun",
+                        "nm",
+                        "-u",
+                        "-arch",
+                        architecture,
+                        str(artifact),
+                    ),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=5,
+                )
+                symbol_detail = (
+                    undefined_symbols.stdout + undefined_symbols.stderr
+                ).decode("utf-8", errors="replace")
+                self.assertEqual(undefined_symbols.returncode, 0, symbol_detail)
+                self.assertIn("_memset_s", symbol_detail.splitlines())
 
     @unittest.skipUnless(sys.platform == "darwin", "requires macOS")
     def test_claude_keychain_broker_build_script_rejects_output_mode(self) -> None:

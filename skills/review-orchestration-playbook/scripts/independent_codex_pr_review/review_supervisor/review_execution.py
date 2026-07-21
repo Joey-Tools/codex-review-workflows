@@ -41,6 +41,7 @@ from .codex_executable import (
     SnapshotExecTarget,
     SnapshotProtectionEvidence,
     authenticate_codex_executable,
+    verify_macos_filesystem_metadata,
 )
 from .direct_gate import (
     AppServerProcessResult,
@@ -331,7 +332,10 @@ def run_authenticated_review(
     refresh_evidence: dict[str, Any] = {"status": "not-required"}
     try:
         try:
-            auth = load_external_auth(selected_auth_path)
+            auth = load_external_auth(
+                selected_auth_path,
+                filesystem_metadata_verifier=verify_macos_filesystem_metadata,
+            )
         except AuthCarrierRefreshRequired:
             refresh = _run_auth_refresh(
                 codex_executable=paths["codex_executable"],
@@ -349,8 +353,15 @@ def run_authenticated_review(
                 "requires_openai_auth": refresh.requires_openai_auth,
                 "process_closure": _refresh_closure_evidence(refresh.process_closure),
             }
-            auth = load_external_auth(selected_auth_path)
-        revalidate_external_auth_source(selected_auth_path, auth)
+            auth = load_external_auth(
+                selected_auth_path,
+                filesystem_metadata_verifier=verify_macos_filesystem_metadata,
+            )
+        revalidate_external_auth_source(
+            selected_auth_path,
+            auth,
+            filesystem_metadata_verifier=verify_macos_filesystem_metadata,
+        )
         liveness_checkpoint()
 
         process, state, auth_checks = _run_review(
@@ -573,11 +584,19 @@ def _run_review(
                 launch.target,
                 process_id=process.pid,
             )
-            revalidate_external_auth_source(auth_path, auth)
+            revalidate_external_auth_source(
+                auth_path,
+                auth,
+                filesystem_metadata_verifier=verify_macos_filesystem_metadata,
+            )
             auth_checks["launch"] = True
 
         def before_external_auth_send() -> None:
-            revalidate_external_auth_source(auth_path, auth)
+            revalidate_external_auth_source(
+                auth_path,
+                auth,
+                filesystem_metadata_verifier=verify_macos_filesystem_metadata,
+            )
             auth_checks["serialization"] = True
 
         lifecycle.begin("reviewer")

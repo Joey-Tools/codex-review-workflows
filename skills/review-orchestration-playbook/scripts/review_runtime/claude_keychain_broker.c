@@ -1,3 +1,5 @@
+#define __STDC_WANT_LIB_EXT1__ 1
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
@@ -24,6 +26,15 @@ static const char *const kIdentitySocketEnvironment =
     "CODEX_CLAUDE_KEYCHAIN_BROKER_IDENTITY_SOCKET";
 static const uint32_t kMaximumCredentialLength = 1024U * 1024U;
 static const size_t kCapabilityLength = 32U;
+
+static void clear_sensitive(void *buffer, size_t length) {
+  if (length == 0U) {
+    return;
+  }
+  if (buffer == NULL || memset_s(buffer, length, 0, length) != 0) {
+    _exit(1);
+  }
+}
 
 static int is_valid_account(const char *account) {
   if (account == NULL || *account == '\0') {
@@ -134,7 +145,7 @@ static int decode_hex(const char *hex, size_t hex_length,
     int high = hex_nibble(hex[index * 2U]);
     int low = hex_nibble(hex[index * 2U + 1U]);
     if (high < 0 || low < 0) {
-      memset(decoded, 0, decoded_length);
+      clear_sensitive(decoded, decoded_length);
       free(decoded);
       return -1;
     }
@@ -159,7 +170,7 @@ static int read_update_script(const char *account, unsigned char **credential,
       if (errno == EINTR) {
         continue;
       }
-      memset(script, 0, used);
+      clear_sensitive(script, used);
       free(script);
       return -1;
     }
@@ -170,12 +181,15 @@ static int read_update_script(const char *account, unsigned char **credential,
   }
   if (used == maximum) {
     char overflow = 0;
-    if (read(STDIN_FILENO, &overflow, 1) != 0) {
-      memset(script, 0, used);
+    ssize_t overflow_received = read(STDIN_FILENO, &overflow, 1);
+    clear_sensitive(&overflow, sizeof(overflow));
+    if (overflow_received != 0) {
+      clear_sensitive(script, used);
       free(script);
       return -1;
     }
   }
+  size_t sensitive_length = used;
   script[used] = '\0';
   char prefix[512] = {0};
   int prefix_length = snprintf(
@@ -184,7 +198,7 @@ static int read_update_script(const char *account, unsigned char **credential,
   if (prefix_length < 0 || (size_t)prefix_length >= sizeof(prefix) ||
       used <= (size_t)prefix_length + 1U ||
       memcmp(script, prefix, (size_t)prefix_length) != 0) {
-    memset(script, 0, used);
+    clear_sensitive(script, sensitive_length);
     free(script);
     return -1;
   }
@@ -192,21 +206,21 @@ static int read_update_script(const char *account, unsigned char **credential,
     used--;
   }
   if (used <= (size_t)prefix_length || script[used - 1U] != '"') {
-    memset(script, 0, used);
+    clear_sensitive(script, sensitive_length);
     free(script);
     return -1;
   }
   size_t hex_length = used - (size_t)prefix_length - 1U;
   int result =
       decode_hex(script + prefix_length, hex_length, credential, length);
-  memset(script, 0, used);
+  clear_sensitive(script, sensitive_length);
   free(script);
   return result;
 }
 
 static void clear_credential(unsigned char **credential, uint32_t length) {
   if (*credential != NULL) {
-    memset(*credential, 0, length);
+    clear_sensitive(*credential, length);
     free(*credential);
     *credential = NULL;
   }
@@ -257,12 +271,12 @@ int main(int argc, char *argv[]) {
   unsigned char capability[32] = {0};
   if (broker_capability(capability) != 0 ||
       write_all(client, capability, sizeof(capability)) != 0) {
-    memset(capability, 0, sizeof(capability));
+    clear_sensitive(capability, sizeof(capability));
     clear_credential(&updated_credential, updated_length);
     close(client);
     return 1;
   }
-  memset(capability, 0, sizeof(capability));
+  clear_sensitive(capability, sizeof(capability));
   unsigned char authorization = 1;
   if (read_all(client, &authorization, 1) != 0 || authorization != 0) {
     clear_credential(&updated_credential, updated_length);
@@ -316,7 +330,7 @@ int main(int argc, char *argv[]) {
     return 1;
   }
   if (read_all(client, credential, length) != 0) {
-    memset(credential, 0, length);
+    clear_sensitive(credential, length);
     free(credential);
     close(client);
     return 1;
@@ -328,7 +342,7 @@ int main(int argc, char *argv[]) {
       write_all(STDOUT_FILENO, "\n", 1) != 0) {
     result = 1;
   }
-  memset(credential, 0, length);
+  clear_sensitive(credential, length);
   free(credential);
   return result;
 }

@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-EXPECTED_SHA256="e4793061f89c46965e95a2c87e557c85215b334f42ddf8b8e866814574308cbb"
-EXPECTED_SIZE=101712
+EXPECTED_SHA256="fcdf6d473ec5c6fa76488da0b115d147fe5e5fa576ed33710ecd3fd7186e0b46"
+EXPECTED_SIZE=101728
 
 fail() {
   printf 'error: %s\n' "$*" >&2

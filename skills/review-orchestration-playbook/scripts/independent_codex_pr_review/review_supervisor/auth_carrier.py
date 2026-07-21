@@ -12,8 +12,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from .appserver_protocol import ExternalChatGPTAuth
+from .codex_executable import (
+    FilesystemMetadataVerifier,
+    verify_filesystem_metadata_evidence,
+)
 from .models import Identity
-from .secureio import identity_from_stat, open_regular_nofollow, read_fd_exact
+from .secureio import identity_from_stat, open_regular_at, read_fd_exact
 
 
 MAX_AUTH_FILE_BYTES = 64 * 1024
@@ -32,6 +36,7 @@ class AuthCarrierRefreshRequired(AuthCarrierError):
 @dataclass(frozen=True)
 class ExternalAuthEvidence:
     auth: ExternalChatGPTAuth
+    source_directory_identity: tuple[int, int, int, int, int, int, int]
     source_identity: Identity
     source_mtime_ns: int
     source_ctime_ns: int
@@ -63,14 +68,25 @@ class _AuthLoadOutcome:
     failure: _AuthLoadFailure | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _AuthSourceSnapshot:
+    raw: bytes | None
+    directory_identity: tuple[int, int, int, int, int, int, int]
+    source_identity: Identity
+    source_mtime_ns: int
+    source_ctime_ns: int
+
+
 def load_external_auth(
     auth_path: pathlib.Path,
     *,
+    filesystem_metadata_verifier: FilesystemMetadataVerifier,
     minimum_remaining_seconds: int = MIN_ACCESS_TOKEN_REMAINING_SECONDS,
     now: float | None = None,
 ) -> ExternalAuthEvidence:
     outcome = _load_external_auth_boundary(
         auth_path=auth_path,
+        filesystem_metadata_verifier=filesystem_metadata_verifier,
         minimum_remaining_seconds=minimum_remaining_seconds,
         now=now,
     )
@@ -90,6 +106,7 @@ def load_external_auth(
 def _load_external_auth_boundary(
     *,
     auth_path: pathlib.Path,
+    filesystem_metadata_verifier: FilesystemMetadataVerifier,
     minimum_remaining_seconds: int,
     now: float | None,
 ) -> _AuthLoadOutcome:
@@ -97,6 +114,7 @@ def _load_external_auth_boundary(
         return _AuthLoadOutcome(
             evidence=_load_external_auth_inner(
                 auth_path,
+                filesystem_metadata_verifier=filesystem_metadata_verifier,
                 minimum_remaining_seconds=minimum_remaining_seconds,
                 now=now,
             )
@@ -121,6 +139,7 @@ def _load_external_auth_boundary(
 def _load_external_auth_inner(
     auth_path: pathlib.Path,
     *,
+    filesystem_metadata_verifier: FilesystemMetadataVerifier,
     minimum_remaining_seconds: int,
     now: float | None,
 ) -> ExternalAuthEvidence:
@@ -131,43 +150,14 @@ def _load_external_auth_inner(
         or not 60 <= minimum_remaining_seconds <= 24 * 60 * 60
     ):
         raise AuthCarrierError("external-auth input policy is invalid")
-    try:
-        fd, identity = open_regular_nofollow(
-            auth_path,
-            expected_uid=os.getuid(),
-            require_link_one=True,
-        )
-        try:
-            descriptor_before = os.fstat(fd)
-            path_before = os.lstat(auth_path)
-            generation_before = _auth_generation(descriptor_before)
-            if (
-                identity_from_stat(descriptor_before) != identity
-                or _auth_generation(path_before) != generation_before
-            ):
-                raise AuthCarrierError("auth carrier changed before it was read")
-            if stat.S_IMODE(descriptor_before.st_mode) != 0o600:
-                raise AuthCarrierError("auth carrier mode is not exactly 0600")
-            if not 1 <= descriptor_before.st_size <= MAX_AUTH_FILE_BYTES:
-                raise AuthCarrierError("auth carrier length is outside its bound")
-            raw = read_fd_exact(
-                fd,
-                max_bytes=MAX_AUTH_FILE_BYTES,
-                expected_size=descriptor_before.st_size,
-            )
-            descriptor_after = os.fstat(fd)
-            path_after = os.lstat(auth_path)
-            if any(
-                _auth_generation(candidate) != generation_before
-                for candidate in (descriptor_after, path_after)
-            ):
-                raise AuthCarrierError("auth carrier changed while it was read")
-        finally:
-            os.close(fd)
-    except AuthCarrierError:
-        raise
-    except (OSError, ValueError) as error:
-        raise AuthCarrierError("auth carrier could not be read safely") from error
+    snapshot = _inspect_auth_source(
+        auth_path,
+        filesystem_metadata_verifier=filesystem_metadata_verifier,
+        read_content=True,
+    )
+    raw = snapshot.raw
+    if raw is None:
+        raise AuthCarrierError("auth carrier validation produced no content")
 
     value = _decode_json(raw)
     if value.get("auth_mode") != "chatgpt":
@@ -220,9 +210,10 @@ def _load_external_auth_inner(
     )
     return ExternalAuthEvidence(
         auth=auth,
-        source_identity=identity,
-        source_mtime_ns=descriptor_after.st_mtime_ns,
-        source_ctime_ns=descriptor_after.st_ctime_ns,
+        source_directory_identity=snapshot.directory_identity,
+        source_identity=snapshot.source_identity,
+        source_mtime_ns=snapshot.source_mtime_ns,
+        source_ctime_ns=snapshot.source_ctime_ns,
         access_token_expires_at=expiration,
         access_token_sha256=hashlib.sha256(access_token_bytes).hexdigest(),
         account_id_sha256=hashlib.sha256(account_id_bytes).hexdigest(),
@@ -234,6 +225,7 @@ def revalidate_external_auth_source(
     auth_path: pathlib.Path,
     evidence: ExternalAuthEvidence,
     *,
+    filesystem_metadata_verifier: FilesystemMetadataVerifier,
     now: float | None = None,
 ) -> None:
     if (
@@ -243,25 +235,14 @@ def revalidate_external_auth_source(
         or not 60 <= evidence.minimum_remaining_seconds <= 24 * 60 * 60
     ):
         raise AuthCarrierError("external-auth evidence is malformed")
-    try:
-        fd, identity = open_regular_nofollow(
-            auth_path,
-            expected_uid=os.getuid(),
-            require_link_one=True,
-        )
-        try:
-            descriptor = os.fstat(fd)
-            path_metadata = os.lstat(auth_path)
-        finally:
-            os.close(fd)
-    except (OSError, ValueError):
-        raise AuthCarrierError(
-            "auth carrier generation cannot be revalidated"
-        ) from None
+    snapshot = _inspect_auth_source(
+        auth_path,
+        filesystem_metadata_verifier=filesystem_metadata_verifier,
+        read_content=False,
+    )
     if (
-        _auth_generation(descriptor) != _evidence_generation(evidence)
-        or _auth_generation(path_metadata) != _evidence_generation(evidence)
-        or identity != evidence.source_identity
+        snapshot.directory_identity != evidence.source_directory_identity
+        or _snapshot_generation(snapshot) != _evidence_generation(evidence)
     ):
         raise AuthCarrierError("auth carrier generation changed before use")
     current_time = _validated_current_time(now)
@@ -271,6 +252,155 @@ def revalidate_external_auth_source(
         raise AuthCarrierError(
             "access token no longer covers the bounded review runtime"
         )
+
+
+def _inspect_auth_source(
+    auth_path: pathlib.Path,
+    *,
+    filesystem_metadata_verifier: FilesystemMetadataVerifier,
+    read_content: bool,
+) -> _AuthSourceSnapshot:
+    if (
+        not isinstance(auth_path, pathlib.Path)
+        or not auth_path.is_absolute()
+        or auth_path.name != "auth.json"
+        or any(part in {".", ".."} for part in auth_path.parts)
+        or not callable(filesystem_metadata_verifier)
+        or type(read_content) is not bool
+    ):
+        raise AuthCarrierError("external-auth input policy is invalid")
+    directory_fd = -1
+    source_fd = -1
+    snapshot: _AuthSourceSnapshot | None = None
+    failure: BaseException | None = None
+    try:
+        directory_fd = os.open(
+            auth_path.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        directory_before = os.fstat(directory_fd)
+        directory_path_before = os.lstat(auth_path.parent)
+        directory_identity = _directory_object_identity(directory_before)
+        if (
+            not stat.S_ISDIR(directory_before.st_mode)
+            or directory_before.st_uid != os.getuid()
+            or stat.S_IMODE(directory_before.st_mode) != 0o700
+            or _directory_object_identity(directory_path_before) != directory_identity
+        ):
+            raise AuthCarrierError("auth carrier directory is not owner-only")
+        directory_metadata_before = verify_filesystem_metadata_evidence(
+            filesystem_metadata_verifier,
+            directory_fd,
+            auth_path.parent,
+            "directory",
+        )
+
+        source_fd, source_identity = open_regular_at(
+            directory_fd,
+            b"auth.json",
+            expected_uid=os.getuid(),
+            require_link_one=True,
+        )
+        source_before = os.fstat(source_fd)
+        source_path_before = os.stat(
+            b"auth.json",
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        source_generation = _auth_generation(source_before)
+        if (
+            identity_from_stat(source_before) != source_identity
+            or _auth_generation(source_path_before) != source_generation
+        ):
+            raise AuthCarrierError("auth carrier changed before it was read")
+        if stat.S_IMODE(source_before.st_mode) != 0o600:
+            raise AuthCarrierError("auth carrier mode is not exactly 0600")
+        if not 1 <= source_before.st_size <= MAX_AUTH_FILE_BYTES:
+            raise AuthCarrierError("auth carrier length is outside its bound")
+        source_metadata_before = verify_filesystem_metadata_evidence(
+            filesystem_metadata_verifier,
+            source_fd,
+            auth_path,
+            "file",
+        )
+        raw = (
+            read_fd_exact(
+                source_fd,
+                max_bytes=MAX_AUTH_FILE_BYTES,
+                expected_size=source_before.st_size,
+            )
+            if read_content
+            else None
+        )
+
+        directory_metadata_after = verify_filesystem_metadata_evidence(
+            filesystem_metadata_verifier,
+            directory_fd,
+            auth_path.parent,
+            "directory",
+        )
+        source_metadata_after = verify_filesystem_metadata_evidence(
+            filesystem_metadata_verifier,
+            source_fd,
+            auth_path,
+            "file",
+        )
+        directory_path_after = os.lstat(auth_path.parent)
+        directory_after = os.fstat(directory_fd)
+        source_after = os.fstat(source_fd)
+        source_path_after = os.stat(
+            b"auth.json",
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if (
+            _auth_generation(source_after) != source_generation
+            or _auth_generation(source_path_after) != source_generation
+            or _directory_object_identity(directory_after) != directory_identity
+            or _directory_object_identity(directory_path_after) != directory_identity
+            or directory_metadata_after != directory_metadata_before
+            or source_metadata_after != source_metadata_before
+        ):
+            raise AuthCarrierError("auth carrier changed while it was inspected")
+        snapshot = _AuthSourceSnapshot(
+            raw=raw,
+            directory_identity=directory_identity,
+            source_identity=source_identity,
+            source_mtime_ns=source_after.st_mtime_ns,
+            source_ctime_ns=source_after.st_ctime_ns,
+        )
+    except BaseException as error:
+        failure = error
+    finally:
+        for fd in (source_fd, directory_fd):
+            if fd < 0:
+                continue
+            try:
+                os.close(fd)
+            except BaseException as error:
+                if failure is None:
+                    failure = error
+    if isinstance(failure, AuthCarrierError):
+        raise failure
+    if failure is not None:
+        raise AuthCarrierError("auth carrier could not be inspected safely") from None
+    if snapshot is None:
+        raise AuthCarrierError("auth carrier validation produced no snapshot")
+    return snapshot
+
+
+def _directory_object_identity(
+    value: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_uid,
+        value.st_gid,
+        getattr(value, "st_flags", 0),
+        getattr(value, "st_gen", 0),
+    )
 
 
 def _validated_current_time(now: float | None) -> int | float:
@@ -303,6 +433,17 @@ def _evidence_generation(
         evidence.source_size,
         evidence.source_mtime_ns,
         evidence.source_ctime_ns,
+    )
+
+
+def _snapshot_generation(
+    snapshot: _AuthSourceSnapshot,
+) -> tuple[Identity, int, int, int]:
+    return (
+        snapshot.source_identity,
+        snapshot.source_identity.size,
+        snapshot.source_mtime_ns,
+        snapshot.source_ctime_ns,
     )
 
 

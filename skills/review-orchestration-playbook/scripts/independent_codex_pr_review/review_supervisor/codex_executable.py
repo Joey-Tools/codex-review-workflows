@@ -913,6 +913,18 @@ def _verify_extended_metadata(
     return evidence
 
 
+def verify_filesystem_metadata_evidence(
+    verifier: FilesystemMetadataVerifier,
+    fd: int,
+    path: pathlib.Path,
+    kind: str,
+) -> ExtendedMetadataEvidence:
+    evidence = _verify_extended_metadata(verifier, fd, path, kind)
+    if evidence is None:
+        raise ValueError("filesystem metadata verifier is required")
+    return evidence
+
+
 def _seatbelt_string(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 

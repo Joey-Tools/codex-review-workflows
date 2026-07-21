@@ -457,3 +457,32 @@ metadata behavior.
   contract tests pass. Ruff lint and formatting, compileall, actionlint,
   canonical CI fixture equality, project-journal validation, the official
   skill validator, synthetic-token validation, and `git diff --check` pass.
+- A fresh-context Codex review of
+  `3134c1cb849ad473f154f4a2ad73ca96484a34ca..6a0f8989ac2fdbb0a9607f20c6c090c9f51624d7`
+  found three remaining trust gaps: the external ChatGPT auth carrier did not
+  reject extended ACLs, arbitrary printable PR URLs remained inside the trusted
+  model instruction zone, and the native Keychain broker used optimizable
+  `memset` calls for sensitive buffers.
+- Auth loading and every subsequent use boundary now open the exact owner-only
+  `.codex` directory and `auth.json` through retained no-follow descriptors,
+  bind the stable directory and file generations, and run the shared macOS
+  ACL/xattr verifier before and after inspection. Directory replacement,
+  metadata races, malformed verifier evidence, and descriptor-close uncertainty
+  fail closed. PR URLs must be byte-canonical HTTPS pull-request URLs before any
+  runtime directory is created and are revalidated when model input is built;
+  the URL is retained only in a canonical JSON block explicitly labeled as
+  untrusted review metadata. The broker now uses C11 `memset_s` for credential,
+  capability, script, and overflow-probe buffers. Its universal artifact is
+  pinned at SHA-256
+  `fcdf6d473ec5c6fa76488da0b115d147fe5e5fa576ed33710ecd3fd7186e0b46`,
+  size 101728, with arm64 CDHash
+  `8af40bf4caf7e2398fb59182082ea57caa12ed9a` and x86_64 CDHash
+  `a5de7fbd8785b8baddb34da1d8477aa4f741efa0`; both slices import
+  `_memset_s`.
+- Final remediation validation used only Python 3.13. The host-level main suite
+  ran 1,430 tests with 5 platform skips and no failures; the deterministic
+  independent suite ran 286 tests with zero skips; 40 repository contract tests
+  and the native broker read/update and installer regressions pass. The pinned
+  Xcode 26.6 / SDK 26.5 developer build reproduced the broker byte-for-byte.
+  Ruff lint and the relevant format gate, compileall, Bash syntax, ShellCheck,
+  actionlint, canonical CI fixture equality, and `git diff --check` pass.

@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 from review_supervisor.appserver_protocol import (
     AppServerSessionResult,
 )
+from review_supervisor.auth_carrier import AuthCarrierRefreshRequired
 from review_supervisor.auth_refresh import (
     ManagedAuthRefreshClosureReceipt,
     ManagedAuthRefreshLaunchRequest,
@@ -204,10 +205,105 @@ class ReviewExecutionTests(unittest.TestCase):
                     auth_path=auth_path,
                 )
             self.assertEqual(load.call_count, 1)
-            revalidate.assert_called_once()
+            self.assertIs(
+                load.call_args.kwargs["filesystem_metadata_verifier"],
+                execution.verify_macos_filesystem_metadata,
+            )
+            revalidate.assert_called_once_with(
+                auth_path,
+                load.return_value,
+                filesystem_metadata_verifier=execution.verify_macos_filesystem_metadata,
+            )
             refresh.assert_not_called()
             self.assertEqual(result.auth_refresh, {"status": "not-required"})
             self.assertTrue(lease.cleaned)
+
+    def test_refreshed_auth_uses_the_filesystem_verifier_before_review(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = pathlib.Path(raw_root)
+            auth_home = root / "home" / ".codex"
+            auth_home.mkdir(parents=True, mode=0o700)
+            auth_path = auth_home / "auth.json"
+            lifecycle = _Lifecycle()
+            lease = _Lease(root / "run")
+            state = ProcessCustodyState(
+                leader_reaped=True,
+                process_group_empty=True,
+                pipes_closed=True,
+                exit_code=0,
+            )
+            closure = ManagedAuthRefreshClosureReceipt(
+                pid=424242,
+                process_group_id=424242,
+                session_id=424242,
+                profile_sha256="a" * 64,
+                exit_code=0,
+                leader_reaped=True,
+                process_group_empty=True,
+                stdio_closed=True,
+            )
+            refresh_result = ManagedAuthRefreshResult(
+                refresh_completed=True,
+                managed_auth_verified=True,
+                codex_home_verified=True,
+                requires_openai_auth=False,
+                process_closure=closure,
+            )
+            refreshed_auth = object()
+            with (
+                patch.object(execution, "_allocate_runtime_lease", return_value=lease),
+                patch.object(
+                    execution,
+                    "load_external_auth",
+                    side_effect=(
+                        AuthCarrierRefreshRequired("synthetic refresh"),
+                        refreshed_auth,
+                    ),
+                ) as load,
+                patch.object(
+                    execution, "revalidate_external_auth_source"
+                ) as revalidate,
+                patch.object(
+                    execution,
+                    "_run_auth_refresh",
+                    return_value=refresh_result,
+                ),
+                patch.object(
+                    execution,
+                    "_run_review",
+                    return_value=(
+                        _process(),
+                        state,
+                        {"launch": True, "serialization": True},
+                    ),
+                ),
+            ):
+                execution.run_authenticated_review(
+                    codex_executable=root / "codex",
+                    aggregate_schema_path=root / "schema.json",
+                    runtime_root=root / "runtime",
+                    repo=root / "repo",
+                    helper_root=root / "helper",
+                    retention_root=root / "retention",
+                    checkout_root=root / "checkout",
+                    prompt=b"review",
+                    requested_model="gpt-5.6-sol",
+                    requested_reasoning_effort="xhigh",
+                    lifecycle=lifecycle,
+                    auth_path=auth_path,
+                )
+
+            self.assertEqual(load.call_count, 2)
+            for call in load.call_args_list:
+                self.assertIs(
+                    call.kwargs["filesystem_metadata_verifier"],
+                    execution.verify_macos_filesystem_metadata,
+                )
+            revalidate.assert_called_once_with(
+                auth_path,
+                refreshed_auth,
+                filesystem_metadata_verifier=execution.verify_macos_filesystem_metadata,
+            )
 
     def test_refresh_preparation_outer_drop_cleans_never_launched_custody(
         self,
@@ -613,6 +709,89 @@ class ReviewExecutionTests(unittest.TestCase):
                         ("closed", "reviewer", 29),
                     ],
                 )
+            finally:
+                os.close(fd)
+
+    def test_review_revalidates_auth_metadata_at_both_send_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = pathlib.Path(raw_root)
+            snapshot = root / "codex.snapshot"
+            snapshot.write_bytes(b"snapshot")
+            fd = os.open(snapshot, os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                custody = _Custody(fd, snapshot)
+                lifecycle = _Lifecycle()
+                lease = _Lease(root / "run")
+                process = _launched()
+                launch = execution._PreparedCustodiedLaunch(
+                    custody=custody,
+                    prepared=Mock(),
+                    target=Mock(),
+                    handoff_token="d" * 64,
+                    profile_sha256=process.profile_sha256,
+                    writable_roots=execution._HeldWritableRoots((), ()),
+                )
+
+                def run_process(**kwargs: object) -> AppServerProcessResult:
+                    state = kwargs["process_state"]
+                    state.process_id = process.pid
+                    state.process_group_id = process.pgid
+                    state.profile_sha256 = process.profile_sha256
+                    kwargs["on_launch"](process)
+                    kwargs["before_external_auth_send"]()
+                    state.exit_code = 0
+                    state.leader_reaped = True
+                    state.process_group_empty = True
+                    state.pipes_closed = True
+                    return _process()
+
+                auth_path = root / "home" / ".codex" / "auth.json"
+                auth = Mock()
+                with (
+                    patch.object(
+                        execution,
+                        "authenticate_codex_executable",
+                        return_value=custody,
+                    ),
+                    patch.object(
+                        execution,
+                        "_prepare_custodied_launch",
+                        return_value=launch,
+                    ),
+                    patch.object(
+                        execution,
+                        "run_bounded_appserver_process",
+                        side_effect=run_process,
+                    ),
+                    patch.object(
+                        execution, "revalidate_external_auth_source"
+                    ) as revalidate,
+                ):
+                    _, _, auth_checks = execution._run_review(
+                        codex_executable=snapshot,
+                        aggregate_schema_path=root / "schema.json",
+                        exclusions=Mock(),
+                        auth_path=auth_path,
+                        auth=auth,
+                        lease=lease,
+                        prompt=b"review",
+                        requested_model="gpt-5.6-sol",
+                        requested_reasoning_effort="xhigh",
+                        lifecycle=lifecycle,
+                        liveness_checkpoint=lambda: None,
+                    )
+
+                self.assertEqual(
+                    auth_checks,
+                    {"launch": True, "serialization": True},
+                )
+                self.assertEqual(revalidate.call_count, 2)
+                for call in revalidate.call_args_list:
+                    self.assertEqual(call.args, (auth_path, auth))
+                    self.assertIs(
+                        call.kwargs["filesystem_metadata_verifier"],
+                        execution.verify_macos_filesystem_metadata,
+                    )
             finally:
                 os.close(fd)
 

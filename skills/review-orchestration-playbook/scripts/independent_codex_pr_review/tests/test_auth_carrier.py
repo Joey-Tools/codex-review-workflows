@@ -6,6 +6,7 @@ import os
 import pathlib
 import tempfile
 import unittest
+from typing import Any
 from unittest import mock
 
 import review_supervisor.auth_carrier as auth_carrier
@@ -13,12 +14,50 @@ import review_supervisor.auth_carrier as auth_carrier
 from review_supervisor.auth_carrier import (
     AuthCarrierError,
     AuthCarrierRefreshRequired,
-    load_external_auth,
-    revalidate_external_auth_source,
+    ExternalAuthEvidence,
 )
+from review_supervisor.codex_executable import ExtendedMetadataEvidence
 
 
 SYNTHETIC_REFRESH_TOKEN = "codex_synth_v1_refresh_a"  # Catalog id: refresh-a.
+CLEAN_METADATA = ExtendedMetadataEvidence(
+    acl_entry_count=0,
+    xattrs=(),
+    quarantine_present=False,
+)
+
+
+def clean_filesystem_metadata(
+    fd: int,
+    path: pathlib.Path,
+    kind: str,
+) -> ExtendedMetadataEvidence:
+    del fd, path, kind
+    return CLEAN_METADATA
+
+
+def load_external_auth(
+    auth_path: pathlib.Path,
+    **kwargs: Any,
+) -> ExternalAuthEvidence:
+    return auth_carrier.load_external_auth(
+        auth_path,
+        filesystem_metadata_verifier=clean_filesystem_metadata,
+        **kwargs,
+    )
+
+
+def revalidate_external_auth_source(
+    auth_path: pathlib.Path,
+    evidence: ExternalAuthEvidence,
+    **kwargs: Any,
+) -> None:
+    auth_carrier.revalidate_external_auth_source(
+        auth_path,
+        evidence,
+        filesystem_metadata_verifier=clean_filesystem_metadata,
+        **kwargs,
+    )
 
 
 def jwt(payload: dict[str, object]) -> str:
@@ -71,6 +110,150 @@ class AuthCarrierTests(unittest.TestCase):
         self.assertNotIn(evidence.auth.access_token, repr(evidence))
         self.assertNotIn(SYNTHETIC_REFRESH_TOKEN, repr(evidence))
         self.assertNotIn("account-1", json.dumps(evidence.to_json()))
+
+    def test_rejects_directory_and_file_extended_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = pathlib.Path(raw_root)
+            path = self.write_auth(root, expiration=10_000)
+
+            for blocked_path in (root, path):
+                with self.subTest(blocked_path=blocked_path.name):
+
+                    def reject_metadata(
+                        fd: int,
+                        candidate: pathlib.Path,
+                        kind: str,
+                    ) -> ExtendedMetadataEvidence:
+                        del fd, kind
+                        if candidate == blocked_path:
+                            raise ValueError("synthetic ACL")
+                        return CLEAN_METADATA
+
+                    with self.assertRaisesRegex(
+                        AuthCarrierError,
+                        "could not be inspected safely",
+                    ):
+                        auth_carrier.load_external_auth(
+                            path,
+                            filesystem_metadata_verifier=reject_metadata,
+                            now=1_000,
+                            minimum_remaining_seconds=2_700,
+                        )
+
+    def test_verifies_directory_and_file_metadata_at_every_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = pathlib.Path(raw_root)
+            path = self.write_auth(root, expiration=10_000)
+            calls: list[tuple[pathlib.Path, str]] = []
+
+            def record_metadata(
+                fd: int,
+                candidate: pathlib.Path,
+                kind: str,
+            ) -> ExtendedMetadataEvidence:
+                del fd
+                calls.append((candidate, kind))
+                return CLEAN_METADATA
+
+            evidence = auth_carrier.load_external_auth(
+                path,
+                filesystem_metadata_verifier=record_metadata,
+                now=1_000,
+                minimum_remaining_seconds=2_700,
+            )
+            expected = [
+                (root, "directory"),
+                (path, "file"),
+                (root, "directory"),
+                (path, "file"),
+            ]
+            self.assertEqual(calls, expected)
+
+            calls.clear()
+            auth_carrier.revalidate_external_auth_source(
+                path,
+                evidence,
+                filesystem_metadata_verifier=record_metadata,
+                now=1_000,
+            )
+            self.assertEqual(calls, expected)
+
+            def reject_file_metadata(
+                fd: int,
+                candidate: pathlib.Path,
+                kind: str,
+            ) -> ExtendedMetadataEvidence:
+                del fd, kind
+                if candidate == path:
+                    raise OSError("synthetic ACL race")
+                return CLEAN_METADATA
+
+            with self.assertRaisesRegex(
+                AuthCarrierError,
+                "could not be inspected safely",
+            ):
+                auth_carrier.revalidate_external_auth_source(
+                    path,
+                    evidence,
+                    filesystem_metadata_verifier=reject_file_metadata,
+                    now=1_000,
+                )
+
+    def test_rejects_malformed_filesystem_metadata_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = self.write_auth(pathlib.Path(raw_root), expiration=10_000)
+
+            def malformed_metadata(
+                fd: int,
+                candidate: pathlib.Path,
+                kind: str,
+            ) -> object:
+                del fd, candidate, kind
+                return object()
+
+            with self.assertRaisesRegex(
+                AuthCarrierError,
+                "could not be inspected safely",
+            ):
+                auth_carrier.load_external_auth(
+                    path,
+                    filesystem_metadata_verifier=malformed_metadata,
+                    now=1_000,
+                    minimum_remaining_seconds=2_700,
+                )
+
+    def test_close_failure_is_sanitized_and_closes_both_descriptors(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = self.write_auth(pathlib.Path(raw_root), expiration=10_000)
+            original_close = auth_carrier.os.close
+            closed: list[int] = []
+
+            def close_then_fail_once(fd: int) -> None:
+                original_close(fd)
+                closed.append(fd)
+                if len(closed) == 1:
+                    raise OSError("sensitive close detail")
+
+            with (
+                mock.patch.object(
+                    auth_carrier.os,
+                    "close",
+                    side_effect=close_then_fail_once,
+                ),
+                self.assertRaisesRegex(
+                    AuthCarrierError,
+                    "could not be inspected safely",
+                ) as raised,
+            ):
+                auth_carrier.load_external_auth(
+                    path,
+                    filesystem_metadata_verifier=clean_filesystem_metadata,
+                    now=1_000,
+                    minimum_remaining_seconds=2_700,
+                )
+
+            self.assertEqual(len(closed), 2)
+            self.assertNotIn("sensitive close detail", str(raised.exception))
 
     def test_rejects_expiry_mode_links_duplicates_and_malformed_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
@@ -167,6 +350,28 @@ class AuthCarrierTests(unittest.TestCase):
             with self.assertRaisesRegex(AuthCarrierError, "generation changed"):
                 revalidate_external_auth_source(path, evidence, now=1_000)
 
+    def test_revalidation_rejects_replaced_auth_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_container:
+            container = pathlib.Path(raw_container)
+            root = container / ".codex"
+            root.mkdir(mode=0o700)
+            path = self.write_auth(root, expiration=10_000)
+            evidence = load_external_auth(
+                path,
+                now=1_000,
+                minimum_remaining_seconds=2_700,
+            )
+
+            original = container / "original-codex"
+            root.rename(original)
+            root.mkdir(mode=0o700)
+            replacement = self.write_auth(root, expiration=10_000)
+            replacement.write_bytes((original / "auth.json").read_bytes())
+            replacement.chmod(0o600)
+
+            with self.assertRaisesRegex(AuthCarrierError, "generation changed"):
+                revalidate_external_auth_source(path, evidence, now=1_000)
+
     def test_revalidation_requires_the_full_bounded_runtime_lifetime(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             path = self.write_auth(pathlib.Path(raw_root), expiration=10_000)
@@ -259,7 +464,9 @@ class AuthCarrierTests(unittest.TestCase):
                     "read_fd_exact",
                     side_effect=mutate_after_read,
                 ),
-                self.assertRaisesRegex(AuthCarrierError, "changed while it was read"),
+                self.assertRaisesRegex(
+                    AuthCarrierError, "changed while it was inspected"
+                ),
             ):
                 load_external_auth(
                     path,
@@ -280,13 +487,13 @@ class AuthCarrierTests(unittest.TestCase):
             path = self.write_auth(pathlib.Path(raw_root), expiration=10_000)
             original_lstat = os.lstat
             before = path.stat()
-            auth_lstat_calls = 0
+            directory_lstat_calls = 0
 
             def race_lstat(candidate: os.PathLike[str] | str) -> os.stat_result:
-                nonlocal auth_lstat_calls
-                if pathlib.Path(candidate) == path:
-                    auth_lstat_calls += 1
-                    if auth_lstat_calls == 3:
+                nonlocal directory_lstat_calls
+                if pathlib.Path(candidate) == path.parent:
+                    directory_lstat_calls += 1
+                    if directory_lstat_calls == 2:
                         with path.open("r+b") as carrier:
                             carrier.seek(0)
                             first = carrier.read(1)
@@ -305,7 +512,9 @@ class AuthCarrierTests(unittest.TestCase):
 
             with (
                 mock.patch.object(auth_carrier.os, "lstat", side_effect=race_lstat),
-                self.assertRaisesRegex(AuthCarrierError, "changed while it was read"),
+                self.assertRaisesRegex(
+                    AuthCarrierError, "changed while it was inspected"
+                ),
             ):
                 load_external_auth(
                     path,
@@ -314,7 +523,7 @@ class AuthCarrierTests(unittest.TestCase):
                 )
 
             after = path.stat()
-            self.assertEqual(auth_lstat_calls, 3)
+            self.assertEqual(directory_lstat_calls, 2)
             self.assertEqual(
                 (after.st_dev, after.st_ino), (before.st_dev, before.st_ino)
             )

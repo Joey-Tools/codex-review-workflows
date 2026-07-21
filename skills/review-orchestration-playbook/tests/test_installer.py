@@ -14,8 +14,8 @@ import unittest
 SKILL_ROOT = pathlib.Path(__file__).resolve().parents[1]
 INSTALLER = SKILL_ROOT / "scripts" / "install_claude_keychain_broker_macos.sh"
 ARTIFACT = SKILL_ROOT / "scripts" / "review_runtime" / "claude_keychain_broker"
-EXPECTED_SHA256 = "e4793061f89c46965e95a2c87e557c85215b334f42ddf8b8e866814574308cbb"
-EXPECTED_SIZE = 101_712
+EXPECTED_SHA256 = "fcdf6d473ec5c6fa76488da0b115d147fe5e5fa576ed33710ecd3fd7186e0b46"
+EXPECTED_SIZE = 101_728
 
 
 @unittest.skipUnless(sys.platform == "darwin", "requires macOS")

@@ -193,12 +193,12 @@ CLAUDE_KEYCHAIN_BROKER_ARTIFACT = pathlib.Path(__file__).with_name(
     "claude_keychain_broker"
 )
 CLAUDE_KEYCHAIN_BROKER_ARTIFACT_SHA256 = (
-    "e4793061f89c46965e95a2c87e557c85215b334f42ddf8b8e866814574308cbb"
+    "fcdf6d473ec5c6fa76488da0b115d147fe5e5fa576ed33710ecd3fd7186e0b46"
 )
 CLAUDE_KEYCHAIN_BROKER_CDHASHES = frozenset(
     {
-        bytes.fromhex("8186106f3c2ab605be123e98c7adaffd097fd081"),
-        bytes.fromhex("338249f6d5124e16da7eec083fb7c21ae53f05b3"),
+        bytes.fromhex("8af40bf4caf7e2398fb59182082ea57caa12ed9a"),
+        bytes.fromhex("a5de7fbd8785b8baddb34da1d8477aa4f741efa0"),
     }
 )
 CLAUDE_KEYCHAIN_BROKER_INSTALL_ROOT = pathlib.Path(
