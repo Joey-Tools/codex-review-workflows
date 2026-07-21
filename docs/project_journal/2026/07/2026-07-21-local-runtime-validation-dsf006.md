@@ -19,11 +19,9 @@ superseded_by:
 
 ## Current State
 
-- Local validation keeps every required runtime or toolchain in scope, while selecting one version for each by default.
-- Each toolchain uses the first source that exists, in strict order: explicit user version, explicit repository policy, repository version pin, normal repository runner or tool default, then the newest installed compatible version. Only a missing source permits checking the next one.
-- The selected source must resolve to exactly one compatible version; ambiguity, conflict, or incompatibility stops as a blocker instead of silently falling through. Each selected toolchain version and source stay fixed for the validation pass and are recorded in the evidence.
-- Minimum supported versions and CI matrices do not imply an unrequested local runtime matrix.
-- Cross-version compatibility changes may still validate multiple runtimes locally.
+- Local validation keeps every required runtime or toolchain in scope and decides its validation shape before resolving versions. Only an explicit user or repository multi-version requirement, or a cross-version compatibility goal, selects the multi-version path; minimum versions and CI matrices alone do not.
+- On the single-version path, each toolchain uses the first source that exists, in strict order: explicit user version, explicit repository policy, repository version pin, normal repository runner or tool default, then the newest installed compatible version. Only a missing source permits checking the next one.
+- The selected single-version source must resolve to exactly one compatible version; ambiguity, conflict, or incompatibility stops as a blocker instead of silently falling through. The selected version and source stay fixed for the validation pass and are recorded in the evidence.
 - Multi-version validation uses same-checkout serial reuse only when the suite proves it safe. Version-sensitive checkout output, caches, and mutable state use isolated worktrees, caches, and state, or are explicitly cleaned and rebuilt between versions.
 
 ## Next Steps

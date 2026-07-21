@@ -137,7 +137,12 @@ class RepositoryContractTest(unittest.TestCase):
 
         anchors = (
             "每个 runtime/toolchain",
-            "本地默认各选择一个确定的 version",
+            "采用单版本还是多版本形态",
+            "明确要求本地多版本验证",
+            "本次改动目标就是跨版本兼容性",
+            "才选择多版本形态",
+            "否则使用单版本形态",
+            "单版本形态下",
             "每个工具链按以下严格顺序查找",
             "选用第一个实际存在的来源",
             "the user 明确指定的版本",
@@ -153,15 +158,14 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("选定来源必须解析为唯一且与项目兼容的版本", skill)
         self.assertIn("若其内部冲突、无法唯一解析或与项目约束不兼容", skill)
         self.assertIn("停止并报告 blocker，不得静默降级到较低优先级", skill)
-        self.assertIn("记录实际采用的 runtime/toolchain versions 及其来源", skill)
+        self.assertIn("将所选 version 及其来源固定用于同一轮验证并记录", skill)
         self.assertIn(
             "同一 runtime/toolchain 的最低支持版本和 CI matrix 本身不构成本地多版本门禁",
             skill,
         )
-        self.assertIn("明确要求本地多版本验证", skill)
-        self.assertIn("本次改动目标就是跨版本兼容性", skill)
-        self.assertIn("才扩成本地多版本验证", skill)
-        self.assertIn("确需对同一 runtime/toolchain 本地验证多个版本时", skill)
+        self.assertLess(skill.index("否则使用单版本形态"), skill.index("单版本形态下"))
+        self.assertIn("在多版本形态下", skill)
+        self.assertLess(skill.index("单版本形态下"), skill.index("在多版本形态下"))
         self.assertIn("只有 suite 已证明顺序复用安全时", skill)
         self.assertIn("才可在同一 checkout 串行执行", skill)
         self.assertIn("版本敏感的产物、缓存或可变状态", skill)
