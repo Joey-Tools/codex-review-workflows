@@ -19,6 +19,7 @@ SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime import cli, providers, state  # noqa: E402
+from review_runtime.common import ReviewError  # noqa: E402
 from review_runtime.workspace import (  # noqa: E402
     PRIVATE_HELPER_ARTIFACT_NAMES,
     CleanupIdentity,
@@ -53,6 +54,124 @@ def private_cleanup_evidence(container: pathlib.Path) -> PrivateCleanupEvidence:
 
 
 class ForegroundCleanupTest(unittest.TestCase):
+    def test_secret_admission_dispatches_without_starting_a_reviewer(self) -> None:
+        summary = {
+            "base_sha": "a" * 40,
+            "exit_code": 0,
+            "head_sha": "b" * 40,
+            "operation": "exact-secret-admission",
+            "review_contract": "admission-only-no-reviewer",
+            "review_range": f"{'a' * 40}..{'b' * 40}",
+            "reviewer_started": False,
+            "schema_version": 1,
+            "secret_delta": {
+                "limitations": [],
+                "location_status": "complete",
+                "status": "clean",
+                "violations": [],
+            },
+            "source": "direct-git-tree-scan",
+            "status": "clean",
+            "temporary_cleanup_status": "complete",
+        }
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                cli, "secret_admission", return_value=(0, summary)
+            ) as scan,
+            mock.patch.object(cli, "run_review") as run_review,
+            mock.patch.object(cli, "prepare_workspace") as prepare_workspace,
+            mock.patch.object(cli, "start") as start,
+            mock.patch.object(cli, "run_state") as run_state,
+            mock.patch.object(cli, "_run_foreground") as run_foreground,
+            contextlib.redirect_stdout(stdout),
+        ):
+            returncode = cli.main(
+                [
+                    "secret-admission",
+                    "--repo",
+                    "/tmp/repository",
+                    "--base-ref",
+                    "base",
+                    "--head-ref",
+                    "head",
+                ]
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), summary)
+        scan.assert_called_once_with(
+            repo=pathlib.Path("/tmp/repository"),
+            base_ref="base",
+            head_ref="head",
+        )
+        run_review.assert_not_called()
+        prepare_workspace.assert_not_called()
+        start.assert_not_called()
+        run_state.assert_not_called()
+        run_foreground.assert_not_called()
+
+    def test_secret_admission_preserves_terminal_exit_mapping(self) -> None:
+        arguments = [
+            "secret-admission",
+            "--repo",
+            "/tmp/repository",
+            "--base-ref",
+            "base",
+            "--head-ref",
+            "head",
+        ]
+        for exit_code, status in (
+            (0, "clean"),
+            (1, "violations"),
+            (75, "inconclusive"),
+        ):
+            with self.subTest(exit_code=exit_code):
+                summary = {"exit_code": exit_code, "status": status}
+                stdout = io.StringIO()
+                with (
+                    mock.patch.object(
+                        cli,
+                        "secret_admission",
+                        return_value=(exit_code, summary),
+                    ),
+                    contextlib.redirect_stdout(stdout),
+                ):
+                    self.assertEqual(cli.main(arguments), exit_code)
+                self.assertEqual(json.loads(stdout.getvalue()), summary)
+
+    def test_secret_admission_input_error_is_exit_two(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                cli,
+                "secret_admission",
+                side_effect=ReviewError("invalid admission input"),
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            exit_code = cli.main(
+                [
+                    "secret-admission",
+                    "--repo",
+                    "/tmp/repository",
+                    "--base-ref",
+                    "base",
+                    "--head-ref",
+                    "head",
+                ]
+            )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("error: invalid admission input", stderr.getvalue())
+
+    def test_secret_admission_argument_error_is_exit_two(self) -> None:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as error:
+            cli.main(["secret-admission", "--repo", "/tmp/repository"])
+
+        self.assertEqual(error.exception.code, 2)
+
     def test_stateful_admission_always_prints_json_and_returns_embedded_code(
         self,
     ) -> None:
