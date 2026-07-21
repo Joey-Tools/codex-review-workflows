@@ -625,6 +625,7 @@ def _source_git_config_environment(
 ) -> tuple[dict[str, str], pathlib.Path]:
     environment = _git_environment()
     environment.pop("GIT_CONFIG_GLOBAL", None)
+    environment.pop("GIT_CONFIG_NOSYSTEM", None)
     environment["HOME"] = str(home)
     raw_xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
     if raw_xdg_config_home:
@@ -637,7 +638,12 @@ def _source_git_config_environment(
     return environment, xdg_config_home / "git" / "ignore"
 
 
-def _source_excludes_file(source_root: pathlib.Path) -> str:
+def _source_git_config_value(
+    source_root: pathlib.Path,
+    *,
+    key: str,
+    value_type: str,
+) -> tuple[str | None, pathlib.Path]:
     environment, default_path = _source_git_config_environment(_source_git_home())
     command = (
         str(resolve_git()),
@@ -645,18 +651,17 @@ def _source_excludes_file(source_root: pathlib.Path) -> str:
         "-C",
         str(source_root),
         "config",
-        "--global",
         "--includes",
         "--null",
-        "--path",
+        f"--type={value_type}",
         "--get",
-        "core.excludesFile",
+        key,
     )
     completed = _run_bounded_git_capture(
         command,
         input_bytes=None,
         check=False,
-        label="source Git excludes-file query",
+        label="source Git effective-config query",
         byte_limit=MAX_SOURCE_GIT_QUERY_BYTES,
         timeout_seconds=SOURCE_GIT_TIMEOUT_SECONDS,
         timeout_label="source Git",
@@ -664,15 +669,42 @@ def _source_excludes_file(source_root: pathlib.Path) -> str:
     )
     if completed.returncode == 1:
         if completed.stdout:
-            raise ReviewError(
-                "source Git excludes-file query returned malformed output"
-            )
-        return str(default_path)
+            raise ReviewError("source Git config query returned malformed output")
+        return None, default_path
     if completed.returncode != 0:
-        raise ReviewError("cannot resolve the source Git excludes file")
+        raise ReviewError("cannot resolve effective source Git configuration")
     if completed.stdout.count(b"\0") != 1 or not completed.stdout.endswith(b"\0"):
-        raise ReviewError("source Git excludes-file query returned malformed output")
-    return os.fsdecode(completed.stdout[:-1])
+        raise ReviewError("source Git config query returned malformed output")
+    return os.fsdecode(completed.stdout[:-1]), default_path
+
+
+def _source_excludes_file(source_root: pathlib.Path) -> pathlib.Path:
+    value, default_path = _source_git_config_value(
+        source_root,
+        key="core.excludesFile",
+        value_type="path",
+    )
+    path = default_path if value is None else pathlib.Path(value)
+    if not path.is_absolute():
+        path = source_root / path
+    return pathlib.Path(os.path.abspath(path))
+
+
+def _source_git_boolean_config(
+    source_root: pathlib.Path,
+    *,
+    key: str,
+) -> bool | None:
+    value, _default_path = _source_git_config_value(
+        source_root,
+        key=key,
+        value_type="bool",
+    )
+    if value is None:
+        return None
+    if value not in {"true", "false"}:
+        raise ReviewError("source Git boolean config query returned malformed output")
+    return value == "true"
 
 
 def _git(repo: pathlib.Path, *args: str, check: bool = True):
@@ -978,6 +1010,24 @@ def _read_source_info_exclude(path: pathlib.Path) -> bytes:
         return handle.read(MAX_SOURCE_INFO_EXCLUDE_BYTES + 1)
 
 
+def _read_source_excludes_file(path: pathlib.Path) -> bytes:
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return b""
+    except OSError as error:
+        raise ReviewError(
+            "cannot inspect the effective source Git excludes file"
+        ) from error
+    with _secure_file_reader(
+        path,
+        label="effective source Git excludes file",
+        max_bytes=MAX_SOURCE_INFO_EXCLUDE_BYTES,
+        allow_root_owner=True,
+    ) as (handle, _metadata):
+        return handle.read(MAX_SOURCE_INFO_EXCLUDE_BYTES + 1)
+
+
 def _create_source_inspection_git_context(
     *,
     source_root: pathlib.Path,
@@ -1009,6 +1059,11 @@ def _create_source_inspection_git_context(
     info_exclude = _read_source_info_exclude(
         _source_git_path(source_root, "info/exclude", label="info/exclude")
     )
+    source_excludes = _read_source_excludes_file(_source_excludes_file(source_root))
+    source_status_config = {
+        key: _source_git_boolean_config(source_root, key=key)
+        for key in ("core.ignoreCase", "core.precomposeUnicode")
+    }
 
     git_dir = container / "source-inspection.git"
     git_dir.mkdir(mode=0o700)
@@ -1022,19 +1077,25 @@ def _create_source_inspection_git_context(
         "\tbare = false\n"
         "\tlogAllRefUpdates = false\n"
     )
+    for key, value in source_status_config.items():
+        if value is not None:
+            config += f"\t{key.removeprefix('core.')} = {str(value).lower()}\n"
     if len(head_sha) == 64:
         config += "[extensions]\n\tobjectFormat = sha256\n"
     write_text_atomic(git_dir / "config", config)
     exclude_destination = git_dir / "info" / "exclude"
     exclude_destination.write_bytes(info_exclude)
     exclude_destination.chmod(0o600)
+    effective_excludes_destination = git_dir / "effective-excludes"
+    effective_excludes_destination.write_bytes(source_excludes)
+    effective_excludes_destination.chmod(0o600)
     return SourceInspectionGitContext(
         source_root=source_root,
         git_dir=git_dir,
         object_directory=object_directory,
         index_file=index_file,
         head_sha=head_sha,
-        excludes_file=_source_excludes_file(source_root),
+        excludes_file=str(effective_excludes_destination),
     )
 
 
@@ -4257,6 +4318,7 @@ def _secure_file_reader(
     label: str,
     max_bytes: int | None = None,
     expected_artifact: ControlArtifactEvidence | None = None,
+    allow_root_owner: bool = False,
 ) -> Iterator[tuple[_DigestingReader, os.stat_result]]:
     flags = (
         os.O_RDONLY
@@ -4275,8 +4337,12 @@ def _secure_file_reader(
         initial = os.fstat(descriptor)
         if not stat.S_ISREG(initial.st_mode) or initial.st_nlink != 1:
             raise ReviewError(f"{label} is not a regular file with one link")
-        if initial.st_uid != os.getuid():
-            raise ReviewError(f"{label} must be owned by the current user")
+        allowed_uids = {os.getuid(), 0} if allow_root_owner else {os.getuid()}
+        if initial.st_uid not in allowed_uids:
+            owner_requirement = (
+                "the current user or root" if allow_root_owner else "the current user"
+            )
+            raise ReviewError(f"{label} must be owned by {owner_requirement}")
         if initial.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
             raise ReviewError(f"{label} must not be group or other writable")
         if max_bytes is not None and initial.st_size > max_bytes:

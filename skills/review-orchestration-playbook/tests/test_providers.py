@@ -1770,6 +1770,64 @@ class ProviderPolicyTest(unittest.TestCase):
             providers._claude_review_prompt(self.review, absolute_prompt),
             default_prompt,
         )
+        self.assertEqual(
+            providers._claude_review_prompt(
+                self.review,
+                b"Workspace="
+                + str(self.review.workspace_root).encode()
+                + b"\nDiff="
+                + str(self.review.diff_file).encode()
+                + b"\n",
+            ),
+            b"Workspace=.\nDiff=.codex-review/review.diff\n",
+        )
+        self.assertEqual(
+            providers._claude_review_prompt(
+                self.review,
+                (
+                    "Primary diff: "
+                    f"{self.review.diff_file}.\n"
+                    f"工作区：{self.review.workspace_root}。继续检查。\n"
+                ).encode(),
+            ),
+            (
+                "Primary diff: .codex-review/review.diff.\n工作区：.。继续检查。\n"
+            ).encode(),
+        )
+
+    def test_prompt_projects_workspace_descendant_path(self) -> None:
+        workspace = str(self.review.workspace_root).encode()
+
+        self.assertEqual(
+            providers._claude_review_prompt(
+                self.review,
+                b"Inspect " + workspace + b"/nested/note.txt\n",
+            ),
+            b"Inspect ./nested/note.txt\n",
+        )
+
+    def test_prompt_rejects_ambiguous_absolute_path_occurrences(self) -> None:
+        workspace = str(self.review.workspace_root).encode()
+        diff_file = str(self.review.diff_file).encode()
+        prompts = (
+            b"Inspect file://" + workspace + b"/nested/note.txt\n",
+            b"Inspect https://example.invalid/?workspace=" + workspace + b"\n",
+            b"Inspect //example.invalid/?workspace=" + workspace + b"\n",
+            b"Inspect ?workspace=" + workspace + b"\n",
+            b"Inspect opaque=" + (b"x" * 4096) + b"=" + workspace + b"\n",
+            b"Inspect " + workspace + b"-backup\n",
+            b"Inspect " + workspace + b"/../outside.txt\n",
+            b"Inspect " + workspace + b"/sub/../../outside.txt\n",
+            b"Inspect " + diff_file + b".bak\n",
+        )
+
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "ambiguous absolute (?:workspace|diff-file) path",
+                ):
+                    providers._claude_review_prompt(self.review, prompt)
 
     def test_prompt_projection_rechecks_size_limit(self) -> None:
         prompt = b"x" * (providers.MAX_REVIEW_PROMPT_BYTES + 1)

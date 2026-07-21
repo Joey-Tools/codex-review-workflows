@@ -2681,25 +2681,149 @@ def _claude_review_settings(
     )
 
 
+def _claude_prompt_opening_boundary(value: str) -> bool:
+    return (
+        value.isspace()
+        or value in "'\"`([{<"
+        or value == "："
+        or unicodedata.category(value) in {"Ps", "Pi"}
+    )
+
+
+def _claude_prompt_assignment_boundary(prompt: str, occurrence: int) -> bool:
+    if occurrence == 0 or prompt[occurrence - 1] != "=":
+        return False
+    key_end = occurrence - 1
+    key_start = key_end
+    while key_start and (
+        prompt[key_start - 1].isascii()
+        and (prompt[key_start - 1].isalnum() or prompt[key_start - 1] in "_.-")
+    ):
+        key_start -= 1
+    key = prompt[key_start:key_end]
+    if re.fullmatch(r"(?:-{1,2})?[A-Za-z_][A-Za-z0-9_.-]{0,63}", key) is None:
+        return False
+    return key_start == 0 or _claude_prompt_opening_boundary(prompt[key_start - 1])
+
+
+def _claude_prompt_closing_boundary(value: str) -> bool:
+    return (
+        value.isspace()
+        or value in "'\"`)]}>"
+        or unicodedata.category(value) in {"Pe", "Pf"}
+    )
+
+
+def _claude_prompt_descendant_is_safe(prompt: str, start: int) -> bool:
+    end = start
+    while end < len(prompt) and (
+        not _claude_prompt_closing_boundary(prompt[end])
+        and prompt[end] not in "，；：！？。"
+    ):
+        end += 1
+    suffix = prompt[start:end].rstrip(",;:!?")
+    if not suffix.startswith("/") or "\\" in suffix:
+        return False
+    components = suffix[1:].split("/")
+    return bool(components) and all(
+        component not in {"", ".."} for component in components
+    )
+
+
+def _claude_prompt_right_boundary(
+    prompt: str,
+    end: int,
+    *,
+    allow_descendants: bool,
+) -> bool:
+    if end == len(prompt):
+        return True
+    value = prompt[end]
+    if allow_descendants and value == "/":
+        return _claude_prompt_descendant_is_safe(prompt, end)
+    if _claude_prompt_closing_boundary(value):
+        return True
+    if value in "，；：！？。":
+        return True
+    if value not in ".,;:!?":
+        return False
+    following = end
+    while following < len(prompt) and prompt[following] in ".,;:!?":
+        following += 1
+    return following == len(prompt) or _claude_prompt_closing_boundary(
+        prompt[following]
+    )
+
+
+def _project_claude_prompt_path(
+    prompt: str,
+    *,
+    absolute_path: str,
+    projected_path: str,
+    label: str,
+    allow_descendants: bool,
+) -> str:
+    projected: list[str] = []
+    cursor = 0
+    while True:
+        occurrence = prompt.find(absolute_path, cursor)
+        if occurrence < 0:
+            projected.append(prompt[cursor:])
+            return "".join(projected)
+
+        end = occurrence + len(absolute_path)
+        left = prompt[occurrence - 1] if occurrence else None
+        left_is_boundary = (
+            left is None
+            or _claude_prompt_opening_boundary(left)
+            or _claude_prompt_assignment_boundary(prompt, occurrence)
+        )
+        right_is_boundary = _claude_prompt_right_boundary(
+            prompt,
+            end,
+            allow_descendants=allow_descendants,
+        )
+        if not left_is_boundary or not right_is_boundary:
+            raise ReviewError(
+                f"Claude review prompt contains an ambiguous absolute {label} path"
+            )
+
+        projected.append(prompt[cursor:occurrence])
+        projected.append(projected_path)
+        cursor = end
+
+
 def _claude_review_prompt(
     review: ReviewWorkspace,
     prompt: bytes,
 ) -> bytes:
-    workspace = str(review.workspace_root).encode("utf-8")
-    diff_file = str(review.diff_file).encode("utf-8")
-    projected = prompt.replace(
-        diff_file,
-        b".codex-review/review.diff",
-    ).replace(
-        workspace,
-        b".",
+    try:
+        decoded_prompt = prompt.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ReviewError("Claude review prompt is not valid UTF-8") from error
+    workspace = str(review.workspace_root)
+    diff_file = str(review.diff_file)
+    projected = _project_claude_prompt_path(
+        decoded_prompt,
+        absolute_path=diff_file,
+        projected_path=".codex-review/review.diff",
+        label="diff-file",
+        allow_descendants=False,
     )
-    if len(projected) > MAX_REVIEW_PROMPT_BYTES:
+    projected = _project_claude_prompt_path(
+        projected,
+        absolute_path=workspace,
+        projected_path=".",
+        label="workspace",
+        allow_descendants=True,
+    )
+    encoded_prompt = projected.encode("utf-8")
+    if len(encoded_prompt) > MAX_REVIEW_PROMPT_BYTES:
         raise ReviewError(
             "Claude projected review prompt exceeds the "
             f"{MAX_REVIEW_PROMPT_BYTES}-byte limit"
         )
-    return projected
+    return encoded_prompt
 
 
 def _claude_directory_open_flags() -> int:

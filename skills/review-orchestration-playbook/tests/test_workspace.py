@@ -817,6 +817,50 @@ class WorkspaceTest(unittest.TestCase):
         self.assertNotIn(ignored_name, diff)
         self.assertIn(visible_name, diff)
 
+    def test_clean_and_wip_respect_repo_local_relative_excludes_file(self) -> None:
+        excludes_name = "source-review.ignore"
+        ignored_name = "repo-local-secret.json"
+        visible_name = "repo-local-visible.txt"
+        (self.repo / excludes_name).write_text(
+            f"/{excludes_name}\n/{ignored_name}\n",
+            encoding="utf-8",
+        )
+        git(self.repo, "config", "core.excludesFile", excludes_name)
+        (self.repo / ignored_name).write_text(
+            json.dumps({"refresh_token": oauth_refresh_credential()}) + "\n",
+            encoding="utf-8",
+        )
+
+        clean_review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(clean_review)
+        self.assertFalse((clean_review.workspace_root / ignored_name).exists())
+
+        (self.repo / visible_name).write_text(
+            "capture repo-local WIP\n",
+            encoding="utf-8",
+        )
+        wip_review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+            include_source_wip=True,
+        )
+        self.reviews.append(wip_review)
+        self.assertEqual(
+            (wip_review.workspace_root / visible_name).read_text(encoding="utf-8"),
+            "capture repo-local WIP\n",
+        )
+        self.assertFalse((wip_review.workspace_root / ignored_name).exists())
+        diff = wip_review.diff_file.read_text(encoding="utf-8")
+        self.assertIn(visible_name, diff)
+        self.assertNotIn(ignored_name, diff)
+        self.assertNotIn(oauth_refresh_credential(), diff)
+        validate_external_workspace(wip_review)
+
     def test_wip_source_inspection_uses_linked_worktree_index(self) -> None:
         linked = pathlib.Path(self.temporary.name) / "linked"
         git(
@@ -865,6 +909,210 @@ class WorkspaceTest(unittest.TestCase):
             git(self.repo, "worktree", "remove", "--force", str(linked))
             if review_root.exists():
                 review_root.rmdir()
+
+    def test_linked_worktree_excludes_file_overrides_common_config(self) -> None:
+        common_ignore = pathlib.Path(self.temporary.name) / "common-ignore"
+        common_ignore.write_text("/common-only.txt\n", encoding="utf-8")
+        worktree_ignore = pathlib.Path(self.temporary.name) / "worktree-ignore"
+        ignored_name = "worktree-secret.json"
+        worktree_ignore.write_text(f"/{ignored_name}\n", encoding="utf-8")
+        git(self.repo, "config", "core.excludesFile", str(common_ignore))
+        git(self.repo, "config", "extensions.worktreeConfig", "true")
+
+        linked = pathlib.Path(self.temporary.name) / "linked-config"
+        git(
+            self.repo,
+            "worktree",
+            "add",
+            "--detach",
+            str(linked),
+            self.head,
+        )
+        linked_reviews = []
+        try:
+            git(
+                linked,
+                "config",
+                "--worktree",
+                "core.excludesFile",
+                str(worktree_ignore),
+            )
+            (linked / ignored_name).write_text(
+                json.dumps({"refresh_token": oauth_refresh_credential()}) + "\n",
+                encoding="utf-8",
+            )
+
+            clean_review = prepare_workspace(
+                repo=linked,
+                base_ref=self.base,
+                head_ref=self.head,
+            )
+            linked_reviews.append(clean_review)
+            self.assertFalse((clean_review.workspace_root / ignored_name).exists())
+
+            visible_name = "common-only.txt"
+            (linked / visible_name).write_text(
+                "worktree override keeps this visible\n",
+                encoding="utf-8",
+            )
+            wip_review = prepare_workspace(
+                repo=linked,
+                base_ref=self.base,
+                head_ref=self.head,
+                include_source_wip=True,
+            )
+            linked_reviews.append(wip_review)
+            self.assertEqual(
+                (wip_review.workspace_root / visible_name).read_text(encoding="utf-8"),
+                "worktree override keeps this visible\n",
+            )
+            self.assertFalse((wip_review.workspace_root / ignored_name).exists())
+            diff = wip_review.diff_file.read_text(encoding="utf-8")
+            self.assertIn(visible_name, diff)
+            self.assertNotIn(ignored_name, diff)
+            self.assertNotIn(oauth_refresh_credential(), diff)
+            validate_external_workspace(wip_review)
+        finally:
+            review_root = workspace_runtime._review_root_for_source(linked)
+            for review in linked_reviews:
+                if review.container_dir.exists():
+                    cleanup_workspace(review, keep_container=False)
+            git(self.repo, "worktree", "remove", "--force", str(linked))
+            if review_root.exists():
+                review_root.rmdir()
+
+    def test_clean_and_wip_respect_core_ignore_case(self) -> None:
+        raw_info_exclude = pathlib.Path(
+            git(self.repo, "rev-parse", "--git-path", "info/exclude")
+        )
+        info_exclude = (
+            raw_info_exclude
+            if raw_info_exclude.is_absolute()
+            else self.repo / raw_info_exclude
+        )
+        ignored_pattern = "ignore-case-secret.json"
+        ignored_name = "IGNORE-CASE-SECRET.JSON"
+        visible_name = "ignore-case-visible.txt"
+        info_exclude.write_text(f"/{ignored_pattern}\n", encoding="utf-8")
+        git(self.repo, "config", "core.ignoreCase", "true")
+        (self.repo / ignored_name).write_text(
+            json.dumps({"refresh_token": oauth_refresh_credential()}) + "\n",
+            encoding="utf-8",
+        )
+
+        clean_review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(clean_review)
+        self.assertFalse((clean_review.workspace_root / ignored_name).exists())
+
+        (self.repo / visible_name).write_text(
+            "capture ignore-case WIP\n",
+            encoding="utf-8",
+        )
+        wip_review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+            include_source_wip=True,
+        )
+        self.reviews.append(wip_review)
+        self.assertEqual(
+            (wip_review.workspace_root / visible_name).read_text(encoding="utf-8"),
+            "capture ignore-case WIP\n",
+        )
+        self.assertFalse((wip_review.workspace_root / ignored_name).exists())
+        diff = wip_review.diff_file.read_text(encoding="utf-8")
+        self.assertIn(visible_name, diff)
+        self.assertNotIn(ignored_name, diff)
+        self.assertNotIn(oauth_refresh_credential(), diff)
+        validate_external_workspace(wip_review)
+
+    def test_source_inspection_projects_only_safe_path_config(self) -> None:
+        git(self.repo, "config", "core.ignoreCase", "true")
+        git(self.repo, "config", "core.precomposeUnicode", "true")
+        git(self.repo, "config", "filter.evil.clean", "/usr/bin/false")
+
+        with workspace_runtime._temporary_source_inspection_git_context(
+            source_root=self.repo,
+            head_sha=self.head,
+        ) as source_inspection:
+            config = (source_inspection.git_dir / "config").read_text(encoding="utf-8")
+
+        self.assertIn("\tignoreCase = true\n", config)
+        self.assertIn("\tprecomposeUnicode = true\n", config)
+        self.assertNotIn("filter", config.casefold())
+
+    def test_source_excludes_snapshot_is_immutable(self) -> None:
+        ignored_name = "frozen-excludes-secret.json"
+        source_excludes = self.repo / ".git" / "source-review-ignore"
+        source_excludes.write_text(f"/{ignored_name}\n", encoding="utf-8")
+        git(
+            self.repo,
+            "config",
+            "core.excludesFile",
+            ".git/source-review-ignore",
+        )
+        (self.repo / ignored_name).write_text(
+            json.dumps({"refresh_token": oauth_refresh_credential()}) + "\n",
+            encoding="utf-8",
+        )
+
+        with workspace_runtime._temporary_source_inspection_git_context(
+            source_root=self.repo,
+            head_sha=self.head,
+        ) as source_inspection:
+            self.assertNotIn(
+                ignored_name.encode(),
+                workspace_runtime._source_status(source_inspection),
+            )
+            source_excludes.write_text("/different-file.json\n", encoding="utf-8")
+            self.assertNotIn(
+                ignored_name.encode(),
+                workspace_runtime._source_status(source_inspection),
+            )
+
+        self.assertIn(
+            ignored_name,
+            git(
+                self.repo,
+                "status",
+                "--porcelain=v2",
+                "--untracked-files=all",
+            ),
+        )
+
+    def test_source_excludes_file_fails_closed_when_unsafe(self) -> None:
+        source_excludes = pathlib.Path(self.temporary.name) / "source-ignore"
+        symlink_target = pathlib.Path(self.temporary.name) / "source-ignore-target"
+        scenarios = ("oversized", "symlink")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                source_excludes.unlink(missing_ok=True)
+                symlink_target.unlink(missing_ok=True)
+                if scenario == "oversized":
+                    source_excludes.write_bytes(
+                        b"x" * (workspace_runtime.MAX_SOURCE_INFO_EXCLUDE_BYTES + 1)
+                    )
+                    message = "exceeds its review size limit"
+                else:
+                    symlink_target.write_text("/ignored.txt\n", encoding="utf-8")
+                    source_excludes.symlink_to(symlink_target)
+                    message = "cannot open effective source Git excludes file"
+                git(
+                    self.repo,
+                    "config",
+                    "core.excludesFile",
+                    str(source_excludes),
+                )
+                with self.assertRaisesRegex(ReviewError, message):
+                    prepare_workspace(
+                        repo=self.repo,
+                        base_ref=self.base,
+                        head_ref=self.head,
+                    )
 
     def test_clean_and_wip_respect_user_global_git_ignores(self) -> None:
         configured_home = pathlib.Path(self.temporary.name) / "configured-home"
