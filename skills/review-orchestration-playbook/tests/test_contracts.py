@@ -166,12 +166,29 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertLess(skill.index("否则使用单版本形态"), skill.index("单版本形态下"))
         self.assertIn("在多版本形态下", skill)
         self.assertLess(skill.index("单版本形态下"), skill.index("在多版本形态下"))
+        multi_version_anchors = (
+            "第一个实际存在的有限版本集合来源",
+            "the user 或本次任务明确列出的版本集合",
+            "repo-local policy 明确规定的本地多版本集合",
+            "repo 明确声明的有限 supported-version set 或 CI matrix",
+            "选定集合必须非空、无重复且每个版本都与项目兼容",
+            "只能得到开放范围或无法确定有限集合",
+            "不得根据本机已安装版本任意扩张集合",
+            "记录最终版本集合及其来源",
+        )
+        cursor = skill.index("在多版本形态下")
+        for anchor in multi_version_anchors:
+            cursor = skill.index(anchor, cursor) + len(anchor)
         self.assertIn("只有 suite 已证明顺序复用安全时", skill)
         self.assertIn("才可在同一 checkout 串行执行", skill)
-        self.assertIn("版本敏感的产物、缓存或可变状态", skill)
+        self.assertIn("版本敏感的 checkout 产物、缓存或状态", skill)
         self.assertIn("独立 worktree/cache/state", skill)
         self.assertIn("或在版本间显式清理并重建", skill)
-        self.assertIn("只有 suite 已证明隔离时才可在同一 checkout 并发", skill)
+        self.assertIn("无论使用一个还是多个 worktree", skill)
+        self.assertIn("为每次运行分配唯一值或命名空间", skill)
+        self.assertIn("否则必须跨所有 worktree 串行执行", skill)
+        self.assertIn("持久机器级状态还必须在版本间显式 clean/reset", skill)
+        self.assertIn("只有 checkout-local 与机器级资源都已证明隔离时才可并发", skill)
 
     def test_cleanup_only_legacy_0664_lock_migration_is_private_and_ordered(
         self,
