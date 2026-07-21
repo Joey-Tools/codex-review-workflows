@@ -1,24 +1,44 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import pathlib
-import re
 import stat
 import sys
 import tempfile
 from dataclasses import dataclass
 from typing import Callable, Mapping, Sequence, TextIO
 
+from .claude_capabilities import (
+    CLAUDE_REQUIRED_OPTIONS,
+    CLAUDE_VERSION_LINE,
+    ClaudeCapabilityError,
+    ClaudeSafetyContractInvalid,
+    validate_claude_help,
+)
 from .claude_provenance import (
+    CLAUDE_RELEASE_KEY_FINGERPRINT,
     ClaudeReleaseArtifact,
     ClaudeProvenanceDependencyUnavailable,
     ClaudeProvenanceInconclusive,
     ClaudeProvenanceInvalid,
     ClaudeProvenanceUnavailable,
     materialize_verified_executable,
+    release_artifact_urls,
     verify_claude_release,
     verify_release_executable,
+)
+from .claude_stream_contract import (
+    ClaudeStreamContractBinding,
+    ClaudeStreamContractError,
+    load_stream_contract,
+)
+from .claude_version_policy import (
+    CLAUDE_COMPATIBILITY_SPEC,
+    ClaudeVersionPolicyError,
+    parse_compatible_release_version,
+    parse_release_version,
 )
 from .common import (
     ReviewOutputDrainError,
@@ -29,10 +49,8 @@ from .common import (
 )
 
 
-REQUIRED_CLAUDE_VERSION = "2.1.212"
-SIDE_BY_SIDE_RELATIVE_PATH = (
-    pathlib.Path(".local/share/claude/versions") / REQUIRED_CLAUDE_VERSION
-)
+SIDE_BY_SIDE_RELATIVE_ROOT = pathlib.Path(".local/share/claude/versions")
+SIDE_BY_SIDE_ENTRY_LIMIT = 1024
 ACTIVE_HOME_RELATIVE_PATH = pathlib.Path(".local/bin/claude")
 TRUSTED_ACTIVE_PATHS = tuple(
     pathlib.Path(value)
@@ -42,40 +60,39 @@ TRUSTED_ACTIVE_PATHS = tuple(
     )
 )
 PROVENANCE_TEMP_ROOT = pathlib.Path("/tmp")
-VERSION_PROBE_CWD = pathlib.Path("/")
-VERSION_PROBE_TIMEOUT_SECONDS = 10.0
+CAPABILITY_PROBE_CWD = pathlib.Path("/")
+CAPABILITY_PROBE_TIMEOUT_SECONDS = 10.0
 VERSION_PROBE_OUTPUT_LIMIT_BYTES = 16 * 1024
+HELP_PROBE_OUTPUT_LIMIT_BYTES = 256 * 1024
 MACHINE_OUTPUT_LIMIT_BYTES = 16 * 1024
-VERSION_PROBE_ENV: Mapping[str, str] = {
+CAPABILITY_PROBE_ENV: Mapping[str, str] = {
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "CLAUDE_CODE_SAFE_MODE": "1",
+    "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB": "1",
     "HOME": "/nonexistent",
     "LANG": "C",
     "LC_ALL": "C",
     "NO_COLOR": "1",
     "PATH": "/usr/bin:/bin",
 }
-_VERSION_OUTPUT = re.compile(
-    r"^(?P<major>0|[1-9][0-9]*)\."
-    r"(?P<minor>0|[1-9][0-9]*)\."
-    r"(?P<patch>0|[1-9][0-9]*)"
-    r"(?:[ \t]+\(Claude Code\))?[ \t]*\n?$"
-)
-_RELEASE_VERSION = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 
 
 @dataclass(frozen=True)
 class Candidate:
     path: pathlib.Path
     source: str
+    version_hint: str | None = None
 
 
 @dataclass(frozen=True)
 class VerifiedCandidate:
     resolved_path: pathlib.Path
-    platform_key: str
-    checksum: str
-    artifact_size: int
+    artifact: ClaudeReleaseArtifact
     identity: Mapping[str, int]
-    probe_result: ProbeResult
+    manifest_url: str
+    signature_url: str
+    version_probe_result: ProbeResult
+    help_probe_result: ProbeResult
 
 
 @dataclass(frozen=True)
@@ -86,7 +103,10 @@ class ProbeResult:
 
 
 VersionProbe = Callable[[pathlib.Path], ProbeResult]
-CandidateVerifier = Callable[[pathlib.Path, VersionProbe], VerifiedCandidate]
+HelpProbe = Callable[[pathlib.Path], ProbeResult]
+CandidateVerifier = Callable[
+    [pathlib.Path, str, VersionProbe, HelpProbe], VerifiedCandidate
+]
 
 
 class _ArgumentError(ValueError):
@@ -105,6 +125,10 @@ class _VersionProbeInconclusive(RuntimeError):
     pass
 
 
+class _CapabilityProbeInconclusive(RuntimeError):
+    pass
+
+
 def _result(
     classification: str,
     reason: str,
@@ -114,11 +138,12 @@ def _result(
     declared_version: str | None = None,
     observed_version: str | None = None,
     verified: VerifiedCandidate | None = None,
+    stream_contract: ClaudeStreamContractBinding | None = None,
 ) -> dict[str, object]:
     value: dict[str, object] = {
         "classification": classification,
         "reason": reason,
-        "required_version": REQUIRED_CLAUDE_VERSION,
+        "compatible_version_range": CLAUDE_COMPATIBILITY_SPEC,
     }
     if candidate is not None:
         value["source"] = candidate.source
@@ -130,11 +155,30 @@ def _result(
         value["observed_version"] = observed_version
     if verified is not None:
         value["publisher_verification"] = {
-            "artifact_size": verified.artifact_size,
-            "checksum": verified.checksum,
-            "platform": verified.platform_key,
+            "artifact_size": verified.artifact.size,
+            "binary": verified.artifact.binary,
+            "checksum": verified.artifact.checksum,
+            "manifest_url": verified.manifest_url,
+            "platform": verified.artifact.platform_key,
+            "release_version": verified.artifact.version,
+            "signature_url": verified.signature_url,
+            "signer_fingerprint": CLAUDE_RELEASE_KEY_FINGERPRINT,
         }
         value["identity"] = dict(verified.identity)
+        value["capability_contract"] = {
+            "required_options": list(CLAUDE_REQUIRED_OPTIONS),
+            "status": "accepted" if classification == "accepted" else "unaccepted",
+        }
+        if classification == "accepted":
+            value["selected_version"] = verified.artifact.version
+    if stream_contract is not None:
+        value["stream_contract"] = {
+            "baseline_digest": stream_contract.baseline_digest,
+            "capability_digest": stream_contract.capability_digest,
+            "compatibility_digest": stream_contract.compatibility_digest,
+            "digest": stream_contract.digest,
+            "schema_id": stream_contract.schema_id,
+        }
     return value
 
 
@@ -159,12 +203,23 @@ def _identity_from_stat(metadata: os.stat_result) -> dict[str, int]:
 
 
 def _stable_descriptor_identity(path: pathlib.Path) -> dict[str, int]:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     descriptor = -1
     try:
         before = path.stat(follow_symlinks=False)
         descriptor = os.open(path, flags)
         opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or _identity_from_stat(
+            opened
+        ) != _identity_from_stat(before):
+            raise _CandidateInspectionInconclusive(
+                f"candidate identity changed while binding {path}"
+            )
         after = path.stat(follow_symlinks=False)
     except OSError as error:
         raise _CandidateInspectionInconclusive(
@@ -209,15 +264,8 @@ def _verified_source_matches_signed_artifact(
 ) -> bool:
     """Rehash the mutable source before accepting its preflight evidence."""
 
-    artifact = ClaudeReleaseArtifact(
-        version=REQUIRED_CLAUDE_VERSION,
-        platform_key=verified.platform_key,
-        binary="claude",
-        checksum=verified.checksum,
-        size=verified.artifact_size,
-    )
     try:
-        revalidated = verify_release_executable(resolved, artifact)
+        revalidated = verify_release_executable(resolved, verified.artifact)
         current_identity = _identity(revalidated)
     except (
         ClaudeProvenanceInconclusive,
@@ -241,20 +289,80 @@ def _candidate_exists(path: pathlib.Path) -> bool:
     return True
 
 
+def _highest_compatible_side_by_side(home: pathlib.Path) -> Candidate | None:
+    root = home / SIDE_BY_SIDE_RELATIVE_ROOT
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = -1
+    try:
+        before = root.stat(follow_symlinks=False)
+        descriptor = os.open(root, flags)
+        opened_before = os.fstat(descriptor)
+    except OSError as error:
+        if error.errno in (errno.ENOENT, errno.ENOTDIR):
+            return None
+        raise _CandidateInspectionInconclusive(
+            f"cannot open side-by-side Claude Code installs under {root}"
+        ) from error
+    compatible: list[tuple[tuple[int, int, int], pathlib.Path]] = []
+    count = 0
+    try:
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
+                count += 1
+                if count > SIDE_BY_SIDE_ENTRY_LIMIT:
+                    raise _CandidateInspectionInconclusive(
+                        "side-by-side Claude Code install count exceeds the bounded limit"
+                    )
+                try:
+                    parsed = parse_compatible_release_version(entry.name)
+                except ClaudeVersionPolicyError:
+                    continue
+                compatible.append((parsed, root / entry.name))
+        opened_after = os.fstat(descriptor)
+        named_after = root.stat(follow_symlinks=False)
+    except OSError as error:
+        raise _CandidateInspectionInconclusive(
+            f"cannot enumerate side-by-side Claude Code installs under {root}"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    identities = {
+        tuple(_identity_from_stat(value).values())
+        for value in (before, opened_before, opened_after, named_after)
+    }
+    if len(identities) != 1 or not stat.S_ISDIR(opened_before.st_mode):
+        raise _CandidateInspectionInconclusive(
+            "side-by-side Claude Code install directory changed during enumeration"
+        )
+    if not compatible:
+        return None
+    _parsed, selected = max(compatible, key=lambda item: item[0])
+    return Candidate(selected, "side-by-side-compatible", selected.name)
+
+
 def select_candidate(
     *,
     explicit_path: pathlib.Path | None,
+    explicit_version: str | None = None,
     home: pathlib.Path | None,
 ) -> Candidate | None:
     if explicit_path is not None:
         if not explicit_path.is_absolute():
             raise _ArgumentError("--claude-path must be absolute")
-        return Candidate(explicit_path, "explicit-override")
+        return Candidate(explicit_path, "explicit-override", explicit_version)
+    if explicit_version is not None:
+        raise _ArgumentError("--claude-version requires --claude-path")
 
     if home is not None:
-        side_by_side = home / SIDE_BY_SIDE_RELATIVE_PATH
-        if _candidate_exists(side_by_side):
-            return Candidate(side_by_side, "side-by-side-exact")
+        side_by_side = _highest_compatible_side_by_side(home)
+        if side_by_side is not None:
+            return side_by_side
         active_home = home / ACTIVE_HOME_RELATIVE_PATH
         if _candidate_exists(active_home):
             return Candidate(active_home, "active-installed")
@@ -283,17 +391,51 @@ def _resolve_candidate(candidate: Candidate) -> pathlib.Path:
 
 
 def _declared_installer_version(path: pathlib.Path) -> str | None:
-    if path.parent.name != "versions" or _RELEASE_VERSION.fullmatch(path.name) is None:
+    if path.parent.name != "versions" or not path.name or len(path.name) > 32:
+        return None
+    try:
+        parse_release_version(path.name)
+    except ClaudeVersionPolicyError:
         return None
     return path.name
 
 
 def _darwin_platform_key(path: pathlib.Path) -> str:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor = -1
     try:
-        with path.open("rb") as handle:
+        before = path.stat(follow_symlinks=False)
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            descriptor = -1
+            opened_before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened_before.st_mode) or _identity_from_stat(
+                opened_before
+            ) != _identity_from_stat(before):
+                raise _CandidateInspectionInconclusive(
+                    f"candidate identity changed while inspecting {path}"
+                )
             header = handle.read(8)
+            opened_after = os.fstat(handle.fileno())
+        after = path.stat(follow_symlinks=False)
     except OSError as error:
         raise _CandidateInspectionInconclusive(str(path)) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    identities = {
+        tuple(_identity_from_stat(value).values())
+        for value in (before, opened_before, opened_after, after)
+    }
+    if len(identities) != 1:
+        raise _CandidateInspectionInconclusive(
+            f"candidate identity changed while inspecting {path}"
+        )
     if len(header) != 8:
         raise _CandidateUnavailable("truncated native executable")
     if header[:4] == b"\xcf\xfa\xed\xfe":
@@ -333,10 +475,13 @@ def _platform_key(path: pathlib.Path) -> str:
 
 def verify_publisher_candidate(
     path: pathlib.Path,
+    release_version: str,
     version_probe: VersionProbe,
+    help_probe: HelpProbe,
 ) -> VerifiedCandidate:
-    """Verify the exact signed 2.1.212 artifact before executing the candidate."""
+    """Verify one compatible signed artifact before probing its private snapshot."""
 
+    parse_compatible_release_version(release_version)
     platform_key = _platform_key(path)
     try:
         provenance_temp_root = PROVENANCE_TEMP_ROOT.expanduser().resolve(strict=True)
@@ -351,15 +496,33 @@ def verify_publisher_candidate(
         private_root = pathlib.Path(temporary).resolve(strict=True)
         verified = verify_claude_release(
             path,
-            version=REQUIRED_CLAUDE_VERSION,
+            version=release_version,
             platform_key=platform_key,
             gpg_temp_root=private_root,
         )
+        try:
+            expected_resolved = path.resolve(strict=True)
+            returned_resolved = verified.executable.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise _CandidateInspectionInconclusive(
+                "publisher verifier returned an unresolvable executable path"
+            ) from error
+        if (
+            returned_resolved != expected_resolved
+            or verified.artifact.version != release_version
+            or verified.artifact.platform_key != platform_key
+            or verified.artifact.binary != "claude"
+            or (verified.manifest_url, verified.signature_url)
+            != release_artifact_urls(release_version)
+        ):
+            raise ClaudeProvenanceInvalid(
+                "publisher verifier returned incoherent release evidence"
+            )
         if verified.source_identity is None:
             raise _CandidateInspectionInconclusive(
                 "publisher verifier did not return the descriptor-bound source identity"
             )
-        resolved = verified.executable.resolve(strict=True)
+        resolved = returned_resolved
         source_identity = _identity_from_tuple(verified.source_identity)
         try:
             snapshot = materialize_verified_executable(
@@ -375,7 +538,7 @@ def verify_publisher_candidate(
                 "cannot safely materialize the verified executable snapshot"
             ) from error
         try:
-            completed = version_probe(snapshot.executable)
+            version_completed = version_probe(snapshot.executable)
         except (
             OSError,
             ReviewOutputDrainError,
@@ -403,30 +566,81 @@ def verify_publisher_candidate(
             raise _CandidateInspectionInconclusive(
                 "verified executable snapshot path changed during the version probe"
             )
+        try:
+            help_completed = help_probe(snapshot.executable)
+        except (
+            OSError,
+            ReviewOutputDrainError,
+            ReviewOutputLimitError,
+            ReviewProcessLeakError,
+            ReviewTimeoutError,
+        ) as error:
+            raise _CapabilityProbeInconclusive(str(error)) from error
+        except Exception as error:
+            raise _CapabilityProbeInconclusive(str(error)) from error
+        try:
+            after_help_probe = verify_release_executable(
+                snapshot.executable,
+                snapshot.artifact,
+            )
+        except (
+            ClaudeProvenanceInconclusive,
+            ClaudeProvenanceInvalid,
+            ClaudeProvenanceUnavailable,
+        ) as error:
+            raise _CandidateInspectionInconclusive(
+                "verified executable snapshot changed during the capability probe"
+            ) from error
+        if after_help_probe != snapshot.executable:
+            raise _CandidateInspectionInconclusive(
+                "verified executable snapshot path changed during the capability probe"
+            )
     return VerifiedCandidate(
         resolved_path=resolved,
-        platform_key=verified.artifact.platform_key,
-        checksum=verified.artifact.checksum,
-        artifact_size=verified.artifact.size,
+        artifact=verified.artifact,
         identity=source_identity,
-        probe_result=completed,
+        manifest_url=verified.manifest_url,
+        signature_url=verified.signature_url,
+        version_probe_result=version_completed,
+        help_probe_result=help_completed,
     )
 
 
-def probe_verified_version(path: pathlib.Path) -> ProbeResult:
+def _probe_verified_command(
+    path: pathlib.Path,
+    argument: str,
+    *,
+    output_limit_bytes: int,
+) -> ProbeResult:
     completed = run_bounded_capture(
-        (str(path), "--version"),
-        cwd=VERSION_PROBE_CWD,
-        env=dict(VERSION_PROBE_ENV),
+        (str(path), argument),
+        cwd=CAPABILITY_PROBE_CWD,
+        env=dict(CAPABILITY_PROBE_ENV),
         stdin=None,
-        timeout_seconds=VERSION_PROBE_TIMEOUT_SECONDS,
-        stdout_limit_bytes=VERSION_PROBE_OUTPUT_LIMIT_BYTES,
-        stderr_limit_bytes=VERSION_PROBE_OUTPUT_LIMIT_BYTES,
+        timeout_seconds=CAPABILITY_PROBE_TIMEOUT_SECONDS,
+        stdout_limit_bytes=output_limit_bytes,
+        stderr_limit_bytes=output_limit_bytes,
     )
     return ProbeResult(
         completed.returncode,
         bytes(completed.stdout),
         bytes(completed.stderr),
+    )
+
+
+def probe_verified_version(path: pathlib.Path) -> ProbeResult:
+    return _probe_verified_command(
+        path,
+        "--version",
+        output_limit_bytes=VERSION_PROBE_OUTPUT_LIMIT_BYTES,
+    )
+
+
+def probe_verified_help(path: pathlib.Path) -> ProbeResult:
+    return _probe_verified_command(
+        path,
+        "--help",
+        output_limit_bytes=HELP_PROBE_OUTPUT_LIMIT_BYTES,
     )
 
 
@@ -437,25 +651,53 @@ def _parse_version(stdout: bytes, stderr: bytes) -> str:
         text = stdout.decode("utf-8", errors="strict")
     except UnicodeDecodeError as error:
         raise ValueError("version probe output is not UTF-8") from error
-    match = _VERSION_OUTPUT.fullmatch(text)
+    lines = tuple(line.strip() for line in text.splitlines() if line.strip())
+    if len(lines) != 1:
+        raise ValueError("version probe output must contain exactly one non-empty line")
+    match = CLAUDE_VERSION_LINE.fullmatch(lines[0])
     if match is None:
         raise ValueError("version probe output does not match the reviewed format")
-    return ".".join((match.group("major"), match.group("minor"), match.group("patch")))
+    version = ".".join(match.group(name) for name in ("major", "minor", "patch"))
+    try:
+        parsed = parse_release_version(version)
+    except ClaudeVersionPolicyError as error:
+        raise ValueError(
+            "version probe output does not match the reviewed format"
+        ) from error
+    return ".".join(str(component) for component in parsed)
+
+
+def _validate_help_probe(completed: ProbeResult) -> None:
+    if completed.returncode != 0 or completed.stderr.strip():
+        raise _CapabilityProbeInconclusive("capability probe did not complete cleanly")
+    try:
+        help_text = completed.stdout.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise _CapabilityProbeInconclusive(
+            "capability probe output is not UTF-8"
+        ) from error
+    validate_claude_help(help_text)
 
 
 def preflight(
     *,
     explicit_path: pathlib.Path | None = None,
+    explicit_version: str | None = None,
     home: pathlib.Path | None = None,
     verifier: CandidateVerifier = verify_publisher_candidate,
     version_probe: VersionProbe = probe_verified_version,
+    help_probe: HelpProbe = probe_verified_help,
 ) -> dict[str, object]:
     try:
-        candidate = select_candidate(explicit_path=explicit_path, home=home)
+        candidate = select_candidate(
+            explicit_path=explicit_path,
+            explicit_version=explicit_version,
+            home=home,
+        )
     except _CandidateInspectionInconclusive:
         return _result("inconclusive", "candidate-inspection-inconclusive")
     if candidate is None:
-        return _result("blocked", "exact-version-unavailable")
+        return _result("blocked", "compatible-version-unavailable")
 
     try:
         resolved = _resolve_candidate(candidate)
@@ -468,11 +710,24 @@ def preflight(
     except _CandidateUnavailable:
         return _result(
             "blocked",
-            "exact-version-unavailable",
+            "compatible-version-unavailable",
             candidate=candidate,
         )
-    declared_version = _declared_installer_version(resolved)
-    if declared_version is not None and declared_version != REQUIRED_CLAUDE_VERSION:
+
+    path_version = _declared_installer_version(resolved)
+    declared_version = candidate.version_hint or path_version
+    version_reason: str | None = None
+    if candidate.version_hint is not None and path_version is not None:
+        if candidate.version_hint != path_version:
+            version_reason = "version-declaration-conflict"
+    if declared_version is None:
+        version_reason = "version-declaration-unavailable"
+    elif version_reason is None:
+        try:
+            parse_compatible_release_version(declared_version)
+        except ClaudeVersionPolicyError:
+            version_reason = "unsupported-version"
+    if version_reason is not None:
         try:
             bound_identity = _stable_descriptor_identity(resolved)
             after_resolved = _resolve_candidate(candidate)
@@ -495,14 +750,19 @@ def preflight(
             )
         return _result(
             "blocked",
-            "exact-version-mismatch",
+            version_reason,
             candidate=candidate,
             resolved_path=resolved,
             declared_version=declared_version,
         )
 
     try:
-        verified = verifier(resolved, version_probe)
+        verified = verifier(
+            resolved,
+            declared_version,
+            version_probe,
+            help_probe,
+        )
     except _CandidateInspectionInconclusive:
         return _result(
             "inconclusive",
@@ -513,7 +773,7 @@ def preflight(
     except _CandidateUnavailable:
         return _result(
             "blocked",
-            "exact-version-unavailable",
+            "compatible-version-unavailable",
             candidate=candidate,
             resolved_path=resolved,
         )
@@ -521,6 +781,13 @@ def preflight(
         return _result(
             "inconclusive",
             "version-probe-inconclusive",
+            candidate=candidate,
+            resolved_path=resolved,
+        )
+    except _CapabilityProbeInconclusive:
+        return _result(
+            "inconclusive",
+            "capability-probe-inconclusive",
             candidate=candidate,
             resolved_path=resolved,
         )
@@ -563,7 +830,7 @@ def preflight(
             verified=verified,
         )
 
-    completed = verified.probe_result
+    completed = verified.version_probe_result
     if completed.returncode != 0:
         return _result(
             "inconclusive",
@@ -599,34 +866,86 @@ def preflight(
             observed_version=observed_version,
             verified=verified,
         )
-    if observed_version != REQUIRED_CLAUDE_VERSION:
+    if (
+        verified.artifact.version != declared_version
+        or observed_version != declared_version
+    ):
         return _result(
             "blocked",
-            "exact-version-mismatch",
+            "signed-version-identity-mismatch",
             candidate=candidate,
             resolved_path=resolved,
+            declared_version=declared_version,
+            observed_version=observed_version,
+            verified=verified,
+        )
+    try:
+        _validate_help_probe(verified.help_probe_result)
+    except _CapabilityProbeInconclusive:
+        return _result(
+            "inconclusive",
+            "capability-probe-inconclusive",
+            candidate=candidate,
+            resolved_path=resolved,
+            declared_version=declared_version,
+            observed_version=observed_version,
+            verified=verified,
+        )
+    except (ClaudeCapabilityError, ClaudeSafetyContractInvalid):
+        return _result(
+            "blocked",
+            "capability-contract-mismatch",
+            candidate=candidate,
+            resolved_path=resolved,
+            declared_version=declared_version,
+            observed_version=observed_version,
+            verified=verified,
+        )
+    try:
+        stream_contract, _compatibility_raw, _baseline_raw = load_stream_contract()
+    except ClaudeStreamContractError:
+        return _result(
+            "inconclusive",
+            "stream-contract-inconclusive",
+            candidate=candidate,
+            resolved_path=resolved,
+            declared_version=declared_version,
             observed_version=observed_version,
             verified=verified,
         )
     return _result(
         "accepted",
-        "exact-version-selected",
+        "compatible-version-selected",
         candidate=candidate,
         resolved_path=resolved,
+        declared_version=declared_version,
         observed_version=observed_version,
         verified=verified,
+        stream_contract=stream_contract,
     )
 
 
-def _parse_args(argv: Sequence[str]) -> pathlib.Path | None:
+def _parse_args(argv: Sequence[str]) -> tuple[pathlib.Path | None, str | None]:
     if not argv:
-        return None
-    if len(argv) == 2 and argv[0] == "--claude-path" and argv[1]:
-        candidate = pathlib.Path(argv[1])
-        if not candidate.is_absolute():
-            raise _ArgumentError("--claude-path must be absolute")
-        return candidate
-    raise _ArgumentError("expected no arguments or --claude-path ABSOLUTE_PATH")
+        return None, None
+    if len(argv) not in (2, 4) or len(set(argv[::2])) != len(argv[::2]):
+        raise _ArgumentError(
+            "expected no arguments or --claude-path ABSOLUTE_PATH "
+            "[--claude-version RELEASE]"
+        )
+    values = dict(zip(argv[::2], argv[1::2], strict=True))
+    if frozenset(values) - {"--claude-path", "--claude-version"}:
+        raise _ArgumentError("unknown argument")
+    raw_path = values.get("--claude-path")
+    if not raw_path:
+        raise _ArgumentError("--claude-path is required for an explicit candidate")
+    candidate = pathlib.Path(raw_path)
+    if not candidate.is_absolute():
+        raise _ArgumentError("--claude-path must be absolute")
+    version = values.get("--claude-version")
+    if version == "":
+        raise _ArgumentError("--claude-version must not be empty")
+    return candidate, version
 
 
 def _machine_json(value: Mapping[str, object]) -> bytes:
@@ -647,10 +966,14 @@ def main(
     arguments = tuple(sys.argv[1:] if argv is None else argv)
     destination = sys.stdout if stdout is None else stdout
     try:
-        explicit_path = _parse_args(arguments)
+        explicit_path, explicit_version = _parse_args(arguments)
         home_value = os.environ.get("HOME")
         home = pathlib.Path(home_value) if home_value else None
-        value = preflight(explicit_path=explicit_path, home=home)
+        value = preflight(
+            explicit_path=explicit_path,
+            explicit_version=explicit_version,
+            home=home,
+        )
     except _ArgumentError:
         value = _result("inconclusive", "invalid-arguments")
     except Exception:

@@ -1129,7 +1129,13 @@ def inspect_elf(path: pathlib.Path) -> ElfInfo:
 
     try:
         resolved = path.resolve(strict=True)
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        named_before = resolved.stat(follow_symlinks=False)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
         fd = os.open(resolved, flags)
     except (OSError, RuntimeError) as error:
         raise LinuxRuntimeInspectionInconclusive(
@@ -1138,6 +1144,9 @@ def inspect_elf(path: pathlib.Path) -> ElfInfo:
     failure: BaseException | None = None
     try:
         metadata = os.fstat(fd)
+        _require_stable_elf_metadata(named_before, metadata, path)
+        named_after_open = resolved.stat(follow_symlinks=False)
+        _require_stable_elf_metadata(metadata, named_after_open, path)
         if not stat.S_ISREG(metadata.st_mode):
             raise LinuxRuntimeError(f"ELF candidate is not a regular file: {path}")
         header = _pread_exact(
@@ -1400,6 +1409,8 @@ def inspect_elf(path: pathlib.Path) -> ElfInfo:
                 raise LinuxRuntimeError(f"ELF dynamic segment is unterminated: {path}")
         final_metadata = os.fstat(fd)
         _require_stable_elf_metadata(metadata, final_metadata, path)
+        named_after = resolved.stat(follow_symlinks=False)
+        _require_stable_elf_metadata(final_metadata, named_after, path)
     except LinuxRuntimeInspectionInconclusive as error:
         failure = error
         raise

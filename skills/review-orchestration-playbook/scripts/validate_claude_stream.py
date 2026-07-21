@@ -1,20 +1,36 @@
 #!/usr/bin/env python3
-"""Fail-closed validator for canonical Claude Code 2.1.212 JSONL streams."""
+"""Fail-closed validator for compatible canonical Claude Code JSONL streams."""
 
 from __future__ import annotations
 
 import argparse
 import io
 import json
+import os
 import re
+import stat
 import sys
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, BinaryIO, Mapping
 
+from review_runtime.claude_capabilities import CLAUDE_REQUIRED_OPTIONS
+from review_runtime.claude_provenance import (
+    CLAUDE_RELEASE_KEY_FINGERPRINT,
+    CLAUDE_SUPPORTED_PLATFORM_BINARIES,
+    release_artifact_urls,
+)
+from review_runtime.claude_version_policy import (
+    CLAUDE_COMPATIBILITY_SPEC,
+    ClaudeVersionPolicyError,
+    parse_compatible_release_version,
+)
+from review_runtime import claude_stream_contract
 
-CLAUDE_CODE_VERSION = "2.1.212"
+SCHEMA_PATH = claude_stream_contract.BASELINE_PATH
+COMPATIBILITY_PATH = claude_stream_contract.COMPATIBILITY_PATH
+BASELINE_VERSION = claude_stream_contract.BASELINE_VERSION
 EXPECTED_TOOLS = frozenset(("Read", "Grep", "Glob", "Bash"))
 EMPTY_INIT_SURFACES = ("mcp_servers", "slash_commands", "skills", "plugins")
 ACCEPTED_API_KEY_SOURCES = frozenset(("none", "ANTHROPIC_API_KEY"))
@@ -38,12 +54,39 @@ PROCESS_RETURNCODE_CONTRACT = {
         },
     },
 }
-SCHEMA_PATH = (
-    Path(__file__).resolve().parent.parent
-    / "references"
-    / "claude-2.1.212-stream-schema.json"
-)
 MAX_SCHEMA_BYTES = 256 * 1024
+MAX_PREFLIGHT_EVIDENCE_BYTES = 16 * 1024
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_PREFLIGHT_IDENTITY_FIELDS = frozenset(
+    (
+        "device",
+        "inode",
+        "file_type",
+        "mode",
+        "nlink",
+        "uid",
+        "gid",
+        "size",
+        "mtime_ns",
+        "ctime_ns",
+    )
+)
+_PREFLIGHT_FIELDS = frozenset(
+    (
+        "capability_contract",
+        "classification",
+        "compatible_version_range",
+        "declared_version",
+        "identity",
+        "observed_version",
+        "publisher_verification",
+        "reason",
+        "resolved_path",
+        "selected_version",
+        "source",
+        "stream_contract",
+    )
+)
 MAX_JSON_INTEGER_DIGITS = 128
 MAX_JSON_FLOAT_CHARACTERS = 256
 MAX_JSON_FLOAT_SIGNIFICAND_DIGITS = 128
@@ -222,12 +265,17 @@ def _unique_string_set(value: Any, *, label: str) -> frozenset[str]:
     return frozenset(value)
 
 
-def _load_contract() -> dict[str, Any]:
+def _load_contract_with_binding() -> tuple[
+    dict[str, Any],
+    claude_stream_contract.ClaudeStreamContractBinding,
+]:
     try:
-        with SCHEMA_PATH.open("rb") as stream:
-            raw = stream.read(MAX_SCHEMA_BYTES + 1)
-    except OSError as error:
-        raise _ContractError("schema is unreadable") from error
+        binding, _compatibility_raw, raw = claude_stream_contract.load_stream_contract(
+            compatibility_path=COMPATIBILITY_PATH,
+            baseline_path=SCHEMA_PATH,
+        )
+    except claude_stream_contract.ClaudeStreamContractError as error:
+        raise _ContractError("schema is unreadable or incompatible") from error
     if len(raw) > MAX_SCHEMA_BYTES:
         raise _ContractError("schema exceeds its size bound")
     try:
@@ -239,8 +287,23 @@ def _load_contract() -> dict[str, Any]:
         raise _ContractError("schema contains an unpaired Unicode surrogate")
     if type(contract) is not dict:
         raise _ContractError("schema root must be an object")
-    if contract.get("claude_code_version") != CLAUDE_CODE_VERSION:
-        raise _ContractError("schema version is not exact")
+    expected_root_fields = {
+        "claude_code_version",
+        "process_returncode",
+        "stream_contract",
+        "init_event",
+        "model_identity",
+        "accepted_auxiliary_model_usage_keys",
+        "terminal_result",
+        "contract_cases",
+    }
+    if (
+        set(contract) != expected_root_fields
+        or type(contract["contract_cases"]) is not list
+    ):
+        raise _ContractError("schema root fields do not match the validator")
+    if contract.get("claude_code_version") != BASELINE_VERSION:
+        raise _ContractError("schema baseline version is not exact")
     if contract.get("process_returncode") != PROCESS_RETURNCODE_CONTRACT:
         raise _ContractError("process return-code contract does not match")
 
@@ -294,11 +357,67 @@ def _load_contract() -> dict[str, Any]:
     ):
         raise _ContractError("init optional fields do not match the validator")
     field_contracts = init_contract.get("field_contracts")
-    if (
-        type(field_contracts) is not dict
-        or frozenset(field_contracts) != INIT_REQUIRED_FIELDS
-    ):
-        raise _ContractError("init field contracts are incomplete")
+    expected_init_field_contracts = {
+        "type": {
+            "rule": "constant",
+            "value": "system",
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "inconclusive",
+        },
+        "subtype": {
+            "rule": "constant",
+            "value": "init",
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "inconclusive",
+        },
+        "cwd": {
+            "rule": "exact_resolved_cli_argument",
+            "argument": "cwd",
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "blocked",
+        },
+        "permissionMode": {
+            "rule": "constant",
+            "value": "dontAsk",
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "blocked",
+        },
+        "tools": {
+            "rule": "duplicate_free_exact_set",
+            "values": ["Read", "Grep", "Glob", "Bash"],
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "blocked",
+        },
+        **{
+            field: {
+                "rule": "empty_array",
+                "malformed_failure": "inconclusive",
+                "mismatch_failure": "blocked",
+            }
+            for field in EMPTY_INIT_SURFACES
+        },
+        "model": {
+            "rule": "exact_cli_argument",
+            "argument": "model",
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "blocked",
+        },
+        "claude_code_version": {
+            "rule": "constant",
+            "value": BASELINE_VERSION,
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "blocked",
+        },
+        "apiKeySource": {
+            "rule": "exact_cli_argument",
+            "argument": "api_key_source",
+            "accepted_arguments": ["none", "ANTHROPIC_API_KEY"],
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "blocked",
+        },
+    }
+    if field_contracts != expected_init_field_contracts:
+        raise _ContractError("init field contracts do not match the validator")
     if field_contracts.get("permissionMode", {}).get("value") != "dontAsk":
         raise _ContractError("permission mode contract does not match")
     if (
@@ -308,10 +427,7 @@ def _load_contract() -> dict[str, Any]:
         != EXPECTED_TOOLS
     ):
         raise _ContractError("tool contract does not match")
-    if (
-        field_contracts.get("claude_code_version", {}).get("value")
-        != CLAUDE_CODE_VERSION
-    ):
+    if field_contracts.get("claude_code_version", {}).get("value") != BASELINE_VERSION:
         raise _ContractError("init version contract does not match")
     if (
         _unique_string_set(
@@ -353,12 +469,41 @@ def _load_contract() -> dict[str, Any]:
     ):
         raise _ContractError("terminal optional fields do not match")
     optional_contracts = terminal_contract.get("optional_field_contracts")
-    if (
-        type(optional_contracts) is not dict
-        or frozenset(optional_contracts)
-        != TERMINAL_VARIANT_FIELDS | TERMINAL_OPTIONAL_FIELDS
-    ):
-        raise _ContractError("terminal optional contracts are incomplete")
+    expected_terminal_optional_contracts = {
+        "result": {"rule": "variant_specific", "failure": "inconclusive"},
+        "modelUsage": {"rule": "variant_specific", "failure": "classify"},
+        "duration_ms": {
+            "rule": "nonnegative_integer",
+            "failure": "inconclusive",
+        },
+        "duration_api_ms": {
+            "rule": "nonnegative_integer",
+            "failure": "inconclusive",
+        },
+        "num_turns": {"rule": "positive_integer", "failure": "inconclusive"},
+        "session_id": {"rule": "nonempty_string", "failure": "inconclusive"},
+        "total_cost_usd": {
+            "rule": "nonnegative_finite_number",
+            "failure": "inconclusive",
+        },
+        "usage": {"rule": "object", "failure": "inconclusive"},
+        "uuid": {"rule": "nonempty_string", "failure": "inconclusive"},
+        "stop_reason": {
+            "rule": "enum",
+            "accepted_values": [None, "end_turn"],
+            "failure": "blocked",
+        },
+        "structured_output": {"rule": "null", "failure": "inconclusive"},
+        "error": {"rule": "explicitly_empty", "failure": "classify"},
+        "errors": {"rule": "explicitly_empty", "failure": "classify"},
+        "api_error_status": {
+            "rule": "null_or_whitespace_string",
+            "failure": "classify",
+        },
+        "permission_denials": {"rule": "empty_array", "failure": "blocked"},
+    }
+    if optional_contracts != expected_terminal_optional_contracts:
+        raise _ContractError("terminal optional contracts do not match the validator")
     expected_variants = {
         "success": {
             "match": {"subtype": "success", "is_error": False},
@@ -429,7 +574,219 @@ def _load_contract() -> dict[str, Any]:
         "claude-haiku-4-5-20251001"
     ]:
         raise _ContractError("auxiliary model identities do not match")
+    return contract, binding
+
+
+def _load_contract() -> dict[str, Any]:
+    contract, _binding = _load_contract_with_binding()
     return contract
+
+
+def _validate_preflight_evidence(
+    evidence: Mapping[str, Any],
+    binding: claude_stream_contract.ClaudeStreamContractBinding,
+) -> str:
+    if type(evidence) is not dict or frozenset(evidence) != _PREFLIGHT_FIELDS:
+        raise _ContractError("preflight evidence fields do not match")
+    if evidence.get("classification") != "accepted":
+        raise _ContractError("preflight evidence is not accepted")
+    if evidence.get("reason") != "compatible-version-selected":
+        raise _ContractError("preflight reason does not match")
+    if evidence.get("compatible_version_range") != CLAUDE_COMPATIBILITY_SPEC:
+        raise _ContractError("preflight version policy does not match")
+    selected_version = evidence.get("selected_version")
+    if type(selected_version) is not str:
+        raise _ContractError("preflight selected version is missing")
+    try:
+        parse_compatible_release_version(selected_version)
+    except ClaudeVersionPolicyError as error:
+        raise _ContractError("preflight selected version is unsupported") from error
+    if evidence.get("declared_version") != selected_version:
+        raise _ContractError("preflight declared version does not match")
+    if evidence.get("observed_version") != selected_version:
+        raise _ContractError("preflight observed version does not match")
+    if evidence.get("source") not in {
+        "active-installed",
+        "explicit-override",
+        "side-by-side-compatible",
+    }:
+        raise _ContractError("preflight candidate source does not match")
+    resolved_path = evidence.get("resolved_path")
+    if (
+        type(resolved_path) is not str
+        or not resolved_path
+        or "\0" in resolved_path
+        or not Path(resolved_path).is_absolute()
+    ):
+        raise _ContractError("preflight resolved path is invalid")
+
+    identity = evidence.get("identity")
+    if type(identity) is not dict or frozenset(identity) != _PREFLIGHT_IDENTITY_FIELDS:
+        raise _ContractError("preflight identity fields do not match")
+    if any(type(value) is not int or value < 0 for value in identity.values()):
+        raise _ContractError("preflight identity values are invalid")
+    if identity["file_type"] != stat.S_IFREG or not identity["mode"] & 0o111:
+        raise _ContractError("preflight identity is not an executable regular file")
+
+    publisher = evidence.get("publisher_verification")
+    expected_publisher_fields = {
+        "artifact_size",
+        "binary",
+        "checksum",
+        "manifest_url",
+        "platform",
+        "release_version",
+        "signature_url",
+        "signer_fingerprint",
+    }
+    if type(publisher) is not dict or set(publisher) != expected_publisher_fields:
+        raise _ContractError("preflight publisher fields do not match")
+    platform = publisher.get("platform")
+    binary = publisher.get("binary")
+    if (
+        type(platform) is not str
+        or type(binary) is not str
+        or CLAUDE_SUPPORTED_PLATFORM_BINARIES.get(platform) != binary
+    ):
+        raise _ContractError("preflight publisher platform does not match")
+    if publisher.get("release_version") != selected_version:
+        raise _ContractError("preflight publisher version does not match")
+    checksum = publisher.get("checksum")
+    if type(checksum) is not str or _SHA256.fullmatch(checksum) is None:
+        raise _ContractError("preflight publisher digest is invalid")
+    artifact_size = publisher.get("artifact_size")
+    if (
+        type(artifact_size) is not int
+        or artifact_size <= 0
+        or artifact_size != identity["size"]
+    ):
+        raise _ContractError("preflight publisher size does not match identity")
+    manifest_url, signature_url = release_artifact_urls(selected_version)
+    if publisher.get("manifest_url") != manifest_url:
+        raise _ContractError("preflight manifest URL does not match")
+    if publisher.get("signature_url") != signature_url:
+        raise _ContractError("preflight signature URL does not match")
+    if publisher.get("signer_fingerprint") != CLAUDE_RELEASE_KEY_FINGERPRINT:
+        raise _ContractError("preflight signer identity does not match")
+
+    capability = evidence.get("capability_contract")
+    if capability != {
+        "required_options": list(CLAUDE_REQUIRED_OPTIONS),
+        "status": "accepted",
+    }:
+        raise _ContractError("preflight capability contract does not match")
+    stream_binding = evidence.get("stream_contract")
+    if stream_binding != {
+        "baseline_digest": binding.baseline_digest,
+        "capability_digest": binding.capability_digest,
+        "compatibility_digest": binding.compatibility_digest,
+        "digest": binding.digest,
+        "schema_id": binding.schema_id,
+    }:
+        raise _ContractError("preflight stream contract does not match")
+    return selected_version
+
+
+def _read_preflight_evidence(
+    path: Path,
+    *,
+    reviewer_cwd: Path,
+) -> dict[str, Any]:
+    if not path.is_absolute():
+        raise _ContractError("preflight evidence path must be absolute")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor = -1
+    try:
+        canonical_parent = path.parent.resolve(strict=True)
+        canonical_path = canonical_parent / path.name
+        if canonical_path == reviewer_cwd or canonical_path.is_relative_to(
+            reviewer_cwd
+        ):
+            raise _ContractError(
+                "preflight evidence must be outside the reviewer workspace"
+            )
+        before = canonical_path.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size > MAX_PREFLIGHT_EVIDENCE_BYTES
+            or before.st_nlink != 1
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) & 0o077
+        ):
+            raise _ContractError(
+                "preflight evidence is not a parent-private single-link regular file"
+            )
+        descriptor = os.open(canonical_path, flags)
+        opened_before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened_before.st_mode)
+            or opened_before.st_size > MAX_PREFLIGHT_EVIDENCE_BYTES
+            or opened_before.st_nlink != 1
+            or opened_before.st_uid != os.geteuid()
+            or stat.S_IMODE(opened_before.st_mode) & 0o077
+        ):
+            raise _ContractError(
+                "preflight evidence descriptor is not parent-private and bounded"
+            )
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(4096, MAX_PREFLIGHT_EVIDENCE_BYTES + 1 - total),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > MAX_PREFLIGHT_EVIDENCE_BYTES:
+                raise _ContractError("preflight evidence exceeds its size bound")
+        opened_after = os.fstat(descriptor)
+        after = canonical_path.stat(follow_symlinks=False)
+    except _ContractError:
+        raise
+    except OSError as error:
+        raise _ContractError("preflight evidence is unreadable") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    identities = {
+        (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_nlink,
+            value.st_uid,
+            value.st_gid,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+        for value in (before, opened_before, opened_after, after)
+    }
+    if (
+        len(identities) != 1
+        or not stat.S_ISREG(opened_before.st_mode)
+        or opened_before.st_nlink != 1
+    ):
+        raise _ContractError("preflight evidence identity changed while reading")
+    if (
+        opened_before.st_uid != os.geteuid()
+        or stat.S_IMODE(opened_before.st_mode) & 0o077
+    ):
+        raise _ContractError("preflight evidence permissions are not parent-private")
+    try:
+        value = _strict_json_loads(b"".join(chunks).decode("utf-8", errors="strict"))
+    except Exception as error:
+        raise _ContractError("preflight evidence is not strict JSON") from error
+    if _contains_unpaired_surrogate(value) or type(value) is not dict:
+        raise _ContractError("preflight evidence structure is invalid")
+    return value
 
 
 @dataclass
@@ -566,6 +923,7 @@ def _validate_init(
     *,
     expected_cwd: str,
     requested_model: str,
+    expected_claude_code_version: str,
     api_key_source: str,
     evidence: _Evidence,
 ) -> None:
@@ -578,7 +936,12 @@ def _validate_init(
     _validate_exact_string(event, "cwd", expected_cwd, evidence)
     _validate_exact_string(event, "permissionMode", "dontAsk", evidence)
     _validate_exact_string(event, "model", requested_model, evidence)
-    _validate_exact_string(event, "claude_code_version", CLAUDE_CODE_VERSION, evidence)
+    _validate_exact_string(
+        event,
+        "claude_code_version",
+        expected_claude_code_version,
+        evidence,
+    )
     _validate_exact_string(event, "apiKeySource", api_key_source, evidence)
 
     if "tools" in event:
@@ -967,6 +1330,7 @@ def validate_claude_stream(
     expected_cwd: str | Path,
     requested_model: str,
     api_key_source: str,
+    preflight_result: str | Path,
     process_returncode: object = None,
     limits: StreamLimits | None = None,
 ) -> dict[str, Any]:
@@ -975,7 +1339,7 @@ def validate_claude_stream(
     if type(process_returncode) is not int:
         return _failure("inconclusive", {"process.returncode.invalid"})
     try:
-        contract = _load_contract()
+        contract, binding = _load_contract_with_binding()
     except (_ContractError, AttributeError, KeyError, TypeError):
         return _apply_process_returncode_precedence(
             _failure("inconclusive", {"validator.contract-invalid"}),
@@ -988,6 +1352,20 @@ def validate_claude_stream(
     except (OSError, RuntimeError, TypeError, ValueError):
         return _apply_process_returncode_precedence(
             _failure("inconclusive", {"validator.expected-cwd-invalid"}),
+            process_returncode,
+        )
+    try:
+        preflight_evidence = _read_preflight_evidence(
+            Path(preflight_result),
+            reviewer_cwd=resolved_cwd,
+        )
+        selected_claude_code_version = _validate_preflight_evidence(
+            preflight_evidence,
+            binding,
+        )
+    except (_ContractError, AttributeError, KeyError, TypeError, ValueError):
+        return _apply_process_returncode_precedence(
+            _failure("inconclusive", {"validator.preflight-evidence-invalid"}),
             process_returncode,
         )
     if (
@@ -1053,6 +1431,7 @@ def validate_claude_stream(
         envelope.first,
         expected_cwd=str(resolved_cwd),
         requested_model=requested_model,
+        expected_claude_code_version=selected_claude_code_version,
         api_key_source=api_key_source,
         evidence=evidence,
     )
@@ -1083,6 +1462,7 @@ def validate_claude_stream_bytes(
     expected_cwd: str | Path,
     requested_model: str,
     api_key_source: str,
+    preflight_result: str | Path,
     process_returncode: object = None,
     limits: StreamLimits | None = None,
 ) -> dict[str, Any]:
@@ -1095,6 +1475,7 @@ def validate_claude_stream_bytes(
         expected_cwd=expected_cwd,
         requested_model=requested_model,
         api_key_source=api_key_source,
+        preflight_result=preflight_result,
         process_returncode=process_returncode,
         limits=limits,
     )
@@ -1103,7 +1484,7 @@ def validate_claude_stream_bytes(
 def _build_parser() -> argparse.ArgumentParser:
     parser = _MachineArgumentParser(
         add_help=False,
-        description="Validate canonical Claude Code 2.1.212 stream-json output.",
+        description="Validate compatible canonical Claude Code stream-json output.",
     )
     parser.add_argument(
         "-h",
@@ -1118,6 +1499,11 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         choices=("claude-opus-4-8", "claude-opus-4-7"),
         help="Concrete model passed to Claude Code",
+    )
+    parser.add_argument(
+        "--preflight-result",
+        required=True,
+        help="Parent-private accepted named_claude_preflight JSON evidence",
     )
     parser.add_argument(
         "--api-key-source",
@@ -1166,6 +1552,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_cwd=args.cwd,
             requested_model=args.model,
             api_key_source=args.api_key_source,
+            preflight_result=Path(args.preflight_result),
             process_returncode=args.process_returncode,
         )
     finally:

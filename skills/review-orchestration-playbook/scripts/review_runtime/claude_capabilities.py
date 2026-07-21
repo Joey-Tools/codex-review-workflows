@@ -3,10 +3,18 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from .claude_version_policy import (
+    CLAUDE_COMPATIBILITY_SPEC,
+    CLAUDE_MAXIMUM_VERSION as _CLAUDE_MAXIMUM_VERSION,
+    CLAUDE_MINIMUM_VERSION as _CLAUDE_MINIMUM_VERSION,
+    CLAUDE_VERSION_COMPONENT_MAX_DIGITS,
+    ClaudeVersionPolicyError,
+    parse_compatible_release_version,
+)
 
-CLAUDE_MINIMUM_VERSION = (2, 1, 211)
-CLAUDE_NEXT_MAJOR_VERSION = (3, 0, 0)
-CLAUDE_VERSION_COMPONENT_MAX_DIGITS = 9
+CLAUDE_MINIMUM_VERSION = _CLAUDE_MINIMUM_VERSION
+CLAUDE_NEXT_MAJOR_VERSION = _CLAUDE_MAXIMUM_VERSION
+
 _CLAUDE_VERSION_COMPONENT = (
     rf"(?:0|[1-9][0-9]{{0,{CLAUDE_VERSION_COMPONENT_MAX_DIGITS - 1}}})"
 )
@@ -23,9 +31,7 @@ CLAUDE_HELP_OPTION_DECLARATION = re.compile(
     r"--[A-Za-z0-9][A-Za-z0-9-]*"
     r"(?:, --[A-Za-z0-9][A-Za-z0-9-]*)*)"
 )
-CLAUDE_HELP_OPTION_TOKEN = re.compile(
-    r"(?<![A-Za-z0-9-])--[A-Za-z0-9][A-Za-z0-9-]*"
-)
+CLAUDE_HELP_OPTION_TOKEN = re.compile(r"(?<![A-Za-z0-9-])--[A-Za-z0-9][A-Za-z0-9-]*")
 CLAUDE_DONT_ASK_CHOICE = re.compile(r"(?<![a-z0-9])dontask(?![a-z0-9])")
 # These are the exact public options used by the helper's authenticated Claude
 # commands. Help text is not treated as an ABI: option descriptions may change,
@@ -36,6 +42,7 @@ CLAUDE_REQUIRED_OPTIONS = (
     "--effort",
     "--permission-mode",
     "--output-format",
+    "--verbose",
     "--no-session-persistence",
     "--safe-mode",
     "--no-chrome",
@@ -211,9 +218,7 @@ CLAUDE_SAFE_MODE_ENVIRONMENT_ASSIGNMENT = re.compile(
     r"(?<![a-z0-9_])claude_code_safe_mode=1"
     r"(?=$|[\s,;:!?)\]}]|\.(?=\s|$))"
 )
-_CLAUDE_SAFE_MODE_NAME = (
-    r"(?<![a-z0-9-])(?:safe(?:\s+|-)mode|--safe-mode)(?![a-z0-9-])"
-)
+_CLAUDE_SAFE_MODE_NAME = r"(?<![a-z0-9-])(?:safe(?:\s+|-)mode|--safe-mode)(?![a-z0-9-])"
 CLAUDE_SAFE_MODE_SELF_REFERENCE = re.compile(_CLAUDE_SAFE_MODE_NAME)
 CLAUDE_SAFE_MODE_DECLARATION_PREFIX = re.compile(
     r"^(?:-[a-z],\s+)?--safe-mode\b"
@@ -296,17 +301,13 @@ _CLAUDE_SAFE_MODE_PRESERVED_TARGETS = (
     + r")*"
 )
 CLAUDE_SAFE_MODE_PRESERVED_SCOPE_CLAIM = re.compile(
-    _CLAUDE_SAFE_MODE_PREFIX
-    + _CLAUDE_SAFE_MODE_SUBJECT
-    + r"\s+(?:"
+    _CLAUDE_SAFE_MODE_PREFIX + _CLAUDE_SAFE_MODE_SUBJECT + r"\s+(?:"
     r"has\s+no\s+effect\s+(?:on|to)\s+"
     r"|(?:does\s+not|doesn['\N{RIGHT SINGLE QUOTATION MARK}]t|will\s+not|"
     r"won['\N{RIGHT SINGLE QUOTATION MARK}]t)\s+"
     r"(?:apply\s+to|affect|change|disable|restrict|override|remove|bypass)\s+"
     r"|never\s+(?:applies\s+to|affects|changes|disables|restricts|overrides|"
-    r"removes|bypasses)\s+)"
-    + _CLAUDE_SAFE_MODE_PRESERVED_TARGETS
-    + r"[.!?]?$"
+    r"removes|bypasses)\s+)" + _CLAUDE_SAFE_MODE_PRESERVED_TARGETS + r"[.!?]?$"
 )
 CLAUDE_SAFE_MODE_DIRECT_REQUIRED_ACTION_CLAIM = re.compile(
     _CLAUDE_SAFE_MODE_PREFIX
@@ -327,9 +328,7 @@ CLAUDE_SAFE_MODE_PREVENTED_WEAKENING_CLAIM = re.compile(
     r"^(?:"
     r"(?:disabling|bypassing|ignoring|removing|deprecating|overriding|"
     r"deactivating|turning\s+off|switching\s+off)\s+"
-    r"(?:the\s+)?"
-    + _CLAUDE_SAFE_MODE_NAME
-    + r"\s+"
+    r"(?:the\s+)?" + _CLAUDE_SAFE_MODE_NAME + r"\s+"
     r"(?:is|remains?)\s+(?:not\s+supported|unsupported|unavailable|prohibited|"
     r"forbidden|impossible|blocked|disallowed)"
     r"|(?:no\s+"
@@ -439,20 +438,14 @@ def parse_claude_version(output: str) -> ClaudeVersion:
         raise ClaudeCapabilityError(
             "Claude Code version output is not a stable three-component release"
         )
+    version = ".".join(match.group(name) for name in ("major", "minor", "patch"))
     try:
-        parts = tuple(
-            int(match.group(name)) for name in ("major", "minor", "patch")
-        )
-    except (ValueError, OverflowError) as error:
+        typed_parts = parse_compatible_release_version(version)
+    except (ClaudeVersionPolicyError, ValueError, OverflowError) as error:
         raise ClaudeCapabilityError(
-            "Claude Code version contains an invalid numeric component"
+            "Claude Code version is outside the supported "
+            f"{CLAUDE_COMPATIBILITY_SPEC} range"
         ) from error
-    assert len(parts) == 3
-    typed_parts = (parts[0], parts[1], parts[2])
-    if not CLAUDE_MINIMUM_VERSION <= typed_parts < CLAUDE_NEXT_MAJOR_VERSION:
-        raise ClaudeCapabilityError(
-            "Claude Code version is outside the supported >=2.1.211,<3 range"
-        )
     return ClaudeVersion(".".join(str(part) for part in typed_parts), typed_parts)
 
 
@@ -482,17 +475,18 @@ def _declared_options(help_text: str) -> tuple[str, ...]:
             continue
         # Only the declaration line is inspected. Description continuations are
         # deliberately ignored because they can mention unrelated options.
-        result.extend(
-            CLAUDE_HELP_OPTION_TOKEN.findall(declaration.group("options"))
-        )
+        result.extend(CLAUDE_HELP_OPTION_TOKEN.findall(declaration.group("options")))
     return tuple(result)
 
 
 def _has_semantic_term(text: str, term: str) -> bool:
-    return re.search(
-        rf"(?<![a-z0-9_]){re.escape(term)}(?![a-z0-9_])",
-        text,
-    ) is not None
+    return (
+        re.search(
+            rf"(?<![a-z0-9_]){re.escape(term)}(?![a-z0-9_])",
+            text,
+        )
+        is not None
+    )
 
 
 def _has_positive_safe_mode_claim(
@@ -526,17 +520,21 @@ def _has_positive_safe_mode_claim(
             for sentence in relevant_sentences
             if positive_claim.fullmatch(sentence) is not None
         )
-        return bool(primary_claims) and all(
-            positive_claim.fullmatch(sentence) is not None
-            or _is_allowed_safe_mode_self_claim(sentence)
-            or CLAUDE_SAFE_MODE_HARMLESS_INFORMATION.fullmatch(sentence) is not None
-            for sentence in relevant_sentences
-        ) and any(
-            all(
-                any(_has_semantic_term(sentence, term) for term in alternatives)
-                for alternatives in required_terms
+        return (
+            bool(primary_claims)
+            and all(
+                positive_claim.fullmatch(sentence) is not None
+                or _is_allowed_safe_mode_self_claim(sentence)
+                or CLAUDE_SAFE_MODE_HARMLESS_INFORMATION.fullmatch(sentence) is not None
+                for sentence in relevant_sentences
             )
-            for sentence in primary_claims
+            and any(
+                all(
+                    any(_has_semantic_term(sentence, term) for term in alternatives)
+                    for alternatives in required_terms
+                )
+                for sentence in primary_claims
+            )
         )
     unsafe_relevant_sentences = tuple(
         sentence
@@ -645,10 +643,9 @@ def _has_unsafe_safe_mode_self_reference(sentences: tuple[str, ...]) -> bool:
             candidate = CLAUDE_SAFE_MODE_DECLARATION_PREFIX.sub("", candidate, count=1)
         if CLAUDE_SAFE_MODE_SELF_REFERENCE.search(candidate) is None:
             continue
-        if (
-            _is_allowed_safe_mode_self_claim(candidate)
-            or CLAUDE_SAFE_MODE_HARMLESS_INFORMATION.fullmatch(candidate)
-        ):
+        if _is_allowed_safe_mode_self_claim(
+            candidate
+        ) or CLAUDE_SAFE_MODE_HARMLESS_INFORMATION.fullmatch(candidate):
             continue
         return True
     return False
@@ -724,7 +721,9 @@ def _has_unsafe_safe_mode_continuation(sentences: tuple[str, ...]) -> bool:
 
 def validate_claude_help(help_text: str) -> tuple[tuple[str, ...], str]:
     declared = _declared_options(help_text)
-    missing = tuple(option for option in CLAUDE_REQUIRED_OPTIONS if option not in declared)
+    missing = tuple(
+        option for option in CLAUDE_REQUIRED_OPTIONS if option not in declared
+    )
     duplicates = tuple(
         option for option in CLAUDE_REQUIRED_OPTIONS if declared.count(option) != 1
     )
@@ -740,9 +739,10 @@ def validate_claude_help(help_text: str) -> tuple[tuple[str, ...], str]:
         )
 
     permission_mode_blocks = _help_option_blocks(help_text, "--permission-mode")
-    if len(permission_mode_blocks) != 1 or CLAUDE_DONT_ASK_CHOICE.search(
-        permission_mode_blocks[0]
-    ) is None:
+    if (
+        len(permission_mode_blocks) != 1
+        or CLAUDE_DONT_ASK_CHOICE.search(permission_mode_blocks[0]) is None
+    ):
         raise ClaudeCapabilityUnavailable(
             "Claude Code --permission-mode does not advertise the required dontAsk "
             "choice"
@@ -797,7 +797,9 @@ def validate_claude_help(help_text: str) -> tuple[tuple[str, ...], str]:
         missing_claims = (*missing_claims, "safe-mode environment enabled")
     if not _has_only_allowed_safe_mode_sentences(sentences):
         missing_claims = (*missing_claims, "every safe-mode sentence remains bounded")
-    if any(CLAUDE_SAFE_MODE_LEADING_CONTRAST.search(sentence) for sentence in sentences):
+    if any(
+        CLAUDE_SAFE_MODE_LEADING_CONTRAST.search(sentence) for sentence in sentences
+    ):
         missing_claims = (*missing_claims, "unambiguous safe-mode continuation")
     if _has_unsafe_safe_mode_continuation(sentences):
         missing_claims = (*missing_claims, "safe-mode continuation remains positive")

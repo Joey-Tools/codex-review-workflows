@@ -5,9 +5,11 @@ import hashlib
 import errno
 import os
 import pathlib
+import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from unittest import mock
@@ -18,22 +20,58 @@ SCRIPTS = SKILL_ROOT / "scripts"
 PREFLIGHT = SCRIPTS / "named_claude_preflight"
 sys.path.insert(0, str(SCRIPTS))
 
-from review_runtime import claude_linux, claude_provenance  # noqa: E402
+from review_runtime import (  # noqa: E402
+    claude_capabilities,
+    claude_linux,
+    claude_provenance,
+    claude_version_policy,
+)
 from review_runtime import named_claude_preflight as preflight_module  # noqa: E402
 
 
 class NamedClaudePreflightTest(unittest.TestCase):
+    @staticmethod
+    def _supported_help() -> bytes:
+        lines = ["Usage: claude [options]", "", "Options:"]
+        for option in claude_capabilities.CLAUDE_REQUIRED_OPTIONS:
+            if option == "--safe-mode":
+                description = (
+                    "Start with all customizations (CLAUDE.md, skills, plugins, "
+                    "hooks, MCP servers, custom commands and agents, output styles, "
+                    "workflows, custom themes, keybindings, and more) disabled. "
+                    "Admin-managed (policy) settings still apply. Auth, model "
+                    "selection, built-in tools, and permissions work normally. "
+                    "Sets CLAUDE_CODE_SAFE_MODE=1."
+                )
+            elif option == "--permission-mode":
+                description = "Permission mode (choices: default, dontAsk, plan)."
+            else:
+                description = "Supported option."
+            lines.append(f"  {option} <value>  {description}")
+        return ("\n".join(lines) + "\n").encode()
+
     def _write_candidate(
         self,
         path: pathlib.Path,
         *,
         marker: pathlib.Path | None = None,
+        version: str = "2.1.212",
     ) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         lines = ["#!/bin/sh"]
         if marker is not None:
-            lines.append(f"printf 'executed\\n' >> {marker}")
-        lines.extend(("printf '2.1.212 (Claude Code)\\n'", "exit 0"))
+            lines.append(f"printf '%s\\n' executed >> {shlex.quote(str(marker))}")
+        lines.append('if [ "${1-}" = "--help" ]; then')
+        for line in self._supported_help().decode("utf-8").splitlines():
+            lines.append(f"  printf '%s\\n' {shlex.quote(line)}")
+        lines.extend(
+            (
+                "  exit 0",
+                "fi",
+                f"printf '%s\\n' {shlex.quote(f'{version} (Claude Code)')}",
+                "exit 0",
+            )
+        )
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         path.chmod(0o755)
 
@@ -70,50 +108,273 @@ class NamedClaudePreflightTest(unittest.TestCase):
         self,
         path: pathlib.Path,
         probe_result: preflight_module.ProbeResult | None = None,
+        *,
+        release_version: str = "2.1.212",
+        help_probe_result: preflight_module.ProbeResult | None = None,
     ) -> preflight_module.VerifiedCandidate:
         resolved = path.resolve(strict=True)
+        manifest_url, signature_url = claude_provenance.release_artifact_urls(
+            release_version
+        )
         return preflight_module.VerifiedCandidate(
+            artifact=claude_provenance.ClaudeReleaseArtifact(
+                version=release_version,
+                platform_key="darwin-arm64",
+                binary="claude",
+                checksum=hashlib.sha256(resolved.read_bytes()).hexdigest(),
+                size=resolved.stat().st_size,
+            ),
             resolved_path=resolved,
-            platform_key="darwin-arm64",
-            checksum=hashlib.sha256(resolved.read_bytes()).hexdigest(),
-            artifact_size=resolved.stat().st_size,
             identity=preflight_module._identity(resolved),
-            probe_result=probe_result
+            manifest_url=manifest_url,
+            signature_url=signature_url,
+            version_probe_result=probe_result
             or preflight_module.ProbeResult(
                 0,
-                b"2.1.212 (Claude Code)\n",
+                f"{release_version} (Claude Code)\n".encode(),
                 b"",
             ),
+            help_probe_result=help_probe_result
+            or preflight_module.ProbeResult(0, self._supported_help(), b""),
         )
 
     def _verified_with_probe(
         self,
         path: pathlib.Path,
+        release_version: str,
         version_probe: preflight_module.VersionProbe,
+        help_probe: preflight_module.HelpProbe,
     ) -> preflight_module.VerifiedCandidate:
-        return self._verified(path, version_probe(path))
+        return self._verified(
+            path,
+            version_probe(path),
+            release_version=release_version,
+            help_probe_result=help_probe(path),
+        )
 
-    def test_only_active_2_1_216_is_blocked_without_executing_candidate(self) -> None:
+    def test_only_active_2_1_216_is_accepted_without_direct_execution(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             home = root / "home"
             marker = root / "active-invocations"
             installed = home / ".local/share/claude/versions/2.1.216"
-            self._write_candidate(installed, marker=marker)
+            self._write_candidate(installed, marker=marker, version="2.1.216")
             active = home / ".local/bin/claude"
             active.parent.mkdir(parents=True)
             active.symlink_to(installed)
 
-            completed = self._run(home=home, path=str(root / "untrusted-bin"))
-            value = json.loads(completed.stdout)
+            def verifier(
+                path: pathlib.Path,
+                release_version: str,
+                _version_probe: preflight_module.VersionProbe,
+                _help_probe: preflight_module.HelpProbe,
+            ) -> preflight_module.VerifiedCandidate:
+                return self._verified(path, release_version=release_version)
 
-            self.assertEqual(completed.returncode, 1)
-            self.assertEqual(completed.stderr, "")
-            self.assertEqual(value["classification"], "blocked")
-            self.assertEqual(value["reason"], "exact-version-mismatch")
+            value = preflight_module.preflight(home=home, verifier=verifier)
+
+            self.assertEqual(value["classification"], "accepted")
+            self.assertEqual(value["reason"], "compatible-version-selected")
             self.assertEqual(value["declared_version"], "2.1.216")
-            self.assertEqual(value["source"], "active-installed")
+            self.assertEqual(value["observed_version"], "2.1.216")
+            self.assertEqual(value["selected_version"], "2.1.216")
+            self.assertEqual(value["source"], "side-by-side-compatible")
             self.assertFalse(marker.exists())
+
+    def test_compatible_stable_release_matrix_is_not_rejected_by_version(self) -> None:
+        for version in ("2.1.211", "2.1.216", "2.99.999"):
+            with (
+                self.subTest(version=version),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                home = pathlib.Path(temporary) / "home"
+                installed = home / ".local/share/claude/versions" / version
+                self._write_candidate(installed, version=version)
+
+                value = preflight_module.preflight(
+                    home=home,
+                    verifier=self._verified_with_probe,
+                )
+
+                self.assertEqual(value["classification"], "accepted")
+                self.assertEqual(value["selected_version"], version)
+                self.assertEqual(
+                    value["compatible_version_range"],
+                    claude_version_policy.CLAUDE_COMPATIBILITY_SPEC,
+                )
+
+    def test_explicit_arbitrary_path_accepts_a_separate_compatible_version(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate = pathlib.Path(temporary) / "versions/claude"
+            self._write_candidate(candidate, version="2.1.216")
+
+            value = preflight_module.preflight(
+                explicit_path=candidate,
+                explicit_version="2.1.216",
+                verifier=self._verified_with_probe,
+            )
+
+            self.assertEqual(value["classification"], "accepted")
+            self.assertEqual(value["source"], "explicit-override")
+            self.assertEqual(value["selected_version"], "2.1.216")
+
+    def test_controlled_active_install_accepts_compatible_resolved_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            home = root / "home"
+            installed = root / "external/versions/2.1.216"
+            self._write_candidate(installed, version="2.1.216")
+            active = home / ".local/bin/claude"
+            active.parent.mkdir(parents=True)
+            active.symlink_to(installed)
+
+            value = preflight_module.preflight(
+                home=home,
+                verifier=self._verified_with_probe,
+            )
+
+            self.assertEqual(value["classification"], "accepted")
+            self.assertEqual(value["source"], "active-installed")
+            self.assertEqual(value["selected_version"], "2.1.216")
+
+    def test_out_of_range_and_prerelease_versions_stop_before_verification(
+        self,
+    ) -> None:
+        for version in ("2.1.210", "2.1.211-beta.1", "3.0.0"):
+            with (
+                self.subTest(version=version),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = pathlib.Path(temporary)
+                candidate = root / "claude"
+                marker = root / "invocations"
+                self._write_candidate(candidate, marker=marker, version=version)
+                verifier_called = False
+
+                def forbidden_verifier(
+                    _path: pathlib.Path,
+                    _release_version: str,
+                    _version_probe: preflight_module.VersionProbe,
+                    _help_probe: preflight_module.HelpProbe,
+                ) -> preflight_module.VerifiedCandidate:
+                    nonlocal verifier_called
+                    verifier_called = True
+                    raise AssertionError("unsupported version must not be verified")
+
+                value = preflight_module.preflight(
+                    explicit_path=candidate,
+                    explicit_version=version,
+                    verifier=forbidden_verifier,
+                )
+
+                self.assertFalse(verifier_called)
+                self.assertFalse(marker.exists())
+                self.assertEqual(value["classification"], "blocked")
+                self.assertEqual(value["reason"], "unsupported-version")
+
+    def test_highest_compatible_side_by_side_release_is_selected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = pathlib.Path(temporary) / "home"
+            versions = home / ".local/share/claude/versions"
+            for version in ("2.1.211", "2.1.216", "2.99.1", "3.0.0"):
+                self._write_candidate(versions / version, version=version)
+
+            value = preflight_module.preflight(
+                home=home,
+                verifier=self._verified_with_probe,
+            )
+
+            self.assertEqual(value["classification"], "accepted")
+            self.assertEqual(value["selected_version"], "2.99.1")
+            self.assertEqual(
+                value["resolved_path"],
+                str((versions / "2.99.1").resolve()),
+            )
+
+    def test_signed_and_observed_release_versions_must_match_exactly(self) -> None:
+        for observed_version in ("2.1.217", "3.0.0"):
+            with (
+                self.subTest(observed_version=observed_version),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                home = pathlib.Path(temporary) / "home"
+                installed = home / ".local/share/claude/versions/2.1.216"
+                self._write_candidate(installed, version="2.1.216")
+
+                def mismatched_verifier(
+                    path: pathlib.Path,
+                    release_version: str,
+                    _version_probe: preflight_module.VersionProbe,
+                    _help_probe: preflight_module.HelpProbe,
+                ) -> preflight_module.VerifiedCandidate:
+                    return self._verified(
+                        path,
+                        preflight_module.ProbeResult(
+                            0,
+                            f"{observed_version} (Claude Code)\n".encode(),
+                            b"",
+                        ),
+                        release_version=release_version,
+                    )
+
+                value = preflight_module.preflight(
+                    home=home,
+                    verifier=mismatched_verifier,
+                )
+
+                self.assertEqual(value["classification"], "blocked")
+                self.assertEqual(value["reason"], "signed-version-identity-mismatch")
+                self.assertEqual(value["declared_version"], "2.1.216")
+                self.assertEqual(value["observed_version"], observed_version)
+
+    def test_capability_and_stream_contract_fail_closed_after_version_acceptance(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = pathlib.Path(temporary) / "home"
+            installed = home / ".local/share/claude/versions/2.1.216"
+            self._write_candidate(installed, version="2.1.216")
+
+            def missing_capability(
+                path: pathlib.Path,
+                release_version: str,
+                _version_probe: preflight_module.VersionProbe,
+                _help_probe: preflight_module.HelpProbe,
+            ) -> preflight_module.VerifiedCandidate:
+                return self._verified(
+                    path,
+                    release_version=release_version,
+                    help_probe_result=preflight_module.ProbeResult(
+                        0,
+                        b"Usage: claude\n",
+                        b"",
+                    ),
+                )
+
+            self.assertEqual(
+                preflight_module.preflight(
+                    home=home,
+                    verifier=missing_capability,
+                )["reason"],
+                "capability-contract-mismatch",
+            )
+
+            with mock.patch.object(
+                preflight_module,
+                "load_stream_contract",
+                side_effect=preflight_module.ClaudeStreamContractError(
+                    "synthetic contract drift"
+                ),
+            ):
+                value = preflight_module.preflight(
+                    home=home,
+                    verifier=self._verified_with_probe,
+                )
+
+            self.assertEqual(value["classification"], "inconclusive")
+            self.assertEqual(value["reason"], "stream-contract-inconclusive")
 
     def test_declared_version_mismatch_loses_to_descriptor_identity_drift(
         self,
@@ -122,8 +383,8 @@ class NamedClaudePreflightTest(unittest.TestCase):
             root = pathlib.Path(temporary)
             home = root / "home"
             marker = root / "active-invocations"
-            installed = home / ".local/share/claude/versions/2.1.216"
-            self._write_candidate(installed, marker=marker)
+            installed = home / ".local/share/claude/versions/3.0.0"
+            self._write_candidate(installed, marker=marker, version="3.0.0")
             active = home / ".local/bin/claude"
             active.parent.mkdir(parents=True)
             active.symlink_to(installed)
@@ -166,10 +427,10 @@ class NamedClaudePreflightTest(unittest.TestCase):
 
             self.assertEqual(value["classification"], "inconclusive")
             self.assertEqual(value["reason"], "executable-identity-drift")
-            self.assertEqual(value["declared_version"], "2.1.216")
+            self.assertEqual(value["declared_version"], "3.0.0")
             self.assertFalse(marker.exists())
 
-    def test_side_by_side_exact_is_verified_before_version_probe(self) -> None:
+    def test_side_by_side_compatible_is_verified_before_capability_probes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             home = root / "home"
@@ -179,31 +440,47 @@ class NamedClaudePreflightTest(unittest.TestCase):
 
             def verifier(
                 path: pathlib.Path,
+                release_version: str,
                 version_probe: preflight_module.VersionProbe,
+                help_probe: preflight_module.HelpProbe,
             ) -> preflight_module.VerifiedCandidate:
                 calls.append(("verify", path))
-                return self._verified(path, version_probe(path))
+                return self._verified(
+                    path,
+                    version_probe(path),
+                    release_version=release_version,
+                    help_probe_result=help_probe(path),
+                )
 
-            def probe(path: pathlib.Path) -> preflight_module.ProbeResult:
-                calls.append(("probe", path))
+            def version_probe(path: pathlib.Path) -> preflight_module.ProbeResult:
+                calls.append(("version", path))
                 return preflight_module.ProbeResult(
                     0,
                     b"2.1.212 (Claude Code)\n",
                     b"",
                 )
 
+            def help_probe(path: pathlib.Path) -> preflight_module.ProbeResult:
+                calls.append(("help", path))
+                return preflight_module.ProbeResult(0, self._supported_help(), b"")
+
             value = preflight_module.preflight(
                 home=home,
                 verifier=verifier,
-                version_probe=probe,
+                version_probe=version_probe,
+                help_probe=help_probe,
             )
 
             self.assertEqual(value["classification"], "accepted")
-            self.assertEqual(value["source"], "side-by-side-exact")
+            self.assertEqual(value["source"], "side-by-side-compatible")
             self.assertEqual(value["resolved_path"], str(exact.resolve()))
-            self.assertEqual([name for name, _path in calls], ["verify", "probe"])
+            self.assertEqual(
+                [name for name, _path in calls],
+                ["verify", "version", "help"],
+            )
             self.assertEqual(calls[0][1], exact.resolve())
             self.assertEqual(calls[1][1], exact.resolve())
+            self.assertEqual(calls[2][1], exact.resolve())
 
     def test_wrong_explicit_override_does_not_fall_back_or_execute(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -211,9 +488,13 @@ class NamedClaudePreflightTest(unittest.TestCase):
             home = root / "home"
             explicit_marker = root / "explicit-invocations"
             side_marker = root / "side-invocations"
-            explicit = root / "versions/2.1.216"
+            explicit = root / "versions/3.0.0"
             exact = home / ".local/share/claude/versions/2.1.212"
-            self._write_candidate(explicit, marker=explicit_marker)
+            self._write_candidate(
+                explicit,
+                marker=explicit_marker,
+                version="3.0.0",
+            )
             self._write_candidate(exact, marker=side_marker)
 
             completed = self._run(
@@ -224,7 +505,7 @@ class NamedClaudePreflightTest(unittest.TestCase):
             value = json.loads(completed.stdout)
 
             self.assertEqual(completed.returncode, 1)
-            self.assertEqual(value["reason"], "exact-version-mismatch")
+            self.assertEqual(value["reason"], "unsupported-version")
             self.assertEqual(value["source"], "explicit-override")
             self.assertFalse(explicit_marker.exists())
             self.assertFalse(side_marker.exists())
@@ -242,7 +523,7 @@ class NamedClaudePreflightTest(unittest.TestCase):
 
             self.assertEqual(completed.returncode, 1)
             self.assertEqual(value["classification"], "blocked")
-            self.assertEqual(value["reason"], "exact-version-unavailable")
+            self.assertEqual(value["reason"], "compatible-version-unavailable")
             self.assertFalse(marker.exists())
 
     def test_untrusted_path_candidate_is_ignored_and_never_executed(self) -> None:
@@ -259,7 +540,7 @@ class NamedClaudePreflightTest(unittest.TestCase):
             ):
                 value = preflight_module.preflight(home=home)
 
-            self.assertEqual(value["reason"], "exact-version-unavailable")
+            self.assertEqual(value["reason"], "compatible-version-unavailable")
             self.assertFalse(marker.exists())
 
     def test_candidate_presence_io_failure_stops_before_lower_priority_fallback(
@@ -268,34 +549,28 @@ class NamedClaudePreflightTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             home = root / "home"
-            side_by_side = home / ".local/share/claude/versions/2.1.212"
+            versions_root = home / ".local/share/claude/versions"
+            versions_root.mkdir(parents=True)
             active = home / ".local/bin/claude"
             self._write_candidate(active)
             verifier_called = False
-            original_lstat = pathlib.Path.lstat
-
-            def fail_side_by_side_lstat(
-                path: pathlib.Path,
-                *args: object,
-                **kwargs: object,
-            ) -> os.stat_result:
-                if path == side_by_side:
-                    raise OSError(errno.EIO, "synthetic candidate inspection failure")
-                return original_lstat(path, *args, **kwargs)  # type: ignore[arg-type]
 
             def forbidden_verifier(
                 _path: pathlib.Path,
+                _release_version: str,
                 _version_probe: preflight_module.VersionProbe,
+                _help_probe: preflight_module.HelpProbe,
             ) -> preflight_module.VerifiedCandidate:
                 nonlocal verifier_called
                 verifier_called = True
                 raise AssertionError("lower-priority candidate must not be verified")
 
             with mock.patch.object(
-                pathlib.Path,
-                "lstat",
-                autospec=True,
-                side_effect=fail_side_by_side_lstat,
+                preflight_module.os,
+                "scandir",
+                side_effect=OSError(
+                    errno.EIO, "synthetic candidate inspection failure"
+                ),
             ):
                 value = preflight_module.preflight(
                     home=home,
@@ -343,7 +618,7 @@ class NamedClaudePreflightTest(unittest.TestCase):
 
             self.assertEqual(value["classification"], "inconclusive")
             self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
-            self.assertEqual(value["source"], "side-by-side-exact")
+            self.assertEqual(value["source"], "side-by-side-compatible")
 
     def test_explicit_candidate_resolve_io_failure_is_inconclusive(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -372,7 +647,7 @@ class NamedClaudePreflightTest(unittest.TestCase):
             self.assertEqual(value["classification"], "inconclusive")
             self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
 
-    def test_missing_exact_version_is_stable_blocked_json(self) -> None:
+    def test_missing_compatible_version_is_stable_blocked_json(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             home = root / "home"
@@ -393,8 +668,8 @@ class NamedClaudePreflightTest(unittest.TestCase):
                 json.loads(first.stdout),
                 {
                     "classification": "blocked",
-                    "reason": "exact-version-unavailable",
-                    "required_version": "2.1.212",
+                    "compatible_version_range": ">=2.1.211,<3.0.0",
+                    "reason": "compatible-version-unavailable",
                     "source": "explicit-override",
                 },
             )
@@ -407,14 +682,18 @@ class NamedClaudePreflightTest(unittest.TestCase):
             repo.mkdir()
             exact = home / ".local/share/claude/versions/2.1.212"
             self._write_candidate(exact)
-            observed: dict[str, object] = {}
+            observed: list[tuple[object, dict[str, object]]] = []
 
             def bounded_capture(*args, **kwargs):  # type: ignore[no-untyped-def]
-                observed["args"] = args
-                observed["kwargs"] = kwargs
+                observed.append((args, kwargs))
+                argument = args[0][1]
                 return types.SimpleNamespace(
                     returncode=0,
-                    stdout=bytearray(b"2.1.212 (Claude Code)\n"),
+                    stdout=bytearray(
+                        self._supported_help()
+                        if argument == "--help"
+                        else b"2.1.212 (Claude Code)\n"
+                    ),
                     stderr=bytearray(),
                 )
 
@@ -430,25 +709,34 @@ class NamedClaudePreflightTest(unittest.TestCase):
                 )
 
             self.assertEqual(value["classification"], "accepted")
-            self.assertEqual(observed["args"], ((str(exact.resolve()), "--version"),))
-            kwargs = observed["kwargs"]
-            assert isinstance(kwargs, dict)
-            self.assertEqual(kwargs["cwd"], pathlib.Path("/"))
-            self.assertEqual(kwargs["env"], dict(preflight_module.VERSION_PROBE_ENV))
-            self.assertIsNone(kwargs["stdin"])
+            self.assertEqual(
+                [args for args, _kwargs in observed],
+                [
+                    ((str(exact.resolve()), "--version"),),
+                    ((str(exact.resolve()), "--help"),),
+                ],
+            )
+            for _args, kwargs in observed:
+                self.assertEqual(kwargs["cwd"], pathlib.Path("/"))
+                self.assertEqual(
+                    kwargs["env"],
+                    dict(preflight_module.CAPABILITY_PROBE_ENV),
+                )
+                self.assertIsNone(kwargs["stdin"])
             self.assertNotIn(str(repo), repr(observed))
-            self.assertNotIn("ANTHROPIC_API_KEY", kwargs["env"])
-            self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", kwargs["env"])
-            self.assertNotIn("GITHUB_TOKEN", kwargs["env"])
+            environment = observed[0][1]["env"]
+            self.assertNotIn("ANTHROPIC_API_KEY", environment)
+            self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", environment)
+            self.assertNotIn("GITHUB_TOKEN", environment)
 
     def test_default_verifier_probes_private_snapshot_not_candidate_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             home = root / "home"
-            exact = home / ".local/share/claude/versions/2.1.212"
-            self._write_candidate(exact)
-            payload = exact.read_bytes()
-            observed_probe_paths: list[pathlib.Path] = []
+            installed = home / ".local/share/claude/versions/2.1.216"
+            self._write_candidate(installed, version="2.1.216")
+            payload = installed.read_bytes()
+            observed_probe_paths: list[tuple[str, pathlib.Path]] = []
 
             def release_verifier(
                 executable: pathlib.Path,
@@ -459,6 +747,9 @@ class NamedClaudePreflightTest(unittest.TestCase):
             ) -> claude_provenance.VerifiedClaudeExecutable:
                 del gpg_temp_root
                 resolved = executable.resolve(strict=True)
+                manifest_url, signature_url = claude_provenance.release_artifact_urls(
+                    version
+                )
                 return claude_provenance.VerifiedClaudeExecutable(
                     executable=resolved,
                     artifact=claude_provenance.ClaudeReleaseArtifact(
@@ -468,23 +759,29 @@ class NamedClaudePreflightTest(unittest.TestCase):
                         checksum=hashlib.sha256(payload).hexdigest(),
                         size=len(payload),
                     ),
-                    manifest_url="https://downloads.claude.ai/manifest.json",
-                    signature_url="https://downloads.claude.ai/manifest.json.sig",
+                    manifest_url=manifest_url,
+                    signature_url=signature_url,
                     gpg_path=pathlib.Path("/trusted/gpg"),
                     source_identity=claude_provenance._stat_identity(
                         resolved.stat(follow_symlinks=False)
                     ),
                 )
 
-            def probe(path: pathlib.Path) -> preflight_module.ProbeResult:
-                observed_probe_paths.append(path)
-                self.assertNotEqual(path, exact.resolve())
+            def version_probe(path: pathlib.Path) -> preflight_module.ProbeResult:
+                observed_probe_paths.append(("version", path))
+                self.assertNotEqual(path, installed.resolve())
                 self.assertTrue(path.is_file())
                 return preflight_module.ProbeResult(
                     0,
-                    b"2.1.212 (Claude Code)\n",
+                    b"2.1.216 (Claude Code)\n",
                     b"",
                 )
+
+            def help_probe(path: pathlib.Path) -> preflight_module.ProbeResult:
+                observed_probe_paths.append(("help", path))
+                self.assertNotEqual(path, installed.resolve())
+                self.assertTrue(path.is_file())
+                return preflight_module.ProbeResult(0, self._supported_help(), b"")
 
             with (
                 mock.patch.object(
@@ -498,11 +795,104 @@ class NamedClaudePreflightTest(unittest.TestCase):
                     side_effect=release_verifier,
                 ),
             ):
-                value = preflight_module.preflight(home=home, version_probe=probe)
+                value = preflight_module.preflight(
+                    home=home,
+                    version_probe=version_probe,
+                    help_probe=help_probe,
+                )
 
             self.assertEqual(value["classification"], "accepted")
-            self.assertEqual(len(observed_probe_paths), 1)
-            self.assertFalse(observed_probe_paths[0].exists())
+            self.assertEqual(
+                [kind for kind, _path in observed_probe_paths],
+                ["version", "help"],
+            )
+            for _kind, path in observed_probe_paths:
+                self.assertFalse(path.exists())
+
+    def test_publisher_result_identity_must_match_selected_release_before_probe(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            candidate = root / "claude"
+            other = root / "other-claude"
+            self._write_candidate(candidate, version="2.1.216")
+            self._write_candidate(other, version="2.1.216")
+            resolved = candidate.resolve(strict=True)
+            payload = resolved.read_bytes()
+            source_identity = claude_provenance._stat_identity(
+                resolved.stat(follow_symlinks=False)
+            )
+            expected_manifest, expected_signature = (
+                claude_provenance.release_artifact_urls("2.1.216")
+            )
+            probe_called = False
+
+            def forbidden_probe(_path: pathlib.Path) -> preflight_module.ProbeResult:
+                nonlocal probe_called
+                probe_called = True
+                raise AssertionError("incoherent publisher result must not be probed")
+
+            cases: dict[str, dict[str, object]] = {
+                "path": {"executable": other.resolve()},
+                "version": {"version": "2.1.215"},
+                "platform": {"platform": "darwin-x64"},
+                "binary": {"binary": "claude.exe"},
+                "manifest": {"manifest_url": expected_manifest + ".other"},
+                "signature": {"signature_url": expected_signature + ".other"},
+            }
+            for name, overrides in cases.items():
+                with self.subTest(name=name):
+                    executable = overrides.get("executable", resolved)
+                    version = overrides.get("version", "2.1.216")
+                    platform = overrides.get("platform", "darwin-arm64")
+                    binary = overrides.get("binary", "claude")
+                    manifest_url = overrides.get("manifest_url", expected_manifest)
+                    signature_url = overrides.get(
+                        "signature_url",
+                        expected_signature,
+                    )
+                    assert isinstance(executable, pathlib.Path)
+                    assert isinstance(version, str)
+                    assert isinstance(platform, str)
+                    assert isinstance(binary, str)
+                    assert isinstance(manifest_url, str)
+                    assert isinstance(signature_url, str)
+                    verified = claude_provenance.VerifiedClaudeExecutable(
+                        executable=executable,
+                        artifact=claude_provenance.ClaudeReleaseArtifact(
+                            version=version,
+                            platform_key=platform,
+                            binary=binary,
+                            checksum=hashlib.sha256(payload).hexdigest(),
+                            size=len(payload),
+                        ),
+                        manifest_url=manifest_url,
+                        signature_url=signature_url,
+                        gpg_path=pathlib.Path("/trusted/gpg"),
+                        source_identity=source_identity,
+                    )
+                    with (
+                        mock.patch.object(
+                            preflight_module,
+                            "_platform_key",
+                            return_value="darwin-arm64",
+                        ),
+                        mock.patch.object(
+                            preflight_module,
+                            "verify_claude_release",
+                            return_value=verified,
+                        ),
+                        self.assertRaises(claude_provenance.ClaudeProvenanceInvalid),
+                    ):
+                        preflight_module.verify_publisher_candidate(
+                            resolved,
+                            "2.1.216",
+                            forbidden_probe,
+                            forbidden_probe,
+                        )
+
+            self.assertFalse(probe_called)
 
     def test_unsafe_snapshot_metadata_is_inconclusive_not_version_mismatch(
         self,
@@ -514,6 +904,9 @@ class NamedClaudePreflightTest(unittest.TestCase):
             self._write_candidate(exact)
             payload = exact.read_bytes()
             resolved = exact.resolve(strict=True)
+            manifest_url, signature_url = claude_provenance.release_artifact_urls(
+                "2.1.212"
+            )
             verified = claude_provenance.VerifiedClaudeExecutable(
                 executable=resolved,
                 artifact=claude_provenance.ClaudeReleaseArtifact(
@@ -523,8 +916,8 @@ class NamedClaudePreflightTest(unittest.TestCase):
                     checksum=hashlib.sha256(payload).hexdigest(),
                     size=len(payload),
                 ),
-                manifest_url="https://downloads.claude.ai/manifest.json",
-                signature_url="https://downloads.claude.ai/manifest.json.sig",
+                manifest_url=manifest_url,
+                signature_url=signature_url,
                 gpg_path=pathlib.Path("/trusted/gpg"),
                 source_identity=claude_provenance._stat_identity(
                     resolved.stat(follow_symlinks=False)
@@ -581,6 +974,9 @@ class NamedClaudePreflightTest(unittest.TestCase):
                 replacement.write_bytes(b"X" * len(original_payload))
                 replacement.chmod(0o755)
                 os.replace(replacement, resolved)
+                manifest_url, signature_url = claude_provenance.release_artifact_urls(
+                    version
+                )
                 return claude_provenance.VerifiedClaudeExecutable(
                     executable=resolved,
                     artifact=claude_provenance.ClaudeReleaseArtifact(
@@ -590,8 +986,8 @@ class NamedClaudePreflightTest(unittest.TestCase):
                         checksum=hashlib.sha256(original_payload).hexdigest(),
                         size=len(original_payload),
                     ),
-                    manifest_url="https://downloads.claude.ai/manifest.json",
-                    signature_url="https://downloads.claude.ai/manifest.json.sig",
+                    manifest_url=manifest_url,
+                    signature_url=signature_url,
                     gpg_path=pathlib.Path("/trusted/gpg"),
                     source_identity=source_identity,
                 )
@@ -633,7 +1029,9 @@ class NamedClaudePreflightTest(unittest.TestCase):
 
             def rewrite_after_binding(
                 path: pathlib.Path,
+                release_version: str,
                 _version_probe: preflight_module.VersionProbe,
+                _help_probe: preflight_module.HelpProbe,
             ) -> preflight_module.VerifiedCandidate:
                 before = path.stat(follow_symlinks=False)
                 identity = original_identity(path)
@@ -647,15 +1045,29 @@ class NamedClaudePreflightTest(unittest.TestCase):
                     follow_symlinks=False,
                 )
                 verified_identity.update(identity)
+                manifest_url, signature_url = claude_provenance.release_artifact_urls(
+                    release_version
+                )
                 return preflight_module.VerifiedCandidate(
                     resolved_path=path,
-                    platform_key="darwin-arm64",
-                    checksum=hashlib.sha256(payload).hexdigest(),
-                    artifact_size=len(payload),
+                    artifact=claude_provenance.ClaudeReleaseArtifact(
+                        version=release_version,
+                        platform_key="darwin-arm64",
+                        binary="claude",
+                        checksum=hashlib.sha256(payload).hexdigest(),
+                        size=len(payload),
+                    ),
                     identity=identity,
-                    probe_result=preflight_module.ProbeResult(
+                    manifest_url=manifest_url,
+                    signature_url=signature_url,
+                    version_probe_result=preflight_module.ProbeResult(
                         0,
                         b"2.1.212 (Claude Code)\n",
+                        b"",
+                    ),
+                    help_probe_result=preflight_module.ProbeResult(
+                        0,
+                        self._supported_help(),
                         b"",
                     ),
                 )
@@ -687,21 +1099,37 @@ class NamedClaudePreflightTest(unittest.TestCase):
 
             def replace_after_binding(
                 path: pathlib.Path,
+                release_version: str,
                 _version_probe: preflight_module.VersionProbe,
+                _help_probe: preflight_module.HelpProbe,
             ) -> preflight_module.VerifiedCandidate:
                 identity = preflight_module._identity(path)
                 replacement = root / "different-claude"
                 self._write_candidate(replacement)
                 os.replace(replacement, path)
+                manifest_url, signature_url = claude_provenance.release_artifact_urls(
+                    release_version
+                )
                 return preflight_module.VerifiedCandidate(
                     resolved_path=path,
-                    platform_key="darwin-arm64",
-                    checksum="a" * 64,
-                    artifact_size=path.stat().st_size,
+                    artifact=claude_provenance.ClaudeReleaseArtifact(
+                        version=release_version,
+                        platform_key="darwin-arm64",
+                        binary="claude",
+                        checksum="a" * 64,
+                        size=path.stat().st_size,
+                    ),
                     identity=identity,
-                    probe_result=preflight_module.ProbeResult(
+                    manifest_url=manifest_url,
+                    signature_url=signature_url,
+                    version_probe_result=preflight_module.ProbeResult(
                         0,
                         b"2.1.216 (Claude Code)\n",
+                        b"",
+                    ),
+                    help_probe_result=preflight_module.ProbeResult(
+                        0,
+                        self._supported_help(),
                         b"",
                     ),
                 )
@@ -726,7 +1154,9 @@ class NamedClaudePreflightTest(unittest.TestCase):
 
             def invalid_publisher_provenance(
                 _path: pathlib.Path,
+                _release_version: str,
                 _version_probe: preflight_module.VersionProbe,
+                _help_probe: preflight_module.HelpProbe,
             ) -> preflight_module.VerifiedCandidate:
                 raise claude_provenance.ClaudeProvenanceInvalid(
                     "synthetic invalid signature"
@@ -746,7 +1176,7 @@ class NamedClaudePreflightTest(unittest.TestCase):
             self.assertFalse(probe_called)
             self.assertEqual(value["classification"], "blocked")
             self.assertEqual(value["reason"], "publisher-verification-failed")
-            self.assertNotEqual(value["reason"], "exact-version-mismatch")
+            self.assertNotEqual(value["reason"], "signed-version-identity-mismatch")
 
     def test_unexpected_verifier_error_is_bounded_inconclusive_without_probe(
         self,
@@ -760,7 +1190,9 @@ class NamedClaudePreflightTest(unittest.TestCase):
 
             def broken_verifier(
                 _path: pathlib.Path,
+                _release_version: str,
                 _version_probe: preflight_module.VersionProbe,
+                _help_probe: preflight_module.HelpProbe,
             ) -> preflight_module.VerifiedCandidate:
                 raise RuntimeError("synthetic unexpected verifier failure")
 
@@ -834,13 +1266,20 @@ class NamedClaudePreflightTest(unittest.TestCase):
                 probe_called = True
                 raise AssertionError("probe must not run")
 
+            real_open = os.open
+            resolved_exact = exact.resolve()
+
+            def fail_candidate_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+                if pathlib.Path(path) == resolved_exact:
+                    raise OSError("synthetic temporary read failure")
+                return real_open(path, flags, *args, **kwargs)
+
             with (
                 mock.patch.object(preflight_module.sys, "platform", "darwin"),
                 mock.patch.object(
-                    pathlib.Path,
+                    preflight_module.os,
                     "open",
-                    autospec=True,
-                    side_effect=OSError("synthetic temporary read failure"),
+                    side_effect=fail_candidate_open,
                 ),
             ):
                 value = preflight_module.preflight(
@@ -852,6 +1291,70 @@ class NamedClaudePreflightTest(unittest.TestCase):
             self.assertFalse(probe_called)
             self.assertEqual(value["classification"], "inconclusive")
             self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
+
+    @unittest.skipUnless(
+        hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"),
+        "requires POSIX FIFO support",
+    )
+    def test_preflight_rejects_fifo_replacement_after_stat_without_blocking(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate = pathlib.Path(temporary) / "claude"
+            self._write_candidate(candidate)
+            resolved_candidate = candidate.resolve()
+            replacement = candidate.with_name("claude.fifo")
+            os.mkfifo(replacement, mode=0o700)
+            real_open = os.open
+            requested_flags: list[int] = []
+            swapped = False
+            values: list[dict[str, object]] = []
+            failures: list[BaseException] = []
+
+            def swap_before_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+                nonlocal swapped
+                if pathlib.Path(path) == resolved_candidate and not swapped:
+                    swapped = True
+                    requested_flags.append(flags)
+                    os.replace(replacement, candidate)
+                return real_open(path, flags, *args, **kwargs)
+
+            def run_preflight() -> None:
+                try:
+                    values.append(
+                        preflight_module.preflight(
+                            explicit_path=candidate,
+                            explicit_version="2.1.212",
+                        )
+                    )
+                except BaseException as error:
+                    failures.append(error)
+
+            worker = threading.Thread(target=run_preflight, daemon=True)
+            with (
+                mock.patch.object(preflight_module.sys, "platform", "darwin"),
+                mock.patch.object(
+                    preflight_module.os,
+                    "open",
+                    side_effect=swap_before_open,
+                ),
+            ):
+                worker.start()
+                worker.join(timeout=1.0)
+                if worker.is_alive():
+                    rescue = real_open(candidate, os.O_RDWR | os.O_NONBLOCK)
+                    os.close(rescue)
+                    worker.join(timeout=1.0)
+
+            self.assertFalse(worker.is_alive(), "candidate FIFO open blocked preflight")
+            self.assertFalse(failures)
+            self.assertTrue(swapped)
+            self.assertTrue(requested_flags[0] & os.O_NONBLOCK)
+            self.assertEqual(values[0]["classification"], "inconclusive")
+            self.assertEqual(
+                values[0]["reason"],
+                "candidate-inspection-inconclusive",
+            )
 
     def test_symlinked_provenance_parent_is_canonicalized_before_validation(
         self,
@@ -890,11 +1393,14 @@ class NamedClaudePreflightTest(unittest.TestCase):
                     checksum=hashlib.sha256(payload).hexdigest(),
                     size=len(payload),
                 )
+                manifest_url, signature_url = claude_provenance.release_artifact_urls(
+                    version
+                )
                 return claude_provenance.VerifiedClaudeExecutable(
                     executable=resolved,
                     artifact=artifact,
-                    manifest_url="https://downloads.claude.ai/manifest.json",
-                    signature_url="https://downloads.claude.ai/manifest.json.sig",
+                    manifest_url=manifest_url,
+                    signature_url=signature_url,
                     gpg_path=pathlib.Path("/trusted/gpg"),
                     source_identity=claude_provenance._stat_identity(
                         resolved.stat(follow_symlinks=False)
@@ -920,9 +1426,15 @@ class NamedClaudePreflightTest(unittest.TestCase):
             ):
                 verified = preflight_module.verify_publisher_candidate(
                     candidate,
+                    "2.1.212",
                     lambda _path: preflight_module.ProbeResult(
                         0,
                         b"2.1.212 (Claude Code)\n",
+                        b"",
+                    ),
+                    lambda _path: preflight_module.ProbeResult(
+                        0,
+                        self._supported_help(),
                         b"",
                     ),
                 )
@@ -995,8 +1507,8 @@ class NamedClaudePreflightTest(unittest.TestCase):
             json.loads(output.value),
             {
                 "classification": "inconclusive",
+                "compatible_version_range": ">=2.1.211,<3.0.0",
                 "reason": "preflight-internal-error",
-                "required_version": "2.1.212",
             },
         )
 
@@ -1016,8 +1528,8 @@ class NamedClaudePreflightTest(unittest.TestCase):
                 json.loads(completed.stdout),
                 {
                     "classification": "inconclusive",
+                    "compatible_version_range": ">=2.1.211,<3.0.0",
                     "reason": "invalid-arguments",
-                    "required_version": "2.1.212",
                 },
             )
 

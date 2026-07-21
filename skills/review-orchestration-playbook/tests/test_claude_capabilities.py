@@ -33,11 +33,9 @@ def supported_help(*, safe_mode: str | None = None) -> str:
 
 class ClaudeCapabilitiesTest(unittest.TestCase):
     def test_version_range_floats_within_major_two(self) -> None:
-        for version in ("2.1.211", "2.1.212", "2.99.999"):
+        for version in ("2.1.211", "2.1.212", "2.1.216", "2.99.999"):
             with self.subTest(version=version):
-                parsed = capabilities.parse_claude_version(
-                    f"{version} (Claude Code)\n"
-                )
+                parsed = capabilities.parse_claude_version(f"{version} (Claude Code)\n")
                 self.assertEqual(parsed.text, version)
 
     def test_version_range_rejects_old_next_major_and_prerelease(self) -> None:
@@ -87,6 +85,18 @@ class ClaudeCapabilitiesTest(unittest.TestCase):
     def test_help_requires_every_option_used_by_final_command(self) -> None:
         help_text = supported_help().replace(
             "  --strict-mcp-config <value>  Supported option.\n",
+            "",
+        )
+
+        with self.assertRaisesRegex(
+            capabilities.ClaudeCapabilityUnavailable,
+            "required review option",
+        ):
+            capabilities.validate_claude_help(help_text)
+
+    def test_help_requires_verbose_for_stream_json_launch(self) -> None:
+        help_text = supported_help().replace(
+            "  --verbose <value>  Supported option.\n",
             "",
         )
 
@@ -686,16 +696,14 @@ class ClaudeCapabilitiesTest(unittest.TestCase):
                 "duplicate",
                 base.replace(
                     "Sets CLAUDE_CODE_SAFE_MODE=1.",
-                    "Sets CLAUDE_CODE_SAFE_MODE=1. Repeats "
-                    "CLAUDE_CODE_SAFE_MODE=1.",
+                    "Sets CLAUDE_CODE_SAFE_MODE=1. Repeats CLAUDE_CODE_SAFE_MODE=1.",
                 ),
             ),
             (
                 "contradictory",
                 base.replace(
                     "Sets CLAUDE_CODE_SAFE_MODE=1.",
-                    "Sets CLAUDE_CODE_SAFE_MODE=1. Also sets "
-                    "CLAUDE_CODE_SAFE_MODE=2.",
+                    "Sets CLAUDE_CODE_SAFE_MODE=1. Also sets CLAUDE_CODE_SAFE_MODE=2.",
                 ),
             ),
             (
