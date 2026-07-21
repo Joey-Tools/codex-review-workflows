@@ -43,6 +43,7 @@ MAX_SEATBELT_PROFILE_BYTES = 32 * 1024
 PROBE_TIMEOUT_SECONDS = 5.0
 PROBE_DETAIL_OUTER_SEATBELT_DENIED = "nested-seatbelt-denied-by-outer-sandbox"
 PROBE_DETAIL_LEADER_EXITED_BEFORE_BINDING = "probe-leader-exited-before-binding"
+PROBE_DETAIL_KILLED_BEFORE_EVIDENCE = "probe-killed-before-evidence"
 
 
 @dataclass(frozen=True)
@@ -1352,6 +1353,17 @@ def _parse_probe_output(
             action=action,
             outcome="ambiguous",
             detail=PROBE_DETAIL_OUTER_SEATBELT_DENIED,
+        )
+    if (
+        not output
+        and not completed.stderr.strip()
+        and completed.returncode == -signal.SIGKILL
+    ):
+        return ProbeObservation(
+            layer=layer,
+            action=action,
+            outcome="ambiguous",
+            detail=PROBE_DETAIL_KILLED_BEFORE_EVIDENCE,
         )
     if not output:
         if action == "exec" and completed.returncode == 0:

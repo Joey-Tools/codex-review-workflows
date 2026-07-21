@@ -303,6 +303,22 @@ class NoChildProfileUnitTests(unittest.TestCase):
         )
         self.assertNotIn("sandbox_apply", observation.detail)
 
+        killed_observation = profile._parse_probe_output(
+            layer="combined",
+            action="exec",
+            completed=subprocess.CompletedProcess(
+                ("/usr/bin/sandbox-exec",),
+                -signal.SIGKILL,
+                b"",
+                b"",
+            ),
+        )
+        self.assertEqual(killed_observation.outcome, "ambiguous")
+        self.assertEqual(
+            killed_observation.detail,
+            profile.PROBE_DETAIL_KILLED_BEFORE_EVIDENCE,
+        )
+
     def test_nonexistent_probe_leader_uses_a_normalized_reason(self) -> None:
         error = ProcessLookupError(errno.ESRCH, "synthetic private path")
         detail = profile._leader_binding_error_detail(error)
@@ -316,8 +332,8 @@ class NoChildProfileUnitTests(unittest.TestCase):
     def test_hosted_fail_closed_signature_matches_production_blockers(self) -> None:
         from .run_hosted_no_child_fail_closed import (
             PROBE_ACTIONS,
-            _expected_outer_sandbox_blockers,
-            _matches_outer_sandbox_observations,
+            _expected_hosted_fail_closed_blockers,
+            _matches_hosted_fail_closed_observations,
             _signature_diagnostics,
         )
 
@@ -330,10 +346,16 @@ class NoChildProfileUnitTests(unittest.TestCase):
             expected_detail = (
                 profile.PROBE_DETAIL_LEADER_EXITED_BEFORE_BINDING
                 if layer == "rlimit"
-                else profile.PROBE_DETAIL_OUTER_SEATBELT_DENIED
+                else profile.PROBE_DETAIL_KILLED_BEFORE_EVIDENCE
             )
             for action_index, action in enumerate(PROBE_ACTIONS):
                 pid = 4000 + layer_index * 100 + action_index
+                child_process_group = None if layer == "rlimit" else pid
+                child_session = None if layer == "rlimit" else pid
+                child_start_identity = (
+                    None if layer == "rlimit" else f"darwin-proc-start:{pid}:1"
+                )
+                post_exec_limit = (None, None) if layer == "rlimit" else expected_limit
                 observations.append(
                     profile.ProbeObservation(
                         layer=layer,
@@ -341,9 +363,9 @@ class NoChildProfileUnitTests(unittest.TestCase):
                         outcome="ambiguous",
                         detail=expected_detail,
                         child_pid=pid,
-                        child_process_group=None,
-                        child_session=None,
-                        child_start_identity=None,
+                        child_process_group=child_process_group,
+                        child_session=child_session,
+                        child_start_identity=child_start_identity,
                         profile_sha256=expected_profile,
                         pre_exec_setsid_succeeded=True,
                         pre_exec_pid=pid,
@@ -351,8 +373,8 @@ class NoChildProfileUnitTests(unittest.TestCase):
                         pre_exec_session=pid,
                         pre_exec_nproc_soft=expected_limit[0],
                         pre_exec_nproc_hard=expected_limit[1],
-                        nproc_soft=None,
-                        nproc_hard=None,
+                        nproc_soft=post_exec_limit[0],
+                        nproc_hard=post_exec_limit[1],
                     )
                 )
         blockers = profile._probe_blockers(
@@ -383,12 +405,13 @@ class NoChildProfileUnitTests(unittest.TestCase):
             blockers=tuple(blockers),
         )
 
-        self.assertEqual(set(blockers), _expected_outer_sandbox_blockers())
+        self.assertEqual(set(blockers), _expected_hosted_fail_closed_blockers())
+        self.assertEqual(len(blockers), 72)
         self.assertEqual(len(blockers), len(set(blockers)))
-        self.assertTrue(_matches_outer_sandbox_observations(evidence))
+        self.assertTrue(_matches_hosted_fail_closed_observations(evidence))
         diagnostics = _signature_diagnostics(
             evidence,
-            expected_blockers=_expected_outer_sandbox_blockers(),
+            expected_blockers=_expected_hosted_fail_closed_blockers(),
             runtime_matches=True,
             observation_signature_matches=True,
         )
@@ -400,6 +423,39 @@ class NoChildProfileUnitTests(unittest.TestCase):
             ["sandbox_exec", "probe_executable", "alternate_executable"],
         )
         self.assertEqual(len(diagnostics["observations"]), len(observations))
+
+        seatbelt_index = next(
+            index
+            for index, item in enumerate(observations)
+            if (item.layer, item.action) == ("seatbelt", "baseline")
+        )
+        drifted_observations = list(observations)
+        drifted_observations[seatbelt_index] = replace(
+            drifted_observations[seatbelt_index],
+            detail=profile.PROBE_DETAIL_OUTER_SEATBELT_DENIED,
+        )
+        self.assertFalse(
+            _matches_hosted_fail_closed_observations(
+                replace(evidence, observations=tuple(drifted_observations))
+            )
+        )
+
+        rlimit_index = next(
+            index
+            for index, item in enumerate(observations)
+            if (item.layer, item.action) == ("rlimit", "baseline")
+        )
+        drifted_observations = list(observations)
+        drifted_observations[rlimit_index] = replace(
+            drifted_observations[rlimit_index],
+            nproc_soft=0,
+            nproc_hard=0,
+        )
+        self.assertFalse(
+            _matches_hosted_fail_closed_observations(
+                replace(evidence, observations=tuple(drifted_observations))
+            )
+        )
 
     def test_required_live_ci_fails_closed_on_runtime_pin_mismatch(self) -> None:
         runtime = profile.RuntimeFingerprint(

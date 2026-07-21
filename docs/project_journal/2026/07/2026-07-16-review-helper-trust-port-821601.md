@@ -580,3 +580,16 @@ metadata behavior.
   subcheck. It does not retain raw probe stderr or repository data. The focused
   Python 3.13 no-child suite passes all 27 tests outside the enclosing Codex
   Seatbelt; the next Hosted run supplies the exact drift needed for calibration.
+- GitHub Actions run 29849786188, job 88699424062, then showed that the earlier
+  outer-Seatbelt-denial model was too narrow. All RLIMIT probes still exited
+  before post-exec leader binding, but every Seatbelt and combined probe had a
+  bound PID, process group, session, Darwin start identity, profile digest, and
+  expected RLIMIT before terminating with `SIGKILL` without probe output. The
+  parser now maps only that exact empty-output signal shape to a stable
+  `probe-killed-before-evidence` reason. The Hosted matcher requires all 24
+  observations, their layer-specific identity and limit fields, and the exact
+  production-derived blocker set; it does not infer the unobserved cause of the
+  signal. Python 3.13 passes all 27 focused no-child tests and the corresponding
+  repository contract test. The final local gate also passes all 1,825 main
+  tests with 6 expected platform skips, all 299 deterministic independent tests
+  with zero skips, and all 57 repository contract tests.

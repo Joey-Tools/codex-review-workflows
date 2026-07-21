@@ -1218,7 +1218,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("_test_key", deterministic_runner)
         for contract in (
             'platform.machine() != "arm64"',
-            "_matches_outer_sandbox_observations(evidence)",
+            "_matches_hosted_fail_closed_observations(evidence)",
             "blockers == expected_blockers",
             "len(blockers) == len(evidence.blockers)",
             '"reviewed_fail_closed_signature": signature_matches',
@@ -1230,7 +1230,7 @@ class RepositoryContractTest(unittest.TestCase):
             "operator-enforced exact-head gate",
             "seven tests run, zero skips",
             "Any push invalidates that evidence",
-            "Hosted CI's fail-closed probe is not a substitute",
+            "Hosted CI's blocker-signature probe is not a substitute",
             "tests.run_required_no_child_profile",
         ):
             self.assertIn(requirement, pr_readiness)
@@ -1276,7 +1276,7 @@ class RepositoryContractTest(unittest.TestCase):
                     supervisor_job,
                 )
                 self.assertIn(
-                    f"""      - name: Confirm hosted no-child profile fails closed
+                    f"""      - name: Match hosted no-child blocker signature
         working-directory: {skill_root}/scripts/independent_codex_pr_review
         env:
           CODEX_REVIEW_LIVE_NO_CHILD_RUNTIME_PROFILE: github-macos-26-arm64-26.4-25E246

@@ -31,19 +31,22 @@ PROBE_ACTIONS = (
 CREATION_ACTIONS = ("fork", "posix_spawn", "popen", "double_fork")
 
 
-def _expected_outer_sandbox_blockers() -> set[str]:
+def _expected_hosted_fail_closed_blockers() -> set[str]:
     blockers: set[str] = set()
-    for layer in ("rlimit", "seatbelt", "combined"):
+    for action in PROBE_ACTIONS:
+        prefix = f"rlimit-{action}"
+        blockers.update(
+            {
+                f"{prefix}-post-exec-leader-binding-invalid",
+                f"{prefix}-start-identity-is-missing",
+                f"{prefix}-post-exec-rlimit-is-invalid",
+                f"ambiguous-rlimit-{action}",
+            }
+        )
+    for layer in ("seatbelt", "combined"):
         for action in PROBE_ACTIONS:
-            prefix = f"{layer}-{action}"
-            blockers.update(
-                {
-                    f"{prefix}-post-exec-leader-binding-invalid",
-                    f"{prefix}-start-identity-is-missing",
-                    f"{prefix}-post-exec-rlimit-is-invalid",
-                    f"ambiguous-{layer}-{action}",
-                }
-            )
+            blockers.add(f"ambiguous-{layer}-{action}")
+    for layer in ("rlimit", "seatbelt", "combined"):
         blockers.add(f"{layer}-baseline-not-observed")
     for action in CREATION_ACTIONS:
         blockers.add(f"rlimit-{action}-not-denied")
@@ -56,7 +59,7 @@ def _expected_outer_sandbox_blockers() -> set[str]:
     return blockers
 
 
-def _matches_outer_sandbox_observations(
+def _matches_hosted_fail_closed_observations(
     evidence: profile.CompatibilityEvidence,
 ) -> bool:
     indexed = {(item.layer, item.action): item for item in evidence.observations}
@@ -67,7 +70,7 @@ def _matches_outer_sandbox_observations(
     }
     if set(indexed) != expected_keys or len(indexed) != len(evidence.observations):
         return False
-    if evidence.parent_nproc_before is None:
+    if evidence.parent_nproc_before is None or evidence.seatbelt_profile_sha256 is None:
         return False
     for (layer, _action), item in indexed.items():
         expected_limit = evidence.parent_nproc_before if layer == "seatbelt" else (0, 0)
@@ -77,24 +80,37 @@ def _matches_outer_sandbox_observations(
         expected_detail = (
             profile.PROBE_DETAIL_LEADER_EXITED_BEFORE_BINDING
             if layer == "rlimit"
-            else profile.PROBE_DETAIL_OUTER_SEATBELT_DENIED
+            else profile.PROBE_DETAIL_KILLED_BEFORE_EVIDENCE
         )
         if (
             item.outcome != "ambiguous"
             or item.detail != expected_detail
+            or item.error_number is not None
             or item.pre_exec_setsid_succeeded is not True
             or type(item.pre_exec_pid) is not int
             or item.pre_exec_pid <= 1
             or item.pre_exec_process_group != item.pre_exec_pid
             or item.pre_exec_session != item.pre_exec_pid
             or item.child_pid != item.pre_exec_pid
-            or item.child_process_group is not None
-            or item.child_session is not None
-            or item.child_start_identity is not None
             or item.profile_sha256 != expected_profile
             or (item.pre_exec_nproc_soft, item.pre_exec_nproc_hard) != expected_limit
-            or item.nproc_soft is not None
-            or item.nproc_hard is not None
+        ):
+            return False
+        if layer == "rlimit":
+            if (
+                item.child_process_group is not None
+                or item.child_session is not None
+                or item.child_start_identity is not None
+                or item.nproc_soft is not None
+                or item.nproc_hard is not None
+            ):
+                return False
+        elif (
+            item.child_process_group != item.pre_exec_pid
+            or item.child_session != item.pre_exec_pid
+            or not isinstance(item.child_start_identity, str)
+            or not item.child_start_identity.startswith("darwin-proc-start:")
+            or (item.nproc_soft, item.nproc_hard) != expected_limit
         ):
             return False
     return True
@@ -178,7 +194,7 @@ def main() -> int:
             alternate_executable_path=synthetic_alternate,
             python_home=sys.base_prefix,
         )
-    expected_blockers = _expected_outer_sandbox_blockers()
+    expected_blockers = _expected_hosted_fail_closed_blockers()
     blockers = set(evidence.blockers)
     runtime = evidence.runtime
     runtime_matches = (
@@ -200,7 +216,7 @@ def main() -> int:
         and evidence.sandbox_exec.sha256
         == GITHUB_HOSTED_RUNTIME_PIN.sandbox_exec_sha256
     )
-    observation_signature_matches = _matches_outer_sandbox_observations(evidence)
+    observation_signature_matches = _matches_hosted_fail_closed_observations(evidence)
     signature_matches = (
         runtime_matches
         and observation_signature_matches

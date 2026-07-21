@@ -60,12 +60,14 @@ Reserve `blocked-authorization` for a different condition: the intended review i
 
 ## Trusted Mac Isolation Gate
 
-GitHub Hosted `macos-26` runs inside an outer Seatbelt and cannot produce the
-production-equivalent no-child or snapshot-Seatbelt evidence. When the frozen
-range changes the independent supervisor's Darwin isolation implementation,
-its live-test runner, or the covered integration tests, the delivery operator
-must run this command on a trusted Mac that matches the production runtime pin
-after the final commit exists:
+The pinned GitHub Hosted `macos-26` profile produces only a reviewed fail-closed
+signature, not production-equivalent no-child or snapshot-Seatbelt evidence.
+Its RLIMIT probes exit before post-exec leader binding, while its Seatbelt and
+combined probes bind the leader and then terminate with `SIGKILL` before probe
+evidence. When the frozen range changes the independent supervisor's Darwin
+isolation implementation, its live-test runner, or the covered integration
+tests, the delivery operator must run this command on a trusted Mac that
+matches the production runtime pin after the final commit exists:
 
 ```bash
 CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE=1 PYTHONDONTWRITEBYTECODE=1 /opt/homebrew/bin/python3.13 -m tests.run_required_no_child_profile
@@ -74,7 +76,7 @@ CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE=1 PYTHONDONTWRITEBYTECODE=1 /opt/home
 Record the exact `head_sha`, seven tests run, zero skips, and terminal result in
 the PR delivery evidence. Any push invalidates that evidence. Missing, skipped,
 old-head, sandbox-blocked, or nonmatching-host evidence blocks merge-readiness;
-Hosted CI's fail-closed probe is not a substitute.
+Hosted CI's blocker-signature probe is not a substitute.
 
 This is an operator-enforced exact-head gate, not a GitHub check run, branch
 protection status, cryptographic attestation, or named review lane. Do not claim
