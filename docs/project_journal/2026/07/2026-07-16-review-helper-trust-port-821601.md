@@ -624,3 +624,16 @@ metadata behavior.
   tests passed in module order, and a second complete Python 3.13 run passed
   all 2,257 tests with 6 host-gated skips. No production change was made for
   the non-reproducing timing failure.
+- The branch then integrated `origin/master` at
+  `217a3571bd05611d79f85dba5c0068a17ea74168`, including the floating Claude
+  release and stream-compatibility contracts from PR #74. The merge was clean
+  and retained the corrected Linux regression fixture. Post-integration
+  validation used only Python 3.13: the exact regression passed, the complete
+  main suite passed all 2,294 tests with 6 host-gated skips, and the independent
+  deterministic supervisor passed all 299 tests with zero skips. Full-tree
+  Ruff lint, the 75-file PR-range format gate, compileall, Bash syntax,
+  ShellCheck, actionlint, strict Linux-launcher C syntax, canonical CI fixture
+  equality, all four repository skill validations, project-journal validation,
+  synthetic-token catalog validation, and pinned-Xcode broker byte
+  reproduction pass. Ruff 0.13.2 also identifies three baseline-identical
+  files outside the PR range that it would now reformat; they remain unchanged.

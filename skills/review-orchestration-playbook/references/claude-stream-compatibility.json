@@ -1,0 +1,21 @@
+{
+  "schema_id": "claude-code-stream-compatible-v1",
+  "version_policy": "review_runtime.claude_version_policy.CLAUDE_COMPATIBILITY_SPEC",
+  "compatibility_mode": "strict-structural-baseline",
+  "baseline_schema": "claude-2.1.212-stream-schema.json",
+  "baseline_version": "2.1.212",
+  "adaptations": {
+    "init_event.field_contracts.claude_code_version": {
+      "baseline_rule": "constant",
+      "runtime_rule": "exact_preflight_selected_version"
+    }
+  },
+  "fail_closed_surfaces": [
+    "stream_envelope",
+    "init_field_set",
+    "init_field_values",
+    "terminal_field_set",
+    "terminal_variants",
+    "model_identity"
+  ]
+}

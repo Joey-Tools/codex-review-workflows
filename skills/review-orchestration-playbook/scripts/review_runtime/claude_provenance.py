@@ -29,6 +29,11 @@ from .common import (
     run_bounded_capture,
     strict_json_loads,
 )
+from .claude_version_policy import (
+    CLAUDE_COMPATIBILITY_SPEC,
+    ClaudeVersionPolicyError,
+    parse_compatible_release_version,
+)
 
 if TYPE_CHECKING:
     from .claude_linux import HostRuntimeClosure
@@ -37,8 +42,6 @@ if TYPE_CHECKING:
 CLAUDE_RELEASE_BASE_URL = "https://downloads.claude.ai/claude-code-releases"
 CLAUDE_RELEASE_KEY_FINGERPRINT = "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE"
 CLAUDE_RELEASE_KEY_PATH = pathlib.Path(__file__).with_name("claude_code_release.asc")
-CLAUDE_MINIMUM_RELEASE = (2, 1, 211)
-CLAUDE_MAXIMUM_RELEASE = (3, 0, 0)
 CLAUDE_MANIFEST_MAX_BYTES = 256 * 1024
 CLAUDE_SIGNATURE_MAX_BYTES = 64 * 1024
 CLAUDE_BINARY_MAX_BYTES = 1024 * 1024 * 1024
@@ -326,22 +329,13 @@ def _decode_strict_json(payload: bytes, *, label: str) -> object:
 def require_supported_release_version(version: str) -> tuple[int, int, int]:
     """Validate and parse a strict, supported Claude Code release version."""
 
-    if not isinstance(version, str) or len(version) > 32:
-        raise ClaudeProvenanceInvalid(
-            "Claude Code version must be a bounded release semver string"
-        )
-    match = _RELEASE_VERSION.fullmatch(version)
-    if match is None:
-        raise ClaudeProvenanceInvalid(
-            f"Claude Code version is not strict release semver: {version!r}"
-        )
-    parsed = tuple(int(component) for component in match.groups())
-    if not (CLAUDE_MINIMUM_RELEASE <= parsed < CLAUDE_MAXIMUM_RELEASE):
+    try:
+        return parse_compatible_release_version(version)
+    except ClaudeVersionPolicyError as error:
         raise ClaudeProvenanceInvalid(
             "Claude Code version is outside the supported range "
-            f">=2.1.211,<3.0.0: {version}"
-        )
-    return parsed  # type: ignore[return-value]
+            f"{CLAUDE_COMPATIBILITY_SPEC}: {version!r}"
+        ) from error
 
 
 def release_artifact_urls(version: str) -> tuple[str, str]:
@@ -904,7 +898,12 @@ def _stable_trusted_gpg_candidate(
             "trusted GPG candidate has unsafe filesystem metadata"
         )
 
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         descriptor = os.open(resolved, flags)
     except OSError as error:
@@ -913,6 +912,13 @@ def _stable_trusted_gpg_candidate(
         ) from error
     try:
         opened_before = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_before.st_mode) or _stat_identity(
+            opened_before
+        ) != _stat_identity(before):
+            os.close(descriptor)
+            raise ClaudeProvenanceInconclusive(
+                "trusted GPG executable or its path changed while opening"
+            )
         magic = os.read(descriptor, 4)
         os.lseek(descriptor, 0, os.SEEK_SET)
         checksum, bytes_read = _bounded_descriptor_digest(
@@ -2139,7 +2145,12 @@ def _verify_release_executable_with_identity(
         raise ClaudeProvenanceInvalid(
             f"Claude Code executable is not executable: {resolved}"
         )
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         descriptor = os.open(resolved, flags)
     except OSError as error:
@@ -2150,6 +2161,12 @@ def _verify_release_executable_with_identity(
         with os.fdopen(descriptor, "rb", closefd=True) as handle:
             opened_before = os.fstat(handle.fileno())
             source_identity = _stat_identity(opened_before)
+            if not stat.S_ISREG(
+                opened_before.st_mode
+            ) or source_identity != _stat_identity(before):
+                raise ClaudeProvenanceInconclusive(
+                    "Claude Code executable changed while it was opened"
+                )
             if opened_before.st_size == artifact.size:
                 checksum, bytes_read = _sha256_file_descriptor(handle)
             else:
@@ -2531,11 +2548,21 @@ def materialize_verified_executable(
                 "verified Claude Code executable changed before snapshotting"
             )
         source_flags = (
-            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
         )
         try:
             source_descriptor = os.open(source, source_flags)
             source_opened = os.fstat(source_descriptor)
+            if (
+                not stat.S_ISREG(source_opened.st_mode)
+                or _stat_identity(source_opened) != source_identity
+            ):
+                raise ClaudeProvenanceInconclusive(
+                    "verified Claude Code executable changed while opening"
+                )
             source_after_open = source.stat(follow_symlinks=False)
         except OSError as error:
             if source_descriptor >= 0:
