@@ -142,7 +142,12 @@ class RepositoryContractTest(unittest.TestCase):
             "本次改动目标就是跨版本兼容性",
             "才选择多版本形态",
             "否则使用单版本形态",
-            "单版本形态下",
+        )
+        cursor = 0
+        for anchor in anchors:
+            cursor = skill.index(anchor, cursor) + len(anchor)
+
+        single_version_anchors = (
             "每个工具链按以下严格顺序查找",
             "选用第一个实际存在的来源",
             "the user 明确指定的版本",
@@ -150,15 +155,15 @@ class RepositoryContractTest(unittest.TestCase):
             "repo 固定配置或 version pin",
             "repo 常规 runner 或项目工具的默认解析结果",
             "本机已安装且与项目兼容的最新版本",
+            "只有当前来源不存在时才检查下一个来源",
+            "选定来源必须解析为唯一且与项目兼容的版本",
+            "若其内部冲突、无法唯一解析或与项目约束不兼容",
+            "停止并报告 blocker，不得静默降级到较低优先级",
+            "将所选 version 及其来源固定用于同一轮验证并记录",
         )
-        cursor = 0
-        for anchor in anchors:
+        cursor = skill.index("单版本形态下")
+        for anchor in single_version_anchors:
             cursor = skill.index(anchor, cursor) + len(anchor)
-        self.assertIn("只有当前来源不存在时才检查下一个来源", skill)
-        self.assertIn("选定来源必须解析为唯一且与项目兼容的版本", skill)
-        self.assertIn("若其内部冲突、无法唯一解析或与项目约束不兼容", skill)
-        self.assertIn("停止并报告 blocker，不得静默降级到较低优先级", skill)
-        self.assertIn("将所选 version 及其来源固定用于同一轮验证并记录", skill)
         self.assertIn(
             "同一 runtime/toolchain 的最低支持版本和 CI matrix 本身不构成本地多版本门禁",
             skill,
@@ -168,11 +173,16 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertLess(skill.index("单版本形态下"), skill.index("在多版本形态下"))
         multi_version_anchors = (
             "第一个实际存在的有限版本集合来源",
-            "the user 或本次任务明确列出的版本集合",
+            "the user 或本次任务明确列出或可唯一解析的有限版本集合",
             "repo-local policy 明确规定的本地多版本集合",
             "repo 明确声明的有限 supported-version set 或 CI matrix",
+            "只有当前来源不存在时才检查下一个来源",
             "选定集合必须非空、无重复且每个版本都与项目兼容",
-            "只能得到开放范围或无法确定有限集合",
+            "选定来源后不比较或合并较低优先级来源",
+            "较低优先级来源的不同集合不构成冲突",
+            "来源冲突仅指选定来源内部给出相互矛盾的集合",
+            "若选定来源内部冲突、只能得到开放范围或无法确定有限集合",
+            "停止并报告 blocker",
             "不得根据本机已安装版本任意扩张集合",
             "记录最终版本集合及其来源",
         )
@@ -187,7 +197,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("无论使用一个还是多个 worktree", skill)
         self.assertIn("为每次运行分配唯一值或命名空间", skill)
         self.assertIn("否则必须跨所有 worktree 串行执行", skill)
-        self.assertIn("持久机器级状态还必须在版本间显式 clean/reset", skill)
+        self.assertIn("已证明为当前任务专属且可丢弃", skill)
+        self.assertIn("才可在版本间显式 clean/reset", skill)
+        self.assertIn("若状态为共享、所有权不清或不可安全丢弃", skill)
+        self.assertIn("需要额外权限时请求明确授权", skill)
         self.assertIn("只有 checkout-local 与机器级资源都已证明隔离时才可并发", skill)
 
     def test_cleanup_only_legacy_0664_lock_migration_is_private_and_ordered(
