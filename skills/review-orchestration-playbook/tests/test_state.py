@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -2205,18 +2206,140 @@ class StatefulLifecycleTest(unittest.TestCase):
 
     def test_concurrent_wait_serializes_workspace_cleanup(self) -> None:
         self.write_completed_state()
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            first = executor.submit(
-                state.wait, self.review.container_dir, timeout_seconds=2
+        status_barrier = threading.Barrier(3)
+        status_threads: set[int] = set()
+        status_threads_lock = threading.Lock()
+        first_compatibility_open = threading.Event()
+        second_container_attempt = threading.Event()
+        allow_compatibility_open = threading.Event()
+        cleanup_owner: int | None = None
+        cleanup_owner_lock = threading.Lock()
+        real_status = state.status
+        real_open_private_lock_file = state.open_private_lock_file
+        real_acquire_descriptor = state._acquire_cleanup_lock_descriptor
+
+        def synchronized_status(*args, **kwargs):
+            summary = real_status(*args, **kwargs)
+            if summary["running"]:
+                thread_id = threading.get_ident()
+                with status_threads_lock:
+                    first_observation = thread_id not in status_threads
+                    status_threads.add(thread_id)
+                if first_observation:
+                    status_barrier.wait(timeout=2)
+            return summary
+
+        def acquire_descriptor(descriptor, *, deadline):
+            nonlocal cleanup_owner
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                thread_id = threading.get_ident()
+                with cleanup_owner_lock:
+                    if cleanup_owner is None:
+                        cleanup_owner = thread_id
+                    elif cleanup_owner != thread_id:
+                        second_container_attempt.set()
+            return real_acquire_descriptor(descriptor, deadline=deadline)
+
+        def open_private_lock_file(path, **kwargs):
+            if pathlib.Path(path).name == state.CLEANUP_LOCK_FILE:
+                with cleanup_owner_lock:
+                    is_owner = cleanup_owner == threading.get_ident()
+                if is_owner:
+                    first_compatibility_open.set()
+                    if not allow_compatibility_open.wait(timeout=2):
+                        raise AssertionError("timed out serializing cleanup lock open")
+            return real_open_private_lock_file(path, **kwargs)
+
+        with (
+            mock.patch.object(state, "status", side_effect=synchronized_status),
+            mock.patch.object(
+                state,
+                "_acquire_cleanup_lock_descriptor",
+                side_effect=acquire_descriptor,
+            ),
+            mock.patch.object(
+                state,
+                "open_private_lock_file",
+                side_effect=open_private_lock_file,
+            ),
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            with held_runner_lock(self.review):
+                first = executor.submit(
+                    state.wait, self.review.container_dir, timeout_seconds=5
+                )
+                second = executor.submit(
+                    state.wait, self.review.container_dir, timeout_seconds=5
+                )
+                status_barrier.wait(timeout=2)
+
+            self.assertTrue(first_compatibility_open.wait(timeout=2))
+            self.assertTrue(second_container_attempt.wait(timeout=2))
+            self.assertFalse(
+                (self.review.container_dir / state.CLEANUP_LOCK_FILE).exists()
             )
-            second = executor.submit(
-                state.wait, self.review.container_dir, timeout_seconds=2
-            )
-            self.assertEqual(first.result(timeout=2), 0)
-            self.assertEqual(second.result(timeout=2), 0)
+            allow_compatibility_open.set()
+            self.assertEqual(first.result(timeout=5), 0)
+            self.assertEqual(second.result(timeout=5), 0)
 
         self.assertFalse(self.review.workspace_root.exists())
         self.assertFalse((self.review.container_dir / "cleanup-error.txt").exists())
+
+    def test_cleanup_opens_compatibility_lock_after_container_lock(self) -> None:
+        self.write_completed_state()
+        probe_fd = os.open(
+            self.review.container_dir,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0),
+        )
+        real_open_private_lock_file = state.open_private_lock_file
+
+        def open_with_container_probe(path, **kwargs):
+            if pathlib.Path(path).name == state.CLEANUP_LOCK_FILE:
+                with self.assertRaises(BlockingIOError):
+                    state.fcntl.flock(
+                        probe_fd,
+                        state.fcntl.LOCK_EX | state.fcntl.LOCK_NB,
+                    )
+            return real_open_private_lock_file(path, **kwargs)
+
+        try:
+            with mock.patch.object(
+                state,
+                "open_private_lock_file",
+                side_effect=open_with_container_probe,
+            ):
+                self.assertEqual(
+                    state.cleanup(self.review.container_dir, timeout_seconds=5),
+                    0,
+                )
+        finally:
+            os.close(probe_fd)
+
+    def test_shared_runner_probe_does_not_block_terminal_cleanup(self) -> None:
+        self.write_completed_state()
+        with state.open_private_lock_file(
+            self.review.container_dir / state.LOCK_FILE,
+            label="test shared runner probe",
+        ) as observer:
+            state.fcntl.flock(observer.fileno(), state.fcntl.LOCK_SH)
+            self.assertFalse(state._runner_lock_held(self.review.container_dir))
+            self.assertEqual(
+                state.cleanup(self.review.container_dir, timeout_seconds=5),
+                0,
+            )
+
+        self.assertFalse(self.review.workspace_root.exists())
+
+    def test_exclusive_runner_lease_still_blocks_terminal_cleanup(self) -> None:
+        self.write_completed_state()
+        with held_runner_lock(self.review):
+            self.assertTrue(state._runner_lock_held(self.review.container_dir))
+            self.assertEqual(
+                state.cleanup(self.review.container_dir, timeout_seconds=1),
+                3,
+            )
+
+        self.assertTrue(self.review.workspace_root.exists())
 
     def test_directory_identity_allows_child_entry_changes(self) -> None:
         state_dir = self.review.container_dir
@@ -2682,13 +2805,12 @@ class StatefulLifecycleTest(unittest.TestCase):
         lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
         lock_path.write_bytes(b"")
         lock_path.chmod(0o664)
+        real_acquire_cleanup_lock = state._acquire_cleanup_lock
 
         def acquire_then_change_state_mode(handle, *, deadline):
-            del deadline
-            state.fcntl.flock(
-                handle.fileno(),
-                state.fcntl.LOCK_EX | state.fcntl.LOCK_NB,
-            )
+            acquired = real_acquire_cleanup_lock(handle, deadline=deadline)
+            if not acquired:
+                return False
             self.review.container_dir.chmod(0o750)
             return True
 
@@ -2746,8 +2868,12 @@ class StatefulLifecycleTest(unittest.TestCase):
         lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
         lock_path.write_bytes(b"")
         lock_path.chmod(0o644)
+        real_acquire_cleanup_lock = state._acquire_cleanup_lock
 
-        def mutate_mode_after_flock(*_args, **_kwargs) -> bool:
+        def mutate_mode_after_flock(handle, *, deadline) -> bool:
+            acquired = real_acquire_cleanup_lock(handle, deadline=deadline)
+            if not acquired:
+                return False
             lock_path.chmod(0o700)
             return True
 
@@ -2779,13 +2905,12 @@ class StatefulLifecycleTest(unittest.TestCase):
     def test_cleanup_rejects_lock_path_replacement_after_flock(self) -> None:
         self.write_completed_state()
         lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        real_acquire_cleanup_lock = state._acquire_cleanup_lock
 
         def acquire_then_replace(handle, *, deadline):
-            del deadline
-            state.fcntl.flock(
-                handle.fileno(),
-                state.fcntl.LOCK_EX | state.fcntl.LOCK_NB,
-            )
+            acquired = real_acquire_cleanup_lock(handle, deadline=deadline)
+            if not acquired:
+                return False
             lock_path.unlink()
             with state.open_private_lock_file(
                 lock_path,
@@ -2870,17 +2995,22 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.write_completed_state()
         worker = mock.Mock()
         worker.poll.side_effect = KeyboardInterrupt
+        real_flock = state.fcntl.flock
 
         with (
             mock.patch.object(state.subprocess, "Popen", return_value=worker),
             mock.patch.object(state, "_runner_lock_held", return_value=False),
-            mock.patch.object(state, "_acquire_cleanup_lock", return_value=True),
-            mock.patch.object(state.fcntl, "flock") as flock,
+            mock.patch.object(state.fcntl, "flock", wraps=real_flock) as flock,
             self.assertRaises(KeyboardInterrupt),
         ):
             state.wait(self.review.container_dir, timeout_seconds=1)
 
-        flock.assert_not_called()
+        self.assertFalse(
+            any(
+                len(call.args) >= 2 and call.args[1] == state.fcntl.LOCK_UN
+                for call in flock.call_args_list
+            )
+        )
 
     def test_final_reports_bounded_cleanup_timeout(self) -> None:
         self.write_completed_state()
