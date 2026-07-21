@@ -762,11 +762,12 @@ class RepositoryContractTest(unittest.TestCase):
         readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
             encoding="utf-8"
         )
-        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-        agents_policy = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        agents_policy = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
+            encoding="utf-8"
+        )
         interface = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
 
-        causal_anchors = (
+        causal_anchors = [
             (
                 skill,
                 "For a standalone report-only named review, do not create a branch or commit: report review preparation as `blocked-authorization`",
@@ -780,10 +781,6 @@ class RepositoryContractTest(unittest.TestCase):
                 "implementation checkout is dirty and no committed review range exists, report review preparation as `blocked-authorization`",
             ),
             (
-                readme,
-                "If no committed range exists, report `blocked-authorization` rather than review or mutate a dirty checkout",
-            ),
-            (
                 agents_policy,
                 "Without an existing committed range, report `blocked-authorization` instead of reviewing or mutating a dirty checkout",
             ),
@@ -791,19 +788,22 @@ class RepositoryContractTest(unittest.TestCase):
                 interface,
                 "without an existing committed range, stop as blocked-authorization",
             ),
-        )
+        ]
+        if CI_PROFILE == "canonical":
+            readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+            causal_anchors.append(
+                (
+                    readme,
+                    "If no committed range exists, report `blocked-authorization` rather than review or mutate a dirty checkout",
+                )
+            )
         for document, anchor in causal_anchors:
             with self.subTest(anchor=anchor):
                 self.assertIn(anchor, document)
 
-        active_documents = (
-            skill,
-            contracts,
-            readiness,
-            readme,
-            agents_policy,
-            interface,
-        )
+        active_documents = [skill, contracts, readiness, agents_policy, interface]
+        if CI_PROFILE == "canonical":
+            active_documents.append(readme)
         for document in active_documents:
             self.assertNotIn(
                 "If implementation changes are uncommitted, create an intentional review-anchor commit",
@@ -826,7 +826,9 @@ class RepositoryContractTest(unittest.TestCase):
         templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
             encoding="utf-8"
         )
-        agents_policy = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        agents_policy = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
+            encoding="utf-8"
+        )
         interface = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
 
         for anchor in (
