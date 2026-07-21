@@ -1,0 +1,87 @@
+{
+  "claude_code_version": "2.1.212",
+  "model_identity": {
+    "claude-opus-4-8": {
+      "init_model": "claude-opus-4-8",
+      "accepted_model_usage_keys": [
+        "claude-opus-4-8",
+        "claude-opus-4.8"
+      ]
+    },
+    "claude-opus-4-7": {
+      "init_model": "claude-opus-4-7",
+      "accepted_model_usage_keys": [
+        "claude-opus-4-7",
+        "claude-opus-4.7"
+      ]
+    }
+  },
+  "terminal_result": {
+    "required_fields": [
+      "type",
+      "subtype",
+      "is_error",
+      "result",
+      "modelUsage"
+    ],
+    "optional_fields": [
+      "duration_ms",
+      "duration_api_ms",
+      "num_turns",
+      "session_id",
+      "total_cost_usd",
+      "usage",
+      "uuid",
+      "stop_reason",
+      "structured_output",
+      "error",
+      "errors",
+      "api_error_status",
+      "permission_denials"
+    ]
+  },
+  "contract_cases": [
+    {
+      "name": "primary_exact",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
+      "model_usage_keys": [
+        "claude-opus-4-8"
+      ],
+      "extra_terminal_fields": [],
+      "expected": "accept"
+    },
+    {
+      "name": "reviewed_terminal_alias",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
+      "model_usage_keys": [
+        "claude-opus-4.8"
+      ],
+      "extra_terminal_fields": [],
+      "expected": "accept"
+    },
+    {
+      "name": "silent_model_fallback",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-7",
+      "model_usage_keys": [
+        "claude-opus-4-7"
+      ],
+      "extra_terminal_fields": [],
+      "expected": "blocked"
+    },
+    {
+      "name": "unknown_error_field",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
+      "model_usage_keys": [
+        "claude-opus-4-8"
+      ],
+      "extra_terminal_fields": [
+        "fatal_error"
+      ],
+      "expected": "inconclusive"
+    }
+  ]
+}

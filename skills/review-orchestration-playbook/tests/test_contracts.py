@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import pathlib
 import subprocess
 import sys
@@ -1079,11 +1080,15 @@ class RepositoryContractTest(unittest.TestCase):
             "Base SHA: {base_sha}",
             "Head SHA: {head_sha}",
             "Frozen review range: {base_sha}..{head_sha}",
-            "Authoritative review instruction source/version: {review_skill_path_or_version}",
+            "Authoritative review skill path: {review_skill_path}",
+            "Authoritative review skill version/digest: {review_skill_version_or_digest}",
             "clean, independent, read-only Git worktree",
             "does not include a prebuilt full diff",
             "obtain range metadata, changed paths, hunks",
-            "load the review skill",
+            "verify that the exact authoritative review skill path above exists",
+            "missing or mismatched",
+            "never choose another installed copy",
+            "Load exactly that review skill",
             "domain skill",
             "AGENTS.md",
             "project-guidance document",
@@ -1254,7 +1259,7 @@ class RepositoryContractTest(unittest.TestCase):
 
         envelope_anchor = "A missing, duplicate, malformed, out-of-order, or trailing contract event makes the lane `inconclusive`"
         classifier_anchor = "A structurally valid terminal event that fails the success acceptance schema is passed to the failure classifier below"
-        permission_anchor = "Classify a structurally valid permission denial or configuration/policy mismatch as `blocked`"
+        permission_anchor = "Classify a structurally valid permission denial, exact-model mismatch, or configuration/policy mismatch as `blocked`"
         authentication_anchor = "Classify a structurally valid recognized login-expired, HTTP 401, or authentication-refresh error as `blocked-authentication`"
         for anchor in (
             envelope_anchor,
@@ -1281,8 +1286,14 @@ class RepositoryContractTest(unittest.TestCase):
         contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
             encoding="utf-8"
         )
-        reviewer = (REPO_ROOT / "agents/reviewer.toml").read_text(encoding="utf-8")
-        agents_policy = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        policy_scope = _repository_policy_scope_root(REPO_ROOT, CI_PROFILE)
+        reviewer = (policy_scope / "agents/reviewer.toml").read_text(encoding="utf-8")
+        agents_policy = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
+            encoding="utf-8"
+        )
+        templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
+            encoding="utf-8"
+        )
 
         for content in (skill, contracts, reviewer):
             self.assertIn("normally the active installed copy", content)
@@ -1291,6 +1302,87 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("repo-local playbook from the frozen review head", agents_policy)
         for content in (skill, contracts, reviewer):
             self.assertNotIn("from its normal skill environment", content)
+        for anchor in (
+            "Authoritative review skill path: {review_skill_path}",
+            "Authoritative review skill version/digest: {review_skill_version_or_digest}",
+            "verify that the exact authoritative review skill path above exists",
+            "report the lane blocked",
+            "never choose another installed copy",
+        ):
+            self.assertIn(anchor, templates)
+        self.assertNotIn("{review_skill_path_or_version}", templates)
+
+    def test_claude_2_1_212_schema_closes_models_and_terminal_fields(self) -> None:
+        schema_path = SKILL_ROOT / "references/claude-2.1.212-stream-schema.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual(schema["claude_code_version"], "2.1.212")
+        identities = schema["model_identity"]
+        self.assertEqual(
+            identities["claude-opus-4-8"]["accepted_model_usage_keys"],
+            ["claude-opus-4-8", "claude-opus-4.8"],
+        )
+        self.assertEqual(
+            identities["claude-opus-4-7"]["accepted_model_usage_keys"],
+            ["claude-opus-4-7", "claude-opus-4.7"],
+        )
+        allowed_terminal_fields = set(schema["terminal_result"]["required_fields"])
+        allowed_terminal_fields.update(schema["terminal_result"]["optional_fields"])
+
+        observed = {}
+        for case in schema["contract_cases"]:
+            identity = identities[case["requested_model"]]
+            unknown_fields = (
+                set(case["extra_terminal_fields"]) - allowed_terminal_fields
+            )
+            if unknown_fields:
+                outcome = "inconclusive"
+            elif case["init_model"] != identity["init_model"]:
+                outcome = "blocked"
+            elif not set(case["model_usage_keys"]).intersection(
+                identity["accepted_model_usage_keys"]
+            ):
+                outcome = "blocked"
+            else:
+                outcome = "accept"
+            observed[case["name"]] = outcome
+            self.assertEqual(outcome, case["expected"], case["name"])
+
+        self.assertEqual(observed["reviewed_terminal_alias"], "accept")
+        self.assertEqual(observed["silent_model_fallback"], "blocked")
+        self.assertEqual(observed["unknown_error_field"], "inconclusive")
+        for anchor in (
+            "equals the requested concrete model string exactly",
+            "the only reviewed terminal aliases",
+            "`claude-opus-4-8` request with only a `claude-opus-4-7` key",
+            "closed top-level allowlist",
+            "Any other terminal field",
+        ):
+            self.assertIn(anchor, canonical)
+
+    def test_unsupported_mismatched_pr_stays_effective_double_but_not_ready(
+        self,
+    ) -> None:
+        agents_policy = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
+            encoding="utf-8"
+        )
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+        documents = [agents_policy, readiness]
+        if CI_PROFILE == "canonical":
+            documents.append((REPO_ROOT / "README.md").read_text(encoding="utf-8"))
+
+        for content in documents:
+            self.assertIn("still-eligible", content)
+            self.assertIn("effective double", content)
+            self.assertIn("blocked-authorization", content)
+        for content in (agents_policy, *documents[2:]):
+            self.assertIn("already unsupported", content)
+            self.assertIn("keep requested triple/effective double", content)
 
     def test_main_workflow_checks_existing_pr_head_before_local_lanes(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")

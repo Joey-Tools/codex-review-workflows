@@ -126,6 +126,7 @@ The `isolated_review` helper retains a frozen, `.git`-free, prepared-diff runtim
 
 - [review-lane-contracts.md](references/review-lane-contracts.md): canonical workspace, prompt, bounded-read, and output contracts.
 - [canonical-claude-lane.md](references/canonical-claude-lane.md): direct actual-Claude launch, native sandbox, guidance, and evidence contract.
+- [claude-2.1.212-stream-schema.json](references/claude-2.1.212-stream-schema.json): machine-readable exact-model aliases and closed terminal-field allowlist for the currently reviewed Claude CLI schema.
 - [pr-readiness.md](references/pr-readiness.md): PR authorization, current-head GitHub Codex, CI/comments, fix loop, and merge-ready reporting.
 - [review-prompt-templates.md](references/review-prompt-templates.md): fresh-context prompt templates.
 - [github-pr-probes.md](references/github-pr-probes.md): bounded `gh` probes.

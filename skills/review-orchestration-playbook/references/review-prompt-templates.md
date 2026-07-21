@@ -41,12 +41,13 @@ Workspace: {clean_worktree}
 Base SHA: {base_sha}
 Head SHA: {head_sha}
 Frozen review range: {base_sha}..{head_sha}
-Authoritative review instruction source/version: {review_skill_path_or_version}
+Authoritative review skill path: {review_skill_path}
+Authoritative review skill version/digest: {review_skill_version_or_digest}
 
 This is a clean, independent, read-only Git worktree. Review only the frozen range above; do not review a live working tree.
 The prompt intentionally does not include a prebuilt full diff. Verify the refs and obtain range metadata, changed paths, hunks, and necessary nearby tracked context yourself with bounded Git and tool calls.
 
-Before reviewing, load the review skill and repository-wide AGENTS.md. Inspect only changed-path metadata next; then load every applicable path-scoped AGENTS.md file, domain skill, and project-guidance document before inspecting hunks.
+Before reviewing, verify that the exact authoritative review skill path above exists and matches the supplied version/digest. If it is missing or mismatched, report the lane blocked; never choose another installed copy. Load exactly that review skill, then repository-wide AGENTS.md. Inspect only changed-path metadata next; then load every applicable path-scoped AGENTS.md file, domain skill, and project-guidance document before inspecting hunks.
 
 Evidence budget:
 - Start with count-only or compact metadata, then --stat/--numstat and one file, hunk, or symbol at a time.

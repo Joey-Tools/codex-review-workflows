@@ -117,7 +117,7 @@ Before accepting the result, compare the leading init against a reviewed, versio
 - `permissionMode` equals `dontAsk`;
 - `tools` is a duplicate-free set exactly equal to `Read`, `Grep`, `Glob`, and `Bash`;
 - `mcp_servers`, `slash_commands`, `skills`, and `plugins` are present and exactly empty arrays;
-- `model` matches the requested concrete model without silent substitution;
+- `model` equals the requested concrete model string exactly, without alias normalization or silent substitution;
 - `claude_code_version` equals the publisher-verified preflight version; and
 - `apiKeySource` is a string that exactly matches the parent-selected and preflight-verified authentication source: `ANTHROPIC_API_KEY` for explicit API-key mode and `none` for ordinary local login in Claude Code 2.1.212.
 
@@ -127,12 +127,14 @@ For the Claude Code 2.1.212 terminal `result`, require this exact acceptance sch
 
 - `type` is the string `result`, `subtype` is the string `success`, and `is_error` is the boolean `false`;
 - `result` is a required string whose `strip()` value is nonempty; preserve the original string verbatim as the findings payload;
-- `modelUsage` is a required nonempty object; every key is a nonempty model-ID string, every value is an object, and at least one key matches the requested concrete model under the version-reviewed model-ID equivalence. Auxiliary model-usage entries may be retained as metadata but can never select a substitute effective model;
+- `modelUsage` is a required nonempty object; every key is a nonempty model-ID string and every value is an object. For Claude Code 2.1.212, the only reviewed terminal aliases for requested `claude-opus-4-8` are `claude-opus-4-8` and `claude-opus-4.8`; the only aliases for requested fallback `claude-opus-4-7` are `claude-opus-4-7` and `claude-opus-4.7`. At least one key must belong to the exact requested model's set. Auxiliary model-usage entries may be retained as metadata but can never select a substitute effective model; a `claude-opus-4-8` request with only a `claude-opus-4-7` key is a deterministic blocked model substitution;
 - `error` and `errors`, when present, are explicitly empty: `null`, a whitespace-only string, an empty array, or an empty object;
 - `api_error_status`, when present, is `null` or a whitespace-only string; and
 - `permission_denials`, when present, is an empty array.
 
-A non-success subtype, `is_error: true`, blank/non-string `result`, missing or malformed `modelUsage`, no requested-model match, nonempty `error`/`errors`, nonempty `api_error_status`, or nonempty/malformed `permission_denials` fails closed and cannot supply findings. Classify a structurally valid permission denial or configuration/policy mismatch as `blocked`. Classify a structurally valid recognized login-expired, HTTP 401, or authentication-refresh error as `blocked-authentication`. Malformed, contradictory, mixed-category, or otherwise untrustworthy terminal evidence is `inconclusive`. Unknown terminal fields are additive metadata only when the accepted version schema permits them and they do not carry an error, denial, model substitution, or widened runtime surface.
+A non-success subtype, `is_error: true`, blank/non-string `result`, missing or malformed `modelUsage`, no requested-model match, nonempty `error`/`errors`, nonempty `api_error_status`, or nonempty/malformed `permission_denials` fails closed and cannot supply findings. Classify a structurally valid permission denial, exact-model mismatch, or configuration/policy mismatch as `blocked`. Classify a structurally valid recognized login-expired, HTTP 401, or authentication-refresh error as `blocked-authentication`. Malformed, contradictory, mixed-category, or otherwise untrustworthy terminal evidence is `inconclusive`.
+
+The machine-readable Claude Code 2.1.212 contract is [claude-2.1.212-stream-schema.json](claude-2.1.212-stream-schema.json). Its required and optional terminal-field lists form a closed top-level allowlist. Any other terminal field, including an unknown error-bearing field, makes the lane `inconclusive` until a reviewed schema update explicitly adds it. Do not infer a model alias or harmless metadata field from punctuation, provider convention, or a later CLI version.
 
 This evidence verifies only what the CLI reports about that invocation. It does not prove the final merged native sandbox, merged admin-managed permission arrays, path-rule evaluation, or absence of unreported CLI control-plane side effects. Capability output and init evidence must never be promoted into such proof.
 
