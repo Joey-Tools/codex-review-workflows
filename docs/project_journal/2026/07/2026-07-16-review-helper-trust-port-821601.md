@@ -518,3 +518,11 @@ metadata behavior.
   formatting, compileall, Bash syntax, ShellCheck, actionlint, strict launcher
   C syntax, synthetic-token catalog validation, project-journal validation,
   the official skill validator, and `git diff --check` pass.
+- Exact-head self-hosting of the candidate stateful helper at
+  `aaf9ed01e1fb83237c2690388dc342edd220d16c` exposed a raw Git LFS pointer
+  test fixture that made full-tree materialization fail closed before reviewer
+  launch. The pointer detector is intentionally independent of current
+  `.gitattributes`, so the fix keeps the parser samples as runtime byte
+  constants inside `test_lfs.py` and removes the three standalone fixture
+  blobs instead of weakening detection. The focused Python 3.13 LFS parser
+  suite passes; the replacement head must repeat all exact-head gates.

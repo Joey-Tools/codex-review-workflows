@@ -1,23 +1,52 @@
 from __future__ import annotations
 
-import pathlib
 import unittest
 
 from review_supervisor.lfs import is_git_lfs_pointer
 
 
-FIXTURES = pathlib.Path(__file__).parent / "fixtures" / "lfs"
 OID = b"sha256:" + b"a" * 64
+# Keep samples inside a non-pointer source blob so self-review can materialize them.
+CANONICAL_POINTER = (
+    b"\n".join(
+        (
+            b"version https://git-lfs.github.com/spec/v1",
+            b"oid " + OID,
+            b"size 1",
+        )
+    )
+    + b"\n"
+)
+INTERLEAVED_POINTER = (
+    b"\n".join(
+        (
+            b"ext-5-alpha-with-tail sha256:" + b"b" * 64,
+            b"version https://hawser.github.com/spec/v1",
+            b"ext-1-beta sha256:" + b"c" * 64,
+            b"oid sha256:" + b"d" * 64,
+            b"size -0",
+        )
+    )
+    + b"\n"
+)
+INVALID_UPPERCASE_OID = (
+    b"\n".join(
+        (
+            b"version https://git-lfs.github.com/spec/v1",
+            b"oid sha256:" + b"A" * 64,
+            b"size 1",
+        )
+    )
+    + b"\n"
+)
 
 
 class GitLfsPointerTests(unittest.TestCase):
     def test_accepts_canonical_fixture(self) -> None:
-        self.assertTrue(is_git_lfs_pointer((FIXTURES / "canonical.ptr").read_bytes()))
+        self.assertTrue(is_git_lfs_pointer(CANONICAL_POINTER))
 
     def test_accepts_reference_compatible_variants(self) -> None:
-        self.assertTrue(
-            is_git_lfs_pointer((FIXTURES / "interleaved-extensions.ptr").read_bytes())
-        )
+        self.assertTrue(is_git_lfs_pointer(INTERLEAVED_POINTER))
         crlf = b"\r\n".join(
             (
                 b"version http://git-media.io/v/2",
@@ -28,9 +57,7 @@ class GitLfsPointerTests(unittest.TestCase):
         self.assertTrue(is_git_lfs_pointer(b" \t" + crlf + b"\r\n"))
 
     def test_rejects_near_misses(self) -> None:
-        self.assertFalse(
-            is_git_lfs_pointer((FIXTURES / "invalid-uppercase-oid.txt").read_bytes())
-        )
+        self.assertFalse(is_git_lfs_pointer(INVALID_UPPERCASE_OID))
         candidates = (
             b"version https://git-lfs.github.com/spec/v1\n"
             b"oid " + OID + b"\nsize 1\next-1-late " + OID,
