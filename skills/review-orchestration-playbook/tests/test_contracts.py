@@ -138,16 +138,20 @@ class RepositoryContractTest(unittest.TestCase):
         anchors = (
             "每个 runtime/toolchain",
             "本地默认各选择一个确定的 version",
-            "每个工具链分别依次采用",
+            "每个工具链按以下严格顺序检查",
+            "采用第一个能解析为单一兼容版本的来源",
             "the user 明确指定的版本",
-            "repo-local policy、repo 固定配置或既有 runner 解析出的版本",
-            "项目工具默认值",
+            "repo-local policy 明确指定的本地验证版本",
+            "repo 固定配置或 version pin",
+            "repo 常规 runner 或项目工具的默认解析结果",
             "本机已安装且与项目兼容的最新版本",
         )
         cursor = 0
         for anchor in anchors:
             cursor = skill.index(anchor, cursor) + len(anchor)
-        self.assertIn("记录实际采用的 runtime/toolchain versions", skill)
+        self.assertIn("已选中的较高优先级来源内部冲突", skill)
+        self.assertIn("停止并报告 blocker，不得静默降级到较低优先级", skill)
+        self.assertIn("记录实际采用的 runtime/toolchain versions 及其来源", skill)
         self.assertIn(
             "同一 runtime/toolchain 的最低支持版本和 CI matrix 本身不构成本地多版本门禁",
             skill,

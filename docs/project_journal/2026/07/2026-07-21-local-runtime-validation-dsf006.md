@@ -20,8 +20,8 @@ superseded_by:
 ## Current State
 
 - Local validation keeps every required runtime or toolchain in scope, while selecting one version for each by default.
-- Each toolchain first uses an explicit user or repository version, then a repository-pinned or runner-resolved version, then the tool default, and finally the newest installed compatible version.
-- Each selected toolchain version stays fixed for the validation pass and is recorded in the evidence.
+- Each toolchain uses the first source that resolves to one compatible version, in strict order: explicit user version, explicit repository policy, repository version pin, normal repository runner or tool default, then the newest installed compatible version.
+- A conflict inside the selected higher-priority source stops as a blocker instead of silently falling through. Each selected toolchain version and source stay fixed for the validation pass and are recorded in the evidence.
 - Minimum supported versions and CI matrices do not imply an unrequested local runtime matrix.
 - Cross-version compatibility changes may still validate multiple runtimes locally.
 - Multi-version validation uses same-checkout serial reuse only when the suite proves it safe. Version-sensitive checkout output, caches, and mutable state use isolated worktrees, caches, and state, or are explicitly cleaned and rebuilt between versions.
