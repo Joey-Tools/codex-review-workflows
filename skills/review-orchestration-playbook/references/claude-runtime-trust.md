@@ -6,7 +6,7 @@ platform or version is supported only when every applicable gate below passes.
 The canonical named-double lane launches actual Claude Code directly under
 [canonical-claude-lane.md](canonical-claude-lane.md); it reuses applicable
 publisher-verification primitives, native-sandbox boundary, and failure
-vocabulary here, but not the helper-only version bounds and never the helper's
+vocabulary here, but never the helper's
 executable snapshot, dependency closure, supplied-diff workspace, outer sandbox,
 credential carrier, catalog,
 guarded writeback, recovery, or prompt contract.
@@ -40,10 +40,16 @@ materialization, supplied-diff prompts, helper-private credential carriers, or
 helper-owned outer sandboxes remain helper-only and cannot make an
 `isolated_review` artifact count as the canonical lane.
 
-The canonical lane requires exactly Claude Code `2.1.212`; the broader
-`>=2.1.211,<3.0.0` range in this document is helper-only and never makes another
-version eligible for the named direct lane. The canonical lane uses ordinary
-Claude CLI authentication in trusted real
+The canonical lane and low-level helper share the stable publisher-verified
+compatibility range `>=2.1.211,<3.0.0`, defined once in
+`scripts/review_runtime/claude_version_policy.py`. Exact patch versions remain
+facts in signed per-version artifact manifests, schema baselines, and helper
+credential-lock catalog entries; they are not the global eligibility policy.
+Claude Code `2.1.212` is the audited per-version stream-schema baseline, not a
+global eligibility pin. The canonical lane additionally requires its
+publisher-first preflight, advertised-capability probe, preflight-bound strict
+stream profile, and installed-path identity/digest revalidation. The canonical
+lane uses ordinary Claude CLI authentication in trusted real
 `HOME`, or an explicitly authorized API key. The publisher-verified CLI may
 update ordinary CLI-owned authentication and runtime state in that control
 plane, including credential refresh and possible cache or tool-result
@@ -58,7 +64,7 @@ according to upstream CLI behavior. Authentication rejection is still
 `blocked-authentication`, ambiguous credential persistence is inconclusive, and
 neither condition authorizes another provider.
 
-### Native Selected-Deny Read Boundary For Claude Code 2.1.212
+### Native Selected-Deny Read Boundary
 
 For the accepted real-`HOME` native-sandbox review design, keep these layers distinct:
 
@@ -66,24 +72,24 @@ For the accepted real-`HOME` native-sandbox review design, keep these layers dis
 - The model may receive `Read`, `Grep`, `Glob`, and sandboxed `Bash`, with read-only behavior required by the prompt and permission contract.
 - Launch must request global `denyWrite` and critical-sensitive-root `denyRead` for credential/configuration roots, the original source checkout, other review-state roots, `/proc`, and `/dev`; those requested controls define the native-sandbox enforcement boundary. A canonical worktree's registered Git metadata/object paths remain part of its logical read-only scope even when their physical storage is outside the worktree directory.
 - Native-sandbox `allowRead` entries are exceptions within a selected-deny policy, not a global host-read whitelist. Sandboxed Bash can technically read a host path that is outside the detached worktree when that path is not covered by `denyRead`. The prompt/model scope therefore explicitly forbids all outside-workspace reads; do not describe the selected-deny policy as re-opening only the current workspace or private Git view.
-- Claude Code 2.1.212 capability probes and the first `system/init` event report only their documented fields. They do not prove the final merged native-sandbox configuration, merged admin-managed permission arrays, or path-rule evaluation. Persist sandbox controls as requested configuration and do not promote init/capability output into independent evidence of effective enforcement.
-- For the canonical direct lane, require exactly one leading `system/init` and one trailing terminal `result`, plus the exact version-specific init fields defined in `canonical-claude-lane.md`. Missing, duplicate, malformed, misordered, or mismatched observable evidence must fail closed. This strict envelope proves only reported invocation fields and still does not attest the merged sandbox, managed permission arrays, or path evaluation.
+- Capability probes and the first `system/init` event report only their documented fields. They do not prove the final merged native-sandbox configuration, merged admin-managed permission arrays, or path-rule evaluation; that limitation applies even to Claude Code 2.1.212 baseline output. Persist sandbox controls as requested configuration and do not promote init/capability output into independent evidence of effective enforcement.
+- For the canonical direct lane, require exactly one leading `system/init` and one trailing terminal `result`, plus the preflight-bound compatibility fields defined in `canonical-claude-lane.md`. Missing, duplicate, malformed, misordered, or mismatched observable evidence must fail closed. This strict envelope proves only reported invocation fields and still does not attest the merged sandbox, managed permission arrays, or path evaluation.
 - Post-attempt worktree validation can prove the inspected worktree and private Git state are unchanged at validation time. It cannot prove that no transient write or outside-workspace read/side effect occurred.
 
 This boundary is an accepted model-behavior tradeoff, not full host-read isolation. A stronger outer sandbox may add protection, but must not be inferred from selected `denyRead` / `allowRead` settings or init output.
 
-- For the low-level helper only, accept installed Claude Code release versions
-  `>=2.1.211,<3.0.0` after all
-  applicable provenance, platform, capability, authentication, and isolation
+- For both launch paths, accept installed Claude Code release versions
+  `>=2.1.211,<3.0.0` only after all
+  path-applicable provenance, platform, capability, authentication, and isolation
   checks pass. For the low-level helper only, local-login refresh writeback
   additionally requires an exact version/platform/SHA-256 entry from the signed
   artifact in the credential-lock protocol catalog. The canonical direct lane
   uses the ordinary control-plane contract above instead.
-- Do not pin the helper to `latest`, `stable`, or one current patch release. The
-  helper never upgrades Claude Code and reviews the installed release it finds.
-- The former exact patch pin was a compact trust-and-compatibility shortcut for
-  the one CLI that receives local authentication and review data. It was not a
-  reliable wrapper detector: native Mach-O/ELF shape rejects scripts and
+- Do not pin either production path to `latest`, `stable`, or one current patch
+  release. Neither path upgrades Claude Code; each validates an installed release.
+- Treating one audited patch as the complete compatibility policy was a compact
+  trust shortcut, but it was not a reliable wrapper detector: native Mach-O/ELF
+  shape rejects scripts and
   interpreter wrappers, while signed artifact verification separately proves
   Anthropic publisher provenance and capability probes bound the CLI contract.
 - Reject prerelease, development, unparseable, and future-major versions unless
@@ -160,9 +166,10 @@ explicitly configured Claude Code candidate:
    helper-owned home/temp paths, a fixed system-only `PATH`, a deterministic C
    locale, and `NO_COLOR`; do not inherit proxy, CA, authentication, review, or
    other caller state. Bound time and both output streams.
-4. Parse exactly one release version and, for this low-level helper candidate,
-   require the helper-only range `>=2.1.211,<3.0.0`. This gate does not apply to
-   the canonical direct lane, which requires exact `2.1.212`.
+4. Parse exactly one stable release version and require the shared range
+   `>=2.1.211,<3.0.0` from the single canonical policy source. The direct lane
+   and low-level helper apply their own later runtime gates, but neither may
+   replace this range with one globally pinned patch.
 5. Fetch the manifest and detached signature for that exact version through the
    parent helper. Resolve GPG only from the fixed host paths, validate the source
    path, retain a stable source descriptor, and copy from that descriptor into a
@@ -421,8 +428,10 @@ same fixed-minimal-environment principle, with only the host-tool home, locale,
 path, and temporary directory provided.
 
 Anthropic documents detached manifest signatures for releases from `2.1.89`
-onward, which covers the complete low-level helper-only supported version range
-in this contract. The canonical direct lane remains pinned to exact `2.1.212`.
+onward, which covers the complete shared supported version range in this
+contract. Each selected release still requires its own signed per-version
+manifest and matching artifact digest; this coverage is not a floating `latest`
+trust decision.
 One process-level absolute deadline covers DNS resolution, connection and TLS
 setup, response headers, body reads, and response teardown for each bounded
 manifest/signature fetch; per-socket timeouts are not the total-time boundary.
@@ -452,8 +461,7 @@ execute only the private snapshot.
 
 ## Capability Probes
 
-Low-level helper compatibility is capability-based within the helper-only
-accepted version range. Do not
+Compatibility is capability-based within the shared accepted version range. Do not
 match the complete `--help` output or pin whitespace and unrelated wording from
 one release.
 
@@ -514,11 +522,14 @@ the opposite state. Require exactly one complete
 `CLAUDE_CODE_SAFE_MODE=1` assignment, so longer values, prefixed names,
 duplicates, and conflicting assignments cannot satisfy the probe.
 
-The helper does not claim a credential-free fixed-input behavioral canary. The
-preflight capability evidence is the helper-only accepted release range, the required
-public options, and the parsed safe-mode semantics. Behavioral acceptance comes
-from the final real review invocation plus strict structured-output,
-effective-model, error-state, and terminal-artifact validation.
+Neither path claims a credential-free fixed-input behavioral canary. Preflight
+capability evidence consists of the accepted release range, required public
+options, and parsed safe-mode semantics. It proves only the advertised surface,
+not actual launch semantics or the final merged sandbox. Behavioral acceptance
+comes from the final real review invocation plus strict structured-output,
+effective-model, error-state, and terminal-artifact validation; the canonical
+direct lane additionally binds that validation to its accepted preflight and
+stream-profile digests.
 
 The outer sandbox remains authoritative for host filesystem, process, write,
 and network isolation after these probes pass. It deliberately makes the
@@ -1139,7 +1150,7 @@ described as an enforced final launch.
 
 | Condition | Terminal classification | Copilot fallback |
 | --- | --- | --- |
-| No automatic candidate, supported platform unavailable, or a helper-only accepted-range automatic candidate cleanly lacks a required non-security capability or secure runtime dependency | `runtime-unavailable` | Only after a separate explicit supplemental Copilot request; never satisfies named double |
+| No automatic candidate, supported platform unavailable, or a shared-range automatic candidate in the low-level helper path cleanly lacks a required non-security capability or secure runtime dependency | `runtime-unavailable` | Only after a separate explicit supplemental Copilot request; never satisfies named double |
 | A helper-owned Keychain-broker, TCP-proxy, or Unix-proxy bind fails with an explicit OS policy or socket-capability errno | `runtime-unavailable` | Only after a separate explicit supplemental Copilot request; never satisfies named double |
 | The Keychain-broker source and compiler exist, but the compiler cannot start or the broker build returns nonzero | `inconclusive`; report the build gate and pause | No |
 | Local/API authentication is missing, malformed, unsafe, refresh-token-less, or actually rejected as `Login expired`, HTTP 401, or refresh failure | `blocked-authentication`; request `claude auth login` for local login or unset/replace the explicit API key, then pause | No |
@@ -1173,7 +1184,7 @@ or mismatched model metadata stops the lane as `runtime-unverified` or
 `model-mismatch` and never authorizes fallback. `explicit-claude-review` remains
 Anthropic-only.
 
-An unsupported future patch inside the low-level helper-only version range may
+An unsupported future patch inside the shared version range on the low-level helper path may
 be treated as automatic
 runtime unavailability only when it cleanly lacks a required public capability.
 An uncatalogued internal credential-lock protocol is instead inconclusive for

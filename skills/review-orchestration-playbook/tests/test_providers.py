@@ -33180,7 +33180,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(
                     providers.InvalidReviewerExecutable,
-                    "supported >=2.1.211,<3 range",
+                    "supported >=2.1.211,<3.0.0 range",
                 ):
                     providers._require_claude_identity(
                         pathlib.Path("/bin/claude"),
