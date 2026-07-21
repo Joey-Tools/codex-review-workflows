@@ -8,6 +8,7 @@ import os
 import pathlib
 import re
 import secrets
+import signal
 import stat
 import sys
 from dataclasses import dataclass
@@ -21,8 +22,12 @@ from .common import (
     ReviewProcessLeakError,
     ReviewTimeoutError,
     TRUSTED_PATH,
+    block_forwarded_signals,
+    consume_pending_forwarded_signal,
+    forwarded_signals,
     is_relative_to,
     resolve_git,
+    restore_signal_mask,
     run_bounded_capture,
 )
 
@@ -34,6 +39,8 @@ GIT_OUTPUT_LIMIT_BYTES = 32 * 1024 * 1024
 SYMLINK_TARGET_LIMIT_BYTES = 16 * 1024
 SYMLINK_COUNT_LIMIT = 4_096
 SYMLINK_BATCH_OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024
+SUBMODULE_ACTIVE_PATHSPEC_COUNT_LIMIT = 4_096
+SUBMODULE_ACTIVE_PATHSPEC_ARGV_LIMIT_BYTES = 128 * 1024
 FULL_OBJECT_ID = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
 CLAUDE_ENV_PASSTHROUGH_KEYS = (
     "ALL_PROXY",
@@ -74,6 +81,12 @@ class WorktreeValidation:
 class _OutputTarget:
     path: pathlib.Path
     parent_fd: int
+
+
+@dataclass(frozen=True)
+class _PublishedOutput:
+    target: _OutputTarget
+    identity: tuple[int, int]
 
 
 def _git_environment() -> dict[str, str]:
@@ -210,6 +223,7 @@ def _validate_initialized_submodules(
     frozen_head: str,
     tree: Mapping[pathlib.PurePosixPath, tuple[str, str, str]],
     gitlinks: frozenset[pathlib.PurePosixPath],
+    configured_keys: frozenset[bytes],
 ) -> None:
     gitmodules = tree.get(pathlib.PurePosixPath(".gitmodules"))
     if not gitlinks or gitmodules is None:
@@ -217,7 +231,7 @@ def _validate_initialized_submodules(
     mode, object_type, _object_id = gitmodules
     if mode not in {"100644", "100755"} or object_type != "blob":
         raise NamedLaneGuardError("frozen .gitmodules must be a regular blob")
-    configured_names: set[bytes] = set()
+    configured_names: dict[bytes, pathlib.PurePosixPath] = {}
     definitions = _git_capture(
         root,
         (
@@ -242,25 +256,185 @@ def _validate_initialized_submodules(
             raise NamedLaneGuardError("malformed frozen submodule path record")
         relative_path = pathlib.PurePosixPath(os.fsdecode(raw_path))
         if relative_path in gitlinks:
-            configured_names.add(key[len(b"submodule.") : -len(b".path")])
+            configured_names[key[len(b"submodule.") : -len(b".path")]] = relative_path
 
-    for key in _git_capture(
-        root,
-        ("config", "--local", "--null", "--name-only", "--list"),
-    ).split(b"\0"):
+    configured_urls: set[bytes] = set()
+    for key in configured_keys:
         if not key:
             continue
         lower_key = key.lower()
-        for suffix in (b".active", b".url"):
-            if not lower_key.startswith(b"submodule.") or not lower_key.endswith(
-                suffix
-            ):
-                continue
-            name = key[len(b"submodule.") : -len(suffix)]
-            if name in configured_names:
-                raise NamedLaneGuardError(
-                    "tracked gitlinks must not be initialized as submodules"
-                )
+        if lower_key.startswith(b"submodule.") and lower_key.endswith(b".url"):
+            configured_urls.add(key[len(b"submodule.") : -len(b".url")])
+
+    configured_active = _effective_tracked_submodule_active(
+        root,
+        configured_names.keys(),
+    )
+
+    globally_selected: set[pathlib.PurePosixPath] = set()
+    for name, path in configured_names.items():
+        if name in configured_urls or configured_active.get(name) is True:
+            raise NamedLaneGuardError(
+                "tracked gitlinks must not be initialized as submodules"
+            )
+        if configured_active.get(name) is False:
+            continue
+        globally_selected.add(path)
+
+    if globally_selected:
+        global_active = _effective_submodule_active_pathspecs(root)
+        if _match_submodule_active_pathspecs(
+            root,
+            frozen_head,
+            frozenset(globally_selected),
+            global_active,
+        ):
+            raise NamedLaneGuardError(
+                "tracked gitlinks must not be initialized as submodules"
+            )
+
+
+def _effective_tracked_submodule_active(
+    root: pathlib.Path,
+    names: Iterable[bytes],
+) -> dict[bytes, bool]:
+    tracked_names = tuple(sorted(set(names)))
+    if not tracked_names:
+        return {}
+    escaped_names = tuple(_escape_posix_ere(name) for name in tracked_names)
+    pattern = b"^submodule\\.(" + b"|".join(escaped_names) + b")\\.active$"
+    if (
+        len(tracked_names) > SUBMODULE_ACTIVE_PATHSPEC_COUNT_LIMIT
+        or len(pattern) > SUBMODULE_ACTIVE_PATHSPEC_ARGV_LIMIT_BYTES
+    ):
+        raise NamedLaneGuardError("tracked submodule active keys are too large")
+    active_definitions = _git_capture(
+        root,
+        (
+            "config",
+            "--includes",
+            "--null",
+            "--type=bool",
+            "--get-regexp",
+            os.fsdecode(pattern),
+        ),
+        allow_no_match=True,
+    )
+    configured_active: dict[bytes, bool] = {}
+    for key, value in _parse_git_config_records(
+        active_definitions,
+        label="effective submodule active",
+    ):
+        lower_key = key.lower()
+        if not lower_key.startswith(b"submodule.") or not lower_key.endswith(
+            b".active"
+        ):
+            raise NamedLaneGuardError("malformed effective submodule active record")
+        if value not in {b"true", b"false"}:
+            raise NamedLaneGuardError("malformed effective submodule active boolean")
+        configured_active[key[len(b"submodule.") : -len(b".active")]] = value == b"true"
+    return configured_active
+
+
+def _escape_posix_ere(value: bytes) -> bytes:
+    special = b".^$*+?{}[]\\|()"
+    return b"".join(
+        b"\\" + bytes((character,)) if character in special else bytes((character,))
+        for character in value
+    )
+
+
+def _parse_git_config_records(
+    payload: bytes,
+    *,
+    label: str,
+) -> tuple[tuple[bytes, bytes], ...]:
+    if not payload:
+        return ()
+    if not payload.endswith(b"\0"):
+        raise NamedLaneGuardError(f"malformed {label} record")
+    records: list[tuple[bytes, bytes]] = []
+    for record in payload[:-1].split(b"\0"):
+        key, separator, value = record.partition(b"\n")
+        if not separator or not key:
+            raise NamedLaneGuardError(f"malformed {label} record")
+        records.append((key, value))
+    return tuple(records)
+
+
+def _effective_submodule_active_pathspecs(root: pathlib.Path) -> tuple[bytes, ...]:
+    payload = _git_capture(
+        root,
+        (
+            "config",
+            "--includes",
+            "--null",
+            "--get-all",
+            "submodule.active",
+        ),
+        allow_no_match=True,
+    )
+    if not payload:
+        return ()
+    if not payload.endswith(b"\0"):
+        raise NamedLaneGuardError("malformed effective submodule active pathspec")
+    return tuple(payload[:-1].split(b"\0"))
+
+
+def _match_submodule_active_pathspecs(
+    root: pathlib.Path,
+    frozen_head: str,
+    gitlinks: frozenset[pathlib.PurePosixPath],
+    pathspecs: Sequence[bytes],
+) -> frozenset[pathlib.PurePosixPath]:
+    if not pathspecs:
+        return frozenset()
+    argv_size = sum(len(pathspec) + 8 for pathspec in pathspecs)
+    if (
+        len(pathspecs) > SUBMODULE_ACTIVE_PATHSPEC_COUNT_LIMIT
+        or argv_size > SUBMODULE_ACTIVE_PATHSPEC_ARGV_LIMIT_BYTES
+    ):
+        raise NamedLaneGuardError("effective submodule active pathspecs are too large")
+    payload = _git_capture(
+        root,
+        (
+            "ls-files",
+            "--cached",
+            "--full-name",
+            f"--with-tree={frozen_head}",
+            "-z",
+            "--",
+            *(os.fsdecode(pathspec) for pathspec in pathspecs),
+        ),
+    )
+    matched = frozenset(
+        pathlib.PurePosixPath(os.fsdecode(path))
+        for path in payload.split(b"\0")
+        if path
+    )
+    return gitlinks.intersection(matched)
+
+
+def _effective_git_config_keys(root: pathlib.Path) -> frozenset[bytes]:
+    return frozenset(
+        key
+        for key in _git_capture(
+            root,
+            ("config", "--includes", "--null", "--name-only", "--list"),
+        ).split(b"\0")
+        if key
+    )
+
+
+def _validate_status_filter_config(configured_keys: frozenset[bytes]) -> None:
+    for key in configured_keys:
+        lower_key = key.lower()
+        if lower_key.startswith(b"filter.") and lower_key.endswith(
+            (b".clean", b".process")
+        ):
+            raise NamedLaneGuardError(
+                "Git filter clean/process commands are not allowed before status"
+            )
 
 
 def _status_has_disallowed_changes(
@@ -502,7 +676,15 @@ def validate_worktree(
         mode, object_type, _object_id = tree[path]
         if mode != "160000" or object_type != "commit":
             raise NamedLaneGuardError("frozen Git gitlink entry has an invalid type")
-    _validate_initialized_submodules(root, frozen_head, tree, gitlinks)
+    configured_keys = _effective_git_config_keys(root)
+    _validate_status_filter_config(configured_keys)
+    _validate_initialized_submodules(
+        root,
+        frozen_head,
+        tree,
+        gitlinks,
+        configured_keys,
+    )
     _validate_index_flags(
         _git_capture(
             root,
@@ -578,6 +760,10 @@ def _revalidate_output_parent(target: _OutputTarget) -> None:
         not stat.S_ISDIR(descriptor_metadata.st_mode)
         or not stat.S_ISDIR(lexical_metadata.st_mode)
         or stat.S_ISLNK(lexical_metadata.st_mode)
+        or descriptor_metadata.st_uid != os.getuid()
+        or lexical_metadata.st_uid != os.getuid()
+        or stat.S_IMODE(descriptor_metadata.st_mode) != 0o700
+        or stat.S_IMODE(lexical_metadata.st_mode) != 0o700
         or resolved != parent
         or (descriptor_metadata.st_dev, descriptor_metadata.st_ino)
         != (lexical_metadata.st_dev, lexical_metadata.st_ino)
@@ -615,6 +801,13 @@ def _validate_output_path(path: pathlib.Path, worktree: pathlib.Path) -> _Output
     canonical = parent_resolved / path.name
     if is_relative_to(canonical, worktree):
         raise NamedLaneGuardError("Claude output paths must stay outside the worktree")
+    if (
+        parent_metadata.st_uid != os.getuid()
+        or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+    ):
+        raise NamedLaneGuardError(
+            "Claude output parent must be current-user-owned with mode 0700"
+        )
     open_flags = os.O_RDONLY
     for flag_name in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW"):
         open_flags |= getattr(os, flag_name, 0)
@@ -634,6 +827,9 @@ def _validate_output_path(path: pathlib.Path, worktree: pathlib.Path) -> _Output
     if (opened_metadata.st_dev, opened_metadata.st_ino) != (
         parent_metadata.st_dev,
         parent_metadata.st_ino,
+    ) or (
+        opened_metadata.st_uid != os.getuid()
+        or stat.S_IMODE(opened_metadata.st_mode) != 0o700
     ):
         os.close(parent_fd)
         raise NamedLaneGuardError("Claude output parent changed during validation")
@@ -774,9 +970,92 @@ def _open_private_temporary(target: _OutputTarget) -> tuple[int, str]:
     raise NamedLaneGuardError("Claude output temporary name could not be reserved")
 
 
-def _write_private_bytes(target: _OutputTarget, payload: bytes | bytearray) -> None:
+def _output_identity(metadata: os.stat_result) -> tuple[int, int]:
+    return (metadata.st_dev, metadata.st_ino)
+
+
+def _validate_published_output(output: _PublishedOutput) -> None:
+    try:
+        metadata = os.stat(
+            output.target.path.name,
+            dir_fd=output.target.parent_fd,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise NamedLaneGuardError("Claude output changed after publication") from error
+    if _output_identity(metadata) != output.identity:
+        raise NamedLaneGuardError("Claude output changed after publication")
+
+
+def _unlink_output_if_observed_same(
+    target: _OutputTarget,
+    name: str,
+    identity: tuple[int, int],
+    *,
+    label: str,
+) -> None:
+    # POSIX has no portable conditional unlink. The caller supplies a
+    # lane-private 0700 directory and cooperatively excludes other same-UID
+    # writers; this check preserves identity drift already visible here.
+    try:
+        metadata = os.stat(
+            name,
+            dir_fd=target.parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise NamedLaneGuardError(
+            f"{label} cannot be inspected before cleanup"
+        ) from error
+    if _output_identity(metadata) != identity:
+        raise NamedLaneGuardError(f"{label} changed before cleanup")
+    try:
+        os.unlink(name, dir_fd=target.parent_fd)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise NamedLaneGuardError(f"{label} cannot be removed safely") from error
+
+
+def _remove_private_output(output: _PublishedOutput) -> None:
+    _unlink_output_if_observed_same(
+        output.target,
+        output.target.path.name,
+        output.identity,
+        label="Claude output",
+    )
+
+
+def _rollback_published_outputs(outputs: list[_PublishedOutput]) -> None:
+    rollback = tuple(reversed(outputs))
+    outputs.clear()
+    errors: list[Exception] = []
+    for output in rollback:
+        try:
+            _remove_private_output(output)
+        except Exception as error:
+            errors.append(error)
+    if errors:
+        raise NamedLaneGuardError(
+            "Claude output rollback remained incomplete"
+        ) from errors[0]
+
+
+def _write_private_bytes(
+    target: _OutputTarget,
+    payload: bytes | bytearray,
+) -> _PublishedOutput:
     descriptor, temporary_name = _open_private_temporary(target)
-    published = False
+    try:
+        identity = _output_identity(os.fstat(descriptor))
+    except OSError as error:
+        os.close(descriptor)
+        raise NamedLaneGuardError(
+            "Claude output temporary file cannot be inspected safely"
+        ) from error
+    published: _PublishedOutput | None = None
     try:
         os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "wb") as handle:
@@ -792,7 +1071,17 @@ def _write_private_bytes(target: _OutputTarget, payload: bytes | bytearray) -> N
                 dst_dir_fd=target.parent_fd,
                 follow_symlinks=False,
             )
-            published = True
+            published = _PublishedOutput(target=target, identity=identity)
+            try:
+                _validate_published_output(published)
+            except Exception:
+                try:
+                    _remove_private_output(published)
+                except Exception as rollback_error:
+                    raise NamedLaneGuardError(
+                        "Claude output publication rollback remained incomplete"
+                    ) from rollback_error
+                raise
         except FileExistsError as error:
             raise NamedLaneGuardError(
                 "Claude output path appeared during write"
@@ -806,23 +1095,27 @@ def _write_private_bytes(target: _OutputTarget, payload: bytes | bytearray) -> N
             with contextlib.suppress(OSError):
                 os.close(descriptor)
         try:
-            os.unlink(temporary_name, dir_fd=target.parent_fd)
-        except FileNotFoundError:
-            pass
-        except OSError as cleanup_error:
-            rollback_errors: list[OSError] = []
-            if published:
+            _unlink_output_if_observed_same(
+                target,
+                temporary_name,
+                identity,
+                label="Claude output temporary file",
+            )
+        except NamedLaneGuardError as cleanup_error:
+            rollback_errors: list[Exception] = []
+            if published is not None:
                 try:
-                    os.unlink(target.path.name, dir_fd=target.parent_fd)
-                except FileNotFoundError:
-                    pass
-                except OSError as error:
+                    _remove_private_output(published)
+                except Exception as error:
                     rollback_errors.append(error)
             try:
-                os.unlink(temporary_name, dir_fd=target.parent_fd)
-            except FileNotFoundError:
-                pass
-            except OSError as error:
+                _unlink_output_if_observed_same(
+                    target,
+                    temporary_name,
+                    identity,
+                    label="Claude output temporary file",
+                )
+            except Exception as error:
                 rollback_errors.append(error)
             if rollback_errors:
                 raise NamedLaneGuardError(
@@ -831,13 +1124,8 @@ def _write_private_bytes(target: _OutputTarget, payload: bytes | bytearray) -> N
             raise NamedLaneGuardError(
                 "Claude output temporary cleanup failed"
             ) from cleanup_error
-
-
-def _remove_private_output(target: _OutputTarget) -> None:
-    try:
-        os.unlink(target.path.name, dir_fd=target.parent_fd)
-    except FileNotFoundError:
-        pass
+    assert published is not None
+    return published
 
 
 def run_claude(
@@ -892,31 +1180,105 @@ def run_claude(
                 stderr_limit_bytes=stream_limit_bytes,
             )
             try:
-                stdout_written = False
-                stderr_written = False
+                publication_mask = block_forwarded_signals()
+                if publication_mask is None:
+                    raise NamedLaneGuardError(
+                        "Claude output publication requires main-thread signal masking"
+                    )
+                published_outputs: list[_PublishedOutput] = []
+                previous_handlers: dict[signal.Signals, object] = {}
+                publication_phase = "publishing"
+                deferred_signal: signal.Signals | None = None
+
+                def defer_publication_signal(signum: int, _frame: object) -> None:
+                    nonlocal deferred_signal, publication_phase
+                    received = signal.Signals(signum)
+                    if deferred_signal is None:
+                        deferred_signal = received
+                    if publication_phase == "publishing":
+                        publication_phase = "interrupted"
+                        raise ForwardedSignal(received)
+
                 try:
+                    for forwarded in forwarded_signals():
+                        previous_handlers[forwarded] = signal.getsignal(forwarded)
+                        signal.signal(forwarded, defer_publication_signal)
                     _revalidate_output_parent(stdout)
                     _revalidate_output_parent(stderr)
-                    _write_private_bytes(stdout, capture.stdout)
-                    stdout_written = True
-                    _write_private_bytes(stderr, capture.stderr)
-                    stderr_written = True
+                    published_outputs.append(
+                        _write_private_bytes(stdout, capture.stdout)
+                    )
+                    published_outputs.append(
+                        _write_private_bytes(stderr, capture.stderr)
+                    )
                     _revalidate_output_parent(stdout)
                     _revalidate_output_parent(stderr)
-                except Exception:
-                    if stderr_written:
-                        _remove_private_output(stderr)
-                    if stdout_written:
-                        _remove_private_output(stdout)
+                    for output in published_outputs:
+                        _validate_published_output(output)
+                    result = {
+                        "status": ("complete" if capture.returncode == 0 else "failed"),
+                        "returncode": capture.returncode,
+                        "stdout_path": str(stdout.path),
+                        "stdout_bytes": len(capture.stdout),
+                        "stderr_path": str(stderr.path),
+                        "stderr_bytes": len(capture.stderr),
+                    }
+                    deferred_signal = consume_pending_forwarded_signal()
+                    if deferred_signal is not None:
+                        publication_phase = "interrupted"
+                        raise ForwardedSignal(deferred_signal)
+                    restore_signal_mask(publication_mask)
+                    publication_phase = "committed"
+                except BaseException as publication_error:
+                    publication_phase = "cleanup"
+                    block_forwarded_signals()
+                    cleanup_errors: list[BaseException] = []
+                    try:
+                        try:
+                            _rollback_published_outputs(published_outputs)
+                        except BaseException as error:
+                            cleanup_errors.append(error)
+                        late_signal = consume_pending_forwarded_signal()
+                        if deferred_signal is None:
+                            deferred_signal = late_signal
+                        for forwarded, previous in previous_handlers.items():
+                            try:
+                                signal.signal(forwarded, previous)
+                            except BaseException as error:
+                                cleanup_errors.append(error)
+                    finally:
+                        restore_signal_mask(publication_mask)
+                    if cleanup_errors:
+                        raise NamedLaneGuardError(
+                            "Claude output signal rollback remained incomplete"
+                        ) from cleanup_errors[0]
+                    if deferred_signal is not None and not isinstance(
+                        publication_error,
+                        ForwardedSignal,
+                    ):
+                        raise ForwardedSignal(deferred_signal) from publication_error
                     raise
-                return {
-                    "status": "complete" if capture.returncode == 0 else "failed",
-                    "returncode": capture.returncode,
-                    "stdout_path": str(stdout.path),
-                    "stdout_bytes": len(capture.stdout),
-                    "stderr_path": str(stderr.path),
-                    "stderr_bytes": len(capture.stderr),
-                }
+                else:
+                    block_forwarded_signals()
+                    handler_errors: list[BaseException] = []
+                    try:
+                        late_signal = consume_pending_forwarded_signal()
+                        if deferred_signal is None:
+                            deferred_signal = late_signal
+                        for forwarded, previous in previous_handlers.items():
+                            try:
+                                signal.signal(forwarded, previous)
+                            except BaseException as error:
+                                handler_errors.append(error)
+                    finally:
+                        restore_signal_mask(publication_mask)
+                    if handler_errors:
+                        raise NamedLaneGuardError(
+                            "Claude output signal handlers could not be restored"
+                        ) from handler_errors[0]
+                    if deferred_signal is not None:
+                        raise ForwardedSignal(deferred_signal)
+                    return result
             finally:
                 capture.stdout[:] = b"\x00" * len(capture.stdout)
                 capture.stderr[:] = b"\x00" * len(capture.stderr)

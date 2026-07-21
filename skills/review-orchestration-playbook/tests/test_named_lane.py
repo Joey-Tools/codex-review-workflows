@@ -19,6 +19,7 @@ from unittest import mock
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+from review_runtime import named_lane as named_lane_runtime  # noqa: E402
 from review_runtime.common import (  # noqa: E402
     ForwardedSignal,
     ReviewOutputDrainError,
@@ -395,6 +396,82 @@ class NamedLaneGuardTest(unittest.TestCase):
         with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
             validate_worktree(self.repo.resolve(), head)
 
+    def test_per_worktree_initialized_submodule_config_is_rejected(self) -> None:
+        head = self.add_deinitialized_gitlink()
+        git(self.repo, "config", "extensions.worktreeConfig", "true")
+        git(
+            self.repo,
+            "config",
+            "--worktree",
+            "submodule.unrelated.url",
+            str(self.root / "unrelated"),
+        )
+        clean = validate_worktree(self.repo.resolve(), head)
+        self.assertEqual(clean.head_sha, head)
+
+        for suffix, value in (
+            ("url", str(self.root / "submodule-source")),
+            ("active", "true"),
+        ):
+            key = f"submodule.vendor.{suffix}"
+            with self.subTest(key=key):
+                git(self.repo, "config", "--worktree", key, value)
+                with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
+                    validate_worktree(self.repo.resolve(), head)
+                git(self.repo, "config", "--worktree", "--unset-all", key)
+
+    def test_global_submodule_active_uses_git_pathspec_precedence(self) -> None:
+        head = self.add_deinitialized_gitlink()
+
+        git(self.repo, "config", "submodule.unrelated.active", "not-a-boolean")
+        git(self.repo, "config", "submodule.active", "unrelated")
+        clean = validate_worktree(self.repo.resolve(), head)
+        self.assertEqual(clean.head_sha, head)
+
+        git(self.repo, "config", "--replace-all", "submodule.active", "true")
+        clean = validate_worktree(self.repo.resolve(), head)
+        self.assertEqual(clean.head_sha, head)
+
+        git(self.repo, "config", "--replace-all", "submodule.active", "vendor")
+        with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
+            validate_worktree(self.repo.resolve(), head)
+
+        git(self.repo, "config", "--replace-all", "submodule.active", "*")
+        git(self.repo, "config", "--add", "submodule.active", ":(exclude)vendor")
+        clean = validate_worktree(self.repo.resolve(), head)
+        self.assertEqual(clean.head_sha, head)
+
+        git(self.repo, "config", "--replace-all", "submodule.active", "vendor")
+        git(self.repo, "config", "submodule.vendor.active", "false")
+        clean = validate_worktree(self.repo.resolve(), head)
+        self.assertEqual(clean.head_sha, head)
+
+        git(self.repo, "config", "submodule.vendor.active", "true")
+        with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
+            validate_worktree(self.repo.resolve(), head)
+
+    def test_global_submodule_active_reads_worktree_and_included_config(
+        self,
+    ) -> None:
+        head = self.add_deinitialized_gitlink()
+        git(self.repo, "config", "extensions.worktreeConfig", "true")
+        git(self.repo, "config", "--worktree", "submodule.active", "vendor")
+        with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
+            validate_worktree(self.repo.resolve(), head)
+        git(
+            self.repo,
+            "config",
+            "--worktree",
+            "--unset-all",
+            "submodule.active",
+        )
+
+        included = self.root / "included-submodule-active.config"
+        included.write_text("[submodule]\n\tactive = vendor\n", encoding="utf-8")
+        git(self.repo, "config", "include.path", str(included))
+        with self.assertRaisesRegex(NamedLaneGuardError, "initialized"):
+            validate_worktree(self.repo.resolve(), head)
+
     def test_empty_gitmodules_without_definitions_allows_absent_gitlink(
         self,
     ) -> None:
@@ -482,6 +559,74 @@ class NamedLaneGuardTest(unittest.TestCase):
 
         with self.assertRaisesRegex(NamedLaneGuardError, "full Git object ID"):
             validate_worktree(self.repo.resolve(), "--not-a-revision")
+
+    def test_status_filter_commands_are_rejected_before_execution(self) -> None:
+        tracked = self.repo / "AGENTS.md"
+        tracked.write_text("clean\n", encoding="utf-8")
+        (self.repo / ".gitattributes").write_text(
+            "AGENTS.md filter=unsafe\n",
+            encoding="utf-8",
+        )
+        head = self.commit()
+        marker = self.root / "filter-command.marker"
+
+        smudge = self.make_executable(
+            f"import pathlib\npathlib.Path({str(marker)!r}).write_text('ran')\n"
+        )
+        git(self.repo, "config", "filter.unsafe.smudge", str(smudge))
+        clean = validate_worktree(self.repo.resolve(), head)
+        self.assertEqual(clean.head_sha, head)
+        self.assertFalse(marker.exists())
+        git(self.repo, "config", "--unset-all", "filter.unsafe.smudge")
+
+        tracked.write_text("dirty\n", encoding="utf-8")
+        for suffix in ("clean", "process"):
+            with self.subTest(suffix=suffix):
+                marker.unlink(missing_ok=True)
+                source = (
+                    f"import pathlib\npathlib.Path({str(marker)!r}).write_text('ran')\n"
+                )
+                if suffix == "clean":
+                    source += (
+                        "import sys\nsys.stdout.buffer.write(sys.stdin.buffer.read())\n"
+                    )
+                probe = self.make_executable(source)
+                key = f"filter.unsafe.{suffix}"
+                git(self.repo, "config", key, str(probe))
+                with self.assertRaisesRegex(
+                    NamedLaneGuardError,
+                    "filter clean/process commands",
+                ):
+                    validate_worktree(self.repo.resolve(), head)
+                self.assertFalse(marker.exists())
+                git(self.repo, "config", "--unset-all", key)
+
+    def test_included_filter_command_is_rejected_before_execution(self) -> None:
+        tracked = self.repo / "AGENTS.md"
+        tracked.write_text("clean\n", encoding="utf-8")
+        (self.repo / ".gitattributes").write_text(
+            "AGENTS.md filter=included\n",
+            encoding="utf-8",
+        )
+        head = self.commit()
+        tracked.write_text("dirty\n", encoding="utf-8")
+        marker = self.root / "included-filter.marker"
+        probe = self.make_executable(
+            f"import pathlib\npathlib.Path({str(marker)!r}).write_text('ran')\n"
+        )
+        included = self.root / "included-filter.config"
+        included.write_text(
+            f'[filter "included"]\n\tprocess = {probe}\n',
+            encoding="utf-8",
+        )
+        git(self.repo, "config", "include.path", str(included))
+
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "filter clean/process commands",
+        ):
+            validate_worktree(self.repo.resolve(), head)
+        self.assertFalse(marker.exists())
 
     def test_successful_process_writes_private_bounded_outputs(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
@@ -831,6 +976,58 @@ class NamedLaneGuardTest(unittest.TestCase):
                 stream_limit_bytes=64,
             )
 
+    def test_process_rejects_nonprivate_output_parent(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("pass\n")
+        output_parent = self.root / "shared-output"
+        output_parent.mkdir(mode=0o755)
+        output_parent.chmod(0o755)
+
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "current-user-owned with mode 0700",
+        ):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=output_parent / "stdout",
+                stderr_path=output_parent / "stderr",
+                command=(str(executable),),
+                prompt=b"",
+                timeout_seconds=1.0,
+                stream_limit_bytes=64,
+            )
+
+    def test_output_parent_mode_drift_blocks_publication(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        output_parent = self.root / "private-output"
+        output_parent.mkdir(mode=0o700)
+        output_parent.chmod(0o700)
+        executable = self.make_executable(
+            "import os, pathlib, sys\nos.chmod(pathlib.Path(sys.argv[1]), 0o755)\n"
+        )
+
+        try:
+            with self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "changed after validation",
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=output_parent / "stdout",
+                    stderr_path=output_parent / "stderr",
+                    command=(str(executable), str(output_parent)),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=64,
+                )
+        finally:
+            output_parent.chmod(0o700)
+
+        self.assertFalse((output_parent / "stdout").exists())
+        self.assertFalse((output_parent / "stderr").exists())
+
     def test_process_anchors_outputs_if_parent_is_replaced_after_launch(
         self,
     ) -> None:
@@ -838,7 +1035,8 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.commit()
         output_parent = self.root / "outputs"
         displaced_parent = self.root / "outputs-displaced"
-        output_parent.mkdir()
+        output_parent.mkdir(mode=0o700)
+        output_parent.chmod(0o700)
         executable = self.make_executable(
             "import os, pathlib, sys\n"
             "parent = pathlib.Path(sys.argv[1])\n"
@@ -915,6 +1113,300 @@ class NamedLaneGuardTest(unittest.TestCase):
 
         self.assertTrue(failed_once)
         self.assertFalse(stdout.exists())
+        self.assertFalse(stderr.exists())
+        self.assertEqual(list(self.root.glob(".named-lane-*")), [])
+
+    def test_output_publication_requires_signal_mask_before_writing(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("print('captured')\n")
+        stdout = self.root / "mask-stdout.bin"
+        stderr = self.root / "mask-stderr.bin"
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "block_forwarded_signals",
+            return_value=None,
+        ):
+            with self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "requires main-thread signal masking",
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=stdout,
+                    stderr_path=stderr,
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=64,
+                )
+
+        self.assertFalse(stdout.exists())
+        self.assertFalse(stderr.exists())
+
+    def test_deferred_signal_rolls_back_complete_output_pair(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable(
+            "import sys\n"
+            "sys.stdout.write('captured stdout')\n"
+            "sys.stderr.write('captured stderr')\n"
+        )
+        stdout = self.root / "signal-stdout.bin"
+        stderr = self.root / "signal-stderr.bin"
+
+        consume_calls = 0
+
+        def consume_after_pair() -> signal.Signals | None:
+            nonlocal consume_calls
+            consume_calls += 1
+            if consume_calls == 1:
+                self.assertEqual(stdout.read_bytes(), b"captured stdout")
+                self.assertEqual(stderr.read_bytes(), b"captured stderr")
+                return signal.SIGINT
+            return None
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "block_forwarded_signals",
+                return_value=set(),
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "consume_pending_forwarded_signal",
+                side_effect=consume_after_pair,
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "restore_signal_mask",
+            ) as restore,
+        ):
+            with self.assertRaises(ForwardedSignal) as raised:
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=stdout,
+                    stderr_path=stderr,
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=64,
+                )
+
+        self.assertEqual(raised.exception.signum, signal.SIGINT)
+        self.assertFalse(stdout.exists())
+        self.assertFalse(stderr.exists())
+        restore.assert_called_once_with(set())
+
+    def test_keyboard_interrupt_rolls_back_first_published_output(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("print('captured')\n")
+        stdout = self.root / "interrupt-stdout.bin"
+        stderr = self.root / "interrupt-stderr.bin"
+        real_write = named_lane_runtime._write_private_bytes
+        calls = 0
+
+        def interrupt_second_write(
+            target: object,
+            payload: bytes | bytearray,
+        ) -> object:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise KeyboardInterrupt
+            return real_write(target, payload)
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "_write_private_bytes",
+            side_effect=interrupt_second_write,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=stdout,
+                    stderr_path=stderr,
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=64,
+                )
+
+        self.assertEqual(calls, 2)
+        self.assertFalse(stdout.exists())
+        self.assertFalse(stderr.exists())
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "signal publication test requires POSIX signal masks",
+    )
+    def test_signal_during_mask_restore_rolls_back_output_pair(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable(
+            "import sys\n"
+            "sys.stdout.write('captured stdout')\n"
+            "sys.stderr.write('captured stderr')\n"
+        )
+        stdout = self.root / "restore-signal-stdout.bin"
+        stderr = self.root / "restore-signal-stderr.bin"
+        previous_handler = signal.getsignal(signal.SIGINT)
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        real_restore = named_lane_runtime.restore_signal_mask
+        consume_calls = 0
+        restore_calls = 0
+
+        def consume_after_pair() -> None:
+            nonlocal consume_calls
+            consume_calls += 1
+            if consume_calls == 1:
+                self.assertEqual(stdout.read_bytes(), b"captured stdout")
+                self.assertEqual(stderr.read_bytes(), b"captured stderr")
+            return None
+
+        def interrupt_first_restore(mask: set[signal.Signals]) -> None:
+            nonlocal restore_calls
+            restore_calls += 1
+            real_restore(mask)
+            if restore_calls == 1:
+                temporary_handler = signal.getsignal(signal.SIGINT)
+                self.assertIsNot(temporary_handler, previous_handler)
+                self.assertTrue(callable(temporary_handler))
+                temporary_handler(signal.SIGINT, None)
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "consume_pending_forwarded_signal",
+                side_effect=consume_after_pair,
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "restore_signal_mask",
+                side_effect=interrupt_first_restore,
+            ),
+        ):
+            with self.assertRaises(ForwardedSignal) as raised:
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=stdout,
+                    stderr_path=stderr,
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=64,
+                )
+
+        self.assertEqual(raised.exception.signum, signal.SIGINT)
+        self.assertGreaterEqual(consume_calls, 2)
+        self.assertEqual(restore_calls, 2)
+        self.assertFalse(stdout.exists())
+        self.assertFalse(stderr.exists())
+        self.assertEqual(signal.getsignal(signal.SIGINT), previous_handler)
+        self.assertEqual(
+            signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+            previous_mask,
+        )
+
+    def test_output_rollback_preserves_replacement_observed_before_cleanup(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("print('captured')\n")
+        stdout = self.root / "replacement-stdout.bin"
+        stderr = self.root / "replacement-stderr.bin"
+        replacement = self.root / "replacement-source.bin"
+        replacement.write_bytes(b"concurrent replacement")
+        real_write = named_lane_runtime._write_private_bytes
+        calls = 0
+
+        def replace_before_second_failure(
+            target: object,
+            payload: bytes | bytearray,
+        ) -> object:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                output = real_write(target, payload)
+                os.replace(replacement, stdout)
+                return output
+            raise NamedLaneGuardError("synthetic stderr publication failure")
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "_write_private_bytes",
+            side_effect=replace_before_second_failure,
+        ):
+            with self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "rollback remained incomplete",
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=stdout,
+                    stderr_path=stderr,
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=64,
+                )
+
+        self.assertEqual(stdout.read_bytes(), b"concurrent replacement")
+        self.assertFalse(stderr.exists())
+
+    def test_temp_cleanup_preserves_replacement_observed_before_rollback(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("print('captured')\n")
+        stdout = self.root / "temp-replacement-stdout.bin"
+        stderr = self.root / "temp-replacement-stderr.bin"
+        replacement = self.root / "temp-replacement-source.bin"
+        replacement.write_bytes(b"concurrent replacement")
+        real_unlink = os.unlink
+        failed_once = False
+
+        def replace_before_temp_cleanup_failure(
+            path: str | bytes,
+            *arguments: object,
+            **keywords: object,
+        ) -> None:
+            nonlocal failed_once
+            if (
+                not failed_once
+                and isinstance(path, str)
+                and path.startswith(".named-lane-")
+            ):
+                failed_once = True
+                os.replace(replacement, stdout)
+                raise OSError("synthetic temporary cleanup failure")
+            real_unlink(path, *arguments, **keywords)
+
+        with mock.patch.object(
+            named_lane_runtime.os,
+            "unlink",
+            side_effect=replace_before_temp_cleanup_failure,
+        ):
+            with self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "cleanup or rollback remained incomplete",
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=stdout,
+                    stderr_path=stderr,
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=64,
+                )
+
+        self.assertTrue(failed_once)
+        self.assertEqual(stdout.read_bytes(), b"concurrent replacement")
         self.assertFalse(stderr.exists())
         self.assertEqual(list(self.root.glob(".named-lane-*")), [])
 

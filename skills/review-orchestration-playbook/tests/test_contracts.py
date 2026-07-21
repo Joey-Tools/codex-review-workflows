@@ -1149,6 +1149,9 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("path is absent or is an empty directory", contracts)
         self.assertIn("may consume only that exact status record", contracts)
         self.assertIn("every materialized or initialized submodule", canonical)
+        self.assertIn("per-name boolean precedence", canonical)
+        self.assertIn("repeated `submodule.active` pathspec", contracts)
+        self.assertIn("explicit per-name false", contracts)
 
         for anchor in (
             "_validate_index_flags",
@@ -1158,6 +1161,8 @@ class RepositoryContractTest(unittest.TestCase):
             '"--no-renames"',
             'entry[0] == "160000"',
             "_validate_initialized_submodules",
+            "_effective_submodule_active_pathspecs",
+            "_match_submodule_active_pathspecs",
             "_validate_materialized_gitlink",
             "_status_has_disallowed_changes",
         ):
@@ -1238,11 +1243,17 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertIn(anchor, canonical)
         for anchor in (
-            "caller supplies a canonical real parent directory",
+            "caller supplies a lane-unique",
+            "canonical real parent directory",
             "absent, non-symlink leaf",
         ):
             self.assertIn(anchor, skill)
         self.assertIn("already-canonical real directory", canonical)
+        self.assertIn("current-user-owned", canonical)
+        self.assertIn("exact-mode-`0700`", canonical)
+        self.assertIn("cooperatively exclude every other same-UID writer", canonical)
+        self.assertIn("no portable conditional unlink", canonical)
+        self.assertIn("explicit commit point", canonical)
         self.assertIn("leaf must be absent and non-symlink", canonical)
         self.assertIn("open directory descriptor", canonical)
         self.assertIn("(st_dev, st_ino)", canonical)
