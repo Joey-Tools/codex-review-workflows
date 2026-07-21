@@ -389,6 +389,38 @@ def _guard_companions(
     return guarded_main
 
 
+def _current_posix_account_home() -> pathlib.Path:
+    if os.name != "posix":
+        raise _fail("current POSIX account home is unavailable")
+    try:
+        import pwd
+
+        uid = os.getuid()
+        account = pwd.getpwuid(uid)
+    except (ImportError, KeyError, OSError) as error:
+        raise _fail("current POSIX account home cannot be resolved", error)
+    if account.pw_uid != uid or not account.pw_dir:
+        raise _fail("current POSIX account home is invalid")
+    home = pathlib.Path(account.pw_dir)
+    if not home.is_absolute():
+        raise _fail("current POSIX account home is not absolute")
+    try:
+        resolved = home.resolve(strict=True)
+        metadata = resolved.stat(follow_symlinks=False)
+    except (OSError, RuntimeError) as error:
+        raise _fail("current POSIX account home is not accessible", error)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise _fail("current POSIX account home is not a directory")
+    return resolved
+
+
+def _bind_preflight_account_home(entrypoint: object) -> object:
+    def guarded_main(argv: object = None) -> object:
+        return entrypoint(argv, selection_home=_current_posix_account_home())
+
+    return guarded_main
+
+
 def _load_default_entrypoint(scripts_root: pathlib.Path) -> object:
     return _load_bound_sources(
         scripts_root / "review_runtime",
@@ -422,7 +454,10 @@ def _load_claude_preflight_entrypoint(scripts_root: pathlib.Path) -> object:
             ),
         ),
     )
-    return _guard_companions(entrypoint, ((release_key_path, release_key_bytes),))
+    return _guard_companions(
+        _bind_preflight_account_home(entrypoint),
+        ((release_key_path, release_key_bytes),),
+    )
 
 
 def _load_claude_stream_validator_entrypoint(scripts_root: pathlib.Path) -> object:

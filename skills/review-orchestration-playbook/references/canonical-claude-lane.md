@@ -56,7 +56,7 @@ Before any prompt, credential, authentication, repository, range, PR, or review-
   [--claude-path <explicit-absolute-override>]
 ```
 
-That profile raw-loads the implementation behind [`named_claude_preflight`](../scripts/named_claude_preflight) from the trusted bundle without ordinary package import resolution. The env-shebang `named_claude_preflight` wrapper is a low-level compatibility entrypoint only; executing it directly cannot satisfy a formal named lane or a self-policy-migration control-plane bound. The machine helper hardcodes required version `2.1.212` and considers candidates in this exact order:
+That profile raw-loads the implementation behind [`named_claude_preflight`](../scripts/named_claude_preflight) from the trusted bundle without ordinary package import resolution. The env-shebang `named_claude_preflight` wrapper is a low-level compatibility entrypoint only; executing it directly cannot satisfy a formal named lane or a self-policy-migration control-plane bound. The formal guard ignores ambient `HOME`, resolves the current POSIX account through `pwd.getpwuid(os.getuid())`, and requires its nonempty absolute home to resolve to an accessible directory. In the ordered paths below, `$HOME` means that canonical account home; inability to establish it fails closed before selection. The machine helper hardcodes required version `2.1.212` and considers candidates in this exact order:
 
 1. an explicit absolute `--claude-path` override, when supplied;
 2. the side-by-side install at `$HOME/.local/share/claude/versions/2.1.212`, when present; then

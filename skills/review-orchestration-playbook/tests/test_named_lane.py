@@ -572,6 +572,61 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout.strip(), str(runtime / "claude_linux.py"))
 
+    @unittest.skipUnless(os.name == "posix", "account home requires POSIX")
+    def test_preflight_profile_derives_home_with_scrubbed_environment(self) -> None:
+        import pwd
+
+        _, guard = self.copy_guard_bundle()
+        body = (
+            "import json\n"
+            "module = sys.modules['review_runtime.named_claude_preflight']\n"
+            "observed = {}\n"
+            "def capture(*, explicit_path, home):\n"
+            "    observed['explicit_path'] = explicit_path\n"
+            "    observed['home'] = str(home)\n"
+            "    return {\n"
+            "        'classification': 'blocked',\n"
+            "        'reason': 'exact-version-unavailable',\n"
+            "    }\n"
+            "module.preflight = capture\n"
+            "returncode = namespace['main'](())\n"
+            "print(json.dumps({\n"
+            "    'home': observed['home'],\n"
+            "    'explicit_path': observed['explicit_path'],\n"
+            "    'returncode': returncode,\n"
+            "}, sort_keys=True))\n"
+        )
+        completed = subprocess.run(
+            self.guard_probe_command(
+                guard,
+                body,
+                guard_arguments=("preflight-claude",),
+            ),
+            check=False,
+            env={"LANG": "C", "LC_ALL": "C", "PATH": TRUSTED_PATH},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        lines = completed.stdout.splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(
+            json.loads(lines[0]),
+            {
+                "classification": "blocked",
+                "reason": "exact-version-unavailable",
+            },
+        )
+        observed = json.loads(lines[1])
+        expected_home = pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(
+            strict=True
+        )
+        self.assertEqual(observed["home"], str(expected_home))
+        self.assertIsNone(observed["explicit_path"])
+        self.assertEqual(observed["returncode"], 1)
+
     def test_validator_entrypoint_loads_only_bound_manifest_source(self) -> None:
         scripts, guard = self.copy_guard_bundle()
         argparse_marker = self.root / "validator-argparse-shadow.marker"

@@ -52,6 +52,13 @@ manifest-bound raw-source/schema profiles. None uses ordinary package import
 resolution, and launch supervision and output validation cannot replace one
 another.
 
+The formal preflight does not inherit or trust ambient `HOME`. The guard derives
+the current POSIX account with `pwd.getpwuid(os.getuid())`, requires its nonempty
+absolute home to resolve to an accessible directory, and binds that canonical
+path directly into the preflight consumer. The compatibility wrapper may still
+use its process `HOME` for low-level callers, but that behavior cannot satisfy a
+named lane or self-policy-migration review.
+
 Concretely, `preflight-claude` raw-loads `review_runtime`,
 `review_runtime.common`, `review_runtime.claude_refresh_lock`,
 `review_runtime.claude_linux`, `review_runtime.claude_provenance`, and
