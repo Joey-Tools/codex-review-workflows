@@ -606,3 +606,13 @@ metadata behavior.
   official skill validations, project-journal validation, synthetic-token
   catalog validation, broker developer byte reproduction, and `git diff
   --check` pass. No local Python 3.10 run was performed.
+- GitHub Actions run 29858821134 passed the macOS platform suite, deterministic
+  independent supervisor, and hosted broker byte-reproduction jobs. Ubuntu
+  exposed one merge-only fixture gap: after receiving the required fake broker,
+  the missing-process-start-proof regression reached macOS identity allocation
+  without the non-Darwin identity-directory fixture used by neighboring tests.
+  The regression now injects its existing private `0700` identity directory,
+  preserving the production allocator and the terminal fail-closed assertion.
+  The exact targeted test and the complete Python 3.13 main suite pass; the
+  latter ran all 2,257 tests with 6 host-gated skips. No local Python 3.10 run
+  was performed; the replacement GitHub Actions head remains its platform gate.

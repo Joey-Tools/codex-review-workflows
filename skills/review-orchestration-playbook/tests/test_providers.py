@@ -26877,6 +26877,11 @@ class ProviderPolicyTest(unittest.TestCase):
             ),
             mock.patch.object(
                 providers,
+                "_allocate_claude_keychain_identity_directory",
+                return_value=self.claude_identity_socket.parent,
+            ),
+            mock.patch.object(
+                providers,
                 "block_forwarded_signals",
                 return_value=set(),
             ),
