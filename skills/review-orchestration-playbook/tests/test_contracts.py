@@ -65,6 +65,10 @@ CI_PROFILE_BY_SKILL_LAYOUT = {
     pathlib.Path("skills/review-orchestration-playbook"): "canonical",
     pathlib.Path("personal_codex/skills/review-orchestration-playbook"): "private",
 }
+REPOSITORY_POLICY_SCOPE_BY_PROFILE = {
+    "canonical": pathlib.Path("."),
+    "private": pathlib.Path("personal_codex"),
+}
 
 
 def _ci_contract_context(skill_root: pathlib.Path) -> tuple[pathlib.Path, str]:
@@ -87,12 +91,21 @@ def _ci_contract_context(skill_root: pathlib.Path) -> tuple[pathlib.Path, str]:
 REPO_ROOT, CI_PROFILE = _ci_contract_context(SKILL_ROOT)
 
 
+def _repository_policy_scope_root(
+    repo_root: pathlib.Path,
+    profile: str,
+) -> pathlib.Path:
+    try:
+        relative_scope = REPOSITORY_POLICY_SCOPE_BY_PROFILE[profile]
+    except KeyError as error:
+        raise AssertionError(
+            f"unsupported repository policy profile: {profile}"
+        ) from error
+    return repo_root / relative_scope
+
+
 def _repository_agents_path(repo_root: pathlib.Path, profile: str) -> pathlib.Path:
-    if profile == "canonical":
-        return repo_root / "AGENTS.md"
-    if profile == "private":
-        return repo_root / "personal_codex/AGENTS.md"
-    raise AssertionError(f"unsupported repository policy profile: {profile}")
+    return _repository_policy_scope_root(repo_root, profile) / "AGENTS.md"
 
 
 def _claude_auth_repository_policy_files(
@@ -587,6 +600,31 @@ class RepositoryContractTest(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "unsupported review skill layout"):
             _ci_contract_context(pathlib.Path("/repo/custom/review-playbook"))
 
+    def test_repository_policy_scope_matches_distribution_profile(self) -> None:
+        repo_root = pathlib.Path("/repo")
+
+        self.assertEqual(
+            _repository_policy_scope_root(repo_root, "canonical"),
+            repo_root,
+        )
+        self.assertEqual(
+            _repository_policy_scope_root(repo_root, "private"),
+            repo_root / "personal_codex",
+        )
+        self.assertEqual(
+            _repository_agents_path(repo_root, "canonical"),
+            repo_root / "AGENTS.md",
+        )
+        self.assertEqual(
+            _repository_agents_path(repo_root, "private"),
+            repo_root / "personal_codex/AGENTS.md",
+        )
+        with self.assertRaisesRegex(
+            AssertionError,
+            "unsupported repository policy profile",
+        ):
+            _repository_policy_scope_root(repo_root, "unknown")
+
     def test_ci_contract_carries_every_reviewed_profile_snapshot(self) -> None:
         self.assertEqual(
             set(CI_PROFILE_BY_SKILL_LAYOUT.values()),
@@ -1043,8 +1081,11 @@ class RepositoryContractTest(unittest.TestCase):
         if CI_PROFILE == "canonical":
             self.assertIn("Those guarantees do not apply", agents)
         else:
-            self.assertIn("supplied-diff helper", agents)
-            self.assertIn("actual Claude Code", agents)
+            self.assertIn(
+                "never count a supplied-diff helper as a named lane",
+                agents,
+            )
+            self.assertIn("Named double adds actual Claude Code", agents)
         for retired_global_detail in (
             "Local-login writeback requires",
             "broker `W` generation",
@@ -1124,7 +1165,9 @@ class RepositoryContractTest(unittest.TestCase):
 
     def test_readme_separates_canonical_claude_from_helper_only_details(self) -> None:
         if CI_PROFILE != "canonical":
-            self.skipTest("public README is not packaged in private overlay")
+            self.skipTest(
+                "canonical public README section layout is not part of private profile"
+            )
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         boundary = readme.index("## Low-Level `isolated_review` Helper Only")
 
@@ -1144,10 +1187,11 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("cannot satisfy named double or triple review", readme)
 
     def test_core_active_policy_has_no_retired_codex_pr_gate_names(self) -> None:
+        policy_scope_root = _repository_policy_scope_root(REPO_ROOT, CI_PROFILE)
         active_policy = [
             _repository_agents_path(REPO_ROOT, CI_PROFILE),
-            SKILL_SCOPE_ROOT / "agents/reviewer.toml",
-            SKILL_SCOPE_ROOT / "skills/change-delivery-workflow/SKILL.md",
+            policy_scope_root / "agents/reviewer.toml",
+            policy_scope_root / "skills/change-delivery-workflow/SKILL.md",
             SKILL_ROOT / "SKILL.md",
             SKILL_ROOT / "agents/openai.yaml",
             SKILL_ROOT / "references/canonical-claude-lane.md",
@@ -1173,10 +1217,11 @@ class RepositoryContractTest(unittest.TestCase):
     def test_active_named_lane_policy_has_no_unimplemented_overstrict_contracts(
         self,
     ) -> None:
+        policy_scope_root = _repository_policy_scope_root(REPO_ROOT, CI_PROFILE)
         active_policy = [
             _repository_agents_path(REPO_ROOT, CI_PROFILE),
-            SKILL_SCOPE_ROOT / "agents/reviewer.toml",
-            SKILL_SCOPE_ROOT / "skills/change-delivery-workflow/SKILL.md",
+            policy_scope_root / "agents/reviewer.toml",
+            policy_scope_root / "skills/change-delivery-workflow/SKILL.md",
             SKILL_ROOT / "SKILL.md",
             SKILL_ROOT / "agents/openai.yaml",
             SKILL_ROOT / "references/canonical-claude-lane.md",
