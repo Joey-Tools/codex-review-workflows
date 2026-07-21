@@ -10,8 +10,10 @@ import re
 import secrets
 import select
 import signal
+import shutil
 import stat
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import BinaryIO, Iterable, Mapping, Sequence
@@ -43,6 +45,10 @@ SYMLINK_COUNT_LIMIT = 4_096
 SYMLINK_BATCH_OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024
 SUBMODULE_ACTIVE_PATHSPEC_COUNT_LIMIT = 4_096
 SUBMODULE_ACTIVE_PATHSPEC_ARGV_LIMIT_BYTES = 128 * 1024
+MATERIALIZER_GIT_TIMEOUT_SECONDS = 120.0
+MATERIALIZER_MINIMUM_GIT_VERSION = (2, 45, 0)
+MATERIALIZER_BASE_REF = "refs/named-lane/base"
+MATERIALIZER_HEAD_REF = "refs/named-lane/head"
 FULL_OBJECT_ID = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
 CLAUDE_ENV_PASSTHROUGH_KEYS = (
     "ALL_PROXY",
@@ -80,6 +86,24 @@ class WorktreeValidation:
 
 
 @dataclass(frozen=True)
+class MaterializedWorktree:
+    root: pathlib.Path
+    base_sha: str
+    head_sha: str
+    _parent: pathlib.Path
+    _parent_identity: _DirectoryIdentity
+    _root_identity: _DirectoryIdentity
+    _handoff_signal_mask: set[signal.Signals] | None = None
+
+
+@dataclass(frozen=True)
+class _DirectoryIdentity:
+    device: int
+    inode: int
+    owner: int
+
+
+@dataclass(frozen=True)
 class _OutputTarget:
     path: pathlib.Path
     parent_fd: int
@@ -105,6 +129,7 @@ def _git_environment() -> dict[str, str]:
         "GIT_TERMINAL_PROMPT": "0",
         "LANG": "C",
         "LC_ALL": "C",
+        "PAGER": "cat",
         "PATH": TRUSTED_PATH,
     }
     return environment
@@ -122,13 +147,21 @@ def _git_capture(
     stdin: bytearray | None = None,
 ) -> bytes:
     git = resolve_git()
+    if not root.is_absolute() or os.pathsep in os.fspath(root.parent):
+        raise NamedLaneGuardError(
+            "Git worktree parent cannot be encoded as a discovery ceiling"
+        )
     safety_config = [
         str(git),
         "--no-pager",
         "-c",
+        "core.commitGraph=false",
+        "-c",
         "core.fileMode=true",
         "-c",
         "core.hooksPath=/dev/null",
+        "-c",
+        "core.multiPackIndex=false",
     ]
     if neutralize_fsmonitor:
         safety_config.extend(("-c", "core.fsmonitor=false"))
@@ -136,9 +169,11 @@ def _git_capture(
         safety_config.extend(("-c", "diff.external="))
     safety_config.extend(("-c", "color.ui=false", "-C", str(root)))
     command = (*safety_config, *tuple(arguments))
+    environment = _git_environment()
+    environment["GIT_CEILING_DIRECTORIES"] = str(root.parent)
     capture = run_bounded_capture(
         command,
-        env=_git_environment(),
+        env=environment,
         stdin=stdin,
         timeout_seconds=timeout_seconds,
         stdout_limit_bytes=output_limit_bytes,
@@ -157,6 +192,1410 @@ def _git_capture(
     finally:
         capture.stdout[:] = b"\x00" * len(capture.stdout)
         capture.stderr[:] = b"\x00" * len(capture.stderr)
+
+
+def _current_user_id() -> int:
+    get_effective_user_id = getattr(os, "geteuid", None)
+    if get_effective_user_id is None:
+        raise NamedLaneGuardError(
+            "worktree materialization requires effective-user ownership checks"
+        )
+    return int(get_effective_user_id())
+
+
+def _directory_identity(metadata: os.stat_result) -> _DirectoryIdentity:
+    return _DirectoryIdentity(
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        owner=metadata.st_uid,
+    )
+
+
+def _validate_materializer_parent(
+    destination: pathlib.Path,
+) -> tuple[pathlib.Path, pathlib.Path, _DirectoryIdentity]:
+    if not destination.is_absolute():
+        raise NamedLaneGuardError("materialized worktree path must be absolute")
+    parent = destination.parent
+    try:
+        metadata = parent.lstat()
+        resolved_parent = parent.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "materialized worktree parent is not accessible"
+        ) from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or resolved_parent != parent
+    ):
+        raise NamedLaneGuardError(
+            "materialized worktree parent must be an absolute real directory"
+        )
+    if metadata.st_uid != _current_user_id():
+        raise NamedLaneGuardError(
+            "materialized worktree parent must be owned by the current user"
+        )
+    if stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise NamedLaneGuardError("materialized worktree parent must have mode 0700")
+    if os.pathsep in os.fspath(resolved_parent):
+        raise NamedLaneGuardError(
+            "materialized worktree parent cannot be encoded as a Git discovery ceiling"
+        )
+    normalized = resolved_parent / destination.name
+    if normalized != destination:
+        raise NamedLaneGuardError(
+            "materialized worktree path must not contain unresolved components"
+        )
+    try:
+        destination.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "materialized worktree destination cannot be inspected"
+        ) from error
+    else:
+        raise NamedLaneGuardError(
+            "materialized worktree destination must not already exist"
+        )
+    return normalized, resolved_parent, _directory_identity(metadata)
+
+
+def _verify_materializer_parent(
+    parent: pathlib.Path,
+    expected: _DirectoryIdentity,
+) -> None:
+    try:
+        metadata = parent.lstat()
+        resolved = parent.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "materialized worktree parent changed during materialization"
+        ) from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or resolved != parent
+        or metadata.st_uid != _current_user_id()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or _directory_identity(metadata) != expected
+    ):
+        raise NamedLaneGuardError(
+            "materialized worktree parent changed during materialization"
+        )
+
+
+def _resolve_materializer_source(
+    source: pathlib.Path,
+) -> tuple[pathlib.Path, pathlib.Path]:
+    if not source.is_absolute():
+        raise NamedLaneGuardError("materializer source path must be absolute")
+    try:
+        metadata = source.lstat()
+        resolved = source.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError("materializer source is not accessible") from error
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise NamedLaneGuardError("materializer source must be a real directory")
+    if os.pathsep in os.fspath(resolved.parent):
+        raise NamedLaneGuardError(
+            "materializer source parent cannot be encoded as a Git discovery ceiling"
+        )
+    admin_marker = resolved / ".git"
+    try:
+        admin_metadata = admin_marker.lstat()
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "materializer source must name an exact Git worktree root"
+        ) from error
+    if (
+        stat.S_ISLNK(admin_metadata.st_mode)
+        or admin_metadata.st_uid != _current_user_id()
+    ):
+        raise NamedLaneGuardError(
+            "materializer source must name an exact Git worktree root"
+        )
+    if stat.S_ISDIR(admin_metadata.st_mode):
+        try:
+            expected_admin = admin_marker.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise NamedLaneGuardError(
+                "materializer source Git admin directory cannot be resolved safely"
+            ) from error
+        if expected_admin != admin_marker:
+            raise NamedLaneGuardError(
+                "materializer source Git admin directory must be a real directory"
+            )
+    elif stat.S_ISREG(admin_metadata.st_mode):
+        if admin_metadata.st_size > 4096:
+            raise NamedLaneGuardError("materializer source Git admin file is too large")
+        try:
+            raw_admin = admin_marker.read_bytes()
+        except OSError as error:
+            raise NamedLaneGuardError(
+                "materializer source Git admin file cannot be read"
+            ) from error
+        stripped_admin = raw_admin.rstrip(b"\r\n")
+        if (
+            not stripped_admin.startswith(b"gitdir: ")
+            or b"\n" in stripped_admin
+            or b"\r" in stripped_admin
+            or not stripped_admin[len(b"gitdir: ") :]
+        ):
+            raise NamedLaneGuardError("materializer source Git admin file is malformed")
+        admin_value = pathlib.Path(os.fsdecode(stripped_admin[len(b"gitdir: ") :]))
+        if not admin_value.is_absolute():
+            admin_value = resolved / admin_value
+        try:
+            expected_admin = admin_value.resolve(strict=True)
+            expected_metadata = expected_admin.lstat()
+        except (OSError, RuntimeError) as error:
+            raise NamedLaneGuardError(
+                "materializer source Git admin directory cannot be resolved safely"
+            ) from error
+        if (
+            not stat.S_ISDIR(expected_metadata.st_mode)
+            or stat.S_ISLNK(expected_metadata.st_mode)
+            or expected_metadata.st_uid != _current_user_id()
+        ):
+            raise NamedLaneGuardError(
+                "materializer source Git admin directory must be a real directory"
+            )
+    else:
+        raise NamedLaneGuardError(
+            "materializer source must name an exact Git worktree root"
+        )
+    return resolved, expected_admin
+
+
+def _cleanup_materializer_path(
+    path: pathlib.Path,
+    parent: pathlib.Path,
+    parent_identity: _DirectoryIdentity,
+    expected_identity: _DirectoryIdentity | None,
+) -> pathlib.Path | None:
+    try:
+        _verify_materializer_parent(parent, parent_identity)
+    except NamedLaneGuardError:
+        return path
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return path
+    if expected_identity is None or _directory_identity(metadata) != expected_identity:
+        return path
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != _current_user_id()
+    ):
+        return path
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return path
+    if resolved != path or path.parent != parent:
+        return path
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        pass
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return path
+    return path
+
+
+def _make_materializer_control_directory(
+    parent: pathlib.Path,
+    parent_identity: _DirectoryIdentity,
+) -> tuple[pathlib.Path, dict[str, pathlib.Path], _DirectoryIdentity]:
+    _verify_materializer_parent(parent, parent_identity)
+    control = pathlib.Path(
+        tempfile.mkdtemp(prefix=".named-lane-materializer-", dir=parent)
+    )
+    control_identity: _DirectoryIdentity | None = None
+    try:
+        control_metadata = control.lstat()
+        if (
+            not stat.S_ISDIR(control_metadata.st_mode)
+            or stat.S_ISLNK(control_metadata.st_mode)
+            or control_metadata.st_uid != _current_user_id()
+        ):
+            raise NamedLaneGuardError(
+                "materializer control directory must be current-user-owned"
+            )
+        control_identity = _directory_identity(control_metadata)
+        os.chmod(control, 0o700, follow_symlinks=False)
+        revalidated_control = control.lstat()
+        if (
+            _directory_identity(revalidated_control) != control_identity
+            or stat.S_IMODE(revalidated_control.st_mode) != 0o700
+        ):
+            raise NamedLaneGuardError(
+                "materializer control directory changed during setup"
+            )
+        directories: dict[str, pathlib.Path] = {}
+        for name in ("home", "xdg", "hooks", "template", "tmp"):
+            path = control / name
+            path.mkdir(mode=0o700)
+            path.chmod(0o700)
+            metadata = path.lstat()
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != _current_user_id()
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
+                raise NamedLaneGuardError(
+                    "materializer control directories must be owner-only"
+                )
+            directories[name] = path
+        if any(directories["template"].iterdir()):
+            raise NamedLaneGuardError(
+                "materializer Git template directory must start empty"
+            )
+        _verify_materializer_parent(parent, parent_identity)
+        return control, directories, control_identity
+    except BaseException as error:
+        retained = _cleanup_materializer_path(
+            control,
+            parent,
+            parent_identity,
+            control_identity,
+        )
+        if retained is not None:
+            raise NamedLaneGuardError(
+                f"materializer control setup failed; retained control path: {retained}"
+            ) from error
+        raise
+
+
+def _materializer_git_environment(
+    directories: Mapping[str, pathlib.Path],
+    destination_parent: pathlib.Path,
+) -> dict[str, str]:
+    environment = _git_environment()
+    environment.update(
+        {
+            "GIT_CEILING_DIRECTORIES": str(destination_parent),
+            "HOME": str(directories["home"]),
+            "XDG_CONFIG_HOME": str(directories["xdg"]),
+        }
+    )
+    return environment
+
+
+def _validate_materializer_git_version(
+    git: pathlib.Path,
+    environment: Mapping[str, str],
+    cwd: pathlib.Path,
+) -> None:
+    capture = run_bounded_capture(
+        (str(git), "--version"),
+        cwd=cwd,
+        env=dict(environment),
+        timeout_seconds=30.0,
+        stdout_limit_bytes=1024,
+        stderr_limit_bytes=1024,
+    )
+    try:
+        if capture.returncode != 0 or capture.stderr:
+            raise NamedLaneGuardError("materializer Git version could not be validated")
+        match = re.fullmatch(
+            rb"git version ([0-9]+)\.([0-9]+)\.([0-9]+)"
+            rb"(?: \(Apple Git-[0-9]+(?:\.[0-9]+)*\))?",
+            bytes(capture.stdout).strip(),
+        )
+        if match is None:
+            raise NamedLaneGuardError("materializer Git version could not be validated")
+        version = tuple(int(component) for component in match.groups())
+        if version < MATERIALIZER_MINIMUM_GIT_VERSION:
+            raise NamedLaneGuardError(
+                "worktree materialization requires Git 2.45.0 or newer"
+            )
+    finally:
+        capture.stdout[:] = b"\x00" * len(capture.stdout)
+        capture.stderr[:] = b"\x00" * len(capture.stderr)
+
+
+def _materializer_git_prefix(
+    git: pathlib.Path,
+    hooks: pathlib.Path,
+) -> tuple[str, ...]:
+    return (
+        str(git),
+        "--no-pager",
+        "-c",
+        "advice.detachedHead=false",
+        "-c",
+        "color.ui=false",
+        "-c",
+        "core.commitGraph=false",
+        "-c",
+        f"core.attributesFile={os.devnull}",
+        "-c",
+        f"core.excludesFile={os.devnull}",
+        "-c",
+        "core.fileMode=true",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        f"core.hooksPath={hooks}",
+        "-c",
+        "core.multiPackIndex=false",
+        "-c",
+        "credential.helper=",
+        "-c",
+        "diff.external=",
+        "-c",
+        "fetch.recurseSubmodules=false",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        "-c",
+        "protocol.ext.allow=never",
+        "-c",
+        "submodule.recurse=false",
+    )
+
+
+def _materializer_git_capture(
+    git: pathlib.Path,
+    environment: Mapping[str, str],
+    hooks: pathlib.Path,
+    arguments: Sequence[str],
+    *,
+    root: pathlib.Path | None = None,
+    allow_no_match: bool = False,
+    stdin: bytearray | None = None,
+    timeout_seconds: float = MATERIALIZER_GIT_TIMEOUT_SECONDS,
+) -> bytes:
+    prefix = _materializer_git_prefix(git, hooks)
+    command = (
+        (*prefix, *arguments)
+        if root is None
+        else (*prefix, "-C", str(root), *arguments)
+    )
+    capture = run_bounded_capture(
+        command,
+        cwd=hooks.parent / "tmp",
+        env=dict(environment),
+        stdin=stdin,
+        timeout_seconds=timeout_seconds,
+        stdout_limit_bytes=GIT_OUTPUT_LIMIT_BYTES,
+        stderr_limit_bytes=1024 * 1024,
+    )
+    try:
+        no_match = (
+            allow_no_match
+            and capture.returncode == 1
+            and not capture.stdout
+            and not capture.stderr
+        )
+        if capture.returncode != 0 and not no_match:
+            command_name = arguments[0] if arguments else "command"
+            raise NamedLaneGuardError(f"bounded materializer Git {command_name} failed")
+        return bytes(capture.stdout)
+    finally:
+        capture.stdout[:] = b"\x00" * len(capture.stdout)
+        capture.stderr[:] = b"\x00" * len(capture.stderr)
+
+
+def _git_config_value_is_false(value: bytes | None) -> bool:
+    return value is not None and value.strip().lower() in {
+        b"0",
+        b"false",
+        b"no",
+        b"off",
+    }
+
+
+def _audit_materialized_local_config(
+    root: pathlib.Path,
+    source: pathlib.Path,
+    oid_length: int,
+    git: pathlib.Path,
+    environment: Mapping[str, str],
+    hooks: pathlib.Path,
+    *,
+    allow_origin: bool,
+) -> None:
+    payload = _materializer_git_capture(
+        git,
+        environment,
+        hooks,
+        (
+            "config",
+            "--file",
+            str(root / ".git" / "config"),
+            "--no-includes",
+            "--null",
+            "--list",
+        ),
+    )
+    records = _parse_git_config_records(
+        payload,
+        label="materialized direct local Git config",
+    )
+    configured_keys = frozenset(key for key, _value in records)
+    _validate_git_config_includes(configured_keys)
+
+    object_formats: list[bytes] = []
+    commit_graph_values: list[bytes] = []
+    multi_pack_index_values: list[bytes] = []
+    expected_hooks = os.fsencode(hooks)
+    expected_source = os.fsencode(source)
+    expected_fetch = b"+refs/heads/*:refs/remotes/origin/*"
+    false_only_keys = frozenset(
+        (
+            b"clone.recursesubmodules",
+            b"fetch.recursesubmodules",
+            b"submodule.recurse",
+        )
+    )
+    for key, value in records:
+        lower_key = key.lower()
+        if lower_key.startswith(b"alias."):
+            raise NamedLaneGuardError(
+                "materialized Git aliases are not allowed before checkout"
+            )
+        if lower_key.startswith(b"credential."):
+            raise NamedLaneGuardError(
+                "materialized Git credential helpers are not allowed before checkout"
+            )
+        if lower_key == b"core.worktree":
+            raise NamedLaneGuardError(
+                "materialized core.worktree is not allowed before checkout"
+            )
+        if lower_key == b"core.commitgraph":
+            if not _git_config_value_is_false(value):
+                raise NamedLaneGuardError(
+                    "materialized core.commitGraph must be disabled before checkout"
+                )
+            assert value is not None
+            commit_graph_values.append(value.strip().lower())
+            continue
+        if lower_key == b"core.multipackindex":
+            if not _git_config_value_is_false(value):
+                raise NamedLaneGuardError(
+                    "materialized core.multiPackIndex must be disabled before checkout"
+                )
+            assert value is not None
+            multi_pack_index_values.append(value.strip().lower())
+            continue
+        if lower_key == b"core.fsmonitor":
+            if not _git_config_value_is_false(value):
+                raise NamedLaneGuardError(
+                    "materialized core.fsmonitor must be disabled before checkout"
+                )
+            continue
+        if lower_key == b"core.hookspath":
+            if value != expected_hooks:
+                raise NamedLaneGuardError(
+                    "materialized core.hooksPath is not the private hooks directory"
+                )
+            continue
+        if lower_key == b"core.attributesfile" and value != os.fsencode(os.devnull):
+            raise NamedLaneGuardError(
+                "materialized core.attributesFile is not allowed before checkout"
+            )
+        if lower_key in {
+            b"core.alternaterefscommand",
+            b"core.askpass",
+            b"core.gitproxy",
+            b"core.sshcommand",
+            b"ssh.command",
+        }:
+            raise NamedLaneGuardError(
+                "materialized Git remote command configuration is not allowed"
+            )
+        if lower_key.startswith(b"core.sparse") or lower_key.startswith(
+            b"index.sparse"
+        ):
+            raise NamedLaneGuardError(
+                "materialized sparse checkout configuration is not allowed"
+            )
+        if lower_key.startswith(b"extensions."):
+            if lower_key != b"extensions.objectformat":
+                raise NamedLaneGuardError(
+                    "unexpected materialized Git repository extension"
+                )
+            if value is None:
+                raise NamedLaneGuardError(
+                    "materialized Git object format must have a value"
+                )
+            object_formats.append(value.lower())
+            continue
+        executable_filter = _matches_named_driver_key(
+            lower_key,
+            b"filter.",
+            frozenset((b"clean", b"process", b"smudge")),
+        )
+        executable_diff = lower_key == b"diff.external" or (
+            _matches_named_driver_key(
+                lower_key,
+                b"diff.",
+                frozenset((b"command", b"textconv")),
+            )
+        )
+        if executable_filter or executable_diff:
+            raise NamedLaneGuardError(
+                "materialized executable Git filter or diff driver is not allowed"
+            )
+        if lower_key in false_only_keys and not _git_config_value_is_false(value):
+            raise NamedLaneGuardError(
+                "materialized submodule recursion must be disabled"
+            )
+        if (
+            lower_key.startswith(b"submodule.")
+            and lower_key.endswith(b".update")
+            and (value is None or value.lstrip().startswith(b"!"))
+        ):
+            raise NamedLaneGuardError(
+                "materialized executable submodule update command is not allowed"
+            )
+        if lower_key.startswith(b"url.") or lower_key.startswith(b"protocol."):
+            raise NamedLaneGuardError(
+                "materialized Git remote helper configuration is not allowed"
+            )
+        if lower_key.startswith((b"fsck.", b"fetch.fsck.", b"receive.fsck.")):
+            raise NamedLaneGuardError(
+                "materialized Git fsck policy overrides are not allowed"
+            )
+        if lower_key.startswith(b"remote."):
+            allowed_remote = allow_origin and (
+                (lower_key == b"remote.origin.url" and value == expected_source)
+                or (lower_key == b"remote.origin.fetch" and value == expected_fetch)
+            )
+            if not allowed_remote:
+                raise NamedLaneGuardError(
+                    "unexpected materialized Git remote configuration"
+                )
+
+    if oid_length == 64:
+        if object_formats != [b"sha256"]:
+            raise NamedLaneGuardError(
+                "materialized Git object format does not match frozen object IDs"
+            )
+    elif object_formats not in ([], [b"sha1"]):
+        raise NamedLaneGuardError(
+            "materialized Git object format does not match frozen object IDs"
+        )
+    if commit_graph_values != [b"false"]:
+        raise NamedLaneGuardError(
+            "materialized core.commitGraph must have one Git-false value"
+        )
+    if multi_pack_index_values != [b"false"]:
+        raise NamedLaneGuardError(
+            "materialized core.multiPackIndex must have one Git-false value"
+        )
+
+
+def _validate_materializer_source_repository(
+    source: pathlib.Path,
+    expected_admin: pathlib.Path,
+    git: pathlib.Path,
+    environment: Mapping[str, str],
+    hooks: pathlib.Path,
+) -> None:
+    try:
+        top_level = os.fsdecode(
+            _materializer_git_capture(
+                git,
+                environment,
+                hooks,
+                ("rev-parse", "--show-toplevel"),
+                root=source,
+            )
+        ).strip()
+    except NamedLaneGuardError as error:
+        raise NamedLaneGuardError(
+            "materializer source must name an exact Git worktree root"
+        ) from error
+    try:
+        resolved_top_level = pathlib.Path(top_level).resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "materializer source must name an exact Git worktree root"
+        ) from error
+    if resolved_top_level != source:
+        raise NamedLaneGuardError(
+            "materializer source must name an exact Git worktree root"
+        )
+    try:
+        actual_admin = os.fsdecode(
+            _materializer_git_capture(
+                git,
+                environment,
+                hooks,
+                ("rev-parse", "--absolute-git-dir"),
+                root=source,
+            )
+        ).strip()
+    except NamedLaneGuardError as error:
+        raise NamedLaneGuardError(
+            "materializer source Git admin directory does not match its exact marker"
+        ) from error
+    try:
+        resolved_admin = pathlib.Path(actual_admin).resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "materializer source Git admin directory cannot be resolved safely"
+        ) from error
+    if resolved_admin != expected_admin:
+        raise NamedLaneGuardError(
+            "materializer source Git admin directory does not match its exact marker"
+        )
+
+
+def _validate_materialized_admin_directory(root: pathlib.Path) -> pathlib.Path:
+    git_directory = root / ".git"
+    try:
+        metadata = git_directory.lstat()
+        resolved = git_directory.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "materialized clone does not have a private Git directory"
+        ) from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != _current_user_id()
+        or resolved != git_directory
+    ):
+        raise NamedLaneGuardError(
+            "materialized clone does not have a private Git directory"
+        )
+    config = git_directory / "config"
+    try:
+        config_metadata = config.lstat()
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "materialized Git config is not a private regular file"
+        ) from error
+    if (
+        not stat.S_ISREG(config_metadata.st_mode)
+        or stat.S_ISLNK(config_metadata.st_mode)
+        or config_metadata.st_uid != _current_user_id()
+    ):
+        raise NamedLaneGuardError(
+            "materialized Git config is not a private regular file"
+        )
+    commondir = git_directory / "commondir"
+    try:
+        commondir.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "materialized Git commondir state cannot be inspected"
+        ) from error
+    else:
+        raise NamedLaneGuardError("materialized Git commondir state is not allowed")
+    worktree_config = git_directory / "config.worktree"
+    try:
+        worktree_config.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "materialized per-worktree Git config cannot be inspected"
+        ) from error
+    else:
+        raise NamedLaneGuardError("materialized per-worktree Git config is not allowed")
+    return git_directory
+
+
+def _validate_materialized_object_storage(
+    git_directory: pathlib.Path,
+    *,
+    remove_bitmaps: bool = False,
+) -> None:
+    objects = git_directory / "objects"
+    try:
+        objects_metadata = objects.lstat()
+        objects_resolved = objects.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "materialized Git object storage cannot be inspected"
+        ) from error
+    if (
+        not stat.S_ISDIR(objects_metadata.st_mode)
+        or stat.S_ISLNK(objects_metadata.st_mode)
+        or objects_metadata.st_uid != _current_user_id()
+        or objects_resolved != objects
+    ):
+        raise NamedLaneGuardError(
+            "materialized Git object storage must be a real directory"
+        )
+
+    info = objects / "info"
+    try:
+        info_metadata = info.lstat()
+        info_resolved = info.resolve(strict=True)
+    except FileNotFoundError:
+        info_metadata = None
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "materialized Git object-info storage cannot be inspected"
+        ) from error
+    if info_metadata is not None and (
+        not stat.S_ISDIR(info_metadata.st_mode)
+        or stat.S_ISLNK(info_metadata.st_mode)
+        or info_metadata.st_uid != _current_user_id()
+        or info_resolved != info
+    ):
+        raise NamedLaneGuardError(
+            "materialized Git object-info storage must be a real directory"
+        )
+    alternates = info / "alternates"
+    http_alternates = info / "http-alternates"
+    for candidate, label in (
+        (alternates, "alternates"),
+        (http_alternates, "HTTP alternates"),
+    ):
+        try:
+            candidate.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise NamedLaneGuardError(
+                f"materialized Git {label} cannot be inspected"
+            ) from error
+        raise NamedLaneGuardError(f"materialized Git {label} must be absent")
+
+    for candidate, label in (
+        (git_directory / "shallow", "shallow repository state"),
+        (git_directory / "info" / "sparse-checkout", "sparse checkout state"),
+    ):
+        try:
+            candidate.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise NamedLaneGuardError(
+                f"materialized Git {label} cannot be inspected"
+            ) from error
+        raise NamedLaneGuardError(f"materialized Git {label} is not allowed")
+
+    pack = objects / "pack"
+    try:
+        pack_metadata = pack.lstat()
+        pack_resolved = pack.resolve(strict=True)
+    except FileNotFoundError:
+        return
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "materialized Git pack storage cannot be inspected"
+        ) from error
+    if (
+        not stat.S_ISDIR(pack_metadata.st_mode)
+        or stat.S_ISLNK(pack_metadata.st_mode)
+        or pack_metadata.st_uid != _current_user_id()
+        or pack_resolved != pack
+    ):
+        raise NamedLaneGuardError(
+            "materialized Git pack storage must be a real directory"
+        )
+    pack_fd = -1
+    try:
+        pack_fd = os.open(
+            pack,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        descriptor_metadata = os.fstat(pack_fd)
+        if (
+            not stat.S_ISDIR(descriptor_metadata.st_mode)
+            or descriptor_metadata.st_uid != _current_user_id()
+            or _directory_identity(descriptor_metadata)
+            != _directory_identity(pack_metadata)
+        ):
+            raise NamedLaneGuardError(
+                "materialized Git pack storage changed during inspection"
+            )
+        bitmaps: list[tuple[str, tuple[int, int, int, int]]] = []
+        with os.scandir(pack_fd) as entries:
+            for entry in entries:
+                folded_name = entry.name.casefold()
+                if folded_name.endswith(".promisor"):
+                    raise NamedLaneGuardError(
+                        "materialized Git promisor state is not allowed"
+                    )
+                if not folded_name.endswith(".bitmap"):
+                    continue
+                metadata = entry.stat(follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_uid != _current_user_id()
+                ):
+                    raise NamedLaneGuardError(
+                        "materialized Git bitmap cache must be an owned regular file"
+                    )
+                if not remove_bitmaps:
+                    raise NamedLaneGuardError(
+                        "materialized Git bitmap cache must be absent"
+                    )
+                bitmaps.append(
+                    (
+                        entry.name,
+                        (
+                            metadata.st_dev,
+                            metadata.st_ino,
+                            metadata.st_mode,
+                            metadata.st_uid,
+                        ),
+                    )
+                )
+        for name, expected_identity in bitmaps:
+            current = os.stat(name, dir_fd=pack_fd, follow_symlinks=False)
+            current_identity = (
+                current.st_dev,
+                current.st_ino,
+                current.st_mode,
+                current.st_uid,
+            )
+            if current_identity != expected_identity:
+                raise NamedLaneGuardError(
+                    "materialized Git bitmap cache changed before removal"
+                )
+            os.unlink(name, dir_fd=pack_fd)
+        with os.scandir(pack_fd) as entries:
+            if any(entry.name.casefold().endswith(".bitmap") for entry in entries):
+                raise NamedLaneGuardError(
+                    "materialized Git bitmap cache must be absent"
+                )
+    except NamedLaneGuardError:
+        raise
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "materialized Git pack storage cannot be inspected"
+        ) from error
+    finally:
+        if pack_fd >= 0:
+            os.close(pack_fd)
+
+
+def _materializer_verify_revision(
+    root: pathlib.Path,
+    revision: str,
+    expected: str,
+    git: pathlib.Path,
+    environment: Mapping[str, str],
+    hooks: pathlib.Path,
+) -> None:
+    actual = os.fsdecode(
+        _materializer_git_capture(
+            git,
+            environment,
+            hooks,
+            ("rev-parse", "--verify", f"{revision}^{{commit}}"),
+            root=root,
+        )
+    ).strip()
+    if actual.lower() != expected.lower():
+        raise NamedLaneGuardError(
+            f"materialized {revision} does not match the frozen object ID"
+        )
+
+
+def _materializer_verify_complete_objects(
+    root: pathlib.Path,
+    base_sha: str,
+    head_sha: str,
+    git: pathlib.Path,
+    environment: Mapping[str, str],
+    hooks: pathlib.Path,
+) -> None:
+    _materializer_verify_revision(
+        root,
+        base_sha,
+        base_sha,
+        git,
+        environment,
+        hooks,
+    )
+    _materializer_verify_revision(
+        root,
+        head_sha,
+        head_sha,
+        git,
+        environment,
+        hooks,
+    )
+    _materializer_git_capture(
+        git,
+        environment,
+        hooks,
+        (
+            "rev-list",
+            "--objects",
+            "--missing=error",
+            "--quiet",
+            base_sha,
+            head_sha,
+            "--",
+        ),
+        root=root,
+    )
+
+
+def _materializer_verify_object_integrity(
+    root: pathlib.Path,
+    base_sha: str,
+    head_sha: str,
+    git: pathlib.Path,
+    environment: Mapping[str, str],
+    hooks: pathlib.Path,
+) -> None:
+    _materializer_git_capture(
+        git,
+        environment,
+        hooks,
+        (
+            "fsck",
+            "--full",
+            "--no-reflogs",
+            "--no-dangling",
+            "--no-progress",
+            base_sha,
+            head_sha,
+        ),
+        root=root,
+        timeout_seconds=300.0,
+    )
+
+
+def _verify_materialized_root(
+    root: pathlib.Path,
+    expected_identity: _DirectoryIdentity,
+) -> None:
+    try:
+        metadata = root.lstat()
+        resolved = root.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "materialized worktree changed during checkout"
+        ) from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != _current_user_id()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or resolved != root
+        or _directory_identity(metadata) != expected_identity
+    ):
+        raise NamedLaneGuardError("materialized worktree changed during checkout")
+
+
+def _block_materializer_cleanup_signals() -> tuple[
+    set[signal.Signals] | None, ForwardedSignal | None
+]:
+    deferred: ForwardedSignal | None = None
+    while True:
+        try:
+            return block_forwarded_signals(), deferred
+        except ForwardedSignal as error:
+            if deferred is None:
+                deferred = error
+
+
+def _restore_materializer_terminal_failure_mask(
+    previous_mask: set[signal.Signals] | None,
+) -> None:
+    if previous_mask is None:
+        restore_signal_mask(previous_mask)
+        return
+    terminal_signals: list[signal.Signals] = []
+
+    def record_terminal_signal(signum: int, _frame: object) -> None:
+        terminal_signals.append(signal.Signals(signum))
+
+    # The caller has already frozen the terminal failure, including every
+    # retained path. Keep later signals from replacing that evidence while the
+    # enclosing structured-signal context regains control and restores the
+    # original handlers.
+    for forwarded in forwarded_signals():
+        signal.signal(forwarded, record_terminal_signal)
+    consume_pending_forwarded_signal()
+    restore_signal_mask(previous_mask)
+
+
+def materialize_worktree(
+    source: pathlib.Path,
+    worktree: pathlib.Path,
+    base_sha: str,
+    head_sha: str,
+    *,
+    defer_signal_handoff: bool = False,
+) -> MaterializedWorktree:
+    if FULL_OBJECT_ID.fullmatch(base_sha) is None:
+        raise NamedLaneGuardError("frozen base must be a full Git object ID")
+    if FULL_OBJECT_ID.fullmatch(head_sha) is None:
+        raise NamedLaneGuardError("frozen head must be a full Git object ID")
+    if len(base_sha) != len(head_sha):
+        raise NamedLaneGuardError(
+            "frozen base and head must use the same Git object format"
+        )
+    frozen_base = base_sha.lower()
+    frozen_head = head_sha.lower()
+    resolved_source, expected_source_admin = _resolve_materializer_source(source)
+    destination, parent, parent_identity = _validate_materializer_parent(worktree)
+    git = resolve_git()
+    control: pathlib.Path | None = None
+    directories: dict[str, pathlib.Path] | None = None
+    control_identity: _DirectoryIdentity | None = None
+    environment: dict[str, str] | None = None
+    clone_started = False
+    result: MaterializedWorktree | None = None
+    failure: BaseException | None = None
+    destination_identity: _DirectoryIdentity | None = None
+    cleanup_mask: set[signal.Signals] | None = None
+    cleanup_acquisition_signal: ForwardedSignal | None = None
+    try:
+        setup_mask = block_forwarded_signals()
+        if setup_mask is None:
+            raise NamedLaneGuardError(
+                "materializer setup requires main-thread signal masking"
+            )
+        try:
+            control, directories, control_identity = (
+                _make_materializer_control_directory(
+                    parent,
+                    parent_identity,
+                )
+            )
+            setup_signal = consume_pending_forwarded_signal()
+            if setup_signal is not None:
+                raise ForwardedSignal(setup_signal)
+        except BaseException:
+            if defer_signal_handoff:
+                _restore_materializer_terminal_failure_mask(setup_mask)
+            else:
+                restore_signal_mask(setup_mask)
+            raise
+        else:
+            restore_signal_mask(setup_mask)
+        environment = _materializer_git_environment(directories, parent)
+        _verify_materializer_parent(parent, parent_identity)
+        _validate_materializer_git_version(
+            git,
+            environment,
+            directories["tmp"],
+        )
+        source_environment = dict(environment)
+        source_environment["GIT_CEILING_DIRECTORIES"] = str(resolved_source.parent)
+        _validate_materializer_source_repository(
+            resolved_source,
+            expected_source_admin,
+            git,
+            source_environment,
+            directories["hooks"],
+        )
+        clone_started = True
+        _materializer_git_capture(
+            git,
+            environment,
+            directories["hooks"],
+            (
+                "clone",
+                "--local",
+                "--no-checkout",
+                "--no-hardlinks",
+                "--reject-shallow",
+                f"--template={directories['template']}",
+                "--no-recurse-submodules",
+                "--",
+                str(resolved_source),
+                str(destination),
+            ),
+        )
+        _verify_materializer_parent(parent, parent_identity)
+        try:
+            initial_destination_metadata = destination.lstat()
+            initial_destination_resolved = destination.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise NamedLaneGuardError(
+                "materialized clone directory cannot be inspected safely"
+            ) from error
+        if (
+            not stat.S_ISDIR(initial_destination_metadata.st_mode)
+            or stat.S_ISLNK(initial_destination_metadata.st_mode)
+            or initial_destination_metadata.st_uid != _current_user_id()
+            or initial_destination_resolved != destination
+        ):
+            raise NamedLaneGuardError(
+                "materialized clone directory must be a current-user-owned real directory"
+            )
+        initial_destination_identity = _directory_identity(initial_destination_metadata)
+        try:
+            os.chmod(destination, 0o700, follow_symlinks=False)
+            destination_metadata = destination.lstat()
+        except (NotImplementedError, OSError) as error:
+            raise NamedLaneGuardError(
+                "materialized clone directory cannot be made owner-only"
+            ) from error
+        destination_identity = _directory_identity(destination_metadata)
+        if destination_identity != initial_destination_identity:
+            raise NamedLaneGuardError(
+                "materialized clone directory changed before it became owner-only"
+            )
+        _verify_materialized_root(destination, destination_identity)
+        git_directory = _validate_materialized_admin_directory(destination)
+        _materializer_git_capture(
+            git,
+            environment,
+            directories["hooks"],
+            (
+                "config",
+                "--file",
+                str(git_directory / "config"),
+                "--no-includes",
+                "core.commitGraph",
+                "false",
+            ),
+        )
+        _materializer_git_capture(
+            git,
+            environment,
+            directories["hooks"],
+            (
+                "config",
+                "--file",
+                str(git_directory / "config"),
+                "--no-includes",
+                "core.multiPackIndex",
+                "false",
+            ),
+        )
+        _audit_materialized_local_config(
+            destination,
+            resolved_source,
+            len(frozen_head),
+            git,
+            environment,
+            directories["hooks"],
+            allow_origin=True,
+        )
+        _validate_materialized_object_storage(
+            git_directory,
+            remove_bitmaps=True,
+        )
+        _materializer_verify_object_integrity(
+            destination,
+            frozen_base,
+            frozen_head,
+            git,
+            environment,
+            directories["hooks"],
+        )
+        _materializer_verify_complete_objects(
+            destination,
+            frozen_base,
+            frozen_head,
+            git,
+            environment,
+            directories["hooks"],
+        )
+
+        ref_transaction = bytearray(
+            (
+                "start\n"
+                f"create {MATERIALIZER_BASE_REF} {frozen_base}\n"
+                f"create {MATERIALIZER_HEAD_REF} {frozen_head}\n"
+                "prepare\n"
+                "commit\n"
+            ).encode("ascii")
+        )
+        _materializer_git_capture(
+            git,
+            environment,
+            directories["hooks"],
+            ("update-ref", "--stdin"),
+            root=destination,
+            stdin=ref_transaction,
+        )
+        _materializer_git_capture(
+            git,
+            environment,
+            directories["hooks"],
+            (
+                "config",
+                "--file",
+                str(git_directory / "config"),
+                "--no-includes",
+                "--remove-section",
+                "remote.origin",
+            ),
+        )
+        _audit_materialized_local_config(
+            destination,
+            resolved_source,
+            len(frozen_head),
+            git,
+            environment,
+            directories["hooks"],
+            allow_origin=False,
+        )
+        _validate_materialized_object_storage(git_directory)
+        _materializer_verify_complete_objects(
+            destination,
+            frozen_base,
+            frozen_head,
+            git,
+            environment,
+            directories["hooks"],
+        )
+        _verify_materialized_root(destination, destination_identity)
+        _materializer_git_capture(
+            git,
+            environment,
+            directories["hooks"],
+            (
+                "checkout",
+                "--detach",
+                "--force",
+                "--no-recurse-submodules",
+                frozen_head,
+                "--",
+            ),
+            root=destination,
+        )
+        _verify_materialized_root(destination, destination_identity)
+        symbolic_head = _materializer_git_capture(
+            git,
+            environment,
+            directories["hooks"],
+            ("symbolic-ref", "--quiet", "HEAD"),
+            root=destination,
+            allow_no_match=True,
+        )
+        if symbolic_head:
+            raise NamedLaneGuardError("materialized worktree HEAD must be detached")
+        _materializer_verify_revision(
+            destination,
+            "HEAD",
+            frozen_head,
+            git,
+            environment,
+            directories["hooks"],
+        )
+        _materializer_verify_revision(
+            destination,
+            MATERIALIZER_BASE_REF,
+            frozen_base,
+            git,
+            environment,
+            directories["hooks"],
+        )
+        _materializer_verify_revision(
+            destination,
+            MATERIALIZER_HEAD_REF,
+            frozen_head,
+            git,
+            environment,
+            directories["hooks"],
+        )
+        _validate_materialized_object_storage(git_directory)
+        result = MaterializedWorktree(
+            root=destination,
+            base_sha=frozen_base,
+            head_sha=frozen_head,
+            _parent=parent,
+            _parent_identity=parent_identity,
+            _root_identity=destination_identity,
+        )
+    except BaseException as error:
+        failure = error
+    finally:
+        cleanup_mask, cleanup_acquisition_signal = _block_materializer_cleanup_signals()
+
+    if cleanup_acquisition_signal is not None and failure is None:
+        failure = cleanup_acquisition_signal
+    if control is None or directories is None or control_identity is None:
+        assert failure is not None
+        if defer_signal_handoff:
+            _restore_materializer_terminal_failure_mask(cleanup_mask)
+        else:
+            restore_signal_mask(cleanup_mask)
+        raise failure
+    if defer_signal_handoff and cleanup_mask is None and failure is None:
+        failure = NamedLaneGuardError(
+            "materializer receipt handoff requires main-thread signal masking"
+        )
+    retained_control = _cleanup_materializer_path(
+        control,
+        parent,
+        parent_identity,
+        control_identity,
+    )
+    pending_cleanup_signal = (
+        consume_pending_forwarded_signal() if cleanup_mask is not None else None
+    )
+    if pending_cleanup_signal is not None and failure is None:
+        failure = ForwardedSignal(pending_cleanup_signal)
+    retained_worktree: pathlib.Path | None = None
+    if failure is not None or retained_control is not None:
+        if clone_started:
+            retained_worktree = _cleanup_materializer_path(
+                destination,
+                parent,
+                parent_identity,
+                destination_identity,
+            )
+        late_cleanup_signal = (
+            consume_pending_forwarded_signal() if cleanup_mask is not None else None
+        )
+        if late_cleanup_signal is not None and failure is None:
+            failure = ForwardedSignal(late_cleanup_signal)
+            if clone_started and retained_worktree is None:
+                retained_worktree = _cleanup_materializer_path(
+                    destination,
+                    parent,
+                    parent_identity,
+                    destination_identity,
+                )
+        retained: list[str] = []
+        if retained_worktree is not None:
+            retained.append(f"retained materialized worktree: {retained_worktree}")
+        if retained_control is not None:
+            retained.append(f"retained materializer control path: {retained_control}")
+        if retained:
+            detail = "; ".join(retained)
+            if failure is None:
+                terminal_failure = NamedLaneGuardError(detail)
+            else:
+                terminal_failure = NamedLaneGuardError(f"{failure}; {detail}")
+            if defer_signal_handoff:
+                _restore_materializer_terminal_failure_mask(cleanup_mask)
+            else:
+                restore_signal_mask(cleanup_mask)
+            if failure is None:
+                raise terminal_failure
+            raise terminal_failure from failure
+        if failure is not None:
+            if defer_signal_handoff:
+                _restore_materializer_terminal_failure_mask(cleanup_mask)
+            else:
+                restore_signal_mask(cleanup_mask)
+            raise failure
+
+    assert result is not None
+    if defer_signal_handoff:
+        object.__setattr__(result, "_handoff_signal_mask", cleanup_mask)
+    else:
+        restore_signal_mask(cleanup_mask)
+    return result
 
 
 def _resolve_worktree_root(
@@ -271,8 +1710,10 @@ def _validate_initialized_submodules(
             label="frozen submodule path",
         ):
             lower_key = key.lower()
-            if not lower_key.startswith(b"submodule.") or not lower_key.endswith(
-                b".path"
+            if (
+                not lower_key.startswith(b"submodule.")
+                or not lower_key.endswith(b".path")
+                or raw_path is None
             ):
                 raise NamedLaneGuardError("malformed frozen submodule path record")
             relative_path = pathlib.PurePosixPath(os.fsdecode(raw_path))
@@ -298,6 +1739,8 @@ def _validate_initialized_submodules(
     ):
         lower_key = key.lower()
         if not lower_key.startswith(b"submodule.") or not lower_key.endswith(b".path"):
+            raise NamedLaneGuardError("malformed effective submodule path record")
+        if raw_path is None:
             raise NamedLaneGuardError("malformed effective submodule path record")
         name = key[len(b"submodule.") : -len(b".path")]
         effective_paths[name] = pathlib.PurePosixPath(os.fsdecode(raw_path))
@@ -413,17 +1856,17 @@ def _parse_git_config_records(
     payload: bytes,
     *,
     label: str,
-) -> tuple[tuple[bytes, bytes], ...]:
+) -> tuple[tuple[bytes, bytes | None], ...]:
     if not payload:
         return ()
     if not payload.endswith(b"\0"):
         raise NamedLaneGuardError(f"malformed {label} record")
-    records: list[tuple[bytes, bytes]] = []
+    records: list[tuple[bytes, bytes | None]] = []
     for record in payload[:-1].split(b"\0"):
         key, separator, value = record.partition(b"\n")
-        if not separator or not key:
+        if not key:
             raise NamedLaneGuardError(f"malformed {label} record")
-        records.append((key, value))
+        records.append((key, value if separator else None))
     return tuple(records)
 
 
@@ -964,8 +2407,17 @@ def _read_control_prompt(
     return bytes(payload)
 
 
+@dataclass
+class _StructuredSignalState:
+    committed: bool = False
+
+    def commit(self) -> None:
+        self.committed = True
+
+
 @contextlib.contextmanager
-def _structured_forwarded_signals() -> Iterable[None]:
+def _structured_forwarded_signals() -> Iterable[_StructuredSignalState]:
+    state = _StructuredSignalState()
     previous_handlers: dict[signal.Signals, object] = {}
 
     def raise_forwarded_signal(signum: int, _frame: object) -> None:
@@ -984,19 +2436,28 @@ def _structured_forwarded_signals() -> Iterable[None]:
         initial_mask_restored = True
         if pending_signal is not None:
             raise ForwardedSignal(pending_signal)
-        yield
+        yield state
     finally:
         cleanup_mask = block_forwarded_signals()
         pending_cleanup_signal: signal.Signals | None = None
-        try:
-            for forwarded, previous in previous_handlers.items():
-                signal.signal(forwarded, previous)
+        if state.committed:
             if cleanup_mask is not None:
-                pending_cleanup_signal = consume_pending_forwarded_signal()
-        finally:
+                consume_pending_forwarded_signal()
             restore_signal_mask(
                 cleanup_mask if initial_mask_restored else previous_mask
             )
+            for forwarded, previous in previous_handlers.items():
+                signal.signal(forwarded, previous)
+        else:
+            try:
+                for forwarded, previous in previous_handlers.items():
+                    signal.signal(forwarded, previous)
+                if cleanup_mask is not None:
+                    pending_cleanup_signal = consume_pending_forwarded_signal()
+            finally:
+                restore_signal_mask(
+                    cleanup_mask if initial_mask_restored else previous_mask
+                )
         if pending_cleanup_signal is not None:
             raise ForwardedSignal(pending_cleanup_signal)
 
@@ -1156,6 +2617,7 @@ def _validate_node_extra_ca_certs(path: pathlib.Path) -> str:
 
 
 def _claude_environment(
+    worktree: pathlib.Path,
     inherit_node_extra_ca_certs: bool = False,
 ) -> dict[str, str]:
     if os.name != "posix":
@@ -1174,6 +2636,7 @@ def _claude_environment(
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_CEILING_DIRECTORIES": str(worktree.parent),
         "GIT_NO_LAZY_FETCH": "1",
         "GIT_NO_REPLACE_OBJECTS": "1",
         "GIT_OPTIONAL_LOCKS": "0",
@@ -1440,7 +2903,7 @@ def run_claude(
             capture = run_bounded_capture(
                 command,
                 cwd=root,
-                env=_claude_environment(inherit_node_extra_ca_certs),
+                env=_claude_environment(root, inherit_node_extra_ca_certs),
                 stdin=bytearray(prompt),
                 timeout_seconds=_remaining_deadline_seconds(
                     deadline,
@@ -1564,6 +3027,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command_name", required=True)
 
+    materialize = subparsers.add_parser(
+        "materialize-worktree",
+        help="Create a private no-checkout clone and detach it at a frozen head.",
+    )
+    materialize.add_argument("--source", required=True)
+    materialize.add_argument("--worktree", required=True)
+    materialize.add_argument("--base", required=True)
+    materialize.add_argument("--head", required=True)
+
     validate = subparsers.add_parser(
         "validate-worktree",
         help="Validate tracked symlink containment for a frozen named-lane worktree.",
@@ -1597,28 +3069,155 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _emit(payload: dict[str, object], *, stream: object = sys.stdout) -> None:
+def _emit(payload: dict[str, object], *, stream: object | None = None) -> None:
+    if stream is None:
+        stream = sys.stdout
     print(json.dumps(payload, sort_keys=True), file=stream)
+
+
+def _install_post_terminal_signal_handlers() -> None:
+    post_terminal_signals: list[signal.Signals] = []
+
+    def record_post_terminal_signal(signum: int, _frame: object) -> None:
+        post_terminal_signals.append(signal.Signals(signum))
+
+    for forwarded in forwarded_signals():
+        signal.signal(forwarded, record_post_terminal_signal)
+
+
+def _emit_structured_terminal_failure(
+    payload: dict[str, object],
+    signal_state: _StructuredSignalState,
+) -> None:
+    terminal_mask, _deferred_signal = _block_materializer_cleanup_signals()
+    if terminal_mask is None:
+        raise NamedLaneGuardError(
+            "terminal failure publication requires main-thread signal masking"
+        )
+    _emit(payload, stream=sys.stderr)
+    sys.stderr.flush()
+    _install_post_terminal_signal_handlers()
+    consume_pending_forwarded_signal()
+    signal_state.commit()
+    restore_signal_mask(terminal_mask)
+
+
+def _materializer_failure_payload(
+    error: BaseException,
+) -> tuple[int, dict[str, object]]:
+    if isinstance(error, ForwardedSignal):
+        return (
+            128 + int(error.signum),
+            {"status": "blocked-safety", "reason": "forwarded-signal"},
+        )
+    if isinstance(error, ReviewTimeoutError):
+        reason = "deadline"
+    elif isinstance(error, ReviewOutputLimitError):
+        reason = "output-limit"
+    elif isinstance(error, ReviewOutputDrainError):
+        reason = "output-drain"
+    elif isinstance(error, ReviewProcessLeakError):
+        reason = "process-leak"
+    else:
+        reason = str(error)
+    return 2, {"status": "blocked-safety", "reason": reason}
+
+
+def _emit_materialized_receipt(result: MaterializedWorktree) -> None:
+    handoff_mask = result._handoff_signal_mask
+    if handoff_mask is None:
+        raise NamedLaneGuardError(
+            "materializer receipt handoff does not own a signal mask"
+        )
+    try:
+        pending_before_receipt = consume_pending_forwarded_signal()
+        if pending_before_receipt is not None:
+            raise ForwardedSignal(pending_before_receipt)
+        _emit(
+            {
+                "status": "ok",
+                "worktree": str(result.root),
+                "base": result.base_sha,
+                "head": result.head_sha,
+            }
+        )
+        sys.stdout.flush()
+    except BaseException as error:
+        retained = _cleanup_materializer_path(
+            result.root,
+            result._parent,
+            result._parent_identity,
+            result._root_identity,
+        )
+        if retained is not None:
+            terminal_failure: BaseException = NamedLaneGuardError(
+                f"{error}; retained materialized worktree: {retained}"
+            )
+        else:
+            terminal_failure = error
+        _restore_materializer_terminal_failure_mask(handoff_mask)
+        if retained is not None:
+            raise terminal_failure from error
+        raise terminal_failure
+    # After the complete flushed receipt, replace the outer raising handlers
+    # with commit-aware handlers before unblocking. The enclosing structured
+    # context restores the original handlers on exit.
+    _install_post_terminal_signal_handlers()
+    consume_pending_forwarded_signal()
+    restore_signal_mask(handoff_mask)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    safety_command = args.command_name in {
+        "materialize-worktree",
+        "validate-worktree",
+    }
     try:
+        if args.command_name == "materialize-worktree":
+            with _structured_forwarded_signals() as signal_state:
+                try:
+                    result = materialize_worktree(
+                        pathlib.Path(args.source),
+                        pathlib.Path(args.worktree),
+                        args.base,
+                        args.head,
+                        defer_signal_handoff=True,
+                    )
+                    _emit_materialized_receipt(result)
+                except (
+                    ForwardedSignal,
+                    ReviewTimeoutError,
+                    ReviewOutputLimitError,
+                    ReviewOutputDrainError,
+                    ReviewProcessLeakError,
+                    NamedLaneGuardError,
+                    ReviewError,
+                    OSError,
+                    ValueError,
+                ) as error:
+                    returncode, payload = _materializer_failure_payload(error)
+                    _emit_structured_terminal_failure(payload, signal_state)
+                    return returncode
+                signal_state.commit()
+                return 0
+
         if args.command_name == "validate-worktree":
-            result = validate_worktree(
-                pathlib.Path(args.worktree),
-                args.head,
-                args.guidance,
-            )
-            _emit(
-                {
-                    "status": "ok",
-                    "head": result.head_sha,
-                    "symlink_count": result.symlink_count,
-                    "guidance_count": result.guidance_count,
-                }
-            )
+            with _structured_forwarded_signals():
+                result = validate_worktree(
+                    pathlib.Path(args.worktree),
+                    args.head,
+                    args.guidance,
+                )
+                _emit(
+                    {
+                        "status": "ok",
+                        "head": result.head_sha,
+                        "symlink_count": result.symlink_count,
+                        "guidance_count": result.guidance_count,
+                    }
+                )
             return 0
 
         command = list(args.claude_argv)
@@ -1663,66 +3262,42 @@ def main(argv: Sequence[str] | None = None) -> int:
         _emit(result)
         return 0 if result["status"] == "complete" else 1
     except ForwardedSignal as error:
-        status = (
-            "blocked-safety"
-            if args.command_name == "validate-worktree"
-            else "inconclusive"
-        )
+        status = "blocked-safety" if safety_command else "inconclusive"
         _emit(
             {"status": status, "reason": "forwarded-signal"},
             stream=sys.stderr,
         )
         return 128 + int(error.signum)
     except ReviewTimeoutError:
-        status = (
-            "blocked-safety"
-            if args.command_name == "validate-worktree"
-            else "inconclusive"
-        )
+        status = "blocked-safety" if safety_command else "inconclusive"
         _emit(
             {"status": status, "reason": "deadline"},
             stream=sys.stderr,
         )
         return 2
     except ReviewOutputLimitError:
-        status = (
-            "blocked-safety"
-            if args.command_name == "validate-worktree"
-            else "inconclusive"
-        )
+        status = "blocked-safety" if safety_command else "inconclusive"
         _emit(
             {"status": status, "reason": "output-limit"},
             stream=sys.stderr,
         )
         return 2
     except ReviewOutputDrainError:
-        status = (
-            "blocked-safety"
-            if args.command_name == "validate-worktree"
-            else "inconclusive"
-        )
+        status = "blocked-safety" if safety_command else "inconclusive"
         _emit(
             {"status": status, "reason": "output-drain"},
             stream=sys.stderr,
         )
         return 2
     except ReviewProcessLeakError:
-        status = (
-            "blocked-safety"
-            if args.command_name == "validate-worktree"
-            else "inconclusive"
-        )
+        status = "blocked-safety" if safety_command else "inconclusive"
         _emit(
             {"status": status, "reason": "process-leak"},
             stream=sys.stderr,
         )
         return 2
     except (NamedLaneGuardError, ReviewError, OSError, ValueError) as error:
-        status = (
-            "blocked-safety"
-            if args.command_name == "validate-worktree"
-            else "inconclusive"
-        )
+        status = "blocked-safety" if safety_command else "inconclusive"
         _emit(
             {"status": status, "reason": str(error)},
             stream=sys.stderr,

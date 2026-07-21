@@ -573,8 +573,8 @@ class RepositoryContractTest(unittest.TestCase):
         for anchor in (
             "required local Codex reviewer lane",
             "sole lane that satisfies a named single review",
-            "separate clean Git worktree",
-            "Keep the workspace read-only",
+            "separate clean Git workspace supplied by the orchestrator",
+            "Keep it read-only",
             "exact prompt-provided authoritative review skill",
             "independently trusted control-plane bundle",
             "absolute path, version, and SHA-256 digest",
@@ -1172,7 +1172,7 @@ class RepositoryContractTest(unittest.TestCase):
             "Triple / triple review | Double plus exact `@codex review` on an exact-host `github.com` PR",
             "Each logical lane receives its own workspace",
             "intentional review-anchor commit",
-            "separate clean Git worktree at `head_sha` for each lane",
+            "Materialize a separate lane-private Git workspace at `head_sha`",
             "Enforce read-only reviewer behavior",
             '`fork_turns="none"`',
             "review-control metadata",
@@ -1183,13 +1183,13 @@ class RepositoryContractTest(unittest.TestCase):
             "Codex must load exactly the parent-named authoritative source",
             "Do not prepare, paste, attach, or point either reviewer to a full diff",
             "existing frozen-diff Codex helper is not this lane and does not satisfy single review",
-            "actual Claude Code process in a second clean Git worktree",
+            "actual Claude Code process in a second independently materialized clean Git workspace",
             "A Copilot, Cursor, OpenCode, or other model-family result does not satisfy the Claude Code lane",
         ):
             self.assertIn(anchor, skill)
 
         for anchor in (
-            "lane-unique clean Git worktree at `head_sha`",
+            "pre-status isolated clone",
             "Never derive a formal named-lane range from a dirty working tree",
             "Expose the workspace and Git metadata for read-only reviewer behavior",
             "free of generated prompts, diff files, manifests, state directories, and helper control artifacts",
@@ -1294,7 +1294,7 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn(anchor, skill)
         for anchor in (
             "It never adds a hidden local Codex review",
-            "Each lane gets its own clean Git worktree, clear reviewer context, and read-only access",
+            "Each reviewer gets that lane-unique read-only worktree and clear control metadata",
             "never prepare or inject a full diff",
             "Persist `requested: triple`, `effective: double`, and a concrete reason",
             "exact `@codex review` comment",
@@ -1480,6 +1480,102 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn(
             "full-current-SHA binding that disambiguates the head epoch",
             readiness,
+        )
+
+    def test_named_lanes_materialize_before_the_first_status_query(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        claude = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
+            encoding="utf-8"
+        )
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+        reviewer = (REPO_ROOT / "agents/reviewer.toml").read_text(encoding="utf-8")
+        repository_policy = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        delivery = (REPO_ROOT / "skills/change-delivery-workflow/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+
+        for name, content in {
+            "skill": skill,
+            "lane contracts": contracts,
+            "Claude lane": claude,
+            "prompt templates": templates,
+            "PR readiness": readiness,
+            "reviewer profile": reviewer,
+            "repository policy": repository_policy,
+            "README": readme,
+            "delivery entrypoint": delivery,
+        }.items():
+            with self.subTest(document=name):
+                self.assertIn("materialize-worktree", content)
+                self.assertIn("validate-worktree", content)
+
+        shared = contracts[
+            contracts.index("## Shared Frozen-Range Contract") : contracts.index(
+                "## Separate PR/Master Secret Admission"
+            )
+        ]
+        ordered_anchors = (
+            "pre-status isolated clone",
+            "Before checkout",
+            "Materialize `head_sha` only after that audit",
+            "As the first worktree-status operation",
+            "Codex spawn or Claude process launch",
+        )
+        positions = tuple(shared.index(anchor) for anchor in ordered_anchors)
+        self.assertEqual(positions, tuple(sorted(positions)))
+
+        for anchor in (
+            "version 2.45.0 or newer",
+            "`/usr/bin/env -i`",
+            "`GIT_CONFIG_NOSYSTEM=1`",
+            "`GIT_CONFIG_GLOBAL=/dev/null`",
+            "`GIT_CONFIG_SYSTEM=/dev/null`",
+            "`GIT_ATTR_NOSYSTEM=1`",
+            "`GIT_CEILING_DIRECTORIES=<source-parent>`",
+            "`GIT_CEILING_DIRECTORIES=<destination-parent>`",
+            "`GIT_NO_LAZY_FETCH=1`",
+            "`GIT_NO_REPLACE_OBJECTS=1`",
+            "`GIT_TERMINAL_PROMPT=0`",
+            "-c core.hooksPath=<empty-private-hooks>",
+            "-c core.commitGraph=false",
+            "-c core.multiPackIndex=false",
+            "-c core.fsmonitor=false",
+            "-c core.attributesFile=/dev/null",
+            "-c submodule.recurse=false",
+            "--no-checkout --no-hardlinks",
+            "--reject-shallow",
+            "--no-recurse-submodules",
+            "promisor dependency",
+            "sibling `.bundle` / `.git` suffix discovery",
+            "exact `.git` marker",
+            "bounded full object-validity `git fsck`",
+            "alternate-dependent",
+            "`commondir`, `config.worktree`, or per-worktree config",
+            "`.git/objects/info/alternates`",
+            "executable clean/smudge/process filter",
+            "The guard's forced ordinary/staged status is the first status query",
+            "recorded device, inode, and owner",
+        ):
+            self.assertIn(anchor, shared)
+
+        self.assertIn("never use `git worktree add`", shared)
+        self.assertIn("`git clone -c`", shared)
+        self.assertIn("cleanup failure must report the exact retained path", skill)
+        self.assertIn("complete flushed success receipt", skill)
+        self.assertNotIn("parent-validated native Git", shared)
+        self.assertIn("prior-policy bootstrap", templates)
+        self.assertNotIn(
+            "Before launch, require `git status --porcelain`",
+            contracts,
         )
 
     def test_review_scope_and_github_provider_identity_are_fail_closed(
@@ -2067,8 +2163,8 @@ class RepositoryContractTest(unittest.TestCase):
             '"disableBundledSkills": true',
             "`--safe-mode` alone is not evidence that bundled skills are absent",
             '"denyWrite": ["/"]',
-            "lane-private local clone or private bare object store plus worktree",
-            "not a network clone or prepared-diff materialization",
+            "owner-private, lane-local, no-checkout local clone",
+            "no remote transport",
             "GIT_NO_LAZY_FETCH=1",
             "locally complete",
             "never run `fetch`, `pull`",
@@ -2731,7 +2827,7 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("GIT_NO_LAZY_FETCH=1", content)
             self.assertIn("GIT_TERMINAL_PROMPT=0", content)
             self.assertIn("locally complete", content)
-        self.assertIn("without rendering or persisting a full diff", contracts)
+        self.assertIn("non-rendering plumbing", contracts)
         self.assertIn("never let the reviewer trigger an on-demand fetch", skill)
         self.assertIn("forbid `fetch`, `pull`", templates)
         self.assertNotIn("prepared full diff", contracts)
@@ -3119,7 +3215,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn(
             "never accepts included values as safety configuration", contracts
         )
-        self.assertIn("not a no-read guarantee", contracts)
+        self.assertIn("provide no no-read guarantee", contracts)
         self.assertIn("every raw gitlink", contracts)
         self.assertIn("global pathspecs apply", contracts)
         for retired_included_config_contract in (
@@ -3175,6 +3271,7 @@ class RepositoryContractTest(unittest.TestCase):
             "fixed `LANG`/`LC_ALL`",
             "`GIT_ASKPASS=/usr/bin/false`",
             "`GIT_ATTR_NOSYSTEM=1`",
+            "`GIT_CEILING_DIRECTORIES=<absolute-clean-worktree-parent>`",
             "`GIT_CONFIG_GLOBAL=/dev/null`",
             "`GIT_CONFIG_SYSTEM=/dev/null`",
             "`GIT_CONFIG_NOSYSTEM=1`",
@@ -3185,6 +3282,8 @@ class RepositoryContractTest(unittest.TestCase):
             "`PAGER=cat`",
             "`GIT_PAGER=cat`",
             "`--no-pager",
+            "core.commitGraph=false",
+            "core.multiPackIndex=false",
             "core.fsmonitor=false",
             "core.fileMode=true",
             "core.hooksPath=/dev/null",
@@ -3227,6 +3326,8 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("explicit per-name false", contracts.lower())
         self.assertIn("global pathspecs apply to every raw gitlink", contracts)
         self.assertIn("forces `core.fileMode=true`", contracts)
+        self.assertIn("forces `core.commitGraph=false`", contracts)
+        self.assertIn("`core.multiPackIndex=false`", contracts)
         self.assertIn("`diff.external`", contracts)
         self.assertIn("`diff.<driver>.command`", contracts)
         self.assertIn("`diff.<driver>.textconv`", contracts)
@@ -3244,6 +3345,8 @@ class RepositoryContractTest(unittest.TestCase):
             "_effective_submodule_active_pathspecs",
             "_match_submodule_active_pathspecs",
             '"core.fileMode=true"',
+            '"core.commitGraph=false"',
+            '"core.multiPackIndex=false"',
             "_validate_executable_git_config",
             "_validate_materialized_gitlink",
             "_status_has_disallowed_changes",
@@ -3263,7 +3366,8 @@ class RepositoryContractTest(unittest.TestCase):
         runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(encoding="utf-8")
 
         self.assertIn(
-            "compares only properties relevant to clean state and safety", skill
+            "compare only properties relevant to object completeness, checkout safety, clean state, or reviewer safety",
+            skill,
         )
         self.assertIn("Keep the guard property-scoped", contracts)
         self.assertIn("must not treat `mtime`, `ctime`", contracts)
@@ -3374,7 +3478,10 @@ class RepositoryContractTest(unittest.TestCase):
 
         self.assertIn("CLAUDE_ENV_PASSTHROUGH_KEYS", runtime)
         self.assertIn("pwd.getpwuid(os.getuid())", runtime)
-        self.assertIn("env=_claude_environment(inherit_node_extra_ca_certs)", runtime)
+        self.assertIn(
+            "env=_claude_environment(root, inherit_node_extra_ca_certs)",
+            runtime,
+        )
         self.assertNotIn("env=dict(os.environ)", runtime)
         for key in (
             "LANG",
@@ -3424,10 +3531,14 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("blocked-safety", content)
             self.assertIn("run-claude", content)
             self.assertIn("inconclusive", content)
-        self.assertIn("Every bounded Git/preflight error", skill)
+        self.assertIn(
+            "Every bounded Git/materialization/preflight/cleanup error", skill
+        )
         self.assertIn("Every bounded Git, output-limit, deadline", contracts)
         self.assertIn("Every `run-claude` supervision failure", contracts)
-        self.assertIn("Every bounded preflight failure", canonical)
+        self.assertIn(
+            "Every bounded materialization, validation, or cleanup failure", canonical
+        )
         self.assertIn("Every `run-claude` supervision failure", canonical)
         self.assertIn('args.command_name == "validate-worktree"', runtime)
         self.assertIn('"blocked-safety"', runtime)

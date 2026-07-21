@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import importlib.machinery
 import importlib.util
@@ -8,6 +9,7 @@ import json
 import os
 import pathlib
 import py_compile
+import re
 import shutil
 import signal
 import stat
@@ -33,12 +35,16 @@ from review_runtime.common import (  # noqa: E402
     TRUSTED_PATH,
 )
 from review_runtime.named_lane import (  # noqa: E402
+    MATERIALIZER_BASE_REF,
+    MATERIALIZER_HEAD_REF,
     SYMLINK_COUNT_LIMIT,
     NamedLaneGuardError,
     _read_symlink_blobs,
+    _validate_materializer_git_version,
     _validate_materialized_gitlink,
     _validate_materialized_symlink,
     main as named_lane_main,
+    materialize_worktree,
     run_claude,
     validate_worktree,
 )
@@ -708,8 +714,9 @@ class NamedLaneGuardTest(unittest.TestCase):
             ),
             (
                 "validate-claude-stream",
-                lambda scripts: scripts.parent
-                / "references/claude-2.1.212-stream-schema.json",
+                lambda scripts: (
+                    scripts.parent / "references/claude-2.1.212-stream-schema.json"
+                ),
             ),
         )
         for subcommand, companion_path in cases:
@@ -1185,6 +1192,1647 @@ class NamedLaneGuardTest(unittest.TestCase):
         git(self.repo, "submodule", "deinit", "-f", "--", path)
         return git(self.repo, "rev-parse", "HEAD")
 
+    def test_materializer_checks_out_exact_head_without_running_status(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit("head")
+        destination = self.root / "lane"
+        original_capture = named_lane_runtime.run_bounded_capture
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "run_bounded_capture",
+            wraps=original_capture,
+        ) as capture:
+            result = materialize_worktree(
+                self.repo.resolve(),
+                destination,
+                base,
+                head,
+            )
+
+        self.assertEqual(result.root, destination)
+        self.assertEqual(result.base_sha, base)
+        self.assertEqual(result.head_sha, head)
+        self.assertEqual(git(destination, "rev-parse", "HEAD"), head)
+        self.assertEqual(
+            git(destination, "rev-parse", MATERIALIZER_BASE_REF),
+            base,
+        )
+        self.assertEqual(
+            git(destination, "rev-parse", MATERIALIZER_HEAD_REF),
+            head,
+        )
+        self.assertNotIn(
+            "remote.origin.url",
+            git(destination, "config", "--local", "--name-only", "--list"),
+        )
+        local_config_keys = git(
+            destination,
+            "config",
+            "--local",
+            "--name-only",
+            "--list",
+        ).splitlines()
+        self.assertFalse(
+            any(key.casefold().startswith("remote.") for key in local_config_keys)
+        )
+        self.assertFalse(
+            any(
+                key.casefold() == "extensions.partialclone" for key in local_config_keys
+            )
+        )
+        self.assertEqual(
+            git(
+                destination,
+                "config",
+                "--local",
+                "--type=bool",
+                "--get",
+                "core.commitGraph",
+            ),
+            "false",
+        )
+        self.assertEqual(
+            git(
+                destination,
+                "config",
+                "--local",
+                "--type=bool",
+                "--get",
+                "core.multiPackIndex",
+            ),
+            "false",
+        )
+        tracked_blob = git(self.repo, "rev-parse", f"{head}:tracked.txt")
+        source_object = (
+            self.repo / ".git" / "objects" / tracked_blob[:2] / tracked_blob[2:]
+        )
+        materialized_object = (
+            destination / ".git" / "objects" / tracked_blob[:2] / tracked_blob[2:]
+        )
+        self.assertTrue(source_object.is_file())
+        self.assertTrue(materialized_object.is_file())
+        self.assertNotEqual(
+            (source_object.stat().st_dev, source_object.stat().st_ino),
+            (materialized_object.stat().st_dev, materialized_object.stat().st_ino),
+        )
+        validated = validate_worktree(destination, head)
+        self.assertEqual(validated.head_sha, head)
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(
+            list(self.root.glob(".named-lane-materializer-*")),
+            [],
+        )
+
+        commands = [tuple(call.args[0]) for call in capture.call_args_list]
+        for command in commands:
+            self.assertTrue({"status", "diff-files", "diff-index"}.isdisjoint(command))
+            if command[-1:] != ("--version",):
+                commit_graph_index = command.index("core.commitGraph=false")
+                self.assertEqual(command[commit_graph_index - 1], "-c")
+                multi_pack_index = command.index("core.multiPackIndex=false")
+                self.assertEqual(command[multi_pack_index - 1], "-c")
+        clone = next(command for command in commands if "clone" in command)
+        clone_index = clone.index("clone")
+        self.assertLess(
+            max(index for index, item in enumerate(clone) if item == "-c"), clone_index
+        )
+        self.assertIn("--local", clone)
+        self.assertIn("--no-checkout", clone)
+        self.assertIn("--no-hardlinks", clone)
+        self.assertIn("--reject-shallow", clone)
+        self.assertIn("--no-recurse-submodules", clone)
+        self.assertTrue(any(item.startswith("--template=") for item in clone))
+
+        clone_call = next(
+            call for call in capture.call_args_list if "clone" in tuple(call.args[0])
+        )
+        clone_environment = clone_call.kwargs["env"]
+        clone_cwd = pathlib.Path(clone_call.kwargs["cwd"])
+        self.assertEqual(clone_cwd.name, "tmp")
+        self.assertTrue(clone_cwd.parent.name.startswith(".named-lane-materializer-"))
+        self.assertEqual(clone_cwd.parent.parent, self.root)
+        for call in capture.call_args_list:
+            self.assertEqual(pathlib.Path(call.kwargs["cwd"]), clone_cwd)
+            command = tuple(call.args[0])
+            expected_ceiling = (
+                self.repo.resolve().parent
+                if "--show-toplevel" in command or "--absolute-git-dir" in command
+                else destination.parent
+            )
+            self.assertEqual(
+                call.kwargs["env"]["GIT_CEILING_DIRECTORIES"],
+                str(expected_ceiling),
+            )
+        self.assertEqual(
+            set(clone_environment),
+            {
+                "GIT_ASKPASS",
+                "GIT_ATTR_NOSYSTEM",
+                "GIT_CEILING_DIRECTORIES",
+                "GIT_CONFIG_GLOBAL",
+                "GIT_CONFIG_NOSYSTEM",
+                "GIT_CONFIG_SYSTEM",
+                "GIT_NO_LAZY_FETCH",
+                "GIT_NO_REPLACE_OBJECTS",
+                "GIT_OPTIONAL_LOCKS",
+                "GIT_PAGER",
+                "GIT_TERMINAL_PROMPT",
+                "HOME",
+                "LANG",
+                "LC_ALL",
+                "PAGER",
+                "PATH",
+                "XDG_CONFIG_HOME",
+            },
+        )
+        self.assertEqual(clone_environment["GIT_ASKPASS"], "/usr/bin/false")
+        self.assertEqual(
+            clone_environment["GIT_CEILING_DIRECTORIES"],
+            str(destination.parent),
+        )
+        self.assertEqual(clone_environment["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(clone_environment["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(clone_environment["GIT_CONFIG_SYSTEM"], os.devnull)
+        self.assertEqual(clone_environment["GIT_ATTR_NOSYSTEM"], "1")
+        self.assertEqual(clone_environment["GIT_NO_LAZY_FETCH"], "1")
+        self.assertEqual(clone_environment["GIT_NO_REPLACE_OBJECTS"], "1")
+        self.assertEqual(clone_environment["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(clone_environment["GIT_OPTIONAL_LOCKS"], "0")
+        self.assertEqual(clone_environment["GIT_PAGER"], "cat")
+        self.assertEqual(clone_environment["PAGER"], "cat")
+        self.assertNotIn("GIT_TEMPLATE_DIR", clone_environment)
+        self.assertNotIn("TMPDIR", clone_environment)
+        self.assertNotEqual(clone_environment["HOME"], str(pathlib.Path.home()))
+        self.assertNotEqual(
+            clone_environment["XDG_CONFIG_HOME"],
+            os.environ.get("XDG_CONFIG_HOME"),
+        )
+
+    def test_materializer_ignores_a_forged_copied_commit_graph(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "head-only.txt").write_text("head only\n", encoding="utf-8")
+        head = self.commit("head")
+        base_tree = bytes.fromhex(git(self.repo, "rev-parse", f"{base}^{{tree}}"))
+        git(self.repo, "commit-graph", "write", "--reachable")
+        graph_path = self.repo / ".git" / "objects" / "info" / "commit-graph"
+        graph = bytearray(graph_path.read_bytes())
+        self.assertEqual(graph[:4], b"CGPH")
+        hash_length = {1: 20, 2: 32}[graph[5]]
+        chunk_count = graph[6]
+        chunks: dict[bytes, int] = {}
+        for index in range(chunk_count + 1):
+            entry = 8 + index * 12
+            chunk_id = bytes(graph[entry : entry + 4])
+            chunk_offset = int.from_bytes(graph[entry + 4 : entry + 12], "big")
+            if chunk_id != b"\0\0\0\0":
+                chunks[chunk_id] = chunk_offset
+        oid_fanout = chunks[b"OIDF"]
+        oid_lookup = chunks[b"OIDL"]
+        commit_data = chunks[b"CDAT"]
+        commit_count = int.from_bytes(
+            graph[oid_fanout + 255 * 4 : oid_fanout + 256 * 4],
+            "big",
+        )
+        head_bytes = bytes.fromhex(head)
+        position = next(
+            index
+            for index in range(commit_count)
+            if bytes(
+                graph[
+                    oid_lookup + index * hash_length : oid_lookup
+                    + (index + 1) * hash_length
+                ]
+            )
+            == head_bytes
+        )
+        record = commit_data + position * (hash_length + 16)
+        graph[record : record + hash_length] = base_tree
+        digest_name = "sha1" if hash_length == 20 else "sha256"
+        graph[-hash_length:] = hashlib.new(
+            digest_name,
+            graph[:-hash_length],
+        ).digest()
+        graph_path.chmod(0o600)
+        graph_path.write_bytes(graph)
+        verification = subprocess.run(
+            ("git", "-C", str(self.repo), "commit-graph", "verify"),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertNotEqual(verification.returncode, 0)
+
+        destination = self.root / "forged-commit-graph-lane"
+        result = materialize_worktree(
+            self.repo.resolve(),
+            destination,
+            base,
+            head,
+        )
+
+        self.assertEqual(result.head_sha, head)
+        self.assertEqual(
+            (destination / "head-only.txt").read_text(encoding="utf-8"),
+            "head only\n",
+        )
+        self.assertTrue(
+            (destination / ".git" / "objects" / "info" / "commit-graph").is_file()
+        )
+        self.assertEqual(
+            git(
+                destination,
+                "config",
+                "--local",
+                "--type=bool",
+                "--get",
+                "core.commitGraph",
+            ),
+            "false",
+        )
+        self.assertEqual(validate_worktree(destination, head).head_sha, head)
+
+    def test_materializer_removes_pack_bitmap_caches_before_object_traversal(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit("head")
+        git(self.repo, "repack", "-a", "-d", "-b")
+        source_bitmaps = tuple(
+            (self.repo / ".git" / "objects" / "pack").glob("*.bitmap")
+        )
+        self.assertTrue(source_bitmaps)
+        expected_objects = set(
+            git(
+                self.repo,
+                "rev-list",
+                "--objects",
+                base,
+                head,
+                "--",
+            ).splitlines()
+        )
+        destination = self.root / "bitmap-free-lane"
+
+        result = materialize_worktree(
+            self.repo.resolve(),
+            destination,
+            base,
+            head,
+        )
+
+        self.assertEqual(result.head_sha, head)
+        self.assertEqual(
+            tuple((destination / ".git" / "objects" / "pack").glob("*.bitmap")),
+            (),
+        )
+        self.assertEqual(
+            set(
+                git(
+                    destination,
+                    "rev-list",
+                    "--objects",
+                    "--use-bitmap-index",
+                    base,
+                    head,
+                    "--",
+                ).splitlines()
+            ),
+            expected_objects,
+        )
+
+    def test_materializer_rejects_bundle_and_bare_suffix_dwim_sources(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit("head")
+
+        bundle_source = self.root / "not-a-bundle-repository"
+        bundle_source.mkdir()
+        git(
+            self.repo,
+            "bundle",
+            "create",
+            str(self.root / f"{bundle_source.name}.bundle"),
+            "--all",
+        )
+        bare_source = self.root / "not-a-bare-repository"
+        bare_source.mkdir()
+        subprocess.run(
+            (
+                "git",
+                "clone",
+                "--bare",
+                str(self.repo),
+                str(self.root / f"{bare_source.name}.git"),
+            ),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        for label, source in (
+            ("bundle", bundle_source),
+            ("bare", bare_source),
+        ):
+            with self.subTest(label=label):
+                destination = self.root / f"{label}-dwim-lane"
+                with self.assertRaisesRegex(
+                    NamedLaneGuardError,
+                    "source must name an exact Git worktree root",
+                ):
+                    materialize_worktree(
+                        source.resolve(),
+                        destination,
+                        base,
+                        head,
+                    )
+                self.assertFalse(destination.exists())
+
+        ancestor = self.root / "ancestor-repository"
+        ancestor.mkdir()
+        subprocess.run(
+            ("git", "init", "-b", "master", str(ancestor)),
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        redirected_source = ancestor / "redirected-worktree"
+        redirected_source.mkdir()
+        (redirected_source / ".git").mkdir()
+        git(ancestor, "config", "core.worktree", str(redirected_source))
+        git(
+            self.repo,
+            "bundle",
+            "create",
+            str(ancestor / f"{redirected_source.name}.bundle"),
+            "--all",
+        )
+        redirected_destination = self.root / "redirected-dwim-lane"
+
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "source must name an exact Git worktree root",
+        ):
+            materialize_worktree(
+                redirected_source.resolve(),
+                redirected_destination,
+                base,
+                head,
+            )
+
+        self.assertFalse(redirected_destination.exists())
+
+    def test_materializer_fsck_rejects_a_forged_pack_index(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "head-only.txt").write_text("head only\n", encoding="utf-8")
+        head = self.commit("head")
+        base_tree = bytes.fromhex(git(self.repo, "rev-parse", f"{base}^{{tree}}"))
+        head_tree = bytes.fromhex(git(self.repo, "rev-parse", f"{head}^{{tree}}"))
+        git(self.repo, "repack", "-ad")
+        indexes = list((self.repo / ".git" / "objects" / "pack").glob("*.idx"))
+        self.assertEqual(len(indexes), 1)
+        index_path = indexes[0]
+        payload = bytearray(index_path.read_bytes())
+        self.assertEqual(payload[:4], b"\xfftOc")
+        self.assertEqual(int.from_bytes(payload[4:8], "big"), 2)
+        object_count = int.from_bytes(payload[8 + 255 * 4 : 8 + 256 * 4], "big")
+        oid_table = 8 + 256 * 4
+        crc_table = oid_table + object_count * 20
+        offset_table = crc_table + object_count * 4
+
+        def object_position(object_id: bytes) -> int:
+            return next(
+                position
+                for position in range(object_count)
+                if bytes(
+                    payload[oid_table + position * 20 : oid_table + (position + 1) * 20]
+                )
+                == object_id
+            )
+
+        base_position = object_position(base_tree)
+        head_position = object_position(head_tree)
+        for table in (crc_table, offset_table):
+            base_entry = slice(
+                table + base_position * 4, table + (base_position + 1) * 4
+            )
+            head_entry = slice(
+                table + head_position * 4, table + (head_position + 1) * 4
+            )
+            base_value = bytes(payload[base_entry])
+            payload[base_entry] = payload[head_entry]
+            payload[head_entry] = base_value
+        payload[-20:] = hashlib.sha1(payload[:-20]).digest()
+        index_path.chmod(0o600)
+        index_path.write_bytes(payload)
+        verification = subprocess.run(
+            ("git", "verify-pack", str(index_path)),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertNotEqual(verification.returncode, 0)
+
+        destination = self.root / "forged-pack-index-lane"
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "bounded materializer Git fsck failed",
+        ):
+            materialize_worktree(
+                self.repo.resolve(),
+                destination,
+                base,
+                head,
+            )
+
+        self.assertFalse(destination.exists())
+
+    def test_materializer_cwd_is_fenced_from_an_ancestor_repository(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit("head")
+        parent = self.repo / "private-lanes"
+        parent.mkdir(mode=0o700)
+        destination = parent / "lane"
+        original_capture = named_lane_runtime.run_bounded_capture
+        observed_fenced_cwd = False
+
+        def probe_clone_cwd(argv: object, **kwargs: object) -> object:
+            nonlocal observed_fenced_cwd
+            command = tuple(argv)
+            if not observed_fenced_cwd and "clone" in command:
+                probe = original_capture(
+                    (
+                        str(named_lane_runtime.resolve_git()),
+                        "rev-parse",
+                        "--show-toplevel",
+                    ),
+                    cwd=kwargs["cwd"],
+                    env=kwargs["env"],
+                    timeout_seconds=30.0,
+                    stdout_limit_bytes=4096,
+                    stderr_limit_bytes=4096,
+                )
+                try:
+                    self.assertNotEqual(probe.returncode, 0)
+                    self.assertEqual(bytes(probe.stdout), b"")
+                finally:
+                    probe.stdout[:] = b"\x00" * len(probe.stdout)
+                    probe.stderr[:] = b"\x00" * len(probe.stderr)
+                observed_fenced_cwd = True
+            return original_capture(command, **kwargs)
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "run_bounded_capture",
+            side_effect=probe_clone_cwd,
+        ):
+            materialize_worktree(
+                self.repo.resolve(),
+                destination,
+                base,
+                head,
+            )
+
+        self.assertTrue(observed_fenced_cwd)
+        self.assertEqual(validate_worktree(destination, head).head_sha, head)
+
+    def test_materializer_rejects_a_parent_that_cannot_encode_the_ceiling(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        head = self.commit("base")
+        parent = self.root / f"ceiling{os.pathsep}parent"
+        parent.mkdir(mode=0o700)
+
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "cannot be encoded as a Git discovery ceiling",
+        ):
+            materialize_worktree(
+                self.repo.resolve(),
+                parent / "lane",
+                head,
+                head,
+            )
+
+        self.assertEqual(list(parent.iterdir()), [])
+
+    def test_materializer_does_not_fall_back_to_an_ancestor_repository(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        tracked = self.repo / "tracked.txt"
+        tracked.write_text("head\n", encoding="utf-8")
+        head = self.commit("head")
+        parent = self.repo / "private-fallback-lanes"
+        parent.mkdir(mode=0o700)
+        destination = parent / "lane"
+        original_capture = named_lane_runtime.run_bounded_capture
+        removed_target_head = False
+
+        def remove_target_head(argv: object, **kwargs: object) -> object:
+            nonlocal removed_target_head
+            command = tuple(argv)
+            result = original_capture(command, **kwargs)
+            if not removed_target_head and "clone" in command:
+                (destination / ".git" / "HEAD").unlink()
+                removed_target_head = True
+            return result
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "run_bounded_capture",
+            side_effect=remove_target_head,
+        ):
+            with self.assertRaisesRegex(
+                NamedLaneGuardError,
+                r"bounded materializer Git (?:fsck|rev-parse) failed",
+            ):
+                materialize_worktree(
+                    self.repo.resolve(),
+                    destination,
+                    base,
+                    head,
+                )
+
+        self.assertTrue(removed_target_head)
+        self.assertFalse(destination.exists())
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), head)
+        self.assertEqual(tracked.read_text(encoding="utf-8"), "head\n")
+        reference = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(self.repo),
+                "show-ref",
+                "--verify",
+                "--quiet",
+                MATERIALIZER_HEAD_REF,
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertNotEqual(reference.returncode, 0)
+
+    def test_materializer_then_validator_runs_the_first_native_status(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit("head")
+        destination = self.root / "native-trace-lane"
+        trace = self.root / "native-git-trace.jsonl"
+        real_git = named_lane_runtime.resolve_git()
+        traced_git = self.make_executable(
+            "import json\n"
+            "import os\n"
+            "import sys\n"
+            f"trace = {str(trace)!r}\n"
+            "with open(trace, 'a', encoding='utf-8') as handle:\n"
+            "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            f"os.execv({str(real_git)!r}, [{str(real_git)!r}, *sys.argv[1:]])\n"
+        )
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "resolve_git",
+            return_value=traced_git,
+        ):
+            materialize_worktree(
+                self.repo.resolve(),
+                destination,
+                base,
+                head,
+            )
+            materializer_commands = tuple(
+                json.loads(line)
+                for line in trace.read_text(encoding="utf-8").splitlines()
+            )
+            validate_worktree(destination, head)
+            all_commands = tuple(
+                json.loads(line)
+                for line in trace.read_text(encoding="utf-8").splitlines()
+            )
+
+        status_commands = {"status", "diff-files", "diff-index"}
+        self.assertFalse(
+            any(
+                status_commands.intersection(command)
+                for command in materializer_commands
+            )
+        )
+        validator_commands = all_commands[len(materializer_commands) :]
+        for command in validator_commands:
+            commit_graph_index = command.index("core.commitGraph=false")
+            self.assertEqual(command[commit_graph_index - 1], "-c")
+            multi_pack_index = command.index("core.multiPackIndex=false")
+            self.assertEqual(command[multi_pack_index - 1], "-c")
+        first_status_index = next(
+            index
+            for index, command in enumerate(validator_commands)
+            if status_commands.intersection(command)
+        )
+        self.assertIn("status", validator_commands[first_status_index])
+
+    def test_validator_fences_a_nonrepository_from_its_ancestor(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        head = self.commit("ancestor")
+        nested = self.repo / "not-a-worktree"
+        nested.mkdir(mode=0o700)
+        original_capture = named_lane_runtime.run_bounded_capture
+        observed_returncode: int | None = None
+        observed_environment: dict[str, str] | None = None
+
+        def observe_probe(argv: object, **kwargs: object) -> object:
+            nonlocal observed_returncode, observed_environment
+            command = tuple(argv)
+            result = original_capture(command, **kwargs)
+            if "--show-toplevel" in command:
+                observed_returncode = result.returncode
+                observed_environment = dict(kwargs["env"])
+            return result
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "run_bounded_capture",
+            side_effect=observe_probe,
+        ):
+            with self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "bounded local Git preflight failed",
+            ):
+                validate_worktree(nested.resolve(), head)
+
+        self.assertIsNotNone(observed_returncode)
+        self.assertNotEqual(observed_returncode, 0)
+        assert observed_environment is not None
+        self.assertEqual(
+            observed_environment["GIT_CEILING_DIRECTORIES"],
+            str(nested.resolve().parent),
+        )
+
+    def test_materializer_requires_git_245_or_newer(self) -> None:
+        environment = named_lane_runtime._git_environment()
+        for version, expected_error in (
+            ("2.35.1", "requires Git 2.45.0 or newer"),
+            ("2.44.9", "requires Git 2.45.0 or newer"),
+            ("2.45.0.rc1", "version could not be validated"),
+            ("2.45.0", None),
+            ("2.53.0 (Apple Git-154.1)", None),
+        ):
+            with self.subTest(version=version):
+                candidate = self.make_executable(f"print('git version {version}')\n")
+                if expected_error is None:
+                    _validate_materializer_git_version(
+                        candidate,
+                        environment,
+                        self.root,
+                    )
+                else:
+                    with self.assertRaisesRegex(
+                        NamedLaneGuardError,
+                        expected_error,
+                    ):
+                        _validate_materializer_git_version(
+                            candidate,
+                            environment,
+                            self.root,
+                        )
+
+    def test_materializer_neutralizes_ambient_and_source_execution_surfaces(
+        self,
+    ) -> None:
+        marker = self.root / "unexpected-execution.marker"
+        probe = self.make_executable(
+            f"import pathlib\npathlib.Path({str(marker)!r}).write_text('ran')\n"
+        )
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / ".gitattributes").write_text(
+            "tracked.txt filter=unsafe\n",
+            encoding="utf-8",
+        )
+        (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit("head")
+        source_hooks = self.repo / ".git" / "hooks"
+        shutil.copy2(probe, source_hooks / "post-checkout")
+        shutil.copy2(probe, source_hooks / "reference-transaction")
+        git(self.repo, "config", "core.hooksPath", str(source_hooks))
+        git(self.repo, "config", "core.fsmonitor", str(probe))
+        git(self.repo, "config", "filter.unsafe.smudge", str(probe))
+        git(self.repo, "config", "filter.unsafe.process", str(probe))
+
+        ambient_home = self.root / "ambient-home"
+        ambient_home.mkdir()
+        ambient_template = self.root / "ambient-template"
+        (ambient_template / "hooks").mkdir(parents=True)
+        shutil.copy2(probe, ambient_template / "hooks" / "post-checkout")
+        shutil.copy2(
+            probe,
+            ambient_template / "hooks" / "reference-transaction",
+        )
+        ambient_global = self.root / "ambient-global.config"
+        ambient_global.write_text(
+            "[core]\n"
+            f"\thooksPath = {ambient_template / 'hooks'}\n"
+            f"\tfsmonitor = {probe}\n"
+            '[filter "unsafe"]\n'
+            f"\tprocess = {probe}\n"
+            "[init]\n"
+            f"\ttemplateDir = {ambient_template}\n"
+            "[submodule]\n"
+            "\trecurse = true\n",
+            encoding="utf-8",
+        )
+        ambient_system = self.root / "ambient-system.config"
+        ambient_system.write_text(
+            f'[filter "unsafe"]\n\tsmudge = {probe}\n',
+            encoding="utf-8",
+        )
+        destination = self.root / "ambient-safe-lane"
+        previous_cwd = pathlib.Path.cwd()
+        try:
+            os.chdir(self.repo)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "HOME": str(ambient_home),
+                    "XDG_CONFIG_HOME": str(ambient_home / "xdg"),
+                    "GIT_CONFIG_GLOBAL": str(ambient_global),
+                    "GIT_CONFIG_NOSYSTEM": "0",
+                    "GIT_CONFIG_SYSTEM": str(ambient_system),
+                },
+            ):
+                result = materialize_worktree(
+                    self.repo.resolve(),
+                    destination,
+                    base,
+                    head,
+                )
+        finally:
+            os.chdir(previous_cwd)
+
+        self.assertEqual(result.head_sha, head)
+        self.assertFalse(marker.exists())
+        self.assertEqual(validate_worktree(destination, head).head_sha, head)
+
+    def test_materializer_private_hooks_override_injected_target_hook(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit("head")
+        destination = self.root / "target-hook-lane"
+        marker = self.root / "target-hook.marker"
+        probe = self.make_executable(
+            f"import pathlib\npathlib.Path({str(marker)!r}).write_text('ran')\n"
+        )
+        original_capture = named_lane_runtime.run_bounded_capture
+        injected = False
+
+        def inject_hook(argv: object, **kwargs: object) -> object:
+            nonlocal injected
+            result = original_capture(argv, **kwargs)
+            if not injected and "clone" in tuple(argv):
+                target_hooks = destination / ".git" / "hooks"
+                target_hooks.mkdir(exist_ok=True)
+                shutil.copy2(probe, target_hooks / "post-checkout")
+                shutil.copy2(probe, target_hooks / "reference-transaction")
+                injected = True
+            return result
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "run_bounded_capture",
+            side_effect=inject_hook,
+        ):
+            result = materialize_worktree(
+                self.repo.resolve(),
+                destination,
+                base,
+                head,
+            )
+
+        self.assertTrue(injected)
+        self.assertEqual(result.head_sha, head)
+        self.assertFalse(marker.exists())
+        self.assertEqual(validate_worktree(destination, head).head_sha, head)
+
+    def test_materializer_accepts_a_linked_source_worktree(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit("head")
+        linked_source = self.root / "linked-source"
+        git(
+            self.repo,
+            "worktree",
+            "add",
+            "--detach",
+            str(linked_source),
+            head,
+        )
+        destination = self.root / "linked-source-lane"
+
+        result = materialize_worktree(
+            linked_source.resolve(),
+            destination,
+            base,
+            head,
+        )
+
+        self.assertEqual(result.head_sha, head)
+        self.assertEqual(validate_worktree(destination, head).head_sha, head)
+        self.assertFalse(
+            (destination / ".git" / "objects" / "info" / "alternates").exists()
+        )
+
+    def test_materializer_rejects_unsafe_target_config_before_checkout(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit("head")
+        marker = self.root / "unsafe-target.marker"
+        probe = self.make_executable(
+            f"import pathlib\npathlib.Path({str(marker)!r}).write_text('ran')\n"
+        )
+        included = self.root / "unsafe-included.config"
+        included.write_text(
+            f'[filter "unsafe"]\n\tprocess = {probe}\n',
+            encoding="utf-8",
+        )
+        cases = (
+            ("include", "include.path", str(included), "include directives"),
+            (
+                "include-if",
+                "includeIf.gitdir:/never/.path",
+                str(included),
+                "include directives",
+            ),
+            ("alias", "alias.review", f"!{probe}", "aliases"),
+            ("credential", "credential.helper", str(probe), "credential helpers"),
+            ("fsck", "fsck.skipList", os.devnull, "fsck policy"),
+            ("fsmonitor", "core.fsmonitor", str(probe), "fsmonitor"),
+            ("fsmonitor-no-value", "core.fsmonitor", None, "fsmonitor"),
+            (
+                "hooks",
+                "core.hooksPath",
+                str(self.root / "unsafe-hooks"),
+                "hooksPath",
+            ),
+            ("clean", "filter.unsafe.clean", str(probe), "filter or diff"),
+            ("smudge", "filter.unsafe.smudge", str(probe), "filter or diff"),
+            ("process", "filter.unsafe.process", str(probe), "filter or diff"),
+            ("diff-external", "diff.external", str(probe), "filter or diff"),
+            ("diff-command", "diff.unsafe.command", str(probe), "filter or diff"),
+            ("diff", "diff.unsafe.textconv", str(probe), "filter or diff"),
+            (
+                "extension",
+                "extensions.worktreeConfig",
+                "true",
+                "repository extension",
+            ),
+            ("sparse", "core.sparseCheckout", "true", "sparse checkout"),
+            ("submodule", "submodule.recurse", "true", "recursion"),
+            ("submodule-no-value", "submodule.recurse", None, "recursion"),
+            (
+                "remote-command",
+                "remote.origin.uploadpack",
+                str(probe),
+                "remote configuration",
+            ),
+        )
+        original_capture = named_lane_runtime.run_bounded_capture
+
+        for label, key, value, expected in cases:
+            with self.subTest(label=label):
+                destination = self.root / f"unsafe-{label}-lane"
+                commands: list[tuple[str, ...]] = []
+                injected = False
+
+                def inject_config(argv: object, **kwargs: object) -> object:
+                    nonlocal injected
+                    command = tuple(argv)
+                    commands.append(command)
+                    result = original_capture(command, **kwargs)
+                    if not injected and "clone" in command:
+                        if value is None:
+                            section, name = key.split(".", 1)
+                            with (destination / ".git" / "config").open(
+                                "a",
+                                encoding="utf-8",
+                            ) as handle:
+                                handle.write(f"[{section}]\n\t{name}\n")
+                        else:
+                            git(destination, "config", "--local", key, value)
+                        injected = True
+                    return result
+
+                with mock.patch.object(
+                    named_lane_runtime,
+                    "run_bounded_capture",
+                    side_effect=inject_config,
+                ):
+                    with self.assertRaisesRegex(NamedLaneGuardError, expected):
+                        materialize_worktree(
+                            self.repo.resolve(),
+                            destination,
+                            base,
+                            head,
+                        )
+
+                self.assertTrue(injected)
+                self.assertFalse(destination.exists())
+                self.assertFalse(marker.exists())
+                self.assertFalse(any("checkout" in command for command in commands))
+
+    def test_materializer_rejects_alternates_shallow_and_promisor_state(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit("head")
+        tracked_blob = git(self.repo, "rev-parse", f"{head}:tracked.txt")
+        original_capture = named_lane_runtime.run_bounded_capture
+        cases = (
+            ("commondir", "commondir state"),
+            ("alternates-empty", "alternates must be absent"),
+            ("alternates-nonempty", "alternates must be absent"),
+            ("http-alternates-empty", "HTTP alternates must be absent"),
+            ("shallow", "shallow repository state"),
+            ("promisor", "promisor state"),
+            ("promisor-mixed-case", "promisor state"),
+            ("missing-object", "materializer Git fsck failed"),
+        )
+
+        for label, expected in cases:
+            with self.subTest(label=label):
+                destination = self.root / f"unsafe-{label}-storage"
+                injected = False
+
+                def inject_storage(argv: object, **kwargs: object) -> object:
+                    nonlocal injected
+                    command = tuple(argv)
+                    result = original_capture(command, **kwargs)
+                    if not injected and "clone" in command:
+                        if label == "commondir":
+                            (destination / ".git" / "commondir").write_text(
+                                "../shared\n",
+                                encoding="utf-8",
+                            )
+                        elif label.startswith("alternates-"):
+                            info = destination / ".git" / "objects" / "info"
+                            info.mkdir(exist_ok=True)
+                            content = (
+                                ""
+                                if label == "alternates-empty"
+                                else str(self.repo / ".git" / "objects") + "\n"
+                            )
+                            (info / "alternates").write_text(content, encoding="utf-8")
+                        elif label == "http-alternates-empty":
+                            info = destination / ".git" / "objects" / "info"
+                            info.mkdir(exist_ok=True)
+                            (info / "http-alternates").write_text(
+                                "",
+                                encoding="utf-8",
+                            )
+                        elif label == "shallow":
+                            (destination / ".git" / "shallow").write_text(
+                                head + "\n",
+                                encoding="ascii",
+                            )
+                        elif label in {"promisor", "promisor-mixed-case"}:
+                            pack = destination / ".git" / "objects" / "pack"
+                            pack.mkdir(exist_ok=True)
+                            suffix = (
+                                "injected.promisor"
+                                if label == "promisor"
+                                else "injected.PrOmIsOr"
+                            )
+                            (pack / suffix).write_bytes(b"")
+                        else:
+                            loose_object = (
+                                destination
+                                / ".git"
+                                / "objects"
+                                / tracked_blob[:2]
+                                / tracked_blob[2:]
+                            )
+                            loose_object.unlink()
+                        injected = True
+                    return result
+
+                with mock.patch.object(
+                    named_lane_runtime,
+                    "run_bounded_capture",
+                    side_effect=inject_storage,
+                ):
+                    with self.assertRaisesRegex(NamedLaneGuardError, expected):
+                        materialize_worktree(
+                            self.repo.resolve(),
+                            destination,
+                            base,
+                            head,
+                        )
+
+                self.assertTrue(injected)
+                self.assertFalse(destination.exists())
+
+    def test_materializer_does_not_initialize_submodules(self) -> None:
+        head = self.add_deinitialized_gitlink()
+        base = git(self.repo, "rev-parse", "HEAD^")
+        git(self.repo, "config", "submodule.recurse", "true")
+        destination = self.root / "submodule-lane"
+
+        result = materialize_worktree(
+            self.repo.resolve(),
+            destination,
+            base,
+            head,
+        )
+
+        self.assertEqual(result.head_sha, head)
+        gitlink = destination / "vendor"
+        if gitlink.exists():
+            self.assertTrue(gitlink.is_dir())
+            self.assertEqual(list(gitlink.iterdir()), [])
+        self.assertEqual(validate_worktree(destination, head).head_sha, head)
+
+    def test_materializer_reports_exact_retained_path_when_cleanup_fails(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit("head")
+        destination = self.root / "retained-lane"
+        original_capture = named_lane_runtime.run_bounded_capture
+        original_rmtree = named_lane_runtime.shutil.rmtree
+        injected = False
+
+        def inject_config(argv: object, **kwargs: object) -> object:
+            nonlocal injected
+            command = tuple(argv)
+            result = original_capture(command, **kwargs)
+            if not injected and "clone" in command:
+                git(destination, "config", "core.fsmonitor", "/usr/bin/false")
+                injected = True
+            return result
+
+        def retain_destination(path: object, *args: object, **kwargs: object) -> None:
+            if pathlib.Path(path) == destination:
+                raise OSError("simulated cleanup failure")
+            original_rmtree(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "run_bounded_capture",
+                side_effect=inject_config,
+            ),
+            mock.patch.object(
+                named_lane_runtime.shutil,
+                "rmtree",
+                side_effect=retain_destination,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                NamedLaneGuardError,
+                f"retained materialized worktree: {re.escape(str(destination))}",
+            ):
+                materialize_worktree(
+                    self.repo.resolve(),
+                    destination,
+                    base,
+                    head,
+                )
+
+        self.assertTrue(injected)
+        self.assertTrue(destination.exists())
+
+    def test_materializer_cleanup_preserves_a_replaced_directory(self) -> None:
+        target = self.root / "cleanup-target"
+        target.mkdir(mode=0o700)
+        expected_identity = named_lane_runtime._directory_identity(target.lstat())
+        original = self.root / "original-cleanup-target"
+        target.rename(original)
+        target.mkdir(mode=0o700)
+
+        retained = named_lane_runtime._cleanup_materializer_path(
+            target,
+            self.root,
+            named_lane_runtime._directory_identity(self.root.lstat()),
+            expected_identity,
+        )
+
+        self.assertEqual(retained, target)
+        self.assertTrue(target.is_dir())
+        self.assertTrue(original.is_dir())
+
+    def test_materializer_cli_structures_signal_during_python_cleanup_window(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit("head")
+        destination = self.root / "signal-cleanup-lane"
+        interrupted = False
+
+        def interrupt_storage(
+            _git_directory: pathlib.Path,
+            **_kwargs: object,
+        ) -> None:
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                signal.raise_signal(signal.SIGINT)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_validate_materialized_object_storage",
+                side_effect=interrupt_storage,
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(
+                (
+                    "materialize-worktree",
+                    "--source",
+                    str(self.repo.resolve()),
+                    "--worktree",
+                    str(destination),
+                    "--base",
+                    base,
+                    "--head",
+                    head,
+                )
+            )
+
+        self.assertTrue(interrupted)
+        self.assertEqual(returncode, 128 + signal.SIGINT)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            json.loads(stderr.getvalue()),
+            {"status": "blocked-safety", "reason": "forwarded-signal"},
+        )
+        self.assertFalse(destination.exists())
+        self.assertEqual(list(self.root.glob(".named-lane-materializer-*")), [])
+
+    def test_materializer_cli_preserves_retained_control_path_at_terminal_restore(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit("head")
+        destination = self.root / "control-setup-failure-lane"
+        original_mkdir = pathlib.Path.mkdir
+        original_rmtree = named_lane_runtime.shutil.rmtree
+        original_restore = named_lane_runtime.restore_signal_mask
+        restore_calls = 0
+
+        def fail_control_child(
+            path: pathlib.Path,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            if path.name == "xdg" and path.parent.name.startswith(
+                ".named-lane-materializer-"
+            ):
+                raise OSError("simulated control setup failure")
+            original_mkdir(path, *args, **kwargs)
+
+        def retain_control(path: object, *args: object, **kwargs: object) -> None:
+            if pathlib.Path(path).name.startswith(".named-lane-materializer-"):
+                raise OSError("simulated control cleanup failure")
+            original_rmtree(path, *args, **kwargs)
+
+        def interrupt_terminal_restore(previous: object) -> None:
+            nonlocal restore_calls
+            restore_calls += 1
+            if restore_calls == 2:
+                signal.raise_signal(signal.SIGINT)
+            original_restore(previous)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                pathlib.Path,
+                "mkdir",
+                autospec=True,
+                side_effect=fail_control_child,
+            ),
+            mock.patch.object(
+                named_lane_runtime.shutil,
+                "rmtree",
+                side_effect=retain_control,
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "restore_signal_mask",
+                side_effect=interrupt_terminal_restore,
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(
+                (
+                    "materialize-worktree",
+                    "--source",
+                    str(self.repo.resolve()),
+                    "--worktree",
+                    str(destination),
+                    "--base",
+                    base,
+                    "--head",
+                    head,
+                )
+            )
+
+        retained_controls = list(self.root.glob(".named-lane-materializer-*"))
+        self.assertEqual(len(retained_controls), 1)
+        self.assertGreaterEqual(restore_calls, 5)
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        payload = json.loads(stderr.getvalue())
+        self.assertEqual(payload["status"], "blocked-safety")
+        self.assertIn(
+            f"retained control path: {retained_controls[0]}",
+            payload["reason"],
+        )
+        self.assertNotEqual(payload["reason"], "forwarded-signal")
+        self.assertFalse(destination.exists())
+
+    def test_materializer_cli_defers_signal_during_control_cleanup(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit("head")
+        destination = self.root / "cleanup-signal-lane"
+        original_rmtree = named_lane_runtime.shutil.rmtree
+        interrupted = False
+
+        def interrupt_control_cleanup(
+            path: object,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal interrupted
+            candidate = pathlib.Path(path)
+            if not interrupted and candidate.name.startswith(
+                ".named-lane-materializer-"
+            ):
+                interrupted = True
+                signal.raise_signal(signal.SIGINT)
+            original_rmtree(path, *args, **kwargs)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                named_lane_runtime.shutil,
+                "rmtree",
+                side_effect=interrupt_control_cleanup,
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(
+                (
+                    "materialize-worktree",
+                    "--source",
+                    str(self.repo.resolve()),
+                    "--worktree",
+                    str(destination),
+                    "--base",
+                    base,
+                    "--head",
+                    head,
+                )
+            )
+
+        self.assertTrue(interrupted)
+        self.assertEqual(returncode, 128 + signal.SIGINT)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            json.loads(stderr.getvalue()),
+            {"status": "blocked-safety", "reason": "forwarded-signal"},
+        )
+        self.assertFalse(destination.exists())
+        self.assertEqual(list(self.root.glob(".named-lane-materializer-*")), [])
+
+    def test_materializer_cli_retries_signal_block_before_cleanup(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit("head")
+        destination = self.root / "cleanup-block-signal-lane"
+        original_block = named_lane_runtime.block_forwarded_signals
+        block_calls = 0
+
+        def interrupt_before_cleanup_block() -> object:
+            nonlocal block_calls
+            block_calls += 1
+            if block_calls == 3:
+                signal.raise_signal(signal.SIGINT)
+            return original_block()
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "block_forwarded_signals",
+                side_effect=interrupt_before_cleanup_block,
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(
+                (
+                    "materialize-worktree",
+                    "--source",
+                    str(self.repo.resolve()),
+                    "--worktree",
+                    str(destination),
+                    "--base",
+                    base,
+                    "--head",
+                    head,
+                )
+            )
+
+        self.assertGreaterEqual(block_calls, 4)
+        self.assertEqual(returncode, 128 + signal.SIGINT)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            json.loads(stderr.getvalue()),
+            {"status": "blocked-safety", "reason": "forwarded-signal"},
+        )
+        self.assertFalse(destination.exists())
+        self.assertEqual(list(self.root.glob(".named-lane-materializer-*")), [])
+
+    def test_materializer_cli_receipt_commits_a_signal_during_emit(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit("head")
+        destination = self.root / "receipt-signal-lane"
+        original_emit = named_lane_runtime._emit
+        interrupted = False
+
+        def interrupt_receipt(
+            payload: dict[str, object],
+            *,
+            stream: object | None = None,
+        ) -> None:
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                signal.raise_signal(signal.SIGINT)
+            original_emit(payload, stream=sys.stdout if stream is None else stream)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_emit",
+                side_effect=interrupt_receipt,
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(
+                (
+                    "materialize-worktree",
+                    "--source",
+                    str(self.repo.resolve()),
+                    "--worktree",
+                    str(destination),
+                    "--base",
+                    base,
+                    "--head",
+                    head,
+                )
+            )
+
+        self.assertTrue(interrupted)
+        self.assertEqual(returncode, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {
+                "status": "ok",
+                "worktree": str(destination),
+                "base": base,
+                "head": head,
+            },
+        )
+        self.assertEqual(validate_worktree(destination, head).head_sha, head)
+
+    def test_materializer_cli_receipt_commits_signal_while_unblocking(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit("head")
+        destination = self.root / "receipt-unblock-signal-lane"
+        original_restore = named_lane_runtime.restore_signal_mask
+        restore_calls = 0
+
+        def interrupt_receipt_unblock(previous: object) -> None:
+            nonlocal restore_calls
+            restore_calls += 1
+            if restore_calls == 3:
+                signal.raise_signal(signal.SIGINT)
+            original_restore(previous)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "restore_signal_mask",
+                side_effect=interrupt_receipt_unblock,
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(
+                (
+                    "materialize-worktree",
+                    "--source",
+                    str(self.repo.resolve()),
+                    "--worktree",
+                    str(destination),
+                    "--base",
+                    base,
+                    "--head",
+                    head,
+                )
+            )
+
+        self.assertGreaterEqual(restore_calls, 3)
+        self.assertEqual(returncode, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(json.loads(stdout.getvalue())["status"], "ok")
+        self.assertEqual(validate_worktree(destination, head).head_sha, head)
+
+    def test_materializer_cli_receipt_commits_signal_during_outer_teardown(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit("head")
+        destination = self.root / "receipt-teardown-signal-lane"
+        original_block = named_lane_runtime.block_forwarded_signals
+        block_calls = 0
+
+        def interrupt_outer_teardown() -> object:
+            nonlocal block_calls
+            block_calls += 1
+            mask = original_block()
+            if block_calls == 4:
+                signal.raise_signal(signal.SIGINT)
+            return mask
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "block_forwarded_signals",
+                side_effect=interrupt_outer_teardown,
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(
+                (
+                    "materialize-worktree",
+                    "--source",
+                    str(self.repo.resolve()),
+                    "--worktree",
+                    str(destination),
+                    "--base",
+                    base,
+                    "--head",
+                    head,
+                )
+            )
+
+        self.assertGreaterEqual(block_calls, 4)
+        self.assertEqual(returncode, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(json.loads(stdout.getvalue())["status"], "ok")
+        self.assertEqual(validate_worktree(destination, head).head_sha, head)
+
+    def test_materializer_cli_retains_terminal_failure_when_signal_arrives_during_receipt_rollback(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit("head")
+        destination = self.root / "receipt-rollback-retained-lane"
+        original_emit = named_lane_runtime._emit
+        original_rmtree = named_lane_runtime.shutil.rmtree
+        original_restore = named_lane_runtime.restore_signal_mask
+        receipt_failed = False
+        cleanup_failed = False
+        restore_calls = 0
+
+        def fail_receipt(
+            payload: dict[str, object],
+            *,
+            stream: object | None = None,
+        ) -> None:
+            nonlocal receipt_failed
+            if stream is None and not receipt_failed:
+                receipt_failed = True
+                raise BrokenPipeError("simulated receipt failure")
+            original_emit(payload, stream=stream)
+
+        def retain_destination(path: object, *args: object, **kwargs: object) -> None:
+            nonlocal cleanup_failed
+            if pathlib.Path(path) == destination:
+                cleanup_failed = True
+                signal.raise_signal(signal.SIGINT)
+                raise OSError("simulated rollback failure")
+            original_rmtree(path, *args, **kwargs)
+
+        def interrupt_outer_terminal_teardown(previous: object) -> None:
+            nonlocal restore_calls
+            restore_calls += 1
+            if restore_calls == 5:
+                signal.raise_signal(signal.SIGINT)
+            original_restore(previous)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_emit",
+                side_effect=fail_receipt,
+            ),
+            mock.patch.object(
+                named_lane_runtime.shutil,
+                "rmtree",
+                side_effect=retain_destination,
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "restore_signal_mask",
+                side_effect=interrupt_outer_terminal_teardown,
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(
+                (
+                    "materialize-worktree",
+                    "--source",
+                    str(self.repo.resolve()),
+                    "--worktree",
+                    str(destination),
+                    "--base",
+                    base,
+                    "--head",
+                    head,
+                )
+            )
+
+        self.assertTrue(receipt_failed)
+        self.assertTrue(cleanup_failed)
+        self.assertGreaterEqual(restore_calls, 5)
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        payload = json.loads(stderr.getvalue())
+        self.assertEqual(payload["status"], "blocked-safety")
+        self.assertIn("simulated receipt failure", payload["reason"])
+        self.assertIn(
+            f"retained materialized worktree: {destination}",
+            payload["reason"],
+        )
+        self.assertNotEqual(payload["reason"], "forwarded-signal")
+        self.assertTrue(destination.exists())
+
     def test_safe_internal_source_symlink_is_allowed(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
         (self.repo / "target.txt").write_text("tracked\n", encoding="utf-8")
@@ -1655,6 +3303,73 @@ class NamedLaneGuardTest(unittest.TestCase):
         ):
             validate_worktree(self.repo.resolve(), head)
 
+    def test_valueless_frozen_submodule_path_is_structured_blocked_safety(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        target = self.commit("gitlink target")
+        (self.repo / ".gitmodules").write_text(
+            '[submodule "vendor"]\n\tpath\n',
+            encoding="utf-8",
+        )
+        git(
+            self.repo,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000",
+            target,
+            "vendor",
+        )
+        git(self.repo, "add", ".gitmodules")
+        tree = git(self.repo, "write-tree")
+        head = git(
+            self.repo,
+            "commit-tree",
+            tree,
+            "-p",
+            target,
+            "-m",
+            "add valueless submodule path",
+        )
+        git(self.repo, "update-ref", "refs/heads/master", head, target)
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(
+                (
+                    "validate-worktree",
+                    "--worktree",
+                    str(self.repo.resolve()),
+                    "--head",
+                    head,
+                )
+            )
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        payload = json.loads(stderr.getvalue())
+        self.assertEqual(payload["status"], "blocked-safety")
+        self.assertIn("malformed frozen submodule path record", payload["reason"])
+
+    def test_valueless_effective_submodule_path_is_rejected(self) -> None:
+        head = self.add_gitlink()
+        with (self.repo / ".git" / "config").open(
+            "a",
+            encoding="utf-8",
+        ) as handle:
+            handle.write('[submodule "vendor"]\n\tpath\n')
+
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "malformed effective submodule path record",
+        ):
+            validate_worktree(self.repo.resolve(), head)
+
     def test_guard_does_not_scan_ordinary_file_contents(self) -> None:
         (self.repo / "AGENTS.md").write_text(
             "synthetic-looking text sk-" + "A" * 48 + "\n",
@@ -2115,6 +3830,10 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(child["GIT_CONFIG_GLOBAL"], os.devnull)
         self.assertEqual(child["GIT_CONFIG_NOSYSTEM"], "1")
         self.assertEqual(child["GIT_CONFIG_SYSTEM"], os.devnull)
+        self.assertEqual(
+            child["GIT_CEILING_DIRECTORIES"],
+            str(self.repo.resolve().parent),
+        )
         self.assertEqual(child["GIT_ASKPASS"], "/usr/bin/false")
         self.assertEqual(child["GIT_ATTR_NOSYSTEM"], "1")
         self.assertEqual(child["GIT_PAGER"], "cat")
@@ -3151,6 +4870,22 @@ class NamedLaneGuardTest(unittest.TestCase):
         )
         commands = (
             (
+                "materialize-worktree",
+                "review_runtime.named_lane.materialize_worktree",
+                (
+                    "materialize-worktree",
+                    "--source",
+                    str(self.repo.resolve()),
+                    "--worktree",
+                    str(self.root / "classified-materialized-worktree"),
+                    "--base",
+                    "0" * 40,
+                    "--head",
+                    "0" * 40,
+                ),
+                "blocked-safety",
+            ),
+            (
                 "validate-worktree",
                 "review_runtime.named_lane.validate_worktree",
                 (
@@ -3210,6 +4945,20 @@ class NamedLaneGuardTest(unittest.TestCase):
         head = self.commit()
         executable = self.make_executable("pass\n")
         commands = (
+            (
+                (
+                    "materialize-worktree",
+                    "--source",
+                    str(self.repo.resolve()),
+                    "--worktree",
+                    str(self.root / "thread-start-materialized-worktree"),
+                    "--base",
+                    head,
+                    "--head",
+                    head,
+                ),
+                "blocked-safety",
+            ),
             (
                 (
                     "validate-worktree",
