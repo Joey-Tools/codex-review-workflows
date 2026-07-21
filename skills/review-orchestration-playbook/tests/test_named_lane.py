@@ -770,6 +770,43 @@ class NamedLaneGuardTest(unittest.TestCase):
                 self.assertFalse(marker.exists())
                 git(self.repo, "config", "--unset-all", key)
 
+    def test_git_alias_is_blocked_before_reviewer_launch(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        head = self.commit()
+        marker = self.root / "alias-reviewer-started.marker"
+        probe = self.make_executable(
+            f"import pathlib\npathlib.Path({str(marker)!r}).write_text('ran')\n"
+        )
+        git(self.repo, "config", "extensions.worktreeConfig", "true")
+
+        for scope in ((), ("--worktree",)):
+            with self.subTest(scope=scope or ("--local",)):
+                git(self.repo, "config", *scope, "alias.foo", f"!{probe}")
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    returncode = named_lane_main(
+                        (
+                            "validate-worktree",
+                            "--worktree",
+                            str(self.repo.resolve()),
+                            "--head",
+                            head,
+                        )
+                    )
+
+                self.assertEqual(returncode, 2)
+                self.assertEqual(
+                    json.loads(stderr.getvalue()),
+                    {
+                        "status": "blocked-safety",
+                        "reason": (
+                            "Git config aliases are not allowed before reviewer launch"
+                        ),
+                    },
+                )
+                self.assertFalse(marker.exists())
+                git(self.repo, "config", *scope, "--unset-all", "alias.foo")
+
     def test_included_config_is_blocked_and_worktree_diff_command_is_rejected(
         self,
     ) -> None:

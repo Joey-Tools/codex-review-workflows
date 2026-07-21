@@ -536,6 +536,10 @@ def _matches_named_driver_key(
 def _validate_executable_git_config(configured_keys: frozenset[bytes]) -> None:
     for key in configured_keys:
         lower_key = key.lower()
+        if lower_key.startswith(b"alias."):
+            raise NamedLaneGuardError(
+                "Git config aliases are not allowed before reviewer launch"
+            )
         status_filter = _matches_named_driver_key(
             lower_key,
             b"filter.",
