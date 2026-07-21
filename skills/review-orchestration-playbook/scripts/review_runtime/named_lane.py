@@ -115,6 +115,7 @@ def _git_capture(
     arguments: Iterable[str],
     *,
     output_limit_bytes: int = GIT_OUTPUT_LIMIT_BYTES,
+    timeout_seconds: float = 30.0,
     allow_no_match: bool = False,
     neutralize_external_diff: bool = True,
     neutralize_fsmonitor: bool = True,
@@ -139,7 +140,7 @@ def _git_capture(
         command,
         env=_git_environment(),
         stdin=stdin,
-        timeout_seconds=30.0,
+        timeout_seconds=timeout_seconds,
         stdout_limit_bytes=output_limit_bytes,
         stderr_limit_bytes=1024 * 1024,
     )
@@ -158,7 +159,11 @@ def _git_capture(
         capture.stderr[:] = b"\x00" * len(capture.stderr)
 
 
-def _resolve_worktree_root(worktree: pathlib.Path) -> pathlib.Path:
+def _resolve_worktree_root(
+    worktree: pathlib.Path,
+    *,
+    deadline_monotonic: float | None = None,
+) -> pathlib.Path:
     if not worktree.is_absolute():
         raise NamedLaneGuardError("worktree path must be absolute")
     lexical = worktree.absolute()
@@ -172,8 +177,21 @@ def _resolve_worktree_root(worktree: pathlib.Path) -> pathlib.Path:
         resolved = lexical.resolve(strict=True)
     except (OSError, RuntimeError) as error:
         raise NamedLaneGuardError("worktree path cannot be resolved safely") from error
+    git_timeout_seconds = 30.0
+    if deadline_monotonic is not None:
+        git_timeout_seconds = min(
+            git_timeout_seconds,
+            _remaining_deadline_seconds(
+                deadline_monotonic,
+                "Claude worktree Git resolution",
+            ),
+        )
     top_level = os.fsdecode(
-        _git_capture(resolved, ("rev-parse", "--show-toplevel"))
+        _git_capture(
+            resolved,
+            ("rev-parse", "--show-toplevel"),
+            timeout_seconds=git_timeout_seconds,
+        )
     ).strip()
     try:
         top_level_path = pathlib.Path(top_level).resolve(strict=True)
@@ -1388,7 +1406,10 @@ def run_claude(
         raise NamedLaneGuardError(
             f"Claude control prompt must not exceed {DEFAULT_PROMPT_LIMIT_BYTES} bytes"
         )
-    root = _resolve_worktree_root(worktree)
+    root = _resolve_worktree_root(
+        worktree,
+        deadline_monotonic=deadline,
+    )
     if not command:
         raise NamedLaneGuardError("Claude command is required")
     executable = pathlib.Path(command[0])

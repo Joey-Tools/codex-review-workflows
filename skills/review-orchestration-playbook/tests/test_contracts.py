@@ -3379,6 +3379,7 @@ class RepositoryContractTest(unittest.TestCase):
         for content in (skill, contracts, canonical):
             self.assertIn("run-claude", content)
             self.assertIn("1,800-second monotonic deadline", content)
+            self.assertIn("worktree Git", content)
             self.assertIn("64 MiB", content)
             self.assertIn("128 MiB aggregate", content)
             self.assertIn("TERM/KILL/drain/reap", content)

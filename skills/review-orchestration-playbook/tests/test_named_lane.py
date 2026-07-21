@@ -2952,6 +2952,50 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["timeout_seconds"], 3.5)
         self.assertEqual(run.call_args.kwargs["deadline_monotonic"], 105.0)
 
+    def test_worktree_git_resolution_uses_shared_remaining_deadline(self) -> None:
+        observed_timeouts: list[float] = []
+
+        def slow_git(
+            _root: pathlib.Path,
+            _arguments: object,
+            *,
+            timeout_seconds: float,
+            **_keywords: object,
+        ) -> bytes:
+            observed_timeouts.append(timeout_seconds)
+            raise ReviewTimeoutError("synthetic slow Git resolution")
+
+        with (
+            mock.patch.object(
+                named_lane_runtime.time,
+                "monotonic",
+                side_effect=(100.0, 100.0, 104.5),
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "_git_capture",
+                side_effect=slow_git,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ReviewTimeoutError,
+                "synthetic slow Git resolution",
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "git-deadline.stdout",
+                    stderr_path=self.root / "git-deadline.stderr",
+                    command=("/usr/bin/false",),
+                    prompt=b"review",
+                    timeout_seconds=5.0,
+                    stream_limit_bytes=64,
+                    deadline_monotonic=105.0,
+                )
+
+        self.assertEqual(observed_timeouts, [0.5])
+        self.assertFalse((self.root / "git-deadline.stdout").exists())
+        self.assertFalse((self.root / "git-deadline.stderr").exists())
+
     def test_cli_rejects_resource_overrides_above_default_caps(self) -> None:
         cases = (
             (
