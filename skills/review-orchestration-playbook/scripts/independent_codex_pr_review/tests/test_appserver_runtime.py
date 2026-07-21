@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import os
 import unittest
+from unittest import mock
 
 from review_supervisor.appserver_protocol import (
     AppServerProtocolError,
@@ -166,6 +167,41 @@ class AppServerRuntimeTests(unittest.TestCase):
         self.assertEqual(prepared.evidence_bundle.artifacts[0].content.encode(), diff)
         self.assertIn(b'"role":"primary_diff"', prepared.prompt)
         self.assertNotIn(str(root).encode(), prepared.prompt)
+
+    def test_rejects_escaped_turn_record_before_stream_activity(self) -> None:
+        with owned_temporary_directory("appserver-input-") as root:
+            control = root / ".codex-review"
+            control.mkdir()
+            diff = b"diff --git a/a.py b/a.py\n+fixed\n"
+            (control / "review.diff").write_bytes(diff)
+            entry = ManifestEntry(
+                path=".codex-review/review.diff",
+                kind="regular",
+                size=len(diff),
+                sha256=sha256_bytes(diff),
+            )
+            manifest = AuthenticatedManifest.authenticate(
+                (entry,),
+                expected_sha256=manifest_sha256((entry,)),
+            )
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with mock.patch(
+                    "review_supervisor.appserver_runtime.render_appserver_prompt",
+                    return_value=b"\\" * (4 * 1024 * 1024),
+                ):
+                    with self.assertRaises(AppServerProtocolError) as raised:
+                        build_prelaunch_appserver_input(
+                            root_fd=root_fd,
+                            manifest=manifest,
+                            pr_url="https://github.example/owner/repo/pull/1",
+                            base_sha="1" * 40,
+                            head_sha="2" * 40,
+                            forbidden_paths=(root,),
+                        )
+            finally:
+                os.close(root_fd)
+        self.assertEqual(raised.exception.code, "record-size")
 
     def test_rejects_abnormal_eof_trailing_record_and_short_write(self) -> None:
         with self.assertRaises(AppServerProtocolError) as raised:

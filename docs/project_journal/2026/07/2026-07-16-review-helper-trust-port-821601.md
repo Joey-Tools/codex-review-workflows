@@ -486,3 +486,19 @@ metadata behavior.
   Xcode 26.6 / SDK 26.5 developer build reproduced the broker byte-for-byte.
   Ruff lint and the relevant format gate, compileall, Bash syntax, ShellCheck,
   actionlint, canonical CI fixture equality, and `git diff --check` pass.
+- A subsequent whole-range fresh-context Codex review of
+  `3134c1cb849ad473f154f4a2ad73ca96484a34ca..68c21f208e8eda2c823faff2771a18c8b1759fa6`
+  found that evidence admission bounded the raw diff, evidence bundle, and
+  rendered prompt but not the final JSONL `turn/start` record. A prompt rich in
+  JSON escape characters could therefore pass the 6 MiB raw prompt limit and
+  exceed the 8 MiB encoded record limit only after reviewer launch.
+- Prelaunch admission now decodes the actual prompt once, constructs the shared
+  `turn/start` request shape with worst-case legal dynamic fields, and applies
+  the production canonical JSONL encoder before returning prepared input. The
+  live protocol uses the same request and parameter constructors, so request
+  shape changes cannot silently drift from the admission proof. Regression
+  tests cover both ordinary input and a 4 MiB backslash prompt that remains
+  below the raw limit but must fail with `record-size` before stream activity.
+  Validation used only Python 3.13: the host-level main suite ran 1,430 tests
+  with 5 expected platform skips and no failures, while the deterministic
+  independent suite ran 288 tests with zero skips.

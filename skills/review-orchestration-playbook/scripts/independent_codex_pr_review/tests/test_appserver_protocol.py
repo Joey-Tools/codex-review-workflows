@@ -13,10 +13,12 @@ from review_supervisor.appserver_protocol import (
     ModelFallbackAuthorization,
     decode_json_line,
     encode_json_line,
+    validate_prelaunch_turn_start_record,
 )
 from review_supervisor.constants import (
     APP_SERVER_CLI_VERSION,
     APP_SERVER_CLIENT_NAME,
+    APP_SERVER_MAX_RECORD_BYTES,
     APP_SERVER_SESSION_SOURCE,
     MODEL,
 )
@@ -382,6 +384,14 @@ class JsonLineTests(unittest.TestCase):
             nested = [nested]
         with self.assertRaises(AppServerProtocolError):
             decode_json_line(encode_json_line({"nested": nested}))
+
+    def test_prelaunch_turn_start_budget_includes_json_escaping(self) -> None:
+        self.assertGreater(validate_prelaunch_turn_start_record(b"evidence"), 0)
+
+        prompt = b"\\" * (APP_SERVER_MAX_RECORD_BYTES // 2)
+        with self.assertRaises(AppServerProtocolError) as raised:
+            validate_prelaunch_turn_start_record(prompt)
+        self.assertEqual(raised.exception.code, "record-size")
 
 
 class AppServerProtocolTests(unittest.TestCase):

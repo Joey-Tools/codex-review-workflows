@@ -11,6 +11,7 @@ from .appserver_protocol import (
     AppServerSessionConfig,
     AppServerSessionResult,
     encode_json_line,
+    validate_prelaunch_turn_start_record,
 )
 from .constants import APP_SERVER_MAX_RECORD_BYTES
 from .evidence import AuthenticatedManifest, EvidenceBundle, build_evidence_bundle
@@ -45,6 +46,7 @@ def build_prelaunch_appserver_input(
         evidence_bundle=bundle,
         forbidden_paths=tuple(forbidden_paths),
     )
+    validate_prelaunch_turn_start_record(prompt)
     return PreparedAppServerInput(prompt=prompt, evidence_bundle=bundle)
 
 

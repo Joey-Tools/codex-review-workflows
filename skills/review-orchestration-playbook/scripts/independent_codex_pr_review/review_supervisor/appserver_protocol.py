@@ -33,6 +33,8 @@ from .prompt import validate_final_message
 
 _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
+_MAX_PROTOCOL_PATH_BYTES = 4096
+_MAX_MODEL_NAME_BYTES = 128
 _JWT_PATTERN = re.compile(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\Z")
 _THREAD_RESPONSE_KEYS = frozenset(
     {
@@ -466,7 +468,11 @@ class AppServerSessionConfig:
             self.expected_codex_home,
             "expected Codex home",
         )
-        _bounded_string(self.expected_model, "expected model", limit=128)
+        _bounded_string(
+            self.expected_model,
+            "expected model",
+            limit=_MAX_MODEL_NAME_BYTES,
+        )
         _bounded_string(
             self.expected_reasoning_effort,
             "expected reasoning effort",
@@ -616,6 +622,95 @@ def encode_json_line(
     return encoded + b"\n"
 
 
+def validate_prelaunch_turn_start_record(prompt: bytes) -> int:
+    """Validate the largest legal encoded turn/start record for this prompt."""
+
+    prompt_text = _decode_appserver_prompt(prompt)
+    record = _request_record(
+        request_id=_INT64_MAX,
+        method="turn/start",
+        params=_turn_start_params(
+            prompt=prompt_text,
+            neutral_cwd=_max_expansion_path(_MAX_PROTOCOL_PATH_BYTES),
+            model=_max_expansion_text(_MAX_MODEL_NAME_BYTES),
+            reasoning_effort=REASONING_EFFORT,
+            thread_id=_max_expansion_text(APP_SERVER_MAX_IDENTIFIER_BYTES),
+        ),
+    )
+    return len(encode_json_line(record))
+
+
+def _decode_appserver_prompt(prompt: bytes) -> str:
+    if not isinstance(prompt, bytes):
+        raise AppServerProtocolError(
+            "app-server prompt is not bytes",
+            code="prompt-type",
+        )
+    if not 1 <= len(prompt) <= MAX_APP_SERVER_PROMPT_BYTES:
+        raise AppServerProtocolError(
+            "app-server prompt length is outside the accepted range",
+            code="prompt-size",
+        )
+    if b"\x00" in prompt:
+        raise AppServerProtocolError(
+            "app-server prompt contains NUL",
+            code="prompt",
+        )
+    try:
+        return prompt.decode("utf-8", "strict")
+    except UnicodeDecodeError as error:
+        raise AppServerProtocolError(
+            "app-server prompt is not UTF-8",
+            code="prompt",
+        ) from error
+
+
+def _max_expansion_text(byte_limit: int) -> str:
+    # U+0080 is accepted by bounded strings and expands from two UTF-8 bytes
+    # to six ASCII JSON bytes under ensure_ascii=True. A trailing backslash
+    # gives the maximum two-byte JSON expansion for an odd byte allowance.
+    pairs, remainder = divmod(byte_limit, 2)
+    return "\u0080" * pairs + ("\\" if remainder else "")
+
+
+def _max_expansion_path(byte_limit: int) -> str:
+    return "/" + _max_expansion_text(byte_limit - 1)
+
+
+def _request_record(
+    *,
+    request_id: int,
+    method: str,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    return {"id": request_id, "method": method, "params": params}
+
+
+def _turn_start_params(
+    *,
+    prompt: str,
+    neutral_cwd: str,
+    model: str,
+    reasoning_effort: str,
+    thread_id: str,
+) -> dict[str, Any]:
+    return {
+        "additionalContext": {},
+        "approvalPolicy": "never",
+        "approvalsReviewer": "user",
+        "cwd": neutral_cwd,
+        "effort": reasoning_effort,
+        "environments": [],
+        "input": [{"text": prompt, "text_elements": [], "type": "text"}],
+        "model": model,
+        "multiAgentMode": "explicitRequestOnly",
+        "responsesapiClientMetadata": {},
+        "runtimeWorkspaceRoots": [],
+        "sandboxPolicy": {"networkAccess": False, "type": "readOnly"},
+        "threadId": thread_id,
+    }
+
+
 def _no_execution_config(*, reasoning_effort: str | None = None) -> dict[str, Any]:
     config: dict[str, Any] = {
         "agents": {"enabled": False},
@@ -659,22 +754,7 @@ def _no_execution_config(*, reasoning_effort: str | None = None) -> dict[str, An
 
 class AppServerProtocol:
     def __init__(self, *, prompt: bytes, config: AppServerSessionConfig) -> None:
-        if not 1 <= len(prompt) <= MAX_APP_SERVER_PROMPT_BYTES:
-            raise AppServerProtocolError(
-                "app-server prompt length is outside the accepted range",
-                code="prompt-size",
-            )
-        if b"\x00" in prompt:
-            raise AppServerProtocolError(
-                "app-server prompt contains NUL", code="prompt"
-            )
-        try:
-            self._prompt = prompt.decode("utf-8", "strict")
-        except UnicodeDecodeError as error:
-            raise AppServerProtocolError(
-                "app-server prompt is not UTF-8",
-                code="prompt",
-            ) from error
+        self._prompt = _decode_appserver_prompt(prompt)
         self.config = config
         self._state = "new"
         self._next_request_id = 1
@@ -775,7 +855,11 @@ class AppServerProtocol:
         self._next_request_id += 1
         self._pending_id = request_id
         self._pending_method = method
-        return {"id": request_id, "method": method, "params": params}
+        return _request_record(
+            request_id=request_id,
+            method=method,
+            params=params,
+        )
 
     def _accept_response(self, message: dict[str, Any]) -> tuple[dict[str, Any], ...]:
         if self._pending_id is None or self._pending_method is None:
@@ -997,7 +1081,18 @@ class AppServerProtocol:
             )
         self._state = "turn"
         thread_id = _required_id(self._thread_id, "thread ID")
-        return (self._request("turn/start", self._turn_start_params(thread_id)),)
+        return (
+            self._request(
+                "turn/start",
+                _turn_start_params(
+                    prompt=self._prompt,
+                    neutral_cwd=self.config.neutral_cwd,
+                    model=self.config.expected_model,
+                    reasoning_effort=self.config.expected_reasoning_effort,
+                    thread_id=thread_id,
+                ),
+            ),
+        )
 
     def _config_request(self) -> dict[str, Any]:
         return self._request(
@@ -1637,23 +1732,6 @@ class AppServerProtocol:
             "sandbox": "read-only",
             "selectedCapabilityRoots": [],
             "threadSource": APP_SERVER_CLIENT_NAME,
-        }
-
-    def _turn_start_params(self, thread_id: str) -> dict[str, Any]:
-        return {
-            "additionalContext": {},
-            "approvalPolicy": "never",
-            "approvalsReviewer": "user",
-            "cwd": self.config.neutral_cwd,
-            "effort": self.config.expected_reasoning_effort,
-            "environments": [],
-            "input": [{"text": self._prompt, "text_elements": [], "type": "text"}],
-            "model": self.config.expected_model,
-            "multiAgentMode": "explicitRequestOnly",
-            "responsesapiClientMetadata": {},
-            "runtimeWorkspaceRoots": [],
-            "sandboxPolicy": {"networkAccess": False, "type": "readOnly"},
-            "threadId": thread_id,
         }
 
 
@@ -2586,7 +2664,7 @@ def _int64(value: Any, label: str, *, nonnegative: bool = False) -> int:
 
 
 def _validate_absolute_normalized_path(value: Any, label: str) -> str:
-    path = _bounded_string(value, label, limit=4096)
+    path = _bounded_string(value, label, limit=_MAX_PROTOCOL_PATH_BYTES)
     if not os.path.isabs(path) or os.path.normpath(path) != path:
         raise AppServerProtocolError(
             f"{label} is not an absolute normalized path",
