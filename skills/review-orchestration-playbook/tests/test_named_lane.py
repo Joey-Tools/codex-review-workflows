@@ -277,8 +277,13 @@ class NamedLaneGuardTest(unittest.TestCase):
         pid_path = self.root / "detached.pid"
         executable = self.make_executable(
             "import os, pathlib, sys, time\n"
+            "ready_read, ready_write = os.pipe()\n"
             "pid = os.fork()\n"
             "if pid == 0:\n"
+            "    os.close(ready_write)\n"
+            "    if os.read(ready_read, 1) != b'1':\n"
+            "        os._exit(1)\n"
+            "    os.close(ready_read)\n"
             "    os.setsid()\n"
             "    for descriptor in (0, 1, 2):\n"
             "        try:\n"
@@ -287,10 +292,13 @@ class NamedLaneGuardTest(unittest.TestCase):
             "            pass\n"
             "    time.sleep(30)\n"
             "    os._exit(0)\n"
+            "os.close(ready_read)\n"
             "pid_path = pathlib.Path(sys.argv[1])\n"
             "temporary_path = pid_path.with_suffix('.tmp')\n"
             "temporary_path.write_text(str(pid), encoding='ascii')\n"
             "os.replace(temporary_path, pid_path)\n"
+            "os.write(ready_write, b'1')\n"
+            "os.close(ready_write)\n"
             "os._exit(0)\n"
         )
         detached_pid: int | None = None
@@ -309,6 +317,11 @@ class NamedLaneGuardTest(unittest.TestCase):
             os.kill(detached_pid, 0)
             self.assertEqual(result["status"], "complete")
         finally:
+            if detached_pid is None:
+                try:
+                    detached_pid = int(pid_path.read_text(encoding="ascii"))
+                except FileNotFoundError:
+                    pass
             if detached_pid is not None:
                 try:
                     os.kill(detached_pid, 9)
