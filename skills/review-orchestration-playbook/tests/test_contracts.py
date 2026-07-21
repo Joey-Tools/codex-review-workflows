@@ -94,7 +94,6 @@ def _claude_auth_repository_policy_files(
     policy_paths: dict[str, pathlib.Path] = {}
     if profile == "canonical":
         policy_paths = {
-            "AGENTS.md": repo_root / "AGENTS.md",
             "README.md": repo_root / "README.md",
             "project journal": (
                 repo_root
@@ -1000,6 +999,39 @@ class RepositoryContractTest(unittest.TestCase):
                 "native sandbox enforces global write denial",
                 content.lower(),
             )
+
+    def test_canonical_claude_auth_control_plane_is_not_helper_broker(self) -> None:
+        agents = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        runtime = (SKILL_ROOT / "references/claude-runtime-trust.md").read_text(
+            encoding="utf-8"
+        )
+
+        for anchor in (
+            "ordinary Claude CLI authentication",
+            "trusted control plane",
+            "own ordinary authentication",
+            "does not use the low-level helper's credential broker",
+            "blocked-authentication",
+            "claude auth login",
+        ):
+            self.assertIn(anchor, canonical)
+        self.assertIn("The canonical lane does not use or", runtime)
+        self.assertIn("helper's credential-lock catalog", runtime)
+        self.assertIn("Do not apply its catalog, broker, carrier, lock", runtime)
+        self.assertIn("do not apply to this direct real-`HOME` lane", skill)
+        self.assertIn("a narrow CLI control-plane exception", skill)
+        self.assertIn("Those guarantees do not apply", agents)
+        for retired_global_detail in (
+            "Local-login writeback requires",
+            "broker `W` generation",
+            "primary `.oauth_refresh.lock`",
+            "last generation and 1 MiB",
+        ):
+            self.assertNotIn(retired_global_detail, agents)
 
     def test_core_active_policy_has_no_retired_codex_pr_gate_names(self) -> None:
         active_policy = (

@@ -34,6 +34,14 @@ supplied-diff prompts, helper-private credential carriers, or helper-owned outer
 sandboxes remain helper-only and cannot make an `isolated_review` artifact count
 as the canonical lane.
 
+The canonical lane uses ordinary Claude CLI authentication in trusted real
+`HOME`, or an explicitly authorized API key. The CLI may perform its own normal
+credential refresh in that control plane. The canonical lane does not use or
+claim the helper's credential-lock catalog, broker, staged carrier, guarded
+writeback, or recovery guarantees. Authentication rejection is still
+`blocked-authentication`, ambiguous credential persistence is inconclusive, and
+neither condition authorizes another provider.
+
 ### Native Selected-Deny Read Boundary For Claude Code 2.1.212
 
 For the accepted real-`HOME` native-sandbox review design, keep these layers distinct:
@@ -48,10 +56,11 @@ For the accepted real-`HOME` native-sandbox review design, keep these layers dis
 This boundary is an accepted model-behavior tradeoff, not full host-read isolation. A stronger outer sandbox may add protection, but must not be inferred from selected `denyRead` / `allowRead` settings or init output.
 
 - Accept installed Claude Code release versions `>=2.1.211,<3.0.0` after all
-  provenance, platform, capability, credential, and isolation checks pass.
-  Local-login refresh writeback additionally requires an exact
-  version/platform/SHA-256 entry from the signed artifact in the credential-lock
-  protocol catalog. An explicit API key does not require that internal protocol.
+  applicable provenance, platform, capability, authentication, and isolation
+  checks pass. For the low-level helper only, local-login refresh writeback
+  additionally requires an exact version/platform/SHA-256 entry from the signed
+  artifact in the credential-lock protocol catalog. The canonical direct lane
+  uses the ordinary control-plane contract above instead.
 - Do not pin the helper to `latest`, `stable`, or one current patch release. The
   helper never upgrades Claude Code and reviews the installed release it finds.
 - The former exact patch pin was a compact trust-and-compatibility shortcut for
@@ -687,6 +696,11 @@ existing `Read`/`Grep`/`Glob` contract because Seatbelt supplies the outer
 filesystem boundary.
 
 ## Credentials
+
+Except for the canonical direct-lane authentication contract above, this
+section specifies the low-level helper's private credential staging and
+writeback implementation. Do not apply its catalog, broker, carrier, lock, or
+recovery requirements to the canonical real-`HOME` lane.
 
 An explicitly supplied `ANTHROPIC_API_KEY` remains an optional override and does
 not require local-login credential access or an internal credential-lock
