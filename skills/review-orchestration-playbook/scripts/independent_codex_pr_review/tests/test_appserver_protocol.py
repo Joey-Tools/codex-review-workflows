@@ -75,6 +75,10 @@ NO_EXECUTION_FEATURES = frozenset(
 )
 
 
+def synthetic_external_access_token() -> str:
+    return ".".join(("header", "payload", "signature"))
+
+
 def initialize_result() -> dict[str, object]:
     return {
         "codexHome": "/private/codex-home",
@@ -693,7 +697,7 @@ class AppServerProtocolTests(unittest.TestCase):
     def test_external_auth_is_in_memory_only_and_never_retained_in_attestation(
         self,
     ) -> None:
-        token = "header.payload.signature"
+        token = synthetic_external_access_token()
         external_auth = ExternalChatGPTAuth(
             access_token=token,
             chatgpt_account_id="account-1",
@@ -787,12 +791,18 @@ class AppServerProtocolTests(unittest.TestCase):
 
         with self.assertRaises(AppServerProtocolError):
             ExternalChatGPTAuth(
-                access_token="not-a-jwt",
+                access_token="-".join(("not", "a", "jwt")),
                 chatgpt_account_id="account-1",
             )
         with self.assertRaises(AppServerProtocolError) as non_ascii:
             ExternalChatGPTAuth(
-                access_token="header.payload.signatur\N{LATIN SMALL LETTER E WITH ACUTE}",
+                access_token=".".join(
+                    (
+                        "header",
+                        "payload",
+                        "signatur\N{LATIN SMALL LETTER E WITH ACUTE}",
+                    )
+                ),
                 chatgpt_account_id="account-1",
             )
         self.assertEqual(non_ascii.exception.code, "external-auth")

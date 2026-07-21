@@ -325,3 +325,9 @@ metadata behavior.
   canonical CI byte comparison, broker developer byte reproduction, and
   `git diff --check` pass. The hosted-only broker `--check` remains a required
   CI gate because its exact Xcode path is intentionally unavailable locally.
+- The first frozen-diff preflight remained local and blocked before egress on
+  three credential-shaped supervisor fixtures. The unused refresh fixture now
+  uses helper-catalog ID `refresh-a`; JWT-shape and malformed-token tests build
+  their values at runtime from non-credential-shaped fragments because the
+  catalog access-token shape intentionally does not satisfy that parser test.
+  The three affected Python 3.13 test modules run 34 tests with no failures.

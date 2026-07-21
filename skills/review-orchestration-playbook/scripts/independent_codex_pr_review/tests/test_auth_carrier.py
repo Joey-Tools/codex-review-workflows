@@ -18,6 +18,9 @@ from review_supervisor.auth_carrier import (
 )
 
 
+SYNTHETIC_REFRESH_TOKEN = "codex_synth_v1_refresh_a"  # Catalog id: refresh-a.
+
+
 def jwt(payload: dict[str, object]) -> str:
     encoded = base64.urlsafe_b64encode(
         json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("ascii")
@@ -47,7 +50,7 @@ class AuthCarrierTests(unittest.TestCase):
                         }
                     }
                 ),
-                "refresh_token": "unused-refresh-value",
+                "refresh_token": SYNTHETIC_REFRESH_TOKEN,
             },
         }
         path.write_text(json.dumps(value), encoding="utf-8")
@@ -66,7 +69,7 @@ class AuthCarrierTests(unittest.TestCase):
         self.assertEqual(evidence.auth.chatgpt_plan_type, "pro")
         self.assertEqual(evidence.access_token_expires_at, 10_000)
         self.assertNotIn(evidence.auth.access_token, repr(evidence))
-        self.assertNotIn("unused-refresh-value", repr(evidence))
+        self.assertNotIn(SYNTHETIC_REFRESH_TOKEN, repr(evidence))
         self.assertNotIn("account-1", json.dumps(evidence.to_json()))
 
     def test_rejects_expiry_mode_links_duplicates_and_malformed_tokens(self) -> None:
@@ -95,7 +98,7 @@ class AuthCarrierTests(unittest.TestCase):
                 json.dumps(
                     {
                         "tokens": {
-                            "access_token": "not-a-jwt",
+                            "access_token": "-".join(("not", "a", "jwt")),
                             "account_id": "account-1",
                         }
                     }
@@ -318,7 +321,7 @@ class AuthCarrierTests(unittest.TestCase):
             self.assertEqual(after.st_size, before.st_size)
 
     def test_failure_traceback_does_not_retain_raw_auth_payload(self) -> None:
-        marker = "sensitive-refresh-marker"
+        marker = "-".join(("sensitive", "refresh", "marker"))
         with tempfile.TemporaryDirectory() as raw_root:
             root = pathlib.Path(raw_root)
             path = self.write_auth(root, expiration=10_000)

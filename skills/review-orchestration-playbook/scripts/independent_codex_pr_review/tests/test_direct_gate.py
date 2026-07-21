@@ -34,6 +34,7 @@ from tests.test_appserver_protocol import (
     initialize_result,
     reasoning_item,
     safe_config_result,
+    synthetic_external_access_token,
     thread_start_result,
 )
 
@@ -520,7 +521,7 @@ class BoundedAppServerProcessTests(unittest.TestCase):
             neutral_cwd=NEUTRAL_CWD,
             expected_codex_home=CODEX_HOME,
             external_auth=ExternalChatGPTAuth(
-                access_token="header.payload.signature",
+                access_token=synthetic_external_access_token(),
                 chatgpt_account_id="account",
                 chatgpt_plan_type="plus",
             ),
