@@ -61,6 +61,9 @@ EXPECTED_CLAUDE_2_1_211_LOCK_ARTIFACTS = {
 
 
 CI_FIXTURE_ROOT = SKILL_ROOT / "tests" / "fixtures" / "ci"
+COMPATIBILITY_WORKFLOW_FIXTURE = (
+    SKILL_ROOT / "tests" / "fixtures" / "compat" / "codex-review-gate.yml"
+)
 CI_PROFILE_BY_SKILL_LAYOUT = {
     pathlib.Path("skills/review-orchestration-playbook"): "canonical",
     pathlib.Path("personal_codex/skills/review-orchestration-playbook"): "private",
@@ -657,16 +660,24 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("external-review-playbook", workflow)
         self.assertNotIn("copilot-review-playbook", workflow)
         if CI_PROFILE == "canonical":
-            compatibility = (
-                REPO_ROOT / ".github/workflows/codex-review-gate.yml"
-            ).read_text(encoding="utf-8")
+            compatibility_path = REPO_ROOT / ".github/workflows/codex-review-gate.yml"
+            compatibility = compatibility_path.read_text(encoding="utf-8")
+            self.assertEqual(
+                compatibility_path.read_bytes(),
+                COMPATIBILITY_WORKFLOW_FIXTURE.read_bytes(),
+                "compatibility status workflow differs from the reviewed safety snapshot",
+            )
             for anchor in (
                 "Codex Review Gate Compatibility Status",
                 "pull_request:",
+                "types: [opened, reopened, synchronize, ready_for_review]",
+                "permissions:\n  contents: read",
+                "jobs:\n  compatibility-status:",
                 "name: codex/review-gate",
                 "no reviewer was started and no review lane was counted",
             ):
                 self.assertIn(anchor, compatibility)
+            self.assertEqual(compatibility.count("\n  compatibility-status:\n"), 1)
             for forbidden in (
                 "pull_request_target:",
                 "issue_comment:",
@@ -678,6 +689,8 @@ class RepositoryContractTest(unittest.TestCase):
                 "issues: write",
                 "codex-review-gate-action",
                 "@codex review",
+                "uses:",
+                "${{",
             ):
                 self.assertNotIn(forbidden, compatibility)
 
