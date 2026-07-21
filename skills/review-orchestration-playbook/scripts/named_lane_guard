@@ -1,17 +1,29 @@
-#!/usr/bin/env python3
 """Run narrow safety and process guards for canonical named review lanes."""
 
 from __future__ import annotations
 
+import pathlib
 import sys
 
 
 if sys.version_info < (3, 10):
     raise SystemExit("named_lane_guard requires Python 3.10 or later")
 
-sys.dont_write_bytecode = True
+if not (
+    sys.flags.isolated
+    and sys.flags.ignore_environment
+    and sys.flags.no_user_site
+    and sys.flags.dont_write_bytecode
+):
+    raise SystemExit(
+        "named_lane_guard requires a prevalidated absolute Python interpreter "
+        "invoked with -I -B"
+    )
 
-from review_runtime.named_lane import main
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+from review_runtime.named_lane import main  # noqa: E402
 
 
 if __name__ == "__main__":

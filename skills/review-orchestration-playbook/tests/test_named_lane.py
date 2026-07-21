@@ -92,24 +92,108 @@ class NamedLaneGuardTest(unittest.TestCase):
         executable.chmod(0o755)
         return executable.resolve()
 
-    def test_entrypoint_does_not_write_import_bytecode(self) -> None:
-        scripts = self.root / "scripts"
+    def copy_guard_bundle(self) -> tuple[pathlib.Path, pathlib.Path]:
+        scripts = self.root / f"scripts-{time.monotonic_ns()}"
         scripts.mkdir()
-        shutil.copy2(SCRIPTS / "named_lane_guard", scripts / "named_lane_guard")
+        guard = scripts / "named_lane_guard"
+        shutil.copy2(SCRIPTS / "named_lane_guard", guard)
         shutil.copytree(
             SCRIPTS / "review_runtime",
             scripts / "review_runtime",
             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
         )
+        return scripts, guard
+
+    def isolated_guard_command(
+        self,
+        guard: pathlib.Path,
+        *arguments: str,
+    ) -> tuple[str, ...]:
+        return (
+            str(pathlib.Path(sys.executable).resolve()),
+            "-I",
+            "-B",
+            str(guard),
+            *arguments,
+        )
+
+    def test_entrypoint_does_not_write_import_bytecode(self) -> None:
+        scripts, guard = self.copy_guard_bundle()
 
         subprocess.run(
-            (sys.executable, str(scripts / "named_lane_guard"), "--help"),
+            self.isolated_guard_command(guard, "--help"),
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
 
         self.assertEqual(list(scripts.rglob("__pycache__")), [])
+
+    def test_entrypoint_ignores_ambient_python_launch_controls(self) -> None:
+        _, guard = self.copy_guard_bundle()
+        attacker = self.root / "attacker"
+        attacker.mkdir()
+        fake_python_marker = self.root / "fake-python.marker"
+        sitecustomize_marker = self.root / "sitecustomize.marker"
+        fake_python = attacker / "python3"
+        fake_python.write_text(
+            f"#!/bin/sh\nprintf fake > {str(fake_python_marker)!r}\nexit 97\n",
+            encoding="utf-8",
+        )
+        fake_python.chmod(0o755)
+        (attacker / "sitecustomize.py").write_text(
+            "import pathlib\n"
+            f"pathlib.Path({str(sitecustomize_marker)!r}).write_text('loaded')\n",
+            encoding="utf-8",
+        )
+        env_executable = pathlib.Path("/usr/bin/env")
+        self.assertTrue(env_executable.is_file())
+
+        completed = subprocess.run(
+            (
+                str(env_executable),
+                "-i",
+                f"PATH={attacker}",
+                f"PYTHONHOME={attacker}",
+                f"PYTHONPATH={attacker}",
+                *self.isolated_guard_command(guard, "--help"),
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("usage:", completed.stdout)
+        self.assertFalse(fake_python_marker.exists())
+        self.assertFalse(sitecustomize_marker.exists())
+
+    def test_entrypoint_is_source_only_and_fails_closed_without_isolation(
+        self,
+    ) -> None:
+        guard = SCRIPTS / "named_lane_guard"
+        source = guard.read_text(encoding="utf-8")
+
+        self.assertEqual(guard.stat().st_mode & 0o111, 0)
+        self.assertFalse(source.startswith("#!"))
+        completed = subprocess.run(
+            (
+                str(pathlib.Path(sys.executable).resolve()),
+                "-E",
+                "-s",
+                "-B",
+                str(guard),
+                "--help",
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("invoked with -I -B", completed.stderr)
 
     def add_gitlink(self, path: str = "vendor") -> str:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
@@ -1762,7 +1846,9 @@ class NamedLaneGuardTest(unittest.TestCase):
         started = time.monotonic()
         process = subprocess.Popen(
             (
-                sys.executable,
+                str(pathlib.Path(sys.executable).resolve()),
+                "-I",
+                "-B",
                 str(SCRIPTS / "named_lane_guard"),
                 "run-claude",
                 "--worktree",
