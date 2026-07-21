@@ -93,6 +93,10 @@ class _CandidateUnavailable(ValueError):
     pass
 
 
+class _CandidateInspectionInconclusive(RuntimeError):
+    pass
+
+
 def _result(
     classification: str,
     reason: str,
@@ -189,7 +193,7 @@ def _darwin_platform_key(path: pathlib.Path) -> str:
         with path.open("rb") as handle:
             header = handle.read(8)
     except OSError as error:
-        raise _CandidateUnavailable(str(path)) from error
+        raise _CandidateInspectionInconclusive(str(path)) from error
     if len(header) != 8:
         raise _CandidateUnavailable("truncated native executable")
     if header[:4] == b"\xcf\xfa\xed\xfe":
@@ -212,6 +216,7 @@ def _platform_key(path: pathlib.Path) -> str:
     if sys.platform.startswith("linux"):
         from .claude_linux import (
             LinuxRuntimeError,
+            LinuxRuntimeInspectionInconclusive,
             detect_host,
             validate_claude_executable,
         )
@@ -219,6 +224,8 @@ def _platform_key(path: pathlib.Path) -> str:
         try:
             info = validate_claude_executable(path, detect_host(env={}))
             return info.manifest_platform_key
+        except LinuxRuntimeInspectionInconclusive as error:
+            raise _CandidateInspectionInconclusive(str(error)) from error
         except LinuxRuntimeError as error:
             raise _CandidateUnavailable(str(error)) from error
     raise _CandidateUnavailable(f"unsupported host platform: {sys.platform}")
@@ -228,15 +235,21 @@ def verify_publisher_candidate(path: pathlib.Path) -> VerifiedCandidate:
     """Verify the exact signed 2.1.212 artifact before executing the candidate."""
 
     platform_key = _platform_key(path)
+    try:
+        provenance_temp_root = PROVENANCE_TEMP_ROOT.expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise _CandidateInspectionInconclusive(
+            "cannot resolve the provenance temporary root"
+        ) from error
     with tempfile.TemporaryDirectory(
         prefix="named-claude-provenance-",
-        dir=PROVENANCE_TEMP_ROOT,
+        dir=provenance_temp_root,
     ) as temporary:
         verified = verify_claude_release(
             path,
             version=REQUIRED_CLAUDE_VERSION,
             platform_key=platform_key,
-            gpg_temp_root=pathlib.Path(temporary),
+            gpg_temp_root=pathlib.Path(temporary).resolve(strict=True),
         )
     resolved = verified.executable.resolve(strict=True)
     return VerifiedCandidate(
@@ -309,6 +322,13 @@ def preflight(
 
     try:
         verified = verifier(resolved)
+    except _CandidateInspectionInconclusive:
+        return _result(
+            "inconclusive",
+            "candidate-inspection-inconclusive",
+            candidate=candidate,
+            resolved_path=resolved,
+        )
     except _CandidateUnavailable:
         return _result(
             "blocked",

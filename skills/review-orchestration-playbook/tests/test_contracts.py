@@ -1220,12 +1220,14 @@ class RepositoryContractTest(unittest.TestCase):
             "lane contracts": contracts,
             "prompt templates": templates,
             "repository policy": agents_policy,
+            "skill interface": interface,
         }
         full_history_documents = {
             "PR readiness": readiness,
             "GitHub probes": probes,
             "lane contracts": contracts,
             "prompt templates": templates,
+            "skill interface": interface,
         }
         if CI_PROFILE == "canonical":
             readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
@@ -1265,8 +1267,8 @@ class RepositoryContractTest(unittest.TestCase):
                     r"both(?: its)? non-null `started_at` and `completed_at`(?: are| must be)? strictly later than",
                 )
                 self.assertIn(
-                    "Re-read complete authenticated request history immediately before accepting",
-                    content,
+                    "re-read complete authenticated request history immediately before",
+                    content.lower(),
                 )
         for content in (readiness, probes, contracts):
             self.assertIn("race", content)
@@ -1287,6 +1289,13 @@ class RepositoryContractTest(unittest.TestCase):
             readiness,
         )
         self.assertNotIn("expected Codex integration identity", probes)
+
+        for anchor in (
+            "Resolve the local frozen range and PR selector independently",
+            "base_sha == pr_merge_base and head_sha == pr_head_oid",
+            "same-head/different-base range is blocked-input scope-mismatch",
+        ):
+            self.assertIn(anchor, interface)
 
     def test_named_single_prompt_uses_clear_context_codex_without_a_full_diff(
         self,
@@ -1450,6 +1459,7 @@ class RepositoryContractTest(unittest.TestCase):
                 "$HOME/.local/share/claude/versions/2.1.212",
                 "exact-version-unavailable",
                 "exact-version-mismatch",
+                "candidate-inspection-inconclusive",
                 "fixed credential-free environment",
                 "never downloads",
                 "active symlink",
@@ -1479,6 +1489,9 @@ class RepositoryContractTest(unittest.TestCase):
             "before any candidate execution",
             "Only that publisher-verified artifact may receive the version probe",
             "Scripts, interpreter wrappers, wrong signed artifacts, and caller-`PATH` candidates are never executed",
+            "resolves the configured system temporary parent to its canonical path",
+            "macOS `/tmp -> /private/tmp`",
+            "Never collapse inspection uncertainty into deterministic unavailability",
         ):
             self.assertIn(anchor, canonical)
         self.assertTrue(helper_path.is_file())

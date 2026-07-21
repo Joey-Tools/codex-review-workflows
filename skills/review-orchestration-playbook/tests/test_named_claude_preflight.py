@@ -16,6 +16,7 @@ SCRIPTS = SKILL_ROOT / "scripts"
 PREFLIGHT = SCRIPTS / "named_claude_preflight"
 sys.path.insert(0, str(SCRIPTS))
 
+from review_runtime import claude_linux, claude_provenance  # noqa: E402
 from review_runtime import named_claude_preflight as preflight_module  # noqa: E402
 
 
@@ -292,6 +293,186 @@ class NamedClaudePreflightTest(unittest.TestCase):
                 len(payload), preflight_module.MACHINE_OUTPUT_LIMIT_BYTES
             )
             self.assertEqual(json.loads(payload), value)
+
+    def test_linux_identity_inspection_failure_is_inconclusive_without_probe(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            home = root / "home"
+            exact = home / ".local/share/claude/versions/2.1.212"
+            self._write_candidate(exact)
+            probe_called = False
+
+            def forbidden_probe(_path: pathlib.Path) -> preflight_module.ProbeResult:
+                nonlocal probe_called
+                probe_called = True
+                raise AssertionError("probe must not run")
+
+            with (
+                mock.patch.object(preflight_module.sys, "platform", "linux"),
+                mock.patch.object(claude_linux, "detect_host", return_value=object()),
+                mock.patch.object(
+                    claude_linux,
+                    "validate_claude_executable",
+                    side_effect=claude_linux.LinuxRuntimeInspectionInconclusive(
+                        "synthetic identity drift"
+                    ),
+                ),
+            ):
+                value = preflight_module.preflight(
+                    home=home,
+                    verifier=preflight_module.verify_publisher_candidate,
+                    version_probe=forbidden_probe,
+                )
+
+            self.assertFalse(probe_called)
+            self.assertEqual(value["classification"], "inconclusive")
+            self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
+
+    def test_darwin_header_io_failure_is_inconclusive_without_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            home = root / "home"
+            exact = home / ".local/share/claude/versions/2.1.212"
+            self._write_candidate(exact)
+            probe_called = False
+
+            def forbidden_probe(_path: pathlib.Path) -> preflight_module.ProbeResult:
+                nonlocal probe_called
+                probe_called = True
+                raise AssertionError("probe must not run")
+
+            with (
+                mock.patch.object(preflight_module.sys, "platform", "darwin"),
+                mock.patch.object(
+                    pathlib.Path,
+                    "open",
+                    autospec=True,
+                    side_effect=OSError("synthetic temporary read failure"),
+                ),
+            ):
+                value = preflight_module.preflight(
+                    home=home,
+                    verifier=preflight_module.verify_publisher_candidate,
+                    version_probe=forbidden_probe,
+                )
+
+            self.assertFalse(probe_called)
+            self.assertEqual(value["classification"], "inconclusive")
+            self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
+
+    def test_symlinked_provenance_parent_is_canonicalized_before_validation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            real_parent = root / "real-provenance-root"
+            real_parent.mkdir(mode=0o700)
+            alias_parent = root / "provenance-root-alias"
+            alias_parent.symlink_to(real_parent, target_is_directory=True)
+            candidate = root / "claude"
+            self._write_candidate(candidate)
+            observed_roots: list[pathlib.Path] = []
+
+            def release_verifier(
+                executable: pathlib.Path,
+                *,
+                version: str,
+                platform_key: str,
+                gpg_temp_root: pathlib.Path,
+            ) -> claude_provenance.VerifiedClaudeExecutable:
+                self.assertEqual(version, "2.1.212")
+                self.assertEqual(platform_key, "darwin-arm64")
+                trust = claude_provenance._resolve_trusted_gpg_temp_root(
+                    gpg_temp_root,
+                    validator=None,
+                )
+                self.assertEqual(trust.requested, trust.resolved)
+                observed_roots.append(gpg_temp_root)
+                resolved = executable.resolve(strict=True)
+                payload = resolved.read_bytes()
+                artifact = claude_provenance.ClaudeReleaseArtifact(
+                    version=version,
+                    platform_key=platform_key,
+                    binary="claude",
+                    checksum="a" * 64,
+                    size=len(payload),
+                )
+                return claude_provenance.VerifiedClaudeExecutable(
+                    executable=resolved,
+                    artifact=artifact,
+                    manifest_url="https://downloads.claude.ai/manifest.json",
+                    signature_url="https://downloads.claude.ai/manifest.json.sig",
+                    gpg_path=pathlib.Path("/trusted/gpg"),
+                )
+
+            with (
+                mock.patch.object(
+                    preflight_module,
+                    "PROVENANCE_TEMP_ROOT",
+                    alias_parent,
+                ),
+                mock.patch.object(
+                    preflight_module,
+                    "_platform_key",
+                    return_value="darwin-arm64",
+                ),
+                mock.patch.object(
+                    preflight_module,
+                    "verify_claude_release",
+                    side_effect=release_verifier,
+                ),
+            ):
+                verified = preflight_module.verify_publisher_candidate(candidate)
+
+            self.assertEqual(verified.resolved_path, candidate.resolve())
+            self.assertEqual(len(observed_roots), 1)
+            self.assertEqual(observed_roots[0], observed_roots[0].resolve())
+            self.assertEqual(observed_roots[0].parent, real_parent.resolve())
+
+    def test_unresolvable_provenance_parent_is_inconclusive_before_execution(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            home = root / "home"
+            exact = home / ".local/share/claude/versions/2.1.212"
+            self._write_candidate(exact)
+            missing_parent = root / "missing-provenance-root"
+            probe_called = False
+
+            def forbidden_probe(_path: pathlib.Path) -> preflight_module.ProbeResult:
+                nonlocal probe_called
+                probe_called = True
+                raise AssertionError("probe must not run")
+
+            with (
+                mock.patch.object(
+                    preflight_module,
+                    "PROVENANCE_TEMP_ROOT",
+                    missing_parent,
+                ),
+                mock.patch.object(
+                    preflight_module,
+                    "_platform_key",
+                    return_value="darwin-arm64",
+                ),
+                mock.patch.object(
+                    preflight_module,
+                    "verify_claude_release",
+                ) as release_verifier,
+            ):
+                value = preflight_module.preflight(
+                    home=home,
+                    verifier=preflight_module.verify_publisher_candidate,
+                    version_probe=forbidden_probe,
+                )
+
+            release_verifier.assert_not_called()
+            self.assertFalse(probe_called)
+            self.assertEqual(value["classification"], "inconclusive")
+            self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
 
     def test_public_main_contains_unexpected_error_as_one_json_object(self) -> None:
         output = types.SimpleNamespace(value="")
