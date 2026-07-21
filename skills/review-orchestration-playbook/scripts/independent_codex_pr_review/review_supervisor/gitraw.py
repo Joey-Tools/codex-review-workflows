@@ -34,6 +34,10 @@ from .secureio import (
 )
 
 
+CAT_FILE_CLOSE_TIMEOUT_SECONDS = 5.0
+CAT_FILE_STDERR_LIMIT_BYTES = 8192
+
+
 @dataclass(frozen=True)
 class RepositoryInfo:
     repo: pathlib.Path
@@ -191,6 +195,69 @@ def run_bounded(
         selector.close()
         if process.stdin is not None and not process.stdin.closed:
             process.stdin.close()
+        process.stdout.close()
+        process.stderr.close()
+
+
+def _drain_started_process(
+    process: subprocess.Popen[bytes],
+    *,
+    timeout: float,
+    stdout_limit: int,
+    stderr_limit: int,
+) -> tuple[int, bytes, bytes]:
+    if process.stdout is None or process.stderr is None:
+        _terminate_process(process)
+        raise RuntimeError("cannot drain bounded Git pipes")
+    selector = selectors.DefaultSelector()
+    streams = {
+        process.stdout.fileno(): (process.stdout, stdout_limit),
+        process.stderr.fileno(): (process.stderr, stderr_limit),
+    }
+    buffers: dict[int, bytearray] = {fd: bytearray() for fd in streams}
+    deadline = time.monotonic() + timeout
+    try:
+        for descriptor in streams:
+            os.set_blocking(descriptor, False)
+            selector.register(descriptor, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("bounded Git shutdown timed out")
+            events = selector.select(min(remaining, 0.25))
+            if not events and process.poll() is not None:
+                events = [
+                    (key, selectors.EVENT_READ) for key in selector.get_map().values()
+                ]
+            for key, _ in events:
+                descriptor = key.fd
+                try:
+                    chunk = os.read(descriptor, 64 * 1024)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(descriptor)
+                    continue
+                _, limit = streams[descriptor]
+                if len(buffers[descriptor]) + len(chunk) > limit:
+                    raise OverflowError(
+                        "bounded Git shutdown output exceeded its byte cap"
+                    )
+                buffers[descriptor].extend(chunk)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("bounded Git shutdown timed out before reap")
+        returncode = process.wait(timeout=remaining)
+        return (
+            returncode,
+            bytes(buffers[process.stdout.fileno()]),
+            bytes(buffers[process.stderr.fileno()]),
+        )
+    except BaseException:
+        _terminate_process(process)
+        raise
+    finally:
+        selector.close()
         process.stdout.close()
         process.stderr.close()
 
@@ -469,6 +536,7 @@ class CatFileBatch:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            bufsize=0,
             close_fds=True,
             start_new_session=False,
         )
@@ -528,16 +596,31 @@ class CatFileBatch:
         if self.closed:
             return
         self.closed = True
-        self.process.stdin.close()
-        extra = self.process.stdout.read(1)
-        if extra:
+        try:
+            self.process.stdin.close()
+            returncode, extra, stderr = _drain_started_process(
+                self.process,
+                timeout=CAT_FILE_CLOSE_TIMEOUT_SECONDS,
+                stdout_limit=1,
+                stderr_limit=CAT_FILE_STDERR_LIMIT_BYTES,
+            )
+        except (OverflowError, subprocess.TimeoutExpired, TimeoutError) as error:
+            raise ValueError(
+                "cat-file producer failed or emitted invalid bounded shutdown output"
+            ) from error
+        except BaseException:
             _terminate_process(self.process)
+            for stream in (
+                self.process.stdin,
+                self.process.stdout,
+                self.process.stderr,
+            ):
+                if stream is not None and not stream.closed:
+                    stream.close()
+            raise
+        if extra:
             raise ValueError("cat-file emitted bytes after the exact request stream")
-        returncode = self.process.wait(timeout=5)
-        stderr = self.process.stderr.read(8193)
-        self.process.stdout.close()
-        self.process.stderr.close()
-        if len(stderr) > 8192 or returncode != 0:
+        if len(stderr) > CAT_FILE_STDERR_LIMIT_BYTES or returncode != 0:
             raise ValueError(
                 "cat-file producer failed or emitted oversized diagnostics"
             )

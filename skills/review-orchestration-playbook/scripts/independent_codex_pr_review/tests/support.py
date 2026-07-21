@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import os
 import pathlib
+import pwd
 import shutil
+import stat
+import subprocess
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -16,13 +20,158 @@ from review_supervisor.constants import (
 )
 
 
-RUNTIME_ROOT = pathlib.Path(__file__).parent / ".runtime"
+_RUNTIME_ROOT: pathlib.Path | None = None
+_RUNTIME_ROOT_PID: int | None = None
+
+
+def _validated_private_runtime_parent(raw_path: str) -> pathlib.Path | None:
+    candidate = pathlib.Path(raw_path)
+    if not candidate.is_absolute():
+        return None
+    try:
+        canonical = candidate.resolve(strict=True)
+    except OSError:
+        return None
+    try:
+        str(canonical).encode("ascii")
+    except UnicodeEncodeError:
+        return None
+
+    owner_uid = os.getuid()
+    current = pathlib.Path("/")
+    try:
+        root_metadata = current.stat(follow_symlinks=False)
+    except OSError:
+        return None
+    if (
+        not stat.S_ISDIR(root_metadata.st_mode)
+        or root_metadata.st_uid != 0
+        or root_metadata.st_mode
+        & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)
+    ):
+        return None
+    for part in canonical.parts[1:]:
+        current /= part
+        try:
+            metadata = current.stat(follow_symlinks=False)
+        except OSError:
+            return None
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid not in {0, owner_uid}
+            or metadata.st_mode
+            & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)
+        ):
+            return None
+
+    try:
+        leaf = canonical.stat(follow_symlinks=False)
+    except OSError:
+        return None
+    if leaf.st_uid != owner_uid or not os.access(canonical, os.W_OK | os.X_OK):
+        return None
+    return canonical
+
+
+def _private_runtime_parent() -> pathlib.Path:
+    account_home = pwd.getpwuid(os.getuid()).pw_dir
+    # Shared OS runtime roots have unrelated metadata churn that invalidates
+    # executable path-identity checks while a fixture is under authentication.
+    candidates = (
+        *_repository_runtime_candidates(),
+        account_home,
+        os.environ.get("XDG_RUNTIME_DIR"),
+        os.environ.get("TMPDIR"),
+    )
+    for raw_path in candidates:
+        if raw_path and (parent := _validated_private_runtime_parent(raw_path)):
+            return parent
+    raise RuntimeError("no trusted private test runtime parent is available")
+
+
+def _repository_runtime_candidates() -> tuple[str, ...]:
+    git = shutil.which("git", path="/usr/bin:/bin:/usr/local/bin")
+    if git is None:
+        return ()
+    environment = {
+        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        "LC_ALL": "C",
+        "LANG": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+    }
+    try:
+        result = subprocess.run(
+            (
+                git,
+                "-C",
+                str(pathlib.Path(__file__).resolve().parent),
+                "rev-parse",
+                "--path-format=absolute",
+                "--show-toplevel",
+                "--git-common-dir",
+            ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ()
+    if result.returncode != 0 or len(result.stdout) > 8192:
+        return ()
+    try:
+        checkout_text, common_text = result.stdout.decode("utf-8").splitlines()
+    except (UnicodeDecodeError, ValueError):
+        return ()
+    checkout = pathlib.Path(checkout_text)
+    common_dir = pathlib.Path(common_text)
+    candidates = [str(checkout.parent)]
+    if common_dir.name == ".git":
+        candidates.append(str(common_dir.parent.parent))
+    return tuple(dict.fromkeys(candidates))
+
+
+def _cleanup_process_runtime_root(path: pathlib.Path, owner_pid: int) -> None:
+    if os.getpid() == owner_pid:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _process_runtime_root() -> pathlib.Path:
+    global _RUNTIME_ROOT, _RUNTIME_ROOT_PID
+
+    current_pid = os.getpid()
+    if _RUNTIME_ROOT is not None and _RUNTIME_ROOT_PID == current_pid:
+        return _RUNTIME_ROOT
+
+    root = pathlib.Path(
+        tempfile.mkdtemp(
+            prefix=".codex-review-tests-",
+            dir=_private_runtime_parent(),
+        )
+    )
+    os.chmod(root, 0o700)
+    metadata = root.stat(follow_symlinks=False)
+    if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
+        shutil.rmtree(root, ignore_errors=True)
+        raise RuntimeError("test runtime root has an unsafe identity")
+    _RUNTIME_ROOT = root
+    _RUNTIME_ROOT_PID = current_pid
+    atexit.register(_cleanup_process_runtime_root, root, current_pid)
+    return root
 
 
 @contextmanager
 def owned_temporary_directory(prefix: str) -> Iterator[pathlib.Path]:
-    RUNTIME_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path = pathlib.Path(tempfile.mkdtemp(prefix=prefix, dir=RUNTIME_ROOT))
+    path = pathlib.Path(
+        tempfile.mkdtemp(
+            prefix=f".codex-review-{prefix}",
+            dir=_process_runtime_root(),
+        )
+    )
     os.chmod(path, 0o700)
     try:
         yield path

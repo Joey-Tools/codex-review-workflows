@@ -637,3 +637,20 @@ metadata behavior.
   synthetic-token catalog validation, and pinned-Xcode broker byte
   reproduction pass. Ruff 0.13.2 also identifies three baseline-identical
   files outside the PR range that it would now reformat; they remain unchanged.
+- Fresh-context Codex review of `217a357..eda22a2` found two shutdown and test
+  isolation gaps. `CatFileBatch.close()` now drains stdout and stderr
+  concurrently under one bounded deadline, caps diagnostics, and terminates and
+  reaps on timeout or overflow; watchdog regressions cover a full stderr pipe,
+  an open-pipe producer, and unexpected stdout. Independent supervisor fixtures
+  now live in a process-scoped private runtime root outside the source checkout.
+  The root selection validates the complete ancestor chain and uses the current
+  checkout parent or linked worktree common checkout parent before account or OS
+  runtime fallbacks, so a `/private/tmp` review worktree does not weaken the
+  executable trust policy or inherit sticky ancestors. Validation used only
+  Python 3.13: both affected modules passed 55 tests with 1 host-gated skip, the
+  deterministic supervisor passed all 299 tests in the main worktree, and the
+  same 299-test gate passed with zero skips from a detached `/private/tmp`
+  linked worktree. The complete main suite passed all 2,294 tests with 6
+  host-gated skips outside the enclosing Codex Seatbelt; inside it, the only
+  failure was the expected inability to nest the keychain broker's own
+  `sandbox-exec`, and that exact test passed outside the outer sandbox.

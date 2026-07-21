@@ -6,6 +6,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import threading
 import time
 import unittest
 from types import SimpleNamespace
@@ -154,6 +155,25 @@ def _protocol_batch(response: bytes) -> CatFileBatch:
     return batch
 
 
+def _scripted_batch(root: pathlib.Path, script: bytes) -> CatFileBatch:
+    repo = root / "repo"
+    repo.mkdir(mode=0o700)
+    executable = root / "fake-git"
+    executable.write_bytes(script)
+    executable.chmod(0o700)
+    return CatFileBatch(
+        RepositoryInfo(
+            repo=repo,
+            common_git_dir=repo / ".git",
+            object_format="sha1",
+            object_hex_length=40,
+            base_sha="1" * 40,
+            head_sha="2" * 40,
+            git_executable=str(executable),
+        )
+    )
+
+
 class RawGitProtocolTests(unittest.TestCase):
     def test_tree_parser_enforces_symlink_target_size_limit(self) -> None:
         object_id = b"a" * 40
@@ -190,6 +210,67 @@ class RawGitProtocolTests(unittest.TestCase):
         self.assertEqual(captured, payload)
         self.assertEqual(batch.requests, 1)
         write.assert_called_once_with(91, object_id.encode("ascii") + b"\n")
+
+        scripts = (
+            (
+                "stderr-overflow",
+                b"#!/bin/sh\nexec /usr/bin/head -c 4194304 /dev/zero >&2\n",
+                OverflowError,
+                2.0,
+            ),
+            (
+                "open-pipes",
+                b"#!/bin/sh\nexec /bin/sleep 30\n",
+                TimeoutError,
+                0.25,
+            ),
+            ("unexpected-stdout", b"#!/bin/sh\nprintf x\n", None, 2.0),
+        )
+        for label, script, expected_cause, close_timeout in scripts:
+            with self.subTest(shutdown_case=label):
+                with owned_temporary_directory("git-cat-file-close-") as root:
+                    live_batch = _scripted_batch(root, script)
+                    errors: list[BaseException] = []
+
+                    def close_batch() -> None:
+                        try:
+                            live_batch.close()
+                        except BaseException as error:
+                            errors.append(error)
+
+                    with mock.patch(
+                        "review_supervisor.gitraw.CAT_FILE_CLOSE_TIMEOUT_SECONDS",
+                        close_timeout,
+                    ):
+                        worker = threading.Thread(target=close_batch, daemon=True)
+                        worker.start()
+                        worker.join(timeout=4)
+                    blocked = worker.is_alive()
+                    if blocked:
+                        if live_batch.process.poll() is None:
+                            live_batch.process.terminate()
+                            try:
+                                live_batch.process.wait(timeout=2)
+                            except subprocess.TimeoutExpired:
+                                live_batch.process.kill()
+                                live_batch.process.wait(timeout=2)
+                        worker.join(timeout=2)
+                    self.assertFalse(blocked, "cat-file shutdown blocked on one pipe")
+                    self.assertFalse(worker.is_alive())
+                    self.assertEqual(len(errors), 1)
+                    self.assertIsInstance(errors[0], ValueError)
+                    self.assertIsNotNone(live_batch.process.poll())
+                    for stream in (
+                        live_batch.process.stdin,
+                        live_batch.process.stdout,
+                        live_batch.process.stderr,
+                    ):
+                        self.assertIsNotNone(stream)
+                        self.assertTrue(stream.closed)
+                    if expected_cause is None:
+                        self.assertIsNone(errors[0].__cause__)
+                    else:
+                        self.assertIsInstance(errors[0].__cause__, expected_cause)
 
     def test_cat_file_rejects_oid_type_and_length_header_mismatches(self) -> None:
         payload = b"payload"

@@ -787,6 +787,15 @@ class CodexExecutableAuthenticationTests(unittest.TestCase):
     def test_authenticates_source_into_private_snapshot_and_returns_both_fds(
         self,
     ) -> None:
+        with owned_temporary_directory("codex-fixture-lifecycle-") as lifecycle_root:
+            lifecycle_stat = lifecycle_root.stat(follow_symlinks=False)
+            self.assertEqual(lifecycle_stat.st_uid, os.getuid())
+            self.assertEqual(stat.S_IMODE(lifecycle_stat.st_mode), 0o700)
+            self.assertFalse(
+                lifecycle_root.is_relative_to(pathlib.Path(__file__).resolve().parent)
+            )
+        self.assertFalse(lifecycle_root.exists())
+
         with owned_temporary_directory("codex-executable-") as root:
             fixture = _build_fixture(root)
             runner = FakeRunner(fixture)
