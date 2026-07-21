@@ -114,8 +114,6 @@ def _resolve_worktree_root(worktree: pathlib.Path) -> pathlib.Path:
         resolved = lexical.resolve(strict=True)
     except (OSError, RuntimeError) as error:
         raise NamedLaneGuardError("worktree path cannot be resolved safely") from error
-    if resolved != lexical:
-        raise NamedLaneGuardError("worktree path must not traverse a symlink")
     top_level = os.fsdecode(
         _git_capture(resolved, ("rev-parse", "--show-toplevel"))
     ).strip()

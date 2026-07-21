@@ -1127,9 +1127,7 @@ class RepositoryContractTest(unittest.TestCase):
         )
         entrypoint_path = SCRIPTS / "named_lane_guard"
         entrypoint = entrypoint_path.read_text(encoding="utf-8")
-        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(
-            encoding="utf-8"
-        )
+        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(encoding="utf-8")
 
         for content in (skill, contracts, canonical):
             self.assertIn("scripts/named_lane_guard run-claude", content)
@@ -1140,6 +1138,10 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("direct", content)
             self.assertIn("inconclusive", content)
             self.assertIn("partial", content)
+            self.assertIn("initial supervisor process group", content)
+            self.assertIn("inherited stream", content)
+            self.assertIn("setsid()", content)
+            self.assertIn("not a process-tree sandbox", content)
         for non_guarantee in (
             "prepare",
             "review logic",
@@ -1157,6 +1159,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("DEFAULT_TIMEOUT_SECONDS = 1_800.0", runtime)
         self.assertIn("DEFAULT_STREAM_LIMIT_BYTES = 64 * 1024 * 1024", runtime)
         self.assertIn("run_bounded_capture", runtime)
+        self.assertIn("whole-process-tree quiescence", canonical)
 
     def test_named_lane_keeps_raw_findings_separate_from_parent_metadata(
         self,

@@ -87,6 +87,25 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(result.symlink_count, 1)
         self.assertEqual(result.guidance_count, 1)
 
+    def test_worktree_path_through_symlink_ancestor_is_allowed(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        head = self.commit()
+        ancestor = self.root / "ancestor"
+        ancestor.symlink_to(self.root, target_is_directory=True)
+
+        result = validate_worktree((ancestor / self.repo.name).absolute(), head)
+
+        self.assertEqual(result.root, self.repo.resolve())
+
+    def test_worktree_path_with_symlink_leaf_is_rejected(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        head = self.commit()
+        worktree_link = self.root / "worktree-link"
+        worktree_link.symlink_to(self.repo, target_is_directory=True)
+
+        with self.assertRaisesRegex(NamedLaneGuardError, "real directory"):
+            validate_worktree(worktree_link.absolute(), head)
+
     def test_absolute_and_relative_escaping_symlinks_are_rejected(self) -> None:
         for target in (str(self.root / "outside"), "../outside"):
             with self.subTest(target=target):
@@ -248,6 +267,53 @@ class NamedLaneGuardTest(unittest.TestCase):
             )
 
         self.assertLess(time.monotonic() - started, 3.0)
+
+    @unittest.skipUnless(os.name == "posix", "detached-process test requires POSIX")
+    def test_process_supervisor_does_not_claim_detached_tree_containment(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        pid_path = self.root / "detached.pid"
+        executable = self.make_executable(
+            "import os, pathlib, sys, time\n"
+            "pid = os.fork()\n"
+            "if pid == 0:\n"
+            "    os.setsid()\n"
+            "    pathlib.Path(sys.argv[1]).write_text(str(os.getpid()), encoding='ascii')\n"
+            "    for descriptor in (0, 1, 2):\n"
+            "        try:\n"
+            "            os.close(descriptor)\n"
+            "        except OSError:\n"
+            "            pass\n"
+            "    time.sleep(30)\n"
+            "    os._exit(0)\n"
+            "os._exit(0)\n"
+        )
+        detached_pid: int | None = None
+        try:
+            result = run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=self.root / "detached.out",
+                stderr_path=self.root / "detached.err",
+                command=(str(executable), str(pid_path)),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=64,
+            )
+            deadline = time.monotonic() + 2.0
+            while not pid_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(pid_path.exists())
+            detached_pid = int(pid_path.read_text(encoding="ascii"))
+            os.kill(detached_pid, 0)
+            self.assertEqual(result["status"], "complete")
+        finally:
+            if detached_pid is not None:
+                try:
+                    os.kill(detached_pid, 9)
+                except ProcessLookupError:
+                    pass
 
     def test_process_rejects_output_inside_worktree_and_nonexact_executable(
         self,
