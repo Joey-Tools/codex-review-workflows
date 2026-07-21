@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import unittest
 from unittest import mock
 
@@ -122,6 +123,50 @@ class ReleaseVersionTest(unittest.TestCase):
 
 
 class SignedManifestFetchTest(unittest.TestCase):
+    def test_deadline_cleanup_legacy_fallback_respects_context_visibility(
+        self,
+    ) -> None:
+        class LegacyError(RuntimeError):
+            add_note = None
+
+        sensitive_path = "/fixture/private/suppressed-provenance-context/auth.json"
+        for suppress_context in (False, True):
+            with self.subTest(suppress_context=suppress_context):
+                marker = (
+                    sensitive_path if suppress_context else "visible-provenance-context"
+                )
+                original_context = RuntimeError(marker)
+                primary = LegacyError("primary deadline failure")
+                primary.__context__ = original_context
+                primary.__suppress_context__ = suppress_context
+
+                claude_provenance._add_deadline_cleanup_note(
+                    primary,
+                    OSError("deadline cleanup failed"),
+                )
+
+                diagnostic = primary.__cause__
+                self.assertIsInstance(
+                    diagnostic,
+                    claude_provenance._FetchDeadlineCleanupDiagnostic,
+                )
+                assert diagnostic is not None
+                if suppress_context:
+                    self.assertIsNone(diagnostic.__context__)
+                else:
+                    self.assertIs(diagnostic.__context__, original_context)
+                formatted = "".join(
+                    traceback.format_exception(
+                        type(primary),
+                        primary,
+                        primary.__traceback__,
+                    )
+                )
+                if suppress_context:
+                    self.assertNotIn(marker, formatted)
+                else:
+                    self.assertIn(marker, formatted)
+
     def test_deadline_rejects_blocked_sigalrm_before_installing_handler(self) -> None:
         with (
             mock.patch.object(

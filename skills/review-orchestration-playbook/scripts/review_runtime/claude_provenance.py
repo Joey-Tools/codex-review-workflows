@@ -210,7 +210,7 @@ def _add_deadline_cleanup_note(
     diagnostic = _FetchDeadlineCleanupDiagnostic(note)
     if error.__cause__ is not None:
         diagnostic.__cause__ = error.__cause__
-    elif error.__context__ is not None:
+    elif not error.__suppress_context__ and error.__context__ is not None:
         diagnostic.__context__ = error.__context__
     error.__cause__ = diagnostic
 
