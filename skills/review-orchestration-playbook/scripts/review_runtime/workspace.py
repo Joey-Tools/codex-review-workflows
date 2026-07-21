@@ -317,6 +317,9 @@ SYNTHETIC_PRIVATE_MANIFEST_NAME = "synthetic-secret-state.json"
 SYNTHETIC_CHANGED_EVIDENCE_NAME = "synthetic-changed-evidence.json"
 SYNTHETIC_MANIFEST_SCHEMA_VERSION = 5
 SECRET_REDUCTION_PROVENANCE_SCHEME = "path-surface-offset-sha256-v1"
+PRIVATE_MANIFEST_SHARD_COMMITMENT_PREFIX = (
+    "Complementary helper-private manifest rows are integrity-bound by SHA-256:"
+)
 CONTROL_ARTIFACT_STATE_NAME = "control-artifact-state.json"
 CONTROL_ARTIFACT_SCHEMA_VERSION = 5
 CHANGED_PATH_DIGESTS_NAME = "changed-path-digests.z"
@@ -4777,6 +4780,145 @@ def _secret_delta_addition_locations(
     return evidence, location_complete
 
 
+def _private_manifest_shard_rows_sha256(
+    manifest: dict[str, Any],
+    raw_reduction_values: list[Any],
+) -> str:
+    try:
+        payload = {
+            "entries": manifest["entries"],
+            "secret_delta_violations": manifest["secret_delta"]["violations"],
+            "secret_reduction_values": raw_reduction_values,
+            "secret_reductions": manifest["secret_reductions"],
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (KeyError, TypeError, ValueError) as error:
+        raise ReviewError(
+            "helper-private manifest shard commitment payload is invalid"
+        ) from error
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _private_manifest_shard_commitment(digest: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ReviewError("helper-private manifest shard commitment is invalid")
+    return f"{PRIVATE_MANIFEST_SHARD_COMMITMENT_PREFIX}{digest}"
+
+
+def _shard_catalog_count_manifest(
+    manifest: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    secret_delta = manifest["secret_delta"]
+    violations = secret_delta["violations"]
+    if (
+        secret_delta["status"] not in {"clean", "violations"}
+        or (secret_delta["status"] == "clean" and violations)
+        or (secret_delta["status"] == "violations" and not violations)
+        or manifest["secret_reductions"]
+    ):
+        raise ReviewError(
+            "synthetic secret manifest cannot represent complete bounded counts"
+        )
+    if any(
+        limitation.startswith(PRIVATE_MANIFEST_SHARD_COMMITMENT_PREFIX)
+        for limitation in secret_delta["limitations"]
+    ):
+        raise ReviewError("synthetic secret manifest shard commitment is duplicated")
+    placeholder_commitment = _private_manifest_shard_commitment("0" * 64)
+    manifest = dict(manifest)
+    secret_delta = dict(secret_delta)
+    secret_delta["limitations"] = [
+        *secret_delta["limitations"],
+        placeholder_commitment,
+    ]
+    manifest["secret_delta"] = secret_delta
+    violation_digests = {violation["value_sha256"] for violation in violations}
+    retained_entries = [
+        entry
+        for entry in manifest["entries"]
+        if entry["value_sha256"] not in violation_digests
+    ]
+
+    def build(
+        entries: list[dict[str, Any]],
+        shard_violations: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        shard = dict(manifest)
+        shard["entries"] = list(entries)
+        shard_delta = dict(secret_delta)
+        shard_delta["violations"] = list(shard_violations)
+        shard["secret_delta"] = shard_delta
+        return shard
+
+    shard_entries: tuple[list[dict[str, Any]], list[dict[str, Any]]] = ([], [])
+    shard_violations: tuple[list[dict[str, Any]], list[dict[str, Any]]] = ([], [])
+    sizes = [
+        len(
+            _bounded_json_bytes(
+                build(shard_entries[index], shard_violations[index]),
+                label="synthetic secret manifest shard",
+            )
+        )
+        for index in range(2)
+    ]
+    records: list[tuple[str, dict[str, Any]]] = [
+        ("violations", violation) for violation in violations
+    ] + [("entries", entry) for entry in retained_entries]
+    records.sort(
+        key=lambda item: len(
+            json.dumps(item[1], separators=(",", ":"), sort_keys=True).encode("utf-8")
+        ),
+        reverse=True,
+    )
+    for kind, record in records:
+        placed = False
+        for index in sorted(range(2), key=lambda candidate: sizes[candidate]):
+            destination = (
+                shard_violations[index]
+                if kind == "violations"
+                else shard_entries[index]
+            )
+            destination.append(record)
+            try:
+                encoded = _bounded_json_bytes(
+                    build(shard_entries[index], shard_violations[index]),
+                    label="synthetic secret manifest shard",
+                )
+            except ReviewError:
+                destination.pop()
+                continue
+            sizes[index] = len(encoded)
+            placed = True
+            break
+        if not placed:
+            raise ReviewError(
+                "synthetic secret manifest cannot represent complete bounded counts"
+            )
+    shards = tuple(
+        build(shard_entries[index], shard_violations[index]) for index in range(2)
+    )
+    private_digest = _private_manifest_shard_rows_sha256(shards[1], [])
+    commitment = _private_manifest_shard_commitment(private_digest)
+    committed_shards: list[dict[str, Any]] = []
+    for shard in shards:
+        committed = dict(shard)
+        committed_delta = dict(shard["secret_delta"])
+        committed_delta["limitations"] = [
+            commitment if item == placeholder_commitment else item
+            for item in committed_delta["limitations"]
+        ]
+        committed["secret_delta"] = committed_delta
+        _bounded_json_bytes(committed, label="synthetic secret manifest shard")
+        committed_shards.append(committed)
+    return committed_shards[0], committed_shards[1]
+
+
 def _secret_count_manifests(
     *,
     git_view: pathlib.Path,
@@ -4794,12 +4936,18 @@ def _secret_count_manifests(
     legacy_accepted = accepted_legacy_values(catalog, catalog.legacy_exemptions)
     authoring_accepted = accepted_authoring_values(catalog)
     scan_accepted = authoring_accepted + legacy_accepted
+    legacy_raw_values = frozenset(
+        descriptor.value
+        for descriptor in legacy_accepted
+        if descriptor.value is not None
+    )
     base_discovery = _scan_frozen_tree_values(
         git_view=git_view,
         object_directory=object_directory,
         commit=base_sha,
         accepted_values=scan_accepted,
         capture_blocking_candidates=True,
+        reduced_secret_values=legacy_raw_values,
         _continue_after_blocking=True,
     )
     head_discovery = _scan_frozen_tree_values(
@@ -4808,6 +4956,7 @@ def _secret_count_manifests(
         commit=head_sha,
         accepted_values=scan_accepted,
         capture_blocking_candidates=True,
+        reduced_secret_values=legacy_raw_values,
         _continue_after_blocking=True,
     )
     if head_discovery.unextractable_rule is not None:
@@ -4817,13 +4966,19 @@ def _secret_count_manifests(
     # Non-exact expressions have no stable byte identity and intentionally do
     # not enter the counter. Scanner resource failures still raise and are
     # recorded by the caller as an inconclusive merge gate.
-    reduction_descriptors = tuple(
-        _secret_reduction_descriptor(candidate, rules)
-        for candidate, rules in sorted(
-            discovery.blocking_candidates.items(),
-            key=lambda item: (hashlib.sha256(item[0]).hexdigest(), item[0]),
-        )
-    )
+    reduction_descriptors_list: list[AcceptedSyntheticValue] = []
+    for candidate, rules in sorted(
+        discovery.blocking_candidates.items(),
+        key=lambda item: (hashlib.sha256(item[0]).hexdigest(), item[0]),
+    ):
+        # Declared rules still govern accepted-fixture matching. Once an exact
+        # value reaches the count stage, however, raw bytes are its identity:
+        # rediscovery through another rule must not create a second counter.
+        if candidate in legacy_raw_values:
+            continue
+        descriptor = _secret_reduction_descriptor(candidate, rules)
+        reduction_descriptors_list.append(descriptor)
+    reduction_descriptors = tuple(reduction_descriptors_list)
     count_values = legacy_accepted + reduction_descriptors
     discovered_values = frozenset(discovery.blocking_candidates)
     if count_values:
@@ -4958,12 +5113,37 @@ def _secret_count_manifests(
     try:
         _bounded_json_bytes(public_manifest, label="synthetic secret manifest")
     except ReviewError:
-        public_manifest["secret_delta"]["location_status"] = "inconclusive"
-        for violation in public_manifest["secret_delta"]["violations"]:
-            violation["omitted_addition_location_count"] += len(violation["additions"])
-            violation["additions"] = []
-        _bounded_json_bytes(public_manifest, label="synthetic secret manifest")
-    private_manifest = dict(public_manifest)
+        sharded_manifests = None
+        if not reduction_descriptors:
+            try:
+                sharded_manifests = _shard_catalog_count_manifest(public_manifest)
+            except ReviewError:
+                pass
+        if sharded_manifests is not None:
+            public_manifest, private_manifest = sharded_manifests
+        else:
+            if public_manifest["secret_delta"]["violations"]:
+                public_manifest["secret_delta"]["location_status"] = "inconclusive"
+                for violation in public_manifest["secret_delta"]["violations"]:
+                    violation["omitted_addition_location_count"] += len(
+                        violation["additions"]
+                    )
+                    violation["additions"] = []
+            try:
+                _bounded_json_bytes(
+                    public_manifest,
+                    label="synthetic secret manifest",
+                )
+            except ReviewError:
+                if reduction_descriptors:
+                    raise
+                public_manifest, private_manifest = _shard_catalog_count_manifest(
+                    public_manifest
+                )
+            else:
+                private_manifest = dict(public_manifest)
+    else:
+        private_manifest = dict(public_manifest)
     if reduction_descriptors:
         private_manifest["secret_reduction_values"] = [
             {
@@ -5361,7 +5541,19 @@ def _validate_bounded_json_depth(value: dict[str, Any], *, label: str) -> None:
 
 
 def encode_preflight_json(value: dict[str, Any]) -> str:
-    encoded = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    encoded = (
+        json.dumps(value, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if len(encoded) > MAX_PREFLIGHT_JSON_BYTES:
+        encoded = (
+            json.dumps(
+                value,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
     if len(encoded) > MAX_PREFLIGHT_JSON_BYTES:
         raise ReviewError("serialized preflight evidence exceeds the size limit")
     return encoded.decode("utf-8")
@@ -5808,7 +6000,7 @@ def validate_secret_delta_summary(
         or not isinstance(value.get("limitations"), list)
         or not all(isinstance(item, str) for item in value.get("limitations", []))
         or not isinstance(value.get("violations"), list)
-        or len(value.get("violations", [])) > MAX_SECRET_REDUCTION_CANDIDATES
+        or len(value.get("violations", [])) > MAX_SYNTHETIC_EVIDENCE_ENTRIES
     ):
         raise ReviewError(f"{label} is invalid")
 
@@ -5916,6 +6108,176 @@ def validate_secret_delta_summary(
     return dict(value)
 
 
+def _merge_secret_count_manifest_shards(
+    workspace_manifest: dict[str, Any],
+    private_manifest: dict[str, Any],
+) -> tuple[dict[str, Any], bool, list[Any]]:
+    expected_fields = {
+        "base_ref",
+        "catalog_schema_version",
+        "entries",
+        "head_ref",
+        "pool_version",
+        "schema_version",
+        "secret_delta",
+        "secret_reductions",
+        "selected_exemptions",
+    }
+    private_only_fields = {"secret_reduction_values"}
+    private_fields = set(private_manifest)
+    if set(workspace_manifest) != expected_fields or private_fields not in (
+        expected_fields,
+        expected_fields | private_only_fields,
+    ):
+        raise ReviewError(
+            "synthetic secret manifest does not match helper-private state"
+        )
+    raw_reduction_values = private_manifest.get("secret_reduction_values", [])
+    if not isinstance(raw_reduction_values, list):
+        raise ReviewError(
+            "synthetic secret manifest does not match helper-private state"
+        )
+    private_public_fields = dict(private_manifest)
+    private_public_fields.pop("secret_reduction_values", None)
+    if workspace_manifest == private_public_fields:
+        standard_delta = private_public_fields.get("secret_delta")
+        standard_limitations = (
+            standard_delta.get("limitations", [])
+            if isinstance(standard_delta, dict)
+            else []
+        )
+        if any(
+            isinstance(item, str)
+            and item.startswith(PRIVATE_MANIFEST_SHARD_COMMITMENT_PREFIX)
+            for item in standard_limitations
+        ):
+            raise ReviewError(
+                "unsharded synthetic secret manifest has a shard commitment"
+            )
+        return dict(private_public_fields), False, list(raw_reduction_values)
+    varying_fields = {"entries", "secret_delta", "secret_reductions"}
+    if any(
+        workspace_manifest[field] != private_public_fields[field]
+        for field in expected_fields - varying_fields
+    ):
+        raise ReviewError(
+            "synthetic secret manifest does not match helper-private state"
+        )
+    if (
+        raw_reduction_values
+        or workspace_manifest["secret_reductions"]
+        or private_public_fields["secret_reductions"]
+    ):
+        raise ReviewError(
+            "synthetic secret manifest does not match helper-private state"
+        )
+    deltas = (
+        workspace_manifest["secret_delta"],
+        private_public_fields["secret_delta"],
+    )
+    if any(not isinstance(delta, dict) for delta in deltas):
+        raise ReviewError(
+            "synthetic secret manifest does not match helper-private state"
+        )
+    delta_fixed_fields = {"limitations", "location_status", "status"}
+    if any(
+        set(delta) != delta_fixed_fields | {"violations"}
+        or delta.get("status") not in {"clean", "violations"}
+        or not isinstance(delta.get("violations"), list)
+        for delta in deltas
+    ):
+        raise ReviewError(
+            "synthetic secret manifest does not match helper-private state"
+        )
+    if any(deltas[0][field] != deltas[1][field] for field in delta_fixed_fields):
+        raise ReviewError(
+            "synthetic secret manifest does not match helper-private state"
+        )
+    status = deltas[0]["status"]
+    has_violations = any(delta["violations"] for delta in deltas)
+    if (status == "clean" and has_violations) or (
+        status == "violations" and not has_violations
+    ):
+        raise ReviewError(
+            "synthetic secret manifest does not match helper-private state"
+        )
+    limitations = deltas[0]["limitations"]
+    if not isinstance(limitations, list):
+        raise ReviewError("helper-private manifest shard commitment is missing")
+    commitments = [
+        item
+        for item in limitations
+        if isinstance(item, str)
+        and item.startswith(PRIVATE_MANIFEST_SHARD_COMMITMENT_PREFIX)
+    ]
+    if (
+        len(commitments) != 1
+        or re.fullmatch(
+            re.escape(PRIVATE_MANIFEST_SHARD_COMMITMENT_PREFIX) + r"[0-9a-f]{64}",
+            commitments[0],
+        )
+        is None
+    ):
+        raise ReviewError("helper-private manifest shard commitment is invalid")
+    expected_private_digest = commitments[0][
+        len(PRIVATE_MANIFEST_SHARD_COMMITMENT_PREFIX) :
+    ]
+    actual_private_digest = _private_manifest_shard_rows_sha256(
+        private_public_fields,
+        raw_reduction_values,
+    )
+    if expected_private_digest != actual_private_digest:
+        raise ReviewError("helper-private manifest shard commitment does not match")
+    violation_digests: set[str] = set()
+    violations: list[dict[str, Any]] = []
+    for delta in deltas:
+        for violation in delta["violations"]:
+            if not isinstance(violation, dict):
+                raise ReviewError(
+                    "synthetic secret manifest does not match helper-private state"
+                )
+            digest = violation.get("value_sha256")
+            if not isinstance(digest, str) or digest in violation_digests:
+                raise ReviewError(
+                    "synthetic secret manifest does not match helper-private state"
+                )
+            violation_digests.add(digest)
+            violations.append(violation)
+    entries: list[dict[str, Any]] = []
+    entry_keys: set[tuple[str, str]] = set()
+    for shard in (workspace_manifest, private_public_fields):
+        shard_entries = shard["entries"]
+        if not isinstance(shard_entries, list):
+            raise ReviewError(
+                "synthetic secret manifest does not match helper-private state"
+            )
+        for entry in shard_entries:
+            if not isinstance(entry, dict):
+                raise ReviewError(
+                    "synthetic secret manifest does not match helper-private state"
+                )
+            key = (entry.get("exemption_id"), entry.get("token_id"))
+            if not all(isinstance(item, str) for item in key) or key in entry_keys:
+                raise ReviewError(
+                    "synthetic secret manifest does not match helper-private state"
+                )
+            entry_keys.add(key)
+            entries.append(entry)
+    merged = dict(workspace_manifest)
+    merged["entries"] = sorted(
+        entries,
+        key=lambda entry: (entry["exemption_id"], entry["token_id"]),
+    )
+    merged_delta = dict(deltas[0])
+    merged_delta["violations"] = sorted(
+        violations,
+        key=lambda violation: violation["value_sha256"],
+    )
+    merged["secret_delta"] = merged_delta
+    merged["secret_reductions"] = []
+    return merged, True, []
+
+
 def _load_legacy_manifest(
     *,
     control_dir: pathlib.Path,
@@ -5965,12 +6327,14 @@ def _load_legacy_manifest(
         label="synthetic secret helper-private state",
         expected_identity=expected_private_identity,
     )
-    raw_reduction_values = private_manifest.pop("secret_reduction_values", [])
-    manifest = private_manifest
-    if workspace_manifest != manifest:
-        raise ReviewError(
-            "synthetic secret manifest does not match helper-private state"
-        )
+    (
+        manifest,
+        manifest_was_sharded,
+        raw_reduction_values,
+    ) = _merge_secret_count_manifest_shards(
+        workspace_manifest,
+        private_manifest,
+    )
     if set(manifest) != {
         "base_ref",
         "catalog_schema_version",
@@ -6052,6 +6416,25 @@ def _load_legacy_manifest(
             0,
         )
         evidence.append(dict(raw_entry))
+    if manifest_was_sharded:
+        legacy_by_digest = {item.value_sha256: item for item in accepted}
+        for violation in secret_delta["violations"]:
+            descriptor = legacy_by_digest.get(violation["value_sha256"])
+            if (
+                descriptor is None
+                or descriptor in counts
+                or violation["rules"] != [descriptor.rule]
+                or violation["value_length"] != descriptor.value_length
+            ):
+                raise ReviewError(
+                    "sharded synthetic secret manifest violation is inconsistent"
+                )
+            counts[descriptor] = (
+                violation["base_count"],
+                violation["head_count"],
+                0,
+                0,
+            )
     if secret_delta["status"] != "inconclusive" and set(counts) != set(accepted):
         raise ReviewError("synthetic secret manifest does not cover its selection")
     raw_reductions = manifest["secret_reductions"]
@@ -6729,7 +7112,20 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             "secret_reductions": reduction_evidence,
         },
     }
-    _encode_synthetic_evidence_json(evidence)
+    try:
+        _encode_synthetic_evidence_json(evidence)
+    except ReviewError:
+        # The manifest has already validated every catalog and reduction count.
+        # For large evidence, keep the authoritative secret-delta admission
+        # result and omit its optional secondary audit rows. The 64-KiB bound
+        # applies to that secondary section; the complete preflight is
+        # independently bounded by MAX_PREFLIGHT_JSON_BYTES.
+        synthetic_tokens = dict(evidence["synthetic_tokens"])
+        for field in ("accepted", "legacy_counts", "secret_reductions"):
+            synthetic_tokens[field] = []
+        evidence = dict(evidence)
+        evidence["synthetic_tokens"] = synthetic_tokens
+        _encode_synthetic_evidence_json(synthetic_tokens)
     complete_preflight_evidence = build_preflight_evidence(review, evidence)
     encode_preflight_json(complete_preflight_evidence)
     _inspect_control_directory(control_dir, expected=control_state.directory)

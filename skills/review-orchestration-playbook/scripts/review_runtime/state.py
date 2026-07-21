@@ -40,6 +40,7 @@ from .providers import (
     run_review,
 )
 from .workspace import (
+    MAX_BOUNDED_JSON_DEPTH,
     MAX_PREFLIGHT_JSON_BYTES,
     PRIVATE_HELPER_ARTIFACT_NAMES,
     REVIEW_CLEANUP_LOCK_NAME,
@@ -711,6 +712,12 @@ class _MarkerObject(dict[str, Any]):
     duplicate_fields: frozenset[str]
 
 
+@dataclass(frozen=True)
+class _RawMarkerJsonValue:
+    encoded: str
+    max_container_depth: int
+
+
 def _capture_duplicate_marker_object(
     pairs: list[tuple[str, Any]],
 ) -> _MarkerObject:
@@ -735,6 +742,141 @@ def _first_duplicate_marker_field(value: Any) -> str | None:
         elif isinstance(current, list):
             pending.extend(current)
     return None
+
+
+def _skip_marker_json_whitespace(encoded: str, offset: int) -> int:
+    while offset < len(encoded) and encoded[offset] in " \t\r\n":
+        offset += 1
+    return offset
+
+
+def _scan_marker_json_string_end(encoded: str, offset: int) -> int:
+    if offset >= len(encoded) or encoded[offset] != '"':
+        raise ValueError("expected a JSON string")
+    offset += 1
+    while offset < len(encoded):
+        character = encoded[offset]
+        if character == '"':
+            return offset + 1
+        if character == "\\":
+            offset += 2
+        else:
+            offset += 1
+    raise ValueError("unterminated JSON string")
+
+
+def _scan_marker_json_value_end(encoded: str, offset: int) -> tuple[int, int]:
+    offset = _skip_marker_json_whitespace(encoded, offset)
+    if offset >= len(encoded):
+        raise ValueError("missing JSON value")
+    character = encoded[offset]
+    if character == '"':
+        return _scan_marker_json_string_end(encoded, offset), -1
+    if character in "{[":
+        delimiters = [character]
+        max_depth = 0
+        offset += 1
+        while offset < len(encoded):
+            character = encoded[offset]
+            if character == '"':
+                offset = _scan_marker_json_string_end(encoded, offset)
+                continue
+            if character in "{[":
+                delimiters.append(character)
+                max_depth = max(max_depth, len(delimiters) - 1)
+            elif character in "}]":
+                expected = "}" if delimiters[-1] == "{" else "]"
+                if character != expected:
+                    raise ValueError("mismatched JSON container")
+                delimiters.pop()
+                if not delimiters:
+                    return offset + 1, max_depth
+            offset += 1
+        raise ValueError("unterminated JSON container")
+    if character in ",}]":
+        raise ValueError("missing JSON value")
+    start = offset
+    while offset < len(encoded) and encoded[offset] not in " \t\r\n,}]":
+        offset += 1
+    if offset == start:
+        raise ValueError("missing JSON value")
+    return offset, -1
+
+
+def _isolate_preflight_receipt_json(
+    encoded: str,
+) -> tuple[str, tuple[_RawMarkerJsonValue, ...]]:
+    offset = _skip_marker_json_whitespace(encoded, 0)
+    if offset >= len(encoded) or encoded[offset] != "{":
+        raise ValueError("state marker root is not a JSON object")
+    offset += 1
+    spans: list[tuple[int, int, _RawMarkerJsonValue]] = []
+    offset = _skip_marker_json_whitespace(encoded, offset)
+    if offset < len(encoded) and encoded[offset] == "}":
+        offset += 1
+    else:
+        while True:
+            offset = _skip_marker_json_whitespace(encoded, offset)
+            key_start = offset
+            key_end = _scan_marker_json_string_end(encoded, key_start)
+            try:
+                key = json.loads(encoded[key_start:key_end])
+            except (json.JSONDecodeError, OverflowError, ValueError) as error:
+                raise ValueError("invalid JSON object key") from error
+            offset = _skip_marker_json_whitespace(encoded, key_end)
+            if offset >= len(encoded) or encoded[offset] != ":":
+                raise ValueError("missing JSON object colon")
+            value_start = _skip_marker_json_whitespace(encoded, offset + 1)
+            value_end, max_depth = _scan_marker_json_value_end(
+                encoded,
+                value_start,
+            )
+            if key == "preflight_receipt":
+                raw_value = encoded[value_start:value_end]
+                spans.append(
+                    (
+                        value_start,
+                        value_end,
+                        _RawMarkerJsonValue(raw_value, max_depth),
+                    )
+                )
+            offset = _skip_marker_json_whitespace(encoded, value_end)
+            if offset >= len(encoded):
+                raise ValueError("unterminated JSON object")
+            if encoded[offset] == "}":
+                offset += 1
+                break
+            if encoded[offset] != ",":
+                raise ValueError("invalid JSON object separator")
+            offset += 1
+    if _skip_marker_json_whitespace(encoded, offset) != len(encoded):
+        raise ValueError("unexpected data after JSON object")
+
+    chunks: list[str] = []
+    previous_end = 0
+    for start, end, raw_value in spans:
+        chunks.append(encoded[previous_end:start])
+        chunks.append("null" if raw_value.encoded == "null" else "false")
+        previous_end = end
+    chunks.append(encoded[previous_end:])
+    return "".join(chunks), tuple(value for _, _, value in spans)
+
+
+def _parse_isolated_preflight_receipt_json(raw: _RawMarkerJsonValue) -> Any:
+    label = "isolated-review preflight receipt"
+    if raw.max_container_depth > MAX_BOUNDED_JSON_DEPTH:
+        raise ReviewError(f"{label} exceeds the JSON nesting depth limit")
+    try:
+        value = json.loads(
+            raw.encoded,
+            object_pairs_hook=_capture_duplicate_marker_object,
+        )
+    except RecursionError as error:
+        raise ReviewError(f"{label} exceeds the JSON nesting depth limit") from error
+    except (json.JSONDecodeError, OverflowError, ValueError) as error:
+        raise ReviewError(f"{label} is not valid JSON") from error
+    _validate_bounded_json_depth(value, label=label)
+    return value
 
 
 def _parse_preflight_receipt(value: Any) -> PreflightReceipt:
@@ -972,14 +1114,35 @@ def _load_state_marker(state_dir: pathlib.Path) -> LoadedStateMarker:
             preflight_receipt=None,
         )
     try:
+        marker_json = encoded.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ReviewError("isolated-review state marker is invalid") from error
+    try:
+        core_json, isolated_receipt_values = _isolate_preflight_receipt_json(
+            marker_json
+        )
+    except (OverflowError, ValueError) as error:
+        raise ReviewError("isolated-review state marker is invalid") from error
+    try:
         marker = json.loads(
-            encoded.decode("utf-8"),
+            core_json,
             object_pairs_hook=_capture_duplicate_marker_object,
         )
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except RecursionError as error:
+        raise ReviewError(
+            "isolated-review state marker exceeds the JSON nesting depth limit"
+        ) from error
+    except (json.JSONDecodeError, OverflowError, ValueError) as error:
         raise ReviewError("isolated-review state marker is invalid") from error
     if not isinstance(marker, dict):
         raise ReviewError("isolated-review state marker is not a JSON object")
+    core_marker = dict(marker)
+    if "preflight_receipt" in core_marker:
+        core_marker["preflight_receipt"] = None
+    _validate_bounded_json_depth(
+        core_marker,
+        label="isolated-review state marker",
+    )
     marker_duplicates = (
         marker.duplicate_fields if isinstance(marker, _MarkerObject) else frozenset()
     )
@@ -1056,7 +1219,9 @@ def _load_state_marker(state_dir: pathlib.Path) -> LoadedStateMarker:
         else parse_partial_private_cleanup_evidence
     )
     receipt_value = marker.get("preflight_receipt")
-    if phase == "preparing" and receipt_value is not None:
+    if phase == "preparing" and any(
+        raw.encoded != "null" for raw in isolated_receipt_values
+    ):
         raise ReviewError(
             "isolated-review preparing marker cannot contain a preflight receipt"
         )
@@ -1069,8 +1234,29 @@ def _load_state_marker(state_dir: pathlib.Path) -> LoadedStateMarker:
         preflight_receipt_error = "isolated-review preflight receipt field is missing"
     else:
         preflight_receipt_error = None
-    receipt_duplicate = _first_duplicate_marker_field(receipt_value)
-    if preflight_receipt_error is None and receipt_duplicate is not None:
+    if preflight_receipt_error is None and version == STATE_MARKER_SCHEMA_VERSION:
+        if len(isolated_receipt_values) != 1:
+            raise ReviewError("isolated-review state marker is invalid")
+        try:
+            receipt_value = _parse_isolated_preflight_receipt_json(
+                isolated_receipt_values[0]
+            )
+        except ReviewError as error:
+            preflight_receipt_error = str(error)
+    if preflight_receipt_error is None:
+        try:
+            _validate_bounded_json_depth(
+                receipt_value,
+                label="isolated-review preflight receipt",
+            )
+        except ReviewError as error:
+            preflight_receipt_error = str(error)
+    receipt_duplicate = (
+        _first_duplicate_marker_field(receipt_value)
+        if preflight_receipt_error is None
+        else None
+    )
+    if receipt_duplicate is not None:
         preflight_receipt_error = (
             f"isolated-review preflight receipt has duplicate field: "
             f"{receipt_duplicate}"
@@ -1851,6 +2037,8 @@ def start(
             stdout_path.open("wb") as stdout_handle,
             stderr_path.open("wb") as stderr_handle,
         ):
+            os.fchmod(stdout_handle.fileno(), 0o600)
+            os.fchmod(stderr_handle.fileno(), 0o600)
             runner_arguments = [
                 sys.executable,
                 str(script_path),

@@ -68,11 +68,17 @@ A dynamic expression that cannot produce one stable exact byte value does not en
 
 A violation report contains only detectable additions for a candidate whose global count grows. Text evidence carries raw path plus one-based head line; new tracked paths and binary fallbacks use `line: null`; symlink targets use line `1`. It does not enumerate unchanged residual or base-only occurrences. If bounded diff evidence cannot map every detected local growth to a line, `location_status` is `inconclusive` rather than inventing one.
 
+The authoritative violation list retains every positive-delta candidate that fits the bounded catalog and complete-preflight capacity. If optional secondary accepted/legacy/reduction audit rows would make the public evidence exceed its fixed byte limit, those rows may be removed after the underlying manifest has been completely validated; the complete digest and base/head/delta proof plus bounded additions remain `violations` and admission remains blocked. Location omission likewise does not weaken a proved global-count violation. The secondary synthetic-token section retains its 64 KiB compact bound. The complete preflight retains a separate 128 KiB bound and switches from pretty to equivalent compact JSON only when required by that limit.
+
 ### Catalog Compatibility
 
 Approved authoring-catalog values remain exact safe-fixture exceptions under their declared scanner rule.
 
 Historical `legacy_exemptions` no longer select a different admission policy. Their exact raw values receive the same complete-tree baseline automatically, without explicit selection, unembedded counts, provenance, encoded-variant checks, or path denial. `--synthetic-secret-exemption`, `list-exemptions`, and `audit-master` may remain temporarily for CLI compatibility, but they are deprecated and must not alter admission.
+
+Declared rules still govern authoring-fixture acceptance. At the counting layer, exact raw bytes are the unique key: if the same cataloged legacy bytes are rediscovered through a different scanner rule, the legacy descriptor takes precedence and the helper creates one counter, one violation, and one set of added locations rather than an ambiguous duplicate.
+
+A large catalog-only manifest may use the existing public and helper-private files as complementary 64 KiB shards. Their fixed metadata must match, their combined rows must be complete and duplicate-free, and a unique SHA-256 commitment carried by the public control-state-bound shard commits to the canonical private rows. The loader verifies the commitment and reruns normal catalog/count/violation consistency checks after merging; missing, duplicated, mutated, or incomplete private rows fail closed.
 
 ### Review Lanes
 
@@ -86,7 +92,7 @@ The stateful supplied-diff/no-Git helper remains a low-level compatibility, secu
 
 ### Stateful Admission Evidence
 
-PR/master/merge-ready evaluation first harvests the terminal reviewer artifact with `stateful final --state-dir <state_dir>`, then evaluates the bounded public secret summary with `stateful admission --state-dir <state_dir>` on that same current-head state. Before releasing its inherited lock, the stateful runner exact-reads and validates `preflight.json` through the preparation-bound container and advances the schema-v5 marker with the artifact's exact size and SHA-256. Admission re-reads the artifact under the same bounded no-follow rules and trusts it only when those bytes match the runner-sealed receipt. Admission exit `0` means receipt-bound `clean` and is the only permitting result; exit `1` means violations, exit `3` means pending, and exit `75` means inconclusive. A terminal unsealed state, malformed or mismatched receipt, replaced preflight, or schema-v4 marker is inconclusive. Receipt-only missing fields, malformed values, and inner or top-level duplicate keys produce structured `preflight-invalid` / exit `75`, cannot be overwritten by sealing, and do not invalidate the separately verified reviewer final or lifecycle cleanup. Non-receipt marker duplication remains a hard state error. Schema v4 remains compatible with `status`, `wait`, `final`, and cleanup; it simply cannot authorize admission. The reviewer final is independent and may remain successful when admission blocks or is inconclusive. Foreground review never supplies admission evidence. A head change invalidates both checks and requires a new frozen current-head state. None of these admission outcomes may delay, suppress, or redact the trusted reviewer launch.
+PR/master/merge-ready evaluation first harvests the terminal reviewer artifact with `stateful final --state-dir <state_dir>`, then evaluates the bounded public secret summary with `stateful admission --state-dir <state_dir>` on that same current-head state. Before releasing its inherited lock, the stateful runner exact-reads and validates `preflight.json` through the preparation-bound container and advances the schema-v5 marker with the artifact's exact size and SHA-256. Admission re-reads the artifact under the same bounded no-follow rules and trusts it only when those bytes match the runner-sealed receipt. Admission exit `0` means receipt-bound `clean` and is the only permitting result; exit `1` means violations, exit `3` means pending, and exit `75` means inconclusive. A terminal unsealed state, malformed or mismatched receipt, replaced preflight, or schema-v4 marker is inconclusive. Receipt-only missing fields, malformed values, excessive nesting, and inner or top-level duplicate keys produce structured `preflight-invalid` / exit `75`, cannot be overwritten by sealing, and do not invalidate the separately verified reviewer final or lifecycle cleanup. Excessive nesting or other corruption in non-receipt lifecycle fields remains a hard state error. Schema v4 remains compatible with `status`, `wait`, `final`, and cleanup; it simply cannot authorize admission. The reviewer final is independent and may remain successful when admission blocks or is inconclusive. Foreground review never supplies admission evidence. A head change invalidates both checks and requires a new frozen current-head state. None of these admission outcomes may delay, suppress, or redact the trusted reviewer launch.
 
 ### Runner Policy Binding And Host Boundary
 
@@ -96,7 +102,7 @@ The receipt and argv bindings close helper-controlled path-replacement and coope
 
 ### Workspace Scope
 
-Targeted launch-boundary hardening is part of this delivery: frozen workspace and control artifacts use safe owner-only modes, newly created runtime/control/attempt/credential-update files are descriptor-forced to `0600` even under an owner-masking umask, existing objects are never chmod-repaired, cleanup is bound to the prepared runner-lock identity, reviewer/egress policy is child-argv-bound, and reviewer workspace, prompt, sandbox mount, attempt output, preflight receipt, and verdict/control I/O remain attached to validated descriptors or exact digests. Canonical named lanes now use #68's separate clean Git worktree contract. This delivery does not redesign the low-level helper's `.git`-free frozen snapshot into a detached worktree or reflinked snapshot; that separate architecture decision remains deferred.
+Targeted launch-boundary hardening is part of this delivery: frozen workspace and control artifacts use safe owner-only modes, newly created runtime/control/attempt/credential-update files are descriptor-forced to `0600` even under an owner-masking umask, runner stdout/stderr descriptors are forced to exact `0600` before child spawn, existing objects are never chmod-repaired, cleanup is bound to the prepared runner-lock identity, reviewer/egress policy is child-argv-bound, and reviewer workspace, prompt, sandbox mount, attempt output, preflight receipt, and verdict/control I/O remain attached to validated descriptors or exact digests. Canonical named lanes now use #68's separate clean Git worktree contract. This delivery does not redesign the low-level helper's `.git`-free frozen snapshot into a detached worktree or reflinked snapshot; that separate architecture decision remains deferred.
 
 ## Current State
 
@@ -110,6 +116,8 @@ Implementation and final combined code validation now match this decision, inclu
 - PR/master admission passes unchanged counts, reductions, and cross-path/surface/offset moves.
 - PR/master admission blocks first appearance and global growth.
 - Former legacy values receive the same baseline without explicit exemption selection.
+- The counter creates one legacy-preferred descriptor for the same raw bytes rediscovered across scanner rules, while authoring acceptance remains declared-rule-specific.
+- Catalog-only clean, mixed, and all-growth evidence can use integrity-bound complementary 64 KiB shards; the complete bounded violation list remains blocked even when optional secondary rows or addition locations must be omitted, and the complete preflight stays within 128 KiB.
 - Authoring-catalog safe fixtures retain exact declared-rule acceptance.
 - Base64 and other encoded variants are neither derived nor scanned as aliases.
 - Non-exact dynamic expressions are excluded from the counter.
@@ -120,13 +128,13 @@ Implementation and final combined code validation now match this decision, inclu
 - PR/master/merge-ready requires low-level `stateful final` followed by same-state, current-head `stateful admission`; only receipt-bound admission exit `0` is permitting.
 - Admission exits `1`, `3`, and `75` remain distinct violations, pending, and inconclusive outcomes; reviewer final success is independent, foreground output is insufficient, and a head change invalidates both checks.
 - A schema-v5 runner-sealed receipt binds admission to the exact bounded `preflight.json` bytes; replacement, mutation, terminal non-sealing, malformed receipt, and schema-v4 admission all fail closed, while schema-v4 `status` / `wait` / `final` / cleanup remain compatible.
-- Receipt-only corruption maps to structured inconclusive admission without masking a valid reviewer final or cleanup; non-receipt marker corruption stays a hard lifecycle error.
+- Receipt-only corruption, including excessive nesting, maps to structured inconclusive admission without masking a valid reviewer final or cleanup; non-receipt marker corruption stays a hard lifecycle error.
 - Terminal child argv binds the reviewer and egress consent independently of path-loaded state, and the documented same-euid host-TCB limitation remains explicit.
 - Frozen workspace/control creation and runner-lock cleanup fail closed under permissive umasks, symlinks/FIFOs, path swaps, and identity/mode/link-count/owner mismatches.
 - Frozen head paths that exceed the cleanup recursion capacity are rejected before materialization, including the additional directory level created for gitlinks.
 - Non-UTF-8 Git path bytes remain reversible in bounded violation evidence and still participate in raw-value leak checks; invalid non-filesystem surrogate strings fail as typed review errors.
 - Reviewer cwd, frozen prompt, Linux sandbox workspace mount, attempt output, and terminal verdict/control artifacts remain bound to the prepared container across pathname swaps; descriptor handoff and close failures surface before a result is accepted.
-- Bound runtime/control/attempt and credential-update file creators force exact owner-only mode after exclusive creation even when the caller umask masks owner bits, while unsafe existing locks are rejected without chmod repair.
+- Bound runtime/control/attempt and credential-update file creators plus runner stdout/stderr force exact owner-only mode before publication or child spawn even when the caller umask masks owner bits, while unsafe existing locks are rejected without chmod repair.
 - Skill and journal validation pass.
 
 ## Next Steps
@@ -170,10 +178,12 @@ The remaining unchecked items are post-commit delivery operations. They are inte
 - Admission/final follow-up review: one malformed-JSON fail-closed finding was fixed; follow-up result `No findings.`.
 - Latest `master` cleanup-directory identity fix `202ef98` was merged; the stable directory identity and descriptor-bound runtime-artifact contracts were both retained, and their focused concurrency/path-replacement regressions passed.
 - Ruff checks, changed-file format checks, and `git diff --check`: passed.
-- Python 3.13 final discovery after integrating master `3134c1c`: `1347 tests` in 338.288 seconds, `OK (skipped=5)`, in the narrow environment that permits the loopback-bind lifecycle test.
+- Python 3.13 final pre-commit discovery after integrating master `3134c1c`: `1359 tests` in 409.464 seconds, `OK (skipped=5)`, in the narrow environment that permits the loopback-bind lifecycle test.
+- Final focused Python 3.13 suites: state `163 tests` in 174.817 seconds; workspace `145 tests` in 139.507 seconds with one platform skip; contracts `41 tests`; all passed.
 - Ubuntu CI exposed an inode-reuse race in one runner-lock replacement fixture; retaining the original inode via rename makes the replacement identity deterministic without changing production behavior.
 - Final-review boundary regressions: deepest cleanable blob path passed and cleaned completely, the next depth and equivalent gitlink depth failed before materialization without residue, reversible non-UTF-8 evidence serialization passed, and the APFS-incompatible raw-filename end-to-end case skipped explicitly on macOS.
 - Final-review P2 regressions: receipt-only missing/malformed/duplicate evidence maps to structured inconclusive admission while real `final` and cleanup remain usable; atomic runtime, control, attempt-log, compatibility-lock, and credential-update writers force `0600` under a local restrictive-umask boundary without repairing unsafe existing files.
+- Final receipt-parser and complementary-manifest-sharding audits found no bypass after exact-`null`, duplicate-order, mixed clean/growth, and exact shard-commitment regressions were added; follow-up result `No findings.`.
 - Official skill validator: `Skill is valid!`.
 - Project journal validator: `Project journal validation passed.`.
 - The final immutable whole-range review result is recorded in PR #60 after the signed implementation anchor exists; it is not pre-claimed by this commit.

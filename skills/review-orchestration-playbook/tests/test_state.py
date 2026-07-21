@@ -28,6 +28,7 @@ from review_runtime.common import (  # noqa: E402
     write_text_atomic,
 )
 from review_runtime.workspace import (  # noqa: E402
+    MAX_SYNTHETIC_EVIDENCE_ENTRIES,
     PRIVATE_CHANGED_PATHS_NAME,
     REVIEW_CLEANUP_QUARANTINE_PREFIX,
     SYNTHETIC_PRIVATE_MANIFEST_NAME,
@@ -35,6 +36,7 @@ from review_runtime.workspace import (  # noqa: E402
     PrivateCleanupEvidence,
     _load_control_artifact_state,
     cleanup_workspace,
+    encode_preflight_json,
     prepare_workspace as _prepare_workspace,
     remove_private_review_artifacts,
 )
@@ -90,6 +92,26 @@ def write_preparing_marker(
         private_cleanup,
         runner_lock_identity(review),
     )
+
+
+def write_marker_with_raw_top_level_value(
+    path: pathlib.Path,
+    marker: dict[str, object],
+    *,
+    field: str,
+    raw_value: str,
+    raw_field_name: str | None = None,
+) -> None:
+    entries = []
+    for key, value in marker.items():
+        encoded_key = (
+            raw_field_name
+            if key == field and raw_field_name is not None
+            else json.dumps(key)
+        )
+        encoded_value = raw_value if key == field else json.dumps(value, sort_keys=True)
+        entries.append(f"{encoded_key}: {encoded_value}")
+    write_text_atomic(path, "{" + ", ".join(entries) + "}\n")
 
 
 @contextlib.contextmanager
@@ -1798,6 +1820,62 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertEqual(status_summary["admission"], standalone)
         self.assertEqual(status_summary["admission"]["status"], "blocked")
 
+    def test_admission_keeps_full_legacy_violation_capacity_blocked(self) -> None:
+        self.write_completed_state()
+        violation_count = MAX_SYNTHETIC_EVIDENCE_ENTRIES
+        secret_delta = {
+            "limitations": [
+                "added secret locations were omitted to keep evidence bounded"
+            ],
+            "location_status": "inconclusive",
+            "status": "violations",
+            "violations": [
+                {
+                    "additions": [],
+                    "base_count": 0,
+                    "delta": 1,
+                    "head_count": 1,
+                    "omitted_addition_location_count": 1,
+                    "rules": ["generic-secret-assignment"],
+                    "value_length": 16,
+                    "value_sha256": f"{index:064x}",
+                }
+                for index in range(violation_count)
+            ],
+        }
+        preflight = {
+            "private_artifacts": state.PREFLIGHT_PRIVATE_ARTIFACTS,
+            "review_range": f"{self.base}..{self.head}",
+            "scope": state.PREFLIGHT_SCOPE,
+            "secret_delta": secret_delta,
+            "status": state.PREFLIGHT_STATUS,
+        }
+        encoded_preflight = encode_preflight_json(preflight)
+        self.assertLess(
+            len(encoded_preflight),
+            len(json.dumps(preflight, indent=2, sort_keys=True) + "\n"),
+        )
+        write_text_atomic(
+            self.review.container_dir / state.PREFLIGHT_FILE,
+            encoded_preflight,
+        )
+        with held_runner_lock(self.review) as runner_lock:
+            state._seal_preflight_receipt(
+                self.review.container_dir,
+                review=self.review,
+                lock_fd=runner_lock.fileno(),
+            )
+
+        exit_code, summary = state.admission(self.review.container_dir)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(summary["status"], "blocked")
+        self.assertEqual(summary["secret_delta"], secret_delta)
+        self.assertEqual(
+            len(summary["secret_delta"]["violations"]),
+            violation_count,
+        )
+
     def test_final_success_is_independent_of_nonclean_admission(self) -> None:
         self.write_completed_state()
         with mock.patch.object(state, "wait", return_value=0):
@@ -1879,6 +1957,169 @@ class StatefulLifecycleTest(unittest.TestCase):
         final_exit, text = state.final(self.review.container_dir)
         self.assertEqual((final_exit, text), (0, "No findings."))
         self.assertFalse(self.review.workspace_root.exists())
+
+    def test_deep_receipt_is_inconclusive_without_blocking_final(self) -> None:
+        self.write_completed_state()
+        self.write_preflight(self.clean_secret_delta())
+        marker_path = self.review.container_dir / state.STATE_MARKER
+        marker = read_json(marker_path)
+        deep_receipt = "[" * 20_000 + '"bracket: }] and quote: \\""' + "]" * 20_000
+        write_marker_with_raw_top_level_value(
+            marker_path,
+            marker,
+            field="preflight_receipt",
+            raw_field_name='"preflight_\\u0072eceipt"',
+            raw_value=deep_receipt,
+        )
+        self.assertLess(marker_path.stat().st_size, state.MAX_STATE_MARKER_BYTES)
+
+        loaded = state._load_state_marker(self.review.container_dir)
+        self.assertIsNone(loaded.preflight_receipt)
+        self.assertRegex(
+            loaded.preflight_receipt_error or "",
+            "receipt exceeds the JSON nesting depth limit",
+        )
+        exit_code, summary = state.admission(self.review.container_dir)
+        self.assertEqual(exit_code, 75)
+        self.assertEqual(summary["status"], "inconclusive")
+        self.assertEqual(summary["failure_class"], "preflight-invalid")
+        self.assertEqual(state.status(self.review.container_dir)["admission"], summary)
+
+        lock_path = self.review.container_dir / state.LOCK_FILE
+        with state.open_private_lock_file(
+            lock_path,
+            label="test review runner lock",
+        ) as runner_lock:
+            state.fcntl.flock(
+                runner_lock.fileno(),
+                state.fcntl.LOCK_EX | state.fcntl.LOCK_NB,
+            )
+            with self.assertRaisesRegex(
+                ReviewError,
+                "receipt exceeds the JSON nesting depth limit",
+            ):
+                state._seal_preflight_receipt(
+                    self.review.container_dir,
+                    review=self.review,
+                    lock_fd=runner_lock.fileno(),
+                )
+
+        final_exit, text = state.final(self.review.container_dir)
+        self.assertEqual((final_exit, text), (0, "No findings."))
+        self.assertFalse(self.review.workspace_root.exists())
+
+    def test_receipt_local_numeric_decode_error_does_not_block_final(self) -> None:
+        self.write_completed_state()
+        self.write_preflight(self.clean_secret_delta())
+        marker_path = self.review.container_dir / state.STATE_MARKER
+        write_marker_with_raw_top_level_value(
+            marker_path,
+            read_json(marker_path),
+            field="preflight_receipt",
+            raw_value="9" * 5_000,
+        )
+
+        loaded = state._load_state_marker(self.review.container_dir)
+        self.assertIsNone(loaded.preflight_receipt)
+        self.assertRegex(
+            loaded.preflight_receipt_error or "",
+            "receipt is not valid JSON",
+        )
+        exit_code, summary = state.admission(self.review.container_dir)
+        self.assertEqual(exit_code, 75)
+        self.assertEqual(summary["failure_class"], "preflight-invalid")
+        self.assertEqual(state.status(self.review.container_dir)["admission"], summary)
+
+        final_exit, text = state.final(self.review.container_dir)
+        self.assertEqual((final_exit, text), (0, "No findings."))
+        self.assertFalse(self.review.workspace_root.exists())
+
+    def test_deep_core_marker_fields_remain_hard_state_errors(self) -> None:
+        self.write_completed_state()
+        marker_path = self.review.container_dir / state.STATE_MARKER
+        valid_marker = read_json(marker_path)
+
+        for depth in (65, 20_000):
+            with self.subTest(depth=depth):
+                write_marker_with_raw_top_level_value(
+                    marker_path,
+                    valid_marker,
+                    field="runner_lock",
+                    raw_value="[" * depth + "0" + "]" * depth,
+                )
+                self.assertLess(
+                    marker_path.stat().st_size,
+                    state.MAX_STATE_MARKER_BYTES,
+                )
+                for operation in (
+                    lambda: state._load_state_marker(self.review.container_dir),
+                    lambda: state.status(self.review.container_dir),
+                    lambda: state.admission_status(self.review.container_dir),
+                    lambda: state.cleanup(
+                        self.review.container_dir,
+                        timeout_seconds=1,
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        ReviewError,
+                        "state marker exceeds the JSON nesting depth limit",
+                    ):
+                        operation()
+                self.assertTrue(self.review.workspace_root.exists())
+
+    def test_deep_receipt_does_not_mask_core_phase_or_version_errors(self) -> None:
+        marker_path = self.review.container_dir / state.STATE_MARKER
+        deep_receipt = "[" * 20_000 + "0" + "]" * 20_000
+
+        write_ready_marker(self.review)
+        invalid_version = read_json(marker_path)
+        invalid_version["version"] = 999
+        write_marker_with_raw_top_level_value(
+            marker_path,
+            invalid_version,
+            field="preflight_receipt",
+            raw_value=deep_receipt,
+        )
+        with self.assertRaisesRegex(ReviewError, "version is invalid"):
+            state._load_state_marker(self.review.container_dir)
+
+        write_ready_marker(self.review)
+        preparing = read_json(marker_path)
+        preparing["phase"] = "preparing"
+        write_marker_with_raw_top_level_value(
+            marker_path,
+            preparing,
+            field="preflight_receipt",
+            raw_value=deep_receipt,
+        )
+        with self.assertRaisesRegex(
+            ReviewError,
+            "preparing marker cannot contain a preflight receipt",
+        ):
+            state._load_state_marker(self.review.container_dir)
+
+    def test_preparing_marker_rejects_any_non_null_duplicate_receipt(self) -> None:
+        write_ready_marker(self.review)
+        marker_path = self.review.container_dir / state.STATE_MARKER
+        preparing = read_json(marker_path)
+        preparing["phase"] = "preparing"
+        preparing.pop("preflight_receipt")
+        marker_prefix = json.dumps(preparing, sort_keys=True)[:-1]
+
+        receipt_fields = (
+            ', "preflight_receipt": [], "preflight_\\u0072eceipt": null',
+            ', "preflight_\\u0072eceipt": null, "preflight_receipt": []',
+            ', "preflight_receipt": \u00a0null\u00a0',
+            ', "preflight_receipt": \vnull\v',
+        )
+        for fields in receipt_fields:
+            with self.subTest(fields=fields):
+                write_text_atomic(marker_path, marker_prefix + fields + "}\n")
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "preparing marker cannot contain a preflight receipt",
+                ):
+                    state._load_state_marker(self.review.container_dir)
 
     def test_missing_or_duplicate_receipt_is_admission_inconclusive(self) -> None:
         self.write_completed_state()
@@ -2915,6 +3156,56 @@ final_path.chmod(0o600)
         exit_code, text = state.final(state_dir)
         self.assertEqual((exit_code, text), (0, "No findings."))
         self.assertFalse(review.workspace_root.exists())
+
+    def test_start_fixes_runner_log_modes_with_owner_masking_umask(self) -> None:
+        process = mock.Mock(pid=12345)
+
+        def spawn_with_private_logs(
+            *_args: object,
+            **kwargs: object,
+        ) -> mock.Mock:
+            for stream in (kwargs["stdout"], kwargs["stderr"]):
+                self.assertEqual(
+                    stat.S_IMODE(os.fstat(stream.fileno()).st_mode),
+                    0o600,
+                )
+            return process
+
+        previous_umask = os.umask(0o777)
+        try:
+            with (
+                mock.patch.object(
+                    state,
+                    "prepare_workspace",
+                    side_effect=prepared_workspace(self.review),
+                ),
+                mock.patch.object(
+                    state.subprocess,
+                    "Popen",
+                    side_effect=spawn_with_private_logs,
+                ),
+            ):
+                state_dir = state.start(
+                    script_path=pathlib.Path("runner.py"),
+                    repo=self.repo,
+                    reviewer="codex",
+                    base_ref=self.base,
+                    head_ref=self.head,
+                    prompt_file=None,
+                    keep_workspace=False,
+                    egress_consent=None,
+                )
+        finally:
+            os.umask(previous_umask)
+
+        try:
+            for name in ("runner.stdout.log", "runner.stderr.log"):
+                self.assertEqual(
+                    stat.S_IMODE((state_dir / name).stat().st_mode),
+                    0o600,
+                )
+        finally:
+            state._STARTED_PROCESSES.pop(process.pid, None)
 
     def test_runner_unblocks_signals_inherited_from_stateful_start(self) -> None:
         state_dir = self.review.container_dir

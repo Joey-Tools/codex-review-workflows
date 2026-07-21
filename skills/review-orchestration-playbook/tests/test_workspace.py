@@ -19,8 +19,14 @@ from unittest import mock
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+from review_runtime import synthetic_tokens as synthetic_tokens_runtime  # noqa: E402
 from review_runtime import workspace as workspace_runtime  # noqa: E402
 from review_runtime.common import ForwardedSignal, ReviewError  # noqa: E402
+from review_runtime.synthetic_tokens import (  # noqa: E402
+    LegacyExemption,
+    LegacyToken,
+    SyntheticTokenCatalog,
+)
 from review_runtime.workspace import (  # noqa: E402
     _file_secret_rule,
     _parse_tree_record,
@@ -156,6 +162,118 @@ class WorkspaceTest(unittest.TestCase):
         git(self.repo, "rm", relative)
         git(self.repo, "commit", "-m", message)
         return git(self.repo, "rev-parse", "HEAD")
+
+    def catalog_with_legacy_values(
+        self,
+        values: tuple[bytes, ...],
+        *,
+        rule: str,
+    ) -> SyntheticTokenCatalog:
+        base_catalog = workspace_runtime.load_catalog()
+        exemption = LegacyExemption(
+            identifier="test-legacy-exemption",
+            repository="example/repository",
+            verified_master_tip=self.base,
+            match="non-increasing-global-count",
+            values=tuple(
+                LegacyToken(
+                    identifier=f"test-legacy-{index:03d}",
+                    rule=rule,
+                    value=value,
+                    containing_commit=self.base,
+                    source_occurrences=1,
+                )
+                for index, value in enumerate(values)
+            ),
+        )
+        return SyntheticTokenCatalog(
+            schema_version=base_catalog.schema_version,
+            pool_version=base_catalog.pool_version,
+            authoring_tokens=base_catalog.authoring_tokens,
+            legacy_exemptions=(exemption,),
+        )
+
+    def encoded_file_catalog_with_legacy_values(
+        self,
+        values: tuple[bytes, ...],
+        *,
+        rule: str,
+    ) -> bytes:
+        payload = json.loads(
+            synthetic_tokens_runtime.CATALOG_PATH.read_text(encoding="utf-8")
+        )
+        payload["legacy_exemptions"] = [
+            {
+                "id": "x",
+                "match": "non-increasing-global-count",
+                "repository": "e/p",
+                "values": [
+                    {
+                        "containing_commit": "b" * 40,
+                        "id": f"t{index}",
+                        "rule": rule,
+                        "source_occurrences": 1,
+                        "value_base64": base64.b64encode(value).decode("ascii"),
+                    }
+                    for index, value in enumerate(values)
+                ],
+                "verified_master_tip": "a" * 40,
+            }
+        ]
+        return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+    def maximal_file_backed_legacy_catalog(
+        self,
+        *,
+        rule: str,
+        compact_values: bool = False,
+    ) -> tuple[tuple[bytes, ...], SyntheticTokenCatalog]:
+        if compact_values:
+            candidate_values = tuple(
+                b"S" * 11 + f"{index:05d}".encode("ascii")
+                for index in range(workspace_runtime.MAX_SYNTHETIC_EVIDENCE_ENTRIES)
+            )
+        else:
+            candidate_values = tuple(
+                b"sk-" + b"P" * 36 + f"{index:04d}".encode("ascii")
+                for index in range(workspace_runtime.MAX_SYNTHETIC_EVIDENCE_ENTRIES)
+            )
+        lower_bound = 0
+        upper_bound = len(candidate_values)
+        while lower_bound < upper_bound:
+            midpoint = (lower_bound + upper_bound + 1) // 2
+            encoded_candidate = self.encoded_file_catalog_with_legacy_values(
+                candidate_values[:midpoint],
+                rule=rule,
+            )
+            if len(encoded_candidate) <= synthetic_tokens_runtime.MAX_CATALOG_BYTES:
+                lower_bound = midpoint
+            else:
+                upper_bound = midpoint - 1
+        values = candidate_values[:lower_bound]
+        encoded_catalog = self.encoded_file_catalog_with_legacy_values(
+            values,
+            rule=rule,
+        )
+        self.assertGreater(
+            len(values),
+            workspace_runtime.MAX_SECRET_REDUCTION_CANDIDATES,
+        )
+        self.assertLessEqual(
+            len(encoded_catalog),
+            synthetic_tokens_runtime.MAX_CATALOG_BYTES,
+        )
+        self.assertLess(len(values), len(candidate_values))
+        self.assertGreater(
+            len(
+                self.encoded_file_catalog_with_legacy_values(
+                    candidate_values[: len(values) + 1],
+                    rule=rule,
+                )
+            ),
+            synthetic_tokens_runtime.MAX_CATALOG_BYTES,
+        )
+        return values, synthetic_tokens_runtime.parse_catalog_bytes(encoded_catalog)
 
     def prepare_range(self, base_ref: str, head_ref: str):
         review = prepare_workspace(
@@ -621,9 +739,13 @@ class WorkspaceTest(unittest.TestCase):
             len(workspace_runtime.encode_preflight_json(pretty).encode("utf-8")),
             pretty_limit,
         )
+        adaptive = exact_value(pretty_limit + 1, pretty=True)
+        adaptive_encoded = workspace_runtime.encode_preflight_json(adaptive)
+        self.assertLessEqual(len(adaptive_encoded.encode("utf-8")), pretty_limit)
+        self.assertEqual(json.loads(adaptive_encoded), adaptive)
         with self.assertRaisesRegex(ReviewError, "serialized preflight evidence"):
             workspace_runtime.encode_preflight_json(
-                exact_value(pretty_limit + 1, pretty=True)
+                exact_value(pretty_limit + 1, pretty=False)
             )
 
     def test_bounded_json_reader_rejects_growth_past_limit(self) -> None:
@@ -856,6 +978,124 @@ class WorkspaceTest(unittest.TestCase):
         summary["violations"] = [violation("e" * 64, [unhashable_surface])]
         with self.assertRaisesRegex(ReviewError, "addition is inconsistent"):
             workspace_runtime.validate_secret_delta_summary(summary)
+
+        bounded_violations = [
+            violation(
+                hashlib.sha256(f"violation-{index}".encode("ascii")).hexdigest(),
+                [],
+            )
+            for index in range(workspace_runtime.MAX_SYNTHETIC_EVIDENCE_ENTRIES)
+        ]
+        bounded_summary = {
+            "limitations": [],
+            "location_status": "complete",
+            "status": "violations",
+            "violations": bounded_violations,
+        }
+        self.assertEqual(
+            workspace_runtime.validate_secret_delta_summary(bounded_summary),
+            bounded_summary,
+        )
+        bounded_manifest = {
+            "base_ref": "1" * 40,
+            "catalog_schema_version": 1,
+            "entries": [
+                {
+                    "base_count": 0,
+                    "exemption_id": "x",
+                    "head_count": 1,
+                    "rule": "generic-secret-assignment",
+                    "token_id": f"t{index}",
+                    "value_length": 16,
+                    "value_sha256": violation_entry["value_sha256"],
+                }
+                for index, violation_entry in enumerate(bounded_violations)
+            ],
+            "head_ref": "2" * 40,
+            "pool_version": "test",
+            "schema_version": workspace_runtime.SYNTHETIC_MANIFEST_SCHEMA_VERSION,
+            "secret_delta": bounded_summary,
+            "secret_reductions": [],
+            "selected_exemptions": ["x"],
+        }
+        public_shard, private_shard = workspace_runtime._shard_catalog_count_manifest(
+            bounded_manifest
+        )
+        self.assertLessEqual(
+            len(
+                workspace_runtime._bounded_json_bytes(
+                    public_shard,
+                    label="test public synthetic secret manifest shard",
+                )
+            ),
+            workspace_runtime.MAX_SYNTHETIC_EVIDENCE_BYTES,
+        )
+        self.assertLessEqual(
+            len(
+                workspace_runtime._bounded_json_bytes(
+                    private_shard,
+                    label="test private synthetic secret manifest shard",
+                )
+            ),
+            workspace_runtime.MAX_SYNTHETIC_EVIDENCE_BYTES,
+        )
+        merged_manifest, was_sharded, raw_reduction_values = (
+            workspace_runtime._merge_secret_count_manifest_shards(
+                public_shard,
+                private_shard,
+            )
+        )
+        self.assertTrue(was_sharded)
+        self.assertEqual(raw_reduction_values, [])
+        self.assertEqual(merged_manifest["entries"], [])
+        self.assertEqual(merged_manifest["secret_delta"]["status"], "violations")
+        self.assertEqual(
+            len(merged_manifest["secret_delta"]["violations"]),
+            workspace_runtime.MAX_SYNTHETIC_EVIDENCE_ENTRIES,
+        )
+        workspace_runtime.validate_secret_delta_summary(merged_manifest["secret_delta"])
+        complete_preflight = {
+            "primary_diff": {
+                "path": ".codex-review/review.diff",
+                "sha256": "0" * 64,
+                "size": 0,
+            },
+            "private_artifacts": "removed",
+            "review_range": f"{'1' * 40}..{'2' * 40}",
+            "scope": "frozen tracked workspace, diff, and review prompt",
+            "secret_delta": bounded_summary,
+            "status": "review workspace containment and integrity checks passed",
+            "synthetic_tokens": {
+                "accepted": [],
+                "catalog_schema_version": 1,
+                "legacy_counts": [],
+                "pool_version": "test",
+                "secret_reductions": [],
+            },
+        }
+        pretty_preflight = (
+            json.dumps(complete_preflight, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        self.assertGreater(
+            len(pretty_preflight),
+            workspace_runtime.MAX_PREFLIGHT_JSON_BYTES,
+        )
+        encoded_preflight = workspace_runtime.encode_preflight_json(
+            complete_preflight
+        ).encode("utf-8")
+        self.assertLessEqual(
+            len(encoded_preflight),
+            workspace_runtime.MAX_PREFLIGHT_JSON_BYTES,
+        )
+        parsed_preflight = json.loads(encoded_preflight)
+        self.assertEqual(parsed_preflight["secret_delta"]["status"], "violations")
+        self.assertEqual(
+            len(parsed_preflight["secret_delta"]["violations"]),
+            workspace_runtime.MAX_SYNTHETIC_EVIDENCE_ENTRIES,
+        )
+        bounded_summary["violations"] = bounded_violations + [violation("f" * 64, [])]
+        with self.assertRaisesRegex(ReviewError, "secret-delta is invalid"):
+            workspace_runtime.validate_secret_delta_summary(bounded_summary)
 
     def test_prompt_override_replaces_only_review_scope_placeholders(self) -> None:
         template = pathlib.Path(self.temporary.name) / "prompt.txt"
@@ -4438,6 +4678,533 @@ class WorkspaceTest(unittest.TestCase):
             payload,
         )
         self.assertIn(raw_value, review.diff_file.read_bytes())
+
+    def test_large_file_backed_legacy_catalog_stays_clean_and_launchable(
+        self,
+    ) -> None:
+        values, catalog = self.maximal_file_backed_legacy_catalog(
+            rule="generic-secret-assignment",
+            compact_values=True,
+        )
+        payload = b"".join(b'password = "' + value + b'"\n' for value in values)
+        existing_base = self.commit_bytes(
+            "existing-legacy-values.txt",
+            payload,
+            "Add existing cataloged legacy values",
+        )
+        clean_head = self.commit_bytes(
+            "unrelated-large-catalog-change.txt",
+            b"unrelated\n",
+            "Change unrelated content with a large catalog",
+        )
+
+        with mock.patch.object(workspace_runtime, "load_catalog", return_value=catalog):
+            review = self.prepare_range(existing_base, clean_head)
+            public_manifest_path = (
+                review.workspace_root
+                / ".codex-review"
+                / workspace_runtime.SYNTHETIC_MANIFEST_NAME
+            )
+            private_manifest_path = (
+                review.container_dir / workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME
+            )
+            public_manifest = json.loads(public_manifest_path.read_text("utf-8"))
+            private_manifest = json.loads(private_manifest_path.read_text("utf-8"))
+            evidence = validate_external_workspace(review)
+
+        self.assertLessEqual(
+            public_manifest_path.stat().st_size,
+            workspace_runtime.MAX_SYNTHETIC_EVIDENCE_BYTES,
+        )
+        self.assertLessEqual(
+            private_manifest_path.stat().st_size,
+            workspace_runtime.MAX_SYNTHETIC_EVIDENCE_BYTES,
+        )
+        self.assertNotEqual(public_manifest["entries"], private_manifest["entries"])
+        self.assertEqual(
+            len(public_manifest["entries"]) + len(private_manifest["entries"]),
+            len(values),
+        )
+        self.assertEqual(public_manifest["secret_delta"]["status"], "clean")
+        self.assertEqual(private_manifest["secret_delta"]["status"], "clean")
+        self.assertEqual(public_manifest["secret_delta"]["violations"], [])
+        self.assertEqual(private_manifest["secret_delta"]["violations"], [])
+        public_commitments = [
+            item
+            for item in public_manifest["secret_delta"]["limitations"]
+            if item.startswith(
+                workspace_runtime.PRIVATE_MANIFEST_SHARD_COMMITMENT_PREFIX
+            )
+        ]
+        private_commitments = [
+            item
+            for item in private_manifest["secret_delta"]["limitations"]
+            if item.startswith(
+                workspace_runtime.PRIVATE_MANIFEST_SHARD_COMMITMENT_PREFIX
+            )
+        ]
+        self.assertEqual(len(public_commitments), 1)
+        self.assertEqual(private_commitments, public_commitments)
+        self.assertEqual(evidence["secret_delta"]["status"], "clean")
+        self.assertEqual(evidence["secret_delta"]["violations"], [])
+        self.assertEqual(evidence["synthetic_tokens"]["accepted"], [])
+        self.assertEqual(evidence["synthetic_tokens"]["legacy_counts"], [])
+        self.assertEqual(evidence["synthetic_tokens"]["secret_reductions"], [])
+        encoded_preflight = workspace_runtime.encode_preflight_json(
+            workspace_runtime.build_preflight_evidence(review, evidence)
+        ).encode("utf-8")
+        self.assertLessEqual(
+            len(encoded_preflight),
+            workspace_runtime.MAX_PREFLIGHT_JSON_BYTES,
+        )
+
+    def test_one_growth_in_large_legacy_catalog_stays_blocked_and_launchable(
+        self,
+    ) -> None:
+        values, catalog = self.maximal_file_backed_legacy_catalog(
+            rule="generic-secret-assignment",
+            compact_values=True,
+        )
+        payload = b"".join(b'password = "' + value + b'"\n' for value in values)
+        existing_base = self.commit_bytes(
+            "existing-legacy-values.txt",
+            payload,
+            "Add existing cataloged legacy values",
+        )
+        growth_head = self.commit_bytes(
+            "one-legacy-growth.txt",
+            b'password = "' + values[0] + b'"\n',
+            "Grow one cataloged legacy value",
+        )
+
+        with mock.patch.object(workspace_runtime, "load_catalog", return_value=catalog):
+            review = self.prepare_range(existing_base, growth_head)
+            public_manifest_path = (
+                review.workspace_root
+                / ".codex-review"
+                / workspace_runtime.SYNTHETIC_MANIFEST_NAME
+            )
+            private_manifest_path = (
+                review.container_dir / workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME
+            )
+            public_manifest = json.loads(public_manifest_path.read_text("utf-8"))
+            private_manifest = json.loads(private_manifest_path.read_text("utf-8"))
+            evidence = validate_external_workspace(review)
+
+        self.assertLessEqual(
+            public_manifest_path.stat().st_size,
+            workspace_runtime.MAX_SYNTHETIC_EVIDENCE_BYTES,
+        )
+        self.assertLessEqual(
+            private_manifest_path.stat().st_size,
+            workspace_runtime.MAX_SYNTHETIC_EVIDENCE_BYTES,
+        )
+        shard_violations = [
+            *public_manifest["secret_delta"]["violations"],
+            *private_manifest["secret_delta"]["violations"],
+        ]
+        self.assertEqual(len(shard_violations), 1)
+        self.assertEqual(
+            sorted(
+                (
+                    len(public_manifest["secret_delta"]["violations"]),
+                    len(private_manifest["secret_delta"]["violations"]),
+                )
+            ),
+            [0, 1],
+        )
+        self.assertEqual(
+            len(public_manifest["entries"]) + len(private_manifest["entries"]),
+            len(values) - 1,
+        )
+        secret_delta = evidence["secret_delta"]
+        self.assertEqual(secret_delta["status"], "violations")
+        self.assertEqual(secret_delta["location_status"], "complete")
+        self.assertEqual(len(secret_delta["violations"]), 1)
+        violation = secret_delta["violations"][0]
+        self.assertEqual(
+            violation["value_sha256"],
+            hashlib.sha256(values[0]).hexdigest(),
+        )
+        self.assertEqual(
+            (violation["base_count"], violation["head_count"], violation["delta"]),
+            (1, 2, 1),
+        )
+        self.assertEqual(
+            violation["additions"],
+            [
+                {
+                    "line": 1,
+                    "occurrence_count": 1,
+                    "path": "one-legacy-growth.txt",
+                    "surface": "blob",
+                }
+            ],
+        )
+        self.assertEqual(evidence["synthetic_tokens"]["accepted"], [])
+        self.assertEqual(evidence["synthetic_tokens"]["legacy_counts"], [])
+        self.assertEqual(evidence["synthetic_tokens"]["secret_reductions"], [])
+        encoded_preflight = workspace_runtime.encode_preflight_json(
+            workspace_runtime.build_preflight_evidence(review, evidence)
+        ).encode("utf-8")
+        self.assertLessEqual(
+            len(encoded_preflight),
+            workspace_runtime.MAX_PREFLIGHT_JSON_BYTES,
+        )
+
+    def test_mixed_catalog_shards_round_trip_and_bind_exact_rows(self) -> None:
+        values = tuple(
+            b"S" * 11 + f"{index:05d}".encode("ascii") for index in range(256)
+        )
+        encoded_catalog = self.encoded_file_catalog_with_legacy_values(
+            values,
+            rule="generic-secret-assignment",
+        )
+        self.assertLessEqual(
+            len(encoded_catalog),
+            synthetic_tokens_runtime.MAX_CATALOG_BYTES,
+        )
+        catalog = synthetic_tokens_runtime.parse_catalog_bytes(encoded_catalog)
+        split = len(values) // 2
+        existing_base = self.commit_bytes(
+            "mixed-existing-legacy-values.txt",
+            b"".join(b'password = "' + value + b'"\n' for value in values[:split]),
+            "Add existing mixed catalog values",
+        )
+        growth_head = self.commit_bytes(
+            "mixed-added-legacy-values.txt",
+            b"".join(b'password = "' + value + b'"\n' for value in values[split:]),
+            "Grow mixed catalog values",
+        )
+
+        with mock.patch.object(workspace_runtime, "load_catalog", return_value=catalog):
+            review = self.prepare_range(existing_base, growth_head)
+            public_manifest_path = (
+                review.workspace_root
+                / ".codex-review"
+                / workspace_runtime.SYNTHETIC_MANIFEST_NAME
+            )
+            private_manifest_path = (
+                review.container_dir / workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME
+            )
+            public_manifest = json.loads(public_manifest_path.read_text("utf-8"))
+            private_manifest = json.loads(private_manifest_path.read_text("utf-8"))
+            evidence = validate_external_workspace(review)
+
+        for manifest in (public_manifest, private_manifest):
+            self.assertTrue(manifest["entries"])
+            self.assertTrue(manifest["secret_delta"]["violations"])
+        self.assertEqual(
+            len(public_manifest["entries"]) + len(private_manifest["entries"]),
+            split,
+        )
+        self.assertEqual(
+            len(public_manifest["secret_delta"]["violations"])
+            + len(private_manifest["secret_delta"]["violations"]),
+            len(values) - split,
+        )
+        self.assertEqual(evidence["secret_delta"]["status"], "violations")
+        self.assertEqual(
+            len(evidence["secret_delta"]["violations"]),
+            len(values) - split,
+        )
+        self.assertEqual(
+            {
+                violation["value_sha256"]
+                for violation in evidence["secret_delta"]["violations"]
+            },
+            {hashlib.sha256(value).hexdigest() for value in values[split:]},
+        )
+
+        for mutation in ("delete", "duplicate", "reorder"):
+            with self.subTest(private_entries=mutation):
+                mutated_private = json.loads(json.dumps(private_manifest))
+                if mutation == "delete":
+                    mutated_private["entries"].pop()
+                elif mutation == "duplicate":
+                    mutated_private["entries"].append(
+                        dict(mutated_private["entries"][0])
+                    )
+                else:
+                    self.assertGreater(len(mutated_private["entries"]), 1)
+                    mutated_private["entries"].reverse()
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "helper-private manifest shard commitment does not match",
+                ):
+                    workspace_runtime._merge_secret_count_manifest_shards(
+                        public_manifest,
+                        mutated_private,
+                    )
+
+        tampered_public = json.loads(json.dumps(public_manifest))
+        tampered_public["entries"][0]["head_count"] += 1
+        public_manifest_path.write_text(
+            json.dumps(tampered_public, separators=(",", ":"), sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        with (
+            mock.patch.object(workspace_runtime, "load_catalog", return_value=catalog),
+            self.assertRaisesRegex(
+                ReviewError,
+                "does not match helper-private control state",
+            ),
+        ):
+            validate_external_workspace(review)
+
+    def test_file_backed_legacy_growth_at_capacity_stays_blocked_and_launchable(
+        self,
+    ) -> None:
+        values, catalog = self.maximal_file_backed_legacy_catalog(
+            rule="generic-secret-assignment",
+        )
+        accepted = workspace_runtime.accepted_legacy_values(
+            catalog,
+            catalog.legacy_exemptions,
+        )
+        probe = b'password = "' + values[0] + b'"\n'
+        unfiltered = workspace_runtime._scan_secret_value(
+            probe,
+            accepted_values=accepted,
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+        filtered = workspace_runtime._scan_secret_value(
+            probe,
+            accepted_values=accepted,
+            capture_blocking_candidates=True,
+            reduced_secret_values=frozenset(values),
+            _continue_after_blocking=True,
+        )
+        self.assertEqual(unfiltered.accepted_counts, {})
+        self.assertIn("openai-key", unfiltered.blocking_candidates[values[0]])
+        self.assertEqual(filtered.accepted_counts, {})
+        self.assertEqual(filtered.blocking_candidates, {})
+        payload = b"".join(b'password = "' + value + b'"\n' for value in values)
+        added_head = self.commit_bytes(
+            "many-legacy-growths.txt",
+            payload,
+            "Add many cataloged legacy values",
+        )
+
+        with mock.patch.object(workspace_runtime, "load_catalog", return_value=catalog):
+            review = self.prepare_range(self.head, added_head)
+            public_manifest_path = (
+                review.workspace_root
+                / ".codex-review"
+                / workspace_runtime.SYNTHETIC_MANIFEST_NAME
+            )
+            private_manifest_path = (
+                review.container_dir / workspace_runtime.SYNTHETIC_PRIVATE_MANIFEST_NAME
+            )
+            public_manifest = json.loads(public_manifest_path.read_text("utf-8"))
+            private_manifest = json.loads(private_manifest_path.read_text("utf-8"))
+            evidence = validate_external_workspace(review)
+
+        self.assertLessEqual(
+            public_manifest_path.stat().st_size,
+            workspace_runtime.MAX_SYNTHETIC_EVIDENCE_BYTES,
+        )
+        self.assertLessEqual(
+            private_manifest_path.stat().st_size,
+            workspace_runtime.MAX_SYNTHETIC_EVIDENCE_BYTES,
+        )
+        public_digests = {
+            item["value_sha256"]
+            for item in public_manifest["secret_delta"]["violations"]
+        }
+        private_digests = {
+            item["value_sha256"]
+            for item in private_manifest["secret_delta"]["violations"]
+        }
+        self.assertTrue(public_digests)
+        self.assertTrue(private_digests)
+        self.assertTrue(public_digests.isdisjoint(private_digests))
+        self.assertEqual(
+            public_digests | private_digests,
+            {hashlib.sha256(value).hexdigest() for value in values},
+        )
+        public_commitments = [
+            item
+            for item in public_manifest["secret_delta"]["limitations"]
+            if item.startswith(
+                workspace_runtime.PRIVATE_MANIFEST_SHARD_COMMITMENT_PREFIX
+            )
+        ]
+        private_commitments = [
+            item
+            for item in private_manifest["secret_delta"]["limitations"]
+            if item.startswith(
+                workspace_runtime.PRIVATE_MANIFEST_SHARD_COMMITMENT_PREFIX
+            )
+        ]
+        self.assertEqual(len(public_commitments), 1)
+        self.assertEqual(private_commitments, public_commitments)
+
+        for mutation in ("missing", "duplicate"):
+            with self.subTest(commitment=mutation):
+                mutated_public = json.loads(json.dumps(public_manifest))
+                mutated_private = json.loads(json.dumps(private_manifest))
+                for manifest in (mutated_public, mutated_private):
+                    limitations = manifest["secret_delta"]["limitations"]
+                    if mutation == "missing":
+                        limitations.remove(public_commitments[0])
+                    else:
+                        limitations.append(public_commitments[0])
+                with self.assertRaisesRegex(ReviewError, "shard commitment"):
+                    workspace_runtime._merge_secret_count_manifest_shards(
+                        mutated_public,
+                        mutated_private,
+                    )
+        duplicated_public = json.loads(json.dumps(public_manifest))
+        duplicated_private = json.loads(json.dumps(private_manifest))
+        duplicated_private["secret_delta"]["violations"].append(
+            dict(duplicated_public["secret_delta"]["violations"][0])
+        )
+        duplicate_digest = workspace_runtime._private_manifest_shard_rows_sha256(
+            duplicated_private,
+            [],
+        )
+        duplicate_commitment = workspace_runtime._private_manifest_shard_commitment(
+            duplicate_digest
+        )
+        for manifest in (duplicated_public, duplicated_private):
+            manifest["secret_delta"]["limitations"] = [
+                duplicate_commitment
+                if item.startswith(
+                    workspace_runtime.PRIVATE_MANIFEST_SHARD_COMMITMENT_PREFIX
+                )
+                else item
+                for item in manifest["secret_delta"]["limitations"]
+            ]
+        with self.assertRaisesRegex(ReviewError, "does not match helper-private state"):
+            workspace_runtime._merge_secret_count_manifest_shards(
+                duplicated_public,
+                duplicated_private,
+            )
+        secret_delta = evidence["secret_delta"]
+        self.assertEqual(secret_delta["status"], "violations")
+        self.assertEqual(
+            len(secret_delta["violations"]),
+            len(values),
+        )
+        self.assertEqual(
+            {item["value_sha256"] for item in secret_delta["violations"]},
+            {hashlib.sha256(value).hexdigest() for value in values},
+        )
+        self.assertTrue(
+            all(
+                (item["base_count"], item["head_count"], item["delta"]) == (0, 1, 1)
+                for item in secret_delta["violations"]
+            )
+        )
+        self.assertEqual(evidence["synthetic_tokens"]["accepted"], [])
+        self.assertEqual(evidence["synthetic_tokens"]["legacy_counts"], [])
+        self.assertEqual(evidence["synthetic_tokens"]["secret_reductions"], [])
+        complete_preflight = workspace_runtime.build_preflight_evidence(
+            review,
+            evidence,
+        )
+        encoded_preflight = workspace_runtime.encode_preflight_json(
+            complete_preflight
+        ).encode("utf-8")
+        self.assertLessEqual(
+            len(encoded_preflight),
+            workspace_runtime.MAX_PREFLIGHT_JSON_BYTES,
+        )
+        self.assertEqual(
+            len(json.loads(encoded_preflight)["secret_delta"]["violations"]),
+            len(values),
+        )
+        self.assertIn(values[0], review.diff_file.read_bytes())
+        self.assertIn(
+            values[-1],
+            (review.workspace_root / "many-legacy-growths.txt").read_bytes(),
+        )
+
+        tampered_private = json.loads(private_manifest_path.read_text("utf-8"))
+        tampered_violation = tampered_private["secret_delta"]["violations"][0]
+        tampered_violation["base_count"] = 1
+        tampered_violation["head_count"] = 2
+        tampered_violation["delta"] = 1
+        private_manifest_path.write_text(
+            json.dumps(tampered_private, separators=(",", ":"), sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.assertLessEqual(
+            private_manifest_path.stat().st_size,
+            workspace_runtime.MAX_SYNTHETIC_EVIDENCE_BYTES,
+        )
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "load_catalog",
+                return_value=catalog,
+            ),
+            self.assertRaisesRegex(ReviewError, "commitment does not match"),
+        ):
+            validate_external_workspace(review)
+
+    def test_cataloged_exact_bytes_merge_across_scanner_rules(self) -> None:
+        raw_value = unregistered_provider_credential()
+        catalog = self.catalog_with_legacy_values(
+            (raw_value,),
+            rule="github-token",
+        )
+        rendered = b'password = "' + raw_value + b'"\n'
+        secret_base = self.commit_bytes(
+            "cataloged-secret.txt",
+            rendered,
+            "Add cataloged secret",
+        )
+        unchanged_head = self.commit_bytes(
+            "unrelated.txt",
+            b"unrelated change\n",
+            "Change unrelated content",
+        )
+        growth_head = self.commit_bytes(
+            "copied-cataloged-secret.txt",
+            rendered,
+            "Copy cataloged secret",
+        )
+        deletion_head = self.remove_and_commit(
+            "copied-cataloged-secret.txt",
+            "Delete copied cataloged secret",
+        )
+
+        with mock.patch.object(workspace_runtime, "load_catalog", return_value=catalog):
+            unchanged_review = self.prepare_range(secret_base, unchanged_head)
+            deletion_review = self.prepare_range(growth_head, deletion_head)
+            growth_review = self.prepare_range(secret_base, growth_head)
+
+            unchanged = self.assert_secret_delta_status(unchanged_review, "clean")
+            deletion = self.assert_secret_delta_status(deletion_review, "clean")
+            growth = self.assert_secret_violation(
+                growth_review,
+                raw_value,
+                base_count=1,
+                head_count=2,
+            )
+            growth_evidence = validate_external_workspace(growth_review)
+
+        self.assertEqual(unchanged["violations"], [])
+        self.assertEqual(deletion["violations"], [])
+        self.assertEqual(growth["rules"], ["github-token"])
+        self.assertEqual(
+            growth["additions"],
+            [
+                {
+                    "line": 1,
+                    "occurrence_count": 1,
+                    "path": "copied-cataloged-secret.txt",
+                    "surface": "blob",
+                }
+            ],
+        )
+        self.assertEqual(
+            growth_evidence["synthetic_tokens"]["secret_reductions"],
+            [],
+        )
 
     def test_wrapped_unregistered_secret_addition_is_raw_with_violation_evidence(
         self,
