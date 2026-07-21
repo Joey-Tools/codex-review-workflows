@@ -581,6 +581,83 @@ class NamedClaudePreflightTest(unittest.TestCase):
             self.assertEqual(value["classification"], "inconclusive")
             self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
 
+    def test_malformed_side_by_side_root_stops_before_active_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            home = root / "home"
+            versions_root = home / ".local/share/claude/versions"
+            versions_root.parent.mkdir(parents=True)
+            versions_root.write_text("not a directory", encoding="utf-8")
+            active = home / ".local/bin/claude"
+            self._write_candidate(active)
+            verifier = mock.Mock(
+                side_effect=AssertionError(
+                    "a malformed higher-priority root must stop selection"
+                )
+            )
+
+            value = preflight_module.preflight(home=home, verifier=verifier)
+
+            verifier.assert_not_called()
+            self.assertEqual(value["classification"], "inconclusive")
+            self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
+
+    def test_malformed_side_by_side_ancestor_stops_before_trusted_fallback(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            home = root / "home"
+            malformed_ancestor = home / ".local/share"
+            malformed_ancestor.parent.mkdir(parents=True)
+            malformed_ancestor.write_text("not a directory", encoding="utf-8")
+            trusted = root / "trusted-claude"
+            self._write_candidate(trusted)
+            verifier = mock.Mock(
+                side_effect=AssertionError(
+                    "a malformed higher-priority ancestor must stop selection"
+                )
+            )
+
+            with mock.patch.object(
+                preflight_module,
+                "TRUSTED_ACTIVE_PATHS",
+                (trusted,),
+            ):
+                value = preflight_module.preflight(home=home, verifier=verifier)
+
+            verifier.assert_not_called()
+            self.assertEqual(value["classification"], "inconclusive")
+            self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
+
+    def test_observed_side_by_side_root_disappearance_stops_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            home = root / "home"
+            versions_root = home / ".local/share/claude/versions"
+            versions_root.mkdir(parents=True)
+            active = home / ".local/bin/claude"
+            self._write_candidate(active)
+            verifier = mock.Mock(
+                side_effect=AssertionError(
+                    "an observed higher-priority root race must stop selection"
+                )
+            )
+
+            with mock.patch.object(
+                preflight_module.os,
+                "open",
+                side_effect=FileNotFoundError(
+                    errno.ENOENT,
+                    "synthetic side-by-side root disappearance",
+                ),
+            ):
+                value = preflight_module.preflight(home=home, verifier=verifier)
+
+            verifier.assert_not_called()
+            self.assertEqual(value["classification"], "inconclusive")
+            self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
+
     def test_observed_automatic_candidate_disappearance_is_inconclusive(
         self,
     ) -> None:

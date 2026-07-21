@@ -300,11 +300,16 @@ def _highest_compatible_side_by_side(home: pathlib.Path) -> Candidate | None:
     descriptor = -1
     try:
         before = root.stat(follow_symlinks=False)
+    except OSError as error:
+        if error.errno == errno.ENOENT:
+            return None
+        raise _CandidateInspectionInconclusive(
+            f"cannot inspect side-by-side Claude Code installs under {root}"
+        ) from error
+    try:
         descriptor = os.open(root, flags)
         opened_before = os.fstat(descriptor)
     except OSError as error:
-        if error.errno in (errno.ENOENT, errno.ENOTDIR):
-            return None
         raise _CandidateInspectionInconclusive(
             f"cannot open side-by-side Claude Code installs under {root}"
         ) from error
