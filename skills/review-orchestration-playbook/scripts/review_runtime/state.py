@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -32,7 +33,7 @@ from .common import (
     write_json,
     write_text_atomic,
 )
-from .providers import run_review
+from .providers import CLAUDE_EGRESS_CONSENTS, run_review
 from .workspace import (
     MAX_PREFLIGHT_JSON_BYTES,
     PRIVATE_HELPER_ARTIFACT_NAMES,
@@ -47,7 +48,7 @@ from .workspace import (
     _inspect_control_directory,
     _load_control_artifact_state,
     _read_bounded_json,
-    _read_bounded_json_at,
+    _validate_bounded_json_depth,
     cleanup_legacy_workspace,
     cleanup_workspace,
     load_bound_private_cleanup_state,
@@ -74,10 +75,13 @@ STATE_SCHEMA_VERSION = 2
 LEGACY_STATE_MARKER = b"isolated-review-state-v1\n"
 COMPATIBLE_STATE_MARKER_SCHEMA_VERSION = 2
 PREVIOUS_STATE_MARKER_SCHEMA_VERSION = 3
-STATE_MARKER_SCHEMA_VERSION = 4
+BOUND_STATE_MARKER_SCHEMA_VERSION = 4
+STATE_MARKER_SCHEMA_VERSION = 5
 MAX_STATE_MARKER_BYTES = 64 * 1024
 MAX_FINAL_ARTIFACT_BYTES = 64 * 1024 * 1024
 ADMISSION_SCHEMA_VERSION = 1
+PREFLIGHT_RECEIPT_SCHEMA_VERSION = 1
+PREFLIGHT_RECEIPT_ALGORITHM = "sha256"
 PREFLIGHT_FILE = "preflight.json"
 PREFLIGHT_STATUS = "review workspace containment and integrity checks passed"
 PREFLIGHT_PRIVATE_ARTIFACTS = "removed"
@@ -149,12 +153,29 @@ def _remove_loaded_review_text(
 
 
 @dataclass(frozen=True)
+class PreflightReceipt:
+    schema_version: int
+    algorithm: str
+    size: int
+    sha256: str
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "algorithm": self.algorithm,
+            "schema_version": self.schema_version,
+            "sha256": self.sha256,
+            "size": self.size,
+        }
+
+
+@dataclass(frozen=True)
 class LoadedStateMarker:
     version: int
     phase: str
     private_cleanup: PrivateCleanupEvidence | None
     runner_lock: CleanupIdentity | None
     source_root: pathlib.Path | None
+    preflight_receipt: PreflightReceipt | None
 
 
 @dataclass(frozen=True)
@@ -440,10 +461,15 @@ def _state_path(state_dir: pathlib.Path) -> pathlib.Path:
 def _state_marker_payload(
     review: ReviewWorkspace,
     runner_lock: CleanupIdentity,
+    *,
+    preflight_receipt: PreflightReceipt | None = None,
 ) -> dict[str, Any]:
     return {
         "container_dir": str(review.container_dir),
         "phase": "ready",
+        "preflight_receipt": (
+            preflight_receipt.to_json() if preflight_receipt is not None else None
+        ),
         "private_cleanup": review.private_cleanup.to_json(),
         "runner_lock": runner_lock.to_json(),
         "source_root": str(review.source_root),
@@ -459,6 +485,7 @@ def _preparing_state_marker_payload(
     return {
         "container_dir": str(container),
         "phase": "preparing",
+        "preflight_receipt": None,
         "private_cleanup": private_cleanup.to_json(),
         "runner_lock": runner_lock.to_json(),
         "source_root": str(container.parent.parent),
@@ -499,10 +526,16 @@ def _write_preparing_state_marker(
 def _write_state_marker(
     review: ReviewWorkspace,
     runner_lock: CleanupIdentity,
+    *,
+    preflight_receipt: PreflightReceipt | None = None,
 ) -> None:
     _write_state_marker_payload(
         review.container_dir,
-        _state_marker_payload(review, runner_lock),
+        _state_marker_payload(
+            review,
+            runner_lock,
+            preflight_receipt=preflight_receipt,
+        ),
         expected=review.private_cleanup,
     )
 
@@ -679,6 +712,39 @@ def _reject_duplicate_marker_object(
             )
         value[key] = item
     return value
+
+
+def _parse_preflight_receipt(value: Any) -> PreflightReceipt:
+    if not isinstance(value, dict) or set(value) != {
+        "algorithm",
+        "schema_version",
+        "sha256",
+        "size",
+    }:
+        raise ReviewError("isolated-review preflight receipt fields are invalid")
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != PREFLIGHT_RECEIPT_SCHEMA_VERSION
+    ):
+        raise ReviewError("isolated-review preflight receipt version is invalid")
+    if value["algorithm"] != PREFLIGHT_RECEIPT_ALGORITHM:
+        raise ReviewError("isolated-review preflight receipt algorithm is invalid")
+    size = value["size"]
+    if type(size) is not int or size < 0 or size > MAX_PREFLIGHT_JSON_BYTES:
+        raise ReviewError("isolated-review preflight receipt size is invalid")
+    digest = value["sha256"]
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ReviewError("isolated-review preflight receipt digest is invalid")
+    return PreflightReceipt(
+        schema_version=PREFLIGHT_RECEIPT_SCHEMA_VERSION,
+        algorithm=PREFLIGHT_RECEIPT_ALGORITHM,
+        size=size,
+        sha256=digest,
+    )
+
+
+def _bound_state_marker_version(version: int) -> bool:
+    return version in {BOUND_STATE_MARKER_SCHEMA_VERSION, STATE_MARKER_SCHEMA_VERSION}
 
 
 def _validate_marker_container(
@@ -880,6 +946,7 @@ def _load_state_marker(state_dir: pathlib.Path) -> LoadedStateMarker:
             private_cleanup=None,
             runner_lock=None,
             source_root=None,
+            preflight_receipt=None,
         )
     try:
         marker = json.loads(
@@ -906,9 +973,11 @@ def _load_state_marker(state_dir: pathlib.Path) -> LoadedStateMarker:
             private_cleanup=parse_private_cleanup_evidence(marker["private_cleanup"]),
             runner_lock=None,
             source_root=None,
+            preflight_receipt=None,
         )
     if version not in {
         PREVIOUS_STATE_MARKER_SCHEMA_VERSION,
+        BOUND_STATE_MARKER_SCHEMA_VERSION,
         STATE_MARKER_SCHEMA_VERSION,
     }:
         raise ReviewError("isolated-review state marker version is invalid")
@@ -919,8 +988,10 @@ def _load_state_marker(state_dir: pathlib.Path) -> LoadedStateMarker:
         "source_root",
         "version",
     }
-    if version == STATE_MARKER_SCHEMA_VERSION:
+    if _bound_state_marker_version(version):
         expected_fields.add("runner_lock")
+    if version == STATE_MARKER_SCHEMA_VERSION:
+        expected_fields.add("preflight_receipt")
     if set(marker) != expected_fields:
         raise ReviewError("isolated-review state marker fields are invalid")
     source_root = _validate_v3_marker_layout(
@@ -936,16 +1007,26 @@ def _load_state_marker(state_dir: pathlib.Path) -> LoadedStateMarker:
         if phase == "ready"
         else parse_partial_private_cleanup_evidence
     )
+    receipt_value = marker.get("preflight_receipt")
+    if phase == "preparing" and receipt_value is not None:
+        raise ReviewError(
+            "isolated-review preparing marker cannot contain a preflight receipt"
+        )
     return LoadedStateMarker(
         version=version,
         phase=phase,
         private_cleanup=cleanup_parser(marker["private_cleanup"]),
         runner_lock=(
             _parse_runner_lock_identity(marker["runner_lock"])
-            if version == STATE_MARKER_SCHEMA_VERSION
+            if _bound_state_marker_version(version)
             else None
         ),
         source_root=source_root,
+        preflight_receipt=(
+            _parse_preflight_receipt(receipt_value)
+            if version == STATE_MARKER_SCHEMA_VERSION and receipt_value is not None
+            else None
+        ),
     )
 
 
@@ -955,13 +1036,13 @@ def _require_modern_ready_marker(
     purpose: str,
 ) -> PrivateCleanupEvidence:
     if (
-        marker.version != STATE_MARKER_SCHEMA_VERSION
+        not _bound_state_marker_version(marker.version)
         or marker.phase != "ready"
         or marker.private_cleanup is None
     ):
         raise ReviewError(
-            f"{purpose} requires a modern v{STATE_MARKER_SCHEMA_VERSION} ready "
-            "state marker"
+            f"{purpose} requires a modern v{BOUND_STATE_MARKER_SCHEMA_VERSION}/"
+            f"v{STATE_MARKER_SCHEMA_VERSION} ready state marker"
         )
     return marker.private_cleanup
 
@@ -989,8 +1070,9 @@ def _read_modern_bound_state_artifact(
     *,
     name: str,
     max_bytes: int,
+    marker: LoadedStateMarker | None = None,
 ) -> bytes | None:
-    """Read a v4 state artifact without following a mutable path component."""
+    """Read a v4/v5 state artifact without following a mutable path component."""
 
     if (
         not name
@@ -1005,7 +1087,7 @@ def _read_modern_bound_state_artifact(
         raise ReviewError("secure bound review state artifact loading is unavailable")
 
     resolved_state_dir = state_dir.expanduser().resolve(strict=False)
-    marker = _load_state_marker(resolved_state_dir)
+    marker = _load_state_marker(resolved_state_dir) if marker is None else marker
     expected = _require_modern_ready_marker(
         marker,
         purpose="bound review state artifact loading",
@@ -1114,6 +1196,76 @@ def _read_modern_bound_state_artifact(
             os.close(descriptor)
 
 
+def _reject_duplicate_preflight_object(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ReviewError(f"preflight evidence has duplicate field: {key}")
+        value[key] = item
+    return value
+
+
+def _parse_preflight_payload(payload: bytes, *, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_preflight_object,
+        )
+    except RecursionError as error:
+        raise ReviewError(f"{label} exceeds the JSON nesting depth limit") from error
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        OverflowError,
+        ValueError,
+    ) as error:
+        raise ReviewError(f"{label} is not valid JSON") from error
+    if not isinstance(value, dict):
+        raise ReviewError(f"{label} must be a JSON object")
+    _validate_bounded_json_depth(value, label=label)
+    return value
+
+
+def _seal_preflight_receipt(
+    state_dir: pathlib.Path,
+    *,
+    review: ReviewWorkspace,
+    lock_fd: int,
+) -> PreflightReceipt:
+    validate_inherited_runner_lock_lease(state_dir, lock_fd)
+    marker = _load_state_marker(state_dir)
+    if marker.version != STATE_MARKER_SCHEMA_VERSION or marker.phase != "ready":
+        raise ReviewError(
+            f"secret admission sealing requires a v{STATE_MARKER_SCHEMA_VERSION} "
+            "ready state marker"
+        )
+    if marker.preflight_receipt is not None:
+        raise ReviewError("secret admission preflight receipt is already sealed")
+    payload = _read_modern_bound_state_artifact(
+        state_dir,
+        name=PREFLIGHT_FILE,
+        max_bytes=MAX_PREFLIGHT_JSON_BYTES,
+        marker=marker,
+    )
+    if payload is None:
+        raise ReviewError("secret admission preflight evidence is missing")
+    _parse_preflight_payload(payload, label="secret admission preflight evidence")
+    receipt = PreflightReceipt(
+        schema_version=PREFLIGHT_RECEIPT_SCHEMA_VERSION,
+        algorithm=PREFLIGHT_RECEIPT_ALGORITHM,
+        size=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    _write_state_marker(
+        review,
+        _require_bound_runner_lock(marker),
+        preflight_receipt=receipt,
+    )
+    return receipt
+
+
 def _load_state_marker_cleanup(
     state_dir: pathlib.Path,
 ) -> PrivateCleanupEvidence:
@@ -1197,6 +1349,7 @@ def load_review_state(
             not in {
                 COMPATIBLE_STATE_MARKER_SCHEMA_VERSION,
                 PREVIOUS_STATE_MARKER_SCHEMA_VERSION,
+                BOUND_STATE_MARKER_SCHEMA_VERSION,
                 STATE_MARKER_SCHEMA_VERSION,
             }
             or marker.phase != "ready"
@@ -1248,7 +1401,7 @@ def _read_exit_code(state_dir: pathlib.Path) -> int | None:
 
 
 def _require_bound_runner_lock(marker: LoadedStateMarker) -> CleanupIdentity:
-    if marker.version != STATE_MARKER_SCHEMA_VERSION or marker.runner_lock is None:
+    if not _bound_state_marker_version(marker.version) or marker.runner_lock is None:
         raise ReviewError(
             "review state marker has no preparation-bound runner lock identity; "
             "manual recovery is required for legacy v1/v2/v3 review state"
@@ -1530,6 +1683,21 @@ def _reap_started_process(pid: int) -> None:
     _STARTED_PROCESSES.pop(pid, None)
 
 
+def _validate_reviewer_policy(
+    reviewer: str,
+    egress_consent: str | None,
+) -> None:
+    if not isinstance(reviewer, str) or reviewer not in {"codex", "claude"}:
+        raise ReviewError("reviewer policy is invalid")
+    if reviewer == "claude":
+        if egress_consent not in CLAUDE_EGRESS_CONSENTS:
+            raise ReviewError(
+                "Claude reviewer policy requires a valid explicit egress consent"
+            )
+    elif egress_consent is not None:
+        raise ReviewError("Codex reviewer policy cannot contain egress consent")
+
+
 def start(
     *,
     script_path: pathlib.Path,
@@ -1543,6 +1711,7 @@ def start(
     synthetic_secret_exemptions: tuple[str, ...] = (),
     publisher: Callable[[pathlib.Path], None] | None = None,
 ) -> pathlib.Path:
+    _validate_reviewer_policy(reviewer, egress_consent)
     process: subprocess.Popen[bytes] | None = None
     review: ReviewWorkspace | None = None
     preparation_guard = ReviewPreparationGuard()
@@ -1609,19 +1778,24 @@ def start(
             stdout_path.open("wb") as stdout_handle,
             stderr_path.open("wb") as stderr_handle,
         ):
+            runner_arguments = [
+                sys.executable,
+                str(script_path),
+                "_run-state",
+                "--state-dir",
+                str(state_dir),
+                "--lock-fd",
+                str(lock_fd),
+                "--reviewer",
+                reviewer,
+            ]
+            if egress_consent is not None:
+                runner_arguments.extend(("--egress-consent", egress_consent))
             spawning = True
             spawn_mask = block_forwarded_signals()
             try:
                 process = subprocess.Popen(
-                    (
-                        sys.executable,
-                        str(script_path),
-                        "_run-state",
-                        "--state-dir",
-                        str(state_dir),
-                        "--lock-fd",
-                        str(lock_fd),
-                    ),
+                    tuple(runner_arguments),
                     cwd=review.workspace_root,
                     stdin=subprocess.DEVNULL,
                     stdout=stdout_handle,
@@ -1713,6 +1887,8 @@ def run_state(
     state_dir: pathlib.Path,
     lock_fd: int | None = None,
     terminal_process: bool = False,
+    expected_reviewer: str | None = None,
+    expected_egress_consent: str | None = None,
 ) -> int:
     exit_code = 1
     pending_signal: signal.Signals | None = None
@@ -1738,10 +1914,20 @@ def run_state(
                 raise ReviewError(
                     "terminal review runner has no inherited preparation lock"
                 )
+            if expected_reviewer is None:
+                raise ReviewError("terminal review runner has no bound reviewer policy")
+            _validate_reviewer_policy(
+                expected_reviewer,
+                expected_egress_consent,
+            )
             validate_inherited_runner_lock_lease(state_dir, lock_fd)
-        elif lock_fd is not None:
+        elif (
+            lock_fd is not None
+            or expected_reviewer is not None
+            or expected_egress_consent is not None
+        ):
             raise ReviewError(
-                "review runner lock descriptor is valid only for terminal execution"
+                "review runner launch binding is valid only for terminal execution"
             )
         state, review = load_review_state(state_dir)
         state_loaded = True
@@ -1752,20 +1938,56 @@ def run_state(
         marker = _load_state_marker(state_dir)
         if marker.version != STATE_MARKER_SCHEMA_VERSION:
             raise ReviewError(
-                "legacy v2/v3 review state cannot be resumed safely; start a new review"
+                "legacy v2/v3/v4 review state cannot be resumed safely; start a new "
+                "review"
             )
-        unblock_forwarded_signals()
-        reviewer = state.get("reviewer")
-        if not isinstance(reviewer, str):
+        state_reviewer = state.get("reviewer")
+        if not isinstance(state_reviewer, str):
             raise ReviewError("review state does not contain a reviewer")
         consent_value = state.get("egress_consent")
-        egress_consent = consent_value if isinstance(consent_value, str) else None
+        if consent_value is not None and not isinstance(consent_value, str):
+            raise ReviewError("review state contains invalid egress consent")
+        state_egress_consent = consent_value
+        if terminal_process:
+            if (
+                state_reviewer != expected_reviewer
+                or state_egress_consent != expected_egress_consent
+            ):
+                raise ReviewError(
+                    "review state reviewer policy does not match its trusted launch "
+                    "binding"
+                )
+            reviewer = expected_reviewer
+            egress_consent = expected_egress_consent
+        else:
+            reviewer = state_reviewer
+            egress_consent = state_egress_consent
+        unblock_forwarded_signals()
         outcome = run_review(
             review=review,
             reviewer=reviewer,
             egress_consent=egress_consent,
         )
         exit_code = outcome.returncode
+        if terminal_process:
+            assert lock_fd is not None
+            suppress_signal_raise = True
+            try:
+                seal_mask = block_forwarded_signals()
+                _seal_preflight_receipt(
+                    state_dir,
+                    review=review,
+                    lock_fd=lock_fd,
+                )
+                if seal_mask is not None:
+                    sealed_signal = consume_pending_forwarded_signal()
+                    if pending_signal is None:
+                        pending_signal = sealed_signal
+            except Exception as error:
+                print(
+                    f"secret admission preflight receipt was not sealed: {error}",
+                    file=sys.stderr,
+                )
     except ForwardedSignal as error:
         exit_code = 128 + int(error.signum)
         if state_loaded and review is not None and error.detail:
@@ -1947,50 +2169,30 @@ def _read_bound_preflight(
     state_dir: pathlib.Path,
     *,
     marker: LoadedStateMarker,
-) -> tuple[dict[str, Any] | None, bool]:
-    expected = _require_modern_ready_marker(
-        marker,
-        purpose="secret admission",
+) -> dict[str, Any]:
+    receipt = marker.preflight_receipt
+    if receipt is None:
+        raise ReviewError("secret admission preflight receipt is missing")
+    payload = _read_modern_bound_state_artifact(
+        state_dir,
+        name=PREFLIGHT_FILE,
+        max_bytes=MAX_PREFLIGHT_JSON_BYTES,
+        marker=marker,
     )
-    try:
-        with _open_private_cleanup_state_directory(state_dir) as (
-            state_dir_fd,
-            revalidate_state_directory,
-        ):
-            revalidate_state_directory()
-            metadata = os.fstat(state_dir_fd)
-            if CleanupIdentity(metadata.st_dev, metadata.st_ino) != expected.container:
-                raise ReviewError(
-                    "secret admission container does not match preparation identity"
-                )
-            try:
-                os.stat(
-                    PREFLIGHT_FILE,
-                    dir_fd=state_dir_fd,
-                    follow_symlinks=False,
-                )
-            except FileNotFoundError:
-                revalidate_state_directory()
-                return None, True
-            preflight = _read_bounded_json_at(
-                state_dir_fd,
-                PREFLIGHT_FILE,
-                label="secret admission preflight evidence",
-                max_bytes=MAX_PREFLIGHT_JSON_BYTES,
-            )
-            revalidate_state_directory()
-            metadata = os.fstat(state_dir_fd)
-            if CleanupIdentity(metadata.st_dev, metadata.st_ino) != expected.container:
-                raise ReviewError(
-                    "secret admission container changed while evidence was read"
-                )
-            return preflight, False
-    except ReviewError:
-        raise
-    except OSError as error:
+    if payload is None:
+        raise ReviewError("sealed secret admission preflight evidence is missing")
+    if (
+        len(payload) != receipt.size
+        or hashlib.sha256(payload).hexdigest() != receipt.sha256
+    ):
         raise ReviewError(
-            "secret admission evidence could not be read safely"
-        ) from error
+            "secret admission preflight evidence does not match its runner-sealed "
+            "receipt"
+        )
+    return _parse_preflight_payload(
+        payload,
+        label="secret admission preflight evidence",
+    )
 
 
 def _admission_status_for_loaded_state(
@@ -2002,7 +2204,7 @@ def _admission_status_for_loaded_state(
 ) -> dict[str, Any]:
     review_range = f"{review.base_ref}..{review.head_ref}"
     if isinstance(review, LegacyReviewWorkspace) or (
-        marker.version != STATE_MARKER_SCHEMA_VERSION or marker.phase != "ready"
+        not _bound_state_marker_version(marker.version) or marker.phase != "ready"
     ):
         return _admission_result(
             state_dir=state_dir,
@@ -2012,8 +2214,23 @@ def _admission_status_for_loaded_state(
             failure_class="legacy-state-no-admission",
             secret_delta=None,
         )
+    if marker.preflight_receipt is None:
+        if running:
+            failure_class = "preflight-not-ready"
+        elif marker.version == BOUND_STATE_MARKER_SCHEMA_VERSION:
+            failure_class = "legacy-state-no-preflight-receipt"
+        else:
+            failure_class = "preflight-unsealed"
+        return _admission_result(
+            state_dir=state_dir,
+            review_range=review_range,
+            status="pending" if running else "inconclusive",
+            exit_code=3 if running else 75,
+            failure_class=failure_class,
+            secret_delta=None,
+        )
     try:
-        preflight, missing = _read_bound_preflight(state_dir, marker=marker)
+        preflight = _read_bound_preflight(state_dir, marker=marker)
     except ReviewError:
         return _admission_result(
             state_dir=state_dir,
@@ -2021,15 +2238,6 @@ def _admission_status_for_loaded_state(
             status="inconclusive",
             exit_code=75,
             failure_class="preflight-invalid",
-            secret_delta=None,
-        )
-    if missing or preflight is None:
-        return _admission_result(
-            state_dir=state_dir,
-            review_range=review_range,
-            status="pending" if running else "inconclusive",
-            exit_code=3 if running else 75,
-            failure_class="preflight-not-ready" if running else "preflight-missing",
             secret_delta=None,
         )
     if preflight.get("review_range") != review_range:
@@ -2096,7 +2304,7 @@ def admission_status(state_dir: pathlib.Path) -> dict[str, Any]:
     running = False
     if (
         not isinstance(review, LegacyReviewWorkspace)
-        and marker.version == STATE_MARKER_SCHEMA_VERSION
+        and _bound_state_marker_version(marker.version)
         and marker.phase == "ready"
     ):
         running = _runner_lock_held(state_dir, marker=marker)
@@ -2488,7 +2696,7 @@ def _cleanup_terminal_workspace(
                     ) from state_error
                 state_path = state_dir / STATE_FILE
                 if (
-                    marker.version == STATE_MARKER_SCHEMA_VERSION
+                    _bound_state_marker_version(marker.version)
                     and marker.phase == "preparing"
                     and marker.private_cleanup is not None
                     and not os.path.lexists(state_path)
@@ -2504,7 +2712,7 @@ def _cleanup_terminal_workspace(
                         ) from state_error
                     return 0
                 if (
-                    marker.version == STATE_MARKER_SCHEMA_VERSION
+                    _bound_state_marker_version(marker.version)
                     and marker.phase == "ready"
                     and marker.private_cleanup is not None
                     and not os.path.lexists(state_path)

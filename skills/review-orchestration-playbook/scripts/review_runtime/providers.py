@@ -11433,24 +11433,19 @@ def _claude_persistence_failed_attempt(
     index: int,
     model: str,
     completed: Completed,
+    output: AttemptOutput,
     category: str = "blocked-authentication",
 ) -> Attempt:
-    stdout_path, stderr_path = _attempt_paths_without_io(
-        review,
-        index,
-        "claude",
-        model,
-    )
     try:
-        stdout_path.parent.mkdir(parents=True, exist_ok=True)
-        stdout_path.touch(exist_ok=True)
-        stderr_path.touch(exist_ok=True)
-        _append_attempt_diagnostic(
-            stderr_path,
+        output.ensure_captured(completed)
+    except (OSError, ReviewError):
+        pass
+    try:
+        output.append_stderr(
             "Claude credential refresh persistence was not safely completed after "
             "the runtime attempt.",
         )
-    except OSError:
+    except (OSError, ReviewError):
         pass
     return Attempt(
         runtime="claude",
@@ -11461,8 +11456,8 @@ def _claude_persistence_failed_attempt(
         returncode=completed.returncode,
         category=category,
         final_text=None,
-        stdout_path=str(stdout_path),
-        stderr_path=str(stderr_path),
+        stdout_path=str(output.stdout_path),
+        stderr_path=str(output.stderr_path),
     )
 
 
@@ -11472,6 +11467,7 @@ def _claude_auth_rejection_after_credential_inspection(
     index: int,
     model: str,
     completed: Completed,
+    output: AttemptOutput,
     inspection_error: BaseException,
 ) -> ClaudeKeychainCredentialUnavailable | None:
     if classify_failure(completed.stdout, completed.stderr) != "auth":
@@ -11488,6 +11484,7 @@ def _claude_auth_rejection_after_credential_inspection(
             index=index,
             model=model,
             completed=completed,
+            output=output,
             category="auth",
         ),
     )
@@ -12414,6 +12411,7 @@ def _claude_attempt_with_output(
                         index=index,
                         model=model,
                         completed=completed,
+                        output=output,
                         inspection_error=error,
                     )
                 )
@@ -12447,6 +12445,7 @@ def _claude_attempt_with_output(
                         index=index,
                         model=model,
                         completed=completed,
+                        output=output,
                         category="inconclusive",
                     ),
                 )
@@ -12507,6 +12506,7 @@ def _claude_attempt_with_output(
                         index=index,
                         model=model,
                         completed=completed,
+                        output=output,
                     ),
                 )
             raise translated_error from error
@@ -12635,6 +12635,7 @@ def _claude_attempt_with_output(
                         index=index,
                         model=model,
                         completed=completed,
+                        output=output,
                         inspection_error=error,
                     )
                 )
@@ -12648,6 +12649,7 @@ def _claude_attempt_with_output(
                         index=index,
                         model=model,
                         completed=completed,
+                        output=output,
                         category="inconclusive",
                     ),
                 )
@@ -12701,6 +12703,7 @@ def _claude_attempt_with_output(
                         index=index,
                         model=model,
                         completed=completed,
+                        output=output,
                     ),
                 )
             raise

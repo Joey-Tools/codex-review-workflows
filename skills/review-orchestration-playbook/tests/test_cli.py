@@ -105,6 +105,10 @@ class ForegroundCleanupTest(unittest.TestCase):
                     str(state_dir),
                     "--lock-fd",
                     "41",
+                    "--reviewer",
+                    "claude",
+                    "--egress-consent",
+                    "double-review",
                 ]
             )
 
@@ -113,6 +117,8 @@ class ForegroundCleanupTest(unittest.TestCase):
             state_dir=state_dir,
             lock_fd=41,
             terminal_process=True,
+            expected_reviewer="claude",
+            expected_egress_consent="double-review",
         )
 
     def test_stateful_cleanup_dispatches_bounded_cleanup(self) -> None:

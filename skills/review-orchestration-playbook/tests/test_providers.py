@@ -19928,6 +19928,101 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(attempt.category, "blocked-authentication")
         self.assertEqual(attempt.returncode, 0)
 
+    def test_claude_persistence_diagnostic_uses_bound_attempt_after_path_swap(
+        self,
+    ) -> None:
+        executable = pathlib.Path("/verified/claude")
+        model = providers.CLAUDE_MODELS[0]
+        completed = Completed(
+            argv=("sandbox",),
+            returncode=0,
+            stdout=b"runtime stdout\n",
+            stderr=b"runtime stderr\n",
+        )
+        stdout_name = f"01-claude-{model}.stdout.log"
+        stderr_name = f"01-claude-{model}.stderr.log"
+        forged_stdout = b"forged stdout\n"
+        forged_stderr = b"forged stderr\n"
+
+        def run_after_spawn(*_args: object, **kwargs: object) -> Completed:
+            on_process_started = kwargs.get("on_process_started")
+            assert callable(on_process_started)
+            on_process_started()
+            stdout_file = kwargs["stdout_file"]
+            stderr_file = kwargs["stderr_file"]
+            stdout_file.write(completed.stdout)
+            stdout_file.flush()
+            stderr_file.write(completed.stderr)
+            stderr_file.flush()
+            self._replace_attempts_with_forged_stdout(
+                stdout_name=stdout_name,
+                payload=forged_stdout,
+            )
+            (self.review.container_dir / "attempts" / stderr_name).write_bytes(
+                forged_stderr
+            )
+            return completed
+
+        @contextlib.contextmanager
+        def failing_runtime():
+            yield mock.Mock(argv=("sandbox",), env={})
+            raise providers.LinuxCredentialUnsafe(
+                "host credential changed before refresh writeback"
+            )
+
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {
+                "phase": "publisher-and-capabilities-verified",
+                "authentication": {"status": "pending"},
+            },
+        )
+        with (
+            providers._open_review_launch_binding(self.review) as launch,
+            mock.patch.object(providers, "_is_claude_linux_host", return_value=True),
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_linux_review_runtime",
+                return_value=failing_runtime(),
+            ),
+            mock.patch.object(providers, "run", side_effect=run_after_spawn),
+            self.assertRaises(providers.ClaudeCredentialUnsafe) as raised,
+        ):
+            launch.freeze_prompt()
+            providers._claude_attempt(
+                review=self.review,
+                model=model,
+                index=1,
+                env={},
+                executable=executable,
+                launch=launch,
+                refresh_lock_protocol=self.claude_refresh_lock_protocol,
+            )
+
+        attempt = getattr(
+            raised.exception,
+            "_codex_claude_persistence_attempt",
+        )
+        self.assertIsInstance(attempt, providers.Attempt)
+        retained = self.review.container_dir / "attempts-retained"
+        self.assertEqual((retained / stdout_name).read_bytes(), completed.stdout)
+        retained_stderr = (retained / stderr_name).read_bytes()
+        self.assertIn(completed.stderr.rstrip(), retained_stderr)
+        self.assertIn(b"credential refresh persistence", retained_stderr)
+        replacement = self.review.container_dir / "attempts"
+        self.assertEqual((replacement / stdout_name).read_bytes(), forged_stdout)
+        self.assertEqual((replacement / stderr_name).read_bytes(), forged_stderr)
+
     def test_claude_linux_auth_rejection_precedes_inspection_failure(
         self,
     ) -> None:
@@ -20012,48 +20107,47 @@ class ProviderPolicyTest(unittest.TestCase):
             stdout=b"",
             stderr=b"",
         )
-        failure_patches = (
+        failures = (
+            ("capture", "ensure_captured", OSError("attempt capture unavailable")),
+            ("append", "append_stderr", OSError("attempt diagnostic unavailable")),
             (
-                "attempt-directory",
-                mock.patch.object(
-                    pathlib.Path,
-                    "mkdir",
-                    side_effect=OSError("attempt directory unavailable"),
-                ),
-            ),
-            (
-                "empty-log",
-                mock.patch.object(
-                    pathlib.Path,
-                    "touch",
-                    side_effect=OSError("attempt log unavailable"),
-                ),
-            ),
-            (
-                "append",
-                mock.patch.object(
-                    providers,
-                    "_append_attempt_diagnostic",
-                    side_effect=OSError("attempt diagnostic unavailable"),
-                ),
+                "bound-append",
+                "append_stderr",
+                providers.ReviewError("bound attempt diagnostic unavailable"),
             ),
         )
 
-        for index, (label, failure_patch) in enumerate(
-            failure_patches,
+        for index, (label, method, error) in enumerate(
+            failures,
             start=1,
         ):
-            with self.subTest(label=label), failure_patch:
+            with self.subTest(label=label):
+                stdout_path, stderr_path = providers._attempt_paths_without_io(
+                    self.review,
+                    index,
+                    "claude",
+                    providers.CLAUDE_MODELS[0],
+                )
+                output = mock.create_autospec(
+                    providers.AttemptOutput,
+                    instance=True,
+                )
+                output.stdout_path = stdout_path
+                output.stderr_path = stderr_path
+                getattr(output, method).side_effect = error
                 attempt = providers._claude_persistence_failed_attempt(
                     review=self.review,
                     index=index,
                     model=providers.CLAUDE_MODELS[0],
                     completed=completed,
+                    output=output,
                     category="inconclusive",
                 )
 
                 self.assertEqual(attempt.category, "inconclusive")
                 self.assertEqual(attempt.returncode, 1)
+                output.ensure_captured.assert_called_once_with(completed)
+                output.append_stderr.assert_called_once()
 
     def test_auth_rejection_preserves_recovery_when_attempt_log_fails(
         self,
@@ -20085,18 +20179,24 @@ class ProviderPolicyTest(unittest.TestCase):
             str(carrier),
         )
 
-        with mock.patch.object(
-            providers,
-            "_append_attempt_diagnostic",
-            side_effect=OSError("attempt diagnostic unavailable"),
-        ):
-            failure = providers._claude_auth_rejection_after_credential_inspection(
-                review=self.review,
-                index=1,
-                model=providers.CLAUDE_MODELS[0],
-                completed=completed,
-                inspection_error=inspection_error,
-            )
+        stdout_path, stderr_path = providers._attempt_paths_without_io(
+            self.review,
+            1,
+            "claude",
+            providers.CLAUDE_MODELS[0],
+        )
+        output = mock.create_autospec(providers.AttemptOutput, instance=True)
+        output.stdout_path = stdout_path
+        output.stderr_path = stderr_path
+        output.append_stderr.side_effect = OSError("attempt diagnostic unavailable")
+        failure = providers._claude_auth_rejection_after_credential_inspection(
+            review=self.review,
+            index=1,
+            model=providers.CLAUDE_MODELS[0],
+            completed=completed,
+            output=output,
+            inspection_error=inspection_error,
+        )
 
         self.assertIsInstance(
             failure,

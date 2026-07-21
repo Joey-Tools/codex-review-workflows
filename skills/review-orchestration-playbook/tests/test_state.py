@@ -211,6 +211,12 @@ class StatefulLifecycleTest(unittest.TestCase):
                 "status": state.PREFLIGHT_STATUS,
             },
         )
+        with held_runner_lock(self.review) as runner_lock:
+            state._seal_preflight_receipt(
+                self.review.container_dir,
+                review=self.review,
+                lock_fd=runner_lock.fileno(),
+            )
 
     def clean_secret_delta(self) -> dict[str, object]:
         return {
@@ -616,6 +622,7 @@ class StatefulLifecycleTest(unittest.TestCase):
             self.review,
             runner_lock_identity(self.review),
         )
+        payload.pop("preflight_receipt")
         payload.pop("runner_lock")
         payload["version"] = state.PREVIOUS_STATE_MARKER_SCHEMA_VERSION
         write_json(self.review.container_dir / state.STATE_MARKER, payload)
@@ -633,6 +640,23 @@ class StatefulLifecycleTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ReviewError, "manual recovery"):
                 action()
+
+    def test_v4_terminal_state_remains_compatible_with_status_and_final(self) -> None:
+        self.write_completed_state()
+        marker_path = self.review.container_dir / state.STATE_MARKER
+        marker = read_json(marker_path)
+        marker.pop("preflight_receipt")
+        marker["version"] = state.BOUND_STATE_MARKER_SCHEMA_VERSION
+        write_json(marker_path, marker)
+
+        summary = state.status(self.review.container_dir)
+        self.assertFalse(summary["running"])
+        self.assertEqual(summary["exit_code"], 0)
+        self.assertEqual(summary["admission"]["status"], "inconclusive")
+
+        with mock.patch.object(state, "wait", return_value=0):
+            exit_code, text = state.final(self.review.container_dir)
+        self.assertEqual((exit_code, text), (0, "No findings."))
 
     def test_preparing_marker_recovers_partial_container_without_state(self) -> None:
         retained_name = PRIVATE_CHANGED_PATHS_NAME
@@ -855,6 +879,31 @@ class StatefulLifecycleTest(unittest.TestCase):
         for payload in invalid_payloads:
             with self.subTest(payload=payload):
                 write_json(marker_path, payload)
+                with self.assertRaises(ReviewError):
+                    state._load_state_marker(self.review.container_dir)
+
+    def test_v5_preflight_receipt_schema_is_strict(self) -> None:
+        marker_path = self.review.container_dir / state.STATE_MARKER
+        base = state._state_marker_payload(
+            self.review,
+            runner_lock_identity(self.review),
+        )
+        valid = {
+            "algorithm": state.PREFLIGHT_RECEIPT_ALGORITHM,
+            "schema_version": state.PREFLIGHT_RECEIPT_SCHEMA_VERSION,
+            "sha256": "a" * 64,
+            "size": 17,
+        }
+        invalid_receipts = (
+            {**valid, "schema_version": True},
+            {**valid, "algorithm": "sha512"},
+            {**valid, "size": -1},
+            {**valid, "sha256": "A" * 64},
+            {**valid, "extra": "field"},
+        )
+        for receipt in invalid_receipts:
+            with self.subTest(receipt=receipt):
+                write_json(marker_path, {**base, "preflight_receipt": receipt})
                 with self.assertRaises(ReviewError):
                     state._load_state_marker(self.review.container_dir)
 
@@ -1578,7 +1627,7 @@ class StatefulLifecycleTest(unittest.TestCase):
         terminal = state.admission_status(self.review.container_dir)
         self.assertEqual(terminal["status"], "inconclusive")
         self.assertEqual(terminal["exit_code"], 75)
-        self.assertEqual(terminal["failure_class"], "preflight-missing")
+        self.assertEqual(terminal["failure_class"], "preflight-unsealed")
 
         lock_path = self.review.container_dir / state.LOCK_FILE
         with lock_path.open("r+b") as runner_lock:
@@ -1593,6 +1642,7 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.write_completed_state()
         preflight_path = self.review.container_dir / state.PREFLIGHT_FILE
 
+        self.write_preflight(self.clean_secret_delta())
         write_text_atomic(preflight_path, "not-json\n")
         malformed = state.admission_status(self.review.container_dir)
         self.assertEqual(malformed["failure_class"], "preflight-invalid")
@@ -1618,20 +1668,20 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.write_preflight(self.clean_secret_delta())
         state_dir = self.review.container_dir
         moved_state_dir = state_dir.with_name(f"{state_dir.name}-admission-bound")
-        original_reader = state._read_bounded_json_at
+        original_reader = state._read_modern_bound_state_artifact
         swapped = False
 
-        def swap_then_read(directory_descriptor, name, **kwargs):
+        def swap_then_read(bound_state_dir, **kwargs):
             nonlocal swapped
             swapped = True
             state_dir.rename(moved_state_dir)
             state_dir.mkdir(mode=0o700)
-            return original_reader(directory_descriptor, name, **kwargs)
+            return original_reader(bound_state_dir, **kwargs)
 
         try:
             with mock.patch.object(
                 state,
-                "_read_bounded_json_at",
+                "_read_modern_bound_state_artifact",
                 side_effect=swap_then_read,
             ):
                 summary = state.admission_status(state_dir)
@@ -1643,6 +1693,56 @@ class StatefulLifecycleTest(unittest.TestCase):
                 state_dir.rmdir()
             if moved_state_dir.is_dir():
                 moved_state_dir.rename(state_dir)
+
+    def test_admission_rejects_valid_preflight_replacement_after_runner_seal(
+        self,
+    ) -> None:
+        self.write_completed_state()
+        self.write_preflight(self.violating_secret_delta())
+
+        write_json(
+            self.review.container_dir / state.PREFLIGHT_FILE,
+            {
+                "private_artifacts": state.PREFLIGHT_PRIVATE_ARTIFACTS,
+                "review_range": f"{self.base}..{self.head}",
+                "scope": state.PREFLIGHT_SCOPE,
+                "secret_delta": self.clean_secret_delta(),
+                "status": state.PREFLIGHT_STATUS,
+            },
+        )
+
+        summary = state.admission_status(self.review.container_dir)
+
+        self.assertEqual(summary["status"], "inconclusive")
+        self.assertEqual(summary["exit_code"], 75)
+        self.assertEqual(summary["failure_class"], "preflight-invalid")
+        self.assertIsNone(summary["secret_delta"])
+
+    def test_v4_admission_is_pending_while_held_and_inconclusive_when_terminal(
+        self,
+    ) -> None:
+        self.write_completed_state()
+        marker_path = self.review.container_dir / state.STATE_MARKER
+        marker = read_json(marker_path)
+        marker.pop("preflight_receipt")
+        marker["version"] = state.BOUND_STATE_MARKER_SCHEMA_VERSION
+        write_json(marker_path, marker)
+
+        terminal = state.admission_status(self.review.container_dir)
+        self.assertEqual(terminal["status"], "inconclusive")
+        self.assertEqual(
+            terminal["failure_class"],
+            "legacy-state-no-preflight-receipt",
+        )
+
+        lock_path = self.review.container_dir / state.LOCK_FILE
+        with lock_path.open("r+b") as runner_lock:
+            state.fcntl.flock(runner_lock.fileno(), state.fcntl.LOCK_EX)
+            pending = state.admission_status(self.review.container_dir)
+
+        self.assertEqual(pending["status"], "pending")
+        self.assertEqual(pending["exit_code"], 3)
+        self.assertEqual(pending["failure_class"], "preflight-not-ready")
 
     def test_status_admission_matches_standalone_result(self) -> None:
         self.write_completed_state()
@@ -1980,7 +2080,7 @@ class StatefulLifecycleTest(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assertTrue(self.review.workspace_root.exists())
-        self.assertIn("modern v4 ready state marker", stderr.getvalue())
+        self.assertIn("modern v4/v5 ready state marker", stderr.getvalue())
 
     def test_private_lock_creation_has_fixed_mode_with_permissive_umask(self) -> None:
         lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
@@ -3033,6 +3133,33 @@ final_path.chmod(0o600)
 
         popen.assert_not_called()
 
+    def test_direct_start_rejects_invalid_reviewer_policy_before_preparation(
+        self,
+    ) -> None:
+        cases = (
+            ("unknown", None),
+            ("claude", None),
+            ("claude", "untrusted-consent"),
+            ("codex", "double-review"),
+        )
+        for reviewer, egress_consent in cases:
+            with (
+                self.subTest(reviewer=reviewer, egress_consent=egress_consent),
+                mock.patch.object(state, "prepare_workspace") as prepare,
+                self.assertRaises(ReviewError),
+            ):
+                state.start(
+                    script_path=pathlib.Path("runner.py"),
+                    repo=self.repo,
+                    reviewer=reviewer,
+                    base_ref=self.base,
+                    head_ref=self.head,
+                    prompt_file=None,
+                    keep_workspace=False,
+                    egress_consent=egress_consent,
+                )
+            prepare.assert_not_called()
+
     def test_start_holds_preparation_lock_through_child_fd_handoff(self) -> None:
         process = mock.Mock(pid=12345)
         lock_identity: tuple[int, int] | None = None
@@ -3057,8 +3184,13 @@ final_path.chmod(0o600)
             kwargs["ownership_handoff"](self.review)
             return self.review
 
-        def spawn_with_inherited_lock(*_args, **kwargs):
+        def spawn_with_inherited_lock(arguments, **kwargs):
             self.assertIsNotNone(lock_identity)
+            self.assertEqual(
+                arguments[arguments.index("--reviewer") + 1],
+                "codex",
+            )
+            self.assertNotIn("--egress-consent", arguments)
             self.assertEqual(len(kwargs["pass_fds"]), 1)
             inherited = os.fstat(kwargs["pass_fds"][0])
             self.assertEqual(
@@ -3640,14 +3772,141 @@ with pathlib.Path(sys.argv[1]).open("a+b") as handle:
                     state_dir=state_dir,
                     lock_fd=runner_lock.fileno(),
                     terminal_process=True,
+                    expected_reviewer="codex",
+                    expected_egress_consent=None,
                 )
 
         self.assertEqual(exit_code, 0)
-        block.assert_called_once_with()
+        self.assertEqual(block.call_args_list, [mock.call(), mock.call()])
         restore.assert_not_called()
         self.assertEqual(
             (state_dir / state.EXIT_FILE).read_text(encoding="utf-8").strip(),
             "0",
+        )
+
+    def test_terminal_runner_seals_preflight_receipt_before_releasing_lock(
+        self,
+    ) -> None:
+        state_dir = self.review.container_dir
+        with held_runner_lock(self.review) as runner_lock:
+            write_json(
+                state_dir / state.STATE_FILE,
+                {
+                    "version": state.STATE_SCHEMA_VERSION,
+                    "reviewer": "codex",
+                    "egress_consent": None,
+                    "workspace": self.review.to_json(),
+                },
+            )
+            write_json(
+                state_dir / state.PREFLIGHT_FILE,
+                {
+                    "private_artifacts": state.PREFLIGHT_PRIVATE_ARTIFACTS,
+                    "review_range": f"{self.base}..{self.head}",
+                    "scope": state.PREFLIGHT_SCOPE,
+                    "secret_delta": self.clean_secret_delta(),
+                    "status": state.PREFLIGHT_STATUS,
+                },
+            )
+            with mock.patch.object(
+                state,
+                "run_review",
+                return_value=mock.Mock(returncode=0),
+            ) as run_review:
+                exit_code = state.run_state(
+                    state_dir=state_dir,
+                    lock_fd=runner_lock.fileno(),
+                    terminal_process=True,
+                    expected_reviewer="codex",
+                    expected_egress_consent=None,
+                )
+            self.assertIsNotNone(state._load_state_marker(state_dir).preflight_receipt)
+
+        self.assertEqual(exit_code, 0)
+        run_review.assert_called_once_with(
+            review=self.review,
+            reviewer="codex",
+            egress_consent=None,
+        )
+        admission_exit, summary = state.admission(state_dir)
+        self.assertEqual(admission_exit, 0)
+        self.assertEqual(summary["status"], "clean")
+
+    def test_terminal_preflight_seal_failure_does_not_change_reviewer_outcome(
+        self,
+    ) -> None:
+        state_dir = self.review.container_dir
+        stderr = io.StringIO()
+        with held_runner_lock(self.review) as runner_lock:
+            write_json(
+                state_dir / state.STATE_FILE,
+                {
+                    "version": state.STATE_SCHEMA_VERSION,
+                    "reviewer": "codex",
+                    "egress_consent": None,
+                    "workspace": self.review.to_json(),
+                },
+            )
+            with (
+                mock.patch.object(
+                    state,
+                    "run_review",
+                    return_value=mock.Mock(returncode=0),
+                ),
+                mock.patch.object(
+                    state,
+                    "_seal_preflight_receipt",
+                    side_effect=OSError("receipt storage unavailable"),
+                ),
+                contextlib.redirect_stderr(stderr),
+            ):
+                exit_code = state.run_state(
+                    state_dir=state_dir,
+                    lock_fd=runner_lock.fileno(),
+                    terminal_process=True,
+                    expected_reviewer="codex",
+                    expected_egress_consent=None,
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            (state_dir / state.EXIT_FILE).read_text(encoding="utf-8").strip(),
+            "0",
+        )
+        self.assertFalse((state_dir / "runner-error.txt").exists())
+        self.assertIn("receipt storage unavailable", stderr.getvalue())
+        summary = state.admission_status(state_dir)
+        self.assertEqual(summary["status"], "inconclusive")
+        self.assertEqual(summary["failure_class"], "preflight-unsealed")
+
+    def test_terminal_runner_rejects_state_policy_replacement_before_launch(
+        self,
+    ) -> None:
+        state_dir = self.review.container_dir
+        with held_runner_lock(self.review) as runner_lock:
+            write_json(
+                state_dir / state.STATE_FILE,
+                {
+                    "version": state.STATE_SCHEMA_VERSION,
+                    "reviewer": "claude",
+                    "egress_consent": "double-review",
+                    "workspace": self.review.to_json(),
+                },
+            )
+            with mock.patch.object(state, "run_review") as run_review:
+                exit_code = state.run_state(
+                    state_dir=state_dir,
+                    lock_fd=runner_lock.fileno(),
+                    terminal_process=True,
+                    expected_reviewer="codex",
+                    expected_egress_consent=None,
+                )
+
+        self.assertEqual(exit_code, 1)
+        run_review.assert_not_called()
+        self.assertIn(
+            "does not match its trusted launch binding",
+            (state_dir / "runner-error.txt").read_text(encoding="utf-8"),
         )
 
     def test_runner_lock_validator_accepts_exact_inherited_lease(self) -> None:

@@ -343,11 +343,23 @@ def main(argv: list[str] | None = None) -> int:
             internal.add_argument("action")
             internal.add_argument("--state-dir", required=True)
             internal.add_argument("--lock-fd", required=True, type=int)
+            internal.add_argument(
+                "--reviewer",
+                required=True,
+                choices=("codex", "claude"),
+            )
+            internal.add_argument(
+                "--egress-consent",
+                choices=CLAUDE_EGRESS_CONSENTS,
+            )
             parsed = internal.parse_args(arguments)
+            _validate_review_arguments(parsed)
             exit_code = run_state(
                 state_dir=pathlib.Path(parsed.state_dir),
                 lock_fd=parsed.lock_fd,
                 terminal_process=True,
+                expected_reviewer=parsed.reviewer,
+                expected_egress_consent=parsed.egress_consent,
             )
             os._exit(exit_code)
         if arguments and arguments[0] == "stateful":
