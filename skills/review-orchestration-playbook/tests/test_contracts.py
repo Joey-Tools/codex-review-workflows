@@ -673,26 +673,33 @@ class RepositoryContractTest(unittest.TestCase):
                 "Codex Review Gate Compatibility Status",
                 "pull_request_target:",
                 "types: [opened, reopened, synchronize, ready_for_review]",
-                "permissions:\n  contents: read",
+                "permissions:\n  contents: read\n  statuses: write",
                 "jobs:\n  compatibility-status:",
-                "name: codex/review-gate",
-                "no reviewer was started and no review lane was counted",
+                "name: codex/review-gate compatibility publisher",
+                "GH_TOKEN: ${{ github.token }}",
+                "HEAD_SHA: ${{ github.event.pull_request.head.sha }}",
+                "REPOSITORY: ${{ github.repository }}",
+                'gh api --method POST "repos/${REPOSITORY}/statuses/${HEAD_SHA}"',
+                "-f state=success",
+                "-f context=codex/review-gate",
+                "Compatibility only; no reviewer or review lane.",
             ):
                 self.assertIn(anchor, compatibility)
             self.assertEqual(compatibility.count("\n  compatibility-status:\n"), 1)
+            self.assertEqual(compatibility.count("${{ github."), 3)
             for forbidden in (
                 "pull_request:",
                 "issue_comment:",
                 "pull_request_review:",
                 "schedule:",
                 "workflow_dispatch:",
-                "statuses: write",
                 "pull-requests: write",
                 "issues: write",
                 "codex-review-gate-action",
                 "@codex review",
-                "uses:",
-                "${{",
+                "\n      - uses:",
+                "actions/checkout",
+                "github.sha",
             ):
                 self.assertNotIn(forbidden, compatibility)
 
@@ -1401,32 +1408,36 @@ class RepositoryContractTest(unittest.TestCase):
             unknown_fields = (
                 set(case["extra_terminal_fields"]) - allowed_terminal_fields
             )
-            optional_failures = {
-                optional_contracts[field]["failure"]
-                for field, value in case["optional_terminal_values"].items()
-                if field not in optional_contracts
-                or not optional_value_is_valid(
-                    optional_contracts[field]["rule"],
-                    value,
-                    optional_contracts[field],
+            optional_failures = set()
+            for field, value in case["optional_terminal_values"].items():
+                contract = optional_contracts.get(field)
+                if contract is None:
+                    optional_failures.add("inconclusive")
+                elif not optional_value_is_valid(contract["rule"], value, contract):
+                    optional_failures.add(contract["failure"])
+
+            blocked_evidence = any(
+                (
+                    case["init_model"] != identity["init_model"],
+                    bool(observed_model_keys.intersection(other_primary_keys)),
+                    not observed_model_keys.intersection(requested_keys),
+                    "blocked" in optional_failures,
                 )
-            }
-            if unknown_fields:
+            )
+            inconclusive_evidence = any(
+                (
+                    bool(unknown_fields),
+                    bool(unknown_model_keys),
+                    "inconclusive" in optional_failures,
+                    bool(optional_failures - {"blocked", "inconclusive"}),
+                )
+            )
+            if blocked_evidence and inconclusive_evidence:
                 outcome = "inconclusive"
-            elif case["init_model"] != identity["init_model"]:
-                outcome = "blocked"
-            elif observed_model_keys.intersection(other_primary_keys):
-                outcome = "blocked"
-            elif unknown_model_keys:
+            elif inconclusive_evidence:
                 outcome = "inconclusive"
-            elif not observed_model_keys.intersection(requested_keys):
+            elif blocked_evidence:
                 outcome = "blocked"
-            elif "inconclusive" in optional_failures:
-                outcome = "inconclusive"
-            elif "blocked" in optional_failures:
-                outcome = "blocked"
-            elif optional_failures:
-                outcome = "inconclusive"
             else:
                 outcome = "accept"
             observed[case["name"]] = outcome
@@ -1437,6 +1448,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(observed["silent_model_fallback"], "blocked")
         self.assertEqual(observed["mixed_primary_model_substitution"], "blocked")
         self.assertEqual(observed["unknown_model_usage_key"], "inconclusive")
+        self.assertEqual(
+            observed["mixed_primary_and_unknown_model_evidence"],
+            "inconclusive",
+        )
         self.assertEqual(observed["truncated_stop_reason"], "blocked")
         self.assertEqual(observed["unexpected_structured_output"], "inconclusive")
         self.assertEqual(observed["invalid_optional_metric"], "inconclusive")
@@ -1465,6 +1480,14 @@ class RepositoryContractTest(unittest.TestCase):
             skill,
         )
         self.assertIn("its broader helper version range", skill)
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "including its exact Claude Code `2.1.212` gate before review input is exposed",
+            contracts,
+        )
+        self.assertIn("its broader helper version range", contracts)
         self.assertNotIn(
             "obtain its version using a fixed credential-free environment and require `>=2.1.211,<3.0.0`",
             canonical,
@@ -1819,7 +1842,7 @@ class RepositoryContractTest(unittest.TestCase):
                 REPO_ROOT / ".github/workflows/codex-review-gate.yml"
             ).read_text(encoding="utf-8")
             self.assertIn("Compatibility Status", compatibility)
-            self.assertNotIn("uses:", compatibility)
+            self.assertNotIn("\n      - uses:", compatibility)
         retired = (
             "independent-codex-pr-review",
             "offline-frozen-diff-review",

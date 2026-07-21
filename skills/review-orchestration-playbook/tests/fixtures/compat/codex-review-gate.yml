@@ -6,13 +6,21 @@ on:
 
 permissions:
   contents: read
+  statuses: write
 
 jobs:
   compatibility-status:
-    name: codex/review-gate
+    name: codex/review-gate compatibility publisher
     runs-on: ubuntu-latest
     timeout-minutes: 1
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      REPOSITORY: ${{ github.repository }}
     steps:
       - name: Emit legacy required context
-        run: >-
-          echo "Compatibility-only status: no reviewer was started and no review lane was counted."
+        run: |
+          gh api --method POST "repos/${REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=success \
+            -f context=codex/review-gate \
+            -f description="Compatibility only; no reviewer or review lane."

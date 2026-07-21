@@ -175,6 +175,19 @@
       "expected": "inconclusive"
     },
     {
+      "name": "mixed_primary_and_unknown_model_evidence",
+      "requested_model": "claude-opus-4-8",
+      "init_model": "claude-opus-4-8",
+      "model_usage_keys": [
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-unknown-future"
+      ],
+      "optional_terminal_values": {},
+      "extra_terminal_fields": [],
+      "expected": "inconclusive"
+    },
+    {
       "name": "truncated_stop_reason",
       "requested_model": "claude-opus-4-8",
       "init_model": "claude-opus-4-8",
