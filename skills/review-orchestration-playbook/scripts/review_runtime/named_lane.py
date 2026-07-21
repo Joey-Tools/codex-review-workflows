@@ -117,6 +117,7 @@ def _git_capture(
     output_limit_bytes: int = GIT_OUTPUT_LIMIT_BYTES,
     allow_no_match: bool = False,
     neutralize_external_diff: bool = True,
+    neutralize_fsmonitor: bool = True,
     stdin: bytearray | None = None,
 ) -> bytes:
     git = resolve_git()
@@ -124,12 +125,12 @@ def _git_capture(
         str(git),
         "--no-pager",
         "-c",
-        "core.fsmonitor=false",
-        "-c",
         "core.fileMode=true",
         "-c",
         "core.hooksPath=/dev/null",
     ]
+    if neutralize_fsmonitor:
+        safety_config.extend(("-c", "core.fsmonitor=false"))
     if neutralize_external_diff:
         safety_config.extend(("-c", "diff.external="))
     safety_config.extend(("-c", "color.ui=false", "-C", str(root)))
@@ -462,9 +463,46 @@ def _effective_git_config_keys(root: pathlib.Path) -> frozenset[bytes]:
             root,
             ("config", "--includes", "--null", "--name-only", "--list"),
             neutralize_external_diff=False,
+            neutralize_fsmonitor=False,
         ).split(b"\0")
         if key
     )
+
+
+def _validate_core_fsmonitor_config(
+    root: pathlib.Path,
+    configured_keys: frozenset[bytes],
+) -> None:
+    if not any(key.lower() == b"core.fsmonitor" for key in configured_keys):
+        return
+    message = "effective core.fsmonitor must be disabled before reviewer launch"
+    raw_output = _git_capture(
+        root,
+        ("config", "--includes", "--null", "--get", "core.fsmonitor"),
+        neutralize_fsmonitor=False,
+    )
+    if not raw_output.endswith(b"\0") or b"\0" in raw_output[:-1]:
+        raise NamedLaneGuardError(message)
+    raw_value = os.fsdecode(raw_output[:-1])
+    try:
+        effective = _git_capture(
+            root,
+            (
+                "config",
+                "--includes",
+                "--null",
+                "--type=bool",
+                "--fixed-value",
+                "--get",
+                "core.fsmonitor",
+                raw_value,
+            ),
+            neutralize_fsmonitor=False,
+        )
+    except NamedLaneGuardError as error:
+        raise NamedLaneGuardError(message) from error
+    if effective != b"false\0":
+        raise NamedLaneGuardError(message)
 
 
 def _matches_named_driver_key(
@@ -739,6 +777,7 @@ def validate_worktree(
         if mode != "160000" or object_type != "commit":
             raise NamedLaneGuardError("frozen Git gitlink entry has an invalid type")
     configured_keys = _effective_git_config_keys(root)
+    _validate_core_fsmonitor_config(root, configured_keys)
     _validate_executable_git_config(configured_keys)
     _validate_initialized_submodules(
         root,
@@ -808,6 +847,23 @@ def _validate_positive_finite(value: float, label: str) -> float:
     return value
 
 
+def _validate_timeout_limit(value: float) -> float:
+    timeout = _validate_positive_finite(float(value), "timeout")
+    if timeout > DEFAULT_TIMEOUT_SECONDS:
+        raise NamedLaneGuardError(
+            f"timeout must not exceed {DEFAULT_TIMEOUT_SECONDS:g} seconds"
+        )
+    return timeout
+
+
+def _validate_byte_limit(value: int, maximum: int, label: str) -> int:
+    if value <= 0:
+        raise NamedLaneGuardError(f"{label} must be positive")
+    if value > maximum:
+        raise NamedLaneGuardError(f"{label} must not exceed {maximum} bytes")
+    return value
+
+
 def _remaining_deadline_seconds(deadline: float, label: str) -> float:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -819,7 +875,7 @@ def _bounded_deadline(
     timeout_seconds: float,
     deadline_monotonic: float | None = None,
 ) -> float:
-    timeout = _validate_positive_finite(float(timeout_seconds), "timeout")
+    timeout = _validate_timeout_limit(timeout_seconds)
     duration_deadline = time.monotonic() + timeout
     if deadline_monotonic is None:
         return duration_deadline
@@ -1301,6 +1357,15 @@ def run_claude(
 ) -> dict[str, object]:
     deadline = _bounded_deadline(timeout_seconds, deadline_monotonic)
     _remaining_deadline_seconds(deadline, "Claude named lane")
+    stream_limit = _validate_byte_limit(
+        stream_limit_bytes,
+        DEFAULT_STREAM_LIMIT_BYTES,
+        "stream limit",
+    )
+    if len(prompt) > DEFAULT_PROMPT_LIMIT_BYTES:
+        raise NamedLaneGuardError(
+            f"Claude control prompt must not exceed {DEFAULT_PROMPT_LIMIT_BYTES} bytes"
+        )
     root = _resolve_worktree_root(worktree)
     if not command:
         raise NamedLaneGuardError("Claude command is required")
@@ -1323,8 +1388,6 @@ def run_claude(
         raise NamedLaneGuardError(
             "Claude executable must be an exact absolute executable regular file"
         )
-    if stream_limit_bytes <= 0:
-        raise NamedLaneGuardError("stream limit must be positive")
     stdout = _validate_output_path(stdout_path, root)
     try:
         stderr = _validate_output_path(stderr_path, root)
@@ -1340,8 +1403,8 @@ def run_claude(
                     deadline,
                     "Claude process supervision",
                 ),
-                stdout_limit_bytes=stream_limit_bytes,
-                stderr_limit_bytes=stream_limit_bytes,
+                stdout_limit_bytes=stream_limit,
+                stderr_limit_bytes=stream_limit,
             )
             try:
                 publication_mask = block_forwarded_signals()
@@ -1518,20 +1581,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         command = list(args.claude_argv)
         if command and command[0] == "--":
             command.pop(0)
-        if args.prompt_limit_bytes <= 0:
-            raise NamedLaneGuardError("prompt limit must be positive")
+        prompt_limit = _validate_byte_limit(
+            args.prompt_limit_bytes,
+            DEFAULT_PROMPT_LIMIT_BYTES,
+            "prompt limit",
+        )
+        stream_limit = _validate_byte_limit(
+            args.stream_limit_bytes,
+            DEFAULT_STREAM_LIMIT_BYTES,
+            "stream limit",
+        )
         with _structured_forwarded_signals():
-            timeout = _validate_positive_finite(
-                float(args.timeout_seconds),
-                "timeout",
-            )
+            timeout = _validate_timeout_limit(args.timeout_seconds)
             deadline = time.monotonic() + timeout
             prompt = _read_control_prompt(
                 sys.stdin.buffer,
-                args.prompt_limit_bytes,
+                prompt_limit,
                 deadline,
             )
-            if len(prompt) > args.prompt_limit_bytes:
+            if len(prompt) > prompt_limit:
                 raise NamedLaneGuardError(
                     "Claude control prompt exceeded its bounded limit"
                 )
@@ -1545,7 +1613,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     deadline,
                     "Claude named lane",
                 ),
-                stream_limit_bytes=args.stream_limit_bytes,
+                stream_limit_bytes=stream_limit,
                 inherit_node_extra_ca_certs=args.inherit_node_extra_ca_certs,
                 deadline_monotonic=deadline,
             )

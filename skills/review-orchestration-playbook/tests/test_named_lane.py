@@ -777,6 +777,70 @@ class NamedLaneGuardTest(unittest.TestCase):
         ):
             validate_worktree(self.repo.resolve(), head)
 
+    def test_active_core_fsmonitor_config_is_rejected(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        head = self.commit()
+        marker = self.root / "fsmonitor.marker"
+        probe = self.make_executable(
+            f"import pathlib\npathlib.Path({str(marker)!r}).write_text('ran')\n"
+        )
+
+        for disabled in ("", "false", "no", "off", "0"):
+            with self.subTest(disabled=disabled):
+                git(self.repo, "config", "core.fsmonitor", disabled)
+                clean = validate_worktree(self.repo.resolve(), head)
+                self.assertEqual(clean.head_sha, head)
+
+        for active in ("true", str(probe)):
+            with self.subTest(active=active):
+                git(self.repo, "config", "core.fsmonitor", active)
+                with self.assertRaisesRegex(
+                    NamedLaneGuardError,
+                    "core.fsmonitor|bounded local Git preflight failed",
+                ):
+                    validate_worktree(self.repo.resolve(), head)
+                self.assertFalse(marker.exists())
+
+        git(self.repo, "config", "--unset-all", "core.fsmonitor")
+        config_path = self.repo / ".git" / "config"
+        with config_path.open("a", encoding="utf-8") as config:
+            config.write("\n[core]\n\tfsmonitor\n")
+        with self.assertRaisesRegex(NamedLaneGuardError, "core.fsmonitor"):
+            validate_worktree(self.repo.resolve(), head)
+
+    def test_core_fsmonitor_uses_effective_include_and_worktree_precedence(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        head = self.commit()
+        marker = self.root / "included-fsmonitor.marker"
+        probe = self.make_executable(
+            f"import pathlib\npathlib.Path({str(marker)!r}).write_text('ran')\n"
+        )
+        included = self.root / "included-fsmonitor.config"
+        included.write_text(
+            f"[core]\n\tfsmonitor = {probe}\n",
+            encoding="utf-8",
+        )
+        git(self.repo, "config", "include.path", str(included))
+        with self.assertRaisesRegex(NamedLaneGuardError, "core.fsmonitor"):
+            validate_worktree(self.repo.resolve(), head)
+        self.assertFalse(marker.exists())
+
+        git(self.repo, "config", "extensions.worktreeConfig", "true")
+        git(self.repo, "config", "--worktree", "core.fsmonitor", "false")
+        clean = validate_worktree(self.repo.resolve(), head)
+        self.assertEqual(clean.head_sha, head)
+
+        git(self.repo, "config", "--worktree", "core.fsmonitor", "true")
+        with self.assertRaisesRegex(NamedLaneGuardError, "core.fsmonitor"):
+            validate_worktree(self.repo.resolve(), head)
+
+        git(self.repo, "config", "--worktree", "core.fsmonitor", str(probe))
+        with self.assertRaisesRegex(NamedLaneGuardError, "core.fsmonitor"):
+            validate_worktree(self.repo.resolve(), head)
+        self.assertFalse(marker.exists())
+
     def test_successful_process_writes_private_bounded_outputs(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
         self.commit()
@@ -1726,12 +1790,122 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["timeout_seconds"], 3.5)
         self.assertEqual(run.call_args.kwargs["deadline_monotonic"], 105.0)
 
+    def test_cli_rejects_resource_overrides_above_default_caps(self) -> None:
+        cases = (
+            (
+                "timeout",
+                (
+                    "--timeout-seconds",
+                    str(named_lane_runtime.DEFAULT_TIMEOUT_SECONDS + 1),
+                ),
+                "must not exceed",
+            ),
+            (
+                "stream",
+                (
+                    "--stream-limit-bytes",
+                    str(named_lane_runtime.DEFAULT_STREAM_LIMIT_BYTES + 1),
+                ),
+                "must not exceed",
+            ),
+            (
+                "prompt",
+                (
+                    "--prompt-limit-bytes",
+                    str(named_lane_runtime.DEFAULT_PROMPT_LIMIT_BYTES + 1),
+                ),
+                "must not exceed",
+            ),
+            ("timeout-nan", ("--timeout-seconds", "nan"), "positive and finite"),
+            ("timeout-inf", ("--timeout-seconds", "inf"), "positive and finite"),
+            ("timeout-neg-inf", ("--timeout-seconds=-inf",), "positive and finite"),
+        )
+        for label, override, expected_reason in cases:
+            with self.subTest(label=label):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                argv = (
+                    "run-claude",
+                    "--worktree",
+                    str(self.repo.resolve()),
+                    "--stdout-path",
+                    str(self.root / f"{label}-cap.stdout"),
+                    "--stderr-path",
+                    str(self.root / f"{label}-cap.stderr"),
+                    *override,
+                    "--",
+                    "/usr/bin/false",
+                )
+                with (
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "_read_control_prompt",
+                    ) as prompt_read,
+                    mock.patch.object(named_lane_runtime, "run_claude") as run,
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    returncode = named_lane_main(argv)
+
+                self.assertEqual(returncode, 2)
+                self.assertEqual(stdout.getvalue(), "")
+                result = json.loads(stderr.getvalue())
+                self.assertEqual(result["status"], "inconclusive")
+                self.assertIn(expected_reason, result["reason"])
+                prompt_read.assert_not_called()
+                run.assert_not_called()
+
+    def test_direct_claude_api_cannot_bypass_default_resource_caps(self) -> None:
+        cases = (
+            {
+                "timeout_seconds": named_lane_runtime.DEFAULT_TIMEOUT_SECONDS + 1,
+                "stream_limit_bytes": 64,
+                "prompt": b"",
+            },
+            {
+                "timeout_seconds": 1.0,
+                "stream_limit_bytes": (
+                    named_lane_runtime.DEFAULT_STREAM_LIMIT_BYTES + 1
+                ),
+                "prompt": b"",
+            },
+            {
+                "timeout_seconds": 1.0,
+                "stream_limit_bytes": 64,
+                "prompt": b"x" * (named_lane_runtime.DEFAULT_PROMPT_LIMIT_BYTES + 1),
+            },
+        )
+        with mock.patch.object(
+            named_lane_runtime,
+            "run_bounded_capture",
+        ) as capture:
+            for case in cases:
+                with self.subTest(case=case):
+                    with self.assertRaisesRegex(
+                        NamedLaneGuardError,
+                        "must not exceed",
+                    ):
+                        run_claude(
+                            worktree=self.repo.resolve(),
+                            stdout_path=self.root / "direct-cap.stdout",
+                            stderr_path=self.root / "direct-cap.stderr",
+                            command=("/usr/bin/false",),
+                            **case,
+                        )
+            capture.assert_not_called()
+
     def test_absolute_deadline_can_only_tighten_duration_limit(self) -> None:
         with mock.patch.object(
             named_lane_runtime.time,
             "monotonic",
             return_value=100.0,
         ):
+            self.assertEqual(
+                named_lane_runtime._bounded_deadline(
+                    named_lane_runtime.DEFAULT_TIMEOUT_SECONDS
+                ),
+                100.0 + named_lane_runtime.DEFAULT_TIMEOUT_SECONDS,
+            )
             self.assertEqual(
                 named_lane_runtime._bounded_deadline(1.0, 1_000.0),
                 101.0,
@@ -1740,6 +1914,22 @@ class NamedLaneGuardTest(unittest.TestCase):
                 named_lane_runtime._bounded_deadline(10.0, 100.5),
                 100.5,
             )
+        self.assertEqual(
+            named_lane_runtime._validate_byte_limit(
+                named_lane_runtime.DEFAULT_STREAM_LIMIT_BYTES,
+                named_lane_runtime.DEFAULT_STREAM_LIMIT_BYTES,
+                "stream limit",
+            ),
+            named_lane_runtime.DEFAULT_STREAM_LIMIT_BYTES,
+        )
+        self.assertEqual(
+            named_lane_runtime._validate_byte_limit(
+                named_lane_runtime.DEFAULT_PROMPT_LIMIT_BYTES,
+                named_lane_runtime.DEFAULT_PROMPT_LIMIT_BYTES,
+                "prompt limit",
+            ),
+            named_lane_runtime.DEFAULT_PROMPT_LIMIT_BYTES,
+        )
 
     def test_cli_classifies_bounded_failures_by_subcommand(self) -> None:
         cases = (

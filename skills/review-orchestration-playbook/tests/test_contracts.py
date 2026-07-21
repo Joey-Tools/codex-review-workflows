@@ -1457,6 +1457,35 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("SYMLINK_BATCH_OUTPUT_LIMIT_BYTES", runtime)
         self.assertNotIn('("cat-file", "blob"', runtime)
 
+    def test_named_lane_guard_blocks_effective_fsmonitor_before_reviewer_git(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(encoding="utf-8")
+
+        for content in (skill, contracts, canonical):
+            self.assertIn("`core.fsmonitor`", content)
+            self.assertIn("Git-false", content)
+            self.assertIn("path", content)
+            self.assertIn("reviewer Git", content)
+        self.assertIn("A built-in daemon (`true`)", contracts)
+        self.assertIn("a no-value declaration", contracts)
+        self.assertIn("Only the effective final value is authoritative", contracts)
+        self.assertIn("an earlier included path overridden by a later", contracts)
+        for anchor in (
+            "_validate_core_fsmonitor_config",
+            '"core.fsmonitor=false"',
+            "neutralize_fsmonitor=False",
+            '"config", "--includes", "--null", "--get", "core.fsmonitor"',
+        ):
+            self.assertIn(anchor, runtime)
+
     def test_direct_claude_guard_has_minimal_environment_and_output_paths(
         self,
     ) -> None:
@@ -1627,6 +1656,36 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("reason `forwarded-signal`", contracts)
         self.assertIn("run_bounded_capture", runtime)
         self.assertIn("whole-process-tree quiescence", canonical)
+
+    def test_direct_claude_test_overrides_cannot_raise_production_caps(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(encoding="utf-8")
+
+        for content in (skill, contracts, canonical):
+            self.assertIn("test-oriented", content.lower())
+            self.assertIn("1,800", content)
+            self.assertIn("64 MiB", content)
+            self.assertIn("256 KiB", content)
+            self.assertIn("Python", content)
+        for anchor in (
+            "DEFAULT_TIMEOUT_SECONDS = 1_800.0",
+            "DEFAULT_STREAM_LIMIT_BYTES = 64 * 1024 * 1024",
+            "DEFAULT_PROMPT_LIMIT_BYTES = 256 * 1024",
+            "_validate_timeout_limit",
+            "_validate_byte_limit",
+            '"--timeout-seconds"',
+            '"--stream-limit-bytes"',
+            '"--prompt-limit-bytes"',
+        ):
+            self.assertIn(anchor, runtime)
 
     def test_named_lane_keeps_raw_findings_separate_from_parent_metadata(
         self,
