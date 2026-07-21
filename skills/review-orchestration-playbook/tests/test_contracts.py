@@ -673,26 +673,55 @@ class RepositoryContractTest(unittest.TestCase):
                 "Codex Review Gate Compatibility Status",
                 "pull_request_target:",
                 "types: [opened, reopened, synchronize, ready_for_review]",
-                "permissions:\n  contents: read\n  statuses: write",
+                "workflow_dispatch:",
+                "permissions: {}",
                 "jobs:\n  compatibility-status:",
+                "if: github.event_name == 'pull_request_target'",
                 "name: codex/review-gate compatibility publisher",
+                "permissions:\n      statuses: write",
                 "GH_TOKEN: ${{ github.token }}",
                 "HEAD_SHA: ${{ github.event.pull_request.head.sha }}",
                 "REPOSITORY: ${{ github.repository }}",
                 'gh api --method POST "repos/${REPOSITORY}/statuses/${HEAD_SHA}"',
+                "backfill-open-pull-requests:",
+                "if: github.event_name == 'workflow_dispatch'",
+                "Backfill exact current pull request heads",
+                "pull-requests: read\n      statuses: write",
+                "readonly MAX_ENUMERATION_PASSES=6",
+                "for ((pass = 1; pass <= MAX_ENUMERATION_PASSES; pass++)); do",
+                '"repos/${REPOSITORY}/pulls?state=all&sort=created&direction=asc&per_page=100"',
+                "([.[][]] | sort_by(.number)) as $pulls",
+                'map(select(.state == "open") | "\\(.number)\\t\\(.head.sha)")',
+                '"RETRY_PAGINATION"',
+                'gh api --method POST "repos/${REPOSITORY}/statuses/${head_sha}"',
+                '"${current_snapshot}" == "${previous_snapshot}"',
+                "did not stabilize after ${MAX_ENUMERATION_PASSES} authenticated enumeration passes",
+                '"${GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}"',
                 "-f state=success",
                 "-f context=codex/review-gate",
                 "Compatibility only; no reviewer or review lane.",
             ):
                 self.assertIn(anchor, compatibility)
             self.assertEqual(compatibility.count("\n  compatibility-status:\n"), 1)
-            self.assertEqual(compatibility.count("${{ github."), 3)
+            self.assertEqual(
+                compatibility.count("\n  backfill-open-pull-requests:\n"), 1
+            )
+            self.assertEqual(compatibility.count("gh api --paginate --slurp"), 1)
+            enumeration = compatibility.index("gh api --paginate --slurp")
+            publication = compatibility.index(
+                'gh api --method POST "repos/${REPOSITORY}/statuses/${head_sha}"'
+            )
+            stabilization = compatibility.index(
+                '"${current_snapshot}" == "${previous_snapshot}"'
+            )
+            self.assertLess(enumeration, publication)
+            self.assertLess(publication, stabilization)
+            self.assertNotIn("workflow_dispatch:\n    inputs:", compatibility)
             for forbidden in (
                 "pull_request:",
                 "issue_comment:",
                 "pull_request_review:",
                 "schedule:",
-                "workflow_dispatch:",
                 "pull-requests: write",
                 "issues: write",
                 "codex-review-gate-action",
@@ -700,6 +729,8 @@ class RepositoryContractTest(unittest.TestCase):
                 "\n      - uses:",
                 "actions/checkout",
                 "github.sha",
+                "github.event.inputs",
+                "pulls?state=open&",
             ):
                 self.assertNotIn(forbidden, compatibility)
 
@@ -850,7 +881,7 @@ class RepositoryContractTest(unittest.TestCase):
         for anchor in (
             "Single / single review / single internal review | One fresh-context Codex reviewer.",
             "Double / double review / local double review | Single plus one actual Claude Code reviewer.",
-            "Triple / triple review | Double plus exact `@codex review` on a supported GitHub Cloud PR",
+            "Triple / triple review | Double plus exact `@codex review` on an exact-host `github.com` PR",
             "Each logical lane receives its own workspace",
             "intentional review-anchor commit",
             "separate clean Git worktree at `head_sha` for each lane",
@@ -903,11 +934,11 @@ class RepositoryContractTest(unittest.TestCase):
         causal_anchors = [
             (
                 skill,
-                "For a standalone report-only named review, do not create a branch or commit: report review preparation as `blocked-authorization`",
+                "When the intended review scope includes dirty or untracked state that no committed range represents, report review preparation as `blocked-authorization`",
             ),
             (
                 contracts,
-                "without an existing committed range, report review preparation as `blocked-authorization`",
+                "when its intended scope includes dirty or untracked state that no committed range represents, report review preparation as `blocked-authorization`",
             ),
             (
                 readiness,
@@ -915,11 +946,11 @@ class RepositoryContractTest(unittest.TestCase):
             ),
             (
                 agents_policy,
-                "Without an existing committed range, report `blocked-authorization` instead of reviewing or mutating a dirty checkout",
+                "Reserve `blocked-authorization` for intended dirty/untracked state that would require an unauthorized anchor commit",
             ),
             (
                 interface,
-                "without an existing committed range, stop as blocked-authorization",
+                "intended dirty/untracked state without a representing committed range is blocked-authorization",
             ),
         ]
         if CI_PROFILE == "canonical":
@@ -927,7 +958,7 @@ class RepositoryContractTest(unittest.TestCase):
             causal_anchors.append(
                 (
                     readme,
-                    "If no committed range exists, report `blocked-authorization` rather than review or mutate a dirty checkout",
+                    "Use `blocked-authorization` when the intended scope includes dirty or untracked state that would require an unauthorized anchor commit",
                 )
             )
         for document, anchor in causal_anchors:
@@ -965,7 +996,7 @@ class RepositoryContractTest(unittest.TestCase):
         interface = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
 
         for anchor in (
-            "missing PR, unsupported host or integration, unavailable GitHub Codex service, or unsupported enterprise identity",
+            "missing PR, unsupported host or integration, unavailable GitHub Codex service, or unsupported operating identity",
             "sqbu-github.cisco.com",
             "operating identity is in `{hoteng, hoteng_cisco}`",
             "Report `requested: triple`, `effective: double`, and the concrete reason",
@@ -1071,6 +1102,90 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertIn("after service start means triple-inconclusive", interface)
 
+    def test_review_scope_and_github_provider_identity_are_fail_closed(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+        probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
+            encoding="utf-8"
+        )
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
+            encoding="utf-8"
+        )
+        egress = (SKILL_ROOT / "references/egress-consent.md").read_text(
+            encoding="utf-8"
+        )
+        agents_policy = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
+            encoding="utf-8"
+        )
+        interface = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
+
+        for content in (skill, readiness, probes, contracts, agents_policy, interface):
+            self.assertIn("blocked-input", content)
+            self.assertIn("explicit", content)
+            self.assertIn("target", content)
+        for content in (skill, readiness, probes, contracts):
+            self.assertIn("exact current head repository/branch", content)
+            self.assertIn("no-PR", content)
+            self.assertIn("explicit committed range", content)
+            self.assertIn("explicitly named target/base", content)
+            self.assertIn("blocked-authorization", content)
+        self.assertIn(
+            "the required explicit PR/range/target selector is absent",
+            skill,
+        )
+        self.assertIn(
+            "the required explicit PR/range/target selector is absent",
+            readiness,
+        )
+        self.assertIn(
+            "the required explicit PR/range/target selector is absent",
+            probes,
+        )
+        self.assertIn(
+            "More than one candidate is `blocked-input`",
+            skill,
+        )
+        self.assertIn(
+            "An authenticated successful lookup returning `[]` proves the no-PR path",
+            probes,
+        )
+
+        identity_documents = (
+            skill,
+            readiness,
+            probes,
+            contracts,
+            templates,
+            egress,
+            agents_policy,
+            interface,
+        )
+        for content in identity_documents:
+            self.assertIn("github.com", content)
+            self.assertIn("chatgpt-codex-connector[bot]", content)
+            self.assertIn("chatgpt-codex-connector", content)
+        for content in (skill, readiness, probes, contracts, templates, egress):
+            self.assertIn("Bot", content)
+        self.assertIn('user.login == "chatgpt-codex-connector[bot]"', probes)
+        self.assertIn('user.type == "Bot"', probes)
+        self.assertIn('app.slug == "chatgpt-codex-connector"', probes)
+        self.assertIn(
+            "Accept a review artifact only when its `commit_id` equals `headRefOid`",
+            probes,
+        )
+        self.assertIn(
+            "Accept a check/run only when its `head_sha` equals `headRefOid`",
+            probes,
+        )
+        self.assertNotIn("expected Codex integration identity", probes)
+
     def test_named_single_prompt_uses_clear_context_codex_without_a_full_diff(
         self,
     ) -> None:
@@ -1165,7 +1280,7 @@ class RepositoryContractTest(unittest.TestCase):
         assert_shared_discovery_order(double)
         for anchor in (
             "@codex review",
-            "supported GitHub Cloud PR",
+            "exact-host `github.com` PR",
             "sqbu-github.cisco.com",
             "identity in `{hoteng, hoteng_cisco}`",
             "`requested: triple`, `effective: double`",
@@ -1225,6 +1340,8 @@ class RepositoryContractTest(unittest.TestCase):
         runtime = (SKILL_ROOT / "references/claude-runtime-trust.md").read_text(
             encoding="utf-8"
         )
+        validator_path = SCRIPTS / "validate_claude_stream.py"
+        validator = validator_path.read_text(encoding="utf-8")
 
         for anchor in (
             "## Structured Init And Terminal Evidence",
@@ -1259,6 +1376,26 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("exactly one leading `system/init`", content)
             self.assertIn("one trailing terminal `result`", content)
             self.assertIn("fail closed", content.lower())
+        for content in (skill, contracts, canonical):
+            self.assertIn("validate_claude_stream.py", content)
+            self.assertIn("classification: accepted", content)
+            self.assertIn(
+                "outside the model-visible worktree",
+                " ".join(content.split()),
+            )
+        self.assertTrue(validator_path.is_file())
+        self.assertTrue(validator.startswith("#!/usr/bin/env python3\n"))
+        for anchor in (
+            "MAX_SCHEMA_BYTES",
+            "max_bytes: int = 8 * 1024 * 1024",
+            "object_pairs_hook=_reject_duplicate_keys",
+            "parse_constant=_reject_nonstandard_constant",
+            '"accepted": 0',
+            '"blocked": 1',
+            '"blocked-authentication": 2',
+            '"inconclusive": 3',
+        ):
+            self.assertIn(anchor, validator)
         self.assertNotIn("when the runtime reports it", canonical)
 
     def test_canonical_claude_structured_errors_have_one_failure_classifier(
@@ -1331,6 +1468,44 @@ class RepositoryContractTest(unittest.TestCase):
         )
 
         self.assertEqual(schema["claude_code_version"], "2.1.212")
+        self.assertEqual(
+            schema["stream_contract"]["first_nonblank_event"],
+            {"type": "system", "subtype": "init"},
+        )
+        self.assertEqual(
+            schema["stream_contract"]["last_nonblank_event"],
+            {"type": "result"},
+        )
+        self.assertEqual(schema["stream_contract"]["init_event_count"], 1)
+        self.assertEqual(schema["stream_contract"]["result_event_count"], 1)
+        self.assertEqual(schema["stream_contract"]["max_bytes"], 8 * 1024 * 1024)
+        init_contract = schema["init_event"]
+        self.assertEqual(init_contract["additional_fields"], True)
+        self.assertEqual(
+            set(init_contract["required_fields"]),
+            {
+                "type",
+                "subtype",
+                "cwd",
+                "permissionMode",
+                "tools",
+                "mcp_servers",
+                "slash_commands",
+                "skills",
+                "plugins",
+                "model",
+                "claude_code_version",
+                "apiKeySource",
+            },
+        )
+        self.assertEqual(
+            set(init_contract["field_contracts"]["tools"]["values"]),
+            {"Read", "Grep", "Glob", "Bash"},
+        )
+        self.assertEqual(
+            init_contract["field_contracts"]["permissionMode"]["value"],
+            "dontAsk",
+        )
         identities = schema["model_identity"]
         self.assertEqual(
             identities["claude-opus-4-8"]["accepted_model_usage_keys"],
@@ -1532,10 +1707,13 @@ class RepositoryContractTest(unittest.TestCase):
         head_preflight = "compare it with the intended `head_sha` before creating or running any local lane"
         run_codex = "Run the fresh-context Codex lane"
         for content in (skill, readiness):
-            self.assertIn("every existing PR", content)
+            self.assertIn("selected existing PR", content)
             self.assertIn("single, double, triple", content)
-        self.assertIn("only the no-PR path skips", skill)
-        self.assertIn("Skip this comparison only on the no-PR path", readiness)
+        self.assertIn("only the proven no-PR path skips", skill)
+        self.assertIn(
+            "Skip this comparison only on the no-PR path, which must be proven by a successful authenticated empty discovery result",
+            readiness,
+        )
         self.assertIn(head_preflight, skill)
         self.assertLess(skill.index(head_preflight), skill.index(run_codex))
         self.assertIn(
@@ -1547,7 +1725,7 @@ class RepositoryContractTest(unittest.TestCase):
             readiness,
         )
         self.assertIn(
-            "standalone single, double, or triple request may locate an already-existing PR read-only",
+            "standalone named single, double, or triple request may perform the narrow read-only PR lookup",
             readiness,
         )
         self.assertLess(

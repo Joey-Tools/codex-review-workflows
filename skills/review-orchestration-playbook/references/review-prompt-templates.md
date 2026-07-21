@@ -4,9 +4,9 @@ Use these templates for bounded findings-only review. Named review shapes have o
 
 - Single is exactly one clear/fresh-context Codex `reviewer` agent in a separate clean, read-only Git worktree.
 - Double is single plus actual Claude Code in another independent read-only workspace over the same frozen `base_sha..head_sha`.
-- Triple is double plus exact `@codex review` on a supported GitHub Cloud PR and a trustworthy terminal GitHub Codex result bound to that PR's current head.
+- Triple is double plus exact `@codex review` on an exact-host `github.com` PR and a trustworthy terminal GitHub Codex result bound to that PR's current head.
 
-A separately requested Copilot diagnostic never counts toward named double. If GitHub Codex is unavailable because there is no PR or the integration, host, or identity is unsupported—including host `sqbu-github.cisco.com` and operating identity in `{hoteng, hoteng_cisco}`—the completed shape is `effective double`. The legacy `isolated_review` Codex helper and any pre-materialized-diff review do not count toward single, double, or triple.
+A separately requested Copilot diagnostic never counts toward named double. The third lane supports only exact host `github.com`; every other host, including `sqbu-github.cisco.com` and every GitHub Enterprise host, is unsupported. If GitHub Codex is unavailable because there is no PR or the integration, host, or operating identity in `{hoteng, hoteng_cisco}` is unsupported, the completed shape is `effective double`. The legacy `isolated_review` Codex helper and any pre-materialized-diff review do not count toward single, double, or triple.
 
 ## Prompt Construction Rules
 
@@ -110,13 +110,13 @@ Only a terminal result from actual Anthropic Claude Code satisfies this lane. A 
 
 ## Named Triple: GitHub Cloud Codex Trigger
 
-After both local lanes are terminal on the frozen range, post the exact comment below on a supported GitHub Cloud PR whose current head corresponds to `{head_sha}`:
+After both local lanes are terminal on the frozen range, post the exact comment below on an exact-host `github.com` PR whose current head corresponds to `{head_sha}`:
 
 ```text
 @codex review
 ```
 
-Posting the comment requests the third lane but does not complete it. Record the PR URL, triggered head, and trustworthy terminal current-head result. When a still-eligible PR's current `headRefOid` does not equal the frozen `head_sha`, that mismatch is not an availability fallback. Publish/freeze the intended head and rerun affected lanes only when the parent separately authorized PR mutation; otherwise leave the PR unchanged and report `requested: triple`, `effective: triple-inconclusive`, with GitHub lane status `blocked-authorization`. For the same mismatch on an already unsupported PR, keep `requested: triple`, `effective: double`, and report readiness `blocked-authorization`; do not treat the mismatch as making the already-unavailable lane triple-inconclusive or as permitting readiness to continue. If there is no existing PR or GitHub Codex is proved unsupported for the integration, host, or operating identity—including host `sqbu-github.cisco.com` and identity in `{hoteng, hoteng_cisco}`—do not create or mutate a PR to manufacture the lane. Report `requested: triple`, `effective: double` with the exact reason. An authenticated provider rejection may prove no-start unavailability; missing response or generic failure is `triple-inconclusive`.
+Posting the comment requests the third lane but does not complete it. Record the PR URL, triggered head, and trustworthy terminal current-head result. Accept provider-authored review/comment evidence only from exact REST `user.login == "chatgpt-codex-connector[bot]"` with exact `user.type == "Bot"`; accept app/check evidence only from exact `app.slug == "chatgpt-codex-connector"`. Unknown or lookalike identities are `triple-inconclusive` and prove neither rejection, start, nor completion. When a still-eligible PR's current `headRefOid` does not equal the frozen `head_sha`, that mismatch is not an availability fallback. Publish/freeze the intended head and rerun affected lanes only when the parent separately authorized PR mutation; otherwise leave the PR unchanged and report `requested: triple`, `effective: triple-inconclusive`, with GitHub lane status `blocked-authorization`. For the same mismatch on an already unsupported PR, keep `requested: triple`, `effective: double`, and report readiness `blocked-authorization`; do not treat the mismatch as making the already-unavailable lane triple-inconclusive or as permitting readiness to continue. If there is no existing PR or GitHub Codex is proved unsupported for the integration, host, or operating identity—including host `sqbu-github.cisco.com`, any other non-`github.com` host, and identity in `{hoteng, hoteng_cisco}`—do not create or mutate a PR to manufacture the lane. Report `requested: triple`, `effective: double` with the exact reason. An authenticated provider rejection may prove no-start unavailability; missing response or generic failure is `triple-inconclusive`.
 
 ## Low-Level Helper Results
 

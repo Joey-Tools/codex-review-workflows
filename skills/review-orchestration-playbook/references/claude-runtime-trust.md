@@ -5,9 +5,10 @@ by the low-level Claude Code runtime used by `isolated_review`. A documented
 platform or version is supported only when every applicable gate below passes.
 The canonical named-double lane launches actual Claude Code directly under
 [canonical-claude-lane.md](canonical-claude-lane.md); it reuses applicable
-publisher-verification primitives, version bounds, native-sandbox boundary, and
-failure vocabulary here, but never the helper's executable snapshot, dependency
-closure, supplied-diff workspace, outer sandbox, credential carrier, catalog,
+publisher-verification primitives, native-sandbox boundary, and failure
+vocabulary here, but not the helper-only version bounds and never the helper's
+executable snapshot, dependency closure, supplied-diff workspace, outer sandbox,
+credential carrier, catalog,
 guarded writeback, recovery, or prompt contract.
 
 ## Contents
@@ -39,7 +40,10 @@ materialization, supplied-diff prompts, helper-private credential carriers, or
 helper-owned outer sandboxes remain helper-only and cannot make an
 `isolated_review` artifact count as the canonical lane.
 
-The canonical lane uses ordinary Claude CLI authentication in trusted real
+The canonical lane requires exactly Claude Code `2.1.212`; the broader
+`>=2.1.211,<3.0.0` range in this document is helper-only and never makes another
+version eligible for the named direct lane. The canonical lane uses ordinary
+Claude CLI authentication in trusted real
 `HOME`, or an explicitly authorized API key. The publisher-verified CLI may
 update ordinary CLI-owned authentication and runtime state in that control
 plane, including credential refresh and possible cache or tool-result
@@ -68,7 +72,8 @@ For the accepted real-`HOME` native-sandbox review design, keep these layers dis
 
 This boundary is an accepted model-behavior tradeoff, not full host-read isolation. A stronger outer sandbox may add protection, but must not be inferred from selected `denyRead` / `allowRead` settings or init output.
 
-- Accept installed Claude Code release versions `>=2.1.211,<3.0.0` after all
+- For the low-level helper only, accept installed Claude Code release versions
+  `>=2.1.211,<3.0.0` after all
   applicable provenance, platform, capability, authentication, and isolation
   checks pass. For the low-level helper only, local-login refresh writeback
   additionally requires an exact version/platform/SHA-256 entry from the signed
@@ -155,7 +160,9 @@ explicitly configured Claude Code candidate:
    helper-owned home/temp paths, a fixed system-only `PATH`, a deterministic C
    locale, and `NO_COLOR`; do not inherit proxy, CA, authentication, review, or
    other caller state. Bound time and both output streams.
-4. Parse exactly one release version and require `>=2.1.211,<3.0.0`.
+4. Parse exactly one release version and, for this low-level helper candidate,
+   require the helper-only range `>=2.1.211,<3.0.0`. This gate does not apply to
+   the canonical direct lane, which requires exact `2.1.212`.
 5. Fetch the manifest and detached signature for that exact version through the
    parent helper. Resolve GPG only from the fixed host paths, validate the source
    path, retain a stable source descriptor, and copy from that descriptor into a
@@ -414,7 +421,8 @@ same fixed-minimal-environment principle, with only the host-tool home, locale,
 path, and temporary directory provided.
 
 Anthropic documents detached manifest signatures for releases from `2.1.89`
-onward, which covers the complete supported version range in this contract.
+onward, which covers the complete low-level helper-only supported version range
+in this contract. The canonical direct lane remains pinned to exact `2.1.212`.
 One process-level absolute deadline covers DNS resolution, connection and TLS
 setup, response headers, body reads, and response teardown for each bounded
 manifest/signature fetch; per-socket timeouts are not the total-time boundary.
@@ -444,7 +452,8 @@ execute only the private snapshot.
 
 ## Capability Probes
 
-Compatibility is capability-based within the accepted version range. Do not
+Low-level helper compatibility is capability-based within the helper-only
+accepted version range. Do not
 match the complete `--help` output or pin whitespace and unrelated wording from
 one release.
 
@@ -506,7 +515,7 @@ the opposite state. Require exactly one complete
 duplicates, and conflicting assignments cannot satisfy the probe.
 
 The helper does not claim a credential-free fixed-input behavioral canary. The
-preflight capability evidence is the accepted release range, the required
+preflight capability evidence is the helper-only accepted release range, the required
 public options, and the parsed safe-mode semantics. Behavioral acceptance comes
 from the final real review invocation plus strict structured-output,
 effective-model, error-state, and terminal-artifact validation.
@@ -699,7 +708,8 @@ all fail closed before the authenticated workload starts. As with the final
 path-to-mount handoff, this does not claim protection from a malicious same-euid
 host process after the last identity check.
 
-The supported range starts at `2.1.211`, after Anthropic's documented `2.1.208`
+The low-level helper's supported range starts at `2.1.211`, after Anthropic's
+documented `2.1.208`
 boundary for reliable propagation of `Read` rules to `Grep`, `Glob`, LSP, and
 prompt file mentions. Linux and WSL2 nevertheless retain the narrower defense-
 in-depth contract: they do not expose those search tools and reject ASCII `@`
@@ -1105,7 +1115,7 @@ described as an enforced final launch.
 
 | Condition | Terminal classification | Copilot fallback |
 | --- | --- | --- |
-| No automatic candidate, supported platform unavailable, or an accepted-range automatic candidate cleanly lacks a required non-security capability or secure runtime dependency | `runtime-unavailable` | Only after a separate explicit supplemental Copilot request; never satisfies named double |
+| No automatic candidate, supported platform unavailable, or a helper-only accepted-range automatic candidate cleanly lacks a required non-security capability or secure runtime dependency | `runtime-unavailable` | Only after a separate explicit supplemental Copilot request; never satisfies named double |
 | A helper-owned Keychain-broker, TCP-proxy, or Unix-proxy bind fails with an explicit OS policy or socket-capability errno | `runtime-unavailable` | Only after a separate explicit supplemental Copilot request; never satisfies named double |
 | The Keychain-broker source and compiler exist, but the compiler cannot start or the broker build returns nonzero | `inconclusive`; report the build gate and pause | No |
 | Local/API authentication is missing, malformed, unsafe, refresh-token-less, or actually rejected as `Login expired`, HTTP 401, or refresh failure | `blocked-authentication`; request `claude auth login` for local login or unset/replace the explicit API key, then pause | No |
@@ -1139,7 +1149,8 @@ or mismatched model metadata stops the lane as `runtime-unverified` or
 `model-mismatch` and never authorizes fallback. `explicit-claude-review` remains
 Anthropic-only.
 
-An unsupported future patch inside the version range may be treated as automatic
+An unsupported future patch inside the low-level helper-only version range may
+be treated as automatic
 runtime unavailability only when it cleanly lacks a required public capability.
 An uncatalogued internal credential-lock protocol is instead inconclusive for
 local login and remains usable with an explicit API key. Evidence

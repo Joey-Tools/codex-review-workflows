@@ -115,6 +115,31 @@ If the required native sandbox, global write deny, sensitive-root denies, tool r
 
 Parse `stream-json` as bounded strict UTF-8 JSONL. Every nonblank line must be one JSON object; reject duplicate keys, nonstandard constants, undecodable text, or non-JSON output. The first nonblank record must be the sole event with `type: system` and `subtype: init`; the last nonblank record must be the sole event with `type: result`. A missing, duplicate, malformed, out-of-order, or trailing contract event makes the lane `inconclusive`; partial findings do not count. A structurally valid terminal event that fails the success acceptance schema is passed to the failure classifier below rather than being classified by this envelope rule.
 
+Capture bounded raw stdout in parent-owned state outside the model-visible
+worktree. The canonical lane must pass those captured bytes through
+[`validate_claude_stream.py`](../scripts/validate_claude_stream.py); prose-only
+inspection or an ad hoc parser does not satisfy this gate. Keep stderr separate
+and give the validator the same resolved cwd, concrete model, and selected
+authentication source used to construct the direct Claude CLI argv:
+
+```text
+python3 <playbook>/scripts/validate_claude_stream.py
+  --cwd <resolved-clean-worktree>
+  --model <claude-opus-4-8-or-authorized-4-7>
+  --api-key-source <none-or-ANTHROPIC_API_KEY>
+  --input <bounded-raw-stream-jsonl>
+```
+
+The executable/importable validator applies the versioned machine contract and
+fixed upper bounds of 8 MiB total input, 10,000 raw lines, and 1 MiB per line.
+It emits one JSON object with `classification: accepted` and the verbatim
+`findings` only after every envelope, init, and terminal-success check passes.
+Every failure emits a fail-closed `blocked`, `blocked-authentication`, or
+`inconclusive` classification without a `findings` field. Validator acceptance
+attests only the reported invocation fields and terminal artifact; it never
+claims proof of the final merged sandbox, managed permission arrays, or path-rule
+evaluation.
+
 Before accepting the result, compare the leading init against a reviewed, version-specific expected-init contract for the publisher-verified installed CLI. For Claude Code 2.1.212, require all of these observable fields:
 
 - `cwd` equals the resolved lane-unique clean worktree exactly;

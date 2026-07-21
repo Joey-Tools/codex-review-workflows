@@ -68,7 +68,7 @@ description: "Run a local pre-commit delivery gate for non-trivial repo changes:
 - `在合并前停止` / `stop before merge` 的终点是 PR readiness 的 merge-ready 报告，不是本地 commit。
 - PR creation/update 仍受 `$review-orchestration-playbook` 的 PR target authorization preflight 约束；不要把 local handoff 记录当作对任意 target repository 的授权。
 - Named double review 只在 the user 明确 opt in 后运行，且必须由上述 single lane 加上在另一独立只读 worktree 中直接启动的 actual Claude Code process、绑定同一 frozen range；supplied-diff `isolated_review` helper 与另行显式请求的 Copilot diagnostic 都不计入或满足 named double。
-- Named triple review 必须再包含 supported GitHub Cloud PR 当前 head 上的 exact `@codex review` 请求及可信 terminal GitHub Codex result。无 PR、integration/host/identity 不受支持、host `sqbu-github.cisco.com` 或 operating identity in `{hoteng, hoteng_cisco}` 时，明确报告 `effective double`，不得声称 triple；已启动但证据 malformed/stale/ambiguous/incomplete 时报告 `triple-inconclusive`，不得降成 double。
+- Named triple review 必须再包含 exact host `github.com` PR 当前 head 上的 exact `@codex review` 请求及可信 terminal GitHub Codex result。无 PR、integration/service 不受支持、任何 non-`github.com` host（包括 `sqbu-github.cisco.com` 与所有 GitHub Enterprise host），或 operating identity in `{hoteng, hoteng_cisco}` 时，明确报告 `effective double`，不得声称 triple；已启动但证据 malformed/stale/ambiguous/incomplete 时报告 `triple-inconclusive`，不得降成 double。
 - PR readiness 不再强制已退役的额外 Codex gates。
 - Review progress、file-read trace、keepalive output 都不是 final review artifact。
 - 如果 gate 持续 inconclusive，停在有证据的决策点，不要无限重试。
