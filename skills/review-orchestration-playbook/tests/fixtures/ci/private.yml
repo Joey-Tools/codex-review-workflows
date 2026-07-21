@@ -122,6 +122,12 @@ jobs:
         working-directory: personal_codex/skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         run: |
           python3 -m compileall -q review_supervisor independent-codex-pr-review
+      - name: Report live no-child runtime fingerprint
+        run: |
+          /usr/bin/sw_vers -productVersion
+          /usr/bin/sw_vers -buildVersion
+          /usr/bin/uname -r
+          /usr/bin/shasum -a 256 /usr/bin/sandbox-exec
       - name: Require pinned live no-child profile integration
         working-directory: personal_codex/skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         env:

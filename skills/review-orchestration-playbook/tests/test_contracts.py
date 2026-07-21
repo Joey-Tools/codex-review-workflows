@@ -866,6 +866,16 @@ class RepositoryContractTest(unittest.TestCase):
             with self.subTest(profile=profile):
                 self.assertIn("runs-on: macos-26", supervisor_job)
                 self.assertIn(
+                    """      - name: Report live no-child runtime fingerprint
+        run: |
+          /usr/bin/sw_vers -productVersion
+          /usr/bin/sw_vers -buildVersion
+          /usr/bin/uname -r
+          /usr/bin/shasum -a 256 /usr/bin/sandbox-exec
+""",
+                    supervisor_job,
+                )
+                self.assertIn(
                     f"""      - name: Require pinned live no-child profile integration
         working-directory: {skill_root}/scripts/independent_codex_pr_review
         env:
