@@ -170,7 +170,8 @@ The remaining unchecked items are post-commit delivery operations. They are inte
 - Admission/final follow-up review: one malformed-JSON fail-closed finding was fixed; follow-up result `No findings.`.
 - Latest `master` cleanup-directory identity fix `202ef98` was merged; the stable directory identity and descriptor-bound runtime-artifact contracts were both retained, and their focused concurrency/path-replacement regressions passed.
 - Ruff checks, changed-file format checks, and `git diff --check`: passed.
-- Python 3.13 final candidate discovery: `1346 tests` in 390.038 seconds with `23 skipped`; the only three errors were subtests of one loopback-bind case denied by the desktop sandbox, and that exact test passed `1/1` outside the sandbox.
+- Python 3.13 final discovery: `1346 tests` in 351.343 seconds, `OK (skipped=5)`, in the narrow environment that permits the loopback-bind lifecycle test.
+- Ubuntu CI exposed an inode-reuse race in one runner-lock replacement fixture; retaining the original inode via rename makes the replacement identity deterministic without changing production behavior.
 - Final-review boundary regressions: deepest cleanable blob path passed and cleaned completely, the next depth and equivalent gitlink depth failed before materialization without residue, reversible non-UTF-8 evidence serialization passed, and the APFS-incompatible raw-filename end-to-end case skipped explicitly on macOS.
 - Final-review P2 regressions: receipt-only missing/malformed/duplicate evidence maps to structured inconclusive admission while real `final` and cleanup remain usable; atomic runtime, control, attempt-log, compatibility-lock, and credential-update writers force `0600` under a local restrictive-umask boundary without repairing unsafe existing files.
 - Official skill validator: `Skill is valid!`.

@@ -4237,7 +4237,7 @@ with pathlib.Path(sys.argv[1]).open("a+b") as handle:
         self.write_completed_state()
         state_dir = self.review.container_dir
         lock_path = state_dir / state.LOCK_FILE
-        lock_path.unlink()
+        lock_path.rename(state_dir / "stale-runner.lock")
         lock_path.write_bytes(b"")
         lock_path.chmod(0o600)
         (state_dir / state.EXIT_FILE).unlink()
