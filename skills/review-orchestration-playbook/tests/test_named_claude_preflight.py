@@ -239,6 +239,29 @@ class NamedClaudePreflightTest(unittest.TestCase):
             self.assertEqual(value["source"], "active-installed")
             self.assertEqual(value["selected_version"], "2.1.216")
 
+    def test_symlinked_home_allows_legitimately_absent_side_by_side_fallback(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            real_home = root / "real-home"
+            installed = root / "external/versions/2.1.216"
+            self._write_candidate(installed, version="2.1.216")
+            active = real_home / ".local/bin/claude"
+            active.parent.mkdir(parents=True)
+            active.symlink_to(installed)
+            home = root / "home"
+            home.symlink_to(real_home, target_is_directory=True)
+
+            value = preflight_module.preflight(
+                home=home,
+                verifier=self._verified_with_probe,
+            )
+
+            self.assertEqual(value["classification"], "accepted")
+            self.assertEqual(value["source"], "active-installed")
+            self.assertEqual(value["selected_version"], "2.1.216")
+
     def test_out_of_range_and_prerelease_versions_stop_before_verification(
         self,
     ) -> None:
@@ -602,6 +625,35 @@ class NamedClaudePreflightTest(unittest.TestCase):
             self.assertEqual(value["classification"], "inconclusive")
             self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
 
+    def test_malformed_active_ancestor_stops_before_trusted_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            home = root / "home"
+            malformed_active_ancestor = home / ".local/bin"
+            malformed_active_ancestor.parent.mkdir(parents=True)
+            malformed_active_ancestor.write_text(
+                "not a directory",
+                encoding="utf-8",
+            )
+            trusted = root / "trusted-claude"
+            self._write_candidate(trusted)
+            verifier = mock.Mock(
+                side_effect=AssertionError(
+                    "a malformed higher-priority active path must stop selection"
+                )
+            )
+
+            with mock.patch.object(
+                preflight_module,
+                "TRUSTED_ACTIVE_PATHS",
+                (trusted,),
+            ):
+                value = preflight_module.preflight(home=home, verifier=verifier)
+
+            verifier.assert_not_called()
+            self.assertEqual(value["classification"], "inconclusive")
+            self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
+
     def test_malformed_side_by_side_ancestor_stops_before_trusted_fallback(
         self,
     ) -> None:
@@ -630,6 +682,32 @@ class NamedClaudePreflightTest(unittest.TestCase):
             self.assertEqual(value["classification"], "inconclusive")
             self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
 
+    def test_dangling_side_by_side_ancestor_stops_before_active_fallback(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            home = root / "home"
+            dangling_ancestor = home / ".local/share"
+            dangling_ancestor.parent.mkdir(parents=True)
+            dangling_ancestor.symlink_to(
+                root / "missing-share",
+                target_is_directory=True,
+            )
+            active = home / ".local/bin/claude"
+            self._write_candidate(active)
+            verifier = mock.Mock(
+                side_effect=AssertionError(
+                    "a dangling higher-priority ancestor must stop selection"
+                )
+            )
+
+            value = preflight_module.preflight(home=home, verifier=verifier)
+
+            verifier.assert_not_called()
+            self.assertEqual(value["classification"], "inconclusive")
+            self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
+
     def test_observed_side_by_side_root_disappearance_stops_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -644,17 +722,63 @@ class NamedClaudePreflightTest(unittest.TestCase):
                 )
             )
 
+            real_open = preflight_module.os.open
+
+            def disappear_before_root_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+                if path == "versions":
+                    raise FileNotFoundError(
+                        errno.ENOENT,
+                        "synthetic side-by-side root disappearance",
+                    )
+                return real_open(path, flags, *args, **kwargs)
+
             with mock.patch.object(
                 preflight_module.os,
                 "open",
-                side_effect=FileNotFoundError(
-                    errno.ENOENT,
-                    "synthetic side-by-side root disappearance",
-                ),
+                side_effect=disappear_before_root_open,
             ):
                 value = preflight_module.preflight(home=home, verifier=verifier)
 
             verifier.assert_not_called()
+            self.assertEqual(value["classification"], "inconclusive")
+            self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
+
+    def test_side_by_side_path_appearance_during_absence_stops_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            home = root / "home"
+            parent = home / ".local/share/claude"
+            parent.mkdir(parents=True)
+            active = home / ".local/bin/claude"
+            self._write_candidate(active)
+            verifier = mock.Mock(
+                side_effect=AssertionError(
+                    "an unstable higher-priority absence must stop selection"
+                )
+            )
+            real_stat = preflight_module.os.stat
+            observed_missing = False
+
+            def appear_during_recheck(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+                nonlocal observed_missing
+                if path == "versions" and not observed_missing:
+                    observed_missing = True
+                    (parent / "versions").mkdir()
+                    raise FileNotFoundError(
+                        errno.ENOENT,
+                        "synthetic initially absent side-by-side root",
+                    )
+                return real_stat(path, *args, **kwargs)
+
+            with mock.patch.object(
+                preflight_module.os,
+                "stat",
+                side_effect=appear_during_recheck,
+            ):
+                value = preflight_module.preflight(home=home, verifier=verifier)
+
+            verifier.assert_not_called()
+            self.assertTrue(observed_missing)
             self.assertEqual(value["classification"], "inconclusive")
             self.assertEqual(value["reason"], "candidate-inspection-inconclusive")
 

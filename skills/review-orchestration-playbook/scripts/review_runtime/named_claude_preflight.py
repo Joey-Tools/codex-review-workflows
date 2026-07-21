@@ -102,6 +102,14 @@ class ProbeResult:
     stderr: bytes
 
 
+@dataclass(frozen=True)
+class _BoundDirectoryComponent:
+    parent_descriptor: int
+    name: str
+    descriptor: int
+    identity: Mapping[str, int]
+
+
 VersionProbe = Callable[[pathlib.Path], ProbeResult]
 HelpProbe = Callable[[pathlib.Path], ProbeResult]
 CandidateVerifier = Callable[
@@ -280,8 +288,12 @@ def _verified_source_matches_signed_artifact(
 def _candidate_exists(path: pathlib.Path) -> bool:
     try:
         path.lstat()
-    except (FileNotFoundError, NotADirectoryError):
+    except FileNotFoundError:
         return False
+    except NotADirectoryError as error:
+        raise _CandidateInspectionInconclusive(
+            f"candidate path contains a non-directory ancestor: {path}"
+        ) from error
     except OSError as error:
         raise _CandidateInspectionInconclusive(
             f"cannot inspect candidate path {path}"
@@ -289,34 +301,184 @@ def _candidate_exists(path: pathlib.Path) -> bool:
     return True
 
 
+def _revalidate_side_by_side_chain(
+    *,
+    home: pathlib.Path,
+    home_descriptor: int,
+    home_identity: Mapping[str, int],
+    components: Sequence[_BoundDirectoryComponent],
+) -> None:
+    reopened_home = -1
+    try:
+        reopened_home = os.open(
+            home,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0),
+        )
+        if any(
+            _identity_from_stat(metadata) != home_identity
+            for metadata in (
+                os.fstat(home_descriptor),
+                os.fstat(reopened_home),
+                home.stat(),
+            )
+        ):
+            raise _CandidateInspectionInconclusive(
+                "Claude Code install home changed during inspection"
+            )
+        for component in components:
+            named = os.stat(
+                component.name,
+                dir_fd=component.parent_descriptor,
+                follow_symlinks=False,
+            )
+            opened = os.fstat(component.descriptor)
+            if any(
+                _identity_from_stat(metadata) != component.identity
+                for metadata in (named, opened)
+            ):
+                raise _CandidateInspectionInconclusive(
+                    "side-by-side Claude Code install path changed during inspection"
+                )
+    except _CandidateInspectionInconclusive:
+        raise
+    except OSError as error:
+        raise _CandidateInspectionInconclusive(
+            "cannot revalidate the side-by-side Claude Code install path"
+        ) from error
+    finally:
+        if reopened_home >= 0:
+            try:
+                os.close(reopened_home)
+            except OSError as error:
+                raise _CandidateInspectionInconclusive(
+                    "cannot close the revalidated Claude Code install home"
+                ) from error
+
+
 def _highest_compatible_side_by_side(home: pathlib.Path) -> Candidate | None:
     root = home / SIDE_BY_SIDE_RELATIVE_ROOT
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
+    home_flags = (
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0)
     )
-    descriptor = -1
+    component_flags = home_flags | getattr(os, "O_NOFOLLOW", 0)
+    descriptors: list[int] = []
+    components: list[_BoundDirectoryComponent] = []
+    operation_error: BaseException | None = None
     try:
-        before = root.stat(follow_symlinks=False)
-    except OSError as error:
-        if error.errno == errno.ENOENT:
-            return None
-        raise _CandidateInspectionInconclusive(
-            f"cannot inspect side-by-side Claude Code installs under {root}"
-        ) from error
-    try:
-        descriptor = os.open(root, flags)
-        opened_before = os.fstat(descriptor)
-    except OSError as error:
-        raise _CandidateInspectionInconclusive(
-            f"cannot open side-by-side Claude Code installs under {root}"
-        ) from error
-    compatible: list[tuple[tuple[int, int, int], pathlib.Path]] = []
-    count = 0
-    try:
-        with os.scandir(descriptor) as entries:
+        try:
+            home_before = home.stat()
+        except OSError as error:
+            if error.errno == errno.ENOENT:
+                return None
+            raise _CandidateInspectionInconclusive(
+                f"cannot inspect Claude Code install home {home}"
+            ) from error
+        if not stat.S_ISDIR(home_before.st_mode):
+            raise _CandidateInspectionInconclusive(
+                f"Claude Code install home is not a directory: {home}"
+            )
+        try:
+            home_descriptor = os.open(home, home_flags)
+            descriptors.append(home_descriptor)
+            home_opened = os.fstat(home_descriptor)
+            home_after = home.stat()
+        except OSError as error:
+            raise _CandidateInspectionInconclusive(
+                f"cannot open Claude Code install home {home}"
+            ) from error
+        home_identity = _identity_from_stat(home_opened)
+        if any(
+            _identity_from_stat(metadata) != home_identity
+            for metadata in (home_before, home_after)
+        ):
+            raise _CandidateInspectionInconclusive(
+                "Claude Code install home changed while opening"
+            )
+
+        for name in SIDE_BY_SIDE_RELATIVE_ROOT.parts:
+            parent_descriptor = descriptors[-1]
+            try:
+                before = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                if error.errno == errno.ENOENT:
+                    _revalidate_side_by_side_chain(
+                        home=home,
+                        home_descriptor=home_descriptor,
+                        home_identity=home_identity,
+                        components=components,
+                    )
+                    try:
+                        os.stat(
+                            name,
+                            dir_fd=parent_descriptor,
+                            follow_symlinks=False,
+                        )
+                    except OSError as recheck_error:
+                        if recheck_error.errno != errno.ENOENT:
+                            raise _CandidateInspectionInconclusive(
+                                "cannot confirm that the side-by-side Claude "
+                                "Code install path is absent"
+                            ) from recheck_error
+                        _revalidate_side_by_side_chain(
+                            home=home,
+                            home_descriptor=home_descriptor,
+                            home_identity=home_identity,
+                            components=components,
+                        )
+                        return None
+                    raise _CandidateInspectionInconclusive(
+                        "the side-by-side Claude Code install path appeared "
+                        "during absence verification"
+                    )
+                raise _CandidateInspectionInconclusive(
+                    f"cannot inspect side-by-side Claude Code installs under {root}"
+                ) from error
+            if not stat.S_ISDIR(before.st_mode):
+                raise _CandidateInspectionInconclusive(
+                    "side-by-side Claude Code install path contains a "
+                    "non-directory component"
+                )
+            try:
+                descriptor = os.open(
+                    name,
+                    component_flags,
+                    dir_fd=parent_descriptor,
+                )
+                descriptors.append(descriptor)
+                opened = os.fstat(descriptor)
+                after = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                raise _CandidateInspectionInconclusive(
+                    f"cannot open side-by-side Claude Code installs under {root}"
+                ) from error
+            identity = _identity_from_stat(opened)
+            if any(
+                _identity_from_stat(metadata) != identity
+                for metadata in (before, after)
+            ) or not stat.S_ISDIR(opened.st_mode):
+                raise _CandidateInspectionInconclusive(
+                    "side-by-side Claude Code install path changed while opening"
+                )
+            components.append(
+                _BoundDirectoryComponent(
+                    parent_descriptor=parent_descriptor,
+                    name=name,
+                    descriptor=descriptor,
+                    identity=identity,
+                )
+            )
+
+        compatible: list[tuple[tuple[int, int, int], pathlib.Path]] = []
+        count = 0
+        with os.scandir(descriptors[-1]) as entries:
             for entry in entries:
                 count += 1
                 if count > SIDE_BY_SIDE_ENTRY_LIMIT:
@@ -328,27 +490,41 @@ def _highest_compatible_side_by_side(home: pathlib.Path) -> Candidate | None:
                 except ClaudeVersionPolicyError:
                     continue
                 compatible.append((parsed, root / entry.name))
-        opened_after = os.fstat(descriptor)
-        named_after = root.stat(follow_symlinks=False)
-    except OSError as error:
-        raise _CandidateInspectionInconclusive(
-            f"cannot enumerate side-by-side Claude Code installs under {root}"
-        ) from error
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-    identities = {
-        tuple(_identity_from_stat(value).values())
-        for value in (before, opened_before, opened_after, named_after)
-    }
-    if len(identities) != 1 or not stat.S_ISDIR(opened_before.st_mode):
-        raise _CandidateInspectionInconclusive(
-            "side-by-side Claude Code install directory changed during enumeration"
+        _revalidate_side_by_side_chain(
+            home=home,
+            home_descriptor=home_descriptor,
+            home_identity=home_identity,
+            components=components,
         )
-    if not compatible:
-        return None
-    _parsed, selected = max(compatible, key=lambda item: item[0])
-    return Candidate(selected, "side-by-side-compatible", selected.name)
+        if not compatible:
+            return None
+        _parsed, selected = max(compatible, key=lambda item: item[0])
+        return Candidate(selected, "side-by-side-compatible", selected.name)
+    except _CandidateInspectionInconclusive as error:
+        operation_error = error
+        raise
+    except OSError as error:
+        inconclusive = _CandidateInspectionInconclusive(
+            f"cannot enumerate side-by-side Claude Code installs under {root}"
+        )
+        operation_error = inconclusive
+        raise inconclusive from error
+    finally:
+        cleanup_error: OSError | None = None
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                cleanup_error = error
+        if cleanup_error is not None:
+            if operation_error is not None:
+                operation_error.add_note(
+                    "a side-by-side Claude Code path descriptor could not be closed"
+                )
+            else:
+                raise _CandidateInspectionInconclusive(
+                    "cannot close the side-by-side Claude Code install path"
+                ) from cleanup_error
 
 
 def select_candidate(
