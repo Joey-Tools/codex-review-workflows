@@ -8,6 +8,7 @@
     "duplicate_keys": "reject",
     "nonstandard_constants": "reject",
     "unpaired_surrogates": "reject",
+    "max_integer_digits": 128,
     "max_bytes": 8388608,
     "max_lines": 10000,
     "max_line_bytes": 1048576,

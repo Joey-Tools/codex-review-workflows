@@ -1140,19 +1140,7 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("explicitly named target/base", content)
             self.assertIn("blocked-authorization", content)
         self.assertIn(
-            "the required explicit PR/range/target selector is absent",
-            skill,
-        )
-        self.assertIn(
-            "the required explicit PR/range/target selector is absent",
-            readiness,
-        )
-        self.assertIn(
-            "the required explicit PR/range/target selector is absent",
-            probes,
-        )
-        self.assertIn(
-            "More than one required PR candidate is `blocked-input`",
+            "More than one required PR candidate leaves the GitHub/PR-specific lane `blocked-input` until the caller names a PR",
             skill,
         )
         self.assertIn(
@@ -1165,6 +1153,20 @@ class RepositoryContractTest(unittest.TestCase):
                 content,
             )
             self.assertIn("no PR probe", content)
+            self.assertIn("A frozen range", content)
+            self.assertIn("never selects a PR", content)
+            self.assertIn("required explicit PR selector is absent", content)
+            self.assertIn("local lanes may still run", content.lower())
+        self.assertNotIn("require an explicit PR or frozen range", readiness)
+        self.assertNotIn("supplies an explicit PR or frozen range", probes)
+        self.assertIn(
+            "an existing frozen range allows only the local lanes to run; the GitHub/PR-specific lane remains `blocked-input` until the caller names the PR",
+            readiness,
+        )
+        self.assertIn(
+            "a frozen range does not cure that ambiguity",
+            probes,
+        )
         self.assertIn(
             "report the GitHub lane `blocked-input` and the overall shape `requested: triple`, `effective: triple-inconclusive`",
             readiness,
@@ -1196,11 +1198,11 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn('user.type == "Bot"', probes)
         self.assertIn('app.slug == "chatgpt-codex-connector"', probes)
         self.assertIn(
-            "Accept a review artifact only when its `commit_id` equals `headRefOid`",
+            "Accept a review artifact only when request isolation is proved, its `commit_id` equals `headRefOid`",
             probes,
         )
         self.assertIn(
-            "Accept a check/run only when its `head_sha` equals `headRefOid`",
+            "Accept a check/run only when request isolation is proved, its `head_sha` equals `headRefOid`",
             probes,
         )
         for anchor in (
@@ -1211,8 +1213,29 @@ class RepositoryContractTest(unittest.TestCase):
             "Evidence from an earlier request on the same unchanged head is stale",
         ):
             self.assertIn(anchor, probes)
+        for content in (skill, readiness, probes, agents_policy):
+            normalized = content.lower()
+            self.assertIn("at most one", normalized)
+            self.assertIn("never post a second", normalized)
+            self.assertIn(
+                "timestamps prove ordering, not request/run lineage", normalized
+            )
+        for content in (readiness, probes):
+            self.assertIn("older request", content)
+            self.assertIn("might overlap", content)
+            self.assertIn("triple-inconclusive", content)
+            self.assertIn("non-null `started_at`", content)
+            self.assertIn(
+                "Re-read complete authenticated request history immediately before accepting",
+                content,
+            )
+            self.assertIn("race", content)
         self.assertIn(
-            "causally newer than this request",
+            "both non-null `started_at` and `completed_at` are strictly later than the current request's `created_at`",
+            probes,
+        )
+        self.assertIn(
+            "review/comment APIs expose no request/run identifier",
             readiness,
         )
         self.assertNotIn("expected Codex integration identity", probes)

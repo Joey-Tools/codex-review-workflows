@@ -24,6 +24,7 @@ SCHEMA_PATH = (
     / "claude-2.1.212-stream-schema.json"
 )
 MAX_SCHEMA_BYTES = 256 * 1024
+MAX_JSON_INTEGER_DIGITS = 128
 
 TERMINAL_REQUIRED_FIELDS = frozenset(("type", "subtype", "is_error"))
 TERMINAL_VARIANT_FIELDS = frozenset(("result", "modelUsage"))
@@ -80,8 +81,21 @@ class _NonstandardConstantError(ValueError):
     pass
 
 
+class _IntegerDigitLimitError(ValueError):
+    pass
+
+
 class _ContractError(ValueError):
     pass
+
+
+class _CliArgumentError(ValueError):
+    pass
+
+
+class _MachineArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise _CliArgumentError(message)
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -97,11 +111,19 @@ def _reject_nonstandard_constant(value: str) -> None:
     raise _NonstandardConstantError(value)
 
 
+def _bounded_parse_int(value: str) -> int:
+    digits = value[1:] if value.startswith("-") else value
+    if len(digits) > MAX_JSON_INTEGER_DIGITS:
+        raise _IntegerDigitLimitError(value)
+    return int(value)
+
+
 def _strict_json_loads(text: str) -> Any:
     return json.loads(
         text,
         object_pairs_hook=_reject_duplicate_keys,
         parse_constant=_reject_nonstandard_constant,
+        parse_int=_bounded_parse_int,
     )
 
 
@@ -171,6 +193,7 @@ def _load_contract() -> dict[str, Any]:
         "duplicate_keys": "reject",
         "nonstandard_constants": "reject",
         "unpaired_surrogates": "reject",
+        "max_integer_digits": MAX_JSON_INTEGER_DIGITS,
         "max_bytes": DEFAULT_STREAM_LIMITS.max_bytes,
         "max_lines": DEFAULT_STREAM_LIMITS.max_lines,
         "max_line_bytes": DEFAULT_STREAM_LIMITS.max_line_bytes,
@@ -604,6 +627,7 @@ def _validate_terminal(
     contract: Mapping[str, Any],
     evidence: _Evidence,
 ) -> str | None:
+    blocked_before_terminal = set(evidence.blocked)
     allowed_fields = (
         TERMINAL_REQUIRED_FIELDS | TERMINAL_VARIANT_FIELDS | TERMINAL_OPTIONAL_FIELDS
     )
@@ -649,7 +673,6 @@ def _validate_terminal(
         if "result" in event and type(event["result"]) is not str:
             evidence.inconclusive.add("terminal.result.malformed")
 
-    terminal_blocked_before = set(evidence.blocked)
     _validate_optional_terminal_fields(event, evidence)
     messages = _collect_error_messages(event, evidence)
     if success_claim and messages:
@@ -662,7 +685,7 @@ def _validate_terminal(
             evidence.authentication.add("terminal.authentication-error")
         elif messages:
             evidence.inconclusive.add("terminal.unclassified-error")
-        terminal_blocked = evidence.blocked - terminal_blocked_before
+        terminal_blocked = evidence.blocked - blocked_before_terminal
         if not messages and not terminal_blocked:
             evidence.inconclusive.add("terminal.non-success-unclassified")
     return findings
@@ -778,7 +801,7 @@ def validate_claude_stream_bytes(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _MachineArgumentParser(
         description="Validate canonical Claude Code 2.1.212 stream-json output."
     )
     parser.add_argument("--cwd", required=True, help="Expected resolved review cwd")
@@ -803,7 +826,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+    try:
+        args = _build_parser().parse_args(argv)
+    except _CliArgumentError:
+        result = _failure("inconclusive", {"validator.arguments-invalid"})
+        print(json.dumps(result, ensure_ascii=True, separators=(",", ":")))
+        return 3
     stream: BinaryIO
     close_stream = False
     if args.input == "-":

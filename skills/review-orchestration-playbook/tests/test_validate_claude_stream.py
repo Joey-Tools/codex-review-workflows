@@ -128,6 +128,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "duplicate_keys": "reject",
                 "nonstandard_constants": "reject",
                 "unpaired_surrogates": "reject",
+                "max_integer_digits": 128,
                 "max_bytes": 8388608,
                 "max_lines": 10000,
                 "max_line_bytes": 1048576,
@@ -272,6 +273,33 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                         "reasons": ["validator.contract-invalid"],
                     },
                 )
+
+    def test_json_integer_digit_bound_is_explicit(self) -> None:
+        accepted_progress = (
+            b'{"type":"assistant","value":'
+            + b"1" * validator.MAX_JSON_INTEGER_DIGITS
+            + b"}\n"
+        )
+        rejected_progress = (
+            b'{"type":"assistant","value":'
+            + b"1" * (validator.MAX_JSON_INTEGER_DIGITS + 1)
+            + b"}\n"
+        )
+        valid = self._full_events()
+        init = self._raw([valid[0]])
+        terminal = self._raw([valid[-1]])
+
+        self.assertEqual(
+            self._validate(raw=init + accepted_progress + terminal)["classification"],
+            "accepted",
+        )
+        self.assertEqual(
+            self._validate(raw=init + rejected_progress + terminal),
+            {
+                "classification": "inconclusive",
+                "reasons": ["stream.invalid-json"],
+            },
+        )
 
     def test_rejects_unpaired_surrogates(self) -> None:
         valid = self._full_events()
@@ -439,7 +467,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 events[-1][field_name] = value
                 self.assert_fail_closed(self._validate(events), "inconclusive")
 
-    def test_rejects_nonfinite_and_huge_integer_total_costs(self) -> None:
+    def test_rejects_nonfinite_and_oversized_integer_total_costs(self) -> None:
         huge_integer = 10**400
         huge_integer_events = self._full_events()
         huge_integer_events[-1]["total_cost_usd"] = huge_integer
@@ -448,7 +476,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             self._validate(huge_integer_events),
             {
                 "classification": "inconclusive",
-                "reasons": ["terminal.total_cost_usd.malformed"],
+                "reasons": ["stream.invalid-json"],
             },
         )
 
@@ -541,6 +569,30 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
 
         self.assert_fail_closed(self._validate(contradictory_success), "inconclusive")
 
+    def test_non_success_model_mismatch_is_blocked_without_unclassified_reason(
+        self,
+    ) -> None:
+        events = [
+            copy.deepcopy(self.init_event),
+            {
+                "type": "result",
+                "subtype": "error",
+                "is_error": True,
+                "modelUsage": {"claude-opus-4-7": {}},
+            },
+        ]
+
+        self.assertEqual(
+            self._validate(events),
+            {
+                "classification": "blocked",
+                "reasons": [
+                    "terminal.modelUsage.primary-model-substitution",
+                    "terminal.modelUsage.requested-model-missing",
+                ],
+            },
+        )
+
     def test_cli_parser_and_surrogate_failures_emit_one_json_without_traceback(
         self,
     ) -> None:
@@ -622,7 +674,93 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         )
         self.assertEqual(completed.stderr, b"")
 
-    def test_cli_huge_integer_total_cost_fails_closed_without_traceback(self) -> None:
+    def test_cli_argument_failures_emit_one_inconclusive_json_on_stdout(self) -> None:
+        cases = {
+            "missing-required": ["--model", "claude-opus-4-8"],
+            "invalid-choice": [
+                "--cwd",
+                str(self.cwd),
+                "--model",
+                "claude-future",
+                "--api-key-source",
+                "none",
+            ],
+            "unknown-option": [
+                "--cwd",
+                str(self.cwd),
+                "--model",
+                "claude-opus-4-8",
+                "--api-key-source",
+                "none",
+                "--future-option",
+            ],
+        }
+
+        for name, arguments in cases.items():
+            with self.subTest(name=name):
+                completed = subprocess.run(
+                    [sys.executable, str(VALIDATOR), *arguments],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=5,
+                )
+
+                self.assertEqual(completed.returncode, 3)
+                self.assertEqual(completed.stderr, b"")
+                stdout_lines = completed.stdout.decode("utf-8").splitlines()
+                self.assertEqual(len(stdout_lines), 1)
+                self.assertEqual(
+                    json.loads(stdout_lines[0]),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": ["validator.arguments-invalid"],
+                    },
+                )
+
+    def test_cli_integer_bound_applies_when_runtime_limit_is_disabled(self) -> None:
+        valid = self._full_events()
+        init = self._raw([valid[0]])
+        terminal = self._raw([valid[-1]])
+        oversized_integer = b'{"type":"assistant","value":' + b"1" * 5_000 + b"}\n"
+        input_path = self.cwd / "explicit-integer-bound.jsonl"
+        input_path.write_bytes(init + oversized_integer + terminal)
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(VALIDATOR),
+                "--cwd",
+                str(self.cwd),
+                "--model",
+                "claude-opus-4-8",
+                "--api-key-source",
+                "none",
+                "--input",
+                str(input_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+            env={**os.environ, "PYTHONINTMAXSTRDIGITS": "0"},
+        )
+
+        self.assertEqual(completed.returncode, 3)
+        self.assertEqual(completed.stderr, b"")
+        stdout_lines = completed.stdout.decode("utf-8").splitlines()
+        self.assertEqual(len(stdout_lines), 1)
+        self.assertEqual(
+            json.loads(stdout_lines[0]),
+            {
+                "classification": "inconclusive",
+                "reasons": ["stream.invalid-json"],
+            },
+        )
+
+    def test_cli_oversized_integer_total_cost_fails_closed_without_traceback(
+        self,
+    ) -> None:
         events = self._full_events()
         events[-1]["total_cost_usd"] = 10**400
         input_path = self.cwd / "huge-integer-total-cost.jsonl"
@@ -655,7 +793,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             json.loads(stdout_lines[0]),
             {
                 "classification": "inconclusive",
-                "reasons": ["terminal.total_cost_usd.malformed"],
+                "reasons": ["stream.invalid-json"],
             },
         )
 

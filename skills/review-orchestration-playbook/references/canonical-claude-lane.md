@@ -131,7 +131,10 @@ python3 <playbook>/scripts/validate_claude_stream.py
 ```
 
 The executable/importable validator applies the versioned machine contract and
-fixed upper bounds of 8 MiB total input, 10,000 raw lines, and 1 MiB per line.
+fixed upper bounds of 8 MiB total input, 10,000 raw lines, 1 MiB per line,
+and 128 decimal digits per JSON integer. The integer bound is enforced by the
+validator's parser and does not depend on Python's process-global integer-string
+conversion limit.
 It emits one JSON object with `classification: accepted` and the verbatim
 `findings` only after every envelope, init, and terminal-success check passes.
 Every failure emits a fail-closed `blocked`, `blocked-authentication`, or
@@ -164,7 +167,7 @@ For the Claude Code 2.1.212 terminal `result`, require this exact acceptance sch
 - `api_error_status`, when present, is `null` or a whitespace-only string; and
 - `permission_denials`, when present, is an empty array.
 
-A non-success subtype, `is_error: true`, blank/non-string `result`, missing or malformed `modelUsage`, no requested-model match, unaccepted `stop_reason`, non-null `structured_output`, nonempty `error`/`errors`, nonempty `api_error_status`, or nonempty/malformed `permission_denials` fails closed and cannot supply findings. Classify a structurally valid permission denial, output truncation/abnormal stop, exact-model mismatch, or configuration/policy mismatch as `blocked`. Classify a structurally valid recognized login-expired, HTTP 401, or authentication-refresh error as `blocked-authentication`. Malformed, contradictory, mixed-category, or otherwise untrustworthy terminal evidence is `inconclusive`.
+A non-success subtype, `is_error: true`, blank/non-string `result`, missing or malformed `modelUsage`, no requested-model match, unaccepted `stop_reason`, non-null `structured_output`, nonempty `error`/`errors`, nonempty `api_error_status`, or nonempty/malformed `permission_denials` fails closed and cannot supply findings. Classify a structurally valid permission denial, output truncation/abnormal stop, exact-model mismatch, or configuration/policy mismatch as `blocked`. When a non-success terminal already contains deterministic blocked evidence such as an exact-model mismatch, absence of error prose does not add a generic unclassified reason. Classify a structurally valid recognized login-expired, HTTP 401, or authentication-refresh error as `blocked-authentication`. Malformed, contradictory, mixed-category, or otherwise untrustworthy terminal evidence is `inconclusive`.
 
 The machine-readable Claude Code 2.1.212 contract is [claude-2.1.212-stream-schema.json](claude-2.1.212-stream-schema.json). Its required and optional terminal-field lists form a closed top-level allowlist. Any other terminal field, including an unknown error-bearing field, makes the lane `inconclusive` until a reviewed schema update explicitly adds it. Do not infer a model alias or harmless metadata field from punctuation, provider convention, or a later CLI version.
 
