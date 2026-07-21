@@ -12,11 +12,17 @@ superseded_by: 20260717-c17a11
 
 # Default Claude Reviews To Local Login
 
+> Historical helper record: `20260717-c17a11`, then `20260720-7f2001`,
+> superseded this workstream. The implementation details below describe the
+> low-level `isolated_review` helper at that point in time. They do not define
+> named single, double, or triple review and do not apply to the canonical
+> direct Claude lane.
+
 ## Summary
 
-- Claude-family reviews now use the ordinary local Claude login by default while retaining an optional `ANTHROPIC_API_KEY` override.
+- The low-level helper changed to use ordinary local Claude login by default while retaining an optional `ANTHROPIC_API_KEY` override.
 
-## Current State
+## Historical Helper State
 
 - Claude Code runs with verified `--safe-mode`, restricted read-only tools, disabled setting sources, an isolated home, a capability-authenticated memory-only parent query plus native broker restricted to Claude's current-account Keychain item, and an Anthropic-only local CONNECT proxy.
 - Before every model attempt, a stale access token is refreshed only when it cannot cover that attempt's 30-minute timeout plus the 2-minute safety margin. The fixed-input, no-tools safe-mode warmup uses the current attempt's model and the publisher-verified executable snapshot without workspace access, then the helper re-reads and validates the Keychain item. The final read-only broker performs another single-attempt validation, serves the credential once, blocks OAuth refresh egress, and rejects every Keychain update command. Later Opus attempts repeat the same refresh-if-needed sequence.

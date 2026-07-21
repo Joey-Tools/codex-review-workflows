@@ -5,9 +5,10 @@ by the low-level Claude Code runtime used by `isolated_review`. A documented
 platform or version is supported only when every applicable gate below passes.
 The canonical named-double lane launches actual Claude Code directly under
 [canonical-claude-lane.md](canonical-claude-lane.md); it reuses applicable
-provenance, version, authentication, native-sandbox, and failure-classification
-rules here, but never the helper's supplied-diff workspace or helper-specific
-outer-sandbox/prompt contract.
+publisher-verification primitives, version bounds, native-sandbox boundary, and
+failure vocabulary here, but never the helper's executable snapshot, dependency
+closure, supplied-diff workspace, outer sandbox, credential carrier, catalog,
+guarded writeback, recovery, or prompt contract.
 
 ## Contents
 
@@ -29,10 +30,14 @@ outer-sandbox/prompt contract.
 The direct canonical lane and the low-level helper are separate launch paths.
 For named double/triple review, follow `canonical-claude-lane.md`: use a clean
 Git worktree, no prepared diff, explicit tracked guidance reads, and a direct
-fresh `claude` process. Sections below that describe `.git`-free materialization,
-supplied-diff prompts, helper-private credential carriers, or helper-owned outer
-sandboxes remain helper-only and cannot make an `isolated_review` artifact count
-as the canonical lane.
+fresh `claude` process. Its **Canonical Executable Provenance** section owns the
+direct lane's complete executable contract: verify the installed file against
+the signed release manifest, revalidate that exact resolved path immediately
+before and after launch, and do not create a helper snapshot. Sections below
+that describe executable snapshots or dependency closures, `.git`-free
+materialization, supplied-diff prompts, helper-private credential carriers, or
+helper-owned outer sandboxes remain helper-only and cannot make an
+`isolated_review` artifact count as the canonical lane.
 
 The canonical lane uses ordinary Claude CLI authentication in trusted real
 `HOME`, or an explicitly authorized API key. The CLI may perform its own normal
@@ -80,7 +85,7 @@ This boundary is an accepted model-behavior tradeoff, not full host-read isolati
   per-version manifest as publisher provenance. A version string, executable
   bit, native file format, install path, or self-reported identity is not
   publisher provenance.
-- After the signed manifest, size, and SHA-256 checks pass, materialize a
+- For the low-level helper, after the signed manifest, size, and SHA-256 checks pass, materialize a
   helper-owned private executable snapshot and stop executing the source path.
   Only the snapshot may run the help probe, dependency discovery, credential-
   bearing preparation, or final review.

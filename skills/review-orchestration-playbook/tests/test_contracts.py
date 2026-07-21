@@ -1027,7 +1027,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("Do not apply its catalog, broker, carrier, lock", runtime)
         self.assertIn("do not apply to this direct real-`HOME` lane", skill)
         self.assertIn("a narrow CLI control-plane exception", skill)
-        self.assertIn("Apply only the canonical-applicable executable", lane_contracts)
+        self.assertIn("Apply **Canonical Executable Provenance**", lane_contracts)
         self.assertIn("recovery rules do not apply to this direct lane", lane_contracts)
         self.assertNotIn("authentication, credential-recovery", lane_contracts)
         self.assertIn("Those guarantees do not apply", agents)
@@ -1039,26 +1039,59 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertNotIn(retired_global_detail, agents)
 
-    def test_superseded_auth_journal_is_historical_helper_only(self) -> None:
-        journal = (
-            REPO_ROOT
-            / "docs/project_journal/2026/07/"
-            / "2026-07-17-claude-auth-carriers-c17a11.md"
-        ).read_text(encoding="utf-8")
-        normalized = " ".join(
-            line.removeprefix("> ").strip() for line in journal.splitlines()
+    def test_canonical_claude_provenance_is_direct_not_helper_snapshot(self) -> None:
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
         )
+        runtime = (SKILL_ROOT / "references/claude-runtime-trust.md").read_text(
+            encoding="utf-8"
+        )
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
 
         for anchor in (
-            "Historical helper record",
-            "`20260720-7f2001` supersedes this workstream",
-            "low-level `isolated_review` helper",
-            "do not define named single, double, or triple review",
-            "do not apply to the canonical direct Claude lane",
+            "## Canonical Executable Provenance",
+            "one exact resolved path",
+            "fixed credential-free environment",
+            "`>=2.1.211,<3.0.0`",
+            "fixed Anthropic release-signing key",
+            "signed per-version manifest",
+            "`verify_claude_release` or equivalent checks",
+            "immediately before launch",
+            "revalidate it again after process completion",
+            "does not call `snapshot_verified_claude_executable`",
+            "do not claim the stronger immutability of the helper snapshot",
         ):
-            self.assertIn(anchor, normalized)
-        self.assertIn("## Historical Helper State", journal)
-        self.assertNotIn("## Current State", journal)
+            self.assertIn(anchor, canonical)
+        self.assertIn("do not create a helper snapshot", runtime)
+        self.assertIn("For the low-level helper, after the signed manifest", runtime)
+        self.assertIn("Follow **Canonical Executable Provenance**", skill)
+
+    def test_all_superseded_auth_journals_are_historical_helper_only(self) -> None:
+        journal_names = (
+            "2026-07-03-claude-local-login-b4e9d1.md",
+            "2026-07-15-claude-cli-platform-capabilities-7c1501.md",
+            "2026-07-16-claude-oauth-per-attempt-freshness-662f2c.md",
+            "2026-07-17-claude-auth-carriers-c17a11.md",
+        )
+
+        for journal_name in journal_names:
+            journal = (
+                REPO_ROOT / "docs/project_journal/2026/07" / journal_name
+            ).read_text(encoding="utf-8")
+            normalized = " ".join(
+                line.removeprefix("> ").strip() for line in journal.splitlines()
+            )
+            with self.subTest(journal=journal_name):
+                for anchor in (
+                    "Historical helper record",
+                    "low-level `isolated_review` helper",
+                    "do not define named single, double, or triple review",
+                    "do not apply to the canonical direct Claude lane",
+                ):
+                    self.assertIn(anchor, normalized)
+                self.assertRegex(journal, r"superseded_by: 202607(?:17|20)-")
+                self.assertIn("## Historical Helper State", journal)
+                self.assertNotIn("## Current State", journal)
 
     def test_migration_journal_requires_zero_inherited_turns_for_single(self) -> None:
         journal = (
@@ -1084,7 +1117,10 @@ class RepositoryContractTest(unittest.TestCase):
             "For the low-level helper, missing, malformed, unsafe",
         ):
             self.assertGreater(readme.index(helper_detail), boundary)
-        self.assertIn("not requirements or guarantees of the canonical direct Claude lane", readme)
+        self.assertIn(
+            "not requirements or guarantees of the canonical direct Claude lane",
+            readme,
+        )
         self.assertIn("cannot satisfy named double or triple review", readme)
 
     def test_core_active_policy_has_no_retired_codex_pr_gate_names(self) -> None:
