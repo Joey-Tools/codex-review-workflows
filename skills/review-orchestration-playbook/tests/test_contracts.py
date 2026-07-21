@@ -1033,6 +1033,27 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertNotIn(retired_global_detail, agents)
 
+    def test_superseded_auth_journal_is_historical_helper_only(self) -> None:
+        journal = (
+            REPO_ROOT
+            / "docs/project_journal/2026/07/"
+            / "2026-07-17-claude-auth-carriers-c17a11.md"
+        ).read_text(encoding="utf-8")
+        normalized = " ".join(
+            line.removeprefix("> ").strip() for line in journal.splitlines()
+        )
+
+        for anchor in (
+            "Historical helper record",
+            "`20260720-7f2001` supersedes this workstream",
+            "low-level `isolated_review` helper",
+            "do not define named single, double, or triple review",
+            "do not apply to the canonical direct Claude lane",
+        ):
+            self.assertIn(anchor, normalized)
+        self.assertIn("## Historical Helper State", journal)
+        self.assertNotIn("## Current State", journal)
+
     def test_core_active_policy_has_no_retired_codex_pr_gate_names(self) -> None:
         active_policy = (
             REPO_ROOT / "AGENTS.md",
