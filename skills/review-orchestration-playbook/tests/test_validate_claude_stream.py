@@ -93,6 +93,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         raw: bytes | None = None,
         requested_model: str = "claude-opus-4-8",
         api_key_source: str = "none",
+        process_returncode: object = 0,
         limits: validator.StreamLimits | None = None,
     ) -> dict[str, object]:
         if raw is None:
@@ -102,6 +103,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             expected_cwd=self.cwd,
             requested_model=requested_model,
             api_key_source=api_key_source,
+            process_returncode=process_returncode,
             limits=limits,
         )
 
@@ -118,6 +120,9 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
 
         self.assertEqual(schema["claude_code_version"], "2.1.212")
+        self.assertEqual(
+            schema["process_returncode"], validator.PROCESS_RETURNCODE_CONTRACT
+        )
         self.assertEqual(
             schema["stream_contract"],
             {
@@ -149,7 +154,19 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         self.assertEqual(
             set(init_contract["field_contracts"]), validator.INIT_REQUIRED_FIELDS
         )
-        self.assertTrue(init_contract["additional_fields"])
+        self.assertFalse(init_contract["additional_fields"])
+        self.assertEqual(
+            set(init_contract["optional_fields"]), validator.INIT_OPTIONAL_FIELDS
+        )
+        self.assertEqual(
+            init_contract["optional_field_contracts"],
+            {
+                "session_id": {
+                    "rule": "nonempty_string",
+                    "failure": "inconclusive",
+                }
+            },
+        )
         terminal_contract = schema["terminal_result"]
         self.assertFalse(terminal_contract["additional_fields"])
         self.assertEqual(
@@ -179,12 +196,111 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             {"result", "modelUsage"},
         )
 
+    def test_loader_rejects_process_returncode_contract_drift(self) -> None:
+        schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
+        schema["process_returncode"]["nonzero_precedence"]["blocked"] = "inconclusive"
+        schema_path = self.cwd / "invalid-stream-schema.json"
+        schema_path.write_text(json.dumps(schema), encoding="utf-8")
+
+        with (
+            mock.patch.object(validator, "SCHEMA_PATH", schema_path),
+            self.assertRaises(validator._ContractError),
+        ):
+            validator._load_contract()
+
     def test_accepts_complete_stream_and_preserves_findings_verbatim(self) -> None:
         outcome = self._validate(raw=self._raw(self._full_events(), blank_edges=True))
 
         self.assertEqual(
             outcome,
             {"classification": "accepted", "findings": "\nNo findings.\n"},
+        )
+
+    def test_accepts_init_without_optional_session_id(self) -> None:
+        events = self._full_events()
+        del events[0]["session_id"]
+
+        self.assertEqual(self._validate(events)["classification"], "accepted")
+
+    def test_nonzero_success_is_inconclusive_and_returncode_must_be_exact_int(
+        self,
+    ) -> None:
+        for process_returncode in (1, -9, 401):
+            with self.subTest(process_returncode=process_returncode):
+                self.assertEqual(
+                    self._validate(process_returncode=process_returncode),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": ["process.returncode.nonzero"],
+                    },
+                )
+
+        for process_returncode in (None, False, True, 0.0, "0", [], {}):
+            with self.subTest(invalid_process_returncode=process_returncode):
+                self.assertEqual(
+                    self._validate(process_returncode=process_returncode),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": ["process.returncode.invalid"],
+                    },
+                )
+
+        self.assertEqual(
+            validator.validate_claude_stream_bytes(
+                self._raw(self._full_events()),
+                expected_cwd=self.cwd,
+                requested_model="claude-opus-4-8",
+                api_key_source="none",
+            ),
+            {
+                "classification": "inconclusive",
+                "reasons": ["process.returncode.invalid"],
+            },
+        )
+
+    def test_bare_401_with_nonzero_returncode_is_inconclusive(self) -> None:
+        self.assertEqual(
+            self._validate(raw=b"401\n", process_returncode=401),
+            {
+                "classification": "inconclusive",
+                "reasons": [
+                    "process.returncode.nonzero",
+                    "stream.non-object-event",
+                ],
+            },
+        )
+
+    def test_nonzero_preserves_deterministic_structured_blocked_outcomes(
+        self,
+    ) -> None:
+        init_blocked = self._full_events()
+        init_blocked[0]["permissionMode"] = "default"
+        terminal_blocked = [
+            copy.deepcopy(self.init_event),
+            {
+                "type": "result",
+                "subtype": "error",
+                "is_error": True,
+                "modelUsage": {"claude-opus-4-7": {}},
+            },
+        ]
+
+        self.assertEqual(
+            self._validate(init_blocked, process_returncode=1),
+            {
+                "classification": "blocked",
+                "reasons": ["init.permissionMode.mismatch"],
+            },
+        )
+        self.assertEqual(
+            self._validate(terminal_blocked, process_returncode=401),
+            {
+                "classification": "blocked",
+                "reasons": [
+                    "terminal.modelUsage.primary-model-substitution",
+                    "terminal.modelUsage.requested-model-missing",
+                ],
+            },
         )
 
     def test_accepts_reviewed_model_alias_and_auxiliary_usage(self) -> None:
@@ -234,6 +350,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             expected_cwd=self.cwd,
             requested_model="claude-opus-4-8",
             api_key_source="none",
+            process_returncode=0,
         )
         self.assert_fail_closed(outcome, "inconclusive")
 
@@ -421,6 +538,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "model": ["claude-opus-4-8"],
             "claude_code_version": 212,
             "apiKeySource": None,
+            "session_id": " ",
         }
 
         for field_name, value in malformed_values.items():
@@ -428,6 +546,25 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 events = self._full_events()
                 events[0][field_name] = value
                 self.assert_fail_closed(self._validate(events), "inconclusive")
+
+    def test_rejects_hooks_agents_and_arbitrary_unknown_init_fields(self) -> None:
+        unknown_fields = {
+            "hooks": [{"matcher": "Bash"}],
+            "agents": [{"name": "reviewer"}],
+            "future_field": True,
+        }
+
+        for field_name, value in unknown_fields.items():
+            with self.subTest(field=field_name):
+                events = self._full_events()
+                events[0][field_name] = value
+                self.assertEqual(
+                    self._validate(events),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": ["init.unknown-field"],
+                    },
+                )
 
     def test_rejects_well_formed_init_mismatches_as_blocked(self) -> None:
         mismatch_values = {
@@ -611,6 +748,39 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
 
         self.assert_fail_closed(self._validate(contradictory_success), "inconclusive")
 
+    def test_nonzero_preserves_valid_structured_authentication_failures(self) -> None:
+        authentication_messages = (
+            "Login expired",
+            "HTTP 401 Unauthorized",
+            "OAuth error",
+            "token expired",
+            "credential invalid",
+            "login unauthorized",
+            "authentication failed",
+            "auth error",
+        )
+        for process_returncode in (1, 401):
+            for message in authentication_messages:
+                with self.subTest(
+                    process_returncode=process_returncode, message=message
+                ):
+                    events = [
+                        copy.deepcopy(self.init_event),
+                        {
+                            "type": "result",
+                            "subtype": "error",
+                            "is_error": True,
+                            "error": message,
+                        },
+                    ]
+                    self.assertEqual(
+                        self._validate(events, process_returncode=process_returncode),
+                        {
+                            "classification": "blocked-authentication",
+                            "reasons": ["terminal.authentication-error"],
+                        },
+                    )
+
     def test_non_success_model_mismatch_is_blocked_without_unclassified_reason(
         self,
     ) -> None:
@@ -665,6 +835,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                         "claude-opus-4-8",
                         "--api-key-source",
                         "none",
+                        "--process-returncode",
+                        "0",
                         "--input",
                         str(input_path),
                     ],
@@ -698,6 +870,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "claude-opus-4-8",
                 "--api-key-source",
                 "none",
+                "--process-returncode",
+                "0",
                 "--input",
                 str(input_path),
             ],
@@ -715,6 +889,43 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             {"classification": "accepted", "findings": "\nNo findings.\n"},
         )
         self.assertEqual(completed.stderr, b"")
+
+    def test_cli_rejects_success_stdout_when_process_returncode_is_nonzero(
+        self,
+    ) -> None:
+        input_path = self.cwd / "successful-stream-nonzero-process.jsonl"
+        input_path.write_bytes(self._raw(self._full_events()))
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(VALIDATOR),
+                "--cwd",
+                str(self.cwd),
+                "--model",
+                "claude-opus-4-8",
+                "--api-key-source",
+                "none",
+                "--process-returncode",
+                "401",
+                "--input",
+                str(input_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+
+        self.assertEqual(completed.returncode, 3)
+        self.assertEqual(completed.stderr, b"")
+        self.assertEqual(
+            json.loads(completed.stdout),
+            {
+                "classification": "inconclusive",
+                "reasons": ["process.returncode.nonzero"],
+            },
+        )
 
     def test_cli_exit_zero_is_unique_to_accepted_output(self) -> None:
         blocked = self._full_events()
@@ -750,6 +961,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                         "claude-opus-4-8",
                         "--api-key-source",
                         "none",
+                        "--process-returncode",
+                        "0",
                         "--input",
                         str(input_path),
                     ],
@@ -773,7 +986,32 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         cases = {
             "short-help": ["-h"],
             "long-help": ["--help"],
-            "missing-required": ["--model", "claude-opus-4-8"],
+            "missing-cwd": [
+                "--model",
+                "claude-opus-4-8",
+                "--api-key-source",
+                "none",
+                "--process-returncode",
+                "0",
+            ],
+            "missing-process-returncode": [
+                "--cwd",
+                str(self.cwd),
+                "--model",
+                "claude-opus-4-8",
+                "--api-key-source",
+                "none",
+            ],
+            "invalid-process-returncode": [
+                "--cwd",
+                str(self.cwd),
+                "--model",
+                "claude-opus-4-8",
+                "--api-key-source",
+                "none",
+                "--process-returncode",
+                "not-an-integer",
+            ],
             "invalid-choice": [
                 "--cwd",
                 str(self.cwd),
@@ -781,6 +1019,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "claude-future",
                 "--api-key-source",
                 "none",
+                "--process-returncode",
+                "0",
             ],
             "unknown-option": [
                 "--cwd",
@@ -789,6 +1029,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "claude-opus-4-8",
                 "--api-key-source",
                 "none",
+                "--process-returncode",
+                "0",
                 "--future-option",
             ],
         }
@@ -833,6 +1075,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "claude-opus-4-8",
                 "--api-key-source",
                 "none",
+                "--process-returncode",
+                "0",
                 "--input",
                 str(input_path),
             ],
@@ -873,6 +1117,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "claude-opus-4-8",
                 "--api-key-source",
                 "none",
+                "--process-returncode",
+                "0",
                 "--input",
                 str(input_path),
             ],

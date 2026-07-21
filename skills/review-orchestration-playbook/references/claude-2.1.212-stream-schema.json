@@ -1,5 +1,25 @@
 {
   "claude_code_version": "2.1.212",
+  "process_returncode": {
+    "rule": "exact_int",
+    "missing_or_invalid": {
+      "classification": "inconclusive",
+      "reason": "process.returncode.invalid"
+    },
+    "accepted_requires": 0,
+    "nonzero_precedence": {
+      "accepted": {
+        "classification": "inconclusive",
+        "reason": "process.returncode.nonzero"
+      },
+      "blocked": "preserve",
+      "blocked-authentication": "preserve",
+      "inconclusive": {
+        "classification": "inconclusive",
+        "append_reason": "process.returncode.nonzero"
+      }
+    }
+  },
   "stream_contract": {
     "encoding": "utf-8",
     "format": "jsonl",
@@ -41,7 +61,10 @@
       "claude_code_version",
       "apiKeySource"
     ],
-    "additional_fields": true,
+    "additional_fields": false,
+    "optional_fields": [
+      "session_id"
+    ],
     "field_contracts": {
       "type": {
         "rule": "constant",
@@ -119,6 +142,12 @@
         ],
         "malformed_failure": "inconclusive",
         "mismatch_failure": "blocked"
+      }
+    },
+    "optional_field_contracts": {
+      "session_id": {
+        "rule": "nonempty_string",
+        "failure": "inconclusive"
       }
     }
   },

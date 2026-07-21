@@ -15,7 +15,9 @@ from .claude_provenance import (
     ClaudeProvenanceInconclusive,
     ClaudeProvenanceInvalid,
     ClaudeProvenanceUnavailable,
+    materialize_verified_executable,
     verify_claude_release,
+    verify_release_executable,
 )
 from .common import (
     ReviewOutputDrainError,
@@ -72,6 +74,7 @@ class VerifiedCandidate:
     checksum: str
     artifact_size: int
     identity: Mapping[str, int]
+    probe_result: ProbeResult
 
 
 @dataclass(frozen=True)
@@ -81,8 +84,8 @@ class ProbeResult:
     stderr: bytes
 
 
-CandidateVerifier = Callable[[pathlib.Path], VerifiedCandidate]
 VersionProbe = Callable[[pathlib.Path], ProbeResult]
+CandidateVerifier = Callable[[pathlib.Path, VersionProbe], VerifiedCandidate]
 
 
 class _ArgumentError(ValueError):
@@ -94,6 +97,10 @@ class _CandidateUnavailable(ValueError):
 
 
 class _CandidateInspectionInconclusive(RuntimeError):
+    pass
+
+
+class _VersionProbeInconclusive(RuntimeError):
     pass
 
 
@@ -132,17 +139,79 @@ def _result(
 
 def _identity(path: pathlib.Path) -> dict[str, int]:
     metadata = path.stat(follow_symlinks=False)
+    return _identity_from_stat(metadata)
+
+
+def _identity_from_stat(metadata: os.stat_result) -> dict[str, int]:
     return {
         "device": metadata.st_dev,
         "inode": metadata.st_ino,
-        "mode": stat.S_IMODE(metadata.st_mode),
-        "mtime_ns": metadata.st_mtime_ns,
+        "file_type": stat.S_IFMT(metadata.st_mode),
+        "mode": metadata.st_mode,
+        "nlink": metadata.st_nlink,
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
         "size": metadata.st_size,
+        "mtime_ns": metadata.st_mtime_ns,
+        "ctime_ns": metadata.st_ctime_ns,
     }
 
 
+def _stable_descriptor_identity(path: pathlib.Path) -> dict[str, int]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        before = path.stat(follow_symlinks=False)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        after = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise _CandidateInspectionInconclusive(
+            f"cannot bind a stable candidate identity for {path}"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    identities = {
+        tuple(_identity_from_stat(value).values()) for value in (before, opened, after)
+    }
+    if len(identities) != 1:
+        raise _CandidateInspectionInconclusive(
+            f"candidate identity changed while binding {path}"
+        )
+    return _identity_from_stat(opened)
+
+
+def _identity_from_tuple(identity: tuple[int, ...]) -> dict[str, int]:
+    names = (
+        "device",
+        "inode",
+        "file_type",
+        "mode",
+        "nlink",
+        "uid",
+        "gid",
+        "size",
+        "mtime_ns",
+        "ctime_ns",
+    )
+    if len(identity) != len(names):
+        raise _CandidateInspectionInconclusive(
+            "publisher verifier returned an invalid source identity"
+        )
+    return dict(zip(names, identity, strict=True))
+
+
 def _candidate_exists(path: pathlib.Path) -> bool:
-    return os.path.lexists(path)
+    try:
+        path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as error:
+        raise _CandidateInspectionInconclusive(
+            f"cannot inspect candidate path {path}"
+        ) from error
+    return True
 
 
 def select_candidate(
@@ -171,12 +240,16 @@ def select_candidate(
 
 def _resolve_candidate(candidate: Candidate) -> pathlib.Path:
     if not _candidate_exists(candidate.path):
+        if candidate.source != "explicit-override":
+            raise _CandidateInspectionInconclusive(str(candidate.path))
         raise _CandidateUnavailable(str(candidate.path))
     try:
         resolved = candidate.path.resolve(strict=True)
         metadata = resolved.stat(follow_symlinks=False)
-    except (OSError, RuntimeError) as error:
-        raise _CandidateUnavailable(str(candidate.path)) from error
+    except (FileNotFoundError, NotADirectoryError, RuntimeError) as error:
+        raise _CandidateInspectionInconclusive(str(candidate.path)) from error
+    except OSError as error:
+        raise _CandidateInspectionInconclusive(str(candidate.path)) from error
     if not stat.S_ISREG(metadata.st_mode) or not os.access(resolved, os.X_OK):
         raise _CandidateUnavailable(str(resolved))
     return resolved
@@ -231,7 +304,10 @@ def _platform_key(path: pathlib.Path) -> str:
     raise _CandidateUnavailable(f"unsupported host platform: {sys.platform}")
 
 
-def verify_publisher_candidate(path: pathlib.Path) -> VerifiedCandidate:
+def verify_publisher_candidate(
+    path: pathlib.Path,
+    version_probe: VersionProbe,
+) -> VerifiedCandidate:
     """Verify the exact signed 2.1.212 artifact before executing the candidate."""
 
     platform_key = _platform_key(path)
@@ -245,19 +321,68 @@ def verify_publisher_candidate(path: pathlib.Path) -> VerifiedCandidate:
         prefix="named-claude-provenance-",
         dir=provenance_temp_root,
     ) as temporary:
+        private_root = pathlib.Path(temporary).resolve(strict=True)
         verified = verify_claude_release(
             path,
             version=REQUIRED_CLAUDE_VERSION,
             platform_key=platform_key,
-            gpg_temp_root=pathlib.Path(temporary).resolve(strict=True),
+            gpg_temp_root=private_root,
         )
-    resolved = verified.executable.resolve(strict=True)
+        if verified.source_identity is None:
+            raise _CandidateInspectionInconclusive(
+                "publisher verifier did not return the descriptor-bound source identity"
+            )
+        resolved = verified.executable.resolve(strict=True)
+        source_identity = _identity_from_tuple(verified.source_identity)
+        try:
+            snapshot = materialize_verified_executable(
+                verified,
+                private_root / "executable-snapshot",
+            )
+        except (
+            ClaudeProvenanceInconclusive,
+            ClaudeProvenanceInvalid,
+            ClaudeProvenanceUnavailable,
+        ) as error:
+            raise ClaudeProvenanceInconclusive(
+                "cannot safely materialize the verified executable snapshot"
+            ) from error
+        try:
+            completed = version_probe(snapshot.executable)
+        except (
+            OSError,
+            ReviewOutputDrainError,
+            ReviewOutputLimitError,
+            ReviewProcessLeakError,
+            ReviewTimeoutError,
+        ) as error:
+            raise _VersionProbeInconclusive(str(error)) from error
+        except Exception as error:
+            raise _VersionProbeInconclusive(str(error)) from error
+        try:
+            after_probe = verify_release_executable(
+                snapshot.executable,
+                snapshot.artifact,
+            )
+        except (
+            ClaudeProvenanceInconclusive,
+            ClaudeProvenanceInvalid,
+            ClaudeProvenanceUnavailable,
+        ) as error:
+            raise _CandidateInspectionInconclusive(
+                "verified executable snapshot changed during the version probe"
+            ) from error
+        if after_probe != snapshot.executable:
+            raise _CandidateInspectionInconclusive(
+                "verified executable snapshot path changed during the version probe"
+            )
     return VerifiedCandidate(
         resolved_path=resolved,
         platform_key=verified.artifact.platform_key,
         checksum=verified.artifact.checksum,
         artifact_size=verified.artifact.size,
-        identity=_identity(resolved),
+        identity=source_identity,
+        probe_result=completed,
     )
 
 
@@ -298,12 +423,21 @@ def preflight(
     verifier: CandidateVerifier = verify_publisher_candidate,
     version_probe: VersionProbe = probe_verified_version,
 ) -> dict[str, object]:
-    candidate = select_candidate(explicit_path=explicit_path, home=home)
+    try:
+        candidate = select_candidate(explicit_path=explicit_path, home=home)
+    except _CandidateInspectionInconclusive:
+        return _result("inconclusive", "candidate-inspection-inconclusive")
     if candidate is None:
         return _result("blocked", "exact-version-unavailable")
 
     try:
         resolved = _resolve_candidate(candidate)
+    except _CandidateInspectionInconclusive:
+        return _result(
+            "inconclusive",
+            "candidate-inspection-inconclusive",
+            candidate=candidate,
+        )
     except _CandidateUnavailable:
         return _result(
             "blocked",
@@ -312,6 +446,26 @@ def preflight(
         )
     declared_version = _declared_installer_version(resolved)
     if declared_version is not None and declared_version != REQUIRED_CLAUDE_VERSION:
+        try:
+            bound_identity = _stable_descriptor_identity(resolved)
+            after_resolved = _resolve_candidate(candidate)
+            after_identity = _stable_descriptor_identity(after_resolved)
+        except (_CandidateUnavailable, _CandidateInspectionInconclusive):
+            return _result(
+                "inconclusive",
+                "executable-identity-drift",
+                candidate=candidate,
+                resolved_path=resolved,
+                declared_version=declared_version,
+            )
+        if after_resolved != resolved or after_identity != bound_identity:
+            return _result(
+                "inconclusive",
+                "executable-identity-drift",
+                candidate=candidate,
+                resolved_path=resolved,
+                declared_version=declared_version,
+            )
         return _result(
             "blocked",
             "exact-version-mismatch",
@@ -321,7 +475,7 @@ def preflight(
         )
 
     try:
-        verified = verifier(resolved)
+        verified = verifier(resolved, version_probe)
     except _CandidateInspectionInconclusive:
         return _result(
             "inconclusive",
@@ -333,6 +487,13 @@ def preflight(
         return _result(
             "blocked",
             "exact-version-unavailable",
+            candidate=candidate,
+            resolved_path=resolved,
+        )
+    except _VersionProbeInconclusive:
+        return _result(
+            "inconclusive",
+            "version-probe-inconclusive",
             candidate=candidate,
             resolved_path=resolved,
         )
@@ -375,30 +536,7 @@ def preflight(
             verified=verified,
         )
 
-    try:
-        completed = version_probe(verified.resolved_path)
-    except (
-        OSError,
-        ReviewOutputDrainError,
-        ReviewOutputLimitError,
-        ReviewProcessLeakError,
-        ReviewTimeoutError,
-    ):
-        return _result(
-            "inconclusive",
-            "version-probe-inconclusive",
-            candidate=candidate,
-            resolved_path=resolved,
-            verified=verified,
-        )
-    except Exception:
-        return _result(
-            "inconclusive",
-            "version-probe-inconclusive",
-            candidate=candidate,
-            resolved_path=resolved,
-            verified=verified,
-        )
+    completed = verified.probe_result
     if completed.returncode != 0:
         return _result(
             "inconclusive",
@@ -421,25 +559,22 @@ def preflight(
     try:
         after_resolved = _resolve_candidate(candidate)
         after_identity = _identity(after_resolved)
-    except _CandidateUnavailable:
+    except (_CandidateUnavailable, _CandidateInspectionInconclusive):
         after_resolved = pathlib.Path()
         after_identity = {}
-    if (
-        after_resolved != resolved
-        or after_identity != verified.identity
-        or observed_version != REQUIRED_CLAUDE_VERSION
-    ):
-        reason = (
-            "exact-version-mismatch"
-            if observed_version != REQUIRED_CLAUDE_VERSION
-            else "executable-identity-drift"
-        )
-        classification = (
-            "blocked" if reason == "exact-version-mismatch" else "inconclusive"
-        )
+    if after_resolved != resolved or after_identity != verified.identity:
         return _result(
-            classification,
-            reason,
+            "inconclusive",
+            "executable-identity-drift",
+            candidate=candidate,
+            resolved_path=resolved,
+            observed_version=observed_version,
+            verified=verified,
+        )
+    if observed_version != REQUIRED_CLAUDE_VERSION:
+        return _result(
+            "blocked",
+            "exact-version-mismatch",
             candidate=candidate,
             resolved_path=resolved,
             observed_version=observed_version,

@@ -18,6 +18,26 @@ CLAUDE_CODE_VERSION = "2.1.212"
 EXPECTED_TOOLS = frozenset(("Read", "Grep", "Glob", "Bash"))
 EMPTY_INIT_SURFACES = ("mcp_servers", "slash_commands", "skills", "plugins")
 ACCEPTED_API_KEY_SOURCES = frozenset(("none", "ANTHROPIC_API_KEY"))
+PROCESS_RETURNCODE_CONTRACT = {
+    "rule": "exact_int",
+    "missing_or_invalid": {
+        "classification": "inconclusive",
+        "reason": "process.returncode.invalid",
+    },
+    "accepted_requires": 0,
+    "nonzero_precedence": {
+        "accepted": {
+            "classification": "inconclusive",
+            "reason": "process.returncode.nonzero",
+        },
+        "blocked": "preserve",
+        "blocked-authentication": "preserve",
+        "inconclusive": {
+            "classification": "inconclusive",
+            "append_reason": "process.returncode.nonzero",
+        },
+    },
+}
 SCHEMA_PATH = (
     Path(__file__).resolve().parent.parent
     / "references"
@@ -64,6 +84,7 @@ INIT_REQUIRED_FIELDS = frozenset(
         "apiKeySource",
     )
 )
+INIT_OPTIONAL_FIELDS = frozenset(("session_id",))
 
 
 @dataclass(frozen=True)
@@ -220,6 +241,8 @@ def _load_contract() -> dict[str, Any]:
         raise _ContractError("schema root must be an object")
     if contract.get("claude_code_version") != CLAUDE_CODE_VERSION:
         raise _ContractError("schema version is not exact")
+    if contract.get("process_returncode") != PROCESS_RETURNCODE_CONTRACT:
+        raise _ContractError("process return-code contract does not match")
 
     stream_contract = contract.get("stream_contract")
     if type(stream_contract) is not dict:
@@ -260,8 +283,15 @@ def _load_contract() -> dict[str, Any]:
         != INIT_REQUIRED_FIELDS
     ):
         raise _ContractError("init required fields do not match the validator")
-    if init_contract.get("additional_fields") is not True:
+    if init_contract.get("additional_fields") is not False:
         raise _ContractError("init additional-field policy does not match")
+    if (
+        _unique_string_set(
+            init_contract.get("optional_fields"), label="init optional_fields"
+        )
+        != INIT_OPTIONAL_FIELDS
+    ):
+        raise _ContractError("init optional fields do not match the validator")
     field_contracts = init_contract.get("field_contracts")
     if (
         type(field_contracts) is not dict
@@ -290,6 +320,17 @@ def _load_contract() -> dict[str, Any]:
         != ACCEPTED_API_KEY_SOURCES
     ):
         raise _ContractError("authentication-source contract does not match")
+    expected_init_optional_contracts = {
+        "session_id": {
+            "rule": "nonempty_string",
+            "failure": "inconclusive",
+        }
+    }
+    if (
+        init_contract.get("optional_field_contracts")
+        != expected_init_optional_contracts
+    ):
+        raise _ContractError("init optional contracts do not match the validator")
 
     terminal_contract = contract.get("terminal_result")
     if type(terminal_contract) is not dict:
@@ -390,6 +431,18 @@ class _Evidence:
 
 def _failure(classification: str, reasons: set[str] | list[str]) -> dict[str, Any]:
     return {"classification": classification, "reasons": sorted(reasons)}
+
+
+def _apply_process_returncode_precedence(
+    outcome: dict[str, Any], process_returncode: int
+) -> dict[str, Any]:
+    if process_returncode == 0:
+        return outcome
+    if outcome.get("classification") in ("blocked", "blocked-authentication"):
+        return outcome
+    reasons = set(outcome.get("reasons", ()))
+    reasons.add("process.returncode.nonzero")
+    return _failure("inconclusive", reasons)
 
 
 def _read_envelope(
@@ -497,6 +550,9 @@ def _validate_init(
     api_key_source: str,
     evidence: _Evidence,
 ) -> None:
+    allowed_fields = INIT_REQUIRED_FIELDS | INIT_OPTIONAL_FIELDS
+    if frozenset(event) - allowed_fields:
+        evidence.inconclusive.add("init.unknown-field")
     missing = INIT_REQUIRED_FIELDS - frozenset(event)
     for field_name in missing:
         evidence.inconclusive.add(f"init.{field_name}.missing")
@@ -524,6 +580,11 @@ def _validate_init(
             evidence.inconclusive.add(f"init.{field_name}.malformed")
         elif value:
             evidence.blocked.add(f"init.{field_name}.nonempty")
+
+    if "session_id" in event:
+        value = event["session_id"]
+        if type(value) is not str or not value.strip():
+            evidence.inconclusive.add("init.session_id.malformed")
 
 
 def _validate_model_usage(
@@ -582,12 +643,13 @@ _AUTH_REFRESH_CONTEXT = (
     rf"(?:{_AUTH_CONTEXT}(?:[\s_-]+[a-z0-9]+){{0,3}}[\s_-]+{_REFRESH_ACTION}"
     rf"|{_REFRESH_ACTION}(?:[\s_-]+[a-z0-9]+){{0,3}}[\s_-]+{_AUTH_CONTEXT})"
 )
-_AUTH_REFRESH_FAILURE = re.compile(
+_AUTHENTICATION_FAILURE = re.compile(
     rf"\b(?:"
-    rf"{_AUTH_REFRESH_CONTEXT}\b(?:[\s,:;_-]+[a-z0-9]+){{0,4}}"
+    rf"(?:{_AUTH_CONTEXT}|{_AUTH_REFRESH_CONTEXT})\b"
+    rf"(?:[\s,:;_-]+[a-z0-9]+){{0,4}}"
     rf"[\s,:;_-]+{_FAILURE_SIGNAL}"
     rf"|{_FAILURE_SIGNAL}\b(?:[\s,:;_-]+[a-z0-9]+){{0,4}}"
-    rf"[\s,:;_-]+{_AUTH_REFRESH_CONTEXT}"
+    rf"[\s,:;_-]+(?:{_AUTH_CONTEXT}|{_AUTH_REFRESH_CONTEXT})"
     rf")\b"
 )
 
@@ -597,7 +659,7 @@ def _is_authentication_error(message: str) -> bool:
     return bool(
         "login expired" in normalized
         or _HTTP_401.search(normalized)
-        or _AUTH_REFRESH_FAILURE.search(normalized)
+        or _AUTHENTICATION_FAILURE.search(normalized)
     )
 
 
@@ -765,34 +827,52 @@ def validate_claude_stream(
     expected_cwd: str | Path,
     requested_model: str,
     api_key_source: str,
+    process_returncode: object = None,
     limits: StreamLimits | None = None,
 ) -> dict[str, Any]:
     """Validate one raw Claude stream without ever returning partial findings."""
 
+    if type(process_returncode) is not int:
+        return _failure("inconclusive", {"process.returncode.invalid"})
     try:
         contract = _load_contract()
     except (_ContractError, AttributeError, KeyError, TypeError):
-        return _failure("inconclusive", {"validator.contract-invalid"})
+        return _apply_process_returncode_precedence(
+            _failure("inconclusive", {"validator.contract-invalid"}),
+            process_returncode,
+        )
     try:
         resolved_cwd = Path(expected_cwd).resolve(strict=True)
         if not resolved_cwd.is_dir():
             raise OSError("cwd is not a directory")
     except (OSError, RuntimeError, TypeError, ValueError):
-        return _failure("inconclusive", {"validator.expected-cwd-invalid"})
+        return _apply_process_returncode_precedence(
+            _failure("inconclusive", {"validator.expected-cwd-invalid"}),
+            process_returncode,
+        )
     if (
         type(requested_model) is not str
         or requested_model not in contract["model_identity"]
     ):
-        return _failure("inconclusive", {"validator.requested-model-invalid"})
+        return _apply_process_returncode_precedence(
+            _failure("inconclusive", {"validator.requested-model-invalid"}),
+            process_returncode,
+        )
     if (
         type(api_key_source) is not str
         or api_key_source not in ACCEPTED_API_KEY_SOURCES
     ):
-        return _failure("inconclusive", {"validator.api-key-source-invalid"})
+        return _apply_process_returncode_precedence(
+            _failure("inconclusive", {"validator.api-key-source-invalid"}),
+            process_returncode,
+        )
 
     selected_limits = limits or DEFAULT_STREAM_LIMITS
     if type(selected_limits) is not StreamLimits:
-        return _failure("inconclusive", {"validator.limits-invalid"})
+        return _apply_process_returncode_precedence(
+            _failure("inconclusive", {"validator.limits-invalid"}),
+            process_returncode,
+        )
     values = (
         selected_limits.max_bytes,
         selected_limits.max_lines,
@@ -806,18 +886,29 @@ def validate_claude_stream(
     if any(type(value) is not int or value <= 0 for value in values) or any(
         value > default for value, default in zip(values, defaults)
     ):
-        return _failure("inconclusive", {"validator.limits-invalid"})
+        return _apply_process_returncode_precedence(
+            _failure("inconclusive", {"validator.limits-invalid"}),
+            process_returncode,
+        )
 
     envelope, read_failure = _read_envelope(stream, selected_limits)
     if read_failure is not None:
-        return read_failure
+        return _apply_process_returncode_precedence(read_failure, process_returncode)
     if envelope is None:
-        return _failure("inconclusive", {"stream.envelope-unavailable"})
+        return _apply_process_returncode_precedence(
+            _failure("inconclusive", {"stream.envelope-unavailable"}),
+            process_returncode,
+        )
     evidence = _Evidence()
     if not _validate_envelope(envelope, evidence):
-        return _classify(evidence, None)
+        return _apply_process_returncode_precedence(
+            _classify(evidence, None), process_returncode
+        )
     if envelope.first is None or envelope.last is None:
-        return _failure("inconclusive", {"stream.envelope-unavailable"})
+        return _apply_process_returncode_precedence(
+            _failure("inconclusive", {"stream.envelope-unavailable"}),
+            process_returncode,
+        )
     _validate_init(
         envelope.first,
         expected_cwd=str(resolved_cwd),
@@ -831,7 +922,9 @@ def validate_claude_stream(
         contract=contract,
         evidence=evidence,
     )
-    return _classify(evidence, findings)
+    return _apply_process_returncode_precedence(
+        _classify(evidence, findings), process_returncode
+    )
 
 
 def validate_claude_stream_bytes(
@@ -840,6 +933,7 @@ def validate_claude_stream_bytes(
     expected_cwd: str | Path,
     requested_model: str,
     api_key_source: str,
+    process_returncode: object = None,
     limits: StreamLimits | None = None,
 ) -> dict[str, Any]:
     """Bytes convenience wrapper for callers that already captured bounded output."""
@@ -851,6 +945,7 @@ def validate_claude_stream_bytes(
         expected_cwd=expected_cwd,
         requested_model=requested_model,
         api_key_source=api_key_source,
+        process_returncode=process_returncode,
         limits=limits,
     )
 
@@ -879,6 +974,12 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         choices=("none", "ANTHROPIC_API_KEY"),
         help="Authentication source selected before launch",
+    )
+    parser.add_argument(
+        "--process-returncode",
+        required=True,
+        type=int,
+        help="Return code from the captured Claude Code child process",
     )
     parser.add_argument(
         "--input",
@@ -915,6 +1016,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_cwd=args.cwd,
             requested_model=args.model,
             api_key_source=args.api_key_source,
+            process_returncode=args.process_returncode,
         )
     finally:
         if close_stream:

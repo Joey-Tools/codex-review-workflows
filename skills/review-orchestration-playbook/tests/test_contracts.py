@@ -931,7 +931,6 @@ class RepositoryContractTest(unittest.TestCase):
             encoding="utf-8"
         )
         interface = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
-
         causal_anchors = [
             (
                 skill,
@@ -1128,6 +1127,10 @@ class RepositoryContractTest(unittest.TestCase):
             encoding="utf-8"
         )
         interface = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
+        delivery = (
+            _repository_policy_scope_root(REPO_ROOT, CI_PROFILE)
+            / "skills/change-delivery-workflow/SKILL.md"
+        ).read_text(encoding="utf-8")
 
         for content in (skill, readiness, probes, contracts, agents_policy, interface):
             self.assertIn("blocked-input", content)
@@ -1187,6 +1190,7 @@ class RepositoryContractTest(unittest.TestCase):
             egress,
             agents_policy,
             interface,
+            delivery,
         )
         for content in identity_documents:
             self.assertIn("github.com", content)
@@ -1201,18 +1205,95 @@ class RepositoryContractTest(unittest.TestCase):
             "Accept a review artifact only when request isolation is proved, its `commit_id` equals `headRefOid`",
             probes,
         )
-        self.assertIn(
-            "Accept a check/run only when request isolation is proved, its `head_sha` equals `headRefOid`",
-            probes,
-        )
         for anchor in (
             "server `created_at`",
-            "strictly later than the current request",
-            '`status == "completed"`',
-            '`conclusion == "success"`',
+            "strictly later",
             "Evidence from an earlier request on the same unchanged head is stale",
         ):
             self.assertIn(anchor, probes)
+        for anchor in (
+            "complete terminal provider-authored",
+            "findings payload",
+            "fully paginated associated inline review comment",
+            "terminal",
+            "issue-comment body",
+        ):
+            for content in (
+                skill,
+                readiness,
+                contracts,
+                templates,
+                egress,
+                agents_policy,
+                interface,
+                delivery,
+            ):
+                with self.subTest(payload_anchor=anchor):
+                    self.assertIn(anchor, content)
+        for content in (
+            skill,
+            readiness,
+            contracts,
+            templates,
+            egress,
+            agents_policy,
+            interface,
+            delivery,
+        ):
+            with self.subTest(payload_failure_contract=content[:40]):
+                lowered = content.lower()
+                self.assertIn("missing", lowered)
+                self.assertIn("ambiguous", lowered)
+                self.assertIn("triple-inconclusive", lowered)
+        if CI_PROFILE == "canonical":
+            for content in (
+                (REPO_ROOT / "README.md").read_text(encoding="utf-8"),
+                (
+                    REPO_ROOT
+                    / "docs/project_journal/2026/07/"
+                    / "2026-07-20-review-policy-migration-7f2001.md"
+                ).read_text(encoding="utf-8"),
+            ):
+                self.assertIn("complete terminal provider-authored", content)
+                self.assertIn("fully paginated associated inline", content)
+                self.assertRegex(
+                    content,
+                    r"terminal(?: exact-bot)? issue-comment body",
+                )
+
+        for content in (readiness, probes, contracts):
+            with self.subTest(check_only_document=content[:40]):
+                self.assertIn("service-start evidence only", content)
+                self.assertIn("never completes triple", content)
+                self.assertIn('status == "completed"', content)
+                self.assertIn('conclusion == "success"', content)
+                self.assertIn("same-App check may be unrelated", content)
+                self.assertIn("check success can coexist", content)
+        self.assertNotIn("Accept a check/run only when", probes)
+
+        for anchor in (
+            "'repos/<owner>/<repo>/pulls/<number>/reviews?per_page=100'",
+            "body}]'",
+            "'repos/<owner>/<repo>/pulls/<number>/reviews/<review_id>/comments?per_page=100'",
+            "pull_request_review_id",
+            "'repos/<owner>/<repo>/issues/<number>/comments?per_page=100'",
+            "COMMENTED",
+            "APPROVED",
+            "CHANGES_REQUESTED",
+            "never `PENDING`",
+        ):
+            self.assertIn(anchor, probes)
+        self.assertGreaterEqual(probes.count("--method GET --paginate --slurp"), 4)
+        self.assertIn(
+            "Do not use `gh pr view --repo` for this host-sensitive preflight",
+            probes,
+        )
+        host_bound_metadata_probe = (
+            "gh api --hostname <host> --method GET \\\n"
+            "  repos/<owner>/<repo>/pulls/<number>"
+        )
+        self.assertGreaterEqual(probes.count(host_bound_metadata_probe), 2)
+        self.assertNotIn("gh pr view <number> --repo <owner>/<repo>", probes)
         request_isolation_documents = {
             "skill": skill,
             "PR readiness": readiness,
@@ -1262,10 +1343,8 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertIn("older request", content)
                 self.assertIn("might overlap", content)
                 self.assertIn("triple-inconclusive", content)
-                self.assertRegex(
-                    content,
-                    r"both(?: its)? non-null `started_at` and `completed_at`(?: are| must be)? strictly later than",
-                )
+                self.assertIn("check/run", content)
+                self.assertIn("started_at", content)
                 self.assertIn(
                     "re-read complete authenticated request history immediately before",
                     content.lower(),
@@ -1280,10 +1359,7 @@ class RepositoryContractTest(unittest.TestCase):
             "Otherwise reuse the one recorded request and do not post another",
             templates,
         )
-        self.assertIn(
-            "both non-null `started_at` and `completed_at` are strictly later than the current request's `created_at`",
-            probes,
-        )
+        self.assertIn("non-null `started_at` strictly later than the request", probes)
         self.assertIn(
             "review/comment APIs expose no request/run identifier",
             readiness,
@@ -1396,7 +1472,9 @@ class RepositoryContractTest(unittest.TestCase):
             "identity in `{hoteng, hoteng_cisco}`",
             "`requested: triple`, `effective: double`",
             "Posting the comment requests the third lane but does not complete it",
-            "trustworthy terminal current-head result",
+            "complete terminal provider-authored current-head findings payload",
+            "service-start evidence only",
+            "never completes triple or proves clean/no-findings",
             "effective: triple-inconclusive",
             "GitHub lane status `blocked-authorization`",
         ):
@@ -1451,6 +1529,9 @@ class RepositoryContractTest(unittest.TestCase):
         module = (SCRIPTS / "review_runtime/named_claude_preflight.py").read_text(
             encoding="utf-8"
         )
+        provenance = (SCRIPTS / "review_runtime/claude_provenance.py").read_text(
+            encoding="utf-8"
+        )
 
         for content in (skill, contracts, canonical):
             for anchor in (
@@ -1474,6 +1555,17 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("double", content)
             self.assertIn("blocked", content)
             self.assertIn("triple", content)
+        for content in (skill, contracts):
+            for anchor in (
+                "Candidate presence is tri-state",
+                "stops priority fallback as `candidate-inspection-inconclusive`",
+                "descriptor-bound strong source identity",
+                "including `ctime`",
+                "private digest-verified executable snapshot",
+                "never against the mutable installation path",
+                "Source-identity drift is inconclusive and takes precedence over an observed wrong version",
+            ):
+                self.assertIn(anchor, content)
         for anchor in (
             "explicit absolute `--claude-path` override",
             "An explicit override is authoritative",
@@ -1486,8 +1578,8 @@ class RepositoryContractTest(unittest.TestCase):
             "effective shape may be double",
             "effective double is still incomplete and blocked",
             "Caller `PATH` entries are ignored",
-            "before any candidate execution",
-            "Only that publisher-verified artifact may receive the version probe",
+            "before any version probe",
+            "private digest-verified executable snapshot",
             "Scripts, interpreter wrappers, wrong signed artifacts, and caller-`PATH` candidates are never executed",
             "resolves the configured system temporary parent to its canonical path",
             "macOS `/tmp -> /private/tmp`",
@@ -1508,14 +1600,28 @@ class RepositoryContractTest(unittest.TestCase):
             '"exact-version-unavailable"',
             '"exact-version-mismatch"',
             "verify_claude_release(",
+            "materialize_verified_executable(",
+            "version_probe(snapshot.executable)",
+            '"ctime_ns"',
+            '"executable-identity-drift"',
             '"/opt/homebrew/bin/claude"',
             '"/usr/local/bin/claude"',
         ):
             self.assertIn(anchor, module)
+        self.assertIn("source_identity", provenance)
+        self.assertIn("_stat_identity(opened_before)", provenance)
+        self.assertIn("_require_verified_source_identity", provenance)
+        self.assertNotIn("version_probe(resolved)", module)
         self.assertNotIn("shutil.which", module)
         self.assertLess(
-            module.index("verified = verifier(resolved)"),
-            module.index("completed = version_probe"),
+            module.index("verified = verifier(resolved, version_probe)"),
+            module.index("completed = verified.probe_result"),
+        )
+        self.assertLess(
+            module.index(
+                "if after_resolved != resolved or after_identity != verified.identity:"
+            ),
+            module.index("if observed_version != REQUIRED_CLAUDE_VERSION:"),
         )
 
     def test_canonical_claude_stream_evidence_is_unique_exact_and_fail_closed(
@@ -1533,6 +1639,11 @@ class RepositoryContractTest(unittest.TestCase):
         )
         validator_path = SCRIPTS / "validate_claude_stream.py"
         validator = validator_path.read_text(encoding="utf-8")
+        stream_schema = json.loads(
+            (SKILL_ROOT / "references/claude-2.1.212-stream-schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
 
         for anchor in (
             "## Structured Init And Terminal Evidence",
@@ -1573,6 +1684,13 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("exactly one leading `system/init`", content)
             self.assertIn("one trailing terminal `result`", content)
             self.assertIn("fail closed", content.lower())
+        for content in (skill, contracts):
+            self.assertIn("--process-returncode <child-returncode>", content)
+            self.assertIn("optional nonempty `session_id`", content)
+            self.assertIn("unknown init field", content)
+            self.assertIn("missing, invalid, or nonzero child return code", content)
+            self.assertIn("structured `blocked` or `blocked-authentication`", content)
+            self.assertIn("bare exit code", content)
         for content in (skill, contracts, canonical):
             self.assertIn("validate_claude_stream.py", content)
             self.assertIn("classification: accepted", content)
@@ -1595,8 +1713,43 @@ class RepositoryContractTest(unittest.TestCase):
             '"blocked": 1',
             '"blocked-authentication": 2',
             '"inconclusive": 3',
+            '"--process-returncode"',
+            '"process.returncode.invalid"',
+            '"process.returncode.nonzero"',
+            '"init.unknown-field"',
+            "INIT_OPTIONAL_FIELDS",
         ):
             self.assertIn(anchor, validator)
+        init_contract = stream_schema["init_event"]
+        self.assertEqual(
+            stream_schema["process_returncode"],
+            {
+                "rule": "exact_int",
+                "missing_or_invalid": {
+                    "classification": "inconclusive",
+                    "reason": "process.returncode.invalid",
+                },
+                "accepted_requires": 0,
+                "nonzero_precedence": {
+                    "accepted": {
+                        "classification": "inconclusive",
+                        "reason": "process.returncode.nonzero",
+                    },
+                    "blocked": "preserve",
+                    "blocked-authentication": "preserve",
+                    "inconclusive": {
+                        "classification": "inconclusive",
+                        "append_reason": "process.returncode.nonzero",
+                    },
+                },
+            },
+        )
+        self.assertFalse(init_contract["additional_fields"])
+        self.assertEqual(init_contract["optional_fields"], ["session_id"])
+        self.assertEqual(
+            init_contract["optional_field_contracts"]["session_id"],
+            {"rule": "nonempty_string", "failure": "inconclusive"},
+        )
         self.assertNotIn("when the runtime reports it", canonical)
 
     def test_canonical_claude_structured_errors_have_one_failure_classifier(
@@ -1689,7 +1842,12 @@ class RepositoryContractTest(unittest.TestCase):
             schema["stream_contract"]["max_float_explicit_exponent_magnitude"], 308
         )
         init_contract = schema["init_event"]
-        self.assertEqual(init_contract["additional_fields"], True)
+        self.assertFalse(init_contract["additional_fields"])
+        self.assertEqual(init_contract["optional_fields"], ["session_id"])
+        self.assertEqual(
+            init_contract["optional_field_contracts"]["session_id"],
+            {"rule": "nonempty_string", "failure": "inconclusive"},
+        )
         self.assertEqual(
             set(init_contract["required_fields"]),
             {
@@ -2426,7 +2584,12 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertIn("whole-PR coverage", content)
 
         self.assertIn("base_sha:.base.sha", probes)
-        self.assertIn("--json number,url,baseRefName,baseRefOid,headRefOid", probes)
+        self.assertIn(
+            "--jq '{number,url:.html_url,baseRefName:.base.ref,baseRefOid:.base.sha,headRefOid:.head.sha}'",
+            probes,
+        )
+        self.assertIn("gh api --hostname <host> --method GET", probes)
+        self.assertNotIn("gh pr view <number> --repo <owner>/<repo>", probes)
         self.assertIn("exactly one full merge-base result", probes)
         self.assertIn("head_sha == pr_head_oid", probes)
         self.assertIn("base_sha != pr_merge_base", probes)
