@@ -7,7 +7,7 @@
 
 ## Recovery Pointers
 
-- Latest workstream: `docs/project_journal/2026/07/2026-07-19-real-home-read-only-claude-c63d11.md`
+- Latest workstream: `docs/project_journal/2026/07/2026-07-20-review-policy-migration-7f2001.md`
 
 ## Global Blockers
 

@@ -12,6 +12,12 @@ superseded_by: 20260717-c17a11
 
 # Claude CLI Platform Capabilities
 
+> Historical helper record: `20260717-c17a11`, then `20260720-7f2001`,
+> superseded this workstream. The implementation details below describe the
+> low-level `isolated_review` helper at that point in time. They do not define
+> named single, double, or triple review and do not apply to the canonical
+> direct Claude lane.
+
 ## Summary
 
 - The user asked to remove the operational friction caused by pinning the review
@@ -27,7 +33,7 @@ superseded_by: 20260717-c17a11
   receive review data and credentials from wrapper/script rejection. Native
   file format and platform compatibility are not publisher identity.
 
-## Current State
+## Historical Helper State
 
 - The runtime trust contract is recorded in
   `skills/review-orchestration-playbook/references/claude-runtime-trust.md` and

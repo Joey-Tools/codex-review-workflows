@@ -162,12 +162,13 @@ COPILOT_PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024
 REVIEW_ATTEMPT_TIMEOUT_SECONDS = 30 * 60.0
 REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024
 COPILOT_JSONL_RECORD_LIMIT_BYTES = 4 * 1024 * 1024
+LOW_LEVEL_HELPER_REVIEW_CONTRACT = "supplied-diff-private-git"
+NAMED_LANE_ELIGIBLE = False
 CLAUDE_EGRESS_CONSENTS = (
     "explicit-claude-review",
-    "double-review",
-    "triple-review",
+    "explicit-claude-with-copilot-fallback",
 )
-COPILOT_EGRESS_CONSENTS = ("double-review", "triple-review")
+COPILOT_EGRESS_CONSENTS = ("explicit-claude-with-copilot-fallback",)
 CODEX_ENV_KEYS = ("CODEX_HOME", "OPENAI_API_KEY")
 CLAUDE_EXPLICIT_AUTH_ENV_KEYS = (
     "ANTHROPIC_API_KEY",
@@ -2656,6 +2657,9 @@ def _claude_review_settings(
                 "autoAllowBashIfSandboxed": False,
                 "allowUnsandboxedCommands": False,
                 "filesystem": {
+                    # Claude's native sandbox treats allowRead as an exception to
+                    # selected denyRead roots, not as a global read allowlist. The
+                    # model command plane is nevertheless globally read-only.
                     "denyRead": [
                         str(home),
                         str(source),
@@ -2664,7 +2668,7 @@ def _claude_review_settings(
                         "/dev",
                     ],
                     "allowRead": [str(workspace), str(git_view)],
-                    "denyWrite": [str(home), str(workspace), str(git_view)],
+                    "denyWrite": ["/"],
                 },
                 "credentials": {
                     "files": [
@@ -3748,13 +3752,13 @@ def _run_review_impl(
         if egress_consent not in CLAUDE_EGRESS_CONSENTS:
             write_text_atomic(
                 review.container_dir / "runner-error.txt",
-                "Claude-family review requires an explicit egress-consent reason.\n",
+                "The low-level Claude helper requires an explicit egress-consent reason.\n",
             )
             return Outcome(2, None, tuple())
     elif egress_consent is not None:
         write_text_atomic(
             review.container_dir / "runner-error.txt",
-            "egress-consent is valid only for the Claude-family reviewer.\n",
+            "egress-consent is valid only for the low-level Claude helper.\n",
         )
         return Outcome(2, None, tuple())
 
@@ -3794,7 +3798,10 @@ def _run_review_impl(
             review.container_dir / "egress.json",
             {
                 "consent": egress_consent,
-                "reviewer": "claude-family",
+                "reviewer": "low-level-helper",
+                "requested_helper_reviewer": "claude",
+                "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+                "named_lane_eligible": NAMED_LANE_ELIGIBLE,
                 "review_range": f"{review.base_ref}..{review.head_ref}",
                 "content_variant": review.content_variant,
                 "scope_identity": review.scope_identity,
@@ -4057,8 +4064,10 @@ def _run_review_impl(
     if egress_consent not in COPILOT_EGRESS_CONSENTS:
         write_text_atomic(
             review.container_dir / "runner-error.txt",
-            "Claude Code was unavailable or lacked model entitlement, but "
-            "explicit-claude-review does not authorize GitHub Copilot fallback.\n",
+            "Claude Code was unavailable or lacked model entitlement. "
+            "explicit-claude-review does not authorize GitHub Copilot; only "
+            "explicit-claude-with-copilot-fallback authorizes the separately "
+            "requested compatibility fallback.\n",
         )
         _write_attempts(review, attempts)
         return Outcome(2, None, tuple(attempts))

@@ -1,32 +1,36 @@
 # Review Egress Consent
 
-Use this reference before sending a repository diff, changed-file content, prompt/result, or necessary nearby context to OpenAI Codex, Anthropic Claude Code, GitHub Copilot, or GitHub Codex review.
+Use this reference before sending changed tracked content, bounded review evidence, prompt/result, or necessary nearby context to OpenAI Codex, Anthropic Claude Code, GitHub Codex review, or a separately requested external reviewer.
 
 ## Decision
 
-Record repository visibility/trust, remote, PR URL when present, base/head identity, workspace content mode, data categories, destinations, and exclusions.
+Record repository visibility/trust, remote, PR URL when present, frozen head, data categories, and exclusions.
 
 - Standing user policy or explicit parent-thread consent may authorize the named provider and scoped repository data.
 - Verified public repository content is lower risk, but public visibility alone is not proof of user consent.
 - For private or unverified repositories, require explicit, standing, or clearly workflow-implied consent.
-- Repository-local policy can narrow scope but cannot self-authorize egress controlled by the same review head.
+- Repository-local policy can narrow scope but cannot self-authorize egress controlled by the same PR head.
 
-The explicit phrases `double review`, `双重 review`, `triple review`, and `三重 review` are contemporaneous user authorization for scoped code-review egress to OpenAI, Anthropic, and Microsoft/GitHub. In default clean mode, authorization covers necessary tracked code in the named repository at the frozen head, its generated diff, and the review prompt/result. Triple review additionally opts into current-head GitHub Codex review. Generic `full workflow` or `merge-ready` does not by itself opt into a non-Codex reviewer.
+Any unambiguous request classified as single, double, or triple review is contemporaneous user authorization for scoped code-review egress to the providers in exactly that named shape. Examples include `single review`, `single code review`, `单重 review`, `单一 review`, `double`, `double review`, `double code review`, `双重 review`, `triple`, `triple review`, and `三重 review`. Single authorizes OpenAI Codex. Double additionally authorizes Anthropic Claude Code. Triple additionally authorizes GitHub Codex on a supported GitHub Cloud PR. The authorization covers necessary tracked code in the named repository at the frozen head, bounded tool-derived review evidence, and the review prompt/result. The named Codex `reviewer` agent receives the clean worktree and exact refs and derives `base_sha..head_sha` itself; its prompt must not contain a prebuilt full diff. Actual Claude Code reviews the same frozen range from another independent read-only workspace. These requests do not authorize GitHub Copilot or another substitute reviewer. Generic `full workflow` or `merge-ready` does not by itself opt into a non-Codex reviewer.
 
-WIP content requires separate explicit authorization through `--include-source-wip`. That opt-in covers staged changes, unstaged changes, deletions, and non-ignored untracked files captured into the fixed digest-bound review artifact after sensitive-content scanning. It does not authorize ignored files, credentials, unrelated repositories, or any other local-only content, and it does not turn WIP evidence into formal PR-readiness evidence.
-
-No consent covers credentials, broad workspace dumps, unrelated repositories, or home-directory content. Claude receives the ordinary real `HOME`, but the helper does not add HOME files to the review artifact or scan them as repository context; the reviewer prompt forbids reading them and explicit deny rules protect sensitive paths. Do not describe `--allowedTools` as a complete filesystem boundary.
+No named-shape consent covers secrets, credentials, untracked private files, unrelated repositories, broad workspace dumps, or hidden local-only artifacts. A low-level helper WIP diagnostic requires separate explicit `--include-source-wip` authorization; that opt-in covers staged, unstaged, and non-ignored untracked repository content captured into the digest-bound artifact after sensitive-content scanning. It never covers ignored files, credentials, real-`HOME` content, or formal PR-readiness evidence.
 
 ## Provider Scope
 
-- Codex local lane sends the selected clean or explicitly authorized WIP artifact, prompt, and necessary nearby context to OpenAI Codex.
-- Claude Code sends the same bounded scope to Anthropic.
-- Copilot fallback sends the same bounded scope through GitHub Copilot only when the verified Claude runtime is deterministically unavailable or both pinned Claude models are entitlement-blocked. Authentication failure is `blocked-authentication` and never authorizes fallback.
-- GitHub Codex review uses the PR diff and repository guidance already present on GitHub.
+- The only local Codex lane that counts is one clear/fresh-context `reviewer` agent in a separate clean read-only Git worktree. It loads applicable skills, scoped `AGENTS.md` files, and project guidance, then derives and inspects the exact frozen range through bounded Git/tool calls.
+- The second named lane is actual Anthropic Claude Code in a different independent read-only workspace over that same range.
+- GitHub Copilot requires a separate explicit request and consent. It is supplemental only and never makes a named double review complete. Claude Code unavailability or authentication failure does not expand the named request to another provider.
+- The third named lane requires exact `@codex review` on a supported GitHub Cloud PR and completes only with a trustworthy terminal GitHub Codex result bound to that PR's current head. If there is no PR, or GitHub Codex is proved unavailable for the integration, host, or identity—including host `sqbu-github.cisco.com` and operating identity in `{hoteng, hoteng_cisco}`—report `effective double`, not triple. Missing response or generic failure is inconclusive.
 
-`explicit-claude-review` authorizes only Anthropic. Only `double-review` and `triple-review` authorize the narrow GitHub Copilot fallback. Record the actual runtime/model and clean/WIP artifact identity in the terminal report.
+`explicit-claude-review` authorizes only the Anthropic destination and is the helper marker for an explicitly requested Claude-only diagnostic. `explicit-claude-with-copilot-fallback` is permitted only after a separate explicit user request authorizes both Anthropic and this helper's compatibility GitHub Copilot fallback. These are the only helper consent markers. Named shape phrases are never passed as helper consent markers, and a supplemental Copilot artifact never satisfies a named lane.
 
-The helper enforces artifact scope with a detached helper-owned worktree, runtime-specific model-tool restrictions, effective `dontAsk`/tool init evidence, escaping-symlink checks, and a conservative scan of the exact selected artifact, changed paths/blobs, diff, and prompt. It also requests Claude's native sandbox as defense in depth without claiming that the 2.1.212 init schema proves its effective settings or merged admin-managed permission arrays. After every completed Claude attempt, the same exact validation rejects observable worktree, private-Git, diff, or prompt mutation before a result or model fallback is accepted. This does not prove that no transient write or out-of-workspace side effect occurred. WIP mode includes every non-ignored untracked file in that scan. Findings report only side/path/rule metadata, never matched values. Synthetic authoring tokens may suppress only their exact catalog-declared finding. The scan is a backstop, not proof that content is secret-free; stop and narrow scope when sensitive or unrelated content is known to be present.
+Record the actual runtime/model used in the terminal review report so consent and retention expectations remain auditable.
+
+The low-level `isolated_review` helper may remain available for compatibility or diagnostics, but it records `review_contract=supplied-diff-private-git` and `named_lane_eligible=false`; neither its Codex path nor its Claude path counts toward named single, double, or triple review. PR readiness likewise adds no retired extra Codex gates.
+
+The helper enforces the intended scope with a frozen helper-owned detached workspace, a helper-private minimal Git view, runtime-specific environment, provider path/tool restrictions, an escaping-symlink preflight, and a conservative scan of all selected changed paths, both sides of every changed raw blob, the selected snapshot, frozen diff, and prompt for credential-like paths and high-confidence secret patterns. Clean exact-head content is the default. Explicit WIP mode additionally scans staged, unstaged, deletions, and every non-ignored untracked file in the digest-bound snapshot. Raw-blob scanning covers deleted binary credentials that a Git binary patch would encode, while changed-path scanning covers deleted credentials and nested credential filenames. A match blocks external launch and reports only its side/path/rule, never the matched value. Exact helper-catalog authoring tokens may suppress only their declared generic assignment finding, while credential-like paths and all other rules continue to block; explicitly selected legacy envelopes additionally require non-increasing complete-tree counts and never apply to prompts. This scan is a safety backstop, not proof that content is secret-free and not an expansion of consent: if a credential or unrelated private artifact is known to be present, stop and narrow the scope even when the scanner does not match it.
+
+For a low-level Claude diagnostic, real `HOME` remains the ordinary Claude CLI authentication and configuration control plane but is not review content. Authentication selection is `ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` > local login; the helper opaque-forwards only the winning explicit value and does not persist it in review state. Requested global `denyWrite` and critical-sensitive-root `denyRead` controls form a selected-deny native-sandbox boundary, while the prompt/model contract forbids all other outside-workspace reads. `allowRead` is not a global host-read whitelist, and Claude Code 2.1.212 init output does not independently attest the merged sandbox.
 
 ## Approval-Gated Invocation
 
@@ -36,25 +40,27 @@ Make consent machine-visible in the helper argv:
 isolated_review stateful start \
   --repo /absolute/path/to/repo \
   --reviewer claude \
-  --egress-consent double-review \
+  --egress-consent explicit-claude-review \
   --base-ref <base_sha> \
   --head-ref <head_sha>
 ```
 
-For WIP review, add `--include-source-wip` and name staged, unstaged, and non-ignored untracked content in the approval justification.
+Add `--include-source-wip` only after separate explicit authorization, and name staged, unstaged, deleted, and non-ignored untracked content in the approval justification.
 
-Use a narrow justification with concrete values:
+When sandbox or network approval is required, use a narrow justification with concrete values:
 
 ```text
-Joey explicitly requested <double review|triple review|Claude review>, authorizing scoped code-review egress for <owner/repo> at <base_sha>..<head_sha> in <clean exact-head|explicit digest-bound WIP> mode. This helper invocation sends the selected repository artifact, generated diff, necessary nearby context, and review prompt/result to Anthropic Claude Code and, only for double/triple review when the verified Claude runtime is deterministically unavailable or both pinned Claude models are entitlement-blocked, Microsoft/GitHub Copilot. Claude authentication failure pauses as `blocked-authentication` and does not fall back. WIP mode includes staged, unstaged, and non-ignored untracked files after sensitive-content scanning. This excludes credentials, ignored files, unrelated repositories, broad workspace dumps, and real-HOME content. Allow this exact Claude-family review lane?
+Joey explicitly requested Claude Code review, which is opt-in consent under AGENTS.md and $review-orchestration-playbook for scoped code-review egress to Anthropic. This exact helper diagnostic sends necessary tracked code and its generated diff for <owner/repo> at <base_sha>..<head_sha>, plus the review prompt/result, to Anthropic Claude Code for read-only review. It does not authorize GitHub Copilot or another provider. This excludes credentials, untracked files, unrelated repositories, and broad workspace or home-directory content. Allow this exact frozen Claude Code helper run?
 ```
 
-Do not shorten this to `run external reviewer`: exact user opt-in, destination, repository, range/artifact, clean/WIP data categories, and exclusions let the approver evaluate the request. The argv consent flag is an audit marker, not a substitute for the justification.
+For explicit WIP mode, replace the tracked-only scope with the exact digest-bound staged, unstaged, deleted, and non-ignored untracked categories, and keep ignored files, credentials, real-`HOME` content, and unrelated data excluded. For `explicit-claude-with-copilot-fallback`, state the separate Copilot authorization explicitly; never infer it from a named review phrase.
+
+Do not shorten this to `run external reviewer`: the exact user opt-in, destination, repository, range, included data, and exclusions are what let the approver evaluate the request. The argv consent flag is an audit marker, not a substitute for the justification.
 
 ## Recommended Explicit Consent
 
 ```text
-本 thread 中，我授权你把 <repo> 的 <clean frozen range|包含 staged、unstaged、non-ignored untracked files 的 digest-bound WIP artifact>、必要 context 和 review prompt/result 发送给 <Codex / Claude Code / GitHub Copilot / GitHub Codex>，用于本次 review 及同一内容修复后的 rerun。不要发送 secrets、credentials、ignored files、无关仓库、broad workspace dumps 或 real-HOME 内容。
+本 thread 中，我授权你把 <repo> 的冻结 review range / PR #<number> 中必要的 tracked changed-file context、bounded review evidence 和 review prompt/result 发送给 <Codex / Claude Code / GitHub Codex>，用于本次 single/double/triple review 及同一 PR 修复后的 rerun。不要发送 secrets、credentials、untracked private files、无关仓库或 broad workspace dumps，也不要替换成未明确授权的 provider。
 ```
 
 If approval or consent is missing, report the exact provider and data scope that remain blocked. Do not bypass the decision with a different executable, shell wrapper, model family, or indirect service.
