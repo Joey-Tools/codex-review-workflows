@@ -5811,12 +5811,19 @@ def _acquire_claude_forwarded_signal_mask(
     signal_mask_owner: _ClaudeSignalMaskOwner | None = None,
 ) -> _ClaudeSignalMaskAcquisition:
     if (
+        main_thread_only
+        and threading.current_thread() is not threading.main_thread()
+    ):
+        return _ClaudeSignalMaskAcquisition(
+            previous_mask=None,
+            error=ClaudeCredentialInspectionInconclusive(
+                "cannot establish the Claude forwarded-signal handoff outside "
+                "the main thread"
+            ),
+        )
+    if (
         os.name != "posix"
         or not hasattr(signal, "pthread_sigmask")
-        or (
-            main_thread_only
-            and threading.current_thread() is not threading.main_thread()
-        )
     ):
         return _ClaudeSignalMaskAcquisition(previous_mask=None, error=None)
 
@@ -5861,13 +5868,17 @@ def _acquire_claude_forwarded_signal_mask(
 def block_forwarded_signals(
     *,
     signal_mask_owner: _ClaudeSignalMaskOwner | None = None,
-) -> set[signal.Signals] | None:
+) -> set[signal.Signals]:
     acquisition = _acquire_claude_forwarded_signal_mask(
         main_thread_only=True,
         signal_mask_owner=signal_mask_owner,
     )
     if acquisition.error is not None:
         raise acquisition.error
+    if acquisition.previous_mask is None:
+        raise ClaudeCredentialInspectionInconclusive(
+            "cannot establish the Claude forwarded-signal handoff on this platform"
+        )
     return acquisition.previous_mask
 
 

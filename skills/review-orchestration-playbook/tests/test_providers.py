@@ -3235,6 +3235,115 @@ class ProviderPolicyTest(unittest.TestCase):
             ],
         )
 
+    def test_claude_terminal_signal_mask_fails_closed_off_main_thread(
+        self,
+    ) -> None:
+        signal_mask_owner = providers._ClaudeSignalMaskOwner()
+        captured_errors: list[BaseException] = []
+
+        def block_in_worker() -> None:
+            try:
+                providers.block_forwarded_signals(
+                    signal_mask_owner=signal_mask_owner,
+                )
+            except BaseException as error:
+                captured_errors.append(error)
+
+        with (
+            mock.patch.object(providers.os, "name", "posix"),
+            mock.patch.object(
+                providers.signal,
+                "pthread_sigmask",
+                create=True,
+            ) as pthread_sigmask,
+        ):
+            worker = threading.Thread(target=block_in_worker)
+            worker.start()
+            worker.join(timeout=5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(captured_errors), 1)
+        self.assertIsInstance(
+            captured_errors[0],
+            providers.ClaudeCredentialInspectionInconclusive,
+        )
+        self.assertIn("main thread", str(captured_errors[0]))
+        self.assertFalse(signal_mask_owner.signal_mask_owner_active)
+        pthread_sigmask.assert_not_called()
+
+    def test_claude_terminal_signal_mask_fails_closed_without_platform_mask(
+        self,
+    ) -> None:
+        signal_mask_owner = providers._ClaudeSignalMaskOwner()
+
+        with (
+            mock.patch.object(providers.os, "name", "nt"),
+            mock.patch.object(
+                providers.signal,
+                "pthread_sigmask",
+                create=True,
+            ) as pthread_sigmask,
+            self.assertRaises(
+                providers.ClaudeCredentialInspectionInconclusive
+            ) as raised,
+        ):
+            providers.block_forwarded_signals(
+                signal_mask_owner=signal_mask_owner,
+            )
+
+        self.assertIn("on this platform", str(raised.exception))
+        self.assertFalse(signal_mask_owner.signal_mask_owner_active)
+        pthread_sigmask.assert_not_called()
+
+    def test_claude_macos_terminal_handoff_abandons_off_main_thread(
+        self,
+    ) -> None:
+        handoff = providers._ClaudeMacOSTerminalHandoff()
+        lease = mock.Mock(spec=["abandon"])
+        cleanup = claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+            "fixture off-main handoff retained the refresh lock"
+        )
+        lease.abandon.return_value = cleanup
+        captured_errors: list[BaseException] = []
+
+        def begin_in_worker() -> None:
+            try:
+                providers._begin_claude_macos_terminal_handoff(
+                    self.review,
+                    lease,
+                    None,
+                    handoff,
+                )
+            except BaseException as error:
+                captured_errors.append(error)
+
+        with (
+            mock.patch.object(providers.os, "name", "posix"),
+            mock.patch.object(
+                providers.signal,
+                "pthread_sigmask",
+                create=True,
+            ) as pthread_sigmask,
+        ):
+            worker = threading.Thread(target=begin_in_worker)
+            worker.start()
+            worker.join(timeout=5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(captured_errors), 1)
+        self.assertIsInstance(
+            captured_errors[0],
+            providers.ClaudeCredentialInspectionInconclusive,
+        )
+        self.assertIs(handoff.recovery_source, captured_errors[0])
+        self.assertTrue(handoff.abandonment_attempted)
+        self.assertFalse(handoff.signal_mask_owner_active)
+        lease.abandon.assert_called_once_with(
+            "Claude refresh transaction terminal signal handoff could not be "
+            "established"
+        )
+        pthread_sigmask.assert_not_called()
+
     def test_claude_thread_mask_acquisition_call_result_restores_owner(
         self,
     ) -> None:
@@ -26434,6 +26543,15 @@ class ProviderPolicyTest(unittest.TestCase):
             self.assertIsNotNone(coordinated_refresh_lock)
             return True
 
+        def block_signals(
+            *,
+            signal_mask_owner: providers._ClaudeSignalMaskOwner | None = None,
+        ) -> set[signal.Signals]:
+            previous_mask: set[signal.Signals] = set()
+            if signal_mask_owner is not None:
+                signal_mask_owner.publish_previous_signal_mask(previous_mask)
+            return previous_mask
+
         def run_runtime(*, wait_for_release: bool) -> None:
             try:
                 with self.claude_keychain_runtime(
@@ -26472,6 +26590,12 @@ class ProviderPolicyTest(unittest.TestCase):
                 "_claude_macos_carrier_snapshot_is_current",
                 side_effect=snapshot_is_current,
             ),
+            mock.patch.object(
+                providers,
+                "block_forwarded_signals",
+                side_effect=block_signals,
+            ),
+            mock.patch.object(providers, "restore_signal_mask"),
         ):
             first = threading.Thread(
                 target=run_runtime,
