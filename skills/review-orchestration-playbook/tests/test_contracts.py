@@ -135,8 +135,11 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("本次改动目标就是跨版本兼容性", skill)
         self.assertIn("才扩成本地多版本验证", skill)
         self.assertIn("确需对同一 runtime/toolchain 本地验证多个版本时", skill)
-        self.assertIn("必须串行执行", skill)
+        self.assertIn("只有 suite 已证明顺序复用安全时", skill)
+        self.assertIn("才可在同一 checkout 串行执行", skill)
+        self.assertIn("版本敏感的产物、缓存或可变状态", skill)
         self.assertIn("独立 worktree/cache/state", skill)
+        self.assertIn("或在版本间显式清理并重建", skill)
         self.assertIn("只有 suite 已证明隔离时才可在同一 checkout 并发", skill)
 
     def test_cleanup_only_legacy_0664_lock_migration_is_private_and_ordered(

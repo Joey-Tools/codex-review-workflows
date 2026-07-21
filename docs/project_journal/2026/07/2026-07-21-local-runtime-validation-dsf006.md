@@ -15,7 +15,7 @@ superseded_by:
 ## Summary
 
 - Resolved one deterministic version per required local runtime or toolchain instead of expanding minimum-version or CI declarations into a local matrix.
-- Required serial execution or isolated mutable state when a necessary multi-version suite cannot prove same-checkout concurrency is safe.
+- Allowed same-checkout serial reuse only when it is proven safe; otherwise version-sensitive state must be isolated or explicitly cleaned and rebuilt.
 
 ## Current State
 
@@ -24,7 +24,7 @@ superseded_by:
 - Each selected toolchain version stays fixed for the validation pass and is recorded in the evidence.
 - Minimum supported versions and CI matrices do not imply an unrequested local runtime matrix.
 - Cross-version compatibility changes may still validate multiple runtimes locally.
-- Multi-version validation that shares checkout output, caches, fixed ports, or mutable state runs serially or with isolated worktrees, caches, and state.
+- Multi-version validation uses same-checkout serial reuse only when the suite proves it safe. Version-sensitive checkout output, caches, and mutable state use isolated worktrees, caches, and state, or are explicitly cleaned and rebuilt between versions.
 
 ## Next Steps
 
@@ -37,5 +37,5 @@ superseded_by:
 - A repository contract test preserves the per-toolchain version resolution order, matrix scope, and isolation requirements.
 - `uv run --isolated --with pyyaml python3 .../quick_validate.py skills/change-delivery-workflow` passed.
 - `project_journal.py validate --repo ...` passed.
-- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -q` passed 1,062 tests with 4 skips under the single resolved Python 3.13.0 runtime; loopback-binding tests ran outside the sandbox.
+- `python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -q` passed 1,056 tests with 4 skips under the single resolved Python 3.13.0 runtime; loopback-binding tests ran outside the sandbox.
 - `git diff --check` passed.
