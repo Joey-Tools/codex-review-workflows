@@ -30,6 +30,9 @@ from review_supervisor.codex_executable import (
 from review_supervisor import no_child_profile as profile
 
 
+REQUIRE_LIVE_NO_CHILD_PROFILE_ENV = "CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE"
+
+
 def _sha256(path: pathlib.Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -269,6 +272,56 @@ def _synthetic_compatible_observations(
 
 
 class NoChildProfileUnitTests(unittest.TestCase):
+    def test_required_live_ci_fails_closed_on_runtime_pin_mismatch(self) -> None:
+        runtime = profile.RuntimeFingerprint(
+            platform="darwin",
+            system="Darwin",
+            macos_product_version="99.0",
+            macos_build_version="99Z999",
+            darwin_release="99.0.0",
+            python_version=(3, 13, 0),
+            python_executable="/synthetic/python3.13",
+            effective_uid=501,
+        )
+        with (
+            mock.patch.object(profile, "_runtime_fingerprint", return_value=runtime),
+            mock.patch.dict(
+                os.environ,
+                {REQUIRE_LIVE_NO_CHILD_PROFILE_ENV: "1"},
+                clear=False,
+            ),
+            self.assertRaisesRegex(
+                AssertionError,
+                "required live no-child profile check cannot skip",
+            ),
+        ):
+            NoChildProfileDarwinIntegrationTests.setUpClass()
+
+    def test_unrequired_runtime_pin_mismatch_remains_skippable(self) -> None:
+        runtime = profile.RuntimeFingerprint(
+            platform="darwin",
+            system="Darwin",
+            macos_product_version="99.0",
+            macos_build_version="99Z999",
+            darwin_release="99.0.0",
+            python_version=(3, 13, 0),
+            python_executable="/synthetic/python3.13",
+            effective_uid=501,
+        )
+        with (
+            mock.patch.object(profile, "_runtime_fingerprint", return_value=runtime),
+            mock.patch.dict(
+                os.environ,
+                {REQUIRE_LIVE_NO_CHILD_PROFILE_ENV: ""},
+                clear=False,
+            ),
+            self.assertRaisesRegex(
+                unittest.SkipTest,
+                "live no-child profile checks require the exact pinned",
+            ),
+        ):
+            NoChildProfileDarwinIntegrationTests.setUpClass()
+
     def test_preexec_order_establishes_leader_before_zeroing_nproc(self) -> None:
         events: list[str] = []
         process_groups = iter((99, 123))
@@ -836,30 +889,40 @@ class NoChildProfileUnitTests(unittest.TestCase):
         )
 
 
-@unittest.skipUnless(
-    sys.platform == "darwin" and sys.version_info[:2] == (3, 13),
-    "Darwin with Python 3.13 is required",
-)
 class NoChildProfileDarwinIntegrationTests(unittest.TestCase):
+    @classmethod
+    def _skip_or_fail(cls, message: str) -> None:
+        if os.environ.get(REQUIRE_LIVE_NO_CHILD_PROFILE_ENV) == "1":
+            raise AssertionError(
+                f"required live no-child profile check cannot skip: {message}"
+            )
+        raise unittest.SkipTest(message)
+
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
         runtime = profile._runtime_fingerprint()
         pin = profile.PINNED_RUNTIME
         observed_runtime = (
+            runtime.platform,
+            runtime.python_version[:2],
             runtime.macos_product_version,
             runtime.macos_build_version,
             runtime.darwin_release,
         )
         pinned_runtime = (
+            "darwin",
+            (pin.python_major, pin.python_minor),
             pin.macos_product_version,
             pin.macos_build_version,
             pin.darwin_release,
         )
         if observed_runtime != pinned_runtime:
-            raise unittest.SkipTest(
-                "live no-child profile checks require the exact pinned macOS runtime"
+            message = (
+                "live no-child profile checks require the exact pinned macOS runtime: "
+                f"observed={observed_runtime!r}, pinned={pinned_runtime!r}"
             )
+            cls._skip_or_fail(message)
         cls._parent_limit_before = resource.getrlimit(resource.RLIMIT_NPROC)
         test_root = pathlib.Path(__file__).resolve().parent
         cls._temporary = tempfile.TemporaryDirectory(
@@ -957,7 +1020,7 @@ class NoChildProfileDarwinIntegrationTests(unittest.TestCase):
 
     def test_rlimit_zero_denies_every_creation_api_and_spares_parent(self) -> None:
         if self.evidence.parent_nproc_before is None:
-            self.skipTest("runtime pin did not admit the Darwin probe")
+            self._skip_or_fail("runtime pin did not admit the Darwin probe")
         self.assertEqual(
             self.evidence.parent_nproc_before,
             self._parent_limit_before,
@@ -1001,7 +1064,9 @@ class NoChildProfileDarwinIntegrationTests(unittest.TestCase):
         assert baseline is not None
         if baseline.outcome == "ambiguous" and "sandbox_apply" in baseline.detail:
             self.assertFalse(self.evidence.compatible)
-            self.skipTest("outer sandbox blocks nested Seatbelt; fail-closed verified")
+            self._skip_or_fail(
+                "outer sandbox blocks nested Seatbelt; fail-closed verified"
+            )
         self.assertEqual(baseline.outcome, "observed")
 
         for action in (
@@ -1047,7 +1112,9 @@ class NoChildProfileDarwinIntegrationTests(unittest.TestCase):
     ) -> None:
         baseline = self.evidence.observation("seatbelt", "baseline")
         if baseline is None or baseline.outcome != "observed":
-            self.skipTest("nested Seatbelt profile is unavailable in this host context")
+            self._skip_or_fail(
+                "nested Seatbelt profile is unavailable in this host context"
+            )
 
         test_root = pathlib.Path(__file__).resolve().parent
         with tempfile.TemporaryDirectory(
@@ -1196,7 +1263,7 @@ class NoChildProfileDarwinIntegrationTests(unittest.TestCase):
             )
         except profile.NoChildProfileUnavailable as error:
             if "seatbelt-baseline-not-observed" in error.evidence.blockers:
-                self.skipTest(
+                self._skip_or_fail(
                     "outer sandbox blocks nested Seatbelt; fail-closed verified"
                 )
             raise

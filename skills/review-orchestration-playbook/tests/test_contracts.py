@@ -840,6 +840,42 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn('if [[ "$mode" == "hosted-check" ]]', script)
         self.assertIn("initialize_expected_tool_digests", script)
 
+    def test_independent_supervisor_ci_requires_pinned_live_profile(self) -> None:
+        required_runner = (
+            SCRIPTS
+            / "independent_codex_pr_review/tests/run_required_no_child_profile.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("if result.skipped:", required_runner)
+        self.assertIn("result.wasSuccessful()", required_runner)
+
+        profile_contracts = {
+            "canonical": (
+                "test",
+                "skills/review-orchestration-playbook",
+            ),
+            "private": (
+                "python-39-compatibility",
+                "personal_codex/skills/review-orchestration-playbook",
+            ),
+        }
+        for profile, (next_job, skill_root) in profile_contracts.items():
+            workflow = (CI_FIXTURE_ROOT / f"{profile}.yml").read_text(encoding="utf-8")
+            start = workflow.index("  independent_supervisor_tests:")
+            end = workflow.index(f"\n  {next_job}:", start)
+            supervisor_job = workflow[start:end]
+            with self.subTest(profile=profile):
+                self.assertIn("runs-on: macos-26", supervisor_job)
+                self.assertIn(
+                    f"""      - name: Require pinned live no-child profile integration
+        working-directory: {skill_root}/scripts/independent_codex_pr_review
+        env:
+          CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE: "1"
+        run: |
+          python3 -m tests.run_required_no_child_profile
+""",
+                    supervisor_job,
+                )
+
     def test_independent_supervisor_remains_a_bounded_low_level_tool(self) -> None:
         tool_root = SCRIPTS / "independent_codex_pr_review"
         entrypoint = tool_root / "independent-codex-pr-review"

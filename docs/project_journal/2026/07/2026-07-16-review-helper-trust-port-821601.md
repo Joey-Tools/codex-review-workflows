@@ -394,3 +394,15 @@ metadata behavior.
   3.13 dangling-symlink tests and all 90 common tests passed. The complete
   host-level Python 3.13 suite then ran 1,428 tests with 5 skips and no failures;
   Ruff lint and format checks pass for the changed Python files.
+- A final fresh-context review found that the required independent-supervisor
+  job could pass after silently skipping the live no-child integration when a
+  hosted runner drifted from the pinned macOS runtime. The job now runs on
+  `macos-26`, invokes the live integration through a zero-skip runner, and
+  converts runtime-pin or Seatbelt availability drift into a required-CI
+  failure while preserving ordinary local skips on unpinned hosts. Final
+  host-level Python 3.13 validation ran all 6 live
+  no-child integration tests, 274 independent-supervisor tests, and 1,429 main
+  tests with 5 platform skips. One intermediate supervisor run hit a transient
+  missing status file in the unrelated hard-process-limit test; the exact test
+  and the subsequent complete supervisor run both passed. The 40-test contract
+  suite and Ruff lint/format checks also pass.

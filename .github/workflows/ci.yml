@@ -70,7 +70,7 @@ jobs:
 
   independent_supervisor_tests:
     name: independent-supervisor (python-3.13)
-    runs-on: macos-latest
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -80,6 +80,12 @@ jobs:
         working-directory: skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         run: |
           python3 -m compileall -q review_supervisor independent-codex-pr-review
+      - name: Require pinned live no-child profile integration
+        working-directory: skills/review-orchestration-playbook/scripts/independent_codex_pr_review
+        env:
+          CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE: "1"
+        run: |
+          python3 -m tests.run_required_no_child_profile
       - name: Run independent review supervisor tests
         working-directory: skills/review-orchestration-playbook/scripts/independent_codex_pr_review
         run: |
