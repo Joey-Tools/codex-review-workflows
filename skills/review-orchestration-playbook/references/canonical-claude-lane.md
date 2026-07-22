@@ -235,10 +235,13 @@ Every failure emits a fail-closed `blocked`, `blocked-authentication`, or
 attests only the reported invocation fields and terminal artifact; it never
 claims proof of the final merged sandbox, managed permission arrays, or path-rule
 evaluation. It also does not classify accepted prose as clean, findings, or
-undetermined. Preserve the accepted `findings` value exactly and pass it to
-[`review_result.py`](../scripts/review_runtime/review_result.py) only after this
-artifact gate succeeds. That canonical disposition helper records semantic
-outcome and presentation without changing the validator or rewriting the result.
+undetermined. Preserve the accepted `findings` value exactly and pass its exact
+UTF-8 bytes through the trusted bundle's manifest-bound `named_lane_guard
+classify-review-result --content-assessment <assessment>` profile only after this
+artifact gate succeeds. That two-source profile binds and revalidates
+[`review_result.py`](../scripts/review_runtime/review_result.py) before executing
+the already loaded classifier, which records semantic outcome and presentation
+without changing the validator or rewriting the result.
 
 The validator is a machine interface, not a help-text interface. `-h`, `--help`,
 missing or unknown arguments, and invalid choices all return nonzero, emit exactly
@@ -290,4 +293,4 @@ The control prompt must require Claude to:
 6. avoid direct reads outside the logical review workspace and every mutation;
 7. return findings only; when clean, optionally emit one concise non-actionable positive/coverage summary, then make the final nonempty logical line exactly `No findings.`. Never emit that sentinel when any finding remains.
 
-After `run-claude` has completed inherited-stream drain, initial-process-group cleanup, direct-child reap, and complete bounded-output publication, pass the raw stdout and exact child return code to the strict validator. Accept only its strict init/result evidence from the actual Claude process, extract the terminal result verbatim, and bind it to the frozen range in the parent-owned lane record. Record validator classification as `artifact_status`; only after `accepted`, call [`review_result.py`](../scripts/review_runtime/review_result.py) to record `review_outcome` and `presentation`. Exact or outer-ASCII-whitespace-only sentinel is `clean` / `canonical-clean`; one non-actionable positive/coverage prefix plus a unique final exact sentinel is `clean` / `extended-clean`; an actionable prefix overrides the sentinel as `findings` / `contradictory`; uncertainty or conflict with the sentinel is `undetermined` / `ambiguous`; and other accepted text is `undetermined` / `nonconforming`. Quoted, inline, repeated, non-final, or Unicode-separated sentinel text is not canonical clean. The supervisor's success cannot replace validator acceptance, validator acceptance cannot replace successful supervision and cleanup, and post-acceptance disposition never substitutes for validator acceptance or normalizes the raw result. Progress, tool traces, stdout/stderr tails, partial JSON, silent model substitution, and helper output do not count.
+After `run-claude` has completed inherited-stream drain, initial-process-group cleanup, direct-child reap, and complete bounded-output publication, pass the raw stdout and exact child return code to the strict validator. Accept only its strict init/result evidence from the actual Claude process, extract the terminal result verbatim, and bind it to the frozen range in the parent-owned lane record. Record validator classification as `artifact_status`; only after `accepted`, pass the exact result bytes through the trusted bundle's manifest-bound `classify-review-result` guard profile to record `review_outcome` and `presentation`. Exact or outer-ASCII-whitespace-only sentinel is `clean` / `canonical-clean`; one non-actionable positive/coverage prefix plus a unique final exact sentinel is `clean` / `extended-clean`; an actionable prefix overrides the sentinel as `findings` / `contradictory`; uncertainty or conflict with the sentinel is `undetermined` / `ambiguous`; and other accepted text is `undetermined` / `nonconforming`. Quoted, inline, repeated, non-final, or Unicode-separated sentinel text is not canonical clean. The supervisor's success cannot replace validator acceptance, validator acceptance cannot replace successful supervision and cleanup, and post-acceptance disposition never substitutes for validator acceptance or normalizes the raw result. Progress, tool traces, stdout/stderr tails, partial JSON, silent model substitution, and helper output do not count.

@@ -1,12 +1,18 @@
+"""Classify one already-accepted review result without rewriting it."""
+
 from __future__ import annotations
 
+import argparse
+import json
 import re
+import sys
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Sequence
 
 
 ASCII_WHITESPACE = " \t\n\r\v\f"
 CLEAN_SENTINEL = "No findings."
+MAX_RESULT_BYTES = 8 * 1024 * 1024
 
 ContentAssessment = Literal[
     "summary-only",
@@ -94,3 +100,45 @@ def classify_review_result(
         review_outcome="undetermined",
         presentation="nonconforming",
     )
+
+
+def _read_bounded_result() -> str:
+    payload = sys.stdin.buffer.read(MAX_RESULT_BYTES + 1)
+    if len(payload) > MAX_RESULT_BYTES:
+        raise ValueError("raw_result exceeds the 8 MiB input limit")
+    try:
+        return payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise ValueError("raw_result must be valid UTF-8") from error
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--content-assessment",
+        choices=sorted(_CONTENT_ASSESSMENTS),
+        required=True,
+    )
+    args = parser.parse_args(argv)
+    try:
+        disposition = classify_review_result(
+            _read_bounded_result(),
+            content_assessment=args.content_assessment,
+        )
+    except (TypeError, ValueError) as error:
+        parser.error(str(error))
+    print(
+        json.dumps(
+            {
+                "presentation": disposition.presentation,
+                "raw_result": disposition.raw_result,
+                "review_outcome": disposition.review_outcome,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

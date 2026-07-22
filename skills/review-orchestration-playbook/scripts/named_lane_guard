@@ -80,6 +80,10 @@ _CLAUDE_STREAM_RUNTIME_SOURCES = (
 _CLAUDE_STREAM_VALIDATOR_SOURCES = (
     ("validate_claude_stream", "validate_claude_stream.py", False),
 )
+_REVIEW_RESULT_SOURCES = (
+    ("review_runtime", "__init__.py", True),
+    ("review_runtime.review_result", "review_result.py", False),
+)
 _SourceIdentity = tuple[int, int, int, int, int]
 _CompanionBinding = bytes
 
@@ -658,6 +662,23 @@ def _load_claude_stream_validator_entrypoint(scripts_root: pathlib.Path) -> obje
     return _guard_companions(entrypoint, stream_companions)
 
 
+def _load_review_result_entrypoint(scripts_root: pathlib.Path) -> object:
+    runtime_root = scripts_root / "review_runtime"
+    review_result_path = runtime_root / "review_result.py"
+    review_result_bytes = _validate_bound_companion(review_result_path)
+    entrypoint = _load_bound_sources(
+        runtime_root,
+        _REVIEW_RESULT_SOURCES,
+        namespace_root="review_runtime",
+        entry_module_name="review_runtime.review_result",
+        source_byte_bindings=(("review_runtime.review_result", review_result_bytes),),
+    )
+    return _guard_companions(
+        entrypoint,
+        ((review_result_path, review_result_bytes),),
+    )
+
+
 def _select_entrypoint(
     scripts_root: pathlib.Path,
     argv: tuple[str, ...],
@@ -666,6 +687,8 @@ def _select_entrypoint(
         return _load_claude_preflight_entrypoint(scripts_root), argv[1:]
     if argv and argv[0] == "validate-claude-stream":
         return _load_claude_stream_validator_entrypoint(scripts_root), argv[1:]
+    if argv and argv[0] == "classify-review-result":
+        return _load_review_result_entrypoint(scripts_root), argv[1:]
     return _load_default_entrypoint(scripts_root), argv
 
 

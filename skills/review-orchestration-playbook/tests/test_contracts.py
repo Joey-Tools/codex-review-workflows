@@ -3237,6 +3237,10 @@ class RepositoryContractTest(unittest.TestCase):
                 "validate_claude_stream",
             ],
         )
+        self.assertEqual(
+            loaded_bound_modules("classify-review-result"),
+            ["review_runtime", "review_runtime.review_result"],
+        )
 
         entrypoint = guard.read_text(encoding="utf-8")
         for anchor in (
@@ -3244,9 +3248,11 @@ class RepositoryContractTest(unittest.TestCase):
             "_CLAUDE_PREFLIGHT_SOURCES",
             "_CLAUDE_STREAM_RUNTIME_SOURCES",
             "_CLAUDE_STREAM_VALIDATOR_SOURCES",
+            "_REVIEW_RESULT_SOURCES",
             "_load_default_entrypoint",
             "_load_claude_preflight_entrypoint",
             "_load_claude_stream_validator_entrypoint",
+            "_load_review_result_entrypoint",
             '"review_runtime.claude_refresh_lock"',
             '"claude_refresh_lock.py"',
             '"review_runtime.claude_linux"',
@@ -3259,6 +3265,7 @@ class RepositoryContractTest(unittest.TestCase):
             '"fd_exec.py"',
             'argv[0] == "preflight-claude"',
             'argv[0] == "validate-claude-stream"',
+            'argv[0] == "classify-review-result"',
         ):
             self.assertIn(anchor, entrypoint)
         self.assertNotIn("sys.path.insert", entrypoint)
@@ -3406,6 +3413,7 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/scripts/review_runtime/fd_exec.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/named_claude_preflight.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/named_lane.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/review_result.py",
             "skills/review-orchestration-playbook/scripts/validate_claude_stream.py",
         )
         self.assertEqual(
@@ -3423,6 +3431,7 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/references/egress-consent.md",
             "skills/review-orchestration-playbook/references/github-pr-probes.md",
             "skills/review-orchestration-playbook/references/pr-readiness.md",
+            "skills/review-orchestration-playbook/scripts/review_runtime/review_result.py",
         )
 
         def manifest_digest(overrides: dict[str, bytes] | None = None) -> str:
@@ -3477,6 +3486,7 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/scripts/review_runtime/claude_version_policy.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/named_claude_preflight.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/named_lane.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/review_result.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/common.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/fd_exec.py",
             "review_runtime.common.FD_EXEC_BYTES",
@@ -3493,6 +3503,7 @@ class RepositoryContractTest(unittest.TestCase):
             "Neither profile may widen its control-plane closure to `review_runtime.workspace`, `review_runtime.prompt`, or `review_runtime.synthetic_tokens`",
             "preflight-claude",
             "validate-claude-stream",
+            "classify-review-result",
         ):
             self.assertIn(anchor, contracts)
         self.assertNotIn(
@@ -3516,11 +3527,18 @@ class RepositoryContractTest(unittest.TestCase):
             "<trusted-bundle-absolute-path>/skills/review-orchestration-playbook/"
             "scripts/named_lane_guard"
         )
-        for profile in ("preflight-claude", "validate-claude-stream"):
+        for profile in (
+            "preflight-claude",
+            "validate-claude-stream",
+            "classify-review-result",
+        ):
             self.assertIn(f"{formal_prefix} {profile}", contracts)
         for anchor in (
             "exact three-source bound-source raw loader",
             "default eager runtime closure",
+            "exact two-source closure",
+            "review_runtime.review_result",
+            "same-content ordinary-file replacement is harmless",
             "review_runtime.claude_refresh_lock",
             "review_runtime.claude_linux",
             "review_runtime.claude_provenance",

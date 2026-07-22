@@ -846,6 +846,171 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertFalse(json_marker.exists())
         self.assertFalse(pyc_marker.exists())
 
+    def test_review_result_entrypoint_loads_only_bound_manifest_sources(
+        self,
+    ) -> None:
+        scripts, guard = self.copy_guard_bundle()
+        runtime = scripts / "review_runtime"
+        argparse_marker = self.root / "review-result-argparse-shadow.marker"
+        json_marker = self.root / "review-result-json-shadow.marker"
+        pyc_marker = self.root / "review-result-pyc.marker"
+        for module_name, marker in (
+            ("argparse", argparse_marker),
+            ("json", json_marker),
+        ):
+            (scripts / f"{module_name}.py").write_text(
+                "import pathlib\n"
+                f"pathlib.Path({str(marker)!r}).write_text('loaded')\n"
+                f"raise RuntimeError('malicious {module_name} shadow executed')\n",
+                encoding="utf-8",
+            )
+        for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+            (runtime / f"review_result{suffix}").write_bytes(b"not an extension module")
+        self.install_unchecked_pyc(
+            runtime / "review_result.py",
+            pyc_marker,
+            label="review-result",
+        )
+
+        expected_origins = {
+            "review_runtime": str(runtime / "__init__.py"),
+            "review_runtime.review_result": str(runtime / "review_result.py"),
+        }
+        body = (
+            f"expected = {expected_origins!r}\n"
+            "for name, origin in expected.items():\n"
+            "    module = sys.modules[name]\n"
+            "    if module.__file__ != origin or module.__spec__.origin != origin:\n"
+            "        raise RuntimeError(f'unexpected review-result origin for {name}')\n"
+            "    if module.__cached__ is not None:\n"
+            "        raise RuntimeError(f'unexpected review-result cache for {name}')\n"
+            "if list(sys.modules['review_runtime'].__path__):\n"
+            "    raise RuntimeError('bound package search path must remain closed')\n"
+            "loaded = sorted(name for name in sys.modules "
+            "if name == 'review_runtime' or name.startswith('review_runtime.'))\n"
+            "if loaded != sorted(expected):\n"
+            "    raise RuntimeError(f'unexpected review-result closure: {loaded}')\n"
+            "print(sys.modules['review_runtime.review_result'].__spec__.origin)\n"
+        )
+        completed = subprocess.run(
+            self.guard_probe_command(
+                guard,
+                body,
+                guard_arguments=("classify-review-result", "--sentinel"),
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            completed.stdout.strip(),
+            expected_origins["review_runtime.review_result"],
+        )
+        raw_result = b"Reviewed the changed paths.\r\nNo findings.\r\n"
+        classified = subprocess.run(
+            self.isolated_guard_command(
+                guard,
+                "classify-review-result",
+                "--content-assessment",
+                "summary-only",
+            ),
+            check=False,
+            input=raw_result,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(classified.returncode, 0, classified.stderr.decode())
+        disposition = json.loads(classified.stdout)
+        self.assertEqual(disposition["raw_result"], raw_result.decode("utf-8"))
+        self.assertEqual(disposition["review_outcome"], "clean")
+        self.assertEqual(disposition["presentation"], "extended-clean")
+        self.assertFalse(argparse_marker.exists())
+        self.assertFalse(json_marker.exists())
+        self.assertFalse(pyc_marker.exists())
+
+    def test_review_result_source_content_is_revalidated_before_main(self) -> None:
+        scripts, guard = self.copy_guard_bundle()
+        review_result = scripts / "review_runtime/review_result.py"
+        body = (
+            "import os\n"
+            f"review_result = pathlib.Path({str(review_result)!r})\n"
+            "before = os.stat(review_result, follow_symlinks=False)\n"
+            "with review_result.open('r+b') as stream:\n"
+            "    original = stream.read(1)\n"
+            "    stream.seek(0)\n"
+            "    stream.write(b'X' if original != b'X' else b'Y')\n"
+            "    stream.flush()\n"
+            "    os.fsync(stream.fileno())\n"
+            "after = os.stat(review_result, follow_symlinks=False)\n"
+            "identity = lambda value: (value.st_dev, value.st_ino, "
+            "value.st_mode, value.st_uid, value.st_size)\n"
+            "if identity(before) != identity(after):\n"
+            "    raise RuntimeError('fixture did not preserve source identity')\n"
+            "try:\n"
+            "    namespace['main'](('--content-assessment', 'summary-only'))\n"
+            "except SystemExit as error:\n"
+            "    failure = str(error)\n"
+            "else:\n"
+            "    raise RuntimeError('guard accepted review-result source drift')\n"
+            "if 'companion content changed' not in failure:\n"
+            "    raise RuntimeError(f'unexpected guard failure: {failure}')\n"
+            "print(failure)\n"
+        )
+        completed = subprocess.run(
+            self.guard_probe_command(
+                guard,
+                body,
+                guard_arguments=("classify-review-result",),
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("companion content changed", completed.stdout)
+
+    def test_review_result_source_same_content_replacement_is_allowed(self) -> None:
+        scripts, guard = self.copy_guard_bundle()
+        review_result = scripts / "review_runtime/review_result.py"
+        replacement = review_result.with_name("replacement-review_result.py")
+        body = (
+            "import os\n"
+            f"review_result = pathlib.Path({str(review_result)!r})\n"
+            f"replacement = pathlib.Path({str(replacement)!r})\n"
+            "replacement.write_bytes(review_result.read_bytes())\n"
+            "os.replace(replacement, review_result)\n"
+            "try:\n"
+            "    namespace['main'](('--help',))\n"
+            "except SystemExit as error:\n"
+            "    if error.code != 0:\n"
+            "        raise\n"
+            "else:\n"
+            "    raise RuntimeError('help did not exit')\n"
+            "print('same-content replacement accepted')\n"
+        )
+        completed = subprocess.run(
+            self.guard_probe_command(
+                guard,
+                body,
+                guard_arguments=("classify-review-result",),
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            completed.stdout.splitlines()[-1],
+            "same-content replacement accepted",
+        )
+
     def test_control_companions_must_be_ordinary_non_symlink_files(self) -> None:
         cases = (
             (
@@ -867,6 +1032,10 @@ class NamedLaneGuardTest(unittest.TestCase):
             (
                 "preflight-claude",
                 lambda scripts: scripts / "review_runtime/fd_exec.py",
+            ),
+            (
+                "classify-review-result",
+                lambda scripts: scripts / "review_runtime/review_result.py",
             ),
         )
         for subcommand, companion_path in cases:
