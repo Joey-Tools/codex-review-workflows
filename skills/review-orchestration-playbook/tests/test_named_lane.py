@@ -235,13 +235,21 @@ class NamedLaneGuardTest(unittest.TestCase):
             f"raise RuntimeError('malicious {label} pyc executed')\n",
             encoding="utf-8",
         )
-        cache_path = pathlib.Path(importlib.util.cache_from_source(str(source_path)))
-        cache_path.parent.mkdir(exist_ok=True)
+        # Guard subprocesses use -I, so they ignore an ambient PYTHONPYCACHEPREFIX.
+        with mock.patch.object(sys, "pycache_prefix", None):
+            cache_path = pathlib.Path(
+                importlib.util.cache_from_source(
+                    str(source_path),
+                    optimization="",
+                )
+            )
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
         py_compile.compile(
             str(malicious_source),
             cfile=str(cache_path),
             doraise=True,
             invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+            optimize=0,
         )
         return cache_path
 
@@ -327,6 +335,37 @@ class NamedLaneGuardTest(unittest.TestCase):
         )
 
         self.assertEqual(list(scripts.rglob("__pycache__")), [])
+
+    def test_unchecked_pyc_fixture_matches_unoptimized_guard_subprocess(self) -> None:
+        source_path = self.root / "guard-source.py"
+        source_path.write_text("value = 1\n", encoding="utf-8")
+        marker = self.root / "unchecked-pyc.marker"
+        optimized_flags = mock.Mock(wraps=sys.flags)
+        optimized_flags.optimize = 1
+        ambient_cache = self.root / "absent-ambient-cache" / "deep"
+        self.assertFalse(ambient_cache.parent.exists())
+
+        with (
+            mock.patch.object(sys, "flags", optimized_flags),
+            mock.patch.object(sys, "pycache_prefix", str(ambient_cache)),
+        ):
+            cache_path = self.install_unchecked_pyc(
+                source_path,
+                marker,
+                label="optimized-parent",
+            )
+        with mock.patch.object(sys, "pycache_prefix", None):
+            expected_path = pathlib.Path(
+                importlib.util.cache_from_source(
+                    str(source_path),
+                    optimization="",
+                )
+            )
+
+        self.assertEqual(cache_path, expected_path)
+        self.assertNotIn(".opt-", cache_path.name)
+        self.assertFalse(cache_path.is_relative_to(ambient_cache))
+        self.assertFalse(ambient_cache.parent.exists())
 
     def test_entrypoint_ignores_ambient_python_launch_controls(self) -> None:
         _, guard = self.copy_guard_bundle()
@@ -447,22 +486,10 @@ class NamedLaneGuardTest(unittest.TestCase):
         for suffix in importlib.machinery.EXTENSION_SUFFIXES:
             (runtime / f"common{suffix}").write_bytes(b"not an extension module")
 
-        malicious_common = self.root / "malicious-common.py"
-        malicious_common.write_text(
-            "import pathlib\n"
-            f"pathlib.Path({str(pyc_marker)!r}).write_text('loaded')\n"
-            "raise RuntimeError('malicious common pyc executed')\n",
-            encoding="utf-8",
-        )
-        common_cache = pathlib.Path(
-            importlib.util.cache_from_source(str(runtime / "common.py"))
-        )
-        common_cache.parent.mkdir()
-        py_compile.compile(
-            str(malicious_common),
-            cfile=str(common_cache),
-            doraise=True,
-            invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+        self.install_unchecked_pyc(
+            runtime / "common.py",
+            pyc_marker,
+            label="common",
         )
 
         expected_origins = {
