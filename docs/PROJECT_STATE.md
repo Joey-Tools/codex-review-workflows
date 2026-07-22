@@ -7,7 +7,7 @@
 
 ## Recovery Pointers
 
-- Latest workstream: `docs/project_journal/2026/07/2026-07-22-claude-compatible-version-range-7f2201.md`
+- Latest workstream: `docs/project_journal/2026/07/2026-07-22-review-result-semantics-7f2202.md`
 
 ## Global Blockers
 
