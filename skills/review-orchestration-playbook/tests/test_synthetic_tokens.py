@@ -2305,11 +2305,13 @@ class PublicPoolScannerTest(unittest.TestCase):
                 return chunk
 
         pending_lengths: list[int] = []
+        proof_offsets: list[int] = []
         scan_calls: list[tuple[bytes, int, int | None, int | None]] = []
         original_scan = workspace._scan_secret_value
 
         def recording_scan(value: bytes, **kwargs):
             pending_lengths.append(len(value))
+            proof_offsets.append(kwargs["_prefix_proof_tracker"].coordinate_offset)
             result = original_scan(value, **kwargs)
             scan_calls.append(
                 (
@@ -2345,6 +2347,8 @@ class PublicPoolScannerTest(unittest.TestCase):
         self.assertEqual(scan.accepted_counts[accepted], assignment_count)
         self.assertTrue(pending_lengths)
         self.assertLessEqual(max(pending_lengths), first_read_size)
+        self.assertIn(0, proof_offsets)
+        self.assertTrue(any(offset > 0 for offset in proof_offsets))
         incomplete_calls = [
             (index, value, minimum_end, incomplete_start)
             for index, (
@@ -2740,6 +2744,56 @@ class PublicPoolScannerTest(unittest.TestCase):
 
         self.assertEqual(scan.blocking_rule, "generic-secret-assignment")
         self.assertEqual(scan.accepted_counts[accepted], 0)
+
+    def test_speculative_prefix_coverage_overdraft_can_replay_safe_prefix(
+        self,
+    ) -> None:
+        payload = b"x" * 16
+        exhausted_coverage_budget = workspace.SecretScanBudget(
+            workspace.MAX_SECRET_SCAN_EVENTS,
+            remaining_prefix_proof_bytes=0,
+        )
+        scan_calls = 0
+
+        def scan_window(
+            _value: bytes,
+            **kwargs,
+        ) -> workspace.SecretScanResult:
+            nonlocal scan_calls
+            scan_calls += 1
+            result = workspace.SecretScanResult.empty()
+            if scan_calls == 1:
+                self.assertTrue(kwargs["_prefix_proof_tracker"].consume(6, 10))
+                result.incomplete_suffix_start = 8
+                result.incomplete_suffix_retention_start = 6
+            return result
+
+        with (
+            mock.patch.object(workspace, "MAX_SECRET_PREFIX_PROOF_BYTES", 8),
+            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 4),
+            mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 4),
+            mock.patch.object(
+                workspace,
+                "_scan_secret_value",
+                side_effect=scan_window,
+            ),
+        ):
+            actual = workspace._stream_secret_scan(
+                io.BytesIO(payload),
+                size=len(payload),
+                _event_budget=exhausted_coverage_budget,
+            )
+
+        self.assertEqual(actual, workspace.SecretScanResult.empty())
+        self.assertEqual(scan_calls, 3)
+        self.assertEqual(
+            exhausted_coverage_budget.remaining_prefix_proof_bytes,
+            0,
+        )
+        self.assertEqual(
+            exhausted_coverage_budget.remaining_prefix_proof_work_bytes,
+            workspace.MAX_SECRET_PREFIX_PROOF_WORK_BYTES - 4,
+        )
 
     def test_stream_scan_rejects_invalid_known_size(self) -> None:
         with self.assertRaisesRegex(ReviewError, "size must be nonnegative"):
@@ -4597,6 +4651,297 @@ class PublicPoolScannerTest(unittest.TestCase):
                 suffix_context_complete=False,
                 _event_budget=exhausted_budget,
             )
+
+    def test_dense_accepted_assignments_amortize_shared_prefix_proof(self) -> None:
+        accepted = self.accepted[0]
+        assignment = assignment_bytes(b"access_token", accepted.value) + b"\n"
+        payload = assignment * 8
+        direct_budget = workspace.SecretScanBudget(
+            8,
+            remaining_prefix_proof_bytes=len(payload),
+        )
+        stream_budget = workspace.SecretScanBudget(
+            8,
+            remaining_prefix_proof_bytes=len(payload),
+        )
+
+        direct = workspace._scan_secret_value(
+            payload,
+            accepted_values=(accepted,),
+            _event_budget=direct_budget,
+        )
+        with mock.patch.object(
+            workspace.SecretScanBudget,
+            "default",
+            return_value=stream_budget,
+        ):
+            streamed = workspace._stream_secret_scan(
+                io.BytesIO(payload),
+                size=len(payload),
+                accepted_values=(accepted,),
+            )
+
+        self.assertEqual(direct, streamed)
+        self.assertIsNone(direct.blocking_rule)
+        self.assertEqual(direct.accepted_counts, Counter({accepted: 8}))
+        self.assertEqual(direct_budget.remaining, 0)
+        self.assertEqual(stream_budget.remaining, 0)
+        self.assertEqual(
+            direct_budget.remaining_prefix_proof_bytes,
+            stream_budget.remaining_prefix_proof_bytes,
+        )
+        self.assertGreater(direct_budget.remaining_prefix_proof_bytes, 0)
+
+    def test_nested_fixture_assignments_union_rejected_prefix_proofs(self) -> None:
+        accepted = self.accepted[0]
+        nested_assignment = assignment_bytes(b"access_token", accepted.value)
+        payload = b"".join(
+            b"fixture_"
+            + str(index).encode("ascii")
+            + b" = b'"
+            + nested_assignment
+            + b"'\n"
+            for index in range(32)
+        )
+        bounded_budget = workspace.SecretScanBudget(
+            workspace.MAX_SECRET_SCAN_EVENTS,
+            remaining_prefix_proof_bytes=len(payload),
+        )
+
+        expected = workspace._scan_secret_value(
+            payload,
+            accepted_values=(accepted,),
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+        actual = workspace._scan_secret_value(
+            payload,
+            accepted_values=(accepted,),
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+            _event_budget=bounded_budget,
+        )
+
+        self.assertEqual(actual, expected)
+        self.assertGreater(bounded_budget.remaining_prefix_proof_bytes, 0)
+
+    def test_accepted_assignment_prefix_proof_still_exhausts_on_new_bytes(
+        self,
+    ) -> None:
+        accepted = self.accepted[0]
+        distinct_prefix = b"#" + b"x" * 256 + b"\n"
+        payload = (
+            distinct_prefix + assignment_bytes(b"access_token", accepted.value) + b"\n"
+        )
+        budget = workspace.SecretScanBudget(
+            1,
+            remaining_prefix_proof_bytes=len(distinct_prefix) - 1,
+        )
+
+        with self.assertRaisesRegex(ReviewError, "prefix proof limit"):
+            workspace._scan_secret_value(
+                payload,
+                accepted_values=(accepted,),
+                _event_budget=budget,
+            )
+
+    def test_prefix_proof_range_tracker_fails_closed_at_metadata_cap(self) -> None:
+        budget = workspace.SecretScanBudget(
+            workspace.MAX_SECRET_SCAN_EVENTS,
+            remaining_prefix_proof_bytes=3,
+        )
+        tracker = workspace._PrefixProofRangeTracker(budget)
+
+        with mock.patch.object(workspace, "MAX_SECRET_PREFIX_PROOF_RANGES", 2):
+            self.assertTrue(tracker.consume(0, 1))
+            self.assertTrue(tracker.consume(2, 3))
+            with self.assertRaisesRegex(ReviewError, "prefix proof range limit"):
+                tracker.consume(4, 5)
+
+        self.assertEqual(tracker.ranges, [(0, 1), (2, 3)])
+        self.assertEqual(budget.remaining_prefix_proof_bytes, 1)
+
+    def test_repeated_prefix_proof_fails_closed_at_work_cap(self) -> None:
+        budget = workspace.SecretScanBudget(
+            workspace.MAX_SECRET_SCAN_EVENTS,
+            remaining_prefix_proof_bytes=1,
+            remaining_prefix_proof_work_bytes=2,
+        )
+        tracker = workspace._PrefixProofRangeTracker(budget)
+
+        self.assertTrue(tracker.consume(0, 1))
+        self.assertTrue(tracker.consume(0, 1))
+        with self.assertRaisesRegex(ReviewError, "prefix proof work limit"):
+            tracker.consume(0, 1)
+
+        self.assertEqual(tracker.ranges, [(0, 1)])
+        self.assertEqual(budget.remaining_prefix_proof_bytes, 0)
+        self.assertEqual(budget.remaining_prefix_proof_work_bytes, 0)
+
+    def test_speculative_prefix_proof_work_is_not_rolled_back(self) -> None:
+        budget = workspace.SecretScanBudget(
+            workspace.MAX_SECRET_SCAN_EVENTS,
+            remaining_prefix_proof_bytes=1,
+            remaining_prefix_proof_work_bytes=2,
+        )
+        tracker = workspace._PrefixProofRangeTracker(budget)
+
+        for _attempt in range(2):
+            transaction_budget = budget.clone()
+            transaction = tracker.clone(
+                transaction_budget,
+                coordinate_offset=0,
+            )
+            self.assertTrue(transaction.consume(0, 1))
+
+        self.assertEqual(tracker.ranges, [])
+        self.assertEqual(budget.remaining_prefix_proof_bytes, 1)
+        self.assertEqual(budget.remaining_prefix_proof_work_bytes, 0)
+        exhausted = tracker.clone(budget.clone(), coordinate_offset=0)
+        with self.assertRaisesRegex(ReviewError, "prefix proof work limit"):
+            exhausted.consume(0, 1)
+
+    def test_prefix_proof_budget_failure_is_atomic(self) -> None:
+        budget = workspace.SecretScanBudget(
+            workspace.MAX_SECRET_SCAN_EVENTS,
+            remaining_prefix_proof_bytes=0,
+            remaining_prefix_proof_work_bytes=1,
+        )
+        tracker = workspace._PrefixProofRangeTracker(budget)
+
+        with self.assertRaisesRegex(ReviewError, "prefix proof limit"):
+            tracker.consume(0, 1)
+
+        self.assertEqual(tracker.ranges, [])
+        self.assertEqual(budget.remaining_prefix_proof_bytes, 0)
+        self.assertEqual(budget.remaining_prefix_proof_work_bytes, 1)
+
+    def test_prefix_proof_range_tracker_unions_bridged_and_filtered_ranges(
+        self,
+    ) -> None:
+        budget = workspace.SecretScanBudget(
+            workspace.MAX_SECRET_SCAN_EVENTS,
+            remaining_prefix_proof_bytes=8,
+        )
+        tracker = workspace._PrefixProofRangeTracker(budget)
+
+        self.assertTrue(tracker.consume(0, 2))
+        self.assertTrue(tracker.consume(4, 6))
+        self.assertTrue(tracker.consume(1, 5))
+        self.assertTrue(tracker.consume(0, 6))
+        self.assertEqual(tracker.ranges, [(0, 6)])
+        self.assertEqual(budget.remaining_prefix_proof_bytes, 2)
+
+        self.assertTrue(tracker.consume(4, 8, proof_byte_count=2))
+        self.assertTrue(tracker.consume(4, 8, proof_byte_count=2))
+        self.assertEqual(tracker.ranges, [(0, 8)])
+        self.assertEqual(budget.remaining_prefix_proof_bytes, 0)
+
+    def test_prefix_proof_range_tracker_commits_absolute_transactions(
+        self,
+    ) -> None:
+        budget = workspace.SecretScanBudget(
+            workspace.MAX_SECRET_SCAN_EVENTS,
+            remaining_prefix_proof_bytes=6,
+        )
+        tracker = workspace._PrefixProofRangeTracker(budget)
+        self.assertTrue(tracker.consume(0, 2))
+        transaction_budget = budget.clone()
+        transaction = tracker.clone(
+            transaction_budget,
+            coordinate_offset=2,
+        )
+
+        self.assertTrue(transaction.consume(0, 4))
+        self.assertEqual(tracker.ranges, [(0, 2)])
+        self.assertEqual(budget.remaining_prefix_proof_bytes, 4)
+        self.assertEqual(
+            budget.remaining_prefix_proof_work_bytes,
+            workspace.MAX_SECRET_PREFIX_PROOF_WORK_BYTES - 6,
+        )
+        tracker.commit_from(transaction)
+        self.assertEqual(tracker.ranges, [(0, 6)])
+        self.assertEqual(budget.remaining_prefix_proof_bytes, 0)
+
+        mismatched = workspace._PrefixProofRangeTracker(
+            budget.clone(),
+            ranges=[(0, 7)],
+        )
+        with self.assertRaisesRegex(ReviewError, "proof transaction is invalid"):
+            tracker.commit_from(mismatched)
+        invalid = workspace._PrefixProofRangeTracker(
+            budget.clone(),
+            ranges=[(2, 6)],
+        )
+        with self.assertRaisesRegex(ReviewError, "proof transaction is invalid"):
+            tracker.commit_from(invalid)
+        self.assertEqual(tracker.ranges, [(0, 6)])
+
+    def test_stream_prefix_proof_tracker_unions_absolute_overlap(self) -> None:
+        payload = b"x" * 16
+        budget = workspace.SecretScanBudget(
+            workspace.MAX_SECRET_SCAN_EVENTS,
+            remaining_prefix_proof_bytes=4,
+        )
+        proof_offsets: list[int] = []
+
+        def scan_window(
+            _value: bytes,
+            **kwargs,
+        ) -> workspace.SecretScanResult:
+            tracker = kwargs["_prefix_proof_tracker"]
+            proof_offsets.append(tracker.coordinate_offset)
+            local_start = 6 - tracker.coordinate_offset
+            self.assertTrue(tracker.consume(local_start, local_start + 4))
+            return workspace.SecretScanResult.empty()
+
+        with (
+            mock.patch.object(workspace, "MAX_SECRET_PREFIX_PROOF_BYTES", 8),
+            mock.patch.object(workspace, "STREAM_SCAN_OVERLAP", 4),
+            mock.patch.object(workspace, "STREAM_SCAN_CHUNK_BYTES", 4),
+            mock.patch.object(
+                workspace,
+                "_scan_secret_value",
+                side_effect=scan_window,
+            ),
+        ):
+            scan = workspace._stream_secret_scan(
+                io.BytesIO(payload),
+                size=len(payload),
+                _event_budget=budget,
+            )
+
+        self.assertEqual(scan, workspace.SecretScanResult.empty())
+        self.assertEqual(proof_offsets, [0, 4])
+        self.assertEqual(budget.remaining_prefix_proof_bytes, 0)
+
+    def test_capture_only_local_assignment_uses_parent_proof_ledger(self) -> None:
+        payload = (
+            b'unproven prefix\npassword = "UnknownSecretValueA9Z8Y7"\n'
+            b"def f():\n    pass\n"
+        )
+        budget = workspace.SecretScanBudget.default()
+        tracker = workspace._PrefixProofRangeTracker(
+            budget,
+            coordinate_offset=500,
+        )
+        initial_prefix_budget = budget.remaining_prefix_proof_bytes
+
+        workspace._scan_secret_value(
+            payload,
+            capture_accepted_candidates=True,
+            prefix_context_complete=False,
+            _event_budget=budget,
+            _prefix_proof_tracker=tracker,
+            _continue_after_blocking=True,
+            _capture_only_legacy_evidence=True,
+        )
+
+        charged_bytes = initial_prefix_budget - budget.remaining_prefix_proof_bytes
+        proved_bytes = sum(end - start for start, end in tracker.ranges)
+        self.assertGreater(charged_bytes, 0)
+        self.assertEqual(charged_bytes, proved_bytes)
+        self.assertTrue(all(start >= 500 for start, _end in tracker.ranges))
 
     def test_closed_rhs_cache_does_not_bypass_absolute_proof_cap(self) -> None:
         proof_bytes = 128
