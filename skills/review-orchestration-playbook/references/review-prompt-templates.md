@@ -16,7 +16,7 @@ A separately requested Copilot diagnostic never counts toward named double. The 
 - State that the parent has already proved the frozen scope locally complete with lazy fetching disabled, and forbid `fetch`, `pull`, credential prompts, or any other networked Git operation.
 - Keep the worktree read-only. Do not ask the reviewer to fix findings, modify files, stage changes, commit, switch branches, or perform other Git mutations.
 - Ask for findings only, ordered by severity, with file references and concrete failure modes or triggering conditions.
-- Use exact `No findings.` output when there are no findings.
+- When there are no findings, the reviewer may first give one concise non-actionable positive/coverage summary, but the final nonempty logical line must be exactly `No findings.`. With findings, never emit that sentinel.
 - Include performance and resource risk only when the change plausibly affects hot paths, complexity, allocation, I/O, contention, startup, fan-out, query shape, repeated work, or build cost.
 - Tell the reviewer to avoid style-only nits, speculative micro-optimizations, and unrelated rewrites.
 - Prefer direct argv tool calls. Avoid `bash -lc`, `zsh -lc`, here-docs, and similar wrapper probes unless shell syntax is essential.
@@ -74,7 +74,8 @@ Do not edit files or run mutating Git commands.
 
 <output_contract>
 Return findings only, ordered by severity. Each finding must include a concise title, file/line reference, impact, concrete evidence and triggering condition, and a remediation direction.
-If there are no findings, reply exactly: No findings.
+If there are no findings, you may first include one concise positive summary of the coverage you actually inspected. Keep it non-actionable and free of concerns, remediation, residual risk, contradictions, or uncertainty. The final nonempty logical line must be exactly: No findings.
+If there is any finding, do not output `No findings.` anywhere.
 </output_contract>
 ```
 
@@ -102,7 +103,8 @@ Return findings only, ordered by severity. Each finding must include a concise t
 
 <output_contract>
 If there are findings, output only the findings.
-If there are no findings, reply exactly: No findings.
+If there are no findings, you may first include one concise positive summary of the coverage you actually inspected. Keep it non-actionable and free of concerns, remediation, residual risk, contradictions, or uncertainty. The final nonempty logical line must be exactly: No findings.
+If there is any finding, do not output `No findings.` anywhere.
 </output_contract>
 ```
 
