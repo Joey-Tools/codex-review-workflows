@@ -235,8 +235,12 @@ class NamedLaneGuardTest(unittest.TestCase):
             f"raise RuntimeError('malicious {label} pyc executed')\n",
             encoding="utf-8",
         )
-        cache_path = pathlib.Path(importlib.util.cache_from_source(str(source_path)))
-        cache_path.parent.mkdir(exist_ok=True)
+        # Guard subprocesses use -I, so they ignore an ambient PYTHONPYCACHEPREFIX.
+        with mock.patch.object(sys, "pycache_prefix", None):
+            cache_path = pathlib.Path(
+                importlib.util.cache_from_source(str(source_path))
+            )
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
         py_compile.compile(
             str(malicious_source),
             cfile=str(cache_path),
@@ -447,22 +451,10 @@ class NamedLaneGuardTest(unittest.TestCase):
         for suffix in importlib.machinery.EXTENSION_SUFFIXES:
             (runtime / f"common{suffix}").write_bytes(b"not an extension module")
 
-        malicious_common = self.root / "malicious-common.py"
-        malicious_common.write_text(
-            "import pathlib\n"
-            f"pathlib.Path({str(pyc_marker)!r}).write_text('loaded')\n"
-            "raise RuntimeError('malicious common pyc executed')\n",
-            encoding="utf-8",
-        )
-        common_cache = pathlib.Path(
-            importlib.util.cache_from_source(str(runtime / "common.py"))
-        )
-        common_cache.parent.mkdir()
-        py_compile.compile(
-            str(malicious_common),
-            cfile=str(common_cache),
-            doraise=True,
-            invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+        self.install_unchecked_pyc(
+            runtime / "common.py",
+            pyc_marker,
+            label="common",
         )
 
         expected_origins = {
