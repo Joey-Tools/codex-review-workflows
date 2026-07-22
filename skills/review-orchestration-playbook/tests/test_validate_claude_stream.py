@@ -818,6 +818,18 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             {"classification": "accepted", "findings": "\nNo findings.\n"},
         )
 
+    def test_accepts_extended_clean_result_and_preserves_it_verbatim(self) -> None:
+        events = self._full_events()
+        raw_result = (
+            "Reviewed the frozen range and verified the focused tests.\r\nNo findings."
+        )
+        events[-1]["result"] = raw_result
+
+        self.assertEqual(
+            self._validate(events),
+            {"classification": "accepted", "findings": raw_result},
+        )
+
     def test_runtime_launch_profiles_bind_exact_permission_and_tool_surfaces(
         self,
     ) -> None:

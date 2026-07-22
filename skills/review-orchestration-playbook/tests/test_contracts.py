@@ -1156,6 +1156,23 @@ class RepositoryContractTest(unittest.TestCase):
             "helper review root must be outside the source repository",
             workspace_source,
         )
+        helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "/tmp/codex-isolated-review-uid-<effective-uid>/"
+            "<sha256(canonical-source-path)>/isolated-review-*",
+            helper_contract,
+        )
+        self.assertIn(
+            "Source-local `.codex-tmp` remains only a schema-v1-to-v4 "
+            "legacy compatibility layout",
+            helper_contract,
+        )
+        self.assertNotIn(
+            "source_root/.codex-tmp/isolated-review-*",
+            helper_contract,
+        )
         self.assertIn("_review_root_for_source(canonical_source)", provider_source)
         self.assertIn("container_root.parent != review_root", provider_source)
         for phrase in (
@@ -3333,10 +3350,12 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("forbid `fetch`, `pull`", templates)
         self.assertNotIn("prepared full diff", contracts)
 
-    def test_named_lane_keeps_raw_findings_separate_from_parent_metadata(
-        self,
-    ) -> None:
+    def test_named_lane_separates_artifact_outcome_and_presentation(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
             encoding="utf-8"
         )
         templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
@@ -3344,9 +3363,20 @@ class RepositoryContractTest(unittest.TestCase):
         )
 
         for anchor in (
-            "raw findings-only terminal output",
-            "exactly `No findings.` when clean",
-            "orchestrator stores that verbatim reviewer output in a separate lane record",
+            "raw findings-only terminal result",
+            "Preserve the complete raw result",
+            "`artifact_status`",
+            "`review_outcome`",
+            "`presentation`",
+            "`canonical-clean`",
+            "`extended-clean`",
+            "`contradictory`",
+            "`ambiguous`",
+            "`nonconforming`",
+            "outer ASCII whitespace",
+            "quoted, inline, repeated, or non-final `No findings.`",
+            "classify_review_result(raw_result, content_assessment=...)",
+            "validator remains the sole authority for artifact acceptance",
             "logical lane and actual runtime/provider",
             "full frozen range and workspace identity",
             "Commands, tests, or residual risk may be added",
@@ -3354,8 +3384,29 @@ class RepositoryContractTest(unittest.TestCase):
             "must not be demanded from a reviewer whose raw output contract is findings-only",
         ):
             self.assertIn(anchor, contracts)
-        self.assertIn("Return findings only", templates)
-        self.assertIn("reply exactly: No findings.", templates)
+        for content in (skill, canonical):
+            self.assertIn("artifact_status", content)
+            self.assertIn("review_outcome", content)
+            self.assertIn("presentation", content)
+            self.assertIn("review_result.py", content)
+            self.assertIn("never", content.lower())
+        self.assertIn("validator returns it unchanged", canonical)
+        self.assertIn("never substitutes for validator acceptance", canonical)
+        self.assertIn("one concise non-actionable positive/coverage summary", canonical)
+        self.assertIn("final nonempty logical line exactly `No findings.`", canonical)
+        self.assertIn("final nonempty logical line must be exactly", templates)
+        self.assertIn(
+            "If there is any finding, do not output `No findings.` anywhere.", templates
+        )
+        self.assertNotIn("reply exactly: No findings.", templates)
+        self.assertNotIn("exactly `No findings.` when clean", contracts)
+
+        for content in (skill, contracts):
+            self.assertIn("Rerun only", content)
+            self.assertIn("range/head", content)
+            self.assertIn("new head", content)
+            self.assertIn("explicit", content)
+            self.assertIn("decision point", content)
 
     def test_native_claude_selected_deny_policy_does_not_overclaim_host_read_isolation(
         self,
