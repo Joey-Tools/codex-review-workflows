@@ -966,3 +966,16 @@ metadata behavior.
   The incoming private-layout test compatibility change merged without
   conflicts. All 255 affected contract and named-lane tests and all 345
   deterministic supervisor tests pass under Python 3.13 after integration.
+- Default branch then advanced again through
+  `860fb175427ce3329bac3887bd123b228f452e14`, which made the in-progress
+  `35271bec152f1ccaf484ffa738948d17107f42f9..85d39ad6776f588ab99568b6d6116c9a1dec6d57`
+  local review stale before it produced a terminal result and before any
+  GitHub review request. The stale lane was stopped, and the new base was
+  integrated through signed merge commit
+  `f75a2db`. Conflict resolution retained the branch's structural profiles,
+  exact 2.1.216 init overlay, forced analytics-disabled launch contract, and
+  optional-null extended diagnostics while incorporating the new base's
+  contained cwd-relative `Grep.path` support. All 191 validator and repository
+  contract tests pass under Python 3.13 after resolution. The trusted new base
+  now supports the installed Claude Code 2.1.216 stream, so no temporary older
+  binary acquisition is needed.
