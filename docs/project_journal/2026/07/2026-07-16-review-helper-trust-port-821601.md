@@ -848,3 +848,10 @@ metadata behavior.
   changed-file formatting, compileall, JSON parsing, project-journal validation,
   the official skill validator, and `git diff --check` also pass. No local
   Python 3.10 run was performed.
+- The post-adaptation direct Claude Code 2.1.216 validation used the certified
+  executable and the frozen whole-PR range. Process supervision returned zero,
+  remained quiescent, produced no stderr or overflow, and the exact-version
+  compatibility profile accepted the 919,791-byte canonical stream. The
+  validated review artifact was clean, confirming that the additive init and
+  terminal metadata contract admits the observed 2.1.216 stream without
+  widening the 2.1.212 baseline or later-version behavior.
