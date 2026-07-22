@@ -731,3 +731,28 @@ metadata behavior.
   enclosing Codex Seatbelt. Ruff lint and changed-file formatting, Python 3.13
   compileall, project-journal validation, the official skill validator, and
   `git diff --check` also pass. No local Python 3.10 run was performed.
+- Fresh-context Codex review then found a separate ordinary Git-command
+  supervision gap: `run_bounded()` could reap a successful group leader before
+  proving that its original process group had no remaining members. A
+  background process could therefore outlive the authorized command and keep
+  mutating shared Git metadata. Bounded Git commands now start in an independent
+  session, bind PID, process-start identity, PGID, and SID before supervision,
+  observe leader exit without reaping through `waitid(..., WNOWAIT)`, and prove
+  the original process group empty before the single final reap. Cleanup repeats
+  `SIGKILL` while a bounded Darwin `libproc` or Linux `/proc` enumeration still
+  finds another original-group member; error paths preserve the primary timeout
+  or overflow classification and attach cleanup failures as causes. The
+  identity-less setup-abort path also proves that the numeric PID is still the
+  same unreaped child before signaling its group. Deliberate `setpgid()` or
+  `setsid()` escape remains outside this process-group custody contract and is
+  not described as covered. Three regressions exercise successful leader exit
+  with a resistant child, overflow with detached standard I/O, and selector
+  setup failure including the already-reaped-child boundary. Python 3.13 passes
+  the 22 directly affected tests, the 60 contract tests, the expanded 318-test
+  host-level deterministic supervisor gate in 149.559 seconds, and the complete
+  host-level 2,299-test suite in 531.949 seconds with 6 expected
+  platform/filesystem skips.
+  The exact nested keychain-broker test also passes at host level. Ruff lint and
+  changed-file formatting, Python 3.13 compileall, project-journal validation,
+  the official skill validator, and `git diff --check` pass. No local Python
+  3.10 run was performed.

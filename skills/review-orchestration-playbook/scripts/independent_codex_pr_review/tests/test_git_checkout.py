@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import selectors
 import signal
 import subprocess
 import sys
@@ -476,6 +477,229 @@ class RawGitProtocolTests(unittest.TestCase):
                         _force_cleanup_batch(live_batch)
                         if worker is not None and worker.is_alive():
                             worker.join(timeout=2)
+
+    def test_bounded_git_settles_same_group_child_after_successful_leader_exit(
+        self,
+    ) -> None:
+        script = (
+            b"#!/bin/sh\n"
+            b"(trap '' TERM; exec /bin/sleep 30) </dev/null >/dev/null 2>&1 &\n"
+            b'printf \'%s %s\\n\' "$$" "$!" > "$0.pids"\n'
+            b'while [ ! -f "$0.release" ]; do :; done\n'
+            b"printf 'bounded-output\\n'\n"
+            b"exit 0\n"
+        )
+        with owned_temporary_directory("bounded-git-descendant-") as root:
+            executable = root / "fake-git"
+            executable.write_bytes(script)
+            executable.chmod(0o700)
+            pid_path = root / "fake-git.pids"
+            release_path = root / "fake-git.release"
+            result: list[tuple[int, bytes, bytes]] = []
+            errors: list[BaseException] = []
+            descendant_pid: int | None = None
+            descendant_identity: str | None = None
+            descendant_group: int | None = None
+
+            def invoke() -> None:
+                try:
+                    result.append(
+                        gitraw.run_bounded(
+                            (str(executable),),
+                            cwd=root,
+                            environment=sanitized_git_environment(),
+                            timeout=3,
+                            stdout_limit=8192,
+                            stderr_limit=8192,
+                        )
+                    )
+                except BaseException as error:
+                    errors.append(error)
+
+            worker = threading.Thread(target=invoke, daemon=True)
+            try:
+                worker.start()
+                deadline = time.monotonic() + 2
+                while not pid_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(pid_path.exists(), "bounded Git PIDs were not recorded")
+                leader_raw, descendant_raw = pid_path.read_text(
+                    encoding="ascii"
+                ).split()
+                leader_pid = int(leader_raw)
+                descendant_pid = int(descendant_raw)
+                descendant_identity = process_start_identity(descendant_pid)
+                descendant_group = os.getpgid(descendant_pid)
+                release_path.write_bytes(b"release\n")
+                worker.join(timeout=5)
+
+                self.assertFalse(worker.is_alive(), "bounded Git settlement blocked")
+                self.assertEqual(errors, [])
+                self.assertEqual(result, [(0, b"bounded-output\n", b"")])
+                self.assertTrue(
+                    _wait_for_process_exit(descendant_pid, timeout=2),
+                    "bounded Git same-group child survived successful settlement",
+                )
+                self.assertEqual(descendant_group, leader_pid)
+                self.assertFalse(_process_group_exists(leader_pid))
+            finally:
+                release_path.touch(exist_ok=True)
+                worker.join(timeout=5)
+                if descendant_pid is not None and descendant_identity is not None:
+                    _kill_verified_process(descendant_pid, descendant_identity)
+
+    def test_bounded_git_overflow_terminates_same_group_child(self) -> None:
+        script = (
+            b"#!/bin/sh\n"
+            b"(trap '' TERM; exec /bin/sleep 30) </dev/null >/dev/null 2>&1 &\n"
+            b'printf \'%s %s\\n\' "$$" "$!" > "$0.pids"\n'
+            b'while [ ! -f "$0.release" ]; do :; done\n'
+            b"printf xx\n"
+            b"exec /bin/sleep 30\n"
+        )
+        with owned_temporary_directory("bounded-git-overflow-") as root:
+            executable = root / "fake-git"
+            executable.write_bytes(script)
+            executable.chmod(0o700)
+            pid_path = root / "fake-git.pids"
+            release_path = root / "fake-git.release"
+            errors: list[BaseException] = []
+            descendant_pid: int | None = None
+            descendant_identity: str | None = None
+            descendant_group: int | None = None
+
+            def invoke() -> None:
+                try:
+                    gitraw.run_bounded(
+                        (str(executable),),
+                        cwd=root,
+                        environment=sanitized_git_environment(),
+                        timeout=3,
+                        stdout_limit=1,
+                        stderr_limit=8192,
+                    )
+                except BaseException as error:
+                    errors.append(error)
+
+            worker = threading.Thread(target=invoke, daemon=True)
+            try:
+                worker.start()
+                deadline = time.monotonic() + 2
+                while not pid_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(pid_path.exists(), "bounded Git PIDs were not recorded")
+                leader_raw, descendant_raw = pid_path.read_text(
+                    encoding="ascii"
+                ).split()
+                leader_pid = int(leader_raw)
+                descendant_pid = int(descendant_raw)
+                descendant_identity = process_start_identity(descendant_pid)
+                descendant_group = os.getpgid(descendant_pid)
+                release_path.write_bytes(b"release\n")
+                worker.join(timeout=5)
+
+                self.assertFalse(
+                    worker.is_alive(), "bounded Git overflow cleanup blocked"
+                )
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], OverflowError)
+                self.assertTrue(
+                    _wait_for_process_exit(descendant_pid, timeout=2),
+                    "bounded Git same-group child survived overflow cleanup",
+                )
+                self.assertEqual(descendant_group, leader_pid)
+                self.assertFalse(_process_group_exists(leader_pid))
+            finally:
+                release_path.touch(exist_ok=True)
+                worker.join(timeout=5)
+                if descendant_pid is not None and descendant_identity is not None:
+                    _kill_verified_process(descendant_pid, descendant_identity)
+
+    def test_bounded_git_selector_failure_terminates_same_group_child(
+        self,
+    ) -> None:
+        script = (
+            b"#!/bin/sh\n"
+            b"(trap '' TERM; exec /bin/sleep 30) </dev/null >/dev/null 2>&1 &\n"
+            b'printf \'%s %s\\n\' "$$" "$!" > "$0.pids"\n'
+            b"exec /bin/sleep 30\n"
+        )
+        with owned_temporary_directory("bounded-git-selector-") as root:
+            executable = root / "fake-git"
+            executable.write_bytes(script)
+            executable.chmod(0o700)
+            pid_path = root / "fake-git.pids"
+            leader_pid: int | None = None
+            descendant_pid: int | None = None
+            descendant_identity: str | None = None
+            descendant_group: int | None = None
+
+            def fail_after_child_ready() -> selectors.BaseSelector:
+                nonlocal leader_pid
+                nonlocal descendant_pid
+                nonlocal descendant_identity
+                nonlocal descendant_group
+                deadline = time.monotonic() + 2
+                while not pid_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                if not pid_path.exists():
+                    raise AssertionError("bounded Git PIDs were not recorded")
+                leader_raw, descendant_raw = pid_path.read_text(
+                    encoding="ascii"
+                ).split()
+                leader_pid = int(leader_raw)
+                descendant_pid = int(descendant_raw)
+                descendant_identity = process_start_identity(descendant_pid)
+                descendant_group = os.getpgid(descendant_pid)
+                raise RuntimeError("synthetic selector failure")
+
+            try:
+                with (
+                    mock.patch.object(
+                        gitraw.selectors,
+                        "DefaultSelector",
+                        side_effect=fail_after_child_ready,
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "selector failure"),
+                ):
+                    gitraw.run_bounded(
+                        (str(executable),),
+                        cwd=root,
+                        environment=sanitized_git_environment(),
+                        timeout=3,
+                        stdout_limit=8192,
+                        stderr_limit=8192,
+                    )
+
+                assert leader_pid is not None
+                assert descendant_pid is not None
+                self.assertTrue(
+                    _wait_for_process_exit(descendant_pid, timeout=2),
+                    "bounded Git same-group child survived selector failure cleanup",
+                )
+                self.assertEqual(descendant_group, leader_pid)
+                self.assertFalse(_process_group_exists(leader_pid))
+            finally:
+                if descendant_pid is not None and descendant_identity is not None:
+                    _kill_verified_process(descendant_pid, descendant_identity)
+
+            reaped = SimpleNamespace(
+                pid=424_242,
+                stdin=None,
+                stdout=None,
+                stderr=None,
+            )
+            with (
+                mock.patch.object(
+                    gitraw,
+                    "terminal_status",
+                    side_effect=ChildProcessError("synthetic reaped child"),
+                ),
+                mock.patch.object(gitraw.os, "killpg") as kill_group,
+                self.assertRaisesRegex(ChildProcessError, "reaped child"),
+            ):
+                gitraw._abort_unanchored_fresh_session(reaped)
+            kill_group.assert_not_called()
 
     def test_cat_file_close_terminates_descendant_after_leader_exit(self) -> None:
         script = (

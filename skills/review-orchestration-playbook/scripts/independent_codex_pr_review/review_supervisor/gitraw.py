@@ -24,8 +24,11 @@ from .errors import blocked, inconclusive
 from .models import Identity, TreeEntry, TreeManifest
 from .process import (
     SpawnedProcess,
+    anchored_group_members,
+    process_group_members,
     process_start_identity,
     signal_anchored_group,
+    terminal_status,
     wait_terminal,
 )
 from .secureio import (
@@ -43,8 +46,8 @@ from .secureio import (
 CAT_FILE_CLOSE_TIMEOUT_SECONDS = 5.0
 CAT_FILE_READ_TIMEOUT_SECONDS = 30.0
 CAT_FILE_STDERR_LIMIT_BYTES = 8192
-CAT_FILE_TERMINATE_GRACE_SECONDS = 0.1
-CAT_FILE_TERMINATE_TIMEOUT_SECONDS = 2.0
+PROCESS_GROUP_TERMINATE_GRACE_SECONDS = 0.1
+PROCESS_GROUP_CLEANUP_TIMEOUT_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -113,38 +116,109 @@ def _terminate_process(
                 return None
 
     if group_anchor.pid != process.pid or group_anchor.pgid != process.pid:
-        raise ValueError("cat-file process group is not bound to its leader")
+        raise ValueError("process group is not bound to its leader")
 
-    deadline = time.monotonic() + CAT_FILE_TERMINATE_TIMEOUT_SECONDS
+    deadline = time.monotonic() + PROCESS_GROUP_CLEANUP_TIMEOUT_SECONDS
     signal_anchored_group(group_anchor, signal.SIGTERM)
     grace_deadline = min(
         deadline,
-        time.monotonic() + CAT_FILE_TERMINATE_GRACE_SECONDS,
+        time.monotonic() + PROCESS_GROUP_TERMINATE_GRACE_SECONDS,
     )
     while time.monotonic() < grace_deadline:
         time.sleep(min(0.01, grace_deadline - time.monotonic()))
     signal_anchored_group(group_anchor, signal.SIGKILL)
 
+    wait_terminal(process.pid, deadline=deadline)
+    _wait_anchored_group_without_other_members(group_anchor, deadline=deadline)
+    return _reap_process_group_leader(process, deadline=deadline)
+
+
+def _wait_anchored_group_without_other_members(
+    group_anchor: SpawnedProcess,
+    *,
+    deadline: float,
+) -> None:
+    while True:
+        members = anchored_group_members(group_anchor, deadline=deadline)
+        if not any(pid != group_anchor.pid for pid in members):
+            return
+        signal_anchored_group(group_anchor, signal.SIGKILL)
+        if time.monotonic() >= deadline:
+            raise TimeoutError("process-group members survived cleanup")
+        time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+
+
+def _settle_terminal_process_group(
+    process: subprocess.Popen[bytes],
+    *,
+    group_anchor: SpawnedProcess,
+) -> int:
+    if group_anchor.pid != process.pid or group_anchor.pgid != process.pid:
+        raise ValueError("process group is not bound to its leader")
+    deadline = time.monotonic() + PROCESS_GROUP_CLEANUP_TIMEOUT_SECONDS
+    # The leader is still an unreaped anchor here. Kill any original-group
+    # residue and prove that no other group member remains before its one reap.
+    signal_anchored_group(group_anchor, signal.SIGKILL)
+    _wait_anchored_group_without_other_members(group_anchor, deadline=deadline)
+    return _reap_process_group_leader(process, deadline=deadline)
+
+
+def _reap_process_group_leader(
+    process: subprocess.Popen[bytes],
+    *,
+    deadline: float,
+) -> int:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise TimeoutError("cat-file process-group termination timed out")
+        raise TimeoutError("process-group leader reap deadline expired")
     return process.wait(timeout=remaining)
 
 
 def _abort_unanchored_fresh_session(process: subprocess.Popen[bytes]) -> None:
+    deadline = time.monotonic() + PROCESS_GROUP_CLEANUP_TIMEOUT_SECONDS
     try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
+        # WNOWAIT proves this numeric PID is still our unreaped child before an
+        # identity-less cleanup is allowed to address its fresh process group.
+        terminal_status(process.pid)
         try:
-            process.kill()
+            os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
-            pass
-    try:
-        process.wait(timeout=CAT_FILE_TERMINATE_TIMEOUT_SECONDS)
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        except PermissionError:
+            if terminal_status(process.pid) is None:
+                raise
+        wait_terminal(process.pid, deadline=deadline)
+        while True:
+            members = process_group_members(process.pid, deadline=deadline)
+            if not any(pid != process.pid for pid in members):
+                break
+            os.killpg(process.pid, signal.SIGKILL)
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "unanchored fresh-session group members survived cleanup"
+                )
+            time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+        _reap_process_group_leader(process, deadline=deadline)
     finally:
         for stream in (process.stdin, process.stdout, process.stderr):
             if stream is not None and not stream.closed:
                 stream.close()
+
+
+def _bind_fresh_session(process: subprocess.Popen[bytes]) -> SpawnedProcess:
+    start_identity = process_start_identity(process.pid)
+    if os.getpgid(process.pid) != process.pid or os.getsid(process.pid) != process.pid:
+        raise ChildProcessError("fresh Git process session identity is invalid")
+    return SpawnedProcess(
+        pid=process.pid,
+        pgid=process.pid,
+        acknowledgement_fd=-1,
+        passed_fd_numbers=(),
+        start_identity=start_identity,
+    )
 
 
 def run_bounded(
@@ -165,38 +239,41 @@ def run_bounded(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         close_fds=True,
-        start_new_session=False,
+        start_new_session=True,
     )
-    if process.stdout is None or process.stderr is None:
-        _terminate_process(process)
-        raise RuntimeError("cannot create bounded Git pipes")
-    selector = selectors.DefaultSelector()
-    streams = {
-        process.stdout.fileno(): (process.stdout, stdout_limit),
-        process.stderr.fileno(): (process.stderr, stderr_limit),
-    }
-    buffers: dict[int, bytearray] = {fd: bytearray() for fd in streams}
-    for fd in streams:
-        os.set_blocking(fd, False)
-        selector.register(fd, selectors.EVENT_READ)
-    input_offset = 0
-    input_fd: int | None = None
-    if input_bytes is not None:
-        assert process.stdin is not None
-        input_fd = process.stdin.fileno()
-        os.set_blocking(input_fd, False)
-        selector.register(input_fd, selectors.EVENT_WRITE)
-    deadline = time.monotonic() + timeout
+    group_anchor: SpawnedProcess | None = None
+    selector: selectors.BaseSelector | None = None
+    returncode: int | None = None
     try:
+        group_anchor = _bind_fresh_session(process)
+        if (
+            process.stdout is None
+            or process.stderr is None
+            or (input_bytes is not None and process.stdin is None)
+        ):
+            raise RuntimeError("cannot create bounded Git pipes")
+        selector = selectors.DefaultSelector()
+        streams = {
+            process.stdout.fileno(): (process.stdout, stdout_limit),
+            process.stderr.fileno(): (process.stderr, stderr_limit),
+        }
+        buffers: dict[int, bytearray] = {fd: bytearray() for fd in streams}
+        for fd in streams:
+            os.set_blocking(fd, False)
+            selector.register(fd, selectors.EVENT_READ)
+        input_offset = 0
+        input_fd: int | None = None
+        if input_bytes is not None:
+            assert process.stdin is not None
+            input_fd = process.stdin.fileno()
+            os.set_blocking(input_fd, False)
+            selector.register(input_fd, selectors.EVENT_WRITE)
+        deadline = time.monotonic() + timeout
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("bounded Git command timed out")
             events = selector.select(min(remaining, 0.25))
-            if not events and process.poll() is not None:
-                events = [
-                    (key, selectors.EVENT_READ) for key in selector.get_map().values()
-                ]
             for key, _ in events:
                 fd = key.fd
                 if input_fd is not None and fd == input_fd:
@@ -227,24 +304,49 @@ def run_bounded(
                 if len(buffers[fd]) + len(chunk) > limit:
                     raise OverflowError("bounded Git output exceeded its byte cap")
                 buffers[fd].extend(chunk)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError("bounded Git command timed out before reap")
-        returncode = process.wait(timeout=remaining)
+            if returncode is None and terminal_status(process.pid) is not None:
+                if input_fd is not None:
+                    selector.unregister(input_fd)
+                    assert process.stdin is not None
+                    process.stdin.close()
+                    input_fd = None
+                returncode = _settle_terminal_process_group(
+                    process,
+                    group_anchor=group_anchor,
+                )
+        if returncode is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("bounded Git command timed out before reap")
+            wait_terminal(process.pid, deadline=deadline)
+            returncode = _settle_terminal_process_group(
+                process,
+                group_anchor=group_anchor,
+            )
         return (
             returncode,
             bytes(buffers[process.stdout.fileno()]),
             bytes(buffers[process.stderr.fileno()]),
         )
-    except BaseException:
-        _terminate_process(process)
+    except BaseException as error:
+        try:
+            if process.returncode is None:
+                if group_anchor is None:
+                    _abort_unanchored_fresh_session(process)
+                else:
+                    _terminate_process(process, group_anchor=group_anchor)
+        except BaseException as cleanup_error:
+            raise error from cleanup_error
         raise
     finally:
-        selector.close()
+        if selector is not None:
+            selector.close()
         if process.stdin is not None and not process.stdin.closed:
             process.stdin.close()
-        process.stdout.close()
-        process.stderr.close()
+        if process.stdout is not None and not process.stdout.closed:
+            process.stdout.close()
+        if process.stderr is not None and not process.stderr.closed:
+            process.stderr.close()
 
 
 def _drain_started_process(

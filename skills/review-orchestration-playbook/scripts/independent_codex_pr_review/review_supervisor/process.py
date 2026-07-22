@@ -15,6 +15,9 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 
+PROCESS_GROUP_MEMBER_CAP = 262_144
+
+
 @dataclass(frozen=True)
 class SpawnedProcess:
     pid: int
@@ -447,6 +450,108 @@ def anchored_group_exists(process: SpawnedProcess) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _linux_process_group_members(
+    process_group: int,
+    *,
+    deadline: float,
+) -> tuple[int, ...]:
+    members: set[int] = set()
+    inspected = 0
+    with os.scandir("/proc") as entries:
+        for entry in entries:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("process-group inspection deadline expired")
+            if not entry.name.isascii() or not entry.name.isdigit():
+                continue
+            inspected += 1
+            if inspected > PROCESS_GROUP_MEMBER_CAP:
+                raise ValueError("process table exceeds its inspection cap")
+            pid = int(entry.name)
+            descriptor: int | None = None
+            try:
+                descriptor = os.open(
+                    f"/proc/{pid}/stat",
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                )
+                raw = os.read(descriptor, 4097)
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+            if len(raw) > 4096:
+                raise ValueError("process stat record is oversized")
+            closing = raw.rfind(b")")
+            fields = raw[closing + 2 :].split() if closing >= 0 else ()
+            if len(fields) < 3:
+                raise ValueError("process stat record is malformed")
+            try:
+                observed_group = int(fields[2], 10)
+            except ValueError as error:
+                raise ValueError("process stat group is malformed") from error
+            if observed_group == process_group:
+                members.add(pid)
+    return tuple(sorted(members))
+
+
+def _darwin_process_group_members(
+    process_group: int,
+    *,
+    deadline: float,
+) -> tuple[int, ...]:
+    if time.monotonic() >= deadline:
+        raise TimeoutError("process-group inspection deadline expired")
+    library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    function = library.proc_listpids
+    function.argtypes = [
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    function.restype = ctypes.c_int
+    buffer = (ctypes.c_int * PROCESS_GROUP_MEMBER_CAP)()
+    buffer_bytes = ctypes.sizeof(buffer)
+    ctypes.set_errno(0)
+    result = function(2, process_group, buffer, buffer_bytes)
+    if time.monotonic() >= deadline:
+        raise TimeoutError("process-group inspection deadline expired")
+    if result < 0 or result % ctypes.sizeof(ctypes.c_int) != 0:
+        error_number = ctypes.get_errno()
+        raise ValueError(
+            "cannot enumerate Darwin process-group members"
+            + (f": {os.strerror(error_number)}" if error_number else "")
+        )
+    if result >= buffer_bytes:
+        raise ValueError("process group exceeds its inspection cap")
+    count = result // ctypes.sizeof(ctypes.c_int)
+    return tuple(sorted({pid for pid in buffer[:count] if pid > 0}))
+
+
+def process_group_members(
+    process_group: int,
+    *,
+    deadline: float,
+) -> tuple[int, ...]:
+    if process_group <= 1:
+        raise ValueError("process-group identity is unsafe")
+    system = platform.system()
+    if system == "Linux":
+        return _linux_process_group_members(process_group, deadline=deadline)
+    if system == "Darwin":
+        return _darwin_process_group_members(process_group, deadline=deadline)
+    raise ValueError("process-group enumeration is unsupported on this platform")
+
+
+def anchored_group_members(
+    process: SpawnedProcess,
+    *,
+    deadline: float,
+) -> tuple[int, ...]:
+    _require_live_group_anchor(process)
+    return process_group_members(process.pgid, deadline=deadline)
 
 
 def reap_anchored_group(
