@@ -20,7 +20,7 @@ import uuid
 from bisect import bisect_left
 from collections import Counter, deque
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, BinaryIO, Callable, Iterable, Iterator, Mapping
 
@@ -291,6 +291,8 @@ MAX_LEGACY_CONTAINMENT_CHECKS = 10_000_000
 MAX_SECRET_ASSIGNMENT_TRAILING_BYTES = 256
 MAX_SECRET_PREFIX_PROOF_BYTES = 4 * 1024 * 1024
 MAX_SECRET_PREFIX_PROOF_TOTAL_BYTES = 64 * 1024 * 1024
+MAX_SECRET_PREFIX_PROOF_WORK_BYTES = 512 * 1024 * 1024
+MAX_SECRET_PREFIX_PROOF_RANGES = 100_000
 MAX_REVIEW_PROMPT_BYTES = 64 * 1024
 MAX_SYNTHETIC_EVIDENCE_BYTES = 64 * 1024
 MAX_SYNTHETIC_EVIDENCE_ENTRIES = 512
@@ -785,9 +787,31 @@ class SecretScanResult:
 
 
 @dataclass
-class SecretScanBudget:
+class _SharedPrefixProofWorkBudget:
     remaining: int
-    remaining_prefix_proof_bytes: int = MAX_SECRET_PREFIX_PROOF_TOTAL_BYTES
+
+
+class SecretScanBudget:
+    def __init__(
+        self,
+        remaining: int,
+        remaining_prefix_proof_bytes: int = MAX_SECRET_PREFIX_PROOF_TOTAL_BYTES,
+        remaining_prefix_proof_work_bytes: int = MAX_SECRET_PREFIX_PROOF_WORK_BYTES,
+        *,
+        _shared_prefix_proof_work_budget: _SharedPrefixProofWorkBudget | None = None,
+        _allow_prefix_proof_overdraft: bool = False,
+    ) -> None:
+        self.remaining = remaining
+        self.remaining_prefix_proof_bytes = remaining_prefix_proof_bytes
+        self._shared_prefix_proof_work_budget = (
+            _shared_prefix_proof_work_budget
+            or _SharedPrefixProofWorkBudget(remaining_prefix_proof_work_bytes)
+        )
+        self._allow_prefix_proof_overdraft = _allow_prefix_proof_overdraft
+
+    @property
+    def remaining_prefix_proof_work_bytes(self) -> int:
+        return self._shared_prefix_proof_work_budget.remaining
 
     @classmethod
     def default(cls) -> "SecretScanBudget":
@@ -800,32 +824,201 @@ class SecretScanBudget:
             )
         self.remaining -= 1
 
-    def consume_prefix_proof(self, byte_count: int) -> bool:
+    def consume_prefix_proof(
+        self,
+        byte_count: int,
+        *,
+        work_byte_count: int,
+    ) -> bool:
         if byte_count > MAX_SECRET_PREFIX_PROOF_BYTES:
             return False
-        if byte_count > self.remaining_prefix_proof_bytes:
+        if (
+            byte_count > self.remaining_prefix_proof_bytes
+            and not self._allow_prefix_proof_overdraft
+        ):
             raise ReviewError(
                 "external review content exceeds the sensitive scanner prefix "
                 "proof limit"
             )
+        if work_byte_count > self.remaining_prefix_proof_work_bytes:
+            raise ReviewError(
+                "external review content exceeds the sensitive scanner prefix "
+                "proof work limit"
+            )
         self.remaining_prefix_proof_bytes -= byte_count
+        self._shared_prefix_proof_work_budget.remaining -= work_byte_count
         return True
 
-    def clone(self) -> "SecretScanBudget":
+    def clone(
+        self,
+        *,
+        allow_prefix_proof_overdraft: bool = False,
+    ) -> "SecretScanBudget":
         return SecretScanBudget(
             self.remaining,
             self.remaining_prefix_proof_bytes,
+            _shared_prefix_proof_work_budget=(self._shared_prefix_proof_work_budget),
+            _allow_prefix_proof_overdraft=allow_prefix_proof_overdraft,
         )
 
     def commit_from(self, transaction: "SecretScanBudget") -> None:
+        if transaction.remaining_prefix_proof_bytes < 0:
+            raise ReviewError(
+                "external review content exceeds the sensitive scanner prefix "
+                "proof limit"
+            )
         if (
             transaction.remaining > self.remaining
             or transaction.remaining_prefix_proof_bytes
             > self.remaining_prefix_proof_bytes
+            or transaction._shared_prefix_proof_work_budget
+            is not self._shared_prefix_proof_work_budget
         ):
             raise ReviewError("sensitive scanner budget transaction is invalid")
         self.remaining = transaction.remaining
         self.remaining_prefix_proof_bytes = transaction.remaining_prefix_proof_bytes
+
+
+@dataclass
+class _PrefixProofRangeTracker:
+    """Charge each physical proof byte once within one streamed value."""
+
+    event_budget: SecretScanBudget
+    coordinate_offset: int = 0
+    ranges: list[tuple[int, int]] = field(default_factory=list)
+
+    def clone(
+        self,
+        event_budget: SecretScanBudget,
+        *,
+        coordinate_offset: int,
+    ) -> "_PrefixProofRangeTracker":
+        if type(coordinate_offset) is not int or coordinate_offset < 0:
+            raise ReviewError("sensitive scanner produced an invalid proof offset")
+        return _PrefixProofRangeTracker(
+            event_budget,
+            coordinate_offset=coordinate_offset,
+            ranges=list(self.ranges),
+        )
+
+    def offset_view(self, coordinate_offset: int) -> "_PrefixProofRangeTracker":
+        if type(coordinate_offset) is not int or coordinate_offset < 0:
+            raise ReviewError("sensitive scanner produced an invalid proof offset")
+        return _PrefixProofRangeTracker(
+            self.event_budget,
+            coordinate_offset=self.coordinate_offset + coordinate_offset,
+            ranges=self.ranges,
+        )
+
+    def commit_from(self, transaction: "_PrefixProofRangeTracker") -> None:
+        transaction_index = 0
+        for start, end in self.ranges:
+            while (
+                transaction_index < len(transaction.ranges)
+                and transaction.ranges[transaction_index][1] <= start
+            ):
+                transaction_index += 1
+            if (
+                transaction_index >= len(transaction.ranges)
+                or transaction.ranges[transaction_index][0] > start
+                or transaction.ranges[transaction_index][1] < end
+            ):
+                raise ReviewError("sensitive scanner proof transaction is invalid")
+        if len(transaction.ranges) > MAX_SECRET_PREFIX_PROOF_RANGES:
+            raise ReviewError("sensitive scanner proof transaction is invalid")
+        transaction_budget = transaction.event_budget
+        if transaction_budget.remaining_prefix_proof_bytes < 0:
+            raise ReviewError(
+                "external review content exceeds the sensitive scanner prefix "
+                "proof limit"
+            )
+        if (
+            transaction_budget.remaining > self.event_budget.remaining
+            or transaction_budget.remaining_prefix_proof_bytes
+            > self.event_budget.remaining_prefix_proof_bytes
+            or transaction_budget._shared_prefix_proof_work_budget
+            is not self.event_budget._shared_prefix_proof_work_budget
+        ):
+            raise ReviewError("sensitive scanner budget transaction is invalid")
+        proof_budget_delta = (
+            self.event_budget.remaining_prefix_proof_bytes
+            - transaction_budget.remaining_prefix_proof_bytes
+        )
+        range_growth = sum(end - start for start, end in transaction.ranges) - sum(
+            end - start for start, end in self.ranges
+        )
+        if proof_budget_delta != range_growth:
+            raise ReviewError("sensitive scanner proof transaction is invalid")
+        committed_ranges = list(transaction.ranges)
+        self.event_budget.remaining = transaction_budget.remaining
+        self.event_budget.remaining_prefix_proof_bytes = (
+            transaction_budget.remaining_prefix_proof_bytes
+        )
+        self.ranges = committed_ranges
+
+    def consume(
+        self,
+        start: int,
+        end: int,
+        *,
+        proof_byte_count: int | None = None,
+    ) -> bool:
+        if not (
+            type(start) is int
+            and type(end) is int
+            and 0 <= start <= end
+            and type(self.coordinate_offset) is int
+            and self.coordinate_offset >= 0
+            and (
+                proof_byte_count is None
+                or (
+                    type(proof_byte_count) is int
+                    and 0 <= proof_byte_count <= end - start
+                )
+            )
+        ):
+            raise ReviewError("sensitive scanner produced an invalid proof range")
+        logical_bytes = end - start if proof_byte_count is None else proof_byte_count
+        if logical_bytes > MAX_SECRET_PREFIX_PROOF_BYTES:
+            return False
+        if start == end:
+            return True
+        start += self.coordinate_offset
+        end += self.coordinate_offset
+
+        insert_at = bisect_left(self.ranges, (start, -1))
+        if insert_at > 0 and self.ranges[insert_at - 1][1] >= start:
+            insert_at -= 1
+        merged_start = start
+        merged_end = end
+        uncovered_cursor = start
+        newly_proved_bytes = 0
+        remove_until = insert_at
+        while remove_until < len(self.ranges) and self.ranges[remove_until][0] <= end:
+            range_start, range_end = self.ranges[remove_until]
+            if range_start > uncovered_cursor:
+                newly_proved_bytes += min(range_start, end) - uncovered_cursor
+            uncovered_cursor = max(uncovered_cursor, min(range_end, end))
+            merged_start = min(merged_start, range_start)
+            merged_end = max(merged_end, range_end)
+            remove_until += 1
+        if uncovered_cursor < end:
+            newly_proved_bytes += end - uncovered_cursor
+        if newly_proved_bytes > logical_bytes:
+            raise ReviewError("sensitive scanner proof accounting is inconsistent")
+        resulting_range_count = len(self.ranges) - (remove_until - insert_at) + 1
+        if resulting_range_count > MAX_SECRET_PREFIX_PROOF_RANGES:
+            raise ReviewError(
+                "external review content exceeds the sensitive scanner prefix "
+                "proof range limit"
+            )
+        if not self.event_budget.consume_prefix_proof(
+            newly_proved_bytes,
+            work_byte_count=logical_bytes,
+        ):
+            return False
+        self.ranges[insert_at:remove_until] = [(merged_start, merged_end)]
+        return True
 
 
 @dataclass
@@ -7506,6 +7699,7 @@ def _secret_assignment_rhs_is_closed(
     prefix_context_complete: bool,
     suffix_context_complete: bool,
     event_budget: SecretScanBudget,
+    prefix_proof_tracker: _PrefixProofRangeTracker | None = None,
     closure_recorder: Callable[[int], None] | None = None,
     literal_rhs_recorder: (
         Callable[[int, int | None, bytes, bytes, int | None], None] | None
@@ -7522,6 +7716,9 @@ def _secret_assignment_rhs_is_closed(
         and 0 <= assignment_line_start <= assignment_start
     ):
         raise ReviewError("sensitive scanner produced an invalid RHS proof range")
+    proof_range_tracker = prefix_proof_tracker or _PrefixProofRangeTracker(event_budget)
+    if proof_range_tracker.event_budget is not event_budget:
+        raise ReviewError("sensitive scanner proof tracker uses the wrong budget")
     proof_suffix_context_complete = suffix_context_complete and proof_end == len(value)
     prefix_context_cache = _AssignmentPrefixContextCache(
         assignment_prefix_end=assignment_end,
@@ -7566,8 +7763,7 @@ def _secret_assignment_rhs_is_closed(
         inspected_end = max(inspected_end, min(end, proof_end))
 
     def finish(closed: bool) -> bool:
-        proof_bytes = max(0, inspected_end - assignment_end)
-        if not event_budget.consume_prefix_proof(proof_bytes):
+        if not proof_range_tracker.consume(assignment_end, inspected_end):
             raise ReviewError("sensitive scanner exceeded one RHS proof window")
         if closed and closure_recorder is not None:
             closure_recorder(inspected_end)
@@ -7592,6 +7788,7 @@ def _secret_assignment_rhs_is_closed(
                 prefix_context_complete=prefix_context_complete,
                 suffix_context_complete=proof_suffix_context_complete,
                 event_budget=event_budget,
+                prefix_proof_tracker=proof_range_tracker,
                 maximum_end=proof_end,
                 inspection_recorder=record_tail_inspected,
                 prefix_context_cache=prefix_context_cache,
@@ -7610,6 +7807,7 @@ def _secret_assignment_rhs_is_closed(
                 prefix_context_complete=prefix_context_complete,
                 suffix_context_complete=True,
                 event_budget=event_budget,
+                prefix_proof_tracker=proof_range_tracker,
                 maximum_end=closer_start + 1,
                 matching_external_closer_only=True,
                 prefix_context_cache=prefix_context_cache,
@@ -7992,6 +8190,7 @@ def _quoted_assignment_may_accept(
     prefix_context_complete: bool = True,
     suffix_context_complete: bool = True,
     event_budget: SecretScanBudget,
+    prefix_proof_tracker: _PrefixProofRangeTracker | None = None,
     maximum_end: int | None = None,
     inspection_recorder: Callable[[int], None] | None = None,
     matching_external_closer_only: bool = False,
@@ -8010,6 +8209,9 @@ def _quoted_assignment_may_accept(
         raise ReviewError(
             "sensitive scanner produced an invalid cached assignment prefix"
         )
+    proof_range_tracker = prefix_proof_tracker or _PrefixProofRangeTracker(event_budget)
+    if proof_range_tracker.event_budget is not event_budget:
+        raise ReviewError("sensitive scanner proof tracker uses the wrong budget")
     suffix_context_complete = suffix_context_complete and logical_end == len(value)
     cursor = assignment_end
     inspected = 0
@@ -8042,7 +8244,7 @@ def _quoted_assignment_may_accept(
             match_line_start,
             prefix_context_complete=prefix_context_complete,
         )
-        if not event_budget.consume_prefix_proof(match_line_start - lower_bound):
+        if not proof_range_tracker.consume(lower_bound, match_line_start):
             return False
         return hunk_context is not None
 
@@ -8137,7 +8339,7 @@ def _quoted_assignment_may_accept(
             record_size = record_end - cursor
             if skipped_diff_bytes + record_size > MAX_SECRET_PREFIX_PROOF_BYTES:
                 return False, skipped
-            if not event_budget.consume_prefix_proof(record_size):
+            if not proof_range_tracker.consume(cursor, record_end):
                 return False, skipped
             if record_end == logical_end and not suffix_context_complete:
                 raise _IncompleteSecretScanSuffix(proof_retention_start)
@@ -8406,8 +8608,10 @@ def _quoted_assignment_may_accept(
         if not 0 <= source_proof_bytes <= MAX_SECRET_PREFIX_PROOF_BYTES:
             return None
         newly_proved_bytes = source_proof_bytes - diff_source_proof_bytes
-        if newly_proved_bytes > 0 and not event_budget.consume_prefix_proof(
-            newly_proved_bytes
+        if newly_proved_bytes > 0 and not proof_range_tracker.consume(
+            hunk_start,
+            prefix_end,
+            proof_byte_count=source_proof_bytes,
         ):
             return None
         diff_source_proof_bytes = max(
@@ -8440,8 +8644,9 @@ def _quoted_assignment_may_accept(
         else:
             if not prefix_context_complete:
                 return None
-            if not event_budget.consume_prefix_proof(
-                assignment_start - prefix_proof_start
+            if not proof_range_tracker.consume(
+                prefix_proof_start,
+                assignment_start,
             ):
                 return None
             prefix = value[prefix_proof_start:assignment_start]
@@ -8627,7 +8832,7 @@ def _quoted_assignment_may_accept(
         else:
             if not prefix_context_complete:
                 return False
-            if not event_budget.consume_prefix_proof(cursor - prefix_proof_start):
+            if not proof_range_tracker.consume(prefix_proof_start, cursor):
                 return False
             prefix = value[prefix_proof_start:cursor]
         try:
@@ -9380,6 +9585,7 @@ def _oversized_assignment_is_exact_specific_candidate(
     prefix_context_complete: bool,
     suffix_context_complete: bool,
     event_budget: SecretScanBudget,
+    prefix_proof_tracker: _PrefixProofRangeTracker,
 ) -> bool:
     for specific_end in long_specific_candidate_ends.get(candidate_start, ()):
         if specific_end < prefix_end:
@@ -9394,6 +9600,7 @@ def _oversized_assignment_is_exact_specific_candidate(
                     prefix_context_complete=prefix_context_complete,
                     suffix_context_complete=suffix_context_complete,
                     event_budget=event_budget,
+                    prefix_proof_tracker=prefix_proof_tracker,
                 )
             ):
                 return True
@@ -9427,10 +9634,16 @@ def _iter_secret_events(
     prefix_context_complete: bool = True,
     suffix_context_complete: bool = True,
     _event_budget: SecretScanBudget | None = None,
+    _prefix_proof_tracker: _PrefixProofRangeTracker | None = None,
     _specific_spans: set[tuple[int, int, bytes]] | None = None,
     _capture_only_assignment_spans: set[tuple[int, int, bytes]] | None = None,
 ) -> Iterator[tuple[str, bytes | None, int, bool, int | None, int | None]]:
     event_budget = _event_budget or SecretScanBudget.default()
+    prefix_proof_tracker = _prefix_proof_tracker or _PrefixProofRangeTracker(
+        event_budget
+    )
+    if prefix_proof_tracker.event_budget is not event_budget:
+        raise ReviewError("sensitive scanner proof tracker uses the wrong budget")
 
     def end_is_committable(end: int) -> bool:
         return minimum_end < end and (maximum_end is None or end <= maximum_end)
@@ -9598,6 +9811,7 @@ def _iter_secret_events(
                         prefix_context_complete=prefix_context_complete,
                         suffix_context_complete=suffix_context_complete,
                         event_budget=event_budget,
+                        prefix_proof_tracker=prefix_proof_tracker,
                     )
                 )
             except _IncompleteSecretScanSuffix as incomplete:
@@ -9701,6 +9915,7 @@ def _iter_secret_events(
                     prefix_context_complete=prefix_context_complete,
                     suffix_context_complete=suffix_context_complete,
                     event_budget=event_budget,
+                    prefix_proof_tracker=prefix_proof_tracker,
                     maximum_end=quoted_proof_end,
                 )
             )
@@ -9750,6 +9965,9 @@ def _iter_secret_events(
                         suffix_context_complete and local_end == len(value)
                     ),
                     event_budget=event_budget,
+                    prefix_proof_tracker=prefix_proof_tracker.offset_view(
+                        match.start()
+                    ),
                 )
             except _IncompleteSecretScanSuffix:
                 local_may_accept = False
@@ -9857,6 +10075,7 @@ def _iter_secret_events(
                 prefix_context_complete=prefix_context_complete,
                 suffix_context_complete=suffix_context_complete,
                 event_budget=event_budget,
+                prefix_proof_tracker=prefix_proof_tracker,
                 closure_recorder=recorded_closure_frontiers.append,
                 literal_rhs_recorder=lambda start, end, delimiter, prefix, diff_side: (
                     recorded_literal_rhs.append(
@@ -10162,7 +10381,8 @@ def _iter_secret_events(
                     ),
                 )
             continue
-        event_budget.consume_prefix_proof(proof_end - assignment_match.end())
+        if not prefix_proof_tracker.consume(assignment_match.end(), proof_end):
+            raise ReviewError("sensitive scanner exceeded one RHS proof window")
         assignment_retention_start = _assignment_proof_retention_start(
             value,
             assignment_start=assignment_match.start(),
@@ -10546,6 +10766,7 @@ def _iter_secret_events(
                     prefix_context_complete=prefix_context_complete,
                     suffix_context_complete=proof_suffix_context_complete,
                     event_budget=event_budget,
+                    prefix_proof_tracker=prefix_proof_tracker,
                     maximum_end=proof_end,
                     inspection_recorder=lambda inspected: (
                         assignment_closure_frontiers.append(closing_end + inspected)
@@ -10906,6 +11127,7 @@ def _scan_secret_value(
     suffix_context_complete: bool = True,
     _accepted_index: AcceptedValueIndex | None = None,
     _event_budget: SecretScanBudget | None = None,
+    _prefix_proof_tracker: _PrefixProofRangeTracker | None = None,
     _exact_index: ExactValueIndex | None = None,
     _occurrence_budget: LegacyOccurrenceBudget | None = None,
     exact_only: bool = False,
@@ -10963,6 +11185,7 @@ def _scan_secret_value(
         prefix_context_complete=prefix_context_complete,
         suffix_context_complete=suffix_context_complete,
         _event_budget=event_budget,
+        _prefix_proof_tracker=_prefix_proof_tracker,
         _specific_spans=specific_spans,
         _capture_only_assignment_spans=capture_only_assignment_spans,
     ):
@@ -11097,6 +11320,7 @@ def _stream_secret_scan(
     accepted = tuple(accepted_values)
     accepted_index = _accepted_index or _index_accepted_values(accepted)
     event_budget = _event_budget or SecretScanBudget.default()
+    prefix_proof_tracker = _PrefixProofRangeTracker(event_budget)
     exact_values = tuple(raw_occurrence_values)
     exact_index = _exact_index or _index_exact_values(exact_values)
     exact_retention_length = max(
@@ -11232,9 +11456,13 @@ def _stream_secret_scan(
         local_minimum = max(0, committed_end - pending_offset)
         local_maximum = max(0, next_committed_end - pending_offset)
         # A suffix scan is speculative until its full commit range is proven.
-        # Only the complete scan, or its safe-prefix replay, may spend the
-        # caller-visible logical budget.
-        pending_budget = event_budget.clone()
+        # Only the complete scan, or its safe-prefix replay, may commit event
+        # and coverage budget. Actual proof work remains globally charged.
+        pending_budget = event_budget.clone(allow_prefix_proof_overdraft=True)
+        pending_proof_tracker = prefix_proof_tracker.clone(
+            pending_budget,
+            coordinate_offset=pending_offset,
+        )
         capture_only_legacy_evidence = (
             _continue_after_blocking
             and capture_accepted_candidates
@@ -11255,6 +11483,7 @@ def _stream_secret_scan(
             suffix_context_complete=at_end,
             _accepted_index=accepted_index,
             _event_budget=pending_budget,
+            _prefix_proof_tracker=pending_proof_tracker,
             _continue_after_blocking=_continue_after_blocking,
             _capture_only_legacy_evidence=capture_only_legacy_evidence,
         )
@@ -11273,6 +11502,10 @@ def _stream_secret_scan(
             )
             if safe_local_maximum > local_minimum:
                 committed_budget = event_budget.clone()
+                committed_proof_tracker = prefix_proof_tracker.clone(
+                    committed_budget,
+                    coordinate_offset=pending_offset,
+                )
                 committed_scan = _scan_secret_value(
                     pending,
                     accepted_values=accepted,
@@ -11286,6 +11519,7 @@ def _stream_secret_scan(
                     suffix_context_complete=at_end,
                     _accepted_index=accepted_index,
                     _event_budget=committed_budget,
+                    _prefix_proof_tracker=committed_proof_tracker,
                     _continue_after_blocking=_continue_after_blocking,
                     _capture_only_legacy_evidence=capture_only_legacy_evidence,
                 )
@@ -11293,13 +11527,13 @@ def _stream_secret_scan(
                     raise ReviewError(
                         "sensitive scanner could not establish a complete diff prefix"
                     )
-                event_budget.commit_from(committed_budget)
+                prefix_proof_tracker.commit_from(committed_proof_tracker)
                 result.merge(committed_scan)
             # Commit the complete prefix, but retain the deferred assignment
             # inside the overlap so it is re-evaluated with the next read.
             next_committed_end = pending_offset + safe_local_maximum
         else:
-            event_budget.commit_from(pending_budget)
+            prefix_proof_tracker.commit_from(pending_proof_tracker)
             result.merge(pending_scan)
         if result.blocking_rule is not None and not _continue_after_blocking:
             blocked = True

@@ -6,6 +6,8 @@ Public review orchestration, synthetic fixture selection, and local delivery gat
 
 The canonical Claude lane captures bounded raw stdout outside the model-visible worktree and must pass it through [validate_claude_stream.py](skills/review-orchestration-playbook/scripts/validate_claude_stream.py) with the parent-private accepted preflight result, exact cwd, model, and authentication source. That evidence must be a current-user-owned, single-link regular file outside the reviewer worktree, with no group or world permission bits. The validator binds the selected release plus the current compatibility-profile, audited-baseline, and capability-contract source digests before checking the stream. Only `classification: accepted` supplies findings; prose inspection, partial output, or an ad hoc parser does not satisfy named double/triple review, and acceptance does not prove the final merged sandbox.
 
+Artifact trust and review meaning are separate. The validator continues to return the accepted terminal result verbatim; only afterward does [review_result.py](skills/review-orchestration-playbook/scripts/review_runtime/review_result.py) record `review_outcome` and `presentation`. Exact sentinel-only output is `canonical-clean`, while a concise non-actionable coverage summary ending with exact `No findings.` is `extended-clean`. Actionable content overrides a contradictory sentinel, and uncertain or nonconforming prose never becomes clean. Presentation alone never triggers an automatic rerun; reruns require invalidated range/head evidence, a finding fix on a new head, or an explicit request.
+
 ## Named Review Shapes
 
 A parent-owned control-order record must prove that both required local lanes
