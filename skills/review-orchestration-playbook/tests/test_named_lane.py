@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import contextlib
 import hashlib
 import io
@@ -532,10 +533,11 @@ class NamedLaneGuardTest(unittest.TestCase):
             "pathlib.Path(expected_fd_exec).read_bytes():\n"
             "    raise RuntimeError('fd_exec bytes were not bound exactly')\n"
             "if namespace['_MAIN_ARGV'] != ('--sentinel',):\n"
-            "    raise RuntimeError(f'arguments not forwarded: "
-            "{namespace['_MAIN_ARGV']!r}')\n"
+            "    raise RuntimeError(f\"arguments not forwarded: "
+            "{namespace['_MAIN_ARGV']!r}\")\n"
             "print(json.dumps(observed, sort_keys=True))\n"
         )
+        ast.parse(body, feature_version=(3, 10))
         completed = subprocess.run(
             self.guard_probe_command(
                 guard,
@@ -760,10 +762,11 @@ class NamedLaneGuardTest(unittest.TestCase):
             "if loaded != expected_loaded:\n"
             "    raise RuntimeError(f'unexpected validator closure: {loaded}')\n"
             "if namespace['_MAIN_ARGV'] != ('--sentinel',):\n"
-            "    raise RuntimeError(f'arguments not forwarded: "
-            "{namespace['_MAIN_ARGV']!r}')\n"
+            "    raise RuntimeError(f\"arguments not forwarded: "
+            "{namespace['_MAIN_ARGV']!r}\")\n"
             "print(module.__spec__.origin)\n"
         )
+        ast.parse(body, feature_version=(3, 10))
         completed = subprocess.run(
             self.guard_probe_command(
                 guard,
