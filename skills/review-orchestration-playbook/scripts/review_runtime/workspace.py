@@ -10,7 +10,7 @@ import math
 import os
 import pathlib
 import re
-import shutil
+import selectors
 import signal
 import stat
 import subprocess
@@ -19,7 +19,7 @@ import time
 import uuid
 from bisect import bisect_left
 from collections import Counter, deque
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, BinaryIO, Callable, Iterable, Iterator, Mapping
@@ -33,7 +33,6 @@ from .common import (
     is_relative_to,
     resolve_git,
     restore_signal_mask,
-    run,
     write_text_atomic,
 )
 from .prompt import build_review_prompt
@@ -276,6 +275,36 @@ MAX_SNAPSHOT_BLOB_BYTES = 64 * 1024 * 1024
 MAX_SNAPSHOT_BYTES = 512 * 1024 * 1024
 MAX_SNAPSHOT_ENTRIES = 100_000
 MAX_TREE_METADATA_BYTES = 128 * 1024 * 1024
+MAX_PRIVATE_OBJECT_LIST_BYTES = 128 * 1024 * 1024
+MAX_ENDPOINT_COMMIT_BYTES = 4 * 1024 * 1024
+# Each of base, head, and a WIP snapshot can contain one content object and one
+# tree object per entry, plus endpoint commits and a fixed entry margin.
+MAX_PRIVATE_OBJECT_ENTRIES = 6 * MAX_SNAPSHOT_ENTRIES + 16
+MAX_PRIVATE_OBJECT_BYTES = 2 * (
+    MAX_SNAPSHOT_BYTES + MAX_TREE_METADATA_BYTES + MAX_ENDPOINT_COMMIT_BYTES
+)
+# Bound pack framing, per-object compression expansion, and checksums separately
+# from the uncompressed endpoint objects.
+MAX_PRIVATE_PACK_OVERHEAD_BYTES = MAX_PRIVATE_OBJECT_LIST_BYTES
+MAX_PRIVATE_PACK_BYTES = MAX_PRIVATE_OBJECT_BYTES + MAX_PRIVATE_PACK_OVERHEAD_BYTES
+# WIP capture can add one snapshot of blobs plus tree objects. Its encoding
+# margin and the generated endpoint/WIP pack sidecars remain separately bounded.
+MAX_PRIVATE_WIP_STORAGE_BYTES = (
+    MAX_SNAPSHOT_BYTES + MAX_TREE_METADATA_BYTES + MAX_PRIVATE_PACK_OVERHEAD_BYTES
+)
+MAX_PRIVATE_PACK_SIDECAR_BYTES = 2 * MAX_PRIVATE_OBJECT_LIST_BYTES
+MAX_PRIVATE_STORAGE_BYTES = (
+    MAX_PRIVATE_PACK_BYTES
+    + MAX_PRIVATE_WIP_STORAGE_BYTES
+    + MAX_PRIVATE_PACK_SIDECAR_BYTES
+)
+MAX_PRIVATE_LOOSE_OBJECT_BYTES = (
+    MAX_TREE_METADATA_BYTES + MAX_PRIVATE_PACK_OVERHEAD_BYTES
+)
+# Signature scan material adds strict decoded bytes to content already bounded by
+# MAX_ENDPOINT_COMMIT_BYTES. Base64 decoding can add at most three bytes per four
+# joined body bytes, so twice the endpoint limit is a conservative total bound.
+MAX_ENDPOINT_COMMIT_SCAN_BYTES = 2 * MAX_ENDPOINT_COMMIT_BYTES
 MAX_DIFF_BYTES = 128 * 1024 * 1024
 MAX_CHANGED_METADATA_BYTES = 128 * 1024 * 1024
 MAX_CHANGED_ENTRIES = 100_000
@@ -296,7 +325,27 @@ MAX_SECRET_PREFIX_PROOF_RANGES = 100_000
 MAX_REVIEW_PROMPT_BYTES = 64 * 1024
 MAX_SYNTHETIC_EVIDENCE_BYTES = 64 * 1024
 MAX_SYNTHETIC_EVIDENCE_ENTRIES = 512
+MAX_SOURCE_STATUS_BYTES = MAX_CHANGED_METADATA_BYTES
+MAX_SOURCE_STATUS_RECORDS = 3 * MAX_CHANGED_ENTRIES + 4096
+MAX_SOURCE_TRACKED_PATH_BYTES = MAX_CHANGED_METADATA_BYTES
+MAX_SOURCE_TRACKED_PATH_RECORDS = MAX_CHANGED_ENTRIES
+MAX_SOURCE_INDEX_METADATA_BYTES = MAX_TREE_METADATA_BYTES
+MAX_SOURCE_INDEX_RECORDS = MAX_SNAPSHOT_ENTRIES
+MAX_SOURCE_INFO_EXCLUDE_BYTES = 1024 * 1024
+MAX_SOURCE_GIT_QUERY_BYTES = 64 * 1024
+MAX_SOURCE_GIT_STDERR_BYTES = 64 * 1024
+SOURCE_GIT_TIMEOUT_SECONDS = 120.0
+SOURCE_WIP_CAPTURE_TIMEOUT_SECONDS = 300.0
+MAX_SOURCE_WIP_GIT_INVOCATIONS = 16
+SOURCE_WIP_PARSE_DEADLINE_CHECK_BYTES = 64 * 1024
+MAX_PRIVATE_GIT_STDERR_BYTES = 64 * 1024
+MAX_PRIVATE_FSCK_OUTPUT_BYTES = 4 * 1024 * 1024
+PRIVATE_GIT_TIMEOUT_SECONDS = 300.0
+REVIEW_ROOT_BASE = pathlib.Path("/tmp")
+REVIEW_USER_ROOT_PREFIX = "codex-isolated-review-uid-"
+REVIEW_CONTAINER_PATTERN = re.compile(r"isolated-review-[0-9]{8}-[0-9]{6}-[0-9a-f]{10}")
 MAX_REVIEW_CLEANUP_DEPTH = 256
+PRIVATE_REVIEW_GIT_CLEANUP_DEPTH = 32
 REVIEW_CLEANUP_QUARANTINE_PREFIX = ".codex-review-cleanup-"
 REVIEW_CLEANUP_LOCK_NAME = "cleanup.lock"
 REVIEW_RUNNER_LOCK_NAME = "runner.lock"
@@ -516,34 +565,63 @@ class ReviewWorkspace:
     diff_file: pathlib.Path
     prompt_file: pathlib.Path
     private_cleanup: PrivateCleanupEvidence
+    git_dir: pathlib.Path | None = None
+    content_variant: str = "head"
+    snapshot_tree_sha: str = ""
+    scope_identity: str = ""
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        value: dict[str, Any] = {
             "base_ref": self.base_ref,
             "container_dir": str(self.container_dir),
+            "content_variant": self.content_variant,
             "diff_file": str(self.diff_file),
             "head_ref": self.head_ref,
             "private_cleanup": self.private_cleanup.to_json(),
             "prompt_file": str(self.prompt_file),
+            "scope_identity": self.scope_identity,
+            "snapshot_tree_sha": self.snapshot_tree_sha,
             "source_root": str(self.source_root),
             "workspace_root": str(self.workspace_root),
         }
+        if self.git_dir is not None:
+            value["git_dir"] = str(self.git_dir)
+        return value
+
+    def has_complete_scope_identity(self) -> bool:
+        if (
+            self.content_variant not in {"head", "source-wip"}
+            or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", self.snapshot_tree_sha)
+            is None
+            or re.fullmatch(r"[0-9a-f]{64}", self.scope_identity) is None
+        ):
+            return False
+        return self.scope_identity == _review_scope_identity(
+            base_sha=self.base_ref,
+            head_sha=self.head_ref,
+            content_variant=self.content_variant,
+            snapshot_tree_sha=self.snapshot_tree_sha,
+        )
 
     @classmethod
     def from_json(cls, value: dict[str, Any]) -> "ReviewWorkspace":
-        expected_fields = {
+        required_fields = {
             "base_ref",
             "container_dir",
+            "content_variant",
             "diff_file",
             "head_ref",
             "private_cleanup",
             "prompt_file",
+            "scope_identity",
+            "snapshot_tree_sha",
             "source_root",
             "workspace_root",
         }
-        if set(value) != expected_fields:
+        allowed_fields = required_fields | {"git_dir"}
+        if not required_fields <= set(value) or not set(value) <= allowed_fields:
             raise ValueError("workspace fields are invalid")
-        text_fields = expected_fields - {"private_cleanup"}
+        text_fields = required_fields - {"private_cleanup"}
         if any(not isinstance(value[field], str) for field in text_fields):
             raise ValueError("workspace text fields are invalid")
         return cls(
@@ -558,6 +636,64 @@ class ReviewWorkspace:
                 value["private_cleanup"],
                 require_all=True,
             ),
+            git_dir=(
+                pathlib.Path(value["git_dir"])
+                if isinstance(value.get("git_dir"), str) and value["git_dir"]
+                else pathlib.Path(value["container_dir"]) / "review.git"
+            ),
+            content_variant=value["content_variant"],
+            snapshot_tree_sha=value["snapshot_tree_sha"],
+            scope_identity=value["scope_identity"],
+        )
+
+
+@dataclass(frozen=True)
+class SourceLocalReviewWorkspace(ReviewWorkspace):
+    """Modern v2-v4 state whose container remains under source `.codex-tmp`."""
+
+    @classmethod
+    def from_json(cls, value: dict[str, Any]) -> "SourceLocalReviewWorkspace":
+        required_fields = {
+            "base_ref",
+            "container_dir",
+            "diff_file",
+            "head_ref",
+            "private_cleanup",
+            "prompt_file",
+            "source_root",
+            "workspace_root",
+        }
+        optional_fields = {"git_dir"}
+        if not required_fields <= set(value) or not set(value) <= (
+            required_fields | optional_fields
+        ):
+            raise ValueError("legacy workspace fields are invalid")
+        text_fields = (required_fields - {"private_cleanup"}) | (
+            set(value) & optional_fields
+        )
+        if any(not isinstance(value[field], str) for field in text_fields):
+            raise ValueError("legacy workspace text fields are invalid")
+        container_dir = pathlib.Path(value["container_dir"])
+        return cls(
+            source_root=pathlib.Path(value["source_root"]),
+            container_dir=container_dir,
+            workspace_root=pathlib.Path(value["workspace_root"]),
+            base_ref=value["base_ref"],
+            head_ref=value["head_ref"],
+            diff_file=pathlib.Path(value["diff_file"]),
+            prompt_file=pathlib.Path(value["prompt_file"]),
+            private_cleanup=_parse_private_cleanup_evidence(
+                value["private_cleanup"],
+                require_all=True,
+            ),
+            git_dir=(
+                pathlib.Path(value["git_dir"])
+                if value.get("git_dir")
+                else container_dir / "review.git"
+            ),
+            content_variant="head",
+            snapshot_tree_sha="",
+            scope_identity="",
         )
 
 
@@ -674,6 +810,33 @@ class ControlArtifactState:
             },
             "schema_version": CONTROL_ARTIFACT_SCHEMA_VERSION,
         }
+
+
+@dataclass(frozen=True)
+class ValidatedWorkspaceLaunchReceipt:
+    content_variant: str
+    base_ref: str
+    head_ref: str
+    snapshot_tree_sha: str
+    scope_identity: str
+    private_container: CleanupIdentity
+    private_artifacts: tuple[tuple[str, CleanupIdentity], ...]
+    control_artifacts: tuple[ControlArtifactEvidence, ...]
+    control_directory: ControlDirectoryEvidence
+
+
+@dataclass(frozen=True)
+class LegacyCountState:
+    base_count: int
+    head_count: int
+    source_head_count: int
+    base_unembedded_count: int
+    head_unembedded_count: int
+    source_head_unembedded_count: int
+
+
+class _SourceHeadSecretCountIncrease(ReviewError):
+    pass
 
 
 class _IncompleteSecretScanSuffix(Exception):
@@ -1118,7 +1281,65 @@ class LegacyPathMatcher:
         return None
 
 
-def _git_environment(*, object_directory: pathlib.Path | None = None) -> dict[str, str]:
+@dataclass(frozen=True)
+class BoundedProcessResult:
+    output_bytes: int
+    returncode: int
+    stderr: bytes
+
+
+@dataclass(frozen=True)
+class SourceInspectionGitContext:
+    source_root: pathlib.Path
+    git_dir: pathlib.Path
+    object_directory: pathlib.Path
+    index_file: pathlib.Path
+    head_sha: str
+    excludes_file: str
+    file_mode: bool
+
+
+@dataclass
+class SourceWipCaptureBudget:
+    deadline: float
+    git_invocations: int = 0
+
+    def remaining_seconds(self) -> float:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReviewError(
+                "source WIP capture and revalidation exceeded the shared time limit"
+            )
+        return remaining
+
+    def claim_git_invocation(self) -> float:
+        if self.git_invocations >= MAX_SOURCE_WIP_GIT_INVOCATIONS:
+            raise ReviewError(
+                "source WIP capture and revalidation exceeded the Git invocation limit"
+            )
+        timeout_seconds = min(
+            SOURCE_GIT_TIMEOUT_SECONDS,
+            self.remaining_seconds(),
+        )
+        self.git_invocations += 1
+        return timeout_seconds
+
+
+def _new_source_wip_capture_budget() -> SourceWipCaptureBudget:
+    return SourceWipCaptureBudget(
+        deadline=time.monotonic() + SOURCE_WIP_CAPTURE_TIMEOUT_SECONDS
+    )
+
+
+def _temporary_review_file() -> BinaryIO:
+    return tempfile.TemporaryFile(dir=_canonical_review_root_base())
+
+
+def _git_environment(
+    *,
+    object_directory: pathlib.Path | None = None,
+    index_file: pathlib.Path | None = None,
+) -> dict[str, str]:
     env = {
         "GIT_ATTR_NOSYSTEM": "1",
         "GIT_ASKPASS": "/usr/bin/false",
@@ -1136,27 +1357,558 @@ def _git_environment(*, object_directory: pathlib.Path | None = None) -> dict[st
     }
     if object_directory is not None:
         env["GIT_OBJECT_DIRECTORY"] = str(object_directory)
+    if index_file is not None:
+        env["GIT_INDEX_FILE"] = str(index_file)
     return env
 
 
-def _git(repo: pathlib.Path, *args: str, check: bool = True):
-    return run(
-        (
-            str(resolve_git()),
-            "--no-pager",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            f"core.hooksPath={os.devnull}",
-            "-c",
-            "diff.external=",
-            "-C",
-            str(repo),
-            *args,
-        ),
-        env=_git_environment(),
-        check=check,
+def _source_git_home() -> pathlib.Path:
+    try:
+        import pwd
+
+        raw_home = pwd.getpwuid(os.getuid()).pw_dir
+    except (ImportError, KeyError, OSError) as error:
+        raise ReviewError(
+            f"cannot resolve the current user's Git home: {error}"
+        ) from error
+    home = pathlib.Path(raw_home)
+    if not home.is_absolute() or home == pathlib.Path("/"):
+        raise ReviewError(
+            "the current user's Git home must be an absolute user directory"
+        )
+    return home
+
+
+def _source_git_config_environment(
+    home: pathlib.Path,
+) -> tuple[dict[str, str], pathlib.Path]:
+    environment = _git_environment()
+    environment.pop("GIT_CONFIG_GLOBAL", None)
+    environment.pop("GIT_CONFIG_NOSYSTEM", None)
+    environment["HOME"] = str(home)
+    raw_xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+    if raw_xdg_config_home:
+        xdg_config_home = pathlib.Path(raw_xdg_config_home)
+        if not xdg_config_home.is_absolute():
+            raise ReviewError("XDG_CONFIG_HOME must be absolute for source Git queries")
+        environment["XDG_CONFIG_HOME"] = str(xdg_config_home)
+    else:
+        xdg_config_home = home / ".config"
+    return environment, xdg_config_home / "git" / "ignore"
+
+
+def _source_git_config_value(
+    source_root: pathlib.Path,
+    *,
+    key: str,
+    value_type: str,
+) -> tuple[str | None, pathlib.Path]:
+    environment, default_path = _source_git_config_environment(_source_git_home())
+    command = (
+        str(resolve_git()),
+        "--no-pager",
+        "-C",
+        str(source_root),
+        "config",
+        "--includes",
+        "--null",
+        f"--type={value_type}",
+        "--get",
+        key,
     )
+    completed = _run_bounded_git_capture(
+        command,
+        input_bytes=None,
+        check=False,
+        label="source Git effective-config query",
+        byte_limit=MAX_SOURCE_GIT_QUERY_BYTES,
+        timeout_seconds=SOURCE_GIT_TIMEOUT_SECONDS,
+        timeout_label="source Git",
+        environment=environment,
+    )
+    if completed.returncode == 1:
+        if completed.stdout:
+            raise ReviewError("source Git config query returned malformed output")
+        return None, default_path
+    if completed.returncode != 0:
+        raise ReviewError("cannot resolve effective source Git configuration")
+    if completed.stdout.count(b"\0") != 1 or not completed.stdout.endswith(b"\0"):
+        raise ReviewError("source Git config query returned malformed output")
+    return os.fsdecode(completed.stdout[:-1]), default_path
+
+
+def _source_excludes_file(source_root: pathlib.Path) -> pathlib.Path | None:
+    value, default_path = _source_git_config_value(
+        source_root,
+        key="core.excludesFile",
+        value_type="path",
+    )
+    if value == "" or (
+        value is not None and os.path.normcase(value) == os.path.normcase(os.devnull)
+    ):
+        return None
+    path = default_path if value is None else pathlib.Path(value)
+    if not path.is_absolute():
+        path = source_root / path
+    absolute_path = pathlib.Path(os.path.abspath(path))
+    if value is not None and os.path.normcase(os.fspath(absolute_path)) == (
+        os.path.normcase(os.path.abspath(os.devnull))
+    ):
+        return None
+    return absolute_path
+
+
+def _source_git_boolean_config(
+    source_root: pathlib.Path,
+    *,
+    key: str,
+) -> bool | None:
+    value, _default_path = _source_git_config_value(
+        source_root,
+        key=key,
+        value_type="bool",
+    )
+    if value is None:
+        return None
+    if value not in {"true", "false"}:
+        raise ReviewError("source Git boolean config query returned malformed output")
+    return value == "true"
+
+
+def _git(
+    repo: pathlib.Path,
+    *args: str,
+    check: bool = True,
+    capture_budget: SourceWipCaptureBudget | None = None,
+):
+    command = (
+        str(resolve_git()),
+        "--no-pager",
+        "-c",
+        "core.commitGraph=false",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.filemode=true",
+        "-c",
+        f"core.hooksPath={os.devnull}",
+        "-c",
+        "diff.external=",
+        "-C",
+        str(repo),
+        *args,
+    )
+    try:
+        return _run_bounded_git_capture(
+            command,
+            input_bytes=None,
+            check=check,
+            label="source Git query",
+            byte_limit=MAX_SOURCE_GIT_QUERY_BYTES,
+            timeout_seconds=(
+                SOURCE_GIT_TIMEOUT_SECONDS
+                if capture_budget is None
+                else capture_budget.claim_git_invocation()
+            ),
+            timeout_label="source Git",
+        )
+    except ReviewError:
+        if capture_budget is not None:
+            capture_budget.remaining_seconds()
+        raise
+
+
+def _stop_bounded_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except PermissionError:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=2)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except PermissionError:
+        process.kill()
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired as error:
+        raise ReviewError("cannot stop bounded source Git command") from error
+
+
+def _stop_source_git_process(process: subprocess.Popen[bytes]) -> None:
+    _stop_bounded_process(process)
+
+
+def _bounded_source_git_output(
+    context: SourceInspectionGitContext,
+    *args: str,
+    byte_limit: int,
+    record_limit: int,
+    label: str,
+    config_overrides: tuple[str, ...] = (),
+    capture_budget: SourceWipCaptureBudget | None = None,
+) -> bytes:
+    timeout_seconds = (
+        SOURCE_GIT_TIMEOUT_SECONDS
+        if capture_budget is None
+        else capture_budget.claim_git_invocation()
+    )
+    config_args = tuple(item for value in config_overrides for item in ("-c", value))
+    command = (
+        str(resolve_git()),
+        "--no-pager",
+        "-c",
+        "core.commitGraph=false",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        f"core.hooksPath={os.devnull}",
+        "-c",
+        "diff.external=",
+        *config_args,
+        f"--git-dir={context.git_dir}",
+        f"--work-tree={context.source_root}",
+        *args,
+    )
+    process = subprocess.Popen(
+        command,
+        env=_git_environment(
+            object_directory=context.object_directory,
+            index_file=context.index_file,
+        ),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    if process.stdout is None or process.stderr is None:
+        _stop_source_git_process(process)
+        raise ReviewError(f"failed to create {label} pipes")
+    command_deadline = time.monotonic() + timeout_seconds
+    output_bytes = 0
+    records = 0
+    stderr_bytes = bytearray()
+    selector = selectors.DefaultSelector()
+    try:
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+        with _temporary_review_file() as output:
+            while selector.get_map():
+                remaining = command_deadline - time.monotonic()
+                if remaining <= 0:
+                    if capture_budget is not None:
+                        capture_budget.remaining_seconds()
+                    raise ReviewError(f"{label} exceeded the source Git time limit")
+                events = selector.select(timeout=min(remaining, 0.5))
+                if not events:
+                    continue
+                for key, _mask in events:
+                    try:
+                        chunk = os.read(key.fileobj.fileno(), 64 * 1024)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    if key.data == "stdout":
+                        output_bytes += len(chunk)
+                        if output_bytes > byte_limit:
+                            raise ReviewError(
+                                f"{label} exceeds the {byte_limit}-byte review limit"
+                            )
+                        records += chunk.count(b"\0")
+                        if records > record_limit:
+                            raise ReviewError(
+                                f"{label} exceeds the {record_limit}-entry review limit"
+                            )
+                        output.write(chunk)
+                    elif len(stderr_bytes) <= MAX_SOURCE_GIT_STDERR_BYTES:
+                        remaining_stderr = (
+                            MAX_SOURCE_GIT_STDERR_BYTES + 1 - len(stderr_bytes)
+                        )
+                        stderr_bytes.extend(chunk[:remaining_stderr])
+            remaining = command_deadline - time.monotonic()
+            if remaining <= 0:
+                if capture_budget is not None:
+                    capture_budget.remaining_seconds()
+                raise ReviewError(f"{label} exceeded the source Git time limit")
+            try:
+                returncode = process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired as error:
+                if capture_budget is not None:
+                    capture_budget.remaining_seconds()
+                raise ReviewError(
+                    f"{label} exceeded the source Git time limit"
+                ) from error
+            if returncode != 0:
+                detail = (
+                    bytes(stderr_bytes[:MAX_SOURCE_GIT_STDERR_BYTES])
+                    .decode("utf-8", errors="replace")
+                    .strip()
+                )
+                suffix = f": {detail}" if detail else ""
+                raise ReviewError(f"cannot collect {label}{suffix}")
+            output.seek(0)
+            return output.read(output_bytes)
+    except BaseException:
+        _stop_source_git_process(process)
+        raise
+    finally:
+        selector.close()
+        _close_pipe(process.stdout)
+        _close_pipe(process.stderr)
+
+
+def _run_bounded_process_to_file(
+    command: tuple[str, ...],
+    *,
+    environment: dict[str, str],
+    destination: BinaryIO,
+    label: str,
+    byte_limit: int,
+    record_limit: int | None = None,
+    record_separator: bytes = b"\n",
+    input_handle: BinaryIO | int = subprocess.DEVNULL,
+    timeout_seconds: float | None = None,
+    timeout_label: str = "private Git",
+    check: bool = True,
+) -> BoundedProcessResult:
+    if len(record_separator) != 1:
+        raise ValueError("bounded process record separator must be one byte")
+    if timeout_seconds is None:
+        timeout_seconds = PRIVATE_GIT_TIMEOUT_SECONDS
+    process = subprocess.Popen(
+        command,
+        env=environment,
+        stdin=input_handle,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    if process.stdout is None or process.stderr is None:
+        _stop_bounded_process(process)
+        raise ReviewError(f"failed to create {label} pipes")
+    deadline = time.monotonic() + timeout_seconds
+    copied = 0
+    records = 0
+    stderr_bytes = bytearray()
+    selector = selectors.DefaultSelector()
+    try:
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ReviewError(f"{label} exceeded the {timeout_label} time limit")
+            events = selector.select(timeout=min(remaining, 0.5))
+            if not events:
+                continue
+            for key, _mask in events:
+                try:
+                    chunk = os.read(key.fileobj.fileno(), 1024 * 1024)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                if key.data == "stdout":
+                    copied += len(chunk)
+                    if copied > byte_limit:
+                        raise ReviewError(
+                            f"{label} exceeds the {byte_limit}-byte review limit"
+                        )
+                    if record_limit is not None:
+                        records += chunk.count(record_separator)
+                        if records > record_limit:
+                            raise ReviewError(
+                                f"{label} exceeds the {record_limit}-entry review limit"
+                            )
+                    destination.write(chunk)
+                elif len(stderr_bytes) <= MAX_PRIVATE_GIT_STDERR_BYTES:
+                    remaining_stderr = (
+                        MAX_PRIVATE_GIT_STDERR_BYTES + 1 - len(stderr_bytes)
+                    )
+                    stderr_bytes.extend(chunk[:remaining_stderr])
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReviewError(f"{label} exceeded the {timeout_label} time limit")
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as error:
+            raise ReviewError(
+                f"{label} exceeded the {timeout_label} time limit"
+            ) from error
+        retained_stderr = bytes(stderr_bytes[:MAX_PRIVATE_GIT_STDERR_BYTES])
+        if check and returncode != 0:
+            detail = retained_stderr.decode("utf-8", errors="replace").strip()
+            suffix = f": {detail}" if detail else ""
+            raise ReviewError(f"{label} failed{suffix}")
+        return BoundedProcessResult(
+            output_bytes=copied,
+            returncode=returncode,
+            stderr=retained_stderr,
+        )
+    except BaseException:
+        _stop_bounded_process(process)
+        raise
+    finally:
+        selector.close()
+        _close_pipe(process.stdout)
+        _close_pipe(process.stderr)
+
+
+def _source_git_path(
+    source_root: pathlib.Path,
+    relative: str,
+    *,
+    label: str,
+) -> pathlib.Path:
+    result = _git(
+        source_root,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        relative,
+    )
+    raw_path = result.stdout
+    if not raw_path.endswith(b"\n") or b"\n" in raw_path[:-1] or b"\0" in raw_path:
+        raise ReviewError(f"source Git {label} path is malformed")
+    path = pathlib.Path(os.fsdecode(raw_path[:-1]))
+    if not path.is_absolute():
+        raise ReviewError(f"source Git {label} path is not absolute")
+    return path
+
+
+def _read_source_info_exclude(path: pathlib.Path) -> bytes:
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return b""
+    except OSError as error:
+        raise ReviewError("cannot inspect source Git info/exclude") from error
+    with _secure_file_reader(
+        path,
+        label="source Git info/exclude",
+        max_bytes=MAX_SOURCE_INFO_EXCLUDE_BYTES,
+    ) as (handle, _metadata):
+        return handle.read(MAX_SOURCE_INFO_EXCLUDE_BYTES + 1)
+
+
+def _read_source_excludes_file(path: pathlib.Path | None) -> bytes:
+    if path is None:
+        return b""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return b""
+    except OSError as error:
+        raise ReviewError(
+            "cannot inspect the effective source Git excludes file"
+        ) from error
+    with _secure_file_reader(
+        path,
+        label="effective source Git excludes file",
+        max_bytes=MAX_SOURCE_INFO_EXCLUDE_BYTES,
+        allow_root_owner=True,
+    ) as (handle, _metadata):
+        return handle.read(MAX_SOURCE_INFO_EXCLUDE_BYTES + 1)
+
+
+def _create_source_inspection_git_context(
+    *,
+    source_root: pathlib.Path,
+    head_sha: str,
+    container: pathlib.Path,
+) -> SourceInspectionGitContext:
+    if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head_sha) is None:
+        raise ReviewError("source inspection HEAD is malformed")
+    object_directory = _source_git_path(
+        source_root,
+        "objects",
+        label="object directory",
+    ).resolve()
+    if not object_directory.is_dir():
+        raise ReviewError(
+            f"source Git object directory does not exist: {object_directory}"
+        )
+    index_file = _source_git_path(source_root, "index", label="index")
+    try:
+        index_status = os.lstat(index_file)
+    except FileNotFoundError:
+        index_status = None
+    except OSError as error:
+        raise ReviewError("cannot inspect the source Git index") from error
+    if index_status is not None and (
+        not stat.S_ISREG(index_status.st_mode) or index_status.st_uid != os.getuid()
+    ):
+        raise ReviewError("source Git index must be a current-user regular file")
+    info_exclude = _read_source_info_exclude(
+        _source_git_path(source_root, "info/exclude", label="info/exclude")
+    )
+    source_excludes = _read_source_excludes_file(_source_excludes_file(source_root))
+    source_status_config = {
+        key: _source_git_boolean_config(source_root, key=key)
+        for key in ("core.fileMode", "core.ignoreCase", "core.precomposeUnicode")
+    }
+
+    git_dir = container / "source-inspection.git"
+    git_dir.mkdir(mode=0o700)
+    for name in ("info", "objects", "refs"):
+        (git_dir / name).mkdir(mode=0o700)
+    write_text_atomic(git_dir / "HEAD", f"{head_sha}\n")
+    format_version = 1 if len(head_sha) == 64 else 0
+    config = (
+        "[core]\n"
+        f"\trepositoryformatversion = {format_version}\n"
+        "\tbare = false\n"
+        "\tlogAllRefUpdates = false\n"
+    )
+    for key, value in source_status_config.items():
+        if value is not None:
+            config += f"\t{key.removeprefix('core.')} = {str(value).lower()}\n"
+    if len(head_sha) == 64:
+        config += "[extensions]\n\tobjectFormat = sha256\n"
+    write_text_atomic(git_dir / "config", config)
+    exclude_destination = git_dir / "info" / "exclude"
+    exclude_destination.write_bytes(info_exclude)
+    exclude_destination.chmod(0o600)
+    effective_excludes_destination = git_dir / "effective-excludes"
+    effective_excludes_destination.write_bytes(source_excludes)
+    effective_excludes_destination.chmod(0o600)
+    return SourceInspectionGitContext(
+        source_root=source_root,
+        git_dir=git_dir,
+        object_directory=object_directory,
+        index_file=index_file,
+        head_sha=head_sha,
+        excludes_file=str(effective_excludes_destination),
+        file_mode=source_status_config["core.fileMode"] is not False,
+    )
+
+
+@contextmanager
+def _temporary_source_inspection_git_context(
+    *,
+    source_root: pathlib.Path,
+    head_sha: str,
+) -> Iterator[SourceInspectionGitContext]:
+    with tempfile.TemporaryDirectory(
+        prefix="isolated-review-source-git-",
+        dir=_canonical_review_root_base(),
+    ) as raw:
+        yield _create_source_inspection_git_context(
+            source_root=source_root,
+            head_sha=head_sha,
+            container=pathlib.Path(raw),
+        )
 
 
 def _create_sanitized_git_view(
@@ -1189,6 +1941,738 @@ def _create_sanitized_git_view(
     return git_view, object_directory
 
 
+@contextmanager
+def _temporary_sanitized_git_view(
+    *,
+    source_root: pathlib.Path,
+) -> Iterator[tuple[pathlib.Path, pathlib.Path]]:
+    with tempfile.TemporaryDirectory(
+        prefix="isolated-review-git-view-",
+        dir=_canonical_review_root_base(),
+    ) as raw:
+        yield _create_sanitized_git_view(
+            source_root=source_root,
+            container=pathlib.Path(raw),
+        )
+
+
+def _private_git_command(
+    *,
+    git_dir: pathlib.Path,
+    args: tuple[str, ...],
+    work_tree: pathlib.Path | None = None,
+) -> tuple[str, ...]:
+    command = [
+        str(resolve_git()),
+        "--no-pager",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.logAllRefUpdates=false",
+        "-c",
+        f"core.hooksPath={os.devnull}",
+        "-c",
+        "diff.external=",
+        f"--git-dir={git_dir}",
+    ]
+    if work_tree is not None:
+        command.append(f"--work-tree={work_tree}")
+    command.extend(args)
+    return tuple(command)
+
+
+def _run_private_git(
+    *,
+    git_dir: pathlib.Path,
+    args: tuple[str, ...],
+    work_tree: pathlib.Path | None = None,
+    input_bytes: bytes | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[bytes]:
+    command = _private_git_command(
+        git_dir=git_dir,
+        work_tree=work_tree,
+        args=args,
+    )
+    return _run_bounded_git_capture(
+        command,
+        input_bytes=input_bytes,
+        check=check,
+        label="private review Git command",
+    )
+
+
+def _run_worktree_git(
+    workspace_root: pathlib.Path,
+    *args: str,
+    input_bytes: bytes | None = None,
+    input_handle: BinaryIO | int | None = None,
+    check: bool = True,
+    byte_limit: int = MAX_PRIVATE_OBJECT_LIST_BYTES,
+    record_limit: int | None = None,
+    capture_budget: SourceWipCaptureBudget | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    command = (
+        str(resolve_git()),
+        "--no-pager",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        f"core.hooksPath={os.devnull}",
+        "-c",
+        "diff.external=",
+        "-C",
+        str(workspace_root),
+        *args,
+    )
+    try:
+        return _run_bounded_git_capture(
+            command,
+            input_bytes=input_bytes,
+            input_handle=input_handle,
+            check=check,
+            label="detached review worktree Git command",
+            byte_limit=byte_limit,
+            record_limit=record_limit,
+            timeout_seconds=(
+                PRIVATE_GIT_TIMEOUT_SECONDS
+                if capture_budget is None
+                else capture_budget.claim_git_invocation()
+            ),
+            timeout_label=(
+                "private Git" if capture_budget is None else "source WIP capture"
+            ),
+        )
+    except ReviewError:
+        if capture_budget is not None:
+            capture_budget.remaining_seconds()
+        raise
+
+
+def _run_bounded_git_capture(
+    command: tuple[str, ...],
+    *,
+    input_bytes: bytes | None,
+    input_handle: BinaryIO | int | None = None,
+    check: bool,
+    label: str,
+    byte_limit: int = MAX_PRIVATE_OBJECT_LIST_BYTES,
+    record_limit: int | None = None,
+    timeout_seconds: float = PRIVATE_GIT_TIMEOUT_SECONDS,
+    timeout_label: str = "private Git",
+    environment: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    with _temporary_review_file() as output, _temporary_review_file() as input_file:
+        if input_bytes is not None and input_handle is not None:
+            raise ReviewError(
+                "bounded Git input must use bytes or one handle, not both"
+            )
+        selected_input: BinaryIO | int = subprocess.DEVNULL
+        if input_bytes is not None:
+            input_file.write(input_bytes)
+            input_file.seek(0)
+            selected_input = input_file
+        elif input_handle is not None:
+            selected_input = input_handle
+        result = _run_bounded_process_to_file(
+            command,
+            environment=_git_environment() if environment is None else environment,
+            destination=output,
+            label=label,
+            byte_limit=byte_limit,
+            record_limit=record_limit,
+            input_handle=selected_input,
+            timeout_seconds=timeout_seconds,
+            timeout_label=timeout_label,
+            check=check,
+        )
+        output.seek(0)
+        stdout = output.read(result.output_bytes)
+    return subprocess.CompletedProcess(
+        args=command,
+        returncode=result.returncode,
+        stdout=stdout,
+        stderr=result.stderr,
+    )
+
+
+def _copy_review_objects(
+    *,
+    git_view: pathlib.Path,
+    source_object_directory: pathlib.Path,
+    git_dir: pathlib.Path,
+    base_sha: str,
+    head_sha: str,
+) -> None:
+    with _temporary_review_file() as object_ids:
+        copied = 0
+        for revisions in ((f"{base_sha}^{{tree}}",), (f"{head_sha}^{{tree}}",)):
+            copied += _run_bounded_process_to_file(
+                _frozen_command(
+                    git_view=git_view,
+                    args=("rev-list", "--objects", "--no-object-names", *revisions),
+                ),
+                environment=_git_environment(object_directory=source_object_directory),
+                destination=object_ids,
+                label="private review Git objects",
+                byte_limit=MAX_PRIVATE_OBJECT_LIST_BYTES - copied,
+                record_limit=MAX_PRIVATE_OBJECT_ENTRIES,
+            ).output_bytes
+        if copied and not _temporary_file_ends_with_newline(object_ids):
+            object_ids.write(b"\n")
+        object_ids.write(base_sha.encode("ascii") + b"\n")
+        if head_sha != base_sha:
+            object_ids.write(head_sha.encode("ascii") + b"\n")
+        _validate_private_object_sizes(
+            git_view=git_view,
+            source_object_directory=source_object_directory,
+            object_ids=object_ids,
+        )
+        object_ids.seek(0)
+        with _temporary_review_file() as pack_file:
+            _run_bounded_process_to_file(
+                _frozen_command(
+                    git_view=git_view,
+                    args=(
+                        "pack-objects",
+                        "--stdout",
+                        "--window=0",
+                        "--depth=0",
+                        "--threads=1",
+                    ),
+                ),
+                environment=_git_environment(object_directory=source_object_directory),
+                input_handle=object_ids,
+                destination=pack_file,
+                label="private Git pack",
+                byte_limit=MAX_PRIVATE_PACK_BYTES,
+            )
+            pack_file.seek(0)
+            with _temporary_review_file() as index_output:
+                _run_bounded_process_to_file(
+                    _private_git_command(
+                        git_dir=git_dir,
+                        args=("index-pack", "--stdin", "--threads=1"),
+                    ),
+                    environment=_git_environment(),
+                    input_handle=pack_file,
+                    destination=index_output,
+                    label="private Git pack index",
+                    byte_limit=4096,
+                )
+                index_output.seek(0)
+                index_stdout = index_output.read(4097)
+            if not index_stdout.strip():
+                raise ReviewError("private review Git pack produced no object id")
+
+
+def _validate_private_object_sizes(
+    *,
+    git_view: pathlib.Path,
+    source_object_directory: pathlib.Path,
+    object_ids: BinaryIO,
+) -> None:
+    object_ids.flush()
+    object_ids.seek(0)
+    with _temporary_review_file() as metadata:
+        _run_bounded_process_to_file(
+            _frozen_command(
+                git_view=git_view,
+                args=(
+                    "cat-file",
+                    "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+                ),
+            ),
+            environment=_git_environment(object_directory=source_object_directory),
+            input_handle=object_ids,
+            destination=metadata,
+            label="private Git object-size metadata",
+            byte_limit=MAX_PRIVATE_OBJECT_LIST_BYTES,
+            record_limit=MAX_PRIVATE_OBJECT_ENTRIES,
+        )
+        total_bytes = 0
+        metadata.seek(0)
+        for line in metadata:
+            fields = line.rstrip(b"\n").split(b" ")
+            if len(fields) != 3 or fields[1] not in {b"blob", b"tree", b"commit"}:
+                raise ReviewError("private Git object-size metadata is malformed")
+            try:
+                size = int(fields[2])
+            except ValueError as error_value:
+                raise ReviewError(
+                    "private Git object-size metadata is malformed"
+                ) from error_value
+            if size < 0 or size > MAX_PRIVATE_OBJECT_BYTES - total_bytes:
+                raise ReviewError("private Git endpoint objects exceed the byte limit")
+            total_bytes += size
+    object_ids.seek(0)
+
+
+def _temporary_file_ends_with_newline(handle: BinaryIO) -> bool:
+    position = handle.tell()
+    if position == 0:
+        return False
+    handle.seek(-1, os.SEEK_CUR)
+    value = handle.read(1) == b"\n"
+    handle.seek(position)
+    return value
+
+
+def _scan_endpoint_commit_metadata(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    base_sha: str,
+    head_sha: str,
+    authoring_values: Iterable[AcceptedSyntheticValue],
+    legacy_values: Iterable[AcceptedSyntheticValue],
+) -> None:
+    authoring = tuple(authoring_values)
+    legacy = tuple(legacy_values)
+    if any(item.kind != "authoring" for item in authoring):
+        raise ReviewError("endpoint metadata authoring values are invalid")
+    if any(item.kind != "legacy" for item in legacy):
+        raise ReviewError("endpoint metadata legacy values are invalid")
+    for revision in sorted({base_sha, head_sha}):
+        with _temporary_review_file() as content:
+            size = _run_bounded_process_to_file(
+                _frozen_command(
+                    git_view=git_view,
+                    args=("cat-file", "commit", revision),
+                ),
+                environment=_git_environment(object_directory=object_directory),
+                destination=content,
+                label="endpoint commit metadata",
+                byte_limit=MAX_ENDPOINT_COMMIT_BYTES,
+            ).output_bytes
+            content.seek(0)
+            human_metadata = _human_commit_metadata(
+                content.read(size),
+                object_id_length=len(revision),
+            )
+            scan = _stream_secret_scan(
+                io.BytesIO(human_metadata),
+                size=len(human_metadata),
+                accepted_values=authoring,
+                raw_occurrence_values=legacy,
+            )
+            if scan.blocking_rule is not None or any(
+                scan.raw_occurrence_counts.values()
+            ):
+                raise ReviewError(
+                    "sensitive content preflight blocked external review; "
+                    "an endpoint commit object contains credential-like metadata"
+                )
+
+
+def _human_commit_metadata(
+    raw_commit: bytes,
+    *,
+    object_id_length: int,
+) -> bytes:
+    raw_headers, separator, message = raw_commit.partition(b"\n\n")
+    if not separator:
+        raise ReviewError("endpoint commit object has malformed headers")
+    fields: list[tuple[bytes, bytes]] = []
+    current_key: bytes | None = None
+    current_value = bytearray()
+    for line in raw_headers.split(b"\n"):
+        if line.startswith(b" "):
+            if current_key is None:
+                raise ReviewError("endpoint commit object has malformed continuation")
+            current_value.extend(b"\n" + line[1:])
+            continue
+        if current_key is not None:
+            fields.append((current_key, bytes(current_value)))
+        current_key, space, initial_value = line.partition(b" ")
+        if not space or not current_key:
+            raise ReviewError("endpoint commit object has malformed header")
+        current_value = bytearray(initial_value)
+    if current_key is not None:
+        fields.append((current_key, bytes(current_value)))
+
+    human = bytearray()
+    tree_count = 0
+    for key, value in fields:
+        if key == b"tree":
+            tree_count += 1
+            if tree_count != 1 or not _valid_object_id(value, object_id_length):
+                raise ReviewError("endpoint commit object has malformed tree metadata")
+            continue
+        if key == b"parent":
+            if not _valid_object_id(value, object_id_length):
+                raise ReviewError(
+                    "endpoint commit object has malformed parent metadata"
+                )
+            continue
+        if key in {b"gpgsig", b"gpgsig-sha256"}:
+            human.extend(_human_signature_metadata(value))
+            continue
+        if key == b"mergetag":
+            human.extend(
+                _human_mergetag_metadata(
+                    value,
+                    object_id_length=object_id_length,
+                )
+            )
+            continue
+        human.extend(key + b" " + value + b"\n")
+    if tree_count != 1:
+        raise ReviewError("endpoint commit object must contain exactly one tree")
+    human.extend(b"\n" + message)
+    if len(human) > MAX_ENDPOINT_COMMIT_SCAN_BYTES:
+        raise ReviewError("scannable endpoint commit metadata exceeds its byte limit")
+    return bytes(human)
+
+
+def _valid_object_id(value: bytes, object_id_length: int) -> bool:
+    return (
+        len(value) == object_id_length
+        and re.fullmatch(rb"[0-9A-Fa-f]+", value) is not None
+    )
+
+
+SIGNATURE_ENVELOPES = {
+    b"-----BEGIN PGP SIGNATURE-----": b"-----END PGP SIGNATURE-----",
+    b"-----BEGIN SSH SIGNATURE-----": b"-----END SSH SIGNATURE-----",
+    b"-----BEGIN SIGNED MESSAGE-----": b"-----END SIGNED MESSAGE-----",
+    b"-----BEGIN CMS-----": b"-----END CMS-----",
+    b"-----BEGIN PKCS7-----": b"-----END PKCS7-----",
+}
+
+
+def _human_signature_metadata(value: bytes) -> bytes:
+    lines = value.split(b"\n")
+    while lines and lines[-1] == b"":
+        lines.pop()
+    begin = lines[0] if lines else b""
+    expected_end = SIGNATURE_ENVELOPES.get(begin)
+    if expected_end is None or len(lines) < 3 or lines[-1] != expected_end:
+        raise ReviewError("endpoint commit object has malformed signature metadata")
+    body_lines: list[bytes] = []
+    saw_checksum = False
+    human = bytearray()
+    for line in lines[1:-1]:
+        if not line:
+            continue
+        if not body_lines and re.fullmatch(rb"[A-Za-z0-9-]+: [\x20-\x7e]*", line):
+            human.extend(line + b"\n")
+            continue
+        if re.fullmatch(rb"=[A-Za-z0-9+/]{4}", line):
+            if (
+                begin != b"-----BEGIN PGP SIGNATURE-----"
+                or not body_lines
+                or saw_checksum
+            ):
+                raise ReviewError(
+                    "endpoint commit object has malformed signature metadata"
+                )
+            try:
+                base64.b64decode(line[1:], validate=True)
+            except (binascii.Error, ValueError) as error:
+                raise ReviewError(
+                    "endpoint commit object has malformed signature metadata"
+                ) from error
+            saw_checksum = True
+            continue
+        if (
+            saw_checksum
+            or not 1 <= len(line) <= 128
+            or re.fullmatch(rb"[A-Za-z0-9+/=]+", line) is None
+        ):
+            raise ReviewError("endpoint commit object has malformed signature metadata")
+        body_lines.append(line)
+    if not body_lines:
+        raise ReviewError("endpoint commit object has empty signature metadata")
+    joined_body = b"".join(body_lines)
+    try:
+        decoded = base64.b64decode(joined_body, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ReviewError(
+            "endpoint commit object has malformed signature metadata"
+        ) from error
+    if not decoded:
+        raise ReviewError("endpoint commit object has empty signature metadata")
+    human.extend(b"\n" + joined_body + b"\n" + decoded + b"\n")
+    return bytes(human)
+
+
+def _human_mergetag_metadata(
+    value: bytes,
+    *,
+    object_id_length: int,
+) -> bytes:
+    raw_headers, separator, message = value.partition(b"\n\n")
+    if not separator:
+        raise ReviewError("endpoint commit object has malformed mergetag metadata")
+    human = bytearray()
+    saw_object = False
+    saw_type = False
+    for line in raw_headers.split(b"\n"):
+        key, space, field_value = line.partition(b" ")
+        if not space or not key:
+            raise ReviewError("endpoint commit object has malformed mergetag header")
+        if key == b"object":
+            if saw_object or not _valid_object_id(field_value, object_id_length):
+                raise ReviewError(
+                    "endpoint commit object has malformed mergetag object"
+                )
+            saw_object = True
+            continue
+        if key == b"type":
+            if saw_type or field_value != b"commit":
+                raise ReviewError("endpoint commit object has malformed mergetag type")
+            saw_type = True
+            continue
+        human.extend(key + b" " + field_value + b"\n")
+    if not saw_object or not saw_type:
+        raise ReviewError("endpoint commit object has incomplete mergetag metadata")
+    human.extend(b"\n" + _unsigned_tag_message(message))
+    return bytes(human)
+
+
+def _unsigned_tag_message(message: bytes) -> bytes:
+    for begin in SIGNATURE_ENVELOPES:
+        if message.startswith(begin):
+            signature_start = 0
+            human_end = 0
+        else:
+            prefixed = message.find(b"\n" + begin)
+            if prefixed < 0:
+                continue
+            signature_start = prefixed + 1
+            human_end = prefixed
+        signature_human = _human_signature_metadata(message[signature_start:])
+        human = bytearray(message[:human_end])
+        if signature_human:
+            if human and not human.endswith(b"\n"):
+                human.extend(b"\n")
+            human.extend(signature_human)
+        return bytes(human)
+    return message
+
+
+def _create_private_review_repository(
+    *,
+    container: pathlib.Path,
+    git_view: pathlib.Path,
+    source_object_directory: pathlib.Path,
+    base_sha: str,
+    head_sha: str,
+) -> pathlib.Path:
+    git_dir = container / "review.git"
+    empty_template = container / "empty-git-template"
+    empty_template.mkdir(mode=0o700)
+    init_args = [
+        str(resolve_git()),
+        "init",
+        "--bare",
+        f"--template={empty_template}",
+        "--initial-branch=master",
+    ]
+    if len(base_sha) == 64:
+        init_args.append("--object-format=sha256")
+    init_args.append(str(git_dir))
+    try:
+        with _temporary_review_file() as init_output:
+            _run_bounded_process_to_file(
+                tuple(init_args),
+                environment=_git_environment(),
+                destination=init_output,
+                label="private review Git initialization",
+                byte_limit=4096,
+            )
+    finally:
+        empty_template.rmdir()
+    write_text_atomic(
+        git_dir / "config",
+        _canonical_private_git_config(object_id_length=len(base_sha)).decode("ascii"),
+    )
+    (git_dir / "config").chmod(0o600)
+    write_text_atomic(git_dir / "HEAD", "ref: refs/heads/master\n")
+    (git_dir / "HEAD").chmod(0o600)
+    _copy_review_objects(
+        git_view=git_view,
+        source_object_directory=source_object_directory,
+        git_dir=git_dir,
+        base_sha=base_sha,
+        head_sha=head_sha,
+    )
+    for label, revision in (("base", base_sha), ("head", head_sha)):
+        result = _run_private_git(
+            git_dir=git_dir,
+            args=("cat-file", "-e", f"{revision}^{{commit}}"),
+            check=False,
+        )
+        if result.returncode != 0:
+            raise ReviewError(f"private review Git database is missing the {label}")
+    shallow_path = git_dir / "shallow"
+    write_text_atomic(
+        shallow_path,
+        "".join(f"{revision}\n" for revision in sorted({base_sha, head_sha})),
+    )
+    shallow_path.chmod(0o600)
+    return git_dir
+
+
+def _canonical_private_git_config(*, object_id_length: int) -> bytes:
+    if object_id_length == 40:
+        return (
+            b"[core]\n"
+            b"\trepositoryformatversion = 0\n"
+            b"\tfilemode = true\n"
+            b"\tbare = true\n"
+            b"\tlogAllRefUpdates = false\n"
+        )
+    if object_id_length == 64:
+        return (
+            b"[core]\n"
+            b"\trepositoryformatversion = 1\n"
+            b"\tfilemode = true\n"
+            b"\tbare = true\n"
+            b"\tlogAllRefUpdates = false\n"
+            b"[extensions]\n"
+            b"\tobjectFormat = sha256\n"
+        )
+    raise ReviewError("private review Git object format is invalid")
+
+
+def _harden_private_git_permissions(git_dir: pathlib.Path) -> None:
+    pending = [git_dir]
+    visited = 0
+    while pending:
+        directory = pending.pop()
+        try:
+            metadata = os.lstat(directory)
+        except OSError as error:
+            raise ReviewError("cannot harden private review Git directory") from error
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ReviewError("private review Git directory is unsafe")
+        directory.chmod(0o700)
+        try:
+            entries = os.scandir(directory)
+        except OSError as error:
+            raise ReviewError("cannot harden private review Git directory") from error
+        try:
+            with entries:
+                for entry in entries:
+                    visited += 1
+                    if visited > 2 * MAX_PRIVATE_OBJECT_ENTRIES + 4096:
+                        raise ReviewError(
+                            "private review Git exceeds its hardening entry limit"
+                        )
+                    try:
+                        entry_metadata = entry.stat(follow_symlinks=False)
+                    except OSError as error:
+                        raise ReviewError(
+                            "cannot harden private review Git entry"
+                        ) from error
+                    path = pathlib.Path(entry.path)
+                    if stat.S_ISDIR(entry_metadata.st_mode):
+                        pending.append(path)
+                    elif stat.S_ISREG(entry_metadata.st_mode):
+                        path.chmod(0o600)
+                    else:
+                        raise ReviewError("private review Git contains an unsafe entry")
+        except ReviewError:
+            raise
+        except OSError as error:
+            raise ReviewError("cannot harden private review Git directory") from error
+
+
+def _create_detached_worktree(
+    *,
+    git_dir: pathlib.Path,
+    workspace_root: pathlib.Path,
+    head_sha: str,
+) -> None:
+    _run_private_git(
+        git_dir=git_dir,
+        args=(
+            "worktree",
+            "add",
+            "--detach",
+            "--no-checkout",
+            "--lock",
+            str(workspace_root),
+            head_sha,
+        ),
+    )
+    git_pointer = workspace_root / ".git"
+    try:
+        metadata = os.lstat(git_pointer)
+    except OSError as error:
+        raise ReviewError(
+            "detached review worktree has no .git control file"
+        ) from error
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise ReviewError("detached review worktree .git control is not a private file")
+    git_pointer.chmod(0o600)
+    _ensure_detached_worktree_refs(
+        git_dir=git_dir,
+        workspace_root=workspace_root,
+    )
+
+
+def _ensure_detached_worktree_refs(
+    *,
+    git_dir: pathlib.Path,
+    workspace_root: pathlib.Path,
+) -> None:
+    refs_dir = git_dir / "worktrees" / workspace_root.name / "refs"
+    try:
+        refs_dir.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        raise ReviewError(
+            "cannot create detached review worktree refs directory"
+        ) from error
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    no_follow_flag = getattr(os, "O_NOFOLLOW", None)
+    if directory_flag is None or no_follow_flag is None:
+        raise ReviewError(
+            "host cannot securely inspect detached review worktree refs directory"
+        )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | directory_flag | no_follow_flag
+    try:
+        descriptor = os.open(refs_dir, flags)
+    except OSError as error:
+        raise ReviewError(
+            "cannot securely open detached review worktree refs directory"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+        current = os.lstat(refs_dir)
+        identity = (opened.st_dev, opened.st_ino, opened.st_uid)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or identity != (current.st_dev, current.st_ino, current.st_uid)
+        ):
+            raise ReviewError("detached review worktree refs directory is unsafe")
+        os.fchmod(descriptor, 0o700)
+        hardened = os.fstat(descriptor)
+        current = os.lstat(refs_dir)
+        if (
+            (hardened.st_dev, hardened.st_ino, hardened.st_uid) != identity
+            or (current.st_dev, current.st_ino, current.st_uid) != identity
+            or stat.S_IMODE(hardened.st_mode) != 0o700
+            or stat.S_IMODE(current.st_mode) != 0o700
+        ):
+            raise ReviewError(
+                "detached review worktree refs directory changed while hardening"
+            )
+    except ReviewError:
+        raise
+    except OSError as error:
+        raise ReviewError(
+            "cannot harden detached review worktree refs directory"
+        ) from error
+    finally:
+        os.close(descriptor)
+
+
 def _frozen_command(
     *,
     git_view: pathlib.Path,
@@ -1200,11 +2684,33 @@ def _frozen_command(
         "-c",
         "core.fsmonitor=false",
         "-c",
+        "core.commitGraph=false",
+        "-c",
         f"core.hooksPath={os.devnull}",
         "-c",
         "diff.external=",
         f"--git-dir={git_view}",
         *args,
+    )
+
+
+def _run_sanitized_git_query(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    args: tuple[str, ...],
+    label: str,
+    check: bool = True,
+) -> subprocess.CompletedProcess[bytes]:
+    return _run_bounded_git_capture(
+        _frozen_command(git_view=git_view, args=args),
+        input_bytes=None,
+        check=check,
+        label=label,
+        byte_limit=MAX_SOURCE_GIT_QUERY_BYTES,
+        timeout_seconds=SOURCE_GIT_TIMEOUT_SECONDS,
+        timeout_label="source Git",
+        environment=_git_environment(object_directory=object_directory),
     )
 
 
@@ -1215,41 +2721,29 @@ def _commit_uses_reserved_control_path(
     commit: str,
     label: str,
 ) -> bool:
-    with tempfile.TemporaryFile() as error_output:
-        process = subprocess.Popen(
+    with _temporary_review_file() as output:
+        _run_bounded_process_to_file(
             _frozen_command(
                 git_view=git_view,
                 args=("ls-tree", "-z", "--name-only", commit),
             ),
-            env=_git_environment(object_directory=object_directory),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=error_output,
+            environment=_git_environment(object_directory=object_directory),
+            destination=output,
+            label=f"frozen {label} tree metadata",
+            byte_limit=MAX_TREE_METADATA_BYTES,
+            record_limit=MAX_SNAPSHOT_ENTRIES,
+            record_separator=b"\0",
         )
-        if process.stdout is None:
-            _stop_process(process)
-            raise ReviewError(f"failed to create frozen {label} tree metadata pipe")
+        output.seek(0)
         reserved = False
-        try:
-            for name in _iter_nul_records(
-                process.stdout,
-                byte_limit=MAX_TREE_METADATA_BYTES,
-                record_limit=MAX_SNAPSHOT_ENTRIES,
-                label=f"frozen {label} tree metadata",
-            ):
-                if os.fsdecode(name).casefold() == ".codex-review":
-                    reserved = True
-            _close_pipe(process.stdout)
-            returncode = process.wait()
-        except BaseException:
-            _close_pipe(process.stdout)
-            _stop_process(process)
-            raise
-        if returncode != 0:
-            raise ReviewError(
-                f"cannot inspect frozen {label} tree metadata: "
-                f"{_process_stderr(error_output)}"
-            )
+        for name in _iter_nul_records(
+            output,
+            byte_limit=MAX_TREE_METADATA_BYTES,
+            record_limit=MAX_SNAPSHOT_ENTRIES,
+            label=f"frozen {label} tree metadata",
+        ):
+            if os.fsdecode(name).casefold() == ".codex-review":
+                reserved = True
         return reserved
 
 
@@ -1271,8 +2765,21 @@ def resolve_repo_root(repo: pathlib.Path) -> pathlib.Path:
     return root
 
 
-def resolve_commit(repo: pathlib.Path, ref: str, *, label: str) -> str:
-    result = _git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}", check=False)
+def resolve_commit(
+    repo: pathlib.Path,
+    ref: str,
+    *,
+    label: str,
+    capture_budget: SourceWipCaptureBudget | None = None,
+) -> str:
+    result = _git(
+        repo,
+        "rev-parse",
+        "--verify",
+        f"{ref}^{{commit}}",
+        check=False,
+        capture_budget=capture_budget,
+    )
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", errors="replace").strip()
         raise ReviewError(f"cannot resolve {label} {ref!r}: {detail}")
@@ -1280,32 +2787,75 @@ def resolve_commit(repo: pathlib.Path, ref: str, *, label: str) -> str:
 
 
 def _require_ancestor_range(
-    repo: pathlib.Path,
     *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
     base_sha: str,
     head_sha: str,
 ) -> None:
-    ancestor = _git(
-        repo,
-        "merge-base",
-        "--is-ancestor",
-        base_sha,
-        head_sha,
+    if _is_ancestor_in_sanitized_view(
+        git_view=git_view,
+        object_directory=object_directory,
+        ancestor=base_sha,
+        descendant=head_sha,
+        failure_message="cannot verify that the frozen base is an ancestor of head",
+    ):
+        return
+    connectivity = _run_sanitized_git_query(
+        git_view=git_view,
+        object_directory=object_directory,
+        args=(
+            "rev-list",
+            "--quiet",
+            "--missing=error",
+            base_sha,
+            head_sha,
+            "--",
+        ),
+        label="sanitized commit-connectivity Git query",
         check=False,
     )
-    if ancestor.returncode == 0:
-        return
-    if ancestor.returncode != 1:
+    if connectivity.returncode != 0 or connectivity.stdout:
         raise ReviewError("cannot verify that the frozen base is an ancestor of head")
-    merge_base = _git(repo, "merge-base", base_sha, head_sha, check=False)
+    merge_base = _run_sanitized_git_query(
+        git_view=git_view,
+        object_directory=object_directory,
+        args=("merge-base", base_sha, head_sha),
+        label="sanitized merge-base Git query",
+        check=False,
+    )
     if merge_base.returncode == 0 and merge_base.stdout.strip():
         suggestion = merge_base.stdout.decode("ascii").strip()
         detail = f"; use merge base {suggestion} as --base-ref"
-    else:
+    elif merge_base.returncode == 1:
         detail = "; the commits have no merge base"
+    else:
+        raise ReviewError("cannot determine the merge base for the frozen range")
     raise ReviewError(
         f"frozen base {base_sha} is not an ancestor of head {head_sha}{detail}"
     )
+
+
+def _is_ancestor_in_sanitized_view(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    ancestor: str,
+    descendant: str,
+    failure_message: str,
+) -> bool:
+    result = _run_sanitized_git_query(
+        git_view=git_view,
+        object_directory=object_directory,
+        args=("merge-base", "--is-ancestor", ancestor, descendant),
+        label="sanitized ancestry Git query",
+        check=False,
+    )
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    raise ReviewError(failure_message)
 
 
 def _private_cleanup_directory_error(
@@ -1533,9 +3083,12 @@ def _remove_open_directory_contents(
     directory_descriptor: int,
     *,
     depth: int = 0,
+    depth_limit: int | None = None,
     excluded_entry_names: frozenset[str] = frozenset(),
 ) -> list[str]:
-    if depth >= MAX_REVIEW_CLEANUP_DEPTH:
+    if depth_limit is None:
+        depth_limit = MAX_REVIEW_CLEANUP_DEPTH
+    if depth >= depth_limit:
         return ["review cleanup directory depth exceeds the safety limit"]
     cleanup_errors: list[str] = []
     try:
@@ -1641,6 +3194,7 @@ def _remove_open_directory_contents(
                         label="review cleanup directory entry",
                         require_private_mode=False,
                         depth=depth + 1,
+                        depth_limit=depth_limit,
                         quarantine_before_recursion=True,
                     )
                 )
@@ -1669,6 +3223,7 @@ def _remove_open_directory_tree(
     excluded_entry_names: frozenset[str] = frozenset(),
     final_entry_names: tuple[str, ...] = (),
     depth: int = 0,
+    depth_limit: int | None = None,
     quarantine_before_recursion: bool = False,
     quarantine_before_final_entries: bool = False,
 ) -> list[str]:
@@ -1721,6 +3276,7 @@ def _remove_open_directory_tree(
     cleanup_errors = _remove_open_directory_contents(
         directory_descriptor,
         depth=depth,
+        depth_limit=depth_limit,
         excluded_entry_names=excluded_entry_names | frozenset(final_entry_names),
     )
     if cleanup_errors:
@@ -1907,6 +3463,7 @@ def _remove_named_directory_tree(
     *,
     label: str,
     require_private_mode: bool,
+    depth_limit: int | None = None,
 ) -> list[str]:
     def preexisting_quarantine_errors() -> list[str]:
         try:
@@ -1991,6 +3548,7 @@ def _remove_named_directory_tree(
                             directory_name,
                             label=label,
                             require_private_mode=require_private_mode,
+                            depth_limit=depth_limit,
                             quarantine_before_recursion=True,
                         )
                     )
@@ -2779,6 +4337,15 @@ def _remove_review_container_tree(
             )
             if private_cleanup_errors:
                 return private_cleanup_errors
+        private_git_errors = _remove_named_directory_tree(
+            container_descriptor,
+            "review.git",
+            label="private review Git database",
+            require_private_mode=False,
+            depth_limit=PRIVATE_REVIEW_GIT_CLEANUP_DEPTH,
+        )
+        if private_git_errors:
+            return private_git_errors
         cleanup_errors = _remove_open_directory_tree(
             parent_descriptor,
             container_descriptor,
@@ -2848,8 +4415,17 @@ def _bound_private_cleanup_target(
 ) -> pathlib.Path | None:
     source_root = review.source_root.expanduser().absolute()
     container = review.container_dir.expanduser().absolute()
-    if container.parent != source_root / ".codex-tmp" or not container.name.startswith(
-        "isolated-review-"
+    expected_parent = (
+        source_root / ".codex-tmp"
+        if isinstance(
+            review,
+            (LegacyReviewWorkspace, SourceLocalReviewWorkspace),
+        )
+        else _review_root_for_source(source_root, require_source=False)
+    )
+    if (
+        container.parent != expected_parent
+        or REVIEW_CONTAINER_PATTERN.fullmatch(container.name) is None
     ):
         return None
     return container
@@ -2862,155 +4438,207 @@ def _retained_container_detail(container: pathlib.Path, cleanup_error: str) -> s
     )
 
 
+def _review_directory_identity(item: os.stat_result) -> tuple[int, int, int, int]:
+    return (item.st_dev, item.st_ino, item.st_mode, item.st_uid)
+
+
+def _canonical_review_root_base() -> pathlib.Path:
+    try:
+        canonical_base = REVIEW_ROOT_BASE.resolve(strict=True)
+        base_status = os.lstat(canonical_base)
+    except (OSError, RuntimeError) as error:
+        raise ReviewError(f"cannot resolve helper review root: {error}") from error
+    if (
+        not stat.S_ISDIR(base_status.st_mode)
+        or stat.S_ISLNK(base_status.st_mode)
+        or base_status.st_uid != 0
+        or stat.S_IMODE(base_status.st_mode) != 0o1777
+    ):
+        raise ReviewError(
+            "helper review root base must be a root-owned 01777 real directory: "
+            f"{canonical_base}"
+        )
+    return canonical_base
+
+
+def _review_root_for_source(
+    source_root: pathlib.Path,
+    *,
+    require_source: bool = True,
+) -> pathlib.Path:
+    try:
+        canonical_source = source_root.resolve(strict=require_source)
+    except (OSError, RuntimeError) as error:
+        raise ReviewError(f"cannot resolve source repository: {error}") from error
+    if require_source and not canonical_source.is_dir():
+        raise ReviewError(f"source repository is not a directory: {canonical_source}")
+    canonical_base = _canonical_review_root_base()
+    digest = hashlib.sha256(os.fsencode(str(canonical_source))).hexdigest()
+    review_root = canonical_base / f"{REVIEW_USER_ROOT_PREFIX}{os.geteuid()}" / digest
+    if is_relative_to(review_root, canonical_source) or is_relative_to(
+        canonical_source, review_root
+    ):
+        raise ReviewError("helper review root must be outside the source repository")
+    return review_root
+
+
+def _open_or_create_private_review_directory(
+    *,
+    parent_fd: int,
+    parent_path: pathlib.Path,
+    name: str,
+) -> tuple[pathlib.Path, int]:
+    path = parent_path / name
+    try:
+        path_status = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        initially_missing = False
+    except FileNotFoundError:
+        initially_missing = True
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            # Another creator won after the missing observation. The directory
+            # entry is still new relative to our observation and therefore
+            # requires the same parent durability barrier.
+            pass
+        except OSError as error:
+            raise ReviewError(
+                f"cannot create private review directory {path}: {error}"
+            ) from error
+        try:
+            path_status = os.stat(
+                name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise ReviewError(
+                f"cannot inspect private review directory {path}: {error}"
+            ) from error
+    except OSError as error:
+        raise ReviewError(
+            f"cannot inspect private review directory {path}: {error}"
+        ) from error
+    if (
+        not stat.S_ISDIR(path_status.st_mode)
+        or stat.S_ISLNK(path_status.st_mode)
+        or path_status.st_uid != os.geteuid()
+        or stat.S_IMODE(path_status.st_mode) != 0o700
+    ):
+        raise ReviewError(
+            "private review directory must be a current-user-owned 0700 real "
+            f"directory: {path}"
+        )
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as error:
+        raise ReviewError(
+            f"cannot securely open private review directory {path}: {error}"
+        ) from error
+    try:
+        opened_status = os.fstat(descriptor)
+        absolute_status = os.lstat(path)
+        if (
+            not stat.S_ISDIR(opened_status.st_mode)
+            or opened_status.st_uid != os.geteuid()
+            or stat.S_IMODE(opened_status.st_mode) != 0o700
+            or _review_directory_identity(opened_status)
+            != _review_directory_identity(path_status)
+            or _review_directory_identity(absolute_status)
+            != _review_directory_identity(path_status)
+        ):
+            raise ReviewError(
+                f"private review directory changed while opening it securely: {path}"
+            )
+        if initially_missing:
+            try:
+                os.fsync(parent_fd)
+            except OSError as error:
+                raise ReviewError(
+                    f"cannot persist private review directory entry for {path}: {error}"
+                ) from error
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return path, descriptor
+
+
 def _new_container(
     source_root: pathlib.Path,
 ) -> tuple[pathlib.Path, int, CleanupIdentity, set[signal.Signals] | None]:
     handoff_mask = block_forwarded_signals()
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     suffix = uuid.uuid4().hex[:10]
-    review_root = source_root / ".codex-tmp"
+    review_root = _review_root_for_source(source_root)
     container: pathlib.Path | None = None
     container_descriptor: int | None = None
     container_identity: CleanupIdentity | None = None
-    source_descriptor: int | None = None
+    base_descriptor: int | None = None
+    user_descriptor: int | None = None
     review_root_descriptor: int | None = None
     try:
+        canonical_base = review_root.parents[1]
         try:
-            source_before = os.lstat(source_root)
+            base_before = os.lstat(canonical_base)
         except OSError as error:
             raise ReviewError(
-                f"cannot inspect repository root {source_root}: {error}"
+                f"cannot inspect helper review root base {canonical_base}: {error}"
             ) from error
-        if not stat.S_ISDIR(source_before.st_mode) or stat.S_ISLNK(
-            source_before.st_mode
-        ):
-            raise ReviewError(
-                f"repository root must be a real directory: {source_root}"
-            )
         try:
-            source_descriptor = os.open(
-                source_root,
+            base_descriptor = os.open(
+                canonical_base,
                 _private_cleanup_directory_flags(),
             )
         except OSError as error:
             raise ReviewError(
-                f"cannot securely open repository root {source_root}: {error}"
+                f"cannot securely open helper review root base {canonical_base}: {error}"
             ) from error
-        source_opened = os.fstat(source_descriptor)
-        source_after = os.lstat(source_root)
+        base_opened = os.fstat(base_descriptor)
+        base_after = os.lstat(canonical_base)
         if (
             any(
                 not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
-                for metadata in (source_opened, source_after)
+                for metadata in (base_before, base_opened, base_after)
+            )
+            or any(
+                metadata.st_uid != 0
+                for metadata in (base_before, base_opened, base_after)
+            )
+            or any(
+                stat.S_IMODE(metadata.st_mode) != 0o1777
+                for metadata in (base_before, base_opened, base_after)
             )
             or len(
                 {
-                    _private_cleanup_identity(source_before),
-                    _private_cleanup_identity(source_opened),
-                    _private_cleanup_identity(source_after),
+                    _private_cleanup_identity(base_before),
+                    _private_cleanup_identity(base_opened),
+                    _private_cleanup_identity(base_after),
                 }
             )
             != 1
         ):
-            raise ReviewError("repository root changed while opening it securely")
+            raise ReviewError("helper review root base changed while opening it")
 
-        review_root_initially_missing = False
-        try:
-            root_status = os.stat(
-                ".codex-tmp",
-                dir_fd=source_descriptor,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            review_root_initially_missing = True
-            if any(
-                metadata.st_uid != os.geteuid()
-                for metadata in (source_before, source_opened, source_after)
-            ):
-                raise ReviewError(
-                    "repository root must be owned by the current user to create "
-                    f"the review root: {source_root}"
-                )
-            try:
-                os.mkdir(".codex-tmp", mode=0o700, dir_fd=source_descriptor)
-            except FileExistsError:
-                pass
-            except OSError as error:
-                raise ReviewError(
-                    f"cannot create review root {review_root}: {error}"
-                ) from error
-            try:
-                root_status = os.stat(
-                    ".codex-tmp",
-                    dir_fd=source_descriptor,
-                    follow_symlinks=False,
-                )
-            except OSError as error:
-                raise ReviewError(
-                    f"cannot inspect review root {review_root}: {error}"
-                ) from error
-        except OSError as error:
-            raise ReviewError(
-                f"cannot inspect review root {review_root}: {error}"
-            ) from error
-        if stat.S_ISLNK(root_status.st_mode):
-            raise ReviewError(
-                f"review root must be a real directory, not a symlink: {review_root}"
-            )
-        root_error = _private_cleanup_directory_error(
-            root_status,
-            label="review root",
-            require_private_mode=False,
+        user_root, user_descriptor = _open_or_create_private_review_directory(
+            parent_fd=base_descriptor,
+            parent_path=canonical_base,
+            name=review_root.parent.name,
         )
-        if root_error:
-            raise ReviewError(root_error)
-        if review_root.resolve() != review_root.absolute():
-            raise ReviewError(
-                f"review root resolves outside the source repository: {review_root}"
+        source_review_root, review_root_descriptor = (
+            _open_or_create_private_review_directory(
+                parent_fd=user_descriptor,
+                parent_path=user_root,
+                name=review_root.name,
             )
-        try:
-            review_root_descriptor = os.open(
-                ".codex-tmp",
-                _private_cleanup_directory_flags(),
-                dir_fd=source_descriptor,
-            )
-        except OSError as error:
-            raise ReviewError(
-                f"cannot securely open review root {review_root}: {error}"
-            ) from error
-        root_opened = os.fstat(review_root_descriptor)
-        root_after = os.stat(
-            ".codex-tmp",
-            dir_fd=source_descriptor,
-            follow_symlinks=False,
         )
-        for metadata in (root_opened, root_after):
-            root_error = _private_cleanup_directory_error(
-                metadata,
-                label="review root",
-                require_private_mode=False,
-            )
-            if root_error:
-                raise ReviewError(root_error)
-        if (
-            len(
-                {
-                    _private_cleanup_identity(root_status),
-                    _private_cleanup_identity(root_opened),
-                    _private_cleanup_identity(root_after),
-                }
-            )
-            != 1
-        ):
-            raise ReviewError("review root changed while opening it securely")
-        if review_root_initially_missing:
-            try:
-                os.fsync(source_descriptor)
-            except OSError as error:
-                raise ReviewError(
-                    "cannot persist the repository review-root directory entry: "
-                    f"{error}"
-                ) from error
+        if source_review_root != review_root:
+            raise ReviewError("private review namespace resolved to an unexpected path")
 
         name = f"isolated-review-{stamp}-{suffix}"
         container = review_root / name
@@ -3034,12 +4662,23 @@ def _new_container(
             )
         container_identity = _cleanup_identity_evidence(opened_status)
         path_status = os.lstat(container)
-        if (descriptor_status.st_dev, descriptor_status.st_ino) != (
-            path_status.st_dev,
-            path_status.st_ino,
+        if (
+            not stat.S_ISDIR(descriptor_status.st_mode)
+            or descriptor_status.st_uid != os.geteuid()
+            or stat.S_IMODE(descriptor_status.st_mode) != 0o700
+            or _private_cleanup_identity(descriptor_status)
+            != _private_cleanup_identity(path_status)
         ):
             raise ReviewError(
                 "review root changed while creating the private container"
+            )
+        if _review_directory_identity(os.fstat(user_descriptor)) != (
+            _review_directory_identity(os.lstat(user_root))
+        ) or _review_directory_identity(os.fstat(review_root_descriptor)) != (
+            _review_directory_identity(os.lstat(source_review_root))
+        ):
+            raise ReviewError(
+                "private review namespace changed while creating the container"
             )
         try:
             os.fsync(review_root_descriptor)
@@ -3088,7 +4727,11 @@ def _new_container(
             ) from error
         raise
     finally:
-        for descriptor in (review_root_descriptor, source_descriptor):
+        for descriptor in (
+            review_root_descriptor,
+            user_descriptor,
+            base_descriptor,
+        ):
             if descriptor is not None:
                 os.close(descriptor)
 
@@ -3233,45 +4876,33 @@ def _reject_values_in_frozen_tree_paths(
 ) -> None:
     if len(matcher.transitions) == 1:
         return
-    with tempfile.TemporaryFile() as tree_stderr:
-        process = subprocess.Popen(
+    with _temporary_review_file() as output:
+        _run_bounded_process_to_file(
             _frozen_command(
                 git_view=git_view,
                 args=("ls-tree", "-rz", "--full-tree", "-r", commit),
             ),
-            env=_git_environment(object_directory=object_directory),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=tree_stderr,
+            environment=_git_environment(object_directory=object_directory),
+            destination=output,
+            label="frozen Git path validation metadata",
+            byte_limit=MAX_TREE_METADATA_BYTES,
+            record_limit=MAX_SNAPSHOT_ENTRIES,
+            record_separator=b"\0",
         )
-        if process.stdout is None:
-            _stop_process(process)
-            raise ReviewError("failed to create frozen Git path validation pipe")
-        try:
-            for record in _iter_nul_records(
-                process.stdout,
-                byte_limit=MAX_TREE_METADATA_BYTES,
-                record_limit=MAX_SNAPSHOT_ENTRIES,
-                label="frozen Git path validation metadata",
-            ):
-                _metadata, separator, raw_path = record.partition(b"\t")
-                if not separator:
-                    raise ReviewError("malformed record from git ls-tree")
-                identifier = matcher.match(raw_path)
-                if identifier is not None:
-                    raise ReviewError(f"{match_message}: {identifier}")
-                _parse_tree_record(record)
-            _close_pipe(process.stdout)
-            returncode = process.wait()
-        except BaseException:
-            _close_pipe(process.stdout)
-            _stop_process(process)
-            raise
-        if returncode != 0:
-            raise ReviewError(
-                f"cannot enumerate frozen Git paths for {failure_label} "
-                f"validation: {_process_stderr(tree_stderr)}"
-            )
+        output.seek(0)
+        for record in _iter_nul_records(
+            output,
+            byte_limit=MAX_TREE_METADATA_BYTES,
+            record_limit=MAX_SNAPSHOT_ENTRIES,
+            label="frozen Git path validation metadata",
+        ):
+            _metadata, separator, raw_path = record.partition(b"\t")
+            if not separator:
+                raise ReviewError("malformed record from git ls-tree")
+            identifier = matcher.match(raw_path)
+            if identifier is not None:
+                raise ReviewError(f"{match_message}: {identifier}")
+            _parse_tree_record(record)
 
 
 def _reject_legacy_values_in_frozen_tree_paths(
@@ -3446,6 +5077,41 @@ def _copy_limited(
     return copied
 
 
+def _normalize_frozen_directory_mode(
+    directory: pathlib.Path,
+    *,
+    label: str,
+) -> None:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(directory, flags)
+        initial = os.fstat(descriptor)
+        if not stat.S_ISDIR(initial.st_mode) or initial.st_uid != os.geteuid():
+            raise ReviewError(f"{label} is unsafe")
+        os.fchmod(descriptor, 0o755)
+        final = os.fstat(descriptor)
+        if (
+            (initial.st_dev, initial.st_ino) != (final.st_dev, final.st_ino)
+            or not stat.S_ISDIR(final.st_mode)
+            or final.st_uid != os.geteuid()
+            or stat.S_IMODE(final.st_mode) != 0o755
+        ):
+            raise ReviewError(f"{label} mode normalization failed")
+    except ReviewError:
+        raise
+    except OSError as error:
+        raise ReviewError(f"cannot normalize {label} mode: {error}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def _mkdir_frozen_tree_parents(
     workspace_root: pathlib.Path,
     directory: pathlib.Path,
@@ -3461,19 +5127,15 @@ def _mkdir_frozen_tree_parents(
             current.mkdir(mode=0o755)
         except FileExistsError:
             pass
-        metadata = os.lstat(current)
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or stat.S_ISLNK(metadata.st_mode)
-            or metadata.st_uid != os.geteuid()
-            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-        ):
-            raise ReviewError("frozen Git tree parent directory is unsafe")
+        _normalize_frozen_directory_mode(
+            current,
+            label="frozen Git tree parent directory",
+        )
 
 
 def _materialize_blob(
     *,
-    cat_input: BinaryIO,
+    cat_input: BinaryIO | None,
     cat_output: BinaryIO,
     workspace_root: pathlib.Path,
     destination: pathlib.Path,
@@ -3486,8 +5148,9 @@ def _materialize_blob(
         os.fspath(destination),
         "snapshot path",
     )
-    cat_input.write(object_id.encode("ascii") + b"\n")
-    cat_input.flush()
+    if cat_input is not None:
+        cat_input.write(object_id.encode("ascii") + b"\n")
+        cat_input.flush()
     header = cat_output.readline()
     fields = header.rstrip(b"\n").split(b" ")
     if len(fields) != 3:
@@ -3594,6 +5257,15 @@ def _materialize_blob(
     return materialized_bytes + size
 
 
+def _close_pipe(stream: BinaryIO | None) -> None:
+    if stream is None:
+        return
+    try:
+        stream.close()
+    except OSError:
+        pass
+
+
 def _stop_process(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is not None:
         return
@@ -3603,15 +5275,6 @@ def _stop_process(process: subprocess.Popen[bytes]) -> None:
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait()
-
-
-def _close_pipe(stream: BinaryIO | None) -> None:
-    if stream is None:
-        return
-    try:
-        stream.close()
-    except OSError:
-        pass
 
 
 def _process_stderr(handle: BinaryIO) -> str:
@@ -3630,133 +5293,130 @@ def _materialize_frozen_tree(
     workspace_root: pathlib.Path,
     legacy_value_matcher: LegacyPathMatcher,
 ) -> None:
-    workspace_root.mkdir(mode=0o755)
-    environment = _git_environment(object_directory=object_directory)
+    if workspace_root.exists():
+        if not workspace_root.is_dir() or workspace_root.is_symlink():
+            raise ReviewError("detached review worktree root is not a real directory")
+        entries = {item.name for item in workspace_root.iterdir()}
+        if entries != {".git"}:
+            raise ReviewError(
+                "detached review worktree contains unexpected files before materialization"
+            )
+    else:
+        workspace_root.mkdir(mode=0o755)
+    _normalize_frozen_directory_mode(
+        workspace_root,
+        label="detached review worktree root",
+    )
     with (
-        tempfile.TemporaryFile() as tree_stderr,
-        tempfile.TemporaryFile() as cat_stderr,
+        _temporary_review_file() as tree_metadata,
+        _temporary_review_file() as batch_input,
+        _temporary_review_file() as batch_output,
     ):
-        tree_process = subprocess.Popen(
+        _run_bounded_process_to_file(
             _frozen_command(
                 git_view=git_view,
                 args=("ls-tree", "-rz", "--full-tree", "-r", head_sha),
             ),
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=tree_stderr,
+            environment=_git_environment(object_directory=object_directory),
+            destination=tree_metadata,
+            label="frozen Git tree metadata",
+            byte_limit=MAX_TREE_METADATA_BYTES,
+            record_limit=MAX_SNAPSHOT_ENTRIES,
+            record_separator=b"\0",
         )
-        try:
-            cat_process = subprocess.Popen(
-                _frozen_command(git_view=git_view, args=("cat-file", "--batch")),
-                env=environment,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=cat_stderr,
-            )
-        except BaseException:
-            _close_pipe(tree_process.stdout)
-            _stop_process(tree_process)
-            raise
-        if (
-            tree_process.stdout is None
-            or cat_process.stdin is None
-            or cat_process.stdout is None
+        tree_metadata.seek(0)
+        blob_count = 0
+        for record in _iter_nul_records(
+            tree_metadata,
+            byte_limit=MAX_TREE_METADATA_BYTES,
+            record_limit=MAX_SNAPSHOT_ENTRIES,
+            label="frozen Git tree metadata",
         ):
-            _stop_process(tree_process)
-            _stop_process(cat_process)
-            raise ReviewError(
-                "failed to create pipes for frozen Git tree materialization"
+            mode, object_type, object_id, _relative = _parse_tree_record(record)
+            if mode == "160000" and object_type == "commit":
+                continue
+            if object_type != "blob":
+                raise ReviewError("unsupported object in frozen Git tree")
+            batch_input.write(object_id.encode("ascii") + b"\n")
+            blob_count += 1
+        if blob_count:
+            batch_input.seek(0)
+            _run_bounded_process_to_file(
+                _frozen_command(git_view=git_view, args=("cat-file", "--batch")),
+                environment=_git_environment(object_directory=object_directory),
+                input_handle=batch_input,
+                destination=batch_output,
+                label="frozen Git batch blobs",
+                byte_limit=MAX_SNAPSHOT_BYTES + MAX_TREE_METADATA_BYTES,
             )
+        tree_metadata.seek(0)
+        batch_output.seek(0)
         materialized_bytes = 0
-        materialized_entries = 0
-        try:
-            for record in _iter_nul_records(
-                tree_process.stdout,
-                byte_limit=MAX_TREE_METADATA_BYTES,
-                label="frozen Git tree metadata",
-            ):
-                materialized_entries += 1
-                if materialized_entries > MAX_SNAPSHOT_ENTRIES:
-                    raise ReviewError(
-                        "frozen Git tree exceeds the review entry-count limit"
-                    )
-                mode, object_type, object_id, relative = _parse_tree_record(record)
-                if _uses_review_cleanup_quarantine_namespace(relative):
-                    raise ReviewError(
-                        "the frozen head uses a reserved review cleanup "
-                        "quarantine path component"
-                    )
-                is_gitlink = mode == "160000" and object_type == "commit"
-                cleanup_depth = len(relative.parts) + (1 if is_gitlink else 0)
-                if cleanup_depth >= MAX_REVIEW_CLEANUP_DEPTH:
-                    raise ReviewError(
-                        "frozen Git tree path depth exceeds the review cleanup "
-                        "safety limit"
-                    )
-                destination = workspace_root.joinpath(*relative.parts)
-                path_display = _redact_secret_path(
-                    os.fspath(relative),
-                    "snapshot path",
+        for record in _iter_nul_records(
+            tree_metadata,
+            byte_limit=MAX_TREE_METADATA_BYTES,
+            record_limit=MAX_SNAPSHOT_ENTRIES,
+            label="frozen Git tree metadata",
+        ):
+            mode, object_type, object_id, relative = _parse_tree_record(record)
+            if _uses_review_cleanup_quarantine_namespace(relative):
+                raise ReviewError(
+                    "the frozen head uses a reserved review cleanup quarantine "
+                    "path component"
                 )
-                try:
-                    if is_gitlink:
-                        resolved_parent = destination.parent.resolve(strict=False)
-                        if not is_relative_to(
-                            resolved_parent, workspace_root.resolve(strict=False)
-                        ):
-                            raise ReviewError(
-                                "frozen Git tree path escapes workspace: "
-                                f"{path_display}"
-                            )
-                        _mkdir_frozen_tree_parents(
-                            workspace_root,
-                            destination.parent,
-                        )
-                        destination.mkdir(mode=0o755, exist_ok=False)
-                        continue
-                    if object_type != "blob":
-                        raise ReviewError(
-                            "unsupported object in frozen Git tree: "
-                            f"{object_type} {path_display}"
-                        )
-                    materialized_bytes = _materialize_blob(
-                        cat_input=cat_process.stdin,
-                        cat_output=cat_process.stdout,
-                        workspace_root=workspace_root,
-                        destination=destination,
-                        object_id=object_id,
-                        mode=mode,
-                        materialized_bytes=materialized_bytes,
-                        legacy_value_matcher=legacy_value_matcher,
-                    )
-                except OSError as error:
-                    error_code = (
-                        f" (errno {error.errno})" if error.errno is not None else ""
-                    )
-                    raise ReviewError(
-                        "filesystem error while materializing frozen Git tree path "
-                        f"{path_display}{error_code}"
-                    ) from error
-            _close_pipe(tree_process.stdout)
-            tree_returncode = tree_process.wait()
-            _close_pipe(cat_process.stdin)
-            _close_pipe(cat_process.stdout)
-            cat_returncode = cat_process.wait()
-        except BaseException:
-            _close_pipe(cat_process.stdin)
-            _close_pipe(tree_process.stdout)
-            _close_pipe(cat_process.stdout)
-            _stop_process(tree_process)
-            _stop_process(cat_process)
-            raise
-        if tree_returncode != 0:
-            raise ReviewError(
-                f"cannot enumerate frozen Git tree: {_process_stderr(tree_stderr)}"
+            is_gitlink = mode == "160000" and object_type == "commit"
+            cleanup_depth = len(relative.parts) + (1 if is_gitlink else 0)
+            if cleanup_depth >= MAX_REVIEW_CLEANUP_DEPTH:
+                raise ReviewError(
+                    "frozen Git tree path depth exceeds the review cleanup safety limit"
+                )
+            destination = workspace_root.joinpath(*relative.parts)
+            path_display = _redact_secret_path(
+                os.fspath(relative),
+                "snapshot path",
             )
-        if cat_returncode != 0:
+            try:
+                if is_gitlink:
+                    resolved_parent = destination.parent.resolve(strict=False)
+                    if not is_relative_to(
+                        resolved_parent, workspace_root.resolve(strict=False)
+                    ):
+                        raise ReviewError(
+                            f"frozen Git tree path escapes workspace: {path_display}"
+                        )
+                    _mkdir_frozen_tree_parents(workspace_root, destination.parent)
+                    destination.mkdir(mode=0o755, exist_ok=False)
+                    _normalize_frozen_directory_mode(
+                        destination,
+                        label="materialized Gitlink directory",
+                    )
+                    continue
+                if object_type != "blob":
+                    raise ReviewError(
+                        "unsupported object in frozen Git tree: "
+                        f"{object_type} {path_display}"
+                    )
+                materialized_bytes = _materialize_blob(
+                    cat_input=None,
+                    cat_output=batch_output,
+                    workspace_root=workspace_root,
+                    destination=destination,
+                    object_id=object_id,
+                    mode=mode,
+                    materialized_bytes=materialized_bytes,
+                    legacy_value_matcher=legacy_value_matcher,
+                )
+            except OSError as error:
+                error_code = (
+                    f" (errno {error.errno})" if error.errno is not None else ""
+                )
+                raise ReviewError(
+                    "filesystem error while materializing frozen Git tree path "
+                    f"{path_display}{error_code}"
+                ) from error
+        if batch_output.read(1):
             raise ReviewError(
-                f"cannot materialize frozen Git blobs: {_process_stderr(cat_stderr)}"
+                "frozen Git batch output contains unexpected trailing data"
             )
 
 
@@ -3916,11 +5576,8 @@ def _write_frozen_diff(
     head_sha: str,
     destination: pathlib.Path,
 ) -> None:
-    with (
-        _open_new_private_binary(destination) as output,
-        tempfile.TemporaryFile() as error_output,
-    ):
-        process = subprocess.Popen(
+    with _open_new_private_binary(destination) as output:
+        _run_bounded_process_to_file(
             _frozen_command(
                 git_view=git_view,
                 args=(
@@ -3933,31 +5590,11 @@ def _write_frozen_diff(
                     head_sha,
                 ),
             ),
-            env=_git_environment(object_directory=object_directory),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=error_output,
+            environment=_git_environment(object_directory=object_directory),
+            destination=output,
+            label="frozen review diff",
+            byte_limit=MAX_DIFF_BYTES,
         )
-        if process.stdout is None:
-            _stop_process(process)
-            raise ReviewError("failed to create frozen review diff pipe")
-        try:
-            _copy_limited(
-                process.stdout,
-                output,
-                limit=MAX_DIFF_BYTES,
-                label="frozen review diff",
-            )
-            _close_pipe(process.stdout)
-            returncode = process.wait()
-        except BaseException:
-            _close_pipe(process.stdout)
-            _stop_process(process)
-            raise
-        if returncode != 0:
-            raise ReviewError(
-                f"cannot generate frozen review diff: {_process_stderr(error_output)}"
-            )
 
 
 def _write_limited_diff_metadata(
@@ -3966,36 +5603,18 @@ def _write_limited_diff_metadata(
     object_directory: pathlib.Path,
     args: tuple[str, ...],
     output: BinaryIO,
-    error_output: BinaryIO,
     label: str,
     record_limit: int,
 ) -> None:
-    process = subprocess.Popen(
+    _run_bounded_process_to_file(
         _frozen_command(git_view=git_view, args=args),
-        env=_git_environment(object_directory=object_directory),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=error_output,
+        environment=_git_environment(object_directory=object_directory),
+        destination=output,
+        label=label,
+        byte_limit=MAX_CHANGED_METADATA_BYTES,
+        record_limit=record_limit,
+        record_separator=b"\0",
     )
-    if process.stdout is None:
-        _stop_process(process)
-        raise ReviewError(f"failed to create {label} pipe")
-    try:
-        _copy_limited(
-            process.stdout,
-            output,
-            limit=MAX_CHANGED_METADATA_BYTES,
-            label=label,
-            record_limit=record_limit,
-        )
-        _close_pipe(process.stdout)
-        returncode = process.wait()
-    except BaseException:
-        _close_pipe(process.stdout)
-        _stop_process(process)
-        raise
-    if returncode != 0:
-        raise ReviewError(f"cannot generate {label}: {_process_stderr(error_output)}")
 
 
 def _changed_path_digest(side_tag: bytes, raw_path: bytes) -> bytes:
@@ -4019,10 +5638,7 @@ def _write_frozen_changed_paths(
     private_parent_descriptor: int,
 ) -> None:
     digest_evidence: list[str] = []
-    with (
-        tempfile.TemporaryFile() as raw_metadata,
-        tempfile.TemporaryFile() as error_output,
-    ):
+    with _temporary_review_file() as raw_metadata:
         _write_limited_diff_metadata(
             git_view=git_view,
             object_directory=object_directory,
@@ -4037,7 +5653,6 @@ def _write_frozen_changed_paths(
                 head_sha,
             ),
             output=raw_metadata,
-            error_output=error_output,
             label="frozen changed paths",
             record_limit=MAX_CHANGED_ENTRIES * 2,
         )
@@ -4265,7 +5880,7 @@ def _record_bounded_evidence_count(
 
 def _scan_batch_blob(
     *,
-    cat_input: BinaryIO,
+    cat_input: BinaryIO | None,
     cat_output: BinaryIO,
     object_id: str,
     scanned_bytes: int,
@@ -4282,8 +5897,9 @@ def _scan_batch_blob(
     exact_only: bool = False,
     _continue_after_blocking: bool = False,
 ) -> tuple[SecretScanResult, int]:
-    cat_input.write(object_id.encode("ascii") + b"\n")
-    cat_input.flush()
+    if cat_input is not None:
+        cat_input.write(object_id.encode("ascii") + b"\n")
+        cat_input.flush()
     header = cat_output.readline()
     fields = header.rstrip(b"\n").split(b" ")
     if len(fields) != 3 or fields[1] != b"blob":
@@ -4399,154 +6015,379 @@ def _scan_frozen_tree_values(
     event_budget = SecretScanBudget.default()
     occurrence_budget = LegacyOccurrenceBudget.default()
     result = SecretScanResult.empty()
-    environment = _git_environment(object_directory=object_directory)
     with (
-        tempfile.TemporaryFile() as tree_stderr,
-        tempfile.TemporaryFile() as cat_stderr,
+        _temporary_review_file() as tree_metadata,
+        _temporary_review_file() as batch_input,
+        _temporary_review_file() as batch_output,
     ):
-        tree_process = subprocess.Popen(
+        _run_bounded_process_to_file(
             _frozen_command(
                 git_view=git_view,
                 args=("ls-tree", "-rz", "--full-tree", "-r", commit),
             ),
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=tree_stderr,
+            environment=_git_environment(object_directory=object_directory),
+            destination=tree_metadata,
+            label="frozen Git tree scan metadata",
+            byte_limit=MAX_TREE_METADATA_BYTES,
+            record_limit=MAX_SNAPSHOT_ENTRIES,
+            record_separator=b"\0",
         )
-        try:
-            cat_process = subprocess.Popen(
-                _frozen_command(git_view=git_view, args=("cat-file", "--batch")),
-                env=environment,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=cat_stderr,
-            )
-        except BaseException:
-            _close_pipe(tree_process.stdout)
-            _stop_process(tree_process)
-            raise
-        if (
-            tree_process.stdout is None
-            or cat_process.stdin is None
-            or cat_process.stdout is None
+        tree_metadata.seek(0)
+        blob_count = 0
+        for record in _iter_nul_records(
+            tree_metadata,
+            byte_limit=MAX_TREE_METADATA_BYTES,
+            record_limit=MAX_SNAPSHOT_ENTRIES,
+            label="frozen Git tree scan metadata",
         ):
-            _stop_process(tree_process)
-            _stop_process(cat_process)
-            raise ReviewError("failed to create pipes for frozen Git tree scanning")
-        scanned_bytes = 0
-        scanned_entries = 0
-        try:
-            for record in _iter_nul_records(
-                tree_process.stdout,
-                byte_limit=MAX_TREE_METADATA_BYTES,
-                label="frozen Git tree scan metadata",
-            ):
-                scanned_entries += 1
-                if scanned_entries > MAX_SNAPSHOT_ENTRIES:
-                    raise ReviewError(
-                        "frozen Git tree scan exceeds the review entry-count limit"
-                    )
-                mode, object_type, object_id, _relative = _parse_tree_record(record)
-                _metadata, raw_path = record.split(b"\t", 1)
-                path_scan = _scan_secret_value(
-                    raw_path,
-                    accepted_values=accepted,
-                    raw_occurrence_values=raw_occurrences,
-                    capture_accepted_candidates=capture_accepted_candidates,
-                    capture_blocking_candidates=capture_blocking_candidates,
-                    reduced_secret_values=reduced_secret_values,
-                    _accepted_index=accepted_index,
-                    _event_budget=event_budget,
-                    _exact_index=exact_index,
-                    _occurrence_budget=occurrence_budget,
-                    exact_only=exact_only,
-                    _continue_after_blocking=_continue_after_blocking,
-                )
-                result.merge(path_scan)
-                if mode == "160000" and object_type == "commit":
-                    continue
-                if object_type != "blob":
-                    raise ReviewError(
-                        f"unsupported object in frozen Git tree scan: {object_type}"
-                    )
-                scan, scanned_bytes = _scan_batch_blob(
-                    cat_input=cat_process.stdin,
-                    cat_output=cat_process.stdout,
-                    object_id=object_id,
-                    scanned_bytes=scanned_bytes,
-                    accepted_values=accepted,
-                    raw_occurrence_values=raw_occurrences,
-                    capture_accepted_candidates=capture_accepted_candidates,
-                    capture_blocking_candidates=capture_blocking_candidates,
-                    capture_reduction_offsets=capture_reduction_identities,
-                    reduced_secret_values=reduced_secret_values,
-                    accepted_index=accepted_index,
-                    event_budget=event_budget,
-                    exact_index=exact_index,
-                    occurrence_budget=occurrence_budget,
-                    exact_only=exact_only,
-                    _continue_after_blocking=_continue_after_blocking,
-                )
-                if capture_reduction_identities:
-                    for (
-                        descriptor,
-                        offsets,
-                    ) in scan.reduction_occurrence_offsets.items():
-                        identities = scan.reduction_occurrence_identities.setdefault(
-                            descriptor,
-                            set(),
-                        )
-                        identities.update(
-                            _secret_reduction_occurrence_identity(
-                                raw_path=raw_path,
-                                git_mode=mode,
-                                offset=offset,
-                            )
-                            for offset in offsets
-                        )
-                    for (
-                        descriptor,
-                        offsets,
-                    ) in scan.reduction_unembedded_offsets.items():
-                        identities = scan.reduction_unembedded_identities.setdefault(
-                            descriptor,
-                            set(),
-                        )
-                        identities.update(
-                            _secret_reduction_occurrence_identity(
-                                raw_path=raw_path,
-                                git_mode=mode,
-                                offset=offset,
-                            )
-                            for offset in offsets
-                        )
-                    scan.reduction_occurrence_offsets.clear()
-                    scan.reduction_unembedded_offsets.clear()
-                result.merge(scan)
-            _close_pipe(tree_process.stdout)
-            tree_returncode = tree_process.wait()
-            _close_pipe(cat_process.stdin)
-            _close_pipe(cat_process.stdout)
-            cat_returncode = cat_process.wait()
-        except BaseException:
-            _close_pipe(cat_process.stdin)
-            _close_pipe(tree_process.stdout)
-            _close_pipe(cat_process.stdout)
-            _stop_process(tree_process)
-            _stop_process(cat_process)
-            raise
-        if tree_returncode != 0:
-            raise ReviewError(
-                "cannot enumerate frozen Git tree for synthetic-token counts: "
-                f"{_process_stderr(tree_stderr)}"
+            mode, object_type, object_id, _relative = _parse_tree_record(record)
+            _metadata, raw_path = record.split(b"\t", 1)
+            path_scan = _scan_secret_value(
+                raw_path,
+                accepted_values=accepted,
+                raw_occurrence_values=raw_occurrences,
+                capture_accepted_candidates=capture_accepted_candidates,
+                capture_blocking_candidates=capture_blocking_candidates,
+                reduced_secret_values=reduced_secret_values,
+                _accepted_index=accepted_index,
+                _event_budget=event_budget,
+                _exact_index=exact_index,
+                _occurrence_budget=occurrence_budget,
+                exact_only=exact_only,
+                _continue_after_blocking=_continue_after_blocking,
             )
-        if cat_returncode != 0:
+            result.merge(path_scan)
+            if mode == "160000" and object_type == "commit":
+                continue
+            if object_type != "blob":
+                raise ReviewError(
+                    f"unsupported object in frozen Git tree scan: {object_type}"
+                )
+            batch_input.write(object_id.encode("ascii") + b"\n")
+            blob_count += 1
+        if blob_count:
+            batch_input.seek(0)
+            _run_bounded_process_to_file(
+                _frozen_command(git_view=git_view, args=("cat-file", "--batch")),
+                environment=_git_environment(object_directory=object_directory),
+                input_handle=batch_input,
+                destination=batch_output,
+                label="frozen Git tree scan blobs",
+                byte_limit=MAX_SNAPSHOT_BYTES + MAX_TREE_METADATA_BYTES,
+            )
+        tree_metadata.seek(0)
+        batch_output.seek(0)
+        scanned_bytes = 0
+        for record in _iter_nul_records(
+            tree_metadata,
+            byte_limit=MAX_TREE_METADATA_BYTES,
+            record_limit=MAX_SNAPSHOT_ENTRIES,
+            label="frozen Git tree scan metadata",
+        ):
+            mode, object_type, object_id, _relative = _parse_tree_record(record)
+            _metadata, raw_path = record.split(b"\t", 1)
+            if mode == "160000" and object_type == "commit":
+                continue
+            scan, scanned_bytes = _scan_batch_blob(
+                cat_input=None,
+                cat_output=batch_output,
+                object_id=object_id,
+                scanned_bytes=scanned_bytes,
+                accepted_values=accepted,
+                raw_occurrence_values=raw_occurrences,
+                capture_accepted_candidates=capture_accepted_candidates,
+                capture_blocking_candidates=capture_blocking_candidates,
+                capture_reduction_offsets=capture_reduction_identities,
+                reduced_secret_values=reduced_secret_values,
+                accepted_index=accepted_index,
+                event_budget=event_budget,
+                exact_index=exact_index,
+                occurrence_budget=occurrence_budget,
+                exact_only=exact_only,
+                _continue_after_blocking=_continue_after_blocking,
+            )
+            if capture_reduction_identities:
+                for descriptor, offsets in scan.reduction_occurrence_offsets.items():
+                    identities = scan.reduction_occurrence_identities.setdefault(
+                        descriptor,
+                        set(),
+                    )
+                    identities.update(
+                        _secret_reduction_occurrence_identity(
+                            raw_path=raw_path,
+                            git_mode=mode,
+                            offset=offset,
+                        )
+                        for offset in offsets
+                    )
+                for descriptor, offsets in scan.reduction_unembedded_offsets.items():
+                    identities = scan.reduction_unembedded_identities.setdefault(
+                        descriptor,
+                        set(),
+                    )
+                    identities.update(
+                        _secret_reduction_occurrence_identity(
+                            raw_path=raw_path,
+                            git_mode=mode,
+                            offset=offset,
+                        )
+                        for offset in offsets
+                    )
+                scan.reduction_occurrence_offsets.clear()
+                scan.reduction_unembedded_offsets.clear()
+            result.merge(scan)
+        if batch_output.read(1):
             raise ReviewError(
-                "cannot scan frozen Git blobs for synthetic-token counts: "
-                f"{_process_stderr(cat_stderr)}"
+                "frozen Git scan batch output contains unexpected trailing data"
             )
     return result
+
+
+def _legacy_count_manifest(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    base_sha: str,
+    head_sha: str,
+    source_head_sha: str | None = None,
+    catalog: SyntheticTokenCatalog,
+    exemptions: tuple[LegacyExemption, ...],
+) -> dict[str, Any]:
+    legacy_accepted = accepted_legacy_values(catalog, exemptions)
+    authoring_accepted = accepted_authoring_values(catalog)
+    scan_accepted = authoring_accepted + legacy_accepted
+    if legacy_accepted:
+        base_scan = _scan_frozen_tree_values(
+            git_view=git_view,
+            object_directory=object_directory,
+            commit=base_sha,
+            accepted_values=scan_accepted,
+            raw_occurrence_values=legacy_accepted,
+        )
+        head_scan = _scan_frozen_tree_values(
+            git_view=git_view,
+            object_directory=object_directory,
+            commit=head_sha,
+            accepted_values=scan_accepted,
+            raw_occurrence_values=legacy_accepted,
+        )
+        source_head_scan = (
+            head_scan
+            if source_head_sha is None or source_head_sha == head_sha
+            else _scan_frozen_tree_values(
+                git_view=git_view,
+                object_directory=object_directory,
+                commit=source_head_sha,
+                accepted_values=scan_accepted,
+                raw_occurrence_values=legacy_accepted,
+            )
+        )
+    else:
+        base_scan = SecretScanResult.empty()
+        head_scan = SecretScanResult.empty()
+        source_head_scan = head_scan
+    entries: list[dict[str, Any]] = []
+    for exemption in exemptions:
+        envelope_used = False
+        for token in exemption.values:
+            descriptor = next(
+                item
+                for item in legacy_accepted
+                if item.exemption_id == exemption.identifier
+                and item.identifier == token.identifier
+            )
+            base_count = base_scan.raw_occurrence_counts[descriptor]
+            head_count = head_scan.raw_occurrence_counts[descriptor]
+            source_head_count = source_head_scan.raw_occurrence_counts[descriptor]
+            base_unembedded_count = base_scan.unembedded_occurrence_counts[descriptor]
+            head_unembedded_count = head_scan.unembedded_occurrence_counts[descriptor]
+            source_head_unembedded_count = (
+                source_head_scan.unembedded_occurrence_counts[descriptor]
+            )
+            envelope_used = (
+                envelope_used
+                or base_count > 0
+                or head_count > 0
+                or source_head_count > 0
+            )
+            if head_count > base_count:
+                raise ReviewError(
+                    "legacy synthetic fixture count increased for "
+                    f"{token.identifier}: base={base_count}, head={head_count}"
+                )
+            if source_head_count > base_count:
+                raise ReviewError(
+                    "legacy synthetic fixture count increased in source HEAD for "
+                    f"{token.identifier}: base={base_count}, "
+                    f"source_head={source_head_count}"
+                )
+            if head_unembedded_count > base_unembedded_count:
+                raise ReviewError(
+                    "legacy synthetic fixture unembedded count increased for "
+                    f"{token.identifier}: base={base_unembedded_count}, "
+                    f"head={head_unembedded_count}"
+                )
+            if source_head_unembedded_count > base_unembedded_count:
+                raise ReviewError(
+                    "legacy synthetic fixture unembedded count increased in "
+                    f"source HEAD for {token.identifier}: "
+                    f"base={base_unembedded_count}, "
+                    f"source_head={source_head_unembedded_count}"
+                )
+            entries.append(
+                {
+                    "base_count": base_count,
+                    "base_unembedded_count": base_unembedded_count,
+                    "exemption_id": exemption.identifier,
+                    "head_count": head_count,
+                    "head_unembedded_count": head_unembedded_count,
+                    "rule": token.rule,
+                    "source_head_count": source_head_count,
+                    "source_head_unembedded_count": source_head_unembedded_count,
+                    "token_id": token.identifier,
+                    "value_length": token.value_length,
+                    "value_sha256": token.value_sha256,
+                }
+            )
+        if not envelope_used:
+            raise ReviewError(
+                f"selected synthetic secret exemption is unused: {exemption.identifier}"
+            )
+    if len(entries) > MAX_SYNTHETIC_EVIDENCE_ENTRIES:
+        raise ReviewError("legacy synthetic fixture evidence has too many entries")
+    return {
+        "catalog_schema_version": catalog.schema_version,
+        "entries": entries,
+        "pool_version": catalog.pool_version,
+        "schema_version": SYNTHETIC_MANIFEST_SCHEMA_VERSION,
+        "selected_exemptions": [item.identifier for item in exemptions],
+    }
+
+
+def _all_catalog_sensitive_values(
+    catalog: SyntheticTokenCatalog,
+) -> tuple[AcceptedSyntheticValue, ...]:
+    return accepted_authoring_values(catalog) + accepted_legacy_values(
+        catalog,
+        catalog.legacy_exemptions,
+    )
+
+
+def _iter_changed_blob_sides(
+    raw_output: BinaryIO,
+) -> Iterator[tuple[str, str, bytes]]:
+    raw_output.seek(0)
+    records = iter(
+        _iter_nul_records(
+            raw_output,
+            byte_limit=MAX_CHANGED_METADATA_BYTES,
+            record_limit=MAX_CHANGED_ENTRIES * 2,
+            label="changed blob metadata",
+        )
+    )
+    for metadata in records:
+        if not metadata.startswith(b":"):
+            raise ReviewError(f"invalid raw Git diff record: {metadata!r}")
+        fields = metadata[1:].split()
+        if len(fields) != 5:
+            raise ReviewError(f"invalid raw Git diff metadata: {metadata!r}")
+        old_mode, new_mode, old_object, new_object, _status = fields
+        try:
+            raw_path = next(records)
+        except StopIteration as error:
+            raise ReviewError("raw Git diff is missing a changed path") from error
+        for side, mode, raw_object in (
+            ("base", old_mode, old_object),
+            ("head", new_mode, new_object),
+        ):
+            if mode in {b"000000", b"160000"}:
+                continue
+            try:
+                object_id = raw_object.decode("ascii")
+            except UnicodeDecodeError as error:
+                raise ReviewError(
+                    f"invalid changed Git object id: {raw_object!r}"
+                ) from error
+            yield side, object_id, raw_path
+
+
+def _scan_source_head_wip_delta(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    source_head_sha: str,
+    snapshot_tree_sha: str,
+    accepted_values: Iterable[AcceptedSyntheticValue],
+    raw_occurrence_values: Iterable[AcceptedSyntheticValue],
+    accepted_index: AcceptedValueIndex,
+    event_budget: SecretScanBudget,
+    exact_index: ExactValueIndex,
+    occurrence_budget: LegacyOccurrenceBudget,
+    path_callback: Callable[[bytes], None],
+    blob_callback: Callable[[bytes, SecretScanResult], None],
+) -> None:
+    accepted = tuple(accepted_values)
+    raw_occurrences = tuple(raw_occurrence_values)
+    with (
+        _temporary_review_file() as raw_output,
+        _temporary_review_file() as batch_input,
+        _temporary_review_file() as batch_output,
+    ):
+        _write_limited_diff_metadata(
+            git_view=git_view,
+            object_directory=object_directory,
+            args=(
+                "diff",
+                "--raw",
+                "-z",
+                "--no-abbrev",
+                "--no-renames",
+                source_head_sha,
+                snapshot_tree_sha,
+            ),
+            output=raw_output,
+            label="source HEAD to WIP snapshot blob metadata",
+            record_limit=MAX_CHANGED_ENTRIES * 2,
+        )
+        blob_count = 0
+        for side, object_id, raw_path in _iter_changed_blob_sides(raw_output):
+            if side != "base":
+                continue
+            path_callback(raw_path)
+            batch_input.write(object_id.encode("ascii") + b"\n")
+            blob_count += 1
+        if blob_count:
+            batch_input.seek(0)
+            _run_bounded_process_to_file(
+                _frozen_command(git_view=git_view, args=("cat-file", "--batch")),
+                environment=_git_environment(object_directory=object_directory),
+                input_handle=batch_input,
+                destination=batch_output,
+                label="source HEAD WIP delta blob batch",
+                byte_limit=MAX_CHANGED_BLOB_SCAN_BYTES + MAX_CHANGED_METADATA_BYTES,
+            )
+        batch_output.seek(0)
+        scanned_bytes = 0
+        for side, object_id, raw_path in _iter_changed_blob_sides(raw_output):
+            if side != "base":
+                continue
+            scan, scanned_bytes = _scan_batch_blob(
+                cat_input=None,
+                cat_output=batch_output,
+                object_id=object_id,
+                scanned_bytes=scanned_bytes,
+                accepted_values=accepted,
+                raw_occurrence_values=raw_occurrences,
+                accepted_index=accepted_index,
+                event_budget=event_budget,
+                exact_index=exact_index,
+                occurrence_budget=occurrence_budget,
+            )
+            blob_callback(raw_path, scan)
+        if batch_output.read(1):
+            raise ReviewError(
+                "source HEAD WIP delta blob batch contains unexpected trailing data"
+            )
 
 
 def _secret_reduction_descriptor(
@@ -4765,8 +6606,7 @@ def _secret_delta_addition_locations(
 
     environment = _git_environment(object_directory=object_directory)
     with (
-        tempfile.TemporaryFile() as raw_output,
-        tempfile.TemporaryFile() as raw_error,
+        _temporary_review_file() as raw_output,
         tempfile.TemporaryFile() as cat_error,
     ):
         _write_limited_diff_metadata(
@@ -4782,7 +6622,6 @@ def _secret_delta_addition_locations(
                 head_sha,
             ),
             output=raw_output,
-            error_output=raw_error,
             label="secret-delta changed metadata",
             record_limit=MAX_CHANGED_ENTRIES * 2,
         )
@@ -5134,7 +6973,9 @@ def _secret_count_manifests(
     object_directory: pathlib.Path,
     base_sha: str,
     head_sha: str,
+    source_head_sha: str | None = None,
     catalog: SyntheticTokenCatalog,
+    evidence_head_ref: str | None = None,
 ) -> tuple[
     dict[str, Any],
     dict[str, Any],
@@ -5209,9 +7050,23 @@ def _secret_count_manifests(
             reduced_secret_values=discovered_values,
             exact_only=True,
         )
+        source_head_scan = (
+            head_scan
+            if source_head_sha is None or source_head_sha == head_sha
+            else _scan_frozen_tree_values(
+                git_view=git_view,
+                object_directory=object_directory,
+                commit=source_head_sha,
+                accepted_values=scan_accepted,
+                raw_occurrence_values=count_values,
+                reduced_secret_values=discovered_values,
+                exact_only=True,
+            )
+        )
     else:
         base_scan = SecretScanResult.empty()
         head_scan = SecretScanResult.empty()
+        source_head_scan = head_scan
     entries: list[dict[str, Any]] = []
     violations: dict[AcceptedSyntheticValue, tuple[int, int]] = {}
     for exemption in catalog.legacy_exemptions:
@@ -5224,14 +7079,40 @@ def _secret_count_manifests(
             )
             base_count = base_scan.raw_occurrence_counts[descriptor]
             head_count = head_scan.raw_occurrence_counts[descriptor]
+            source_head_count = source_head_scan.raw_occurrence_counts[descriptor]
+            base_unembedded_count = base_scan.unembedded_occurrence_counts[descriptor]
+            head_unembedded_count = head_scan.unembedded_occurrence_counts[descriptor]
+            source_head_unembedded_count = (
+                source_head_scan.unembedded_occurrence_counts[descriptor]
+            )
+            if source_head_sha is not None and source_head_count > base_count:
+                raise _SourceHeadSecretCountIncrease(
+                    "legacy synthetic fixture count increased in source HEAD for "
+                    f"{token.identifier}: base={base_count}, "
+                    f"source_head={source_head_count}"
+                )
+            if (
+                source_head_sha is not None
+                and source_head_unembedded_count > base_unembedded_count
+            ):
+                raise _SourceHeadSecretCountIncrease(
+                    "legacy synthetic fixture unembedded count increased in "
+                    f"source HEAD for {token.identifier}: "
+                    f"base={base_unembedded_count}, "
+                    f"source_head={source_head_unembedded_count}"
+                )
             if head_count > base_count:
                 violations[descriptor] = (base_count, head_count)
             entries.append(
                 {
                     "base_count": base_count,
+                    "base_unembedded_count": base_unembedded_count,
                     "exemption_id": exemption.identifier,
                     "head_count": head_count,
+                    "head_unembedded_count": head_unembedded_count,
                     "rule": token.rule,
+                    "source_head_count": source_head_count,
+                    "source_head_unembedded_count": source_head_unembedded_count,
                     "token_id": token.identifier,
                     "value_length": token.value_length,
                     "value_sha256": token.value_sha256,
@@ -5304,7 +7185,7 @@ def _secret_count_manifests(
         "base_ref": base_sha,
         "catalog_schema_version": catalog.schema_version,
         "entries": entries,
-        "head_ref": head_sha,
+        "head_ref": evidence_head_ref or head_sha,
         "pool_version": catalog.pool_version,
         "schema_version": SYNTHETIC_MANIFEST_SCHEMA_VERSION,
         "secret_delta": {
@@ -5383,6 +7264,7 @@ def _inconclusive_secret_count_manifests(
     head_sha: str,
     catalog: SyntheticTokenCatalog,
     failure_class: str,
+    evidence_head_ref: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], tuple[AcceptedSyntheticValue, ...]]:
     if re.fullmatch(r"[a-z][a-z0-9-]{0,63}", failure_class) is None:
         raise ReviewError("secret scan failure class is invalid")
@@ -5390,7 +7272,7 @@ def _inconclusive_secret_count_manifests(
         "base_ref": base_sha,
         "catalog_schema_version": catalog.schema_version,
         "entries": [],
-        "head_ref": head_sha,
+        "head_ref": evidence_head_ref or head_sha,
         "pool_version": catalog.pool_version,
         "schema_version": SYNTHETIC_MANIFEST_SCHEMA_VERSION,
         "secret_delta": {
@@ -5465,15 +7347,25 @@ def validate_workspace_layout(
 
     source_root = canonical_path(review.source_root, label="source root")
     container_dir = canonical_path(review.container_dir, label="container")
-    expected_parent = resolve_path(
-        source_root / ".codex-tmp",
-        label="source review root",
-    )
-    if container_dir.parent != expected_parent or not container_dir.name.startswith(
-        "isolated-review-"
+    if isinstance(
+        review,
+        (LegacyReviewWorkspace, SourceLocalReviewWorkspace),
+    ):
+        expected_parent = resolve_path(
+            source_root / ".codex-tmp",
+            label="legacy source review root",
+        )
+    else:
+        expected_parent = _review_root_for_source(
+            source_root,
+            require_source=False,
+        )
+    if (
+        container_dir.parent != expected_parent
+        or REVIEW_CONTAINER_PATTERN.fullmatch(container_dir.name) is None
     ):
         raise ReviewError(
-            f"review container is outside the source repository review root: {container_dir}"
+            f"review container is outside the helper-private review root: {container_dir}"
         )
     expected_workspace = container_dir / "workspace"
     if canonical_path(review.workspace_root, label="workspace") != expected_workspace:
@@ -5491,6 +7383,742 @@ def validate_workspace_layout(
     ):
         raise ReviewError(
             f"review prompt escapes its control directory: {review.prompt_file}"
+        )
+    if isinstance(review, LegacyReviewWorkspace):
+        return
+    expected_git_dir = container_dir / "review.git"
+    git_dir = (review.git_dir or expected_git_dir).resolve(strict=False)
+    if git_dir != expected_git_dir:
+        raise ReviewError(f"review Git database escapes its container: {git_dir}")
+    if review.content_variant not in {"head", "source-wip"}:
+        raise ReviewError("review workspace has an invalid content variant")
+    if (
+        review.snapshot_tree_sha
+        and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", review.snapshot_tree_sha)
+        is None
+    ):
+        raise ReviewError("review workspace has an invalid snapshot tree id")
+    if (
+        review.scope_identity
+        and re.fullmatch(r"[0-9a-f]{64}", review.scope_identity) is None
+    ):
+        raise ReviewError("review workspace has an invalid scope identity")
+
+
+def validate_legacy_workspace_layout(review: ReviewWorkspace) -> None:
+    try:
+        source_root = review.source_root.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ReviewError("cannot resolve legacy review source repository") from error
+    if review.source_root != source_root:
+        raise ReviewError("legacy review source repository is not canonical")
+    expected_parent = source_root / ".codex-tmp"
+    container_dir = review.container_dir
+    if (
+        not container_dir.is_absolute()
+        or container_dir.parent != expected_parent
+        or REVIEW_CONTAINER_PATTERN.fullmatch(container_dir.name) is None
+    ):
+        raise ReviewError(
+            "legacy review container is outside the source repository review root: "
+            f"{container_dir}"
+        )
+    try:
+        review_root_status = os.lstat(expected_parent)
+        container_status = os.lstat(container_dir)
+    except OSError as error:
+        raise ReviewError("cannot inspect legacy review container layout") from error
+    if (
+        not stat.S_ISDIR(review_root_status.st_mode)
+        or stat.S_ISLNK(review_root_status.st_mode)
+        or review_root_status.st_uid != os.geteuid()
+        or review_root_status.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise ReviewError("legacy review state root is not a private real directory")
+    if (
+        not stat.S_ISDIR(container_status.st_mode)
+        or stat.S_ISLNK(container_status.st_mode)
+        or container_status.st_uid != os.geteuid()
+        or stat.S_IMODE(container_status.st_mode) != 0o700
+    ):
+        raise ReviewError("legacy review container mode must be exactly 0700")
+    expected_workspace = container_dir / "workspace"
+    if review.workspace_root != expected_workspace:
+        raise ReviewError(
+            f"legacy review workspace escapes its container: {review.workspace_root}"
+        )
+    control_dir = expected_workspace / ".codex-review"
+    if review.diff_file != control_dir / "review.diff":
+        raise ReviewError(
+            f"legacy review diff escapes its control directory: {review.diff_file}"
+        )
+    if review.prompt_file != control_dir / "review.prompt":
+        raise ReviewError(
+            f"legacy review prompt escapes its control directory: {review.prompt_file}"
+        )
+    expected_git_dir = container_dir / "review.git"
+    if (review.git_dir or expected_git_dir) != expected_git_dir:
+        raise ReviewError("legacy review Git path escapes its container")
+    if os.path.lexists(expected_git_dir):
+        raise ReviewError(
+            "legacy review state contains an unexpected private Git database"
+        )
+    if (
+        review.content_variant != "head"
+        or review.snapshot_tree_sha
+        or review.scope_identity
+    ):
+        raise ReviewError("legacy review state contains unsupported scope metadata")
+
+
+def _validate_worktree_git_control(review: ReviewWorkspace) -> pathlib.Path:
+    git_pointer = review.workspace_root / ".git"
+    try:
+        metadata = os.lstat(git_pointer)
+    except OSError as error:
+        raise ReviewError("detached review worktree .git control is missing") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or metadata.st_size > 4096
+    ):
+        raise ReviewError("detached review worktree .git control is unsafe")
+    try:
+        value = git_pointer.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ReviewError(
+            "cannot read detached review worktree .git control"
+        ) from error
+    prefix = "gitdir: "
+    if not value.startswith(prefix) or not value.endswith("\n"):
+        raise ReviewError("detached review worktree .git control is malformed")
+    target = pathlib.Path(value[len(prefix) : -1]).resolve(strict=False)
+    git_dir = (review.git_dir or review.container_dir / "review.git").resolve(
+        strict=False
+    )
+    try:
+        target_metadata = os.lstat(target)
+    except OSError as error:
+        raise ReviewError(
+            "detached review worktree admin directory is missing"
+        ) from error
+    if (
+        target.parent != git_dir / "worktrees"
+        or target.name != review.workspace_root.name
+        or not stat.S_ISDIR(target_metadata.st_mode)
+        or target_metadata.st_uid != os.geteuid()
+        or target_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise ReviewError(
+            "detached review worktree .git control escapes helper Git data"
+        )
+    return target
+
+
+def _validate_private_directory_inventory(
+    directory: pathlib.Path,
+    *,
+    files: frozenset[str],
+    directories: frozenset[str],
+    label: str,
+) -> None:
+    try:
+        directory_metadata = os.lstat(directory)
+    except OSError as error:
+        raise ReviewError(f"private review Git {label} is missing") from error
+    if (
+        not stat.S_ISDIR(directory_metadata.st_mode)
+        or directory_metadata.st_uid != os.geteuid()
+        or directory_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise ReviewError(f"private review Git {label} is unsafe")
+    expected = files | directories
+    seen: set[str] = set()
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.name not in expected or entry.name in seen:
+                    raise ReviewError(
+                        f"private review Git {label} contains an unexpected entry"
+                    )
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except OSError as error:
+                    raise ReviewError(
+                        f"cannot inspect private review Git {label}"
+                    ) from error
+                expected_type = (
+                    stat.S_ISREG(metadata.st_mode)
+                    if entry.name in files
+                    else stat.S_ISDIR(metadata.st_mode)
+                )
+                if (
+                    not expected_type
+                    or metadata.st_uid != os.geteuid()
+                    or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                ):
+                    raise ReviewError(
+                        f"private review Git {label} contains an unsafe entry"
+                    )
+                seen.add(entry.name)
+    except ReviewError:
+        raise
+    except OSError as error:
+        raise ReviewError(f"cannot inspect private review Git {label}") from error
+    if seen != expected:
+        raise ReviewError(f"private review Git {label} is incomplete")
+
+
+def _validate_private_review_endpoint_state(
+    review: ReviewWorkspace,
+    *,
+    git_dir: pathlib.Path,
+    worktree_admin: pathlib.Path,
+) -> None:
+    _validate_private_directory_inventory(
+        git_dir,
+        files=frozenset({"HEAD", "config", "shallow"}),
+        directories=frozenset({"info", "objects", "refs", "worktrees"}),
+        label="root inventory",
+    )
+    _validate_private_directory_inventory(
+        git_dir / "info",
+        files=frozenset({"exclude"}),
+        directories=frozenset(),
+        label="info inventory",
+    )
+    _validate_private_directory_inventory(
+        git_dir / "worktrees",
+        files=frozenset(),
+        directories=frozenset({review.workspace_root.name}),
+        label="worktree inventory",
+    )
+    _validate_private_directory_inventory(
+        worktree_admin,
+        files=frozenset({"HEAD", "commondir", "gitdir", "index", "locked"}),
+        directories=frozenset({"refs"}),
+        label="detached worktree admin inventory",
+    )
+    _validate_private_directory_inventory(
+        worktree_admin / "refs",
+        files=frozenset(),
+        directories=frozenset(),
+        label="detached worktree refs inventory",
+    )
+    _require_empty_private_ref_tree(git_dir / "refs")
+    _require_empty_private_ref_tree(worktree_admin / "refs")
+    _validate_private_directory_inventory(
+        git_dir / "refs",
+        files=frozenset(),
+        directories=frozenset({"heads", "tags"}),
+        label="refs inventory",
+    )
+    for ref_namespace in ("heads", "tags"):
+        _validate_private_directory_inventory(
+            git_dir / "refs" / ref_namespace,
+            files=frozenset(),
+            directories=frozenset(),
+            label="empty ref namespace",
+        )
+    for relative, label in (
+        ("objects/info/alternates", "object alternates"),
+        ("objects/info/http-alternates", "HTTP object alternates"),
+        ("info/grafts", "grafts"),
+        ("packed-refs", "packed refs"),
+    ):
+        _require_absent_private_git_path(git_dir / relative, label=label)
+    _validate_private_object_storage_topology(
+        git_dir,
+        object_id_length=len(review.head_ref),
+    )
+    expected_root_files = {
+        "HEAD": b"ref: refs/heads/master\n",
+        "config": _canonical_private_git_config(object_id_length=len(review.head_ref)),
+        "info/exclude": b"/.codex-review/\n",
+    }
+    for name, expected in expected_root_files.items():
+        with _secure_file_reader(
+            git_dir / name,
+            label=f"private review Git {name}",
+            max_bytes=64 * 1024,
+        ) as (handle, _metadata):
+            actual = handle.read(64 * 1024 + 1)
+        if actual != expected:
+            raise ReviewError(
+                f"private review Git {name} no longer matches helper state"
+            )
+    expected_admin_files = {
+        "commondir": b"../..\n",
+        "gitdir": os.fsencode(review.workspace_root / ".git") + b"\n",
+        "locked": b"added with --lock\n",
+    }
+    for name, expected in expected_admin_files.items():
+        with _secure_file_reader(
+            worktree_admin / name,
+            label=f"detached review worktree {name}",
+            max_bytes=4096,
+        ) as (handle, _metadata):
+            actual = handle.read(4097)
+        if actual != expected:
+            raise ReviewError(
+                f"detached review worktree {name} no longer matches helper state"
+            )
+    for name, limit in (("index", MAX_TREE_METADATA_BYTES),):
+        with _secure_file_reader(
+            worktree_admin / name,
+            label=f"detached review worktree {name}",
+            max_bytes=limit,
+        ) as (handle, _metadata):
+            while handle.read(1024 * 1024):
+                pass
+
+    with _secure_file_reader(
+        worktree_admin / "HEAD",
+        label="detached review worktree HEAD",
+        max_bytes=4096,
+    ) as (handle, _metadata):
+        actual_head = handle.read(4097)
+    endpoints = sorted({review.base_ref, review.head_ref})
+    if any(
+        re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", endpoint) is None
+        for endpoint in endpoints
+    ):
+        raise ReviewError("private review Git endpoint is malformed")
+    expected_shallow = b"".join(
+        endpoint.encode("ascii") + b"\n" for endpoint in endpoints
+    )
+    shallow_path = git_dir / "shallow"
+    with _secure_file_reader(
+        shallow_path,
+        label="private review Git shallow endpoints",
+        max_bytes=2 * 65,
+    ) as (handle, _metadata):
+        actual_shallow = handle.read(2 * 65 + 1)
+
+    symbolic = _run_worktree_git(
+        review.workspace_root,
+        "symbolic-ref",
+        "--quiet",
+        "HEAD",
+        check=False,
+    )
+    if symbolic.returncode != 1:
+        raise ReviewError("detached review worktree HEAD is no longer detached")
+    resolved_head = (
+        _run_worktree_git(
+            review.workspace_root,
+            "rev-parse",
+            "--verify",
+            "HEAD^{commit}",
+        )
+        .stdout.decode("ascii", errors="strict")
+        .strip()
+    )
+    if resolved_head != review.head_ref:
+        raise ReviewError("detached review worktree HEAD no longer matches review head")
+    if actual_head != review.head_ref.encode("ascii") + b"\n":
+        raise ReviewError(
+            "detached review worktree HEAD no longer matches helper state"
+        )
+    if actual_shallow != expected_shallow:
+        raise ReviewError(
+            "private review Git shallow endpoints do not match the frozen range"
+        )
+    for label, endpoint in (("base", review.base_ref), ("head", review.head_ref)):
+        available = _run_private_git(
+            git_dir=git_dir,
+            args=("cat-file", "-e", f"{endpoint}^{{commit}}"),
+            check=False,
+        )
+        if available.returncode != 0:
+            raise ReviewError(f"private review Git database is missing the {label}")
+
+
+def _secure_file_identity(
+    path: pathlib.Path,
+    *,
+    label: str,
+    max_bytes: int,
+) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    with _secure_file_reader(
+        path,
+        label=label,
+        max_bytes=max_bytes,
+    ) as (handle, metadata):
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return metadata.st_size, digest.hexdigest()
+
+
+def _validate_canonical_worktree_index(
+    review: ReviewWorkspace,
+    *,
+    git_dir: pathlib.Path,
+    worktree_admin: pathlib.Path,
+) -> None:
+    with tempfile.TemporaryDirectory(dir=_canonical_review_root_base()) as temporary:
+        canonical_index = pathlib.Path(temporary) / "index"
+        _populate_canonical_worktree_index(
+            git_dir=git_dir,
+            workspace_root=review.workspace_root,
+            snapshot_tree_sha=review.snapshot_tree_sha,
+            index_file=canonical_index,
+        )
+        expected = _secure_file_identity(
+            canonical_index,
+            label="canonical detached review index",
+            max_bytes=MAX_TREE_METADATA_BYTES,
+        )
+    actual = _secure_file_identity(
+        worktree_admin / "index",
+        label="detached review worktree index",
+        max_bytes=MAX_TREE_METADATA_BYTES,
+    )
+    if actual != expected:
+        raise ReviewError(
+            "detached review worktree index contains noncanonical metadata"
+        )
+
+
+def _populate_canonical_worktree_index(
+    *,
+    git_dir: pathlib.Path,
+    workspace_root: pathlib.Path,
+    snapshot_tree_sha: str,
+    index_file: pathlib.Path,
+) -> None:
+    environment = _git_environment(index_file=index_file)
+    with _temporary_review_file() as output:
+        _run_bounded_process_to_file(
+            _private_git_command(
+                git_dir=git_dir,
+                work_tree=workspace_root,
+                args=("read-tree", "--reset", snapshot_tree_sha),
+            ),
+            environment=environment,
+            destination=output,
+            label="canonical detached review index",
+            byte_limit=4096,
+        )
+    index_file.chmod(0o600)
+
+
+def _replace_worktree_index_with_canonical(
+    *,
+    git_dir: pathlib.Path,
+    workspace_root: pathlib.Path,
+    snapshot_tree_sha: str,
+) -> None:
+    worktree_admin = git_dir / "worktrees" / workspace_root.name
+    destination = worktree_admin / "index"
+    candidate = worktree_admin / f".canonical-index-{uuid.uuid4().hex}"
+    try:
+        _populate_canonical_worktree_index(
+            git_dir=git_dir,
+            workspace_root=workspace_root,
+            snapshot_tree_sha=snapshot_tree_sha,
+            index_file=candidate,
+        )
+        os.replace(candidate, destination)
+    finally:
+        try:
+            candidate.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _require_absent_private_git_path(path: pathlib.Path, *, label: str) -> None:
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise ReviewError(f"cannot inspect private review Git {label}") from error
+    raise ReviewError(f"private review Git {label} is not allowed")
+
+
+def _require_empty_private_ref_tree(root: pathlib.Path) -> None:
+    pending = [root]
+    visited = 0
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = os.scandir(directory)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise ReviewError("cannot inspect private review Git refs") from error
+        try:
+            with entries:
+                for entry in entries:
+                    visited += 1
+                    if visited > MAX_PRIVATE_OBJECT_ENTRIES:
+                        raise ReviewError(
+                            "private review Git refs exceed their entry limit"
+                        )
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(pathlib.Path(entry.path))
+                        continue
+                    raise ReviewError("private review Git contains an unexpected ref")
+        except ReviewError:
+            raise
+        except OSError as error:
+            raise ReviewError("cannot inspect private review Git refs") from error
+
+
+def _validate_private_object_storage_topology(
+    git_dir: pathlib.Path,
+    *,
+    object_id_length: int,
+) -> None:
+    objects = git_dir / "objects"
+    loose_entries = 0
+    pack_entries = 0
+    storage_bytes = 0
+    top_entries = 0
+    pack_suffixes: dict[str, set[str]] = {}
+
+    def consume_storage(size: int, *, per_file_limit: int, label: str) -> None:
+        nonlocal storage_bytes
+        if size < 0 or size > per_file_limit:
+            raise ReviewError(f"private review Git {label} exceeds its size limit")
+        if size > MAX_PRIVATE_STORAGE_BYTES - storage_bytes:
+            raise ReviewError(
+                "private review Git object storage exceeds its size limit"
+            )
+        storage_bytes += size
+
+    try:
+        with os.scandir(objects) as entries:
+            for entry in entries:
+                top_entries += 1
+                if top_entries > 258:
+                    raise ReviewError(
+                        "private review Git object storage exceeds its entry limit"
+                    )
+                try:
+                    directory_metadata = entry.stat(follow_symlinks=False)
+                except OSError as error:
+                    raise ReviewError(
+                        "cannot inspect private review Git object storage"
+                    ) from error
+                if (
+                    not stat.S_ISDIR(directory_metadata.st_mode)
+                    or directory_metadata.st_uid != os.geteuid()
+                    or directory_metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                ):
+                    raise ReviewError("private review Git object directory is unsafe")
+                if entry.name == "info":
+                    with os.scandir(entry.path) as info_entries:
+                        if next(info_entries, None) is not None:
+                            raise ReviewError(
+                                "private review Git object info must remain empty"
+                            )
+                    continue
+                if entry.name == "pack":
+                    with os.scandir(entry.path) as packed_objects:
+                        for pack_entry in packed_objects:
+                            pack_entries += 1
+                            if pack_entries > MAX_PRIVATE_OBJECT_ENTRIES:
+                                raise ReviewError(
+                                    "private review Git pack files exceed their limit"
+                                )
+                            match = re.fullmatch(
+                                rf"pack-([0-9a-f]{{{object_id_length}}})\.(pack|idx|rev)",
+                                pack_entry.name,
+                            )
+                            try:
+                                metadata = pack_entry.stat(follow_symlinks=False)
+                            except OSError as error:
+                                raise ReviewError(
+                                    "cannot inspect private review Git pack"
+                                ) from error
+                            if (
+                                match is None
+                                or not stat.S_ISREG(metadata.st_mode)
+                                or metadata.st_nlink != 1
+                                or metadata.st_uid != os.geteuid()
+                                or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                            ):
+                                raise ReviewError(
+                                    "private review Git pack storage is unsafe"
+                                )
+                            consume_storage(
+                                metadata.st_size,
+                                per_file_limit=(
+                                    MAX_PRIVATE_PACK_BYTES
+                                    if match.group(2) == "pack"
+                                    else MAX_PRIVATE_OBJECT_LIST_BYTES
+                                ),
+                                label="pack file",
+                            )
+                            pack_suffixes.setdefault(match.group(1), set()).add(
+                                match.group(2)
+                            )
+                    continue
+                if re.fullmatch(r"[0-9a-f]{2}", entry.name) is None:
+                    raise ReviewError(
+                        "private review Git contains unexpected object storage"
+                    )
+                with os.scandir(entry.path) as loose_objects:
+                    for loose in loose_objects:
+                        loose_entries += 1
+                        if loose_entries > MAX_PRIVATE_OBJECT_ENTRIES:
+                            raise ReviewError(
+                                "private review Git loose objects exceed their limit"
+                            )
+                        try:
+                            metadata = loose.stat(follow_symlinks=False)
+                        except OSError as error:
+                            raise ReviewError(
+                                "cannot inspect private review Git loose object"
+                            ) from error
+                        if (
+                            re.fullmatch(
+                                rf"[0-9a-f]{{{object_id_length - 2}}}",
+                                loose.name,
+                            )
+                            is None
+                            or not stat.S_ISREG(metadata.st_mode)
+                            or metadata.st_nlink != 1
+                            or metadata.st_uid != os.geteuid()
+                            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                        ):
+                            raise ReviewError(
+                                "private review Git loose object storage is unsafe"
+                            )
+                        consume_storage(
+                            metadata.st_size,
+                            per_file_limit=MAX_PRIVATE_LOOSE_OBJECT_BYTES,
+                            label="loose object",
+                        )
+    except ReviewError:
+        raise
+    except OSError as error:
+        raise ReviewError("cannot inspect private review Git object storage") from error
+    if not pack_suffixes or any(
+        not {"idx", "pack"}.issubset(suffixes)
+        or not suffixes.issubset({"idx", "pack", "rev"})
+        for suffixes in pack_suffixes.values()
+    ):
+        raise ReviewError("private review Git pack storage is incomplete")
+
+
+def _private_object_id_set(
+    *,
+    git_dir: pathlib.Path,
+    args: tuple[str, ...],
+    label: str,
+    object_id_length: int,
+) -> set[str]:
+    with _temporary_review_file() as output:
+        size = _run_bounded_process_to_file(
+            _private_git_command(git_dir=git_dir, args=args),
+            environment=_git_environment(),
+            destination=output,
+            label=label,
+            byte_limit=MAX_PRIVATE_OBJECT_LIST_BYTES,
+            record_limit=MAX_PRIVATE_OBJECT_ENTRIES,
+        ).output_bytes
+        if size and not _temporary_file_ends_with_newline(output):
+            raise ReviewError(f"{label} has an unterminated record")
+        output.seek(0)
+        object_ids: set[str] = set()
+        for line in output:
+            raw_object_id = line.rstrip(b"\n")
+            if not _valid_object_id(raw_object_id, object_id_length):
+                raise ReviewError(f"{label} contains a malformed object id")
+            object_ids.add(raw_object_id.decode("ascii"))
+        return object_ids
+
+
+def _validate_private_review_integrity(
+    review: ReviewWorkspace,
+    *,
+    git_dir: pathlib.Path,
+) -> None:
+    object_id_length = len(review.head_ref)
+    for relative, label in (
+        ("objects/info/alternates", "object alternates"),
+        ("objects/info/http-alternates", "HTTP object alternates"),
+        ("info/grafts", "grafts"),
+        ("packed-refs", "packed refs"),
+    ):
+        _require_absent_private_git_path(git_dir / relative, label=label)
+    _require_empty_private_ref_tree(git_dir / "refs")
+    for worktree in (git_dir / "worktrees").iterdir():
+        _require_empty_private_ref_tree(worktree / "refs")
+
+    with _secure_file_reader(
+        git_dir / "config",
+        label="private review Git config",
+        max_bytes=64 * 1024,
+    ) as (handle, _metadata):
+        config = handle.read(64 * 1024 + 1).lower()
+    forbidden_config = (
+        b"promisor",
+        b"partialclone",
+        b"alternate",
+        b"[include",
+        b"[remote ",
+    )
+    if any(value in config for value in forbidden_config):
+        raise ReviewError("private review Git config enables an external object source")
+
+    _validate_private_object_storage_topology(
+        git_dir,
+        object_id_length=object_id_length,
+    )
+    with _temporary_review_file() as fsck_output:
+        _run_bounded_process_to_file(
+            _private_git_command(
+                git_dir=git_dir,
+                args=(
+                    "fsck",
+                    "--full",
+                    "--strict",
+                    "--no-reflogs",
+                    "--no-progress",
+                    "--no-dangling",
+                ),
+            ),
+            environment=_git_environment(),
+            destination=fsck_output,
+            label="private review Git integrity check",
+            byte_limit=MAX_PRIVATE_FSCK_OUTPUT_BYTES,
+            record_limit=MAX_PRIVATE_OBJECT_ENTRIES,
+        )
+
+    expected = _private_object_id_set(
+        git_dir=git_dir,
+        args=(
+            "rev-list",
+            "--objects",
+            "--no-object-names",
+            f"{review.base_ref}^{{tree}}",
+            f"{review.head_ref}^{{tree}}",
+            review.snapshot_tree_sha,
+        ),
+        label="private review Git expected objects",
+        object_id_length=object_id_length,
+    )
+    expected.update({review.base_ref, review.head_ref})
+    actual = _private_object_id_set(
+        git_dir=git_dir,
+        args=(
+            "cat-file",
+            "--batch-check=%(objectname)",
+            "--batch-all-objects",
+        ),
+        label="private review Git actual objects",
+        object_id_length=object_id_length,
+    )
+    if actual != expected:
+        raise ReviewError(
+            "private review Git object set does not match the frozen review scope"
         )
 
 
@@ -5532,6 +8160,7 @@ def _secure_file_reader(
     label: str,
     max_bytes: int | None = None,
     expected_artifact: ControlArtifactEvidence | None = None,
+    allow_root_owner: bool = False,
     expected_identity: CleanupIdentity | None = None,
 ) -> Iterator[tuple[_DigestingReader, os.stat_result]]:
     flags = (
@@ -5551,8 +8180,16 @@ def _secure_file_reader(
         initial = os.fstat(descriptor)
         if not stat.S_ISREG(initial.st_mode) or initial.st_nlink != 1:
             raise ReviewError(f"{label} is not a regular file with one link")
-        if initial.st_uid != os.getuid():
-            raise ReviewError(f"{label} must be owned by the current user")
+        allowed_uids = (
+            {os.getuid(), 0}
+            if allow_root_owner and expected_identity is None
+            else {os.getuid()}
+        )
+        if initial.st_uid not in allowed_uids:
+            owner_requirement = (
+                "the current user or root" if allow_root_owner else "the current user"
+            )
+            raise ReviewError(f"{label} must be owned by {owner_requirement}")
         if expected_identity is not None and stat.S_IMODE(initial.st_mode) != 0o600:
             raise ReviewError(f"{label} must have mode 0600")
         if initial.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
@@ -6506,7 +9143,15 @@ def secret_admission(
         source_root = resolve_repo_root(repo)
         base_sha = resolve_commit(source_root, base_ref, label="base ref")
         head_sha = resolve_commit(source_root, head_ref, label="head ref")
-        _require_ancestor_range(source_root, base_sha=base_sha, head_sha=head_sha)
+        with _temporary_sanitized_git_view(
+            source_root=source_root,
+        ) as (ancestry_git_view, ancestry_object_directory):
+            _require_ancestor_range(
+                git_view=ancestry_git_view,
+                object_directory=ancestry_object_directory,
+                base_sha=base_sha,
+                head_sha=head_sha,
+            )
         catalog = load_catalog()
         validate_authoring_catalog_scanner_contract(catalog)
     except OSError as error:
@@ -6614,7 +9259,7 @@ def _load_legacy_manifest(
 ) -> tuple[
     tuple[LegacyExemption, ...],
     tuple[AcceptedSyntheticValue, ...],
-    dict[AcceptedSyntheticValue, tuple[int, int, int, int]],
+    dict[AcceptedSyntheticValue, LegacyCountState],
     list[dict[str, Any]],
     tuple[AcceptedSyntheticValue, ...],
     dict[AcceptedSyntheticValue, tuple[int, int, int, int]],
@@ -6704,14 +9349,18 @@ def _load_legacy_manifest(
         or len(raw_entries) > MAX_SYNTHETIC_EVIDENCE_ENTRIES
     ):
         raise ReviewError("synthetic secret manifest entries are invalid")
-    counts: dict[AcceptedSyntheticValue, tuple[int, int, int, int]] = {}
+    counts: dict[AcceptedSyntheticValue, LegacyCountState] = {}
     evidence: list[dict[str, Any]] = []
     for raw_entry in raw_entries:
         if not isinstance(raw_entry, dict) or set(raw_entry) != {
             "base_count",
+            "base_unembedded_count",
             "exemption_id",
             "head_count",
+            "head_unembedded_count",
             "rule",
+            "source_head_count",
+            "source_head_unembedded_count",
             "token_id",
             "value_length",
             "value_sha256",
@@ -6723,21 +9372,38 @@ def _load_legacy_manifest(
             raise ReviewError("synthetic secret manifest entry is unknown or duplicate")
         base_count = raw_entry["base_count"]
         head_count = raw_entry["head_count"]
+        source_head_count = raw_entry["source_head_count"]
+        base_unembedded_count = raw_entry["base_unembedded_count"]
+        head_unembedded_count = raw_entry["head_unembedded_count"]
+        source_head_unembedded_count = raw_entry["source_head_unembedded_count"]
         if (
             type(base_count) is not int
             or type(head_count) is not int
+            or type(source_head_count) is not int
+            or type(base_unembedded_count) is not int
+            or type(head_unembedded_count) is not int
+            or type(source_head_unembedded_count) is not int
             or base_count < 0
             or head_count < 0
+            or source_head_count < 0
+            or base_unembedded_count < 0
+            or head_unembedded_count < 0
+            or source_head_unembedded_count < 0
+            or base_unembedded_count > base_count
+            or head_unembedded_count > head_count
+            or source_head_unembedded_count > source_head_count
             or raw_entry["rule"] != descriptor.rule
             or raw_entry["value_sha256"] != descriptor.value_sha256
             or raw_entry["value_length"] != descriptor.value_length
         ):
             raise ReviewError("synthetic secret manifest entry is inconsistent")
-        counts[descriptor] = (
-            base_count,
-            head_count,
-            0,
-            0,
+        counts[descriptor] = LegacyCountState(
+            base_count=base_count,
+            head_count=head_count,
+            source_head_count=source_head_count,
+            base_unembedded_count=base_unembedded_count,
+            head_unembedded_count=head_unembedded_count,
+            source_head_unembedded_count=source_head_unembedded_count,
         )
         evidence.append(dict(raw_entry))
     if manifest_was_sharded:
@@ -6753,11 +9419,13 @@ def _load_legacy_manifest(
                 raise ReviewError(
                     "sharded synthetic secret manifest violation is inconsistent"
                 )
-            counts[descriptor] = (
-                violation["base_count"],
-                violation["head_count"],
-                0,
-                0,
+            counts[descriptor] = LegacyCountState(
+                base_count=violation["base_count"],
+                head_count=violation["head_count"],
+                source_head_count=violation["head_count"],
+                base_unembedded_count=0,
+                head_unembedded_count=0,
+                source_head_unembedded_count=0,
             )
     if secret_delta["status"] != "inconclusive" and set(counts) != set(accepted):
         raise ReviewError("synthetic secret manifest does not cover its selection")
@@ -6873,9 +9541,19 @@ def _load_legacy_manifest(
         raise ReviewError("inconclusive secret-delta evidence must not claim counts")
 
     expected_violations: dict[str, tuple[int, int, list[str], int]] = {}
-    for descriptor, (base_count, head_count, _unused_base, _unused_head) in list(
-        counts.items()
-    ) + list(reduction_counts.items()):
+    count_items = [
+        (
+            descriptor,
+            (
+                count_state.base_count,
+                count_state.head_count,
+                count_state.base_unembedded_count,
+                count_state.head_unembedded_count,
+            ),
+        )
+        for descriptor, count_state in counts.items()
+    ] + list(reduction_counts.items())
+    for descriptor, (base_count, head_count, _unused_base, _unused_head) in count_items:
         if head_count <= base_count:
             continue
         rules = [descriptor.rule]
@@ -7042,31 +9720,197 @@ def _load_changed_synthetic_evidence(
     return [dict(entry) for entry in entries]
 
 
-def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
-    validate_workspace_layout(review)
+def _reject_materialized_cleanup_quarantine_paths(
+    workspace_root: pathlib.Path,
+) -> None:
+    pending = [workspace_root]
+    inspected_entries = 0
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = tuple(os.scandir(directory))
+        except OSError as error:
+            raise ReviewError(
+                "cannot inspect external review snapshot for reserved cleanup paths"
+            ) from error
+        for entry in entries:
+            inspected_entries += 1
+            if inspected_entries > MAX_SNAPSHOT_ENTRIES * 2:
+                raise ReviewError(
+                    "external review snapshot exceeds the quarantine validation limit"
+                )
+            if entry.name.startswith(REVIEW_CLEANUP_QUARANTINE_PREFIX):
+                raise ReviewError(
+                    "external review snapshot uses a reserved review cleanup "
+                    "quarantine path component"
+                )
+            if entry.is_dir(follow_symlinks=False):
+                pending.append(pathlib.Path(entry.path))
+
+
+def _validate_external_private_artifacts(
+    review: ReviewWorkspace,
+    *,
+    post_attempt_receipt: ValidatedWorkspaceLaunchReceipt | None,
+) -> ControlArtifactState:
     control_state = load_bound_private_cleanup_state(
         review.container_dir,
         expected=review.private_cleanup,
     )
-    if control_state.private_artifacts_removed:
+    removed = control_state.private_artifacts_removed
+    if post_attempt_receipt is None:
+        if removed:
+            raise ReviewError(
+                "helper-private artifacts were removed before external review "
+                "validation"
+            )
+        current_private_cleanup = _capture_private_cleanup_evidence(
+            review.container_dir,
+            expected_container=review.private_cleanup.container,
+            require_all=True,
+        )
+        if current_private_cleanup != review.private_cleanup:
+            raise ReviewError(
+                "helper-private artifacts do not match preparation identities"
+            )
+        return control_state
+    receipt = post_attempt_receipt
+    if (
+        receipt.content_variant != review.content_variant
+        or receipt.base_ref != review.base_ref
+        or receipt.head_ref != review.head_ref
+        or receipt.snapshot_tree_sha != review.snapshot_tree_sha
+        or receipt.scope_identity != review.scope_identity
+        or receipt.private_container != review.private_cleanup.container
+        or receipt.private_artifacts
+        != tuple(sorted(review.private_cleanup.artifacts.items()))
+        or receipt.control_artifacts
+        != tuple(sorted(control_state.artifacts.values(), key=lambda item: item.name))
+        or receipt.control_directory != control_state.directory
+    ):
         raise ReviewError(
-            "helper-private artifacts were removed before external review validation"
+            "post-attempt workspace state does not match its validated preflight "
+            "receipt"
+        )
+    if removed != frozenset(PRIVATE_HELPER_ARTIFACT_NAMES):
+        raise ReviewError(
+            "post-attempt helper-private artifact removal receipts are incomplete"
         )
     current_private_cleanup = _capture_private_cleanup_evidence(
         review.container_dir,
         expected_container=review.private_cleanup.container,
-        require_all=True,
+        require_all=False,
     )
-    if current_private_cleanup != review.private_cleanup:
+    if current_private_cleanup != PrivateCleanupEvidence(
+        container=review.private_cleanup.container,
+        artifacts={},
+    ):
         raise ReviewError(
-            "helper-private artifacts do not match preparation identities"
+            "post-attempt helper-private artifacts reappeared after recorded removal"
         )
+    return control_state
+
+
+def _validated_workspace_launch_receipt(
+    review: ReviewWorkspace,
+    *,
+    control_state: ControlArtifactState,
+) -> ValidatedWorkspaceLaunchReceipt:
+    if control_state.private_artifacts_removed:
+        raise ReviewError(
+            "cannot issue a post-attempt receipt after helper-private cleanup"
+        )
+    return ValidatedWorkspaceLaunchReceipt(
+        content_variant=review.content_variant,
+        base_ref=review.base_ref,
+        head_ref=review.head_ref,
+        snapshot_tree_sha=review.snapshot_tree_sha,
+        scope_identity=review.scope_identity,
+        private_container=review.private_cleanup.container,
+        private_artifacts=tuple(sorted(review.private_cleanup.artifacts.items())),
+        control_artifacts=tuple(
+            sorted(control_state.artifacts.values(), key=lambda item: item.name)
+        ),
+        control_directory=control_state.directory,
+    )
+
+
+def _validate_remaining_control_artifacts(
+    control_dir: pathlib.Path,
+    *,
+    control_state: ControlArtifactState,
+) -> None:
+    for artifact_name, (max_bytes, _record_limit) in sorted(
+        CONTROL_ARTIFACT_SPECS.items()
+    ):
+        with _secure_file_reader(
+            control_dir / artifact_name,
+            label=f"post-attempt review control artifact {artifact_name}",
+            max_bytes=max_bytes,
+            expected_artifact=control_state.artifacts[artifact_name],
+        ) as (artifact_handle, _artifact_metadata):
+            while artifact_handle.read(64 * 1024):
+                pass
+
+
+def _validate_external_workspace(
+    review: ReviewWorkspace,
+    *,
+    post_attempt_receipt: ValidatedWorkspaceLaunchReceipt | None,
+) -> tuple[dict[str, Any], ValidatedWorkspaceLaunchReceipt | None]:
+    validate_workspace_layout(review)
+    worktree_admin = _validate_worktree_git_control(review)
+    control_state = _validate_external_private_artifacts(
+        review,
+        post_attempt_receipt=post_attempt_receipt,
+    )
     workspace_root = review.workspace_root.resolve(strict=True)
+    _reject_materialized_cleanup_quarantine_paths(workspace_root)
+    if not review.has_complete_scope_identity():
+        raise ReviewError("external review scope identity does not match its snapshot")
+    git_dir = (review.git_dir or review.container_dir / "review.git").resolve(
+        strict=True
+    )
+    _validate_private_review_endpoint_state(
+        review,
+        git_dir=git_dir,
+        worktree_admin=worktree_admin,
+    )
+    _validate_canonical_worktree_index(
+        review,
+        git_dir=git_dir,
+        worktree_admin=worktree_admin,
+    )
+    _validate_private_review_integrity(review, git_dir=git_dir)
+    _verify_materialized_snapshot(
+        git_view=git_dir,
+        object_directory=git_dir / "objects",
+        workspace_root=workspace_root,
+        snapshot_tree_sha=review.snapshot_tree_sha,
+        allow_control_dir=True,
+        verify_index_tree=False,
+    )
     control_dir = workspace_root / ".codex-review"
-    catalog = load_catalog()
-    validate_authoring_catalog_scanner_contract(catalog)
     _inspect_control_directory(control_dir, expected=control_state.directory)
     control_artifacts = control_state.artifacts
+    if post_attempt_receipt is not None:
+        _validate_remaining_control_artifacts(
+            control_dir,
+            control_state=control_state,
+        )
+        _inspect_control_directory(control_dir, expected=control_state.directory)
+        final_control_state = _validate_external_private_artifacts(
+            review,
+            post_attempt_receipt=post_attempt_receipt,
+        )
+        if final_control_state != control_state:
+            raise ReviewError(
+                "post-attempt helper-private cleanup state changed during validation"
+            )
+        return {}, None
+    catalog = load_catalog()
+    validate_authoring_catalog_scanner_contract(catalog)
+    catalog_legacy_values = accepted_legacy_values(catalog, catalog.legacy_exemptions)
     (
         _exemptions,
         legacy_values,
@@ -7089,6 +9933,28 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     )
     authoring_values = accepted_authoring_values(catalog)
     accepted_values = authoring_values + legacy_values
+    if review.content_variant == "head" and any(
+        count_state.source_head_count != count_state.head_count
+        or count_state.source_head_unembedded_count != count_state.head_unembedded_count
+        for count_state in legacy_counts.values()
+    ):
+        raise ReviewError("synthetic secret manifest head counts are inconsistent")
+    if review.content_variant == "source-wip" and any(
+        count_state.source_head_count > count_state.base_count
+        or count_state.source_head_unembedded_count > count_state.base_unembedded_count
+        for count_state in legacy_counts.values()
+    ):
+        raise ReviewError(
+            "synthetic secret manifest source HEAD counts are inconsistent"
+        )
+    _scan_endpoint_commit_metadata(
+        git_view=git_dir,
+        object_directory=git_dir / "objects",
+        base_sha=review.base_ref,
+        head_sha=review.head_ref,
+        authoring_values=authoring_values,
+        legacy_values=catalog_legacy_values,
+    )
     evidence_sensitive_values = (
         _all_catalog_sensitive_values(catalog) + reduction_values
     )
@@ -7096,7 +9962,19 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     scan_values = (
         accepted_values + reduction_values if admission_counts_available else ()
     )
-    expected_counts = dict(legacy_counts) if admission_counts_available else {}
+    expected_counts = (
+        {
+            descriptor: (
+                count_state.base_count,
+                count_state.head_count,
+                count_state.base_unembedded_count,
+                count_state.head_unembedded_count,
+            )
+            for descriptor, count_state in legacy_counts.items()
+        }
+        if admission_counts_available
+        else {}
+    )
     if admission_counts_available:
         expected_counts.update(reduction_counts)
     changed_accepted_evidence = _load_changed_synthetic_evidence(
@@ -7113,6 +9991,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         Counter()
     )
     frozen_head_counts: Counter[AcceptedSyntheticValue] = Counter()
+    frozen_head_unembedded_counts: Counter[AcceptedSyntheticValue] = Counter()
 
     def record_scan(
         scan: SecretScanResult,
@@ -7121,7 +10000,10 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
         side: str,
         path_bytes: bytes,
     ) -> None:
-        path_sha256 = hashlib.sha256(path_bytes).hexdigest()
+        side_tag = (
+            CHANGED_PATH_HEAD_TAG if side == "head" else CHANGED_PATH_BASE_ONLY_TAG
+        )
+        path_sha256 = _changed_path_digest(side_tag, path_bytes).decode("ascii")
         for accepted in accepted_values:
             count = scan.raw_occurrence_counts[accepted]
             if not count:
@@ -7134,6 +10016,92 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                 overflow_message=(
                     "accepted synthetic-token evidence has too many entries"
                 ),
+            )
+
+    if review.content_variant == "source-wip" and legacy_values:
+        source_head_scan = _scan_frozen_tree_values(
+            git_view=git_dir,
+            object_directory=git_dir / "objects",
+            commit=review.head_ref,
+            accepted_values=accepted_values,
+            raw_occurrence_values=legacy_values,
+            exact_only=True,
+        )
+        for descriptor, count_state in legacy_counts.items():
+            if (
+                source_head_scan.raw_occurrence_counts[descriptor]
+                != count_state.source_head_count
+                or source_head_scan.unembedded_occurrence_counts[descriptor]
+                != count_state.source_head_unembedded_count
+            ):
+                raise ReviewError(
+                    "source HEAD legacy synthetic fixture count changed after "
+                    f"preparation for {descriptor.identifier}"
+                )
+
+    if review.content_variant == "source-wip":
+        source_head_findings: list[str] = []
+        source_head_finding_count = 0
+        source_head_event_budget = SecretScanBudget.default()
+        accepted_index = _index_accepted_values(accepted_values)
+        legacy_exact_index = _index_exact_values(legacy_values)
+
+        def record_source_head_finding(value: str) -> None:
+            nonlocal source_head_finding_count
+            source_head_finding_count += 1
+            if len(source_head_findings) < 10:
+                source_head_findings.append(value)
+
+        def inspect_source_head_path(raw_path: bytes) -> None:
+            rule = _value_secret_rule(
+                raw_path,
+                event_budget=source_head_event_budget,
+            )
+            path = os.fsdecode(raw_path)
+            if rule is None:
+                rule = _sensitive_path_rule(path)
+            if rule is not None:
+                path_display = _redact_secret_path(path, "source HEAD path")
+                record_source_head_finding(f"{path_display} ({rule}; source-head-path)")
+
+        def inspect_source_head_blob(
+            raw_path: bytes,
+            scan: SecretScanResult,
+        ) -> None:
+            if scan.blocking_rule is None:
+                return
+            path_display = _redact_secret_path(
+                os.fsdecode(raw_path),
+                "source HEAD blob path",
+            )
+            record_source_head_finding(
+                f"{path_display} ({scan.blocking_rule}; source-head-blob)"
+            )
+
+        _scan_source_head_wip_delta(
+            git_view=git_dir,
+            object_directory=git_dir / "objects",
+            source_head_sha=review.head_ref,
+            snapshot_tree_sha=review.snapshot_tree_sha,
+            accepted_values=accepted_values,
+            raw_occurrence_values=legacy_values,
+            accepted_index=accepted_index,
+            event_budget=source_head_event_budget,
+            exact_index=legacy_exact_index,
+            occurrence_budget=occurrence_budget,
+            path_callback=inspect_source_head_path,
+            blob_callback=inspect_source_head_blob,
+        )
+        if source_head_finding_count:
+            summary = ", ".join(source_head_findings)
+            if source_head_finding_count > len(source_head_findings):
+                summary += (
+                    f", and {source_head_finding_count - len(source_head_findings)} "
+                    "more"
+                )
+            raise ReviewError(
+                "sensitive content preflight blocked external review; remove or "
+                f"narrow these paths before egress: {summary}"
             )
 
     changed_path_digests_file = (
@@ -7254,6 +10222,8 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     snapshot_entries = 0
     for candidate in review.workspace_root.rglob("*"):
         relative_path = candidate.relative_to(review.workspace_root)
+        if relative_path.parts == (".git",):
+            continue
         if _uses_review_cleanup_quarantine_namespace(relative_path):
             raise ReviewError(
                 "external review snapshot uses a reserved review cleanup "
@@ -7292,6 +10262,9 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                 exact_only=True,
             )
             frozen_head_counts.update(path_count_scan.raw_occurrence_counts)
+            frozen_head_unembedded_counts.update(
+                path_count_scan.unembedded_occurrence_counts
+            )
         path_display = relative
         if is_symlink:
             try:
@@ -7348,6 +10321,9 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
                 path_bytes=raw_relative,
             )
             frozen_head_counts.update(target_scan.raw_occurrence_counts)
+            frozen_head_unembedded_counts.update(
+                target_scan.unembedded_occurrence_counts
+            )
             continue
         if is_directory:
             continue
@@ -7368,6 +10344,7 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             path_bytes=raw_relative,
         )
         frozen_head_counts.update(scan.raw_occurrence_counts)
+        frozen_head_unembedded_counts.update(scan.unembedded_occurrence_counts)
 
     for accepted, (
         _base_count,
@@ -7436,6 +10413,11 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
             "secret_reductions": reduction_evidence,
         },
     }
+    _reject_raw_values_in_evidence(
+        [entry["path"]["sha256"] for entry in accepted_evidence],
+        accepted_values=evidence_sensitive_values,
+        label="accepted synthetic-token path digest evidence",
+    )
     try:
         _encode_synthetic_evidence_json(evidence)
     except ReviewError:
@@ -7453,7 +10435,67 @@ def validate_external_workspace(review: ReviewWorkspace) -> dict[str, Any]:
     complete_preflight_evidence = build_preflight_evidence(review, evidence)
     encode_preflight_json(complete_preflight_evidence)
     _inspect_control_directory(control_dir, expected=control_state.directory)
+    final_control_state = _validate_external_private_artifacts(
+        review,
+        post_attempt_receipt=None,
+    )
+    if final_control_state != control_state:
+        raise ReviewError(
+            "helper-private cleanup state changed during external review validation"
+        )
+    return evidence, _validated_workspace_launch_receipt(
+        review,
+        control_state=control_state,
+    )
+
+
+def validate_external_workspace(
+    review: ReviewWorkspace,
+) -> dict[str, Any]:
+    evidence, _receipt = _validate_external_workspace(
+        review,
+        post_attempt_receipt=None,
+    )
     return evidence
+
+
+def validate_external_workspace_for_launch(
+    review: ReviewWorkspace,
+) -> tuple[dict[str, Any], ValidatedWorkspaceLaunchReceipt]:
+    evidence, receipt = _validate_external_workspace(
+        review,
+        post_attempt_receipt=None,
+    )
+    if receipt is None:
+        raise ReviewError("external review preflight did not issue a launch receipt")
+    return evidence, receipt
+
+
+def validate_external_workspace_post_attempt(
+    review: ReviewWorkspace,
+    *,
+    receipt: ValidatedWorkspaceLaunchReceipt,
+) -> None:
+    evidence, next_receipt = _validate_external_workspace(
+        review,
+        post_attempt_receipt=receipt,
+    )
+    if evidence or next_receipt is not None:
+        raise ReviewError("post-attempt workspace validation returned preflight state")
+
+
+def review_preflight_scope(content_variant: str) -> str:
+    if content_variant == "source-wip":
+        return (
+            "digest-bound source WIP snapshot, scanned endpoint Git objects, "
+            "diff, and review prompt"
+        )
+    if content_variant == "head":
+        return (
+            "detached clean head worktree, scanned endpoint Git objects, "
+            "diff, and review prompt"
+        )
+    raise ReviewError("review preflight scope has an invalid content variant")
 
 
 def build_preflight_evidence(
@@ -7461,9 +10503,12 @@ def build_preflight_evidence(
     synthetic_evidence: dict[str, Any],
 ) -> dict[str, Any]:
     fixed_evidence = {
+        "content_variant": review.content_variant,
         "review_range": f"{review.base_ref}..{review.head_ref}",
         "private_artifacts": "removed",
-        "scope": "frozen tracked workspace, diff, and review prompt",
+        "scope": review_preflight_scope(review.content_variant),
+        "scope_identity": review.scope_identity,
+        "snapshot_tree_sha": review.snapshot_tree_sha,
         "status": "review workspace containment and integrity checks passed",
     }
     overlap = set(fixed_evidence).intersection(synthetic_evidence)
@@ -11642,6 +14687,1161 @@ def _validate_prompt_size(prompt: str) -> None:
         )
 
 
+def _source_status(
+    context: SourceInspectionGitContext,
+    *,
+    capture_budget: SourceWipCaptureBudget | None = None,
+) -> bytes:
+    return _bounded_source_git_output(
+        context,
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--no-renames",
+        "--untracked-files=all",
+        "--ignore-submodules=all",
+        byte_limit=MAX_SOURCE_STATUS_BYTES,
+        record_limit=MAX_SOURCE_STATUS_RECORDS,
+        label="source WIP status metadata",
+        config_overrides=(f"core.excludesFile={context.excludes_file}",),
+        capture_budget=capture_budget,
+    )
+
+
+def _source_index_snapshot(
+    context: SourceInspectionGitContext,
+    *,
+    capture_budget: SourceWipCaptureBudget | None = None,
+) -> dict[bytes, tuple[str, str]]:
+    value = _bounded_source_git_output(
+        context,
+        "ls-files",
+        "--stage",
+        "-v",
+        "-z",
+        "--cached",
+        "--",
+        byte_limit=MAX_SOURCE_INDEX_METADATA_BYTES,
+        record_limit=MAX_SOURCE_INDEX_RECORDS,
+        label="source index-flag metadata",
+        capture_budget=capture_budget,
+    )
+    if value and not value.endswith(b"\0"):
+        raise ReviewError("unterminated source index-flag metadata")
+    object_id_length = len(context.head_sha)
+    lowercase_hex = b"0123456789abcdef"
+    metadata_by_path: dict[bytes, tuple[str, str]] = {}
+    for record in value.split(b"\0")[:-1]:
+        if len(record) < 3 or record[1:2] != b" ":
+            raise ReviewError("source index-flag metadata is malformed")
+        tag = record[:1]
+        if tag == b"S" or tag.islower():
+            raise ReviewError(
+                "source index contains assume-unchanged or skip-worktree entries; "
+                "clear hidden index flags before preparing a review"
+            )
+        metadata, separator, raw_path = record[2:].partition(b"\t")
+        fields = metadata.split(b" ")
+        if not separator or len(fields) != 3:
+            raise ReviewError("source index-flag metadata is malformed")
+        raw_mode, raw_object_id, raw_stage = fields
+        if raw_mode not in {b"100644", b"100755", b"120000", b"160000"}:
+            raise ReviewError("source index contains an unsupported mode")
+        if raw_stage != b"0":
+            raise ReviewError("source index contains an unmerged entry")
+        if len(raw_object_id) != object_id_length or any(
+            byte not in lowercase_hex for byte in raw_object_id
+        ):
+            raise ReviewError("source index object id is malformed")
+        if not raw_path or raw_path in metadata_by_path:
+            raise ReviewError("source index path metadata is malformed")
+        metadata_by_path[raw_path] = (
+            raw_mode.decode("ascii"),
+            raw_object_id.decode("ascii"),
+        )
+    return metadata_by_path
+
+
+def _require_unchanged_source_gitlinks(
+    context: SourceInspectionGitContext,
+    index_snapshot: Mapping[bytes, tuple[str, str]],
+    *,
+    capture_budget: SourceWipCaptureBudget | None = None,
+) -> None:
+    value = _bounded_source_git_output(
+        context,
+        "ls-tree",
+        "-r",
+        "-z",
+        "--full-tree",
+        context.head_sha,
+        "--",
+        byte_limit=MAX_SOURCE_INDEX_METADATA_BYTES,
+        record_limit=MAX_SOURCE_INDEX_RECORDS,
+        label="source HEAD tree metadata",
+        capture_budget=capture_budget,
+    )
+    if value and not value.endswith(b"\0"):
+        raise ReviewError("unterminated source HEAD tree metadata")
+    object_id_length = len(context.head_sha)
+    lowercase_hex = b"0123456789abcdef"
+    head_gitlinks: dict[bytes, str] = {}
+    for record in value.split(b"\0")[:-1]:
+        metadata, separator, raw_path = record.partition(b"\t")
+        fields = metadata.split(b" ")
+        if not separator or len(fields) != 3:
+            raise ReviewError("source HEAD tree metadata is malformed")
+        raw_mode, raw_object_type, raw_object_id = fields
+        if raw_mode not in {b"100644", b"100755", b"120000", b"160000"}:
+            raise ReviewError("source HEAD tree contains an unsupported mode")
+        expected_object_type = b"commit" if raw_mode == b"160000" else b"blob"
+        if raw_object_type != expected_object_type:
+            raise ReviewError("source HEAD tree metadata is malformed")
+        if len(raw_object_id) != object_id_length or any(
+            byte not in lowercase_hex for byte in raw_object_id
+        ):
+            raise ReviewError("source HEAD tree object id is malformed")
+        if not raw_path:
+            raise ReviewError("source HEAD tree path metadata is malformed")
+        if raw_mode == b"160000":
+            if raw_path in head_gitlinks:
+                raise ReviewError("source HEAD tree path metadata is malformed")
+            head_gitlinks[raw_path] = raw_object_id.decode("ascii")
+
+    index_gitlinks = {
+        raw_path: object_id
+        for raw_path, (mode, object_id) in index_snapshot.items()
+        if mode == "160000"
+    }
+    if index_gitlinks != head_gitlinks:
+        raise ReviewError(
+            "source index gitlinks do not match source HEAD; staged gitlink "
+            "changes are not supported"
+        )
+
+
+def _require_clean_source(context: SourceInspectionGitContext) -> None:
+    index_snapshot = _source_index_snapshot(context)
+    _require_unchanged_source_gitlinks(context, index_snapshot)
+    if _source_status(context):
+        raise ReviewError(
+            "source repository has staged, unstaged, or nonignored untracked "
+            "changes; commit or clean them, or explicitly use --include-source-wip"
+        )
+    if _source_index_snapshot(context) != index_snapshot:
+        raise ReviewError("source index changed while clean source was verified")
+
+
+def _parse_wip_path(raw_path: bytes) -> pathlib.PurePosixPath:
+    relative = pathlib.PurePosixPath(os.fsdecode(raw_path))
+    display = _redact_secret_path(os.fsdecode(raw_path), "source WIP path")
+    if not raw_path or relative.is_absolute() or ".." in relative.parts:
+        raise ReviewError(f"unsafe source WIP path: {display}")
+    if any(part.casefold() == ".git" for part in relative.parts):
+        raise ReviewError(f"reserved .git path in source WIP: {display}")
+    if relative.parts[0].casefold() in {".codex-review", ".codex-tmp"}:
+        raise ReviewError(f"reserved helper path in source WIP: {display}")
+    return relative
+
+
+def _porcelain_v2_groups(value: bytes) -> list[tuple[bytes, ...]]:
+    if not value:
+        return []
+    records = value.split(b"\0")
+    if records[-1] != b"":
+        raise ReviewError("unterminated source WIP status metadata")
+    groups: list[tuple[bytes, ...]] = []
+    index = 0
+    while index < len(records) - 1:
+        record = records[index]
+        if record.startswith(b"2 "):
+            if index + 1 >= len(records) - 1:
+                raise ReviewError("source WIP rename status metadata is malformed")
+            groups.append((record, records[index + 1]))
+            index += 2
+        else:
+            groups.append((record,))
+            index += 1
+    return groups
+
+
+def _source_wip_status_paths(
+    status_bytes: bytes,
+) -> tuple[
+    set[pathlib.PurePosixPath],
+    set[pathlib.PurePosixPath],
+    set[pathlib.PurePosixPath],
+    set[pathlib.PurePosixPath],
+    set[pathlib.PurePosixPath],
+]:
+    staged_paths: set[pathlib.PurePosixPath] = set()
+    staged_deleted_paths: set[pathlib.PurePosixPath] = set()
+    unstaged_paths: set[pathlib.PurePosixPath] = set()
+    unstaged_deleted_paths: set[pathlib.PurePosixPath] = set()
+    untracked_paths: set[pathlib.PurePosixPath] = set()
+
+    def add_status_path(
+        status: int,
+        *,
+        current: pathlib.PurePosixPath,
+        original: pathlib.PurePosixPath | None,
+        changed: set[pathlib.PurePosixPath],
+        deleted: set[pathlib.PurePosixPath],
+    ) -> None:
+        if status == ord("."):
+            return
+        if status not in b"MTADRC":
+            raise ReviewError("source WIP status metadata is malformed")
+        changed.add(current)
+        if status in b"RC":
+            if original is None:
+                raise ReviewError("source WIP rename status metadata is malformed")
+            changed.add(original)
+        elif status == ord("D"):
+            deleted.add(current)
+
+    for group in _porcelain_v2_groups(status_bytes):
+        record = group[0]
+        if record.startswith(b"u "):
+            raise ReviewError("source WIP contains unresolved merge conflicts")
+        if record.startswith(b"? "):
+            if len(group) != 1:
+                raise ReviewError("source WIP status metadata is malformed")
+            raw_path = record[2:]
+            if raw_path.endswith(b"/"):
+                raise ReviewError(
+                    "source WIP contains an unexpanded untracked directory; "
+                    "nested repositories are not supported"
+                )
+            untracked_paths.add(_parse_wip_path(raw_path))
+            continue
+        if record.startswith(b"1 "):
+            if len(group) != 1:
+                raise ReviewError("source WIP status metadata is malformed")
+            fields = record.split(b" ", 8)
+            if len(fields) != 9:
+                raise ReviewError("source WIP status metadata is malformed")
+            raw_path = fields[8]
+            raw_original = None
+        elif record.startswith(b"2 "):
+            if len(group) != 2:
+                raise ReviewError("source WIP rename status metadata is malformed")
+            fields = record.split(b" ", 9)
+            if len(fields) != 10:
+                raise ReviewError("source WIP rename status metadata is malformed")
+            raw_path = fields[9]
+            raw_original = group[1]
+        else:
+            raise ReviewError("source WIP status metadata is malformed")
+        xy = fields[1]
+        if len(xy) != 2 or fields[2].startswith(b"S"):
+            if fields[2].startswith(b"S"):
+                raise ReviewError(
+                    "source WIP contains a changed or dirty submodule, which is not supported"
+                )
+            raise ReviewError("source WIP status metadata is malformed")
+        current = _parse_wip_path(raw_path)
+        original = None if raw_original is None else _parse_wip_path(raw_original)
+        add_status_path(
+            xy[0],
+            current=current,
+            original=original,
+            changed=staged_paths,
+            deleted=staged_deleted_paths,
+        )
+        add_status_path(
+            xy[1],
+            current=current,
+            original=original,
+            changed=unstaged_paths,
+            deleted=unstaged_deleted_paths,
+        )
+    return (
+        staged_paths,
+        staged_deleted_paths,
+        unstaged_paths,
+        unstaged_deleted_paths,
+        untracked_paths,
+    )
+
+
+def _source_final_worktree_paths(
+    context: SourceInspectionGitContext,
+    *,
+    capture_budget: SourceWipCaptureBudget | None = None,
+) -> tuple[set[pathlib.PurePosixPath], set[pathlib.PurePosixPath]]:
+    label = "source WIP tracked paths"
+    value = _bounded_source_git_output(
+        context,
+        "diff",
+        "--name-status",
+        "-z",
+        "--no-renames",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--ignore-submodules=all",
+        context.head_sha,
+        "--",
+        byte_limit=MAX_SOURCE_TRACKED_PATH_BYTES,
+        record_limit=2 * MAX_SOURCE_TRACKED_PATH_RECORDS,
+        label=label,
+        capture_budget=capture_budget,
+    )
+
+    def next_record(cursor: int) -> tuple[bytes, int]:
+        search_start = cursor
+        while search_start < len(value):
+            if capture_budget is not None:
+                capture_budget.remaining_seconds()
+            search_end = min(
+                len(value),
+                search_start + SOURCE_WIP_PARSE_DEADLINE_CHECK_BYTES,
+            )
+            separator = value.find(b"\0", search_start, search_end)
+            if separator >= 0:
+                return value[cursor:separator], separator + 1
+            search_start = search_end
+        raise ReviewError("source WIP tracked path metadata is malformed")
+
+    paths: set[pathlib.PurePosixPath] = set()
+    deleted_paths: set[pathlib.PurePosixPath] = set()
+    cursor = 0
+    while cursor < len(value):
+        raw_status, cursor = next_record(cursor)
+        raw_path, cursor = next_record(cursor)
+        if raw_status not in {b"A", b"D", b"M", b"T", b"U", b"X", b"B"}:
+            raise ReviewError("source WIP tracked path metadata is malformed")
+        relative = _parse_wip_path(raw_path)
+        paths.add(relative)
+        if len(paths) > MAX_CHANGED_ENTRIES:
+            raise ReviewError(
+                "source WIP tracked paths exceeds the review entry-count limit"
+            )
+        if raw_status == b"D":
+            deleted_paths.add(relative)
+    if capture_budget is not None:
+        capture_budget.remaining_seconds()
+    return paths, deleted_paths
+
+
+def _source_wip_paths(
+    context: SourceInspectionGitContext,
+    initial_status: bytes,
+    *,
+    capture_budget: SourceWipCaptureBudget | None = None,
+) -> tuple[
+    set[pathlib.PurePosixPath],
+    set[pathlib.PurePosixPath],
+    set[pathlib.PurePosixPath],
+]:
+    (
+        staged_paths,
+        staged_deleted_paths,
+        unstaged_paths,
+        unstaged_deleted_paths,
+        untracked_paths,
+    ) = _source_wip_status_paths(initial_status)
+    (
+        final_worktree_paths,
+        final_worktree_deleted_paths,
+    ) = _source_final_worktree_paths(
+        context,
+        capture_budget=capture_budget,
+    )
+    if capture_budget is not None:
+        capture_budget.remaining_seconds()
+    if not final_worktree_deleted_paths.issubset(final_worktree_paths):
+        raise ReviewError("source WIP tracked path metadata is inconsistent")
+    if not staged_deleted_paths.issubset(staged_paths):
+        raise ReviewError("source WIP staged path metadata is inconsistent")
+    if not unstaged_deleted_paths.issubset(unstaged_paths):
+        raise ReviewError("source WIP unstaged path metadata is inconsistent")
+    deleted_status_paths = staged_deleted_paths | unstaged_deleted_paths
+    if capture_budget is not None:
+        capture_budget.remaining_seconds()
+    if not final_worktree_deleted_paths.issubset(deleted_status_paths):
+        raise ReviewError("source WIP deleted path metadata is inconsistent")
+    status_changed_paths = staged_paths | unstaged_paths
+    if capture_budget is not None:
+        capture_budget.remaining_seconds()
+    final_changed_paths = staged_paths | final_worktree_paths
+    if capture_budget is not None:
+        capture_budget.remaining_seconds()
+    if status_changed_paths != final_changed_paths:
+        raise ReviewError(
+            "source WIP staged and unstaged path metadata is inconsistent"
+        )
+    paths = status_changed_paths | untracked_paths
+    if capture_budget is not None:
+        capture_budget.remaining_seconds()
+    if len(paths) > MAX_CHANGED_ENTRIES:
+        raise ReviewError("source WIP exceeds the review entry-count limit")
+    worktree_capture_paths = (
+        final_worktree_paths - final_worktree_deleted_paths
+    ) | untracked_paths
+    if capture_budget is not None:
+        capture_budget.remaining_seconds()
+    index_capture_paths = staged_paths - staged_deleted_paths - final_worktree_paths
+    if capture_budget is not None:
+        capture_budget.remaining_seconds()
+    return paths, worktree_capture_paths, index_capture_paths
+
+
+def _read_wip_entry(
+    *,
+    source_root: pathlib.Path,
+    relative: pathlib.PurePosixPath,
+    remaining_bytes: int,
+    expected_materialized_mode: str | None = None,
+    regular_mode_override: str | None = None,
+) -> tuple[str, bytes] | None:
+    if regular_mode_override not in {None, "100644", "100755"}:
+        raise ValueError("source WIP regular mode override is invalid")
+    display = _redact_secret_path(relative.as_posix(), "source WIP path")
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        parent_fd = os.open(source_root, directory_flags)
+    except OSError as error:
+        raise ReviewError("cannot securely open the source WIP root") from error
+    try:
+        for component in relative.parts[:-1]:
+            try:
+                component_status = os.stat(
+                    component,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except (FileNotFoundError, NotADirectoryError):
+                return None
+            except OSError as error:
+                raise ReviewError(
+                    f"cannot inspect source WIP parent for {display}"
+                ) from error
+            if stat.S_ISLNK(component_status.st_mode):
+                return None
+            if not stat.S_ISDIR(component_status.st_mode):
+                if stat.S_ISREG(component_status.st_mode):
+                    return None
+                raise ReviewError(
+                    f"source WIP path has a special-file parent: {display}"
+                )
+            try:
+                next_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+            except OSError as error:
+                raise ReviewError(
+                    f"source WIP parent changed while opened: {display}"
+                ) from error
+            opened_status = os.fstat(next_fd)
+            if (opened_status.st_dev, opened_status.st_ino) != (
+                component_status.st_dev,
+                component_status.st_ino,
+            ):
+                os.close(next_fd)
+                raise ReviewError(f"source WIP parent changed while opened: {display}")
+            os.close(parent_fd)
+            parent_fd = next_fd
+        name = relative.parts[-1]
+        try:
+            initial = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        except OSError as error:
+            raise ReviewError(f"cannot inspect source WIP path {display}") from error
+        if stat.S_ISDIR(initial.st_mode):
+            return None
+        if stat.S_ISLNK(initial.st_mode):
+            target = os.readlink(name, dir_fd=parent_fd)
+            raw_target = os.fsencode(target)
+            if len(raw_target) > 16 * 1024:
+                raise ReviewError(f"oversized symlink target in source WIP: {display}")
+            if len(raw_target) > remaining_bytes:
+                raise ReviewError(
+                    f"source WIP symlink exceeds the review snapshot limit: {display}"
+                )
+            if not symlink_target_stays_within_workspace(relative, target):
+                raise ReviewError(
+                    f"source WIP symlink escapes review workspace: {display}"
+                )
+            final = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if os.readlink(name, dir_fd=parent_fd) != target or _wip_stat_identity(
+                initial
+            ) != _wip_stat_identity(final):
+                raise ReviewError(f"source WIP symlink changed while copied: {display}")
+            return "120000", raw_target
+        if not stat.S_ISREG(initial.st_mode):
+            raise ReviewError(f"unsupported special file in source WIP: {display}")
+        if initial.st_nlink != 1:
+            raise ReviewError(
+                f"source WIP regular file must have exactly one hard link: {display}"
+            )
+        if initial.st_uid != os.geteuid():
+            raise ReviewError(
+                f"source WIP regular file must be owned by the current user: {display}"
+            )
+        if expected_materialized_mode in {"100644", "100755"}:
+            expected_permissions = (
+                0o755 if expected_materialized_mode == "100755" else 0o644
+            )
+            if stat.S_IMODE(initial.st_mode) != expected_permissions:
+                raise ReviewError(
+                    "materialized review workspace metadata does not match snapshot tree"
+                )
+        if (
+            initial.st_size > MAX_SNAPSHOT_BLOB_BYTES
+            or initial.st_size > remaining_bytes
+        ):
+            raise ReviewError(
+                f"source WIP file exceeds the review snapshot limit: {display}"
+            )
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (initial.st_dev, initial.st_ino):
+                raise ReviewError(f"source WIP file changed while opened: {display}")
+            with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                data = handle.read(MAX_SNAPSHOT_BLOB_BYTES + 1)
+            final_fd = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            final_path = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as error:
+            raise ReviewError(
+                f"source WIP file changed while copied: {display}"
+            ) from error
+    finally:
+        os.close(parent_fd)
+    if (
+        len(data) > MAX_SNAPSHOT_BLOB_BYTES
+        or _wip_stat_identity(initial) != _wip_stat_identity(final_fd)
+        or _wip_stat_identity(initial) != _wip_stat_identity(final_path)
+    ):
+        raise ReviewError(f"source WIP file changed while copied: {display}")
+    mode = regular_mode_override or (
+        "100755" if initial.st_mode & stat.S_IXUSR else "100644"
+    )
+    return mode, data
+
+
+def _wip_stat_identity(
+    item: os.stat_result,
+) -> tuple[int, int, int, int, int, int]:
+    return (
+        item.st_dev,
+        item.st_ino,
+        item.st_mode,
+        item.st_size,
+        item.st_mtime_ns,
+        item.st_ctime_ns,
+    )
+
+
+def _capture_source_wip_entries(
+    *,
+    source_root: pathlib.Path,
+    paths: set[pathlib.PurePosixPath],
+    regular_mode_overrides: Mapping[pathlib.PurePosixPath, str] | None = None,
+    capture_budget: SourceWipCaptureBudget | None = None,
+) -> dict[pathlib.PurePosixPath, tuple[str, bytes]]:
+    selected_mode_overrides = (
+        {} if regular_mode_overrides is None else regular_mode_overrides
+    )
+    if not set(selected_mode_overrides).issubset(paths):
+        raise ValueError("source WIP regular mode override paths are inconsistent")
+    entries: dict[pathlib.PurePosixPath, tuple[str, bytes]] = {}
+    remaining_bytes = MAX_SNAPSHOT_BYTES
+    for relative in sorted(paths, key=lambda item: item.as_posix()):
+        if capture_budget is not None:
+            capture_budget.remaining_seconds()
+        entry = _read_wip_entry(
+            source_root=source_root,
+            relative=relative,
+            remaining_bytes=remaining_bytes,
+            regular_mode_override=selected_mode_overrides.get(relative),
+        )
+        if entry is None:
+            raise ReviewError(
+                "source WIP planned worktree path is missing during capture"
+            )
+        entries[relative] = entry
+        remaining_bytes -= len(entry[1])
+    if entries.keys() != paths:
+        raise ReviewError("source WIP worktree capture is incomplete")
+    return entries
+
+
+def _source_index_wip_metadata(
+    *,
+    index_snapshot: Mapping[bytes, tuple[str, str]],
+    paths: set[pathlib.PurePosixPath],
+    required_paths: set[pathlib.PurePosixPath],
+) -> dict[pathlib.PurePosixPath, tuple[str, str]]:
+    if not required_paths.issubset(paths):
+        raise ValueError("source WIP required index paths are inconsistent")
+    selected_raw_paths = {
+        os.fsencode(relative.as_posix()): relative for relative in paths
+    }
+    if len(selected_raw_paths) != len(paths):
+        raise ReviewError("source WIP staged index path encoding is ambiguous")
+    metadata_by_path = {
+        relative: index_snapshot[raw_path]
+        for raw_path, relative in selected_raw_paths.items()
+        if raw_path in index_snapshot
+    }
+    if not required_paths.issubset(metadata_by_path):
+        raise ReviewError("source WIP staged index metadata is incomplete")
+    return metadata_by_path
+
+
+def _source_wip_regular_mode_overrides(
+    *,
+    context: SourceInspectionGitContext,
+    metadata_by_path: Mapping[pathlib.PurePosixPath, tuple[str, str]],
+) -> dict[pathlib.PurePosixPath, str]:
+    if context.file_mode:
+        return {}
+    return {
+        relative: mode
+        for relative, (mode, _object_id) in metadata_by_path.items()
+        if mode in {"100644", "100755"}
+    }
+
+
+def _capture_source_index_wip_entries(
+    *,
+    context: SourceInspectionGitContext,
+    metadata_by_path: Mapping[pathlib.PurePosixPath, tuple[str, str]],
+    remaining_bytes: int,
+    capture_budget: SourceWipCaptureBudget,
+) -> dict[pathlib.PurePosixPath, tuple[str, bytes]]:
+    if not 0 <= remaining_bytes <= MAX_SNAPSHOT_BYTES:
+        raise ValueError("source WIP staged blob budget is invalid")
+    if not metadata_by_path:
+        return {}
+    sorted_metadata = sorted(
+        metadata_by_path.items(),
+        key=lambda item: item[0].as_posix(),
+    )
+    with (
+        _temporary_review_file() as batch_input,
+        _temporary_review_file() as batch_output,
+    ):
+        for _relative, (_mode, object_id) in sorted_metadata:
+            batch_input.write(object_id.encode("ascii") + b"\n")
+        batch_input.seek(0)
+        _run_bounded_process_to_file(
+            _frozen_command(
+                git_view=context.git_dir,
+                args=("cat-file", "--batch"),
+            ),
+            environment=_git_environment(
+                object_directory=context.object_directory,
+            ),
+            input_handle=batch_input,
+            destination=batch_output,
+            label="source WIP staged blobs",
+            byte_limit=remaining_bytes + MAX_SOURCE_INDEX_METADATA_BYTES,
+            timeout_seconds=capture_budget.claim_git_invocation(),
+            timeout_label="source Git",
+        )
+        batch_output.seek(0)
+        entries: dict[pathlib.PurePosixPath, tuple[str, bytes]] = {}
+        for relative, (mode, object_id) in sorted_metadata:
+            header = batch_output.readline()
+            fields = header.rstrip(b"\n").split(b" ")
+            if len(fields) != 3:
+                raise ReviewError("source WIP staged blob header is malformed")
+            raw_actual_object, object_type, raw_size = fields
+            if raw_actual_object != object_id.encode("ascii") or object_type != b"blob":
+                raise ReviewError("source WIP staged blob metadata is inconsistent")
+            try:
+                size = int(raw_size)
+            except ValueError as error:
+                raise ReviewError("source WIP staged blob size is malformed") from error
+            display = _redact_secret_path(relative.as_posix(), "source WIP path")
+            if size < 0 or size > remaining_bytes:
+                raise ReviewError(
+                    f"source WIP staged blob exceeds the review snapshot limit: {display}"
+                )
+            if mode == "120000":
+                if size > 16 * 1024:
+                    raise ReviewError(
+                        f"oversized symlink target in source WIP: {display}"
+                    )
+            elif size > MAX_SNAPSHOT_BLOB_BYTES:
+                raise ReviewError(
+                    f"source WIP file exceeds the review snapshot limit: {display}"
+                )
+            data = _read_exact(batch_output, size)
+            if batch_output.read(1) != b"\n":
+                raise ReviewError("missing delimiter after source WIP staged blob")
+            if mode == "120000":
+                if b"\0" in data:
+                    raise ReviewError(f"NUL in source WIP symlink target: {display}")
+                target = os.fsdecode(data)
+                if not symlink_target_stays_within_workspace(relative, target):
+                    raise ReviewError(
+                        f"source WIP symlink escapes review workspace: {display}"
+                    )
+            entries[relative] = (mode, data)
+            remaining_bytes -= size
+        if batch_output.read(1):
+            raise ReviewError(
+                "source WIP staged blobs contain unexpected trailing data"
+            )
+    return entries
+
+
+def _import_source_wip_blobs(
+    *,
+    workspace_root: pathlib.Path,
+    entries: dict[pathlib.PurePosixPath, tuple[str, bytes]],
+    capture_budget: SourceWipCaptureBudget | None = None,
+) -> tuple[str, dict[pathlib.PurePosixPath, str]]:
+    """Import captured WIP blobs with one bounded Git process."""
+
+    object_format = (
+        _run_worktree_git(
+            workspace_root,
+            "rev-parse",
+            "--show-object-format",
+            capture_budget=capture_budget,
+        )
+        .stdout.decode("ascii")
+        .strip()
+    )
+    if object_format not in {"sha1", "sha256"}:
+        raise ReviewError(f"unsupported Git object format: {object_format!r}")
+    object_ids: dict[pathlib.PurePosixPath, str] = {}
+    if not entries:
+        return object_format, object_ids
+
+    object_id_length = {"sha1": 40, "sha256": 64}[object_format]
+    sorted_entries = sorted(entries.items(), key=lambda item: item[0].as_posix())
+    expected_ids: list[str] = []
+    with _temporary_review_file() as stream:
+        stream.write(b"feature get-mark\n")
+        for mark, (_relative, (_mode, data)) in enumerate(sorted_entries, start=1):
+            digest = hashlib.new(object_format)
+            digest.update(f"blob {len(data)}\0".encode("ascii"))
+            digest.update(data)
+            expected_ids.append(digest.hexdigest())
+            stream.write(b"blob\n")
+            stream.write(f"mark :{mark}\n".encode("ascii"))
+            stream.write(f"data {len(data)}\n".encode("ascii"))
+            stream.write(data)
+            stream.write(b"\n")
+        for mark in range(1, len(sorted_entries) + 1):
+            stream.write(f"get-mark :{mark}\n".encode("ascii"))
+        stream.write(b"done\n")
+        stream.seek(0)
+        completed = _run_worktree_git(
+            workspace_root,
+            "fast-import",
+            "--quiet",
+            "--done",
+            input_handle=stream,
+            byte_limit=len(sorted_entries) * (object_id_length + 1),
+            record_limit=len(sorted_entries),
+            capture_budget=capture_budget,
+        )
+    output = completed.stdout
+    if not output.endswith(b"\n"):
+        raise ReviewError("source WIP blob import produced truncated object metadata")
+    actual_ids = output[:-1].split(b"\n")
+    if len(actual_ids) != len(sorted_entries):
+        raise ReviewError("source WIP blob import produced incomplete object metadata")
+    lowercase_hex = b"0123456789abcdef"
+    for (relative, _entry), expected_id, raw_actual in zip(
+        sorted_entries,
+        expected_ids,
+        actual_ids,
+        strict=True,
+    ):
+        if len(raw_actual) != object_id_length or any(
+            byte not in lowercase_hex for byte in raw_actual
+        ):
+            raise ReviewError("source WIP blob import produced invalid object metadata")
+        actual_id = raw_actual.decode("ascii")
+        if actual_id != expected_id:
+            raise ReviewError(
+                "source WIP blob import produced mismatched object metadata"
+            )
+        object_ids[relative] = actual_id
+    return object_format, object_ids
+
+
+def _apply_source_wip_index_overlay(
+    *,
+    workspace_root: pathlib.Path,
+    paths: set[pathlib.PurePosixPath],
+    entries: dict[pathlib.PurePosixPath, tuple[str, bytes]],
+    object_format: str,
+    object_ids: dict[pathlib.PurePosixPath, str],
+    capture_budget: SourceWipCaptureBudget,
+) -> None:
+    """Apply all WIP removals and additions with one NUL-delimited index update."""
+
+    object_id_length = {"sha1": 40, "sha256": 64}.get(object_format)
+    if object_id_length is None:
+        raise ReviewError(f"unsupported Git object format: {object_format!r}")
+    zero_object_id = b"0" * object_id_length
+    with _temporary_review_file() as index_info:
+        for relative in sorted(
+            paths,
+            key=lambda item: (len(item.parts), item.as_posix()),
+            reverse=True,
+        ):
+            index_info.write(b"0 " + zero_object_id + b"\t")
+            index_info.write(os.fsencode(relative.as_posix()))
+            index_info.write(b"\0")
+        for relative, (mode, _data) in sorted(
+            entries.items(), key=lambda item: (len(item[0].parts), item[0].as_posix())
+        ):
+            object_id = object_ids.get(relative)
+            if object_id is None or len(object_id) != object_id_length:
+                raise ReviewError(
+                    "source WIP blob import produced invalid object metadata"
+                )
+            index_info.write(mode.encode("ascii") + b" ")
+            index_info.write(object_id.encode("ascii") + b"\t")
+            index_info.write(os.fsencode(relative.as_posix()))
+            index_info.write(b"\0")
+        index_info.seek(0)
+        _run_worktree_git(
+            workspace_root,
+            "update-index",
+            "-z",
+            "--index-info",
+            input_handle=index_info,
+            capture_budget=capture_budget,
+        )
+
+
+def _overlay_source_wip(
+    *,
+    source_inspection: SourceInspectionGitContext,
+    source_root: pathlib.Path,
+    workspace_root: pathlib.Path,
+    head_sha: str,
+    initial_status: bytes,
+    paths: set[pathlib.PurePosixPath],
+    worktree_capture_paths: set[pathlib.PurePosixPath],
+    index_capture_paths: set[pathlib.PurePosixPath],
+    entries: dict[pathlib.PurePosixPath, tuple[str, bytes]],
+    initial_index_snapshot: Mapping[bytes, tuple[str, str]],
+    capture_budget: SourceWipCaptureBudget,
+) -> str:
+    capture_budget.remaining_seconds()
+    object_format, object_ids = _import_source_wip_blobs(
+        workspace_root=workspace_root,
+        entries=entries,
+        capture_budget=capture_budget,
+    )
+    _apply_source_wip_index_overlay(
+        workspace_root=workspace_root,
+        paths=paths,
+        entries=entries,
+        object_format=object_format,
+        object_ids=object_ids,
+        capture_budget=capture_budget,
+    )
+    snapshot_tree_sha = (
+        _run_worktree_git(
+            workspace_root,
+            "write-tree",
+            capture_budget=capture_budget,
+        )
+        .stdout.decode("ascii")
+        .strip()
+    )
+    if (
+        resolve_commit(
+            source_root,
+            "HEAD",
+            label="source WIP HEAD",
+            capture_budget=capture_budget,
+        )
+        != head_sha
+    ):
+        raise ReviewError("source HEAD changed while the WIP snapshot was prepared")
+    rechecked_index_snapshot = _source_index_snapshot(
+        source_inspection,
+        capture_budget=capture_budget,
+    )
+    if rechecked_index_snapshot != initial_index_snapshot:
+        raise ReviewError(
+            "source WIP index changed while the private snapshot was prepared"
+        )
+    rechecked_index_metadata = _source_index_wip_metadata(
+        index_snapshot=rechecked_index_snapshot,
+        paths=worktree_capture_paths | index_capture_paths,
+        required_paths=index_capture_paths,
+    )
+    rechecked_worktree_metadata = {
+        relative: rechecked_index_metadata[relative]
+        for relative in worktree_capture_paths
+        if relative in rechecked_index_metadata
+    }
+    rechecked_worktree_entries = _capture_source_wip_entries(
+        source_root=source_root,
+        paths=worktree_capture_paths,
+        regular_mode_overrides=_source_wip_regular_mode_overrides(
+            context=source_inspection,
+            metadata_by_path=rechecked_worktree_metadata,
+        ),
+        capture_budget=capture_budget,
+    )
+    if not worktree_capture_paths.issubset(entries):
+        raise ReviewError("source WIP initial worktree capture is incomplete")
+    expected_worktree_entries = {
+        relative: entries[relative] for relative in worktree_capture_paths
+    }
+    if rechecked_worktree_entries != expected_worktree_entries:
+        raise ReviewError(
+            "source WIP content changed while the private snapshot was prepared"
+        )
+    rechecked_index_entries = _capture_source_index_wip_entries(
+        context=source_inspection,
+        metadata_by_path={
+            relative: rechecked_index_metadata[relative]
+            for relative in index_capture_paths
+        },
+        remaining_bytes=MAX_SNAPSHOT_BYTES
+        - sum(len(entry[1]) for entry in rechecked_worktree_entries.values()),
+        capture_budget=capture_budget,
+    )
+    if not index_capture_paths.issubset(entries):
+        raise ReviewError("source WIP initial staged capture is incomplete")
+    expected_index_entries = {
+        relative: entries[relative] for relative in index_capture_paths
+    }
+    if rechecked_index_entries != expected_index_entries:
+        raise ReviewError(
+            "source WIP staged content changed while the private snapshot was prepared"
+        )
+    final_status = _source_status(
+        source_inspection,
+        capture_budget=capture_budget,
+    )
+    if final_status != initial_status:
+        raise ReviewError("source WIP changed while the review snapshot was prepared")
+    final_path_plan = _source_wip_paths(
+        source_inspection,
+        final_status,
+        capture_budget=capture_budget,
+    )
+    if final_path_plan != (
+        paths,
+        worktree_capture_paths,
+        index_capture_paths,
+    ):
+        raise ReviewError(
+            "source WIP path selection changed while the review snapshot was prepared"
+        )
+    capture_budget.remaining_seconds()
+    return snapshot_tree_sha
+
+
+def _clear_materialized_workspace(workspace_root: pathlib.Path) -> None:
+    workspace_descriptor = os.open(
+        workspace_root,
+        _private_cleanup_directory_flags(),
+    )
+    try:
+        opened = os.fstat(workspace_descriptor)
+        path_status = os.lstat(workspace_root)
+        if _private_cleanup_identity(opened) != _private_cleanup_identity(path_status):
+            raise ReviewError(
+                "detached review worktree changed while opening it for rematerialization"
+            )
+        cleanup_errors = _remove_open_directory_contents(
+            workspace_descriptor,
+            depth=0,
+            excluded_entry_names=frozenset({".git"}),
+        )
+        if cleanup_errors:
+            raise ReviewError(
+                "cannot clear detached review worktree before rematerialization: "
+                + "; ".join(cleanup_errors)
+            )
+    finally:
+        os.close(workspace_descriptor)
+    if {entry.name for entry in os.scandir(workspace_root)} != {".git"}:
+        raise ReviewError(
+            "cannot clear detached review worktree before rematerialization"
+        )
+
+
+def _workspace_inventory(
+    workspace_root: pathlib.Path,
+    *,
+    allow_control_dir: bool,
+) -> set[pathlib.PurePosixPath]:
+    inventory: set[pathlib.PurePosixPath] = set()
+
+    def visit(directory: pathlib.Path, prefix: pathlib.PurePosixPath) -> None:
+        for entry in os.scandir(directory):
+            if not prefix.parts and entry.name == ".git":
+                continue
+            if allow_control_dir and not prefix.parts and entry.name == ".codex-review":
+                continue
+            relative = prefix / entry.name
+            inventory.add(relative)
+            if len(inventory) > MAX_SNAPSHOT_ENTRIES * 2:
+                raise ReviewError(
+                    "materialized review workspace exceeds the verification entry limit"
+                )
+            if entry.is_dir(follow_symlinks=False):
+                visit(pathlib.Path(entry.path), relative)
+
+    visit(workspace_root, pathlib.PurePosixPath())
+    return inventory
+
+
+def _verify_materialized_snapshot(
+    *,
+    git_view: pathlib.Path,
+    object_directory: pathlib.Path,
+    workspace_root: pathlib.Path,
+    snapshot_tree_sha: str,
+    allow_control_dir: bool = False,
+    verify_index_tree: bool = True,
+) -> None:
+    object_format = (
+        _run_private_git(
+            git_dir=git_view,
+            args=("rev-parse", "--show-object-format"),
+        )
+        .stdout.decode("ascii")
+        .strip()
+    )
+    expected_oid_length = {"sha1": 40, "sha256": 64}.get(object_format)
+    if expected_oid_length is None or len(snapshot_tree_sha) != expected_oid_length:
+        raise ReviewError("snapshot tree does not match the private Git object format")
+    if verify_index_tree:
+        index_tree = (
+            _run_worktree_git(workspace_root, "write-tree")
+            .stdout.decode("ascii")
+            .strip()
+        )
+        if index_tree != snapshot_tree_sha:
+            raise ReviewError(
+                "detached review worktree index does not match snapshot tree"
+            )
+    expected_paths: set[pathlib.PurePosixPath] = set()
+    expected_directories: set[pathlib.PurePosixPath] = set()
+    byte_budget = MAX_SNAPSHOT_BYTES
+    with _temporary_review_file() as metadata:
+        _run_bounded_process_to_file(
+            _frozen_command(
+                git_view=git_view,
+                args=("ls-tree", "-rz", "--full-tree", "-r", snapshot_tree_sha),
+            ),
+            environment=_git_environment(object_directory=object_directory),
+            destination=metadata,
+            label="snapshot verification metadata",
+            byte_limit=MAX_TREE_METADATA_BYTES,
+            record_limit=MAX_SNAPSHOT_ENTRIES,
+            record_separator=b"\0",
+        )
+        metadata.seek(0)
+        for record in _iter_nul_records(
+            metadata,
+            byte_limit=MAX_TREE_METADATA_BYTES,
+            record_limit=MAX_SNAPSHOT_ENTRIES,
+            label="snapshot verification metadata",
+        ):
+            mode, object_type, object_id, relative = _parse_tree_record(record)
+            expected_paths.add(relative)
+            for depth in range(1, len(relative.parts)):
+                expected_directories.add(pathlib.PurePosixPath(*relative.parts[:depth]))
+            if mode == "160000" and object_type == "commit":
+                expected_directories.add(relative)
+                gitlink = workspace_root.joinpath(*relative.parts)
+                try:
+                    gitlink_metadata = os.lstat(gitlink)
+                except OSError as error:
+                    raise ReviewError(
+                        "materialized review workspace is missing a gitlink directory"
+                    ) from error
+                if (
+                    not stat.S_ISDIR(gitlink_metadata.st_mode)
+                    or gitlink_metadata.st_uid != os.geteuid()
+                    or stat.S_IMODE(gitlink_metadata.st_mode) != 0o755
+                ):
+                    raise ReviewError(
+                        "materialized review workspace gitlink is not a safe directory"
+                    )
+                with os.scandir(gitlink) as gitlink_entries:
+                    if any(gitlink_entries):
+                        raise ReviewError(
+                            "materialized review workspace gitlink is not empty"
+                        )
+                continue
+            if object_type != "blob":
+                raise ReviewError("snapshot verification found an unsupported object")
+            entry = _read_wip_entry(
+                source_root=workspace_root,
+                relative=relative,
+                remaining_bytes=byte_budget,
+                expected_materialized_mode=mode,
+            )
+            if entry is None:
+                raise ReviewError(
+                    "materialized review workspace is missing a snapshot blob"
+                )
+            actual_mode, data = entry
+            byte_budget -= len(data)
+            if actual_mode != mode:
+                raise ReviewError(
+                    "materialized review workspace mode does not match snapshot tree"
+                )
+            digest = hashlib.new(object_format)
+            digest.update(f"blob {len(data)}\0".encode("ascii"))
+            digest.update(data)
+            actual_object = digest.hexdigest()
+            if actual_object != object_id:
+                raise ReviewError(
+                    "materialized review workspace content does not match snapshot tree"
+                )
+    if (
+        _workspace_inventory(
+            workspace_root,
+            allow_control_dir=allow_control_dir,
+        )
+        != expected_paths | expected_directories
+    ):
+        raise ReviewError(
+            "materialized review workspace topology does not match snapshot tree"
+        )
+
+
+def _review_scope_identity(
+    *,
+    base_sha: str,
+    head_sha: str,
+    content_variant: str,
+    snapshot_tree_sha: str,
+) -> str:
+    return hashlib.sha256(
+        b"isolated-review-scope-v1\0"
+        + base_sha.encode("ascii")
+        + b"\0"
+        + head_sha.encode("ascii")
+        + b"\0"
+        + content_variant.encode("ascii")
+        + b"\0"
+        + snapshot_tree_sha.encode("ascii")
+    ).hexdigest()
+
+
 def _canonical_github_repository(remote_url: str) -> str | None:
     patterns = (
         r"https://github\.com/([^/]+/[^/]+?)(?:\.git)?/?$",
@@ -11696,27 +15896,24 @@ def audit_legacy_exemption(
     descriptors = {item.identifier: item for item in accepted}
     evidence: list[dict[str, Any]] = []
 
-    with tempfile.TemporaryDirectory(prefix="synthetic-token-master-audit-") as raw:
-        container = pathlib.Path(raw)
-        git_view, object_directory = _create_sanitized_git_view(
-            source_root=source_root,
-            container=container,
-        )
+    with _temporary_sanitized_git_view(
+        source_root=source_root,
+    ) as (git_view, object_directory):
         by_commit: dict[str, list[AcceptedSyntheticValue]] = {}
         for token in exemption.values:
-            ancestor = _git(
-                source_root,
-                "merge-base",
-                "--is-ancestor",
-                token.containing_commit,
-                tip,
-                check=False,
+            ancestry_error = (
+                "legacy provenance commit is not an ancestor of the verified "
+                f"master tip: {token.identifier}"
             )
-            if ancestor.returncode != 0:
-                raise ReviewError(
-                    "legacy provenance commit is not an ancestor of the verified master tip: "
-                    f"{token.identifier}"
-                )
+            is_ancestor = _is_ancestor_in_sanitized_view(
+                git_view=git_view,
+                object_directory=object_directory,
+                ancestor=token.containing_commit,
+                descendant=tip,
+                failure_message=ancestry_error,
+            )
+            if not is_ancestor:
+                raise ReviewError(ancestry_error)
             by_commit.setdefault(token.containing_commit, []).append(
                 descriptors[token.identifier]
             )
@@ -11794,33 +15991,160 @@ def prepare_workspace(
     ) = None,
     synthetic_secret_exemptions: tuple[str, ...] = (),
     prompt_override: pathlib.Path | None = None,
+    include_source_wip: bool = False,
 ) -> ReviewWorkspace:
     source_root = resolve_repo_root(repo)
     base_sha = resolve_commit(source_root, base_ref, label="base ref")
     head_sha = resolve_commit(source_root, head_ref, label="head ref")
-    _require_ancestor_range(
-        source_root,
-        base_sha=base_sha,
-        head_sha=head_sha,
-    )
-    catalog = load_catalog()
-    validate_authoring_catalog_scanner_contract(catalog)
-    # Keep validating the deprecated option for typo detection, but every
-    # catalog legacy value now participates automatically.
-    resolve_legacy_exemptions(catalog, synthetic_secret_exemptions)
-    selected_exemptions = catalog.legacy_exemptions
-    accepted_values = accepted_authoring_values(catalog) + accepted_legacy_values(
-        catalog,
-        selected_exemptions,
-    )
-    catalog_legacy_value_matcher = _exact_path_matcher({})
-    evidence_sensitive_values = _all_catalog_sensitive_values(catalog)
-    (
-        container,
-        container_descriptor,
-        container_identity,
-        handoff_mask,
-    ) = _new_container(source_root)
+    with _temporary_sanitized_git_view(
+        source_root=source_root,
+    ) as (ancestry_git_view, ancestry_object_directory):
+        _require_ancestor_range(
+            git_view=ancestry_git_view,
+            object_directory=ancestry_object_directory,
+            base_sha=base_sha,
+            head_sha=head_sha,
+        )
+    source_head_sha = resolve_commit(source_root, "HEAD", label="source HEAD")
+    source_inspection_stack = ExitStack()
+    try:
+        source_inspection = source_inspection_stack.enter_context(
+            _temporary_source_inspection_git_context(
+                source_root=source_root,
+                head_sha=source_head_sha,
+            )
+        )
+        if include_source_wip:
+            if source_head_sha != head_sha:
+                raise ReviewError(
+                    "--include-source-wip requires --head-ref to resolve to source HEAD"
+                )
+            source_wip_capture_budget = _new_source_wip_capture_budget()
+            source_wip_index_snapshot = _source_index_snapshot(
+                source_inspection,
+                capture_budget=source_wip_capture_budget,
+            )
+            _require_unchanged_source_gitlinks(
+                source_inspection,
+                source_wip_index_snapshot,
+                capture_budget=source_wip_capture_budget,
+            )
+            source_status = _source_status(
+                source_inspection,
+                capture_budget=source_wip_capture_budget,
+            )
+            (
+                source_wip_paths,
+                source_wip_worktree_capture_paths,
+                source_wip_index_capture_paths,
+            ) = _source_wip_paths(
+                source_inspection,
+                source_status,
+                capture_budget=source_wip_capture_budget,
+            )
+            if source_wip_worktree_capture_paths & source_wip_index_capture_paths:
+                raise ReviewError("source WIP capture path metadata is inconsistent")
+            source_wip_index_metadata = _source_index_wip_metadata(
+                index_snapshot=source_wip_index_snapshot,
+                paths=(
+                    source_wip_worktree_capture_paths | source_wip_index_capture_paths
+                ),
+                required_paths=source_wip_index_capture_paths,
+            )
+            source_wip_worktree_metadata = {
+                relative: source_wip_index_metadata[relative]
+                for relative in source_wip_worktree_capture_paths
+                if relative in source_wip_index_metadata
+            }
+            source_wip_worktree_entries = _capture_source_wip_entries(
+                source_root=source_root,
+                paths=source_wip_worktree_capture_paths,
+                regular_mode_overrides=_source_wip_regular_mode_overrides(
+                    context=source_inspection,
+                    metadata_by_path=source_wip_worktree_metadata,
+                ),
+                capture_budget=source_wip_capture_budget,
+            )
+            source_wip_index_entries = _capture_source_index_wip_entries(
+                context=source_inspection,
+                metadata_by_path={
+                    relative: source_wip_index_metadata[relative]
+                    for relative in source_wip_index_capture_paths
+                },
+                remaining_bytes=MAX_SNAPSHOT_BYTES
+                - sum(len(entry[1]) for entry in source_wip_worktree_entries.values()),
+                capture_budget=source_wip_capture_budget,
+            )
+            source_wip_entries = {
+                **source_wip_index_entries,
+                **source_wip_worktree_entries,
+            }
+            if (
+                sum(len(entry[1]) for entry in source_wip_entries.values())
+                > MAX_SNAPSHOT_BYTES
+            ):
+                raise ReviewError("source WIP exceeds the total review snapshot limit")
+            if source_wip_entries.keys() != (
+                source_wip_worktree_capture_paths | source_wip_index_capture_paths
+            ):
+                raise ReviewError("source WIP initial capture is incomplete")
+            if (
+                resolve_commit(
+                    source_root,
+                    "HEAD",
+                    label="source WIP HEAD",
+                    capture_budget=source_wip_capture_budget,
+                )
+                != head_sha
+            ):
+                raise ReviewError(
+                    "source HEAD changed while the WIP snapshot was captured"
+                )
+            if (
+                _source_status(
+                    source_inspection,
+                    capture_budget=source_wip_capture_budget,
+                )
+                != source_status
+            ):
+                raise ReviewError("source WIP changed while its content was captured")
+        else:
+            _require_clean_source(source_inspection)
+            source_status = b""
+            source_wip_paths = set()
+            source_wip_worktree_capture_paths = set()
+            source_wip_index_capture_paths = set()
+            source_wip_entries = {}
+            source_wip_index_snapshot = {}
+            source_wip_capture_budget = None
+        catalog = load_catalog()
+        validate_authoring_catalog_scanner_contract(catalog)
+        # Keep validating the deprecated option for typo detection, but every
+        # catalog legacy value participates automatically.
+        resolve_legacy_exemptions(
+            catalog,
+            synthetic_secret_exemptions,
+        )
+        selected_exemptions = catalog.legacy_exemptions
+        authoring_values = accepted_authoring_values(catalog)
+        accepted_values = authoring_values + accepted_legacy_values(
+            catalog, selected_exemptions
+        )
+        catalog_legacy_values = accepted_legacy_values(
+            catalog,
+            catalog.legacy_exemptions,
+        )
+        catalog_legacy_value_matcher = _legacy_path_matcher(catalog_legacy_values)
+        evidence_sensitive_values = _all_catalog_sensitive_values(catalog)
+        (
+            container,
+            container_descriptor,
+            container_identity,
+            handoff_mask,
+        ) = _new_container(source_root)
+    except BaseException:
+        source_inspection_stack.close()
+        raise
     private_artifact_identities: dict[str, CleanupIdentity] = {}
 
     def capture_private_identity(
@@ -11872,9 +16196,42 @@ def prepare_workspace(
         restore_signal_mask(handoff_mask)
         handoff_mask = None
         workspace_root = container / "workspace"
-        git_view, object_directory = _create_sanitized_git_view(
+        source_git_view, source_object_directory = _create_sanitized_git_view(
             source_root=source_root,
             container=container,
+        )
+        git_dir = _create_private_review_repository(
+            container=container,
+            git_view=source_git_view,
+            source_object_directory=source_object_directory,
+            base_sha=base_sha,
+            head_sha=head_sha,
+        )
+        _scan_endpoint_commit_metadata(
+            git_view=git_dir,
+            object_directory=git_dir / "objects",
+            base_sha=base_sha,
+            head_sha=head_sha,
+            authoring_values=authoring_values,
+            legacy_values=catalog_legacy_values,
+        )
+        source_view_cleanup_errors = _remove_named_directory_tree(
+            container_descriptor,
+            source_git_view.name,
+            label="temporary sanitized source Git view",
+            require_private_mode=False,
+        )
+        if source_view_cleanup_errors:
+            raise ReviewError(
+                "cannot remove temporary sanitized source Git view: "
+                + "; ".join(source_view_cleanup_errors)
+            )
+        git_view = git_dir
+        object_directory = git_dir / "objects"
+        _create_detached_worktree(
+            git_dir=git_dir,
+            workspace_root=workspace_root,
+            head_sha=head_sha,
         )
         for label, commit in (("base", base_sha), ("head", head_sha)):
             if _commit_uses_reserved_control_path(
@@ -11886,6 +16243,81 @@ def prepare_workspace(
                 raise ReviewError(
                     f"the frozen {label} uses the reserved top-level .codex-review path"
                 )
+        _materialize_frozen_tree(
+            git_view=git_view,
+            object_directory=object_directory,
+            head_sha=head_sha,
+            workspace_root=workspace_root,
+            legacy_value_matcher=catalog_legacy_value_matcher,
+        )
+        _run_worktree_git(workspace_root, "read-tree", "--reset", head_sha)
+        if include_source_wip:
+            snapshot_tree_sha = _overlay_source_wip(
+                source_inspection=source_inspection,
+                source_root=source_root,
+                workspace_root=workspace_root,
+                head_sha=head_sha,
+                initial_status=source_status,
+                paths=source_wip_paths,
+                worktree_capture_paths=source_wip_worktree_capture_paths,
+                index_capture_paths=source_wip_index_capture_paths,
+                entries=source_wip_entries,
+                initial_index_snapshot=source_wip_index_snapshot,
+                capture_budget=source_wip_capture_budget,
+            )
+            content_variant = "source-wip"
+        else:
+            snapshot_tree_sha = (
+                _run_private_git(
+                    git_dir=git_dir,
+                    args=("rev-parse", f"{head_sha}^{{tree}}"),
+                )
+                .stdout.decode("ascii")
+                .strip()
+            )
+            content_variant = "head"
+        _run_worktree_git(
+            workspace_root,
+            "read-tree",
+            "--reset",
+            snapshot_tree_sha,
+        )
+        (git_dir / "worktrees" / workspace_root.name / "index").chmod(0o600)
+        if include_source_wip:
+            _clear_materialized_workspace(workspace_root)
+            _materialize_frozen_tree(
+                git_view=git_view,
+                object_directory=object_directory,
+                head_sha=snapshot_tree_sha,
+                workspace_root=workspace_root,
+                legacy_value_matcher=catalog_legacy_value_matcher,
+            )
+        _verify_materialized_snapshot(
+            git_view=git_view,
+            object_directory=object_directory,
+            workspace_root=workspace_root,
+            snapshot_tree_sha=snapshot_tree_sha,
+        )
+        _replace_worktree_index_with_canonical(
+            git_dir=git_dir,
+            workspace_root=workspace_root,
+            snapshot_tree_sha=snapshot_tree_sha,
+        )
+        scope_identity = _review_scope_identity(
+            base_sha=base_sha,
+            head_sha=head_sha,
+            content_variant=content_variant,
+            snapshot_tree_sha=snapshot_tree_sha,
+        )
+        if _commit_uses_reserved_control_path(
+            git_view=git_view,
+            object_directory=object_directory,
+            commit=snapshot_tree_sha,
+            label="snapshot",
+        ):
+            raise ReviewError(
+                "the review snapshot uses the reserved top-level .codex-review path"
+            )
         try:
             (
                 synthetic_manifest,
@@ -11895,9 +16327,13 @@ def prepare_workspace(
                 git_view=git_view,
                 object_directory=object_directory,
                 base_sha=base_sha,
-                head_sha=head_sha,
+                head_sha=snapshot_tree_sha,
+                source_head_sha=head_sha if include_source_wip else None,
                 catalog=catalog,
+                evidence_head_ref=head_sha,
             )
+        except _SourceHeadSecretCountIncrease:
+            raise
         except (OSError, ReviewError):
             (
                 synthetic_manifest,
@@ -11905,18 +16341,12 @@ def prepare_workspace(
                 secret_reductions,
             ) = _inconclusive_secret_count_manifests(
                 base_sha=base_sha,
-                head_sha=head_sha,
+                head_sha=snapshot_tree_sha,
                 catalog=catalog,
                 failure_class="exact-value-scan-incomplete",
+                evidence_head_ref=head_sha,
             )
         manifest_sensitive_values = evidence_sensitive_values + secret_reductions
-        _materialize_frozen_tree(
-            git_view=git_view,
-            object_directory=object_directory,
-            head_sha=head_sha,
-            workspace_root=workspace_root,
-            legacy_value_matcher=catalog_legacy_value_matcher,
-        )
         _reject_protected_review_path_aliases(workspace_root)
         control_dir = workspace_root / ".codex-review"
         if control_dir.exists() or control_dir.is_symlink():
@@ -11924,12 +16354,13 @@ def prepare_workspace(
                 "the frozen head uses the reserved top-level .codex-review path"
             )
         control_dir.mkdir(mode=0o700)
+        write_text_atomic(git_dir / "info" / "exclude", "/.codex-review/\n")
         diff_file = control_dir / "review.diff"
         _write_frozen_diff(
             git_view=git_view,
             object_directory=object_directory,
             base_sha=base_sha,
-            head_sha=head_sha,
+            head_sha=snapshot_tree_sha,
             destination=diff_file,
         )
         _write_bounded_json(
@@ -11951,7 +16382,7 @@ def prepare_workspace(
             git_view=git_view,
             object_directory=object_directory,
             base_sha=base_sha,
-            head_sha=head_sha,
+            head_sha=snapshot_tree_sha,
             destination=changed_path_digests_file,
             private_destination=container / PRIVATE_CHANGED_PATHS_NAME,
             evidence_sensitive_values=manifest_sensitive_values,
@@ -11965,7 +16396,7 @@ def prepare_workspace(
             git_view=git_view,
             object_directory=object_directory,
             base_sha=base_sha,
-            head_sha=head_sha,
+            head_sha=snapshot_tree_sha,
             destination=changed_blob_findings,
             accepted_destination=control_dir / SYNTHETIC_CHANGED_EVIDENCE_NAME,
             accepted_values=accepted_values,
@@ -11976,30 +16407,22 @@ def prepare_workspace(
                 if descriptor.value is not None
             ),
         )
-        shutil.rmtree(git_view)
-
         prompt_file = control_dir / "review.prompt"
-        if prompt_override is None:
-            prompt = build_review_prompt(
-                workspace=workspace_root,
-                diff_file=diff_file,
-                base_ref=base_sha,
-                head_ref=head_sha,
+        supplemental_template = None
+        if prompt_override is not None:
+            supplemental_template = _read_prompt_template(
+                prompt_override.expanduser().absolute()
             )
-        else:
-            template = _read_prompt_template(prompt_override.expanduser().absolute())
-            replacements = {
-                "workspace": str(workspace_root),
-                "diff_file": str(diff_file),
-                "base_ref": base_sha,
-                "head_ref": head_sha,
-                "review_range": f"{base_sha}..{head_sha}",
-            }
-            prompt = re.sub(
-                r"\{(workspace|diff_file|base_ref|head_ref|review_range)\}",
-                lambda match: replacements[match.group(1)],
-                template,
-            )
+        prompt = build_review_prompt(
+            workspace=workspace_root,
+            diff_file=diff_file,
+            base_ref=base_sha,
+            head_ref=head_sha,
+            content_variant=content_variant,
+            snapshot_tree_sha=snapshot_tree_sha,
+            scope_identity=scope_identity,
+            supplemental_template=supplemental_template,
+        )
         _validate_prompt_size(prompt)
         write_text_atomic(prompt_file, prompt)
         if set(private_artifact_identities) != set(PRIVATE_HELPER_ARTIFACT_NAMES):
@@ -12027,7 +16450,12 @@ def prepare_workspace(
             diff_file=diff_file,
             prompt_file=prompt_file,
             private_cleanup=private_cleanup,
+            git_dir=git_dir,
+            content_variant=content_variant,
+            snapshot_tree_sha=snapshot_tree_sha,
+            scope_identity=scope_identity,
         )
+        _harden_private_git_permissions(git_dir)
         validate_workspace_layout(review)
         ownership_mask = block_forwarded_signals()
         try:
@@ -12078,8 +16506,11 @@ def prepare_workspace(
     finally:
         if container_descriptor is not None:
             os.close(container_descriptor)
-        if handoff_mask is not None:
-            restore_signal_mask(handoff_mask)
+        try:
+            if handoff_mask is not None:
+                restore_signal_mask(handoff_mask)
+        finally:
+            source_inspection_stack.close()
 
 
 def _validated_legacy_cleanup_binding(
@@ -12184,8 +16615,18 @@ def cleanup_workspace(review: ReviewWorkspace, *, keep_container: bool) -> str |
     cleanup_errors: list[str] = []
     validation_error: ReviewError | None = None
     private_cleanup_target = _bound_private_cleanup_target(review)
+    if private_cleanup_target is not None:
+        try:
+            os.lstat(private_cleanup_target)
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            validation_error = ReviewError(
+                f"cannot inspect review container before cleanup: {error}"
+            )
     try:
-        validate_workspace_layout(review)
+        if validation_error is None:
+            validate_workspace_layout(review)
     except ReviewError as error:
         validation_error = error
     if validation_error is None and private_cleanup_target is None:
@@ -12205,7 +16646,7 @@ def cleanup_workspace(review: ReviewWorkspace, *, keep_container: bool) -> str |
                 expected=review.private_cleanup,
             )
 
-            def remove_workspace(
+            def remove_workspace_and_private_git(
                 _parent_descriptor: int,
                 container_descriptor: int,
             ) -> list[str]:
@@ -12216,17 +16657,26 @@ def cleanup_workspace(review: ReviewWorkspace, *, keep_container: bool) -> str |
                     return [
                         "private artifact container does not match preparation identity"
                     ]
-                return _remove_named_directory_tree(
+                workspace_errors = _remove_named_directory_tree(
                     container_descriptor,
                     "workspace",
                     label="review workspace",
                     require_private_mode=False,
                 )
+                if workspace_errors:
+                    return workspace_errors
+                return _remove_named_directory_tree(
+                    container_descriptor,
+                    "review.git",
+                    label="private review Git database",
+                    require_private_mode=False,
+                    depth_limit=PRIVATE_REVIEW_GIT_CLEANUP_DEPTH,
+                )
 
             if private_cleanup_error is None:
                 private_cleanup_error = _operate_on_private_review_container(
                     private_cleanup_target,
-                    remove_workspace,
+                    remove_workspace_and_private_git,
                 )
         else:
             private_cleanup_error = _remove_review_container_tree(
@@ -12244,3 +16694,62 @@ def cleanup_workspace(review: ReviewWorkspace, *, keep_container: bool) -> str |
             ) from validation_error
         raise validation_error
     return "; ".join(cleanup_errors) or None
+
+
+def validate_retained_cleanup_postcondition(review: ReviewWorkspace) -> str | None:
+    """Prove that retained state contains no reviewer runtime trees or secrets."""
+
+    def validate(
+        parent_descriptor: int,
+        container_descriptor: int,
+    ) -> list[str]:
+        errors: list[str] = []
+        opened_identity = _cleanup_identity_evidence(os.fstat(container_descriptor))
+        if opened_identity != review.private_cleanup.container:
+            return ["retained review container does not match preparation identity"]
+        for entry_name in ("workspace", "review.git"):
+            try:
+                os.stat(
+                    entry_name,
+                    dir_fd=container_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                errors.append(
+                    f"cannot verify retained cleanup entry {entry_name}: {error}"
+                )
+            else:
+                errors.append(
+                    f"retained cleanup left reviewer runtime entry {entry_name}"
+                )
+        try:
+            current_state = load_bound_private_cleanup_state(
+                review.container_dir,
+                expected=review.private_cleanup,
+            )
+        except ReviewError as error:
+            errors.append(f"cannot verify retained cleanup receipts: {error}")
+        else:
+            expected_removed = frozenset(PRIVATE_HELPER_ARTIFACT_NAMES)
+            if current_state.private_artifacts_removed != expected_removed:
+                errors.append("retained cleanup receipts are incomplete")
+        try:
+            path_metadata = os.stat(
+                review.container_dir.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            errors.append(
+                f"cannot revalidate retained review container identity: {error}"
+            )
+        else:
+            if _cleanup_identity_evidence(path_metadata) != opened_identity:
+                errors.append(
+                    "retained review container changed during cleanup validation"
+                )
+        return errors
+
+    return _operate_on_private_review_container(review.container_dir, validate)

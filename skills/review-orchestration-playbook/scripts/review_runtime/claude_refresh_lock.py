@@ -301,11 +301,14 @@ def _has_descriptor_bound_refresh_lock_cleanup(error: BaseException) -> bool:
         if id(current) in seen:
             continue
         seen.add(id(current))
-        if getattr(
-            current,
-            "_codex_claude_refresh_lock_descriptor_bound",
-            False,
-        ) is True:
+        if (
+            getattr(
+                current,
+                "_codex_claude_refresh_lock_descriptor_bound",
+                False,
+            )
+            is True
+        ):
             return True
         for chained in (current.__cause__, current.__context__):
             if isinstance(chained, BaseException):
@@ -337,11 +340,14 @@ def _unbind_cleanup_recovery_evidence(
     error: BaseException,
     cleanup_error: BaseException,
 ) -> None:
-    if getattr(
-        error,
-        "_codex_claude_refresh_lock_cleanup_evidence",
-        None,
-    ) is cleanup_error:
+    if (
+        getattr(
+            error,
+            "_codex_claude_refresh_lock_cleanup_evidence",
+            None,
+        )
+        is cleanup_error
+    ):
         delattr(error, "_codex_claude_refresh_lock_cleanup_evidence")
 
 
@@ -769,12 +775,8 @@ def _open_directory_anchor(
             _matches_directory_identity(before, identity)
             and _matches_directory_identity(after, identity)
         ):
-            raise ClaudeRefreshLockUnsafe(
-                f"Claude {label} changed during inspection"
-            )
-        if require_private and (
-            identity.uid != os.getuid() or identity.mode & 0o022
-        ):
+            raise ClaudeRefreshLockUnsafe(f"Claude {label} changed during inspection")
+        if require_private and (identity.uid != os.getuid() or identity.mode & 0o022):
             raise ClaudeRefreshLockUnsafe(
                 f"Claude {label} must be current-user-owned and not writable by others"
             )
@@ -1054,9 +1056,7 @@ def _open_directory_anchor_at(
             raise ClaudeRefreshLockUnsafe(
                 f"anchored Claude {label} changed during inspection"
             )
-        if require_private and (
-            identity.uid != os.getuid() or identity.mode & 0o022
-        ):
+        if require_private and (identity.uid != os.getuid() or identity.mode & 0o022):
             raise ClaudeRefreshLockUnsafe(
                 f"Claude {label} must be current-user-owned and not writable by others"
             )
@@ -1169,9 +1169,8 @@ def _inspect_new_lock(
                     follow_symlinks=False,
                 )
                 descriptor_metadata = os.fstat(descriptor)
-                if (
-                    _matches_lock_identity(current, identity)
-                    and _matches_lock_identity(descriptor_metadata, identity)
+                if _matches_lock_identity(current, identity) and _matches_lock_identity(
+                    descriptor_metadata, identity
                 ):
                     os.rmdir(name, dir_fd=parent.descriptor)
                     removed = True
@@ -1258,9 +1257,7 @@ def _inspect_existing_lock(
             )
         if descriptor_metadata.st_mtime_ns != path_metadata.st_mtime_ns:
             return "live"
-        stale_before_ns = time.time_ns() - int(
-            protocol.stale_seconds * 1_000_000_000
-        )
+        stale_before_ns = time.time_ns() - int(protocol.stale_seconds * 1_000_000_000)
         if descriptor_metadata.st_mtime_ns > stale_before_ns:
             return "live"
         return "stale"
@@ -1410,9 +1407,7 @@ def recover_abandoned_staged_claude_refresh_locks(
         isinstance(value, str) and os.path.isabs(value)
         for value in (raw_carrier, raw_config)
     ):
-        raise ClaudeRefreshLockUnsafe(
-            "staged Claude recovery paths must be absolute"
-        )
+        raise ClaudeRefreshLockUnsafe("staged Claude recovery paths must be absolute")
     carrier_path = pathlib.Path(raw_carrier)
     config_path = pathlib.Path(raw_config)
     if (
@@ -1726,18 +1721,14 @@ class ClaudeRefreshLockLease:
         self._abandoned = False
         self._deletion_prohibited = False
         self._abandonment_cleanup_completed = False
-        self._abandonment_cleanup_lifecycle = (
-            _AbandonmentCleanupLifecycle.NOT_STARTED
-        )
+        self._abandonment_cleanup_lifecycle = _AbandonmentCleanupLifecycle.NOT_STARTED
         self._abandonment_descriptors_pending: list[int] | None = None
         self._abandonment_descriptors_unconfirmed: set[int] = set()
         self._abandonment_descriptors_residue: set[int] = set()
         self._abandonment_diagnostic_reason: str | None = None
         self._require_explicit_context_release = require_explicit_context_release
         self._cleanup_inconclusive_fallback = cleanup_inconclusive_fallback
-        self._descriptor_bound_cleanup_fallback = (
-            descriptor_bound_cleanup_fallback
-        )
+        self._descriptor_bound_cleanup_fallback = descriptor_bound_cleanup_fallback
         # Published recovery evidence. Same-runtime consumers may read this
         # slot directly, but only the lease lifecycle may replace it.
         self._retention_recovery_evidence: (
@@ -1784,9 +1775,7 @@ class ClaudeRefreshLockLease:
         with self._state_lock:
             released = self._released
             lifecycle = self._abandonment_cleanup_lifecycle
-            settled = (
-                lifecycle is _AbandonmentCleanupLifecycle.SETTLED
-            )
+            settled = lifecycle is _AbandonmentCleanupLifecycle.SETTLED
             handoff_terminal = self._pending_operation_handoff is None
             diagnostic = self._retention_recovery_evidence
             return ClaudeRefreshLockRetentionSnapshot(
@@ -1813,14 +1802,11 @@ class ClaudeRefreshLockLease:
 
         normalized_reason = reason.strip()
         if not normalized_reason:
-            raise ValueError(
-                "descriptor-bound retention reason must not be empty"
-        )
+            raise ValueError("descriptor-bound retention reason must not be empty")
         with self._state_lock:
             if self._released:
                 raise ClaudeRefreshLockCompromised(
-                    "cannot retain residue for a released Claude refresh-lock "
-                    "lease"
+                    "cannot retain residue for a released Claude refresh-lock lease"
                 )
             operation_handoff = self._pending_operation_handoff
             if operation_handoff is not None:
@@ -1836,9 +1822,7 @@ class ClaudeRefreshLockLease:
             self._cleanup_started = True
             self._heartbeat_stop.set()
             self._abandonment_diagnostic_reason = normalized_reason
-            self._cleanup_inconclusive = (
-                self._descriptor_bound_cleanup_fallback
-            )
+            self._cleanup_inconclusive = self._descriptor_bound_cleanup_fallback
             descriptors = {
                 *(lock.descriptor for lock in self._locks),
                 self._legacy_parent_anchor.descriptor,
@@ -1850,12 +1834,8 @@ class ClaudeRefreshLockLease:
             self._abandonment_descriptors_pending = []
             self._abandonment_descriptors_unconfirmed.clear()
             self._abandonment_cleanup_completed = False
-            self._retention_recovery_evidence = (
-                self._descriptor_bound_cleanup_fallback
-            )
-            self._abandonment_cleanup_lifecycle = (
-                _AbandonmentCleanupLifecycle.SETTLED
-            )
+            self._retention_recovery_evidence = self._descriptor_bound_cleanup_fallback
+            self._abandonment_cleanup_lifecycle = _AbandonmentCleanupLifecycle.SETTLED
             return self._descriptor_bound_cleanup_fallback
 
     def _begin_pending_acquisition(
@@ -1969,8 +1949,7 @@ class ClaudeRefreshLockLease:
             pending = self._pending_operation_handoff
             if pending is not None and not pending.resolved:
                 raise ClaudeRefreshLockCompromised(
-                    "cannot replace an unresolved Claude refresh-lock "
-                    "operation handoff"
+                    "cannot replace an unresolved Claude refresh-lock operation handoff"
                 )
             self._pending_operation_handoff = handoff
 
@@ -2005,9 +1984,7 @@ class ClaudeRefreshLockLease:
                         self._pending_operation_handoff = None
 
     def _heartbeat_loop(self) -> None:
-        while not self._heartbeat_stop.wait(
-            self._protocol.update_seconds
-        ):
+        while not self._heartbeat_stop.wait(self._protocol.update_seconds):
             with self._state_lock:
                 if self._release_started:
                     return
@@ -2353,9 +2330,7 @@ class ClaudeRefreshLockLease:
                         self._finish_abandonment(diagnostic, errors)
                         return diagnostic
 
-                    operation_handoff = _OperationLockHandoff(
-                        self._operation_lock
-                    )
+                    operation_handoff = _OperationLockHandoff(self._operation_lock)
                     self._publish_operation_handoff(operation_handoff)
                     try:
                         operation_handoff.acquire(
@@ -2557,16 +2532,12 @@ class ClaudeRefreshLockLease:
             finally:
                 first_control_flow.enforce(
                     errors,
-                    selector_error
-                    if selector_error is not None
-                    else boundary_error,
+                    selector_error if selector_error is not None else boundary_error,
                 )
 
     def _publish_abandonment_state(self) -> None:
         self._deletion_prohibited = True
-        self._abandonment_cleanup_lifecycle = (
-            _AbandonmentCleanupLifecycle.RESUMABLE
-        )
+        self._abandonment_cleanup_lifecycle = _AbandonmentCleanupLifecycle.RESUMABLE
         self._cleanup_inconclusive = self._cleanup_inconclusive_fallback
         self._abandoned = True
         self._release_started = True
@@ -2575,9 +2546,7 @@ class ClaudeRefreshLockLease:
 
     def _reassert_abandonment_state(self) -> None:
         self._deletion_prohibited = True
-        self._abandonment_cleanup_lifecycle = (
-            _AbandonmentCleanupLifecycle.RESUMABLE
-        )
+        self._abandonment_cleanup_lifecycle = _AbandonmentCleanupLifecycle.RESUMABLE
         self._cleanup_inconclusive = self._cleanup_inconclusive_fallback
         self._abandoned = True
         self._release_started = True
@@ -2608,9 +2577,7 @@ class ClaudeRefreshLockLease:
                         ):
                             recovery_evidence = diagnostic
                         else:
-                            recovery_evidence = (
-                                self._descriptor_bound_cleanup_fallback
-                            )
+                            recovery_evidence = self._descriptor_bound_cleanup_fallback
                 except BaseException as boundary_error:
                     if _is_control_flow_error(boundary_error):
                         try:
@@ -2728,17 +2695,14 @@ class ClaudeRefreshLockLease:
             finally:
                 first_control_flow.enforce(
                     errors,
-                    selector_error
-                    if selector_error is not None
-                    else boundary_error,
+                    selector_error if selector_error is not None else boundary_error,
                 )
 
     def release(self) -> None:
         """Release a lease, retaining armed leases until context release commits."""
 
         self._abandon_if_context_release_uncommitted(
-            "direct release was requested before explicit context release was "
-            "committed"
+            "direct release was requested before explicit context release was committed"
         )
         if self._prepare_abandonment_resume():
             diagnostic = self._abandon(
@@ -2808,13 +2772,10 @@ class ClaudeRefreshLockLease:
             except BaseException as first_error:
                 with self._state_lock:
                     cleanup_inconclusive = self._cleanup_inconclusive
-                    retry_needed = (
-                        self._pending_operation_handoff is not None
-                        or (
-                            not self._released
-                            and not self._cleanup_started
-                            and cleanup_inconclusive is None
-                        )
+                    retry_needed = self._pending_operation_handoff is not None or (
+                        not self._released
+                        and not self._cleanup_started
+                        and cleanup_inconclusive is None
                     )
                     cleanup_interrupted = cleanup_inconclusive is not None or (
                         not self._released and self._cleanup_started
@@ -2825,9 +2786,9 @@ class ClaudeRefreshLockLease:
                             "Claude refresh-lock descriptor or lock cleanup "
                             "was interrupted"
                         )
-                        if _is_control_flow_error(
-                            first_error
-                        ) or isinstance(first_error, ReviewError):
+                        if _is_control_flow_error(first_error) or isinstance(
+                            first_error, ReviewError
+                        ):
                             _attach_secondary_cleanup(first_error, diagnostic)
                             raise first_error
                         diagnostic.__cause__ = first_error
@@ -2838,17 +2799,11 @@ class ClaudeRefreshLockLease:
                 except BaseException as retry_error:
                     with self._state_lock:
                         cleanup_inconclusive = self._cleanup_inconclusive
-                        cleanup_incomplete = (
-                            cleanup_inconclusive is not None
-                            or (
-                                not self._released
-                                and not self._cleanup_started
-                            )
+                        cleanup_incomplete = cleanup_inconclusive is not None or (
+                            not self._released and not self._cleanup_started
                         )
                     if cleanup_incomplete:
-                        terminal_was_published = (
-                            cleanup_inconclusive is not None
-                        )
+                        terminal_was_published = cleanup_inconclusive is not None
                         diagnostic = self._mark_cleanup_inconclusive(
                             "Claude refresh-lock operations did not quiesce after "
                             "two bounded cleanup attempts"
@@ -2968,8 +2923,7 @@ class ClaudeRefreshLockLease:
                 return self._cleanup_inconclusive
             original_args = diagnostic.args
             promoted_args = (
-                f"{reason}; "
-                f"{_refresh_lock_recovery_diagnostic(authoritative_paths)}",
+                f"{reason}; {_refresh_lock_recovery_diagnostic(authoritative_paths)}",
             )
             try:
                 setattr(
@@ -3024,8 +2978,7 @@ class ClaudeRefreshLockLease:
                 True,
             )
             diagnostic.args = (
-                f"{reason}; "
-                f"{_descriptor_bound_refresh_lock_recovery_diagnostic()}",
+                f"{reason}; {_descriptor_bound_refresh_lock_recovery_diagnostic()}",
             )
             if hasattr(
                 diagnostic,
@@ -3104,9 +3057,7 @@ class ClaudeRefreshLockLease:
                         primary = _primary_error(errors)
                         assert primary is not None
                         raise primary
-                operation_handoff = _OperationLockHandoff(
-                    self._operation_lock
-                )
+                operation_handoff = _OperationLockHandoff(self._operation_lock)
                 self._publish_operation_handoff(operation_handoff)
                 try:
                     try:
@@ -3221,9 +3172,7 @@ class ClaudeRefreshLockLease:
             finally:
                 first_control_flow.enforce(
                     errors,
-                    selector_error
-                    if selector_error is not None
-                    else boundary_error,
+                    selector_error if selector_error is not None else boundary_error,
                 )
             if release_error is not None:
                 raise release_error
@@ -3278,7 +3227,9 @@ def acquire_claude_refresh_lock(
     _validate_timeout(timeout_seconds, retry_interval_seconds)
     raw_path = os.fspath(config_dir)
     if not isinstance(raw_path, str) or not os.path.isabs(raw_path):
-        raise ClaudeRefreshLockUnsafe("Claude config directory must be an absolute path")
+        raise ClaudeRefreshLockUnsafe(
+            "Claude config directory must be an absolute path"
+        )
     requested_path = pathlib.Path(raw_path)
     if any(part in {".", ".."} for part in requested_path.parts):
         raise ClaudeRefreshLockUnsafe(
@@ -3353,9 +3304,7 @@ def acquire_claude_refresh_lock(
             legacy_parent_anchor=parent_anchor,
             locks=(),
             cleanup_inconclusive_fallback=cleanup_inconclusive_fallback,
-            descriptor_bound_cleanup_fallback=(
-                descriptor_bound_cleanup_fallback
-            ),
+            descriptor_bound_cleanup_fallback=(descriptor_bound_cleanup_fallback),
             owner=owner,
             require_explicit_context_release=require_explicit_context_release,
         )
@@ -3408,9 +3357,7 @@ def acquire_claude_refresh_lock(
             try:
                 # Acquisition has not returned successfully. Explicit-mode
                 # retention is armed only after a caller accepts ownership.
-                cleanup_fallback = (
-                    cleanup_lease._cleanup_inconclusive_fallback
-                )
+                cleanup_fallback = cleanup_lease._cleanup_inconclusive_fallback
                 _bind_cleanup_recovery_evidence(
                     primary_error,
                     cleanup_fallback,
@@ -3543,9 +3490,7 @@ def claude_refresh_lock_release_on_success(
                 if (
                     owner.transferred
                     and _refresh_lock_recovery_paths(cleanup_error) is None
-                    and not _has_descriptor_bound_refresh_lock_cleanup(
-                        cleanup_error
-                    )
+                    and not _has_descriptor_bound_refresh_lock_cleanup(cleanup_error)
                 ):
                     _attach_secondary_cleanup(
                         cleanup_error,

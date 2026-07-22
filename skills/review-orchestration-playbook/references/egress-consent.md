@@ -13,7 +13,7 @@ Record repository visibility/trust, remote, PR URL when present, frozen head, da
 
 Any unambiguous request classified as single, double, or triple review is contemporaneous user authorization for scoped code-review egress to the providers in exactly that named shape. Examples include `single review`, `single code review`, `单重 review`, `单一 review`, `double`, `double review`, `double code review`, `双重 review`, `triple`, `triple review`, and `三重 review`. Single authorizes OpenAI Codex. Double additionally authorizes Anthropic Claude Code. Triple additionally authorizes GitHub Codex on an exact-host `github.com` PR. The authorization covers necessary tracked code in the named repository at the frozen head, bounded tool-derived review evidence, and the review prompt/result. The named Codex `reviewer` agent receives the clean worktree and exact refs and derives `base_sha..head_sha` itself; its prompt must not contain a prebuilt full diff. Actual Claude Code reviews the same frozen range from another independent read-only workspace. These requests do not authorize GitHub Copilot or another substitute reviewer. Generic `full workflow` or `merge-ready` does not by itself opt into a non-Codex reviewer.
 
-The selected reviewer is a trusted processor. Named-shape consent covers the original tracked diff and necessary tracked context, including tracked repository secrets, plus bounded review evidence and the prompt/result. Do not redact, rewrite, encode, withhold, or block those reviewer inputs based on secret-admission status. Consent does not cover automatic discovery or collection of reviewer/runtime authentication credentials, untracked private files, unrelated repositories, broad workspace dumps, home-directory content, or hidden local-only artifacts.
+The selected reviewer is a trusted processor. Named-shape consent covers the original tracked diff and necessary tracked context, including tracked repository secrets, plus bounded review evidence and the prompt/result. Do not redact, rewrite, encode, withhold, or block those reviewer inputs based on secret-admission status. Named-shape consent does not cover automatic discovery or collection of reviewer/runtime authentication credentials, untracked private files, unrelated repositories, broad workspace dumps, home-directory content, or hidden local-only artifacts. A low-level helper WIP diagnostic is a separate authorization surface: only explicit `--include-source-wip` approval may add staged, unstaged, and nonignored untracked contents captured in its digest-bound snapshot.
 
 ## Provider Scope
 
@@ -34,9 +34,15 @@ Reviewer launch and PR/master secret admission are separate decisions. Workspace
 
 Required PR/master admission comes from `isolated_review secret-admission --repo <repo> --base-ref <base_sha> --head-ref <head_sha>` under `review_contract: admission-only-no-reviewer`. This direct current-head Git-tree scan starts no reviewer and has no pending state: exit `0` with `temporary_cleanup_status: complete` is clean, exit `1` means proved violations and remains `1` after a later location/cleanup failure, and exit `75` is an inconclusive scan or a clean scan whose temporary cleanup failed. When a low-level helper run was independently requested, its `stateful final` and `stateful admission` results remain optional helper-only evidence; they never become the PR/master admission producer or an extra named lane. Foreground review is not helper-state admission evidence, and a head change invalidates every affected result.
 
+For a low-level Claude helper, `egress.json` binds `content_variant`, `snapshot_tree_sha`, and `scope_identity` to the same verified values as `preflight.json` and the review state. Its `include_source_wip` field is the machine authorization marker: it is `false` for `content_variant: head` and `true` only for `content_variant: source-wip`, corresponding to explicit `--include-source-wip`. Any other variant fails closed before reviewer launch.
+
 ## Approval-Gated Invocation
 
-Make consent machine-visible in the helper argv:
+Choose the approval wording that matches the exact verified content variant. Substitute concrete repository, range, snapshot-tree, and scope-identity values; do not reuse clean-head wording for WIP content.
+
+### Clean-head helper approval
+
+Make clean-head consent machine-visible in the helper argv without `--include-source-wip`:
 
 ```bash
 isolated_review stateful start \
@@ -50,7 +56,27 @@ isolated_review stateful start \
 When sandbox or network approval is required, use a narrow justification with concrete values:
 
 ```text
-Joey explicitly requested Claude Code review, which is opt-in consent under AGENTS.md and $review-orchestration-playbook for scoped code-review egress to Anthropic. This exact helper diagnostic sends necessary original tracked code and its generated diff for <owner/repo> at <base_sha>..<head_sha>, plus the review prompt/result, to Anthropic Claude Code for read-only review. The reviewer is a trusted processor and may receive tracked repository secrets regardless of the separate PR/master secret-admission result; the helper does not redact those inputs. It does not authorize GitHub Copilot or another provider. This excludes automatic discovery of reviewer/runtime authentication credentials, untracked files, unrelated repositories, and broad workspace/home-directory content. Allow this exact frozen Claude Code helper run?
+Joey explicitly requested a clean-head Claude Code helper review, which is opt-in consent under AGENTS.md and $review-orchestration-playbook for scoped code-review egress to Anthropic. This exact helper diagnostic sends tracked blobs materialized from the frozen head, the complete generated diff, and the review prompt/result for <owner/repo> at <base_sha>..<head_sha>. Its verified scope is bound by content_variant=head, snapshot_tree_sha=<snapshot_tree_sha>, and scope_identity=<scope_identity>. The reviewer is a trusted processor and may receive tracked repository secrets regardless of the separate PR/master secret-admission result; the helper does not redact those inputs. It does not authorize GitHub Copilot or another provider. This excludes automatic discovery of reviewer/runtime authentication credentials, untracked files, unrelated repositories, and broad workspace/home-directory content. Allow this exact frozen clean-head Claude Code helper run?
+```
+
+### Source-WIP helper approval
+
+The WIP argv must add the separately authorized marker:
+
+```bash
+isolated_review stateful start \
+  --repo /absolute/path/to/repo \
+  --reviewer claude \
+  --egress-consent explicit-claude-review \
+  --base-ref <base_sha> \
+  --head-ref <head_sha> \
+  --include-source-wip
+```
+
+Use WIP-specific approval wording that discloses the expanded content:
+
+```text
+Joey separately authorized --include-source-wip for this Claude Code helper diagnostic. This exact run sends tracked blobs plus staged, unstaged, and nonignored untracked contents captured in the digest-bound source WIP snapshot, the complete generated diff through that snapshot, and the review prompt/result for <owner/repo> at <base_sha>..<head_sha> to Anthropic Claude Code for read-only review. Its verified scope is bound by content_variant=source-wip, snapshot_tree_sha=<snapshot_tree_sha>, and scope_identity=<scope_identity>. The reviewer is a trusted processor and may receive secrets present in those captured contents; the helper does not redact them. It does not authorize GitHub Copilot or another provider. This excludes automatic discovery of reviewer/runtime authentication credentials, ignored untracked files and source content not captured by the WIP snapshot, unrelated repositories, and broad workspace/home-directory content. Allow this exact digest-bound source-WIP Claude Code helper run?
 ```
 
 Do not shorten this to `run external reviewer`: the exact user opt-in, destination, repository, range, included data, and exclusions are what let the approver evaluate the request. The argv consent flag is an audit marker, not a substitute for the justification.

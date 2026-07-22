@@ -1,36 +1,20 @@
 {
   "schema_id": "claude-code-stream-compatible-v1",
   "version_policy": "review_runtime.claude_version_policy.CLAUDE_COMPATIBILITY_SPEC",
-  "compatibility_mode": "strict-structural-baseline",
+  "compatibility_mode": "strict-version-and-launch-profiles",
   "baseline_schema": "claude-2.1.212-stream-schema.json",
   "baseline_version": "2.1.212",
-  "adaptations": {
-    "init_event.field_contracts.claude_code_version": {
-      "baseline_rule": "constant",
-      "runtime_rule": "exact_preflight_selected_version"
-    }
+  "profile_schema": "claude-stream-schema.json",
+  "profile_version_policy": ">=2.1.211,<3.0.0",
+  "version_profiles": {
+    "legacy-base": ">=2.1.211,<2.1.216",
+    "extended-2x": ">=2.1.216,<3.0.0"
   },
   "version_adaptations": {
     "2.1.216": {
       "scope": "exact-selected-version",
       "init_event": {
         "optional_field_contracts": {
-          "agents": {
-            "rule": "duplicate_free_exact_set",
-            "values": ["claude", "Explore", "general-purpose", "Plan"],
-            "malformed_failure": "inconclusive",
-            "mismatch_failure": "blocked"
-          },
-          "analytics_disabled": {
-            "rule": "boolean",
-            "failure": "inconclusive"
-          },
-          "capabilities": {
-            "rule": "duplicate_free_exact_set",
-            "values": ["interrupt_receipt_v1", "msg_lifecycle_v1"],
-            "malformed_failure": "inconclusive",
-            "mismatch_failure": "blocked"
-          },
           "estimated_tokens": {
             "rule": "null",
             "failure": "inconclusive"
@@ -38,63 +22,25 @@
           "estimated_tokens_delta": {
             "rule": "null",
             "failure": "inconclusive"
-          },
-          "fast_mode_state": {
-            "rule": "constant",
-            "value": "off",
-            "malformed_failure": "inconclusive",
-            "mismatch_failure": "blocked"
-          },
-          "output_style": {
-            "rule": "constant",
-            "value": "default",
-            "malformed_failure": "inconclusive",
-            "mismatch_failure": "blocked"
-          },
-          "product_feedback_disabled": {
-            "rule": "boolean",
-            "failure": "inconclusive"
-          },
-          "uuid": {
-            "rule": "nonempty_string",
-            "failure": "inconclusive"
           }
         }
       },
       "terminal_result": {
-        "optional_field_contracts": {
-          "fast_mode_state": {
-            "rule": "constant",
-            "value": "off",
-            "malformed_failure": "inconclusive",
-            "mismatch_failure": "blocked"
-          },
-          "terminal_reason": {
-            "rule": "constant",
-            "value": "completed",
-            "malformed_failure": "inconclusive",
-            "mismatch_failure": "blocked"
-          },
-          "time_to_request_ms": {
-            "rule": "nonnegative_finite_number",
-            "failure": "inconclusive"
-          },
-          "ttft_ms": {
-            "rule": "nonnegative_finite_number",
-            "failure": "inconclusive"
-          },
-          "ttft_stream_ms": {
-            "rule": "nonnegative_finite_number",
-            "failure": "inconclusive"
-          }
-        }
+        "optional_field_contracts": {}
       }
     }
   },
+  "launch_profiles": [
+    "helper-darwin",
+    "helper-linux",
+    "named-direct"
+  ],
   "fail_closed_surfaces": [
     "stream_envelope",
     "init_field_set",
     "init_field_values",
+    "intermediate_event_field_sets",
+    "intermediate_session_binding",
     "terminal_field_set",
     "terminal_variants",
     "model_identity"

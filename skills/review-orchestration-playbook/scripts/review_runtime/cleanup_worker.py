@@ -17,6 +17,7 @@ from review_runtime.workspace import (  # noqa: E402
     ReviewWorkspace,
     cleanup_workspace,
     remove_bound_review_text,
+    validate_retained_cleanup_postcondition,
     write_bound_review_text,
 )
 
@@ -40,6 +41,8 @@ def main(argv: list[str] | None = None) -> int:
         if isinstance(review, LegacyReviewWorkspace):
             raise ReviewError("legacy review state cannot run automatic cleanup worker")
         cleanup_error = cleanup_workspace(review, keep_container=True)
+        if not cleanup_error:
+            cleanup_error = validate_retained_cleanup_postcondition(review)
         if not cleanup_error:
             if isinstance(review, ReviewWorkspace):
                 remove_error = remove_bound_review_text(

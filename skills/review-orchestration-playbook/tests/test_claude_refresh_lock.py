@@ -119,9 +119,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             if identity in visited:
                 return
             visiting.add(identity)
-            self.assertFalse(
-                hasattr(error, "_codex_claude_refresh_lock_paths")
-            )
+            self.assertFalse(hasattr(error, "_codex_claude_refresh_lock_paths"))
             visible = [str(error), *getattr(error, "__notes__", ())]
             detail = getattr(error, "detail", None)
             if isinstance(detail, str):
@@ -152,16 +150,10 @@ class ClaudeRefreshLockTest(unittest.TestCase):
         forbidden_paths: tuple[pathlib.Path, ...],
     ) -> None:
         self.assertTrue(
-            claude_refresh_lock._has_descriptor_bound_refresh_lock_cleanup(
-                error
-            )
+            claude_refresh_lock._has_descriptor_bound_refresh_lock_cleanup(error)
         )
-        self.assertFalse(
-            hasattr(error, "_codex_claude_refresh_lock_paths")
-        )
-        self.assertIsNone(
-            claude_refresh_lock._refresh_lock_recovery_paths(error)
-        )
+        self.assertFalse(hasattr(error, "_codex_claude_refresh_lock_paths"))
+        self.assertIsNone(claude_refresh_lock._refresh_lock_recovery_paths(error))
         self._assert_descriptor_only_error_graph(
             error,
             forbidden_paths=forbidden_paths,
@@ -220,9 +212,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
         config_dir: os.PathLike[str] | str,
         *,
         protocol: claude_refresh_lock.ClaudeRefreshLockProtocol,
-        timeout_seconds: float = (
-            claude_refresh_lock.DEFAULT_LOCK_TIMEOUT_SECONDS
-        ),
+        timeout_seconds: float = (claude_refresh_lock.DEFAULT_LOCK_TIMEOUT_SECONDS),
         retry_interval_seconds: float = (
             claude_refresh_lock.DEFAULT_RETRY_INTERVAL_SECONDS
         ),
@@ -323,9 +313,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
 
     def _lease_return_offset(self) -> int:
         instructions = tuple(
-            dis.get_instructions(
-                claude_refresh_lock.acquire_claude_refresh_lock
-            )
+            dis.get_instructions(claude_refresh_lock.acquire_claude_refresh_lock)
         )
         for index, instruction in enumerate(instructions):
             if instruction.opname != "RETURN_VALUE":
@@ -343,10 +331,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
         for instruction in dis.get_instructions(function):
             if instruction.opname == "YIELD_VALUE":
                 break
-            if (
-                instruction.opname == "STORE_FAST"
-                and instruction.argval == "lease"
-            ):
+            if instruction.opname == "STORE_FAST" and instruction.argval == "lease":
                 stores_before_yield.append(instruction.offset)
         if not stores_before_yield:
             self.fail(f"{function.__name__} has no lease assignment boundary")
@@ -409,20 +394,15 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 call = instructions[call_index]
                 if call.opname.startswith("CALL"):
                     boundary = instructions[call_index + 1]
-                    if (
-                        boundary.opname == next_opname
-                        and (
-                            next_argval is None
-                            or boundary.argval == next_argval
-                        )
+                    if boundary.opname == next_opname and (
+                        next_argval is None or boundary.argval == next_argval
                     ):
                         return boundary.offset
                     break
                 if call.opname in {"STORE_FAST", "RETURN_VALUE"}:
                     break
         self.fail(
-            f"{function.__name__} has no {callable_name} CALL -> "
-            f"{next_opname} boundary"
+            f"{function.__name__} has no {callable_name} CALL -> {next_opname} boundary"
         )
 
     def _call_entry_and_return_boundary_offsets(
@@ -456,9 +436,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
     ) -> tuple[int, int]:
         source, first_line = inspect.getsourcelines(function)
         matching_lines = [
-            first_line + index
-            for index, line in enumerate(source)
-            if statement in line
+            first_line + index for index, line in enumerate(source) if statement in line
         ]
         if occurrence >= len(matching_lines):
             self.fail(
@@ -470,9 +448,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
         for statement_index, instruction in enumerate(instructions):
             positions = getattr(instruction, "positions", None)
             instruction_line = (
-                positions.lineno
-                if positions is not None
-                else instruction.starts_line
+                positions.lineno if positions is not None else instruction.starts_line
             )
             if instruction_line != target_line:
                 continue
@@ -507,9 +483,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
     ) -> int:
         source, first_line = inspect.getsourcelines(function)
         matching_lines = [
-            first_line + index
-            for index, line in enumerate(source)
-            if statement in line
+            first_line + index for index, line in enumerate(source) if statement in line
         ]
         if occurrence >= len(matching_lines):
             self.fail(
@@ -520,15 +494,11 @@ class ClaudeRefreshLockTest(unittest.TestCase):
         for instruction in dis.get_instructions(function):
             positions = getattr(instruction, "positions", None)
             instruction_line = (
-                positions.lineno
-                if positions is not None
-                else instruction.starts_line
+                positions.lineno if positions is not None else instruction.starts_line
             )
             if instruction_line == target_line:
                 return instruction.offset
-        self.fail(
-            f"{function.__name__} has no opcode for source line {target_line}"
-        )
+        self.fail(f"{function.__name__} has no opcode for source line {target_line}")
 
     def _assert_internal_acquisition_assignment_cleanup(
         self,
@@ -595,9 +565,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                         offset=offset,
                         error=interruption,
                     ),
-                    self.assertRaises(
-                        claude_refresh_lock.ForwardedSignal
-                    ) as raised,
+                    self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
                 ):
                     claude_refresh_lock.acquire_claude_refresh_lock(
                         config,
@@ -620,9 +588,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 self.assertFalse(primary.exists())
                 self.assertFalse(legacy.exists())
                 self.assertIsNone(
-                    claude_refresh_lock._refresh_lock_recovery_paths(
-                        raised.exception
-                    )
+                    claude_refresh_lock._refresh_lock_recovery_paths(raised.exception)
                 )
                 descriptors = tuple(
                     dict.fromkeys(
@@ -778,8 +744,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 deadline = time.monotonic() + 2.0
                 while time.monotonic() < deadline:
                     if renewal_count() >= 4 and all(
-                        path.stat().st_mtime_ns > old_mtime_ns
-                        for path in lease.paths
+                        path.stat().st_mtime_ns > old_mtime_ns for path in lease.paths
                     ):
                         break
                     time.sleep(0.01)
@@ -831,9 +796,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                         offset=self._lease_return_offset(),
                         error=interruption,
                     ),
-                    self.assertRaises(
-                        claude_refresh_lock.ForwardedSignal
-                    ) as raised,
+                    self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
                 ):
                     claude_refresh_lock.acquire_claude_refresh_lock(
                         config,
@@ -855,9 +818,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     "return interruption orphaned a renewing heartbeat",
                 )
                 self.assertIsNone(
-                    claude_refresh_lock._refresh_lock_recovery_paths(
-                        interruption
-                    )
+                    claude_refresh_lock._refresh_lock_recovery_paths(interruption)
                 )
                 self.assertFalse(
                     claude_refresh_lock._has_descriptor_bound_refresh_lock_cleanup(
@@ -928,9 +889,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                         ),
                         error=interruption,
                     ),
-                    self.assertRaises(
-                        claude_refresh_lock.ForwardedSignal
-                    ) as raised,
+                    self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
                 ):
                     claude_refresh_lock.acquire_claude_refresh_lock(
                         config,
@@ -950,9 +909,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 self.assertTrue(primary.is_dir())
                 self.assertFalse(legacy.exists())
                 self.assertIsNone(
-                    claude_refresh_lock._refresh_lock_recovery_paths(
-                        interruption
-                    )
+                    claude_refresh_lock._refresh_lock_recovery_paths(interruption)
                 )
                 self.assertTrue(
                     claude_refresh_lock._has_descriptor_bound_refresh_lock_cleanup(
@@ -1035,9 +992,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 self.assertTrue(primary.is_dir())
                 self.assertFalse(legacy.exists())
                 self.assertIsNone(
-                    claude_refresh_lock._refresh_lock_recovery_paths(
-                        raised.exception
-                    )
+                    claude_refresh_lock._refresh_lock_recovery_paths(raised.exception)
                 )
                 self.assertTrue(
                     claude_refresh_lock._has_descriptor_bound_refresh_lock_cleanup(
@@ -1069,11 +1024,12 @@ class ClaudeRefreshLockTest(unittest.TestCase):
         real_mkdir = os.mkdir
 
         for boundary, offset in zip(("entry", "return"), boundaries):
-            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(boundary=boundary),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 interruption = claude_refresh_lock.ForwardedSignal(signal.SIGTERM)
-                captured_anchors: list[
-                    claude_refresh_lock._DirectoryAnchor
-                ] = []
+                captured_anchors: list[claude_refresh_lock._DirectoryAnchor] = []
 
                 def capture_anchor(*args: object, **kwargs: object) -> object:
                     anchor = real_open_anchor(*args, **kwargs)
@@ -1176,7 +1132,10 @@ class ClaudeRefreshLockTest(unittest.TestCase):
         )
 
         for boundary, offset in zip(("entry", "return"), boundaries):
-            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(boundary=boundary),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 startup_error = claude_refresh_lock.ClaudeRefreshLockError(
                     "injected post-start acquisition failure"
                 )
@@ -1201,9 +1160,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                         offset=offset,
                         error=interruption,
                     ),
-                    self.assertRaises(
-                        claude_refresh_lock.ForwardedSignal
-                    ) as raised,
+                    self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
                 ):
                     claude_refresh_lock.acquire_claude_refresh_lock(
                         config,
@@ -1293,9 +1250,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                         ),
                         error=interruption,
                     ),
-                    self.assertRaises(
-                        claude_refresh_lock.ForwardedSignal
-                    ) as raised,
+                    self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
                 ):
                     claude_refresh_lock.acquire_claude_refresh_lock(
                         config,
@@ -1323,9 +1278,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 self.assertTrue(primary.is_dir())
                 self.assertFalse(legacy.exists())
                 self.assertIsNone(
-                    claude_refresh_lock._refresh_lock_recovery_paths(
-                        interruption
-                    )
+                    claude_refresh_lock._refresh_lock_recovery_paths(interruption)
                 )
                 self.assertTrue(
                     claude_refresh_lock._has_descriptor_bound_refresh_lock_cleanup(
@@ -1420,9 +1373,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     self.assertTrue(lease.released)
                     self.assertTrue(all(not path.exists() for path in paths))
                     self.assertIsNone(
-                        claude_refresh_lock._refresh_lock_recovery_paths(
-                            interruption
-                        )
+                        claude_refresh_lock._refresh_lock_recovery_paths(interruption)
                     )
                 finally:
                     for lease in captured:
@@ -1579,9 +1530,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     autospec=True,
                     side_effect=interrupt_customization_once,
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised,
+                self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
             ):
                 with claude_refresh_lock.claude_refresh_lock(
                     config,
@@ -1634,9 +1583,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     autospec=True,
                     side_effect=mark_interruption,
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised,
+                self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
             ):
                 with claude_refresh_lock.claude_refresh_lock(
                     config,
@@ -1667,9 +1614,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 )
             )
             self.assertIsNone(
-                claude_refresh_lock._refresh_lock_recovery_paths(
-                    mark_interruption
-                )
+                claude_refresh_lock._refresh_lock_recovery_paths(mark_interruption)
             )
             self.assertFalse(lease.released)
             self.assertTrue(all(path.is_dir() for path in paths))
@@ -1715,8 +1660,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             self.assertIsNotNone(cause)
             assert cause is not None
             self.assertTrue(
-                cause is allocation_error
-                or cause.__cause__ is allocation_error
+                cause is allocation_error or cause.__cause__ is allocation_error
             )
             self._assert_descriptor_only_recovery(
                 raised.exception,
@@ -1754,9 +1698,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     autospec=True,
                     side_effect=cache_then_interrupt,
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised,
+                self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
             ):
                 with claude_refresh_lock.claude_refresh_lock(
                     config,
@@ -1818,9 +1760,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     autospec=True,
                     side_effect=reassert_interruption,
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised,
+                self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
             ):
                 with claude_refresh_lock.claude_refresh_lock(
                     config,
@@ -1944,9 +1884,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                         "_shutdown_timeout_seconds",
                         return_value=0.0,
                     ),
-                    self.assertRaises(
-                        claude_refresh_lock.ForwardedSignal
-                    ) as raised,
+                    self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
                 ):
                     lease.abandon("bounded abandonment cleanup timed out")
             finally:
@@ -1982,9 +1920,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 forbidden_paths=paths,
             )
             self.assertIsNone(
-                claude_refresh_lock._refresh_lock_recovery_paths(
-                    publish_interruption
-                )
+                claude_refresh_lock._refresh_lock_recovery_paths(publish_interruption)
             )
             self.assertTrue(
                 claude_refresh_lock._has_descriptor_bound_refresh_lock_cleanup(
@@ -2043,9 +1979,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             release_once.assert_not_called()
             self.assertFalse(lease.released)
             self.assertTrue(all(path.is_dir() for path in paths))
-            with self.assertRaises(
-                claude_refresh_lock.ClaudeRefreshLockCompromised
-            ):
+            with self.assertRaises(claude_refresh_lock.ClaudeRefreshLockCompromised):
                 lease.commit_context_release()
             with self.assertRaises(
                 claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive
@@ -2144,9 +2078,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
         for label, failure in failures:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
                 config = self._config_dir(pathlib.Path(temporary)).resolve()
-                captured_leases: list[
-                    claude_refresh_lock.ClaudeRefreshLockLease
-                ] = []
+                captured_leases: list[claude_refresh_lock.ClaudeRefreshLockLease] = []
 
                 def capture_lease(
                     *args: object,
@@ -2229,9 +2161,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
 
             self.assertFalse(lease.released)
             self.assertTrue(all(path.is_dir() for path in paths))
-            with self.assertRaises(
-                claude_refresh_lock.ClaudeRefreshLockCompromised
-            ):
+            with self.assertRaises(claude_refresh_lock.ClaudeRefreshLockCompromised):
                 lease.commit_context_release()
             with self.assertRaises(
                 claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive
@@ -2261,9 +2191,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     "_release",
                     side_effect=interruption,
                 ) as release,
-                self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised,
+                self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
             ):
                 manager.__exit__(None, None, None)
 
@@ -2290,14 +2218,15 @@ class ClaudeRefreshLockTest(unittest.TestCase):
         self,
     ) -> None:
         for source in ("body", "release"):
-            with self.subTest(source=source), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(source=source),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 config = self._config_dir(pathlib.Path(temporary)).resolve()
-                manager = (
-                    claude_refresh_lock.claude_refresh_lock_release_on_success(
-                        config,
-                        protocol=self.PROTOCOL,
-                        timeout_seconds=0,
-                    )
+                manager = claude_refresh_lock.claude_refresh_lock_release_on_success(
+                    config,
+                    protocol=self.PROTOCOL,
+                    timeout_seconds=0,
                 )
                 lease = manager.__enter__()
                 paths = lease.paths
@@ -2425,9 +2354,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     "_remove_owned_lock",
                     side_effect=interrupt_first_remove,
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised,
+                self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
             ):
                 manager.__exit__(None, None, None)
 
@@ -2532,10 +2459,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 def __enter__(self) -> object:
                     real_release_lock.acquire()
                     try:
-                        if (
-                            threading.current_thread().name
-                            == "interrupting-abandon"
-                        ):
+                        if threading.current_thread().name == "interrupting-abandon":
                             abandon_holds_release_lock.set()
                             if not allow_abandon_store.wait(timeout=2.0):
                                 raise AssertionError(
@@ -2562,13 +2486,11 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 def set(self) -> None:
                     if (
                         self.armed
-                        and threading.current_thread().name
-                        == "interrupting-abandon"
+                        and threading.current_thread().name == "interrupting-abandon"
                     ):
                         if (
                             lease._abandonment_cleanup_lifecycle
-                            is not claude_refresh_lock.
-                            _AbandonmentCleanupLifecycle.RESUMABLE
+                            is not claude_refresh_lock._AbandonmentCleanupLifecycle.RESUMABLE
                         ):
                             raise AssertionError(
                                 "heartbeat stop preceded lifecycle publication"
@@ -2679,9 +2601,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     outcomes["release"],
                     claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive,
                 )
-                resumed = lease.abandon(
-                    "resume interrupted lifecycle publication"
-                )
+                resumed = lease.abandon("resume interrupted lifecycle publication")
                 release_once.assert_not_called()
                 remove_owned_lock.assert_not_called()
 
@@ -2754,25 +2674,17 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     "_finish_abandonment",
                     side_effect=finish_with_lock_entry_interruption,
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised,
+                self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
             ):
                 lease.abandon("interrupt finish state-lock entry")
 
             self.assertIs(raised.exception, first)
             self.assertTrue(close_interrupted)
             self.assertTrue(
-                claude_refresh_lock._has_descriptor_bound_refresh_lock_cleanup(
-                    first
-                )
+                claude_refresh_lock._has_descriptor_bound_refresh_lock_cleanup(first)
             )
-            self.assertFalse(
-                hasattr(first, "_codex_claude_refresh_lock_paths")
-            )
-            self.assertIsNone(
-                claude_refresh_lock._refresh_lock_recovery_paths(first)
-            )
+            self.assertFalse(hasattr(first, "_codex_claude_refresh_lock_paths"))
+            self.assertIsNone(claude_refresh_lock._refresh_lock_recovery_paths(first))
             assert first.detail is not None
             for path in paths:
                 self.assertNotIn(str(path), first.detail)
@@ -2845,13 +2757,9 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                         "close",
                         side_effect=close_then_interrupt,
                     ),
-                    self.assertRaises(
-                        claude_refresh_lock.ForwardedSignal
-                    ) as raised,
+                    self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
                 ):
-                    lease.abandon(
-                        "descriptor close then state-lock entry interrupted"
-                    )
+                    lease.abandon("descriptor close then state-lock entry interrupted")
             finally:
                 lease._state_lock = real_state_lock
 
@@ -2892,9 +2800,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
     def test_finish_attachment_interruptions_preserve_first_control_flow(
         self,
     ) -> None:
-        attachment = (
-            claude_refresh_lock._raise_frozen_control_flow_with_cleanup
-        )
+        attachment = claude_refresh_lock._raise_frozen_control_flow_with_cleanup
         entry_offset, return_offset = (
             self._source_call_entry_and_return_boundary_offsets(
                 attachment,
@@ -2944,9 +2850,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                         offset=offset,
                         error=second,
                     ),
-                    self.assertRaises(
-                        claude_refresh_lock.ForwardedSignal
-                    ) as raised,
+                    self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
                 ):
                     try:
                         raise first
@@ -2975,9 +2879,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 self.assertIsNone(
                     claude_refresh_lock._refresh_lock_recovery_paths(first)
                 )
-                self.assertFalse(
-                    hasattr(first, "_codex_claude_refresh_lock_paths")
-                )
+                self.assertFalse(hasattr(first, "_codex_claude_refresh_lock_paths"))
                 self._assert_descriptor_only_error_graph(
                     first,
                     forbidden_paths=paths,
@@ -3000,9 +2902,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
         attachment_offset, _return_offset = (
             self._source_call_entry_and_return_boundary_offsets(
                 finish,
-                statement=(
-                    "_attach_secondary_cleanup(primary, recovery_evidence)"
-                ),
+                statement=("_attach_secondary_cleanup(primary, recovery_evidence)"),
                 callable_name="_attach_secondary_cleanup",
             )
         )
@@ -3029,9 +2929,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     offset=attachment_offset,
                     error=first,
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised,
+                self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
             ):
                 lease._finish_abandonment(diagnostic, [ordinary])
 
@@ -3048,9 +2946,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 first,
                 forbidden_paths=paths,
             )
-            resumed = lease.abandon(
-                "resume after finish attachment signal"
-            )
+            resumed = lease.abandon("resume after finish attachment signal")
             self.assertIs(resumed, lease._cleanup_inconclusive)
             for path in reversed(paths):
                 path.rmdir()
@@ -3099,9 +2995,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
 
             lease._state_lock = InterruptingStateLock()
             try:
-                with self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised:
+                with self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised:
                     lease._finish_abandonment(diagnostic, [ordinary])
             finally:
                 lease._state_lock = real_state_lock
@@ -3120,9 +3014,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 first,
                 forbidden_paths=paths,
             )
-            resumed = lease.abandon(
-                "resume after finish state-lock signal"
-            )
+            resumed = lease.abandon("resume after finish state-lock signal")
             self.assertIs(resumed, lease._cleanup_inconclusive)
             for path in reversed(paths):
                 path.rmdir()
@@ -3130,9 +3022,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
     def test_finish_lock_boundary_control_flow_survives_attachment_signal(
         self,
     ) -> None:
-        attachment = (
-            claude_refresh_lock._raise_frozen_control_flow_with_cleanup
-        )
+        attachment = claude_refresh_lock._raise_frozen_control_flow_with_cleanup
         offsets = self._source_call_entry_and_return_boundary_offsets(
             attachment,
             statement="_attach_secondary_cleanup(",
@@ -3209,9 +3099,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 self.assertIsNone(
                     claude_refresh_lock._refresh_lock_recovery_paths(first)
                 )
-                self.assertFalse(
-                    hasattr(first, "_codex_claude_refresh_lock_paths")
-                )
+                self.assertFalse(hasattr(first, "_codex_claude_refresh_lock_paths"))
                 self._assert_descriptor_only_error_graph(
                     first,
                     forbidden_paths=paths,
@@ -3290,9 +3178,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                             claude_refresh_lock.ForwardedSignal
                         ) as raised,
                     ):
-                        lease.abandon(
-                            f"finish caller {boundary} interruption"
-                        )
+                        lease.abandon(f"finish caller {boundary} interruption")
                 finally:
                     lease._heartbeat_thread = heartbeat
 
@@ -3320,9 +3206,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
     def test_resuming_demotion_failure_attachment_preserves_first_control_flow(
         self,
     ) -> None:
-        attachment = (
-            claude_refresh_lock._raise_frozen_control_flow_with_cleanup
-        )
+        attachment = claude_refresh_lock._raise_frozen_control_flow_with_cleanup
         offsets = self._source_call_entry_and_return_boundary_offsets(
             attachment,
             statement="_attach_secondary_cleanup(",
@@ -3360,13 +3244,9 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                         offset=offset,
                         error=later,
                     ),
-                    self.assertRaises(
-                        claude_refresh_lock.ForwardedSignal
-                    ) as raised,
+                    self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
                 ):
-                    lease.abandon(
-                        f"resuming demotion attachment {boundary} signal"
-                    )
+                    lease.abandon(f"resuming demotion attachment {boundary} signal")
 
                 self.assertIs(raised.exception, first)
                 self.assertIsNot(raised.exception, later)
@@ -3392,9 +3272,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
     def test_finish_demotion_failure_attachment_preserves_first_control_flow(
         self,
     ) -> None:
-        attachment = (
-            claude_refresh_lock._raise_frozen_control_flow_with_cleanup
-        )
+        attachment = claude_refresh_lock._raise_frozen_control_flow_with_cleanup
         offsets = self._source_call_entry_and_return_boundary_offsets(
             attachment,
             statement="_attach_secondary_cleanup(",
@@ -3435,9 +3313,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                         offset=offset,
                         error=later,
                     ),
-                    self.assertRaises(
-                        claude_refresh_lock.ForwardedSignal
-                    ) as raised,
+                    self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
                 ):
                     lease._finish_abandonment(diagnostic, [ordinary])
 
@@ -3500,8 +3376,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     self._local.depth = depth
                     self._lock.release()
                     if (
-                        threading.current_thread().name
-                        == "guard-uncommitted-release"
+                        threading.current_thread().name == "guard-uncommitted-release"
                         and depth == 0
                         and not self._paused
                     ):
@@ -3661,9 +3536,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     "_start_heartbeat",
                     side_effect=start_error,
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ClaudeRefreshLockError
-                ) as raised,
+                self.assertRaises(claude_refresh_lock.ClaudeRefreshLockError) as raised,
             ):
                 self._acquire_lock(
                     config,
@@ -3844,9 +3717,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     False,
                 )
             )
-            self.assertFalse(
-                hasattr(diagnostic, "_codex_claude_refresh_lock_paths")
-            )
+            self.assertFalse(hasattr(diagnostic, "_codex_claude_refresh_lock_paths"))
             self.assertIsNone(
                 claude_refresh_lock._refresh_lock_recovery_paths(diagnostic)
             )
@@ -3869,13 +3740,9 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 snapshot.diagnostic,
             )
             self.assertTrue(
-                claude_refresh_lock._has_descriptor_bound_refresh_lock_cleanup(
-                    rendered
-                )
+                claude_refresh_lock._has_descriptor_bound_refresh_lock_cleanup(rendered)
             )
-            self.assertFalse(
-                hasattr(rendered, "_codex_claude_refresh_lock_paths")
-            )
+            self.assertFalse(hasattr(rendered, "_codex_claude_refresh_lock_paths"))
             self.assertIsNone(
                 claude_refresh_lock._refresh_lock_recovery_paths(rendered)
             )
@@ -3940,9 +3807,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     offset=close_return_offset,
                     error=interruption,
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised,
+                self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
             ):
                 lease.abandon("promote paths before close interruption")
 
@@ -3967,9 +3832,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 )
             )
             self.assertIsNone(
-                claude_refresh_lock._refresh_lock_recovery_paths(
-                    retention.diagnostic
-                )
+                claude_refresh_lock._refresh_lock_recovery_paths(retention.diagnostic)
             )
             self.assertTrue(
                 claude_refresh_lock._has_descriptor_bound_refresh_lock_cleanup(
@@ -3983,9 +3846,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 )
             )
             self.assertIsNone(
-                claude_refresh_lock._refresh_lock_recovery_paths(
-                    raised.exception
-                )
+                claude_refresh_lock._refresh_lock_recovery_paths(raised.exception)
             )
             assert raised.exception.detail is not None
             for path in lexical_paths:
@@ -4021,16 +3882,12 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     ),
                 ) as remove_owned_lock,
             ):
-                resumed = lease.abandon(
-                    "reproof failed after ancestor retarget"
-                )
+                resumed = lease.abandon("reproof failed after ancestor retarget")
 
             self.assertIs(resumed, diagnostic)
             remove_owned_lock.assert_not_called()
             self.assertEqual(set(close_counts), set(descriptors))
-            self.assertTrue(
-                all(count == 1 for count in close_counts.values())
-            )
+            self.assertTrue(all(count == 1 for count in close_counts.values()))
             self.assertIs(
                 lease._abandonment_cleanup_lifecycle,
                 claude_refresh_lock._AbandonmentCleanupLifecycle.SETTLED,
@@ -4040,9 +3897,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     diagnostic
                 )
             )
-            self.assertFalse(
-                hasattr(diagnostic, "_codex_claude_refresh_lock_paths")
-            )
+            self.assertFalse(hasattr(diagnostic, "_codex_claude_refresh_lock_paths"))
             self.assertIsNone(
                 claude_refresh_lock._refresh_lock_recovery_paths(diagnostic)
             )
@@ -4054,13 +3909,9 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 diagnostic,
             )
             self.assertTrue(
-                claude_refresh_lock._has_descriptor_bound_refresh_lock_cleanup(
-                    attached
-                )
+                claude_refresh_lock._has_descriptor_bound_refresh_lock_cleanup(attached)
             )
-            self.assertFalse(
-                hasattr(attached, "_codex_claude_refresh_lock_paths")
-            )
+            self.assertFalse(hasattr(attached, "_codex_claude_refresh_lock_paths"))
             self.assertIsNone(
                 claude_refresh_lock._refresh_lock_recovery_paths(attached)
             )
@@ -4074,12 +3925,8 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             )
 
             retained_config = retained_home / ".claude"
-            self.assertTrue(
-                (retained_home / ".claude.lock").is_dir()
-            )
-            self.assertTrue(
-                (retained_config / ".oauth_refresh.lock").is_dir()
-            )
+            self.assertTrue((retained_home / ".claude.lock").is_dir())
+            self.assertTrue((retained_config / ".oauth_refresh.lock").is_dir())
             (retained_home / ".claude.lock").rmdir()
             (retained_config / ".oauth_refresh.lock").rmdir()
             replacement_legacy.rmdir()
@@ -4089,10 +3936,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
     def test_recovery_path_demotion_publishes_descriptor_marker_first(
         self,
     ) -> None:
-        demote = (
-            claude_refresh_lock.ClaudeRefreshLockLease.
-            _demote_cleanup_inconclusive_paths
-        )
+        demote = claude_refresh_lock.ClaudeRefreshLockLease._demote_cleanup_inconclusive_paths
         demotion_entry, _demotion_return = (
             self._source_call_entry_and_return_boundary_offsets(
                 demote,
@@ -4124,9 +3968,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     offset=demotion_entry,
                     error=interruption,
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised,
+                self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
             ):
                 lease._demote_cleanup_inconclusive_paths(
                     diagnostic,
@@ -4141,9 +3983,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     False,
                 )
             )
-            self.assertTrue(
-                hasattr(diagnostic, "_codex_claude_refresh_lock_paths")
-            )
+            self.assertTrue(hasattr(diagnostic, "_codex_claude_refresh_lock_paths"))
             self.assertIsNone(
                 claude_refresh_lock._refresh_lock_recovery_paths(diagnostic)
             )
@@ -4155,9 +3995,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 reason="complete fixture demotion",
             )
             self.assertIs(demoted, diagnostic)
-            self.assertFalse(
-                hasattr(diagnostic, "_codex_claude_refresh_lock_paths")
-            )
+            self.assertFalse(hasattr(diagnostic, "_codex_claude_refresh_lock_paths"))
             with lease._state_lock:
                 lease._cleanup_inconclusive = None
             lease.release()
@@ -4180,18 +4018,14 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 timeout_seconds=0,
             )
             paths = tuple(str(path) for path in lease.paths)
-            close_interruption = claude_refresh_lock.ForwardedSignal(
-                signal.SIGTERM
-            )
+            close_interruption = claude_refresh_lock.ForwardedSignal(signal.SIGTERM)
             with (
                 self._raise_before_instruction(
                     abandon,
                     offset=close_return_offset,
                     error=close_interruption,
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as close_raised,
+                self.assertRaises(claude_refresh_lock.ForwardedSignal) as close_raised,
             ):
                 lease.abandon("promote paths before demotion failures")
 
@@ -4207,9 +4041,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 lease._descriptor_bound_cleanup_fallback,
                 diagnostic,
             )
-            first_interruption = claude_refresh_lock.ForwardedSignal(
-                signal.SIGINT
-            )
+            first_interruption = claude_refresh_lock.ForwardedSignal(signal.SIGINT)
             second_interruption = KeyboardInterrupt(
                 "injected second demotion marker interruption"
             )
@@ -4224,8 +4056,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             ) -> None:
                 if (
                     candidate is diagnostic
-                    and name
-                    == "_codex_claude_refresh_lock_descriptor_bound"
+                    and name == "_codex_claude_refresh_lock_descriptor_bound"
                     and interruptions
                 ):
                     raise interruptions.pop(0)
@@ -4247,16 +4078,10 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             self.assertIs(winner, first_interruption)
             self.assertEqual(interruptions, [])
             self.assertTrue(
-                claude_refresh_lock._has_descriptor_bound_refresh_lock_cleanup(
-                    winner
-                )
+                claude_refresh_lock._has_descriptor_bound_refresh_lock_cleanup(winner)
             )
-            self.assertFalse(
-                hasattr(winner, "_codex_claude_refresh_lock_paths")
-            )
-            self.assertIsNone(
-                claude_refresh_lock._refresh_lock_recovery_paths(winner)
-            )
+            self.assertFalse(hasattr(winner, "_codex_claude_refresh_lock_paths"))
+            self.assertIsNone(claude_refresh_lock._refresh_lock_recovery_paths(winner))
             assert winner.detail is not None
             for path in paths:
                 self.assertNotIn(path, winner.detail)
@@ -4493,9 +4318,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 "before-descriptor-close",
                 self._source_statement_offset(
                     abandon,
-                    statement=(
-                        "if self._abandonment_descriptors_pending is None:"
-                    ),
+                    statement=("if self._abandonment_descriptors_pending is None:"),
                 ),
             ),
             (
@@ -4522,9 +4345,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     )
                     paths = lease.paths
                     descriptors = self._lease_descriptors(lease)
-                    interruption = claude_refresh_lock.ForwardedSignal(
-                        signal.SIGTERM
-                    )
+                    interruption = claude_refresh_lock.ForwardedSignal(signal.SIGTERM)
                     try:
                         with (
                             self._raise_before_instruction(
@@ -4536,9 +4357,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                                 claude_refresh_lock.ForwardedSignal
                             ) as raised,
                         ):
-                            lease.abandon(
-                                f"interrupted abandonment at {stage}"
-                            )
+                            lease.abandon(f"interrupted abandonment at {stage}")
 
                         self.assertIs(raised.exception, interruption)
                         diagnostic = lease._cleanup_inconclusive
@@ -4611,9 +4430,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     paths = lease.paths
                     descriptors = self._lease_descriptors(lease)
                     interrupted_descriptor = descriptors[0]
-                    interruption = claude_refresh_lock.ForwardedSignal(
-                        signal.SIGTERM
-                    )
+                    interruption = claude_refresh_lock.ForwardedSignal(signal.SIGTERM)
                     try:
                         with (
                             self._raise_before_instruction(
@@ -4625,9 +4442,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                                 claude_refresh_lock.ForwardedSignal
                             ) as raised,
                         ):
-                            lease.abandon(
-                                f"descriptor pop {boundary} interruption"
-                            )
+                            lease.abandon(f"descriptor pop {boundary} interruption")
 
                         self.assertIs(raised.exception, interruption)
                         diagnostic = lease._cleanup_inconclusive
@@ -4665,9 +4480,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                         for descriptor in descriptors[1:]:
                             with self.assertRaises(OSError):
                                 os.fstat(descriptor)
-                        self.assertFalse(
-                            lease._abandonment_cleanup_completed
-                        )
+                        self.assertFalse(lease._abandonment_cleanup_completed)
                         self.assertIs(
                             lease._abandonment_cleanup_lifecycle,
                             claude_refresh_lock._AbandonmentCleanupLifecycle.SETTLED,
@@ -4722,9 +4535,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     timeout_seconds=0,
                 )
                 descriptors = self._lease_descriptors(lease)
-                interruption = claude_refresh_lock.ForwardedSignal(
-                    signal.SIGTERM
-                )
+                interruption = claude_refresh_lock.ForwardedSignal(signal.SIGTERM)
                 with lease._state_lock:
                     lease._deletion_prohibited = True
                     lease._heartbeat_stop.set()
@@ -4769,9 +4580,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                         claude_refresh_lock._AbandonmentCleanupLifecycle.SETTLED,
                     )
                     self.assertTrue(lease._abandonment_cleanup_completed)
-                    self.assertTrue(
-                        all(path.is_dir() for path in lease.paths)
-                    )
+                    self.assertTrue(all(path.is_dir() for path in lease.paths))
                     for descriptor in descriptors:
                         with self.assertRaises(OSError):
                             os.fstat(descriptor)
@@ -4789,20 +4598,19 @@ class ClaudeRefreshLockTest(unittest.TestCase):
         real_close = os.close
 
         for boundary, offset in zip(("entry", "return"), boundaries):
-            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(boundary=boundary),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 config = self._config_dir(pathlib.Path(temporary)).resolve()
-                manager = (
-                    claude_refresh_lock.claude_refresh_lock_release_on_success(
-                        config,
-                        protocol=self.PROTOCOL,
-                        timeout_seconds=0,
-                    )
+                manager = claude_refresh_lock.claude_refresh_lock_release_on_success(
+                    config,
+                    protocol=self.PROTOCOL,
+                    timeout_seconds=0,
                 )
                 lease = manager.__enter__()
                 descriptors = self._lease_descriptors(lease)
-                interruption = claude_refresh_lock.ForwardedSignal(
-                    signal.SIGTERM
-                )
+                interruption = claude_refresh_lock.ForwardedSignal(signal.SIGTERM)
                 close_counts: dict[int, int] = {}
 
                 def record_close(descriptor: int) -> None:
@@ -4834,9 +4642,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                         claude_refresh_lock._AbandonmentCleanupLifecycle.NOT_STARTED,
                     )
                     self.assertIsNone(lease._abandonment_descriptors_pending)
-                    self.assertTrue(
-                        all(count <= 1 for count in close_counts.values())
-                    )
+                    self.assertTrue(all(count <= 1 for count in close_counts.values()))
                     diagnostic = lease._cleanup_inconclusive
                     self.assertIsNotNone(diagnostic)
                     assert diagnostic is not None
@@ -4882,19 +4688,15 @@ class ClaudeRefreshLockTest(unittest.TestCase):
 
     def test_abandon_close_return_reused_fd_is_never_closed(self) -> None:
         abandon = claude_refresh_lock.ClaudeRefreshLockLease._abandon
-        _entry_offset, return_offset = (
-            self._call_entry_and_return_boundary_offsets(
-                abandon,
-                callable_name="close",
-            )
+        _entry_offset, return_offset = self._call_entry_and_return_boundary_offsets(
+            abandon,
+            callable_name="close",
         )
-        settlement_boundaries = (
-            self._source_call_entry_and_return_boundary_offsets(
-                abandon,
-                statement="_abandonment_descriptors_residue.add(",
-                callable_name="add",
-                occurrence=2,
-            )
+        settlement_boundaries = self._source_call_entry_and_return_boundary_offsets(
+            abandon,
+            statement="_abandonment_descriptors_residue.add(",
+            callable_name="add",
+            occurrence=2,
         )
         real_close = os.close
         real_fstat = os.fstat
@@ -4915,9 +4717,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 paths = lease.paths
                 descriptors = self._lease_descriptors(lease)
                 interrupted_descriptor = descriptors[0]
-                interruption = claude_refresh_lock.ForwardedSignal(
-                    signal.SIGTERM
-                )
+                interruption = claude_refresh_lock.ForwardedSignal(signal.SIGTERM)
                 settlement_interruption = claude_refresh_lock.ForwardedSignal(
                     signal.SIGINT
                 )
@@ -4981,9 +4781,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                             claude_refresh_lock.ForwardedSignal
                         ) as settlement_raised,
                     ):
-                        lease.abandon(
-                            f"interrupt reused descriptor residue {boundary}"
-                        )
+                        lease.abandon(f"interrupt reused descriptor residue {boundary}")
 
                     self.assertIs(
                         settlement_raised.exception,
@@ -5011,9 +4809,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                             side_effect=record_close,
                         ),
                     ):
-                        resumed = lease.abandon(
-                            "settle reused descriptor residue"
-                        )
+                        resumed = lease.abandon("settle reused descriptor residue")
 
                     self.assertIs(resumed, diagnostic)
                     self.assertEqual(
@@ -5110,9 +4906,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                         ),
                     ),
                 ):
-                    resumed = lease.abandon(
-                        "settle non-EBADF descriptor fstat failure"
-                    )
+                    resumed = lease.abandon("settle non-EBADF descriptor fstat failure")
 
                 self.assertEqual(fstat_calls, [failed_descriptor])
                 self.assertIs(resumed, diagnostic)
@@ -5160,13 +4954,11 @@ class ClaudeRefreshLockTest(unittest.TestCase):
         self,
     ) -> None:
         abandon = claude_refresh_lock.ClaudeRefreshLockLease._abandon
-        settlement_boundaries = (
-            self._source_call_entry_and_return_boundary_offsets(
-                abandon,
-                statement="_abandonment_descriptors_residue.add(",
-                callable_name="add",
-                occurrence=1,
-            )
+        settlement_boundaries = self._source_call_entry_and_return_boundary_offsets(
+            abandon,
+            statement="_abandonment_descriptors_residue.add(",
+            callable_name="add",
+            occurrence=1,
         )
         real_fstat = os.fstat
 
@@ -5194,13 +4986,9 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     if descriptor != failed_descriptor:
                         return real_fstat(descriptor)
                     fstat_calls.append(descriptor)
-                    raise RuntimeError(
-                        "injected descriptor fstat control flow"
-                    )
+                    raise RuntimeError("injected descriptor fstat control flow")
 
-                interruption = claude_refresh_lock.ForwardedSignal(
-                    signal.SIGINT
-                )
+                interruption = claude_refresh_lock.ForwardedSignal(signal.SIGINT)
                 try:
                     with (
                         mock.patch.object(
@@ -5222,9 +5010,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                             claude_refresh_lock.ForwardedSignal
                         ) as raised,
                     ):
-                        lease.abandon(
-                            f"interrupt base-exception residue {boundary}"
-                        )
+                        lease.abandon(f"interrupt base-exception residue {boundary}")
 
                     self.assertIs(raised.exception, interruption)
                     self.assertIs(
@@ -5464,9 +5250,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     diagnostic
                 )
             )
-            self.assertFalse(
-                hasattr(diagnostic, "_codex_claude_refresh_lock_paths")
-            )
+            self.assertFalse(hasattr(diagnostic, "_codex_claude_refresh_lock_paths"))
             self.assertIsNone(
                 claude_refresh_lock._refresh_lock_recovery_paths(diagnostic)
             )
@@ -5479,9 +5263,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             with mock.patch.object(
                 claude_refresh_lock.os,
                 "close",
-                side_effect=AssertionError(
-                    "failed descriptor cleanup was retried"
-                ),
+                side_effect=AssertionError("failed descriptor cleanup was retried"),
             ):
                 self.assertIs(
                     lease.abandon("must not retry partial descriptor cleanup"),
@@ -5587,9 +5369,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     offset=offset,
                     error=interruption,
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised,
+                self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
             ):
                 lease.abandon("terminal evidence publication was interrupted")
 
@@ -5650,9 +5430,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     offset=offset,
                     error=interruption,
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised,
+                self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
             ):
                 lease.release()
 
@@ -5801,11 +5579,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 finally:
                     allow_heartbeat_exit.set()
                     alive_workers = self._join_started_workers(
-                        *(
-                            (release_thread,)
-                            if release_thread is not None
-                            else ()
-                        )
+                        *((release_thread,) if release_thread is not None else ())
                     )
                     if not alive_workers:
                         self._operator_cleanup_inconclusive_lease(lease)
@@ -6090,9 +5864,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     assert_thread.start()
                     self.assertTrue(assert_entered.wait(timeout=2.0))
                     release_thread.start()
-                    self.assertTrue(
-                        release_waiting_for_operation.wait(timeout=2.0)
-                    )
+                    self.assertTrue(release_waiting_for_operation.wait(timeout=2.0))
                     allow_assert_failure.set()
                     self.assertTrue(assert_finished.wait(timeout=2.0))
                     self.assertTrue(release_finished.wait(timeout=2.0))
@@ -6319,9 +6091,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     "_release_once",
                     side_effect=interrupt_after_cleanup_started,
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised,
+                self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
             ):
                 lease.release()
 
@@ -6363,9 +6133,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 if calls == 1:
                     raise first_timeout
                 lease._heartbeat_stop.set()
-                lease._mark_cleanup_inconclusive(
-                    "injected second-attempt cleanup gap"
-                )
+                lease._mark_cleanup_inconclusive("injected second-attempt cleanup gap")
                 with lease._state_lock:
                     lease._cleanup_started = True
                 raise forwarded
@@ -6376,9 +6144,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     "_release_once",
                     side_effect=timeout_then_interrupt_cleanup,
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised,
+                self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
             ):
                 lease.release()
 
@@ -6427,9 +6193,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     "_remove_owned_lock",
                     side_effect=interrupt_first_removal,
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised,
+                self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
             ):
                 lease.release()
 
@@ -6457,9 +6221,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 )
             )
             self.assertIsNone(
-                claude_refresh_lock._refresh_lock_recovery_paths(
-                    repeated.exception
-                )
+                claude_refresh_lock._refresh_lock_recovery_paths(repeated.exception)
             )
             self._operator_cleanup_inconclusive_lease(lease)
 
@@ -6493,9 +6255,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     "_remove_owned_lock",
                     side_effect=fail_first_removal,
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ClaudeRefreshLockError
-                ) as raised,
+                self.assertRaises(claude_refresh_lock.ClaudeRefreshLockError) as raised,
             ):
                 lease.release()
 
@@ -6596,9 +6356,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     autospec=True,
                     side_effect=release_then_signal,
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised,
+                self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
             ):
                 self._acquire_lock(
                     config,
@@ -6642,16 +6400,12 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     "utime",
                     side_effect=renew_then_replace,
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ClaudeRefreshLockCompromised
-                ),
+                self.assertRaises(claude_refresh_lock.ClaudeRefreshLockCompromised),
             ):
                 lease.assert_held()
 
             self.assertTrue(replaced)
-            with self.assertRaises(
-                claude_refresh_lock.ClaudeRefreshLockCompromised
-            ):
+            with self.assertRaises(claude_refresh_lock.ClaudeRefreshLockCompromised):
                 lease.release()
             self.assertTrue(primary.is_dir())
             primary.rmdir()
@@ -6744,9 +6498,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 if case == "nonempty-legacy":
                     (legacy / "unexpected").write_text("occupied", encoding="utf-8")
 
-                with self.assertRaises(
-                    claude_refresh_lock.ClaudeRefreshLockUnsafe
-                ):
+                with self.assertRaises(claude_refresh_lock.ClaudeRefreshLockUnsafe):
                     claude_refresh_lock.recover_abandoned_staged_claude_refresh_locks(
                         carrier,
                         config,
@@ -6874,9 +6626,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 unsafe = carrier if unsafe_directory == "carrier" else config
                 unsafe.chmod(0o755)
 
-                with self.assertRaises(
-                    claude_refresh_lock.ClaudeRefreshLockUnsafe
-                ):
+                with self.assertRaises(claude_refresh_lock.ClaudeRefreshLockUnsafe):
                     claude_refresh_lock.recover_abandoned_staged_claude_refresh_locks(
                         carrier,
                         config,
@@ -7844,26 +7594,16 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     legacy_parent_dir_fd=parent_fd,
                 )
                 retained_config = retained_home / ".claude"
-                self.assertTrue(
-                    (retained_config / ".oauth_refresh.lock").is_dir()
-                )
-                self.assertTrue(
-                    pathlib.Path(str(retained_config) + ".lock").is_dir()
-                )
-                self.assertFalse(
-                    (replacement_config / ".oauth_refresh.lock").exists()
-                )
+                self.assertTrue((retained_config / ".oauth_refresh.lock").is_dir())
+                self.assertTrue(pathlib.Path(str(retained_config) + ".lock").is_dir())
+                self.assertFalse((replacement_config / ".oauth_refresh.lock").exists())
                 self.assertFalse(
                     pathlib.Path(str(replacement_config) + ".lock").exists()
                 )
                 lease.assert_held()
                 lease.release()
-                self.assertFalse(
-                    (retained_config / ".oauth_refresh.lock").exists()
-                )
-                self.assertFalse(
-                    pathlib.Path(str(retained_config) + ".lock").exists()
-                )
+                self.assertFalse((retained_config / ".oauth_refresh.lock").exists())
+                self.assertFalse(pathlib.Path(str(retained_config) + ".lock").exists())
             finally:
                 os.close(parent_fd)
                 os.close(config_fd)
@@ -7911,9 +7651,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     lease.release()
 
                 self.assertIsNone(
-                    claude_refresh_lock._refresh_lock_recovery_paths(
-                        raised.exception
-                    )
+                    claude_refresh_lock._refresh_lock_recovery_paths(raised.exception)
                 )
                 messages: list[str] = []
                 pending: list[BaseException] = [raised.exception]
@@ -7934,9 +7672,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                         for message in messages
                     )
                 )
-                self.assertFalse(
-                    (replacement_config / ".oauth_refresh.lock").exists()
-                )
+                self.assertFalse((replacement_config / ".oauth_refresh.lock").exists())
                 self.assertFalse(
                     pathlib.Path(str(replacement_config) + ".lock").exists()
                 )
@@ -8195,9 +7931,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     "close",
                     side_effect=fail_first_close,
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ClaudeRefreshLockError
-                ) as raised,
+                self.assertRaises(claude_refresh_lock.ClaudeRefreshLockError) as raised,
             ):
                 lease.release()
 
@@ -8232,9 +7966,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     "close",
                     side_effect=fail_first_close,
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ClaudeRefreshLockError
-                ) as raised,
+                self.assertRaises(claude_refresh_lock.ClaudeRefreshLockError) as raised,
             ):
                 lease.release()
 
@@ -8368,13 +8100,9 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                         offset=assignment_offset,
                         error=interruption,
                     ),
-                    self.assertRaises(
-                        claude_refresh_lock.ForwardedSignal
-                    ) as raised,
+                    self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
                 ):
-                    lease.abandon(
-                        "operation acquire return boundary was interrupted"
-                    )
+                    lease.abandon("operation acquire return boundary was interrupted")
 
                 self.assertIs(raised.exception, interruption)
                 operation_recovered = lease._operation_lock.acquire(timeout=0.01)
@@ -8423,9 +8151,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                         offset=assignment_offset,
                         error=interruption,
                     ),
-                    self.assertRaises(
-                        claude_refresh_lock.ForwardedSignal
-                    ) as raised,
+                    self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
                 ):
                     lease.release()
 
@@ -8473,13 +8199,9 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                         offset=return_offset,
                         error=interruption,
                     ),
-                    self.assertRaises(
-                        claude_refresh_lock.ForwardedSignal
-                    ) as raised,
+                    self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
                 ):
-                    lease.abandon(
-                        "operation handoff caller boundary was interrupted"
-                    )
+                    lease.abandon("operation handoff caller boundary was interrupted")
 
                 self.assertIs(raised.exception, interruption)
                 self.assertTrue(lease._operation_lock.acquire(timeout=0.01))
@@ -8522,9 +8244,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     offset=return_offset,
                     error=interruption,
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised,
+                self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
             ):
                 lease.release()
 
@@ -8560,9 +8280,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
         holder.start()
         self.assertTrue(holder_started.wait(timeout=2.0))
         fallback = claude_refresh_lock._new_cleanup_inconclusive_fallback()
-        first_control_flow = claude_refresh_lock._FirstControlFlowWinner(
-            fallback
-        )
+        first_control_flow = claude_refresh_lock._FirstControlFlowWinner(fallback)
         handoff = claude_refresh_lock._OperationLockHandoff(operation_lock)
         interruption = claude_refresh_lock.ForwardedSignal(signal.SIGTERM)
         try:
@@ -8572,9 +8290,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     offset=entry_offset,
                     error=interruption,
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised,
+                self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
             ):
                 handoff.acquire(
                     timeout=0.01,
@@ -8599,9 +8315,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
         operation_lock = threading.RLock()
         operation_lock.acquire()
         fallback = claude_refresh_lock._new_cleanup_inconclusive_fallback()
-        first_control_flow = claude_refresh_lock._FirstControlFlowWinner(
-            fallback
-        )
+        first_control_flow = claude_refresh_lock._FirstControlFlowWinner(fallback)
         handoff = claude_refresh_lock._OperationLockHandoff(operation_lock)
 
         with self.assertRaisesRegex(
@@ -8630,9 +8344,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
         )
         operation_lock = threading.RLock()
         fallback = claude_refresh_lock._new_cleanup_inconclusive_fallback()
-        first_control_flow = claude_refresh_lock._FirstControlFlowWinner(
-            fallback
-        )
+        first_control_flow = claude_refresh_lock._FirstControlFlowWinner(fallback)
         handoff = claude_refresh_lock._OperationLockHandoff(operation_lock)
         handoff.acquire(
             timeout=0.01,
@@ -8646,9 +8358,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 offset=return_offset,
                 error=interruption,
             ),
-            self.assertRaises(
-                claude_refresh_lock.ForwardedSignal
-            ) as raised,
+            self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
         ):
             handoff.release()
 
@@ -8669,9 +8379,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             "injected owned release failure"
         )
         fallback = claude_refresh_lock._new_cleanup_inconclusive_fallback()
-        first_control_flow = claude_refresh_lock._FirstControlFlowWinner(
-            fallback
-        )
+        first_control_flow = claude_refresh_lock._FirstControlFlowWinner(fallback)
         handoff = claude_refresh_lock._OperationLockHandoff(operation_lock)
         handoff.acquire(
             timeout=0.01,
@@ -8733,9 +8441,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             lease._state_lock = InterruptingSettlementStateLock()
             lease._operation_lock = operation_lock
             try:
-                with self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised:
+                with self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised:
                     lease.abandon(
                         "settlement exit then operation release were interrupted"
                     )
@@ -8811,13 +8517,9 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                         autospec=True,
                         side_effect=interrupt_final_selector,
                     ),
-                    self.assertRaises(
-                        claude_refresh_lock.ForwardedSignal
-                    ) as raised,
+                    self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
                 ):
-                    lease.abandon(
-                        "final control-flow selection was interrupted"
-                    )
+                    lease.abandon("final control-flow selection was interrupted")
 
                 self.assertIs(raised.exception, first)
                 self.assertIsNot(raised.exception, second)
@@ -8832,12 +8534,10 @@ class ClaudeRefreshLockTest(unittest.TestCase):
 
     def test_first_control_flow_winner_survives_opcode_boundaries(self) -> None:
         observe = claude_refresh_lock._FirstControlFlowWinner.observe
-        _bind_entry, bind_return = (
-            self._source_call_entry_and_return_boundary_offsets(
-                observe,
-                statement="_bind_cleanup_recovery_evidence(",
-                callable_name="_bind_cleanup_recovery_evidence",
-            )
+        _bind_entry, bind_return = self._source_call_entry_and_return_boundary_offsets(
+            observe,
+            statement="_bind_cleanup_recovery_evidence(",
+            callable_name="_bind_cleanup_recovery_evidence",
         )
         raise_if_set = claude_refresh_lock._FirstControlFlowWinner.raise_if_set
         raise_entry, _raise_return = (
@@ -8853,9 +8553,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             ("raise-entry", raise_if_set, raise_entry),
         ):
             with self.subTest(boundary=boundary):
-                fallback = (
-                    claude_refresh_lock._new_cleanup_inconclusive_fallback()
-                )
+                fallback = claude_refresh_lock._new_cleanup_inconclusive_fallback()
                 winner = claude_refresh_lock._FirstControlFlowWinner(fallback)
                 first = claude_refresh_lock.ForwardedSignal(signal.SIGTERM)
                 second = claude_refresh_lock.ForwardedSignal(signal.SIGINT)
@@ -8923,9 +8621,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                     offset=raise_entry,
                     callback=lambda: os.kill(os.getpid(), pending_signal),
                 ),
-                self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised,
+                self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
             ):
                 winner.raise_if_set()
 
@@ -8943,8 +8639,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
         winner_store = next(
             instruction.offset
             for instruction in dis.get_instructions(observe)
-            if instruction.opname == "STORE_ATTR"
-            and instruction.argval == "_winner"
+            if instruction.opname == "STORE_ATTR" and instruction.argval == "_winner"
         )
         with tempfile.TemporaryDirectory() as temporary:
             config = self._config_dir(pathlib.Path(temporary)).resolve()
@@ -8972,9 +8667,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                         offset=winner_store,
                         error=second,
                     ),
-                    self.assertRaises(
-                        claude_refresh_lock.ForwardedSignal
-                    ) as raised,
+                    self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
                 ):
                     lease.abandon("winner publication was interrupted")
 
@@ -8993,8 +8686,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
         winner_store = next(
             instruction.offset
             for instruction in dis.get_instructions(observe)
-            if instruction.opname == "STORE_ATTR"
-            and instruction.argval == "_winner"
+            if instruction.opname == "STORE_ATTR" and instruction.argval == "_winner"
         )
         with tempfile.TemporaryDirectory() as temporary:
             config = self._config_dir(pathlib.Path(temporary)).resolve()
@@ -9022,9 +8714,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                         offset=winner_store,
                         error=second,
                     ),
-                    self.assertRaises(
-                        claude_refresh_lock.ForwardedSignal
-                    ) as raised,
+                    self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised,
                 ):
                     lease.release()
 
@@ -9076,9 +8766,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             lease._operation_lock = operation_lock
 
             try:
-                with self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised:
+                with self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised:
                     lease.abandon("operation release was interrupted twice")
 
                 self.assertIs(raised.exception, first)
@@ -9155,9 +8843,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 protocol=self.PROTOCOL,
                 timeout_seconds=0,
             )
-            handoff = claude_refresh_lock._OperationLockHandoff(
-                lease._operation_lock
-            )
+            handoff = claude_refresh_lock._OperationLockHandoff(lease._operation_lock)
             lease._publish_operation_handoff(handoff)
             handoff.acquire(
                 timeout=0.01,
@@ -9252,9 +8938,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             lease._operation_lock = operation_lock
 
             try:
-                with self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised:
+                with self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised:
                     lease.release()
 
                 self.assertIs(raised.exception, first)
@@ -9312,9 +8996,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             operation_lock = TwiceInterruptedOperationLock()
 
             try:
-                with self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised:
+                with self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised:
                     with claude_refresh_lock.claude_refresh_lock(
                         config,
                         protocol=self.PROTOCOL,
@@ -9368,9 +9050,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             config = self._config_dir(pathlib.Path(temporary)).resolve()
 
             try:
-                with self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised:
+                with self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised:
                     with claude_refresh_lock.claude_refresh_lock(
                         config,
                         protocol=self.PROTOCOL,
@@ -9409,10 +9089,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 self.assertFalse(contender.is_alive())
                 self.assertEqual(acquired_by_other_thread, [True])
             finally:
-                if (
-                    lease is not None
-                    and lease._pending_operation_handoff is not None
-                ):
+                if lease is not None and lease._pending_operation_handoff is not None:
                     lease.release()
                 if operation_lock._is_owned():
                     operation_lock._lock.release()
@@ -9429,16 +9106,12 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             config = self._config_dir(pathlib.Path(temporary)).resolve()
 
             try:
-                with self.assertRaises(
-                    claude_refresh_lock.ForwardedSignal
-                ) as raised:
-                    with (
-                        claude_refresh_lock.claude_refresh_lock_release_on_success(
-                            config,
-                            protocol=self.PROTOCOL,
-                            timeout_seconds=0,
-                        ) as lease
-                    ):
+                with self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised:
+                    with claude_refresh_lock.claude_refresh_lock_release_on_success(
+                        config,
+                        protocol=self.PROTOCOL,
+                        timeout_seconds=0,
+                    ) as lease:
                         heartbeat = lease._heartbeat_thread
                         assert heartbeat is not None
                         lease._heartbeat_stop.set()
@@ -9472,10 +9145,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 self.assertFalse(contender.is_alive())
                 self.assertEqual(acquired_by_other_thread, [True])
             finally:
-                if (
-                    lease is not None
-                    and lease._pending_operation_handoff is not None
-                ):
+                if lease is not None and lease._pending_operation_handoff is not None:
                     lease.release()
                 if operation_lock._is_owned():
                     operation_lock._lock.release()
@@ -9515,9 +9185,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             claude_refresh_lock._new_cleanup_inconclusive_fallback()
         )
 
-        with self.assertRaises(
-            claude_refresh_lock.ForwardedSignal
-        ) as raised:
+        with self.assertRaises(claude_refresh_lock.ForwardedSignal) as raised:
             winner.enforce([first], second)
 
         self.assertIs(raised.exception, first)
@@ -9539,7 +9207,10 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             ("entry", entry_offset),
             ("return", return_offset),
         ):
-            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(boundary=boundary),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 config = self._config_dir(pathlib.Path(temporary)).resolve()
                 lease = self._acquire_lock(
                     config,
@@ -9599,7 +9270,10 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             ("entry", entry_offset),
             ("return", return_offset),
         ):
-            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(boundary=boundary),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 config = self._config_dir(pathlib.Path(temporary)).resolve()
                 lease = self._acquire_lock(
                     config,
@@ -9611,9 +9285,7 @@ class ClaudeRefreshLockTest(unittest.TestCase):
                 first_control_flow = claude_refresh_lock._FirstControlFlowWinner(
                     lease._descriptor_bound_cleanup_fallback
                 )
-                errors = claude_refresh_lock._ControlFlowErrorLog(
-                    first_control_flow
-                )
+                errors = claude_refresh_lock._ControlFlowErrorLog(first_control_flow)
                 errors.append(
                     claude_refresh_lock.ClaudeRefreshLockError(
                         "seed non-control-flow cleanup error"
@@ -9678,7 +9350,10 @@ class ClaudeRefreshLockTest(unittest.TestCase):
             ("entry", entry_offset),
             ("return", return_offset),
         ):
-            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(boundary=boundary),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 config = self._config_dir(pathlib.Path(temporary)).resolve()
                 lease = self._acquire_lock(
                     config,
