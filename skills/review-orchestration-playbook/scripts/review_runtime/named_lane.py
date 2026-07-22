@@ -4448,11 +4448,19 @@ def run_claude(
                         restore_signal_mask(publication_mask)
                         publication_phase = "committed"
                     else:
-                        receipt_signals = _install_post_terminal_signal_handlers()
-                        restore_signal_mask(publication_mask)
                         _receipt_emitter(result)
+                        deferred_signal = consume_pending_forwarded_signal()
+                        if deferred_signal is not None:
+                            publication_phase = "interrupted"
+                            raise ForwardedSignal(deferred_signal)
+                        # The successful pending-signal drain is the explicit
+                        # commit point. Signals that arrive after it are
+                        # post-terminal even though they remain masked until
+                        # the commit-aware handlers are installed.
                         publication_phase = "committed"
                         receipt_committed = True
+                        receipt_signals = _install_post_terminal_signal_handlers()
+                        restore_signal_mask(publication_mask)
                 except BaseException as publication_error:
                     publication_phase = "cleanup"
                     block_forwarded_signals()

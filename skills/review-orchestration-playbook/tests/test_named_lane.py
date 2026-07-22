@@ -6897,6 +6897,58 @@ class NamedLaneGuardTest(unittest.TestCase):
         os.name == "posix" and hasattr(signal, "pthread_sigmask"),
         "receipt handoff requires POSIX signal masks",
     )
+    def test_signal_during_receipt_emission_rolls_back_output_pair(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable(
+            "import sys\n"
+            "sys.stdout.write('captured stdout')\n"
+            "sys.stderr.write('captured stderr')\n"
+        )
+        stdout_path = self.root / "receipt-signal.stdout"
+        stderr_path = self.root / "receipt-signal.stderr"
+        previous_handlers = {
+            forwarded: signal.getsignal(forwarded)
+            for forwarded in named_lane_runtime.forwarded_signals()
+        }
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        receipt_stdout = io.StringIO()
+
+        def interrupt_receipt(payload: dict[str, object]) -> None:
+            self.assertEqual(stdout_path.read_bytes(), b"captured stdout")
+            self.assertEqual(stderr_path.read_bytes(), b"captured stderr")
+            signal.raise_signal(signal.SIGTERM)
+            named_lane_runtime._emit_claude_receipt(payload)
+
+        with contextlib.redirect_stdout(receipt_stdout):
+            with self.assertRaises(ForwardedSignal) as raised:
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    command=(str(executable),),
+                    prompt=b"",
+                    timeout_seconds=5,
+                    stream_limit_bytes=64,
+                    _receipt_emitter=interrupt_receipt,
+                )
+
+        self.assertEqual(raised.exception.signum, signal.SIGTERM)
+        self.assertEqual(json.loads(receipt_stdout.getvalue())["status"], "complete")
+        self.assertFalse(stdout_path.exists())
+        self.assertFalse(stderr_path.exists())
+        self.assertEqual(tuple(self.root.glob(".named-lane-*")), ())
+        for forwarded, previous in previous_handlers.items():
+            self.assertEqual(signal.getsignal(forwarded), previous)
+        self.assertEqual(
+            signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+            previous_mask,
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "receipt handoff requires POSIX signal masks",
+    )
     def test_cli_signal_after_flushed_receipt_keeps_output_pair(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
         self.commit()
@@ -6913,6 +6965,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             for forwarded in named_lane_runtime.forwarded_signals()
         }
         previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        real_install = named_lane_runtime._install_post_terminal_signal_handlers
 
         class SignalAfterFlush(io.StringIO):
             flush_calls = 0
@@ -6920,10 +6973,12 @@ class NamedLaneGuardTest(unittest.TestCase):
             def flush(inner_self) -> None:
                 super().flush()
                 inner_self.flush_calls += 1
-                if inner_self.flush_calls == 1:
-                    handler = signal.getsignal(signal.SIGTERM)
-                    self.assertTrue(callable(handler))
-                    handler(signal.SIGTERM, None)
+
+        def signal_after_receipt_commit() -> list[signal.Signals]:
+            self.assertEqual(stdout.flush_calls, 1)
+            recorded = real_install()
+            signal.raise_signal(signal.SIGTERM)
+            return recorded
 
         stdout = SignalAfterFlush()
         stderr = io.StringIO()
@@ -6932,6 +6987,11 @@ class NamedLaneGuardTest(unittest.TestCase):
                 named_lane_runtime,
                 "_read_control_prompt",
                 return_value=b"",
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "_install_post_terminal_signal_handlers",
+                side_effect=signal_after_receipt_commit,
             ),
             contextlib.redirect_stdout(stdout),
             contextlib.redirect_stderr(stderr),
