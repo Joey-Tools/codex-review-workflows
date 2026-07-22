@@ -229,8 +229,19 @@ class PromptAndArgvTests(unittest.TestCase):
             validate_final_message(b"[P1] Concrete issue\n"),
             ("findings", "[P1] Concrete issue"),
         )
-        with self.assertRaises(ValueError):
-            validate_final_message(b"No findings.\n[P2] contradiction")
+        self.assertEqual(
+            validate_final_message(b"No findings.\n[P2] contradiction"),
+            ("findings", "No findings.\n[P2] contradiction"),
+        )
+        self.assertEqual(
+            validate_final_message(
+                b"[P2] The path emits `No findings.` before a real finding.\n"
+            ),
+            (
+                "findings",
+                "[P2] The path emits `No findings.` before a real finding.",
+            ),
+        )
 
 
 if __name__ == "__main__":

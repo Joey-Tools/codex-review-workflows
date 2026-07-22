@@ -254,6 +254,4 @@ def validate_final_message(value: bytes) -> tuple[str, str]:
         raise ValueError("final message is empty")
     if normalized == "No findings.":
         return "clean", normalized
-    if "No findings." in normalized:
-        raise ValueError("final message mixes the clean sentinel with other output")
     return "findings", normalized

@@ -951,3 +951,12 @@ metadata behavior.
   format check still reports the pre-existing `test_contracts.py` deviation;
   this change does not reformat that unrelated file. No local Python 3.10 run
   was performed.
+- The second formal fresh-context Codex review of
+  `bea5e7ad1312be1c15a0af7785eda74a8fb5282d..9e34b1539f0ec4293aafea651fe9497589ee57d0`
+  found that final-message validation rejected every non-clean finding that
+  quoted the exact `No findings.` sentinel. The validator now treats only an
+  exact normalized sentinel as clean and preserves every other non-empty
+  message as findings, including contradictory output and an inline quoted
+  sentinel. The focused 22-test prompt/app-server regression set, Ruff lint
+  and formatting, `git diff --check`, and all 345 deterministic supervisor
+  tests pass under Python 3.13.
