@@ -30,6 +30,7 @@ from review_supervisor.constants import (
 from review_supervisor.errors import SupervisorError
 from review_supervisor.gitraw import (
     CatFileBatch,
+    GitProcessClosureUnproven,
     RepositoryInfo,
     _parse_tree_record,
     add_detached_worktree,
@@ -40,6 +41,7 @@ from review_supervisor.gitraw import (
     inspect_repository,
     object_digest,
     remove_both_present_worktree,
+    retry_git_process_closure,
     sanitized_git_environment,
     verify_worktree_absent,
 )
@@ -262,6 +264,92 @@ def _kill_verified_process(pid: int, start_identity: str) -> None:
 
 
 class RawGitProtocolTests(unittest.TestCase):
+    def test_repository_inspection_preserves_unproven_git_closure(self) -> None:
+        process = SimpleNamespace(pid=123)
+        failure = GitProcessClosureUnproven(
+            process,
+            None,
+            TimeoutError("synthetic cleanup timeout"),
+        )
+        with (
+            owned_temporary_directory("git-inspection-closure-gap-") as root,
+            mock.patch.object(gitraw, "run_bounded", side_effect=failure),
+            self.assertRaises(GitProcessClosureUnproven) as raised,
+        ):
+            inspect_repository(
+                repo=root,
+                base_sha="a" * 40,
+                head_sha="b" * 40,
+                git_executable=str(GIT),
+            )
+        self.assertIs(raised.exception, failure)
+
+    def test_materializer_preserves_unproven_git_closure(self) -> None:
+        process = SimpleNamespace(pid=124)
+        failure = GitProcessClosureUnproven(
+            process,
+            None,
+            TimeoutError("synthetic cleanup timeout"),
+        )
+        materializer = RawMaterializer.__new__(RawMaterializer)
+        materializer.root_fd = -1
+        materializer.info = SimpleNamespace()
+        with (
+            mock.patch(
+                "review_supervisor.checkout.CatFileBatch",
+                side_effect=failure,
+            ),
+            self.assertRaises(GitProcessClosureUnproven) as raised,
+        ):
+            materializer.materialize()
+        self.assertIs(raised.exception, failure)
+
+    def test_materializer_retains_view_until_git_closure_is_proven(self) -> None:
+        process = SimpleNamespace(pid=125)
+        failure = GitProcessClosureUnproven(
+            process,
+            None,
+            TimeoutError("synthetic cleanup timeout"),
+        )
+        materializer = RawMaterializer.__new__(RawMaterializer)
+        materializer.root_fd = -1
+        materializer.info = SimpleNamespace()
+        materializer.head = SimpleNamespace(entries=())
+        materializer.semantics = SimpleNamespace()
+        materializer.graph = SimpleNamespace(head_targets={})
+        materializer.directories = {}
+        materializer.view_path = pathlib.Path("/tmp/synthetic-sanitized-view")
+        materializer.registration = SimpleNamespace(
+            worktree=pathlib.Path("/tmp/synthetic-worktree"),
+            registration=pathlib.Path("/tmp/synthetic-registration"),
+        )
+        materializer._seal_diff = mock.Mock(return_value=(SimpleNamespace(), "digest"))
+        materializer._verify_final_entry_set = mock.Mock()
+        batch = mock.MagicMock()
+        batch.__enter__.return_value = batch
+        with (
+            mock.patch(
+                "review_supervisor.checkout.CatFileBatch",
+                return_value=batch,
+            ),
+            mock.patch("review_supervisor.checkout._validate_symlink_graph"),
+            mock.patch("review_supervisor.checkout.create_sanitized_view"),
+            mock.patch(
+                "review_supervisor.checkout.check_attributes",
+                side_effect=failure,
+            ),
+            mock.patch("review_supervisor.checkout.os.lstat") as lstat,
+            mock.patch(
+                "review_supervisor.checkout.remove_sanitized_view"
+            ) as remove_view,
+            self.assertRaises(GitProcessClosureUnproven) as raised,
+        ):
+            materializer.materialize()
+
+        self.assertIs(raised.exception, failure)
+        lstat.assert_not_called()
+        remove_view.assert_not_called()
+
     def test_tree_parser_enforces_symlink_target_size_limit(self) -> None:
         object_id = b"a" * 40
         accepted = _parse_tree_record(
@@ -615,6 +703,88 @@ class RawGitProtocolTests(unittest.TestCase):
                 if descendant_pid is not None and descendant_identity is not None:
                     _kill_verified_process(descendant_pid, descendant_identity)
 
+    def test_bounded_git_cleanup_failure_remains_closure_unproven(self) -> None:
+        script = (
+            b"#!/bin/sh\n"
+            b"(trap '' TERM; exec /bin/sleep 30) </dev/null >/dev/null 2>&1 &\n"
+            b'printf \'%s %s\\n\' "$$" "$!" > "$0.pids"\n'
+            b"printf xx\n"
+            b"exec /bin/sleep 30\n"
+        )
+        with owned_temporary_directory("bounded-git-cleanup-gap-") as root:
+            executable = root / "fake-git"
+            executable.write_bytes(script)
+            executable.chmod(0o700)
+            pid_path = root / "fake-git.pids"
+            leader_pid: int | None = None
+            descendant_pid: int | None = None
+
+            selector_type = selectors.DefaultSelector
+
+            class CloseFailingSelector:
+                def __init__(self) -> None:
+                    self.inner = selector_type()
+
+                def __getattr__(self, name: str) -> object:
+                    return getattr(self.inner, name)
+
+                def close(self) -> None:
+                    self.inner.close()
+                    raise OSError("synthetic selector close failure")
+
+            try:
+                with (
+                    mock.patch.object(
+                        gitraw.selectors,
+                        "DefaultSelector",
+                        CloseFailingSelector,
+                    ),
+                    mock.patch.object(
+                        gitraw,
+                        "_terminate_process",
+                        side_effect=TimeoutError("synthetic cleanup timeout"),
+                    ),
+                    self.assertRaises(GitProcessClosureUnproven) as raised,
+                ):
+                    gitraw.run_bounded(
+                        (str(executable),),
+                        cwd=root,
+                        environment=sanitized_git_environment(),
+                        timeout=3,
+                        stdout_limit=1,
+                        stderr_limit=8192,
+                    )
+
+                deadline = time.monotonic() + 2
+                while not pid_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(pid_path.exists(), "bounded Git PIDs were not recorded")
+                leader_raw, descendant_raw = pid_path.read_text(
+                    encoding="ascii"
+                ).split()
+                leader_pid = int(leader_raw)
+                descendant_pid = int(descendant_raw)
+                self.assertEqual(raised.exception.pid, leader_pid)
+                self.assertIsNotNone(raised.exception.group_anchor)
+                self.assertIsInstance(raised.exception.__cause__, OverflowError)
+                self.assertTrue(retry_git_process_closure(raised.exception))
+                self.assertIsNotNone(raised.exception.process.returncode)
+            finally:
+                if leader_pid is not None:
+                    try:
+                        os.killpg(leader_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        raised.exception.process.wait(timeout=2)
+                    except (NameError, subprocess.TimeoutExpired):
+                        pass
+                if descendant_pid is not None:
+                    try:
+                        os.kill(descendant_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
     def test_bounded_git_selector_failure_terminates_same_group_child(
         self,
     ) -> None:
@@ -869,6 +1039,54 @@ class RawGitProtocolTests(unittest.TestCase):
 
 @unittest.skipUnless(GIT.is_file(), "/usr/bin/git is required")
 class RawGitCheckoutTests(unittest.TestCase):
+    def test_worktree_cleanup_does_not_write_after_unproven_git_closure(
+        self,
+    ) -> None:
+        process = SimpleNamespace(pid=125)
+        failure = GitProcessClosureUnproven(
+            process,
+            None,
+            TimeoutError("synthetic cleanup timeout"),
+        )
+        state = {
+            "worktree_path": "/tmp/review-worktree",
+            "checkout_parent_binding": {"path": "/tmp", "identity": {}},
+            "common_git_dir_binding": {
+                "path": "/tmp/repository.git",
+                "identity": {},
+            },
+        }
+        with (
+            mock.patch(
+                "review_supervisor.runtime._DIRECT_PROCESS_CLOSURE_UNPROVEN",
+                None,
+            ),
+            mock.patch(
+                "review_supervisor.runtime.open_absolute_directory_chain",
+                side_effect=failure,
+            ),
+            mock.patch(
+                "review_supervisor.runtime.retry_git_process_closure",
+                return_value=False,
+            ) as retry,
+            mock.patch("review_supervisor.runtime.read_attempt_state") as read_state,
+            mock.patch(
+                "review_supervisor.runtime._manual_worktree_recovery"
+            ) as recovery,
+            self.assertRaises(GitProcessClosureUnproven) as raised,
+        ):
+            _cleanup_worktree(
+                entrypoint=pathlib.Path("/tmp/entrypoint"),
+                attempt_dir=pathlib.Path("/tmp/attempt"),
+                lease_fd=-1,
+                state=state,
+                state_digest="digest",
+            )
+        self.assertIs(raised.exception, failure)
+        retry.assert_called_once_with(failure)
+        read_state.assert_not_called()
+        recovery.assert_not_called()
+
     def test_check_attributes_accepts_many_short_unspecified_paths(self) -> None:
         paths = tuple(f"p{index:03d}".encode("ascii") for index in range(200))
         output = b"".join(

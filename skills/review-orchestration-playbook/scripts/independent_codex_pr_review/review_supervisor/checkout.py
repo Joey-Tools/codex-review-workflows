@@ -14,6 +14,7 @@ from .constants import MAX_RAW_BLOB_BYTES, PRIMARY_DIFF_RELATIVE_PATH
 from .errors import SupervisorError, blocked, inconclusive
 from .gitraw import (
     CatFileBatch,
+    GitProcessClosureUnproven,
     RepositoryInfo,
     WorktreeRegistration,
     check_attributes,
@@ -845,6 +846,7 @@ class RawMaterializer:
             self._verify_final_entry_set(regular, symlinks, sealed_identity)
 
             view_complete = False
+            view_cleanup_allowed = True
             try:
                 create_sanitized_view(self.info, self.view_path)
                 view_complete = True
@@ -858,16 +860,20 @@ class RawMaterializer:
                     attribute_paths,
                 )
                 verify_index(self.info, self.registration, self.view_path, self.head)
+            except GitProcessClosureUnproven:
+                view_cleanup_allowed = False
+                raise
             finally:
-                try:
-                    os.lstat(self.view_path)
-                except FileNotFoundError:
-                    pass
-                else:
-                    remove_sanitized_view(
-                        self.view_path,
-                        allow_partial=not view_complete,
-                    )
+                if view_cleanup_allowed:
+                    try:
+                        os.lstat(self.view_path)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        remove_sanitized_view(
+                            self.view_path,
+                            allow_partial=not view_complete,
+                        )
             checkout_bytes = allocated_bytes(self.registration.worktree)
             git_bytes = allocated_bytes(self.registration.registration)
             if checkout_bytes > self.checkout_root_bound:
@@ -887,7 +893,7 @@ class RawMaterializer:
                 checkout_allocated_bytes=checkout_bytes,
                 git_admin_allocated_bytes=git_bytes,
             )
-        except SupervisorError:
+        except (SupervisorError, GitProcessClosureUnproven):
             raise
         except Exception as error:
             raise inconclusive(

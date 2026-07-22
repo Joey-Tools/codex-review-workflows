@@ -7,6 +7,7 @@ import signal
 import sys
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from review_supervisor.constants import (
@@ -18,13 +19,19 @@ from review_supervisor.constants import (
     SCHEMA_VERSION,
 )
 from review_supervisor.errors import SupervisorError, blocked
+from review_supervisor.gitraw import GitProcessClosureUnproven
 from review_supervisor.ledger import (
     acquire_retention_lease,
     read_attempt_state,
     reconcile_ledger,
 )
-from review_supervisor.process import await_exec, fork_exec
-from review_supervisor.runtime import _compact_terminal, _validate_terminal_lifecycle
+from review_supervisor.process import SpawnedProcess, await_exec, fork_exec
+from review_supervisor.runtime import (
+    DirectProcessClosureUnproven,
+    _compact_terminal,
+    _validate_terminal_lifecycle,
+    direct_process_closure_failure,
+)
 from review_supervisor.secureio import (
     allocated_bytes,
     boot_identifier,
@@ -36,6 +43,7 @@ from review_supervisor.secureio import (
 )
 from review_supervisor.supervisor import (
     _prepare_with_reclamation,
+    _prequiescence_abort,
     _publish_final_authorization,
     _reclaim_released_attempts,
     _require_primary_evidence_budget,
@@ -1497,6 +1505,69 @@ class ReclamationPolicyTests(unittest.TestCase):
 
 
 class IncompleteHandoffProcessTests(unittest.TestCase):
+    def test_cleanup_failure_latches_the_incomplete_handoff_receipt(self) -> None:
+        process = SpawnedProcess(
+            pid=123,
+            pgid=123,
+            acknowledgement_fd=-1,
+            passed_fd_numbers=(),
+            start_identity="darwin-proc-start:123:456",
+        )
+        with (
+            mock.patch(
+                "review_supervisor.runtime._DIRECT_PROCESS_CLOSURE_UNPROVEN",
+                None,
+            ),
+            mock.patch(
+                "review_supervisor.supervisor._terminate_incomplete_handoff_once",
+                side_effect=PermissionError("synthetic group cleanup failure"),
+            ) as terminate,
+        ):
+            with self.assertRaises(DirectProcessClosureUnproven) as raised:
+                _terminate_incomplete_handoff(process)
+            self.assertIs(direct_process_closure_failure(), raised.exception)
+        self.assertEqual(terminate.call_count, 2)
+        self.assertIs(raised.exception.process, process)
+
+    def test_prequiescence_abort_preserves_unproven_git_closure(self) -> None:
+        process = SimpleNamespace(pid=124)
+        failure = GitProcessClosureUnproven(
+            process,
+            None,
+            TimeoutError("synthetic cleanup timeout"),
+        )
+        state = {"prompt_path": "/tmp/synthetic-prompt"}
+        with (
+            mock.patch(
+                "review_supervisor.runtime._DIRECT_PROCESS_CLOSURE_UNPROVEN",
+                None,
+            ),
+            mock.patch(
+                "review_supervisor.supervisor.read_attempt_state",
+                return_value=(state, b"state", "digest"),
+            ),
+            mock.patch(
+                "review_supervisor.supervisor.commit_via_helper",
+                return_value=(state, "next-digest"),
+            ),
+            mock.patch(
+                "review_supervisor.supervisor.open_regular_nofollow",
+                side_effect=FileNotFoundError,
+            ),
+            mock.patch(
+                "review_supervisor.supervisor._cleanup_worktree",
+                side_effect=failure,
+            ),
+            self.assertRaises(GitProcessClosureUnproven) as raised,
+        ):
+            _prequiescence_abort(
+                entrypoint=ENTRYPOINT,
+                attempt_dir=pathlib.Path("/tmp/synthetic-attempt"),
+                lease=SimpleNamespace(fd=-1),
+                message="synthetic handoff failure",
+            )
+        self.assertIs(raised.exception, failure)
+
     def test_termination_reaches_a_sigterm_ignoring_grandchild(self) -> None:
         script = """
 import os

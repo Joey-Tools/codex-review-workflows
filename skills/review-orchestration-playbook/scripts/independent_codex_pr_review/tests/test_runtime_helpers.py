@@ -14,19 +14,29 @@ from review_supervisor.constants import (
     NAMED_LANE_ELIGIBLE,
     SCHEMA_VERSION,
 )
-from review_supervisor.errors import inconclusive
+from review_supervisor.errors import SupervisorError, inconclusive
 from review_supervisor.ledger import acquire_retention_lease, read_attempt_state
-from review_supervisor.process import TerminationSchedule, process_start_identity
+from review_supervisor.process import (
+    ForkedProcessClosureUnproven,
+    SpawnedProcess,
+    TerminationSchedule,
+    process_start_identity,
+)
 from review_supervisor.runtime import (
+    DirectProcessClosureUnproven,
     DurableProcessLifecycle,
     OuterAbandoned,
     PrelaunchWorkerClosureUnproven,
+    _kill_direct,
     _record_failure,
+    _run_checkout,
     _run_authenticated_review_boundary,
+    _spawn_internal,
     _validate_final_authorization_updates,
     authorize_terminal_via_helper,
     attempt_supervisor_main,
     commit_via_helper,
+    direct_process_closure_failure,
     publish_terminal_review,
     run_reviewer,
     settle_process_via_helper,
@@ -49,6 +59,231 @@ ENTRYPOINT = (
 
 
 class RuntimeHelperTests(unittest.TestCase):
+    def test_checkout_phase0_failure_reaps_worker_before_classification(self) -> None:
+        token = "01" * 32
+        worker = SpawnedProcess(
+            pid=123,
+            pgid=123,
+            acknowledgement_fd=-1,
+            passed_fd_numbers=(),
+            start_identity="darwin-proc-start:123:456",
+        )
+        parent = mock.Mock()
+        child = mock.Mock()
+        registration = SimpleNamespace(
+            descendant_count=0,
+            descendant_path_bytes=0,
+        )
+        records = (
+            {
+                "type": "worktree-created",
+                "token": token,
+                "registration": {"synthetic": True},
+            },
+            {
+                "type": "index-initialized",
+                "token": token,
+                "registration_descendant_count": 1,
+                "registration_descendant_path_bytes": 2,
+            },
+            {
+                "type": "checkout-failed",
+                "status": "inconclusive",
+                "stage": "checkout",
+                "code": "synthetic-phase0-failure",
+                "detached_process_closure": None,
+                "error": "synthetic phase-0 failure",
+            },
+        )
+
+        def commit(**kwargs: object) -> tuple[dict[str, object], str]:
+            next_state = dict(kwargs["state"])
+            next_state.update(kwargs["updates"])
+            return next_state, "next-digest"
+
+        with (
+            mock.patch(
+                "review_supervisor.runtime.socket_pair",
+                return_value=(parent, child),
+            ),
+            mock.patch(
+                "review_supervisor.runtime.os.urandom", return_value=b"\x01" * 32
+            ),
+            mock.patch(
+                "review_supervisor.runtime._spawn_internal",
+                return_value=worker,
+            ),
+            mock.patch("review_supervisor.runtime.await_exec"),
+            mock.patch(
+                "review_supervisor.runtime._wait_child_record",
+                side_effect=records,
+            ),
+            mock.patch("review_supervisor.runtime.send_record"),
+            mock.patch(
+                "review_supervisor.runtime.commit_via_helper",
+                side_effect=commit,
+            ),
+            mock.patch(
+                "review_supervisor.runtime._registration",
+                return_value=registration,
+            ),
+            mock.patch(
+                "review_supervisor.runtime._registration_json",
+                return_value={"synthetic": True},
+            ),
+            mock.patch("review_supervisor.runtime.wait_terminal") as wait_terminal,
+            mock.patch("review_supervisor.runtime.reap", return_value=1) as reap,
+            mock.patch("review_supervisor.runtime._terminate_group") as terminate,
+            self.assertRaises(SupervisorError) as raised,
+        ):
+            _run_checkout(
+                entrypoint=ENTRYPOINT,
+                attempt_dir=ENTRYPOINT.parent,
+                lease_fd=-1,
+                outer=mock.Mock(),
+                state={},
+                state_digest="initial-digest",
+                source_fd=-1,
+            )
+
+        self.assertEqual(raised.exception.failure.code, "synthetic-phase0-failure")
+        wait_terminal.assert_called_once_with(worker.pid, deadline=mock.ANY)
+        reap.assert_called_once_with(worker.pid, deadline=mock.ANY)
+        terminate.assert_not_called()
+
+    def test_direct_helper_cleanup_timeout_is_not_suppressed(self) -> None:
+        process = SpawnedProcess(
+            pid=123,
+            pgid=456,
+            acknowledgement_fd=-1,
+            passed_fd_numbers=(),
+            start_identity="darwin-proc-start:123:456",
+        )
+        with (
+            mock.patch(
+                "review_supervisor.runtime._DIRECT_PROCESS_CLOSURE_UNPROVEN",
+                None,
+            ),
+            mock.patch(
+                "review_supervisor.runtime.terminate_direct_process",
+                side_effect=TimeoutError("synthetic cleanup timeout"),
+            ),
+            self.assertRaises(DirectProcessClosureUnproven) as raised,
+        ):
+            _kill_direct(process)
+            self.fail("direct helper cleanup timeout did not fail closed")
+
+        with mock.patch(
+            "review_supervisor.runtime._DIRECT_PROCESS_CLOSURE_UNPROVEN",
+            raised.exception,
+        ):
+            self.assertIs(direct_process_closure_failure(), raised.exception)
+            with (
+                mock.patch("review_supervisor.runtime.fork_exec") as fork_exec,
+                self.assertRaises(DirectProcessClosureUnproven),
+            ):
+                _spawn_internal(
+                    entrypoint=ENTRYPOINT,
+                    mode="_phase-helper",
+                    arguments=(),
+                    cwd=ENTRYPOINT.parent,
+                    pass_fds=(),
+                    own_process_group=False,
+                )
+            fork_exec.assert_not_called()
+
+        self.assertIs(raised.exception.process, process)
+        self.assertIsInstance(raised.exception.__cause__, TimeoutError)
+
+        with (
+            mock.patch(
+                "review_supervisor.runtime._DIRECT_PROCESS_CLOSURE_UNPROVEN",
+                None,
+            ),
+            mock.patch(
+                "review_supervisor.runtime.terminate_direct_process",
+                side_effect=(TimeoutError("synthetic first timeout"), 0),
+            ) as terminate,
+        ):
+            _kill_direct(process)
+            self.assertIsNone(direct_process_closure_failure())
+        self.assertEqual(terminate.call_count, 2)
+
+        fork_failure = ForkedProcessClosureUnproven(
+            process,
+            ValueError("synthetic identity failure"),
+            PermissionError("synthetic cleanup failure"),
+        )
+        with (
+            mock.patch(
+                "review_supervisor.runtime._DIRECT_PROCESS_CLOSURE_UNPROVEN",
+                None,
+            ),
+            mock.patch(
+                "review_supervisor.runtime.fork_exec",
+                side_effect=fork_failure,
+            ),
+            self.assertRaises(DirectProcessClosureUnproven) as raised,
+        ):
+            _spawn_internal(
+                entrypoint=ENTRYPOINT,
+                mode="_phase-helper",
+                arguments=(),
+                cwd=ENTRYPOINT.parent,
+                pass_fds=(),
+                own_process_group=False,
+            )
+        self.assertIs(raised.exception.process, process)
+        self.assertIs(raised.exception.__cause__, fork_failure)
+
+        with (
+            mock.patch(
+                "review_supervisor.runtime._DIRECT_PROCESS_CLOSURE_UNPROVEN",
+                None,
+            ),
+            mock.patch(
+                "review_supervisor.runtime.terminate_direct_process",
+                side_effect=PermissionError("synthetic signaling failure"),
+            ),
+            self.assertRaises(DirectProcessClosureUnproven) as raised,
+        ):
+            _kill_direct(process)
+        self.assertIs(raised.exception.process, process)
+        self.assertIsInstance(raised.exception.__cause__, PermissionError)
+
+        with (
+            mock.patch(
+                "review_supervisor.runtime._DIRECT_PROCESS_CLOSURE_UNPROVEN",
+                None,
+            ),
+            mock.patch(
+                "review_supervisor.runtime.terminate_direct_process",
+                side_effect=(PermissionError("synthetic first failure"), 0),
+            ) as terminate,
+        ):
+            _kill_direct(process)
+            self.assertIsNone(direct_process_closure_failure())
+        self.assertEqual(terminate.call_count, 2)
+
+    def test_authenticated_review_boundary_preserves_unproven_helper(self) -> None:
+        process = SpawnedProcess(
+            pid=124,
+            pgid=456,
+            acknowledgement_fd=-1,
+            passed_fd_numbers=(),
+            start_identity="darwin-proc-start:124:456",
+        )
+        failure = DirectProcessClosureUnproven(process)
+        with (
+            mock.patch(
+                "review_supervisor.runtime.run_authenticated_review",
+                side_effect=failure,
+            ),
+            self.assertRaises(DirectProcessClosureUnproven) as raised,
+        ):
+            _run_authenticated_review_boundary()
+        self.assertIs(raised.exception, failure)
+
     def test_authenticated_review_boundary_drops_sensitive_traceback(self) -> None:
         marker = "sensitive-access-marker"
 
@@ -885,9 +1120,32 @@ class RuntimeHelperTests(unittest.TestCase):
                 peer.close()
 
     def test_handoff_complete_waits_for_exact_outer_ack_before_checkout(self) -> None:
-        for exact_ack in (False, True):
+        closure_process = SpawnedProcess(
+            pid=999,
+            pgid=999,
+            acknowledgement_fd=-1,
+            passed_fd_numbers=(),
+            start_identity="darwin-proc-start:999:1",
+        )
+        cases = (
+            ("bad-ack", False, RuntimeError("unused checkout"), True),
+            ("ordinary-checkout-failure", True, RuntimeError("stop after ACK"), True),
+            (
+                "helper-closure-unproven",
+                True,
+                DirectProcessClosureUnproven(closure_process),
+                False,
+            ),
+            (
+                "checkout-worker-closure-unproven",
+                True,
+                PrelaunchWorkerClosureUnproven("synthetic detached-process gap"),
+                False,
+            ),
+        )
+        for case, exact_ack, checkout_error, records_failure in cases:
             with (
-                self.subTest(exact_ack=exact_ack),
+                self.subTest(case=case),
                 owned_temporary_directory("handoff-final-ack-") as root,
             ):
                 attempt = root / "attempt"
@@ -920,7 +1178,15 @@ class RuntimeHelperTests(unittest.TestCase):
                 source_fd = os.open(source_path, os.O_RDONLY | os.O_CLOEXEC)
                 lease_fd = os.open(root / "lease", os.O_RDWR | os.O_CREAT, 0o600)
                 outer, peer = socket_pair()
-                checkout = mock.Mock(side_effect=RuntimeError("stop after ACK"))
+                checkout = mock.Mock(side_effect=checkout_error)
+                record_failure = mock.Mock(
+                    side_effect=RuntimeError("stop failure recording")
+                )
+                cleanup_worktree = mock.Mock(
+                    side_effect=AssertionError(
+                        "worktree cleanup followed unproven helper closure"
+                    )
+                )
                 thread_errors: list[BaseException] = []
 
                 def drive_outer() -> None:
@@ -1011,7 +1277,11 @@ class RuntimeHelperTests(unittest.TestCase):
                         ),
                         mock.patch(
                             "review_supervisor.runtime._record_failure",
-                            side_effect=RuntimeError("stop failure recording"),
+                            record_failure,
+                        ),
+                        mock.patch(
+                            "review_supervisor.runtime._cleanup_worktree",
+                            cleanup_worktree,
                         ),
                     ):
                         result = attempt_supervisor_main(
@@ -1023,6 +1293,8 @@ class RuntimeHelperTests(unittest.TestCase):
                         )
                     self.assertEqual(result, 2)
                     self.assertEqual(checkout.called, exact_ack)
+                    self.assertEqual(record_failure.called, records_failure)
+                    cleanup_worktree.assert_not_called()
                 finally:
                     driver.join(timeout=5)
                     peer.close()

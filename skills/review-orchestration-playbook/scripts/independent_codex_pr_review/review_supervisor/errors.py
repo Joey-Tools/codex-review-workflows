@@ -32,6 +32,10 @@ class SupervisorError(Exception):
         )
 
 
+class UnprovenDirectHelperClosure(RuntimeError):
+    """Marks a direct helper whose exact child-process closure is unknown."""
+
+
 def blocked(message: str, *, stage: str, code: str) -> SupervisorError:
     return SupervisorError(message, status="blocked", stage=stage, code=code)
 

@@ -39,8 +39,9 @@ from .evidence import (
     ManifestEntry,
     manifest_sha256 as evidence_manifest_sha256,
 )
-from .errors import SupervisorError, inconclusive
+from .errors import SupervisorError, UnprovenDirectHelperClosure, inconclusive
 from .gitraw import (
+    GitProcessClosureUnproven,
     WorktreeRegistration,
     add_detached_worktree,
     enumerate_registration,
@@ -49,12 +50,14 @@ from .gitraw import (
     inspect_repository,
     manifest_digest,
     remove_both_present_worktree,
+    retry_git_process_closure,
     verify_worktree_absent,
 )
 from .ledger import commit_state, read_attempt_state
 from .models import HelperCustody, Identity
 from .no_child_profile import LaunchedNoChildProcess
 from .process import (
+    ForkedProcessClosureUnproven,
     SpawnedProcess,
     TerminationSchedule,
     await_exec,
@@ -92,6 +95,11 @@ from .secureio import (
     validate_private_directory_fd,
 )
 from .settlement_state import publish_exact_process_settlement
+from .signal_relay import (
+    DeferredSignalInterrupt,
+    activate_deferred_signal_interrupt,
+    deactivate_deferred_signal_interrupt,
+)
 from .wire import (
     peer_is_open,
     receive_blob,
@@ -713,6 +721,45 @@ def _registration_json(value: WorktreeRegistration) -> dict[str, Any]:
     }
 
 
+class DirectProcessClosureUnproven(UnprovenDirectHelperClosure):
+    def __init__(self, process: SpawnedProcess) -> None:
+        self.process = process
+        super().__init__(
+            "direct helper process closure is unproven: "
+            f"pid={process.pid}, start_identity={process.start_identity}"
+        )
+
+
+_DIRECT_PROCESS_CLOSURE_UNPROVEN: DirectProcessClosureUnproven | None = None
+
+
+def _remember_direct_process_closure_failure(
+    failure: DirectProcessClosureUnproven,
+) -> DirectProcessClosureUnproven:
+    global _DIRECT_PROCESS_CLOSURE_UNPROVEN
+    if _DIRECT_PROCESS_CLOSURE_UNPROVEN is None:
+        _DIRECT_PROCESS_CLOSURE_UNPROVEN = failure
+    return _DIRECT_PROCESS_CLOSURE_UNPROVEN
+
+
+def latch_direct_process_closure_unproven(
+    process: SpawnedProcess,
+) -> DirectProcessClosureUnproven:
+    return _remember_direct_process_closure_failure(
+        DirectProcessClosureUnproven(process)
+    )
+
+
+def direct_process_closure_failure() -> DirectProcessClosureUnproven | None:
+    return _DIRECT_PROCESS_CLOSURE_UNPROVEN
+
+
+def require_direct_process_closure_proven() -> None:
+    failure = direct_process_closure_failure()
+    if failure is not None:
+        raise failure
+
+
 def _open_devnull() -> int:
     return os.open("/dev/null", os.O_RDWR | os.O_CLOEXEC)
 
@@ -724,8 +771,24 @@ def _kill_direct(process: SpawnedProcess) -> None:
             grace_seconds=1.0,
             deadline=time.monotonic() + 2.0,
         )
-    except (ChildProcessError, TimeoutError):
-        pass
+    except ChildProcessError:
+        return
+    except BaseException as first_error:
+        try:
+            terminate_direct_process(
+                process,
+                grace_seconds=0.0,
+                deadline=time.monotonic() + 5.0,
+            )
+        except ChildProcessError:
+            if not isinstance(first_error, Exception):
+                raise first_error
+        except BaseException as final_error:
+            failure = latch_direct_process_closure_unproven(process)
+            raise failure from final_error
+        else:
+            if not isinstance(first_error, Exception):
+                raise first_error
 
 
 def _spawn_internal(
@@ -737,18 +800,23 @@ def _spawn_internal(
     pass_fds: tuple[int, ...],
     own_process_group: bool,
 ) -> SpawnedProcess:
+    require_direct_process_closure_proven()
     devnull = _open_devnull()
     try:
         argv = (sys.executable, str(entrypoint), mode, *arguments)
-        return fork_exec(
-            argv,
-            cwd=cwd,
-            stdin_fd=devnull,
-            stdout_fd=devnull,
-            stderr_fd=devnull,
-            pass_fds=pass_fds,
-            own_process_group=own_process_group,
-        )
+        try:
+            return fork_exec(
+                argv,
+                cwd=cwd,
+                stdin_fd=devnull,
+                stdout_fd=devnull,
+                stderr_fd=devnull,
+                pass_fds=pass_fds,
+                own_process_group=own_process_group,
+            )
+        except ForkedProcessClosureUnproven as error:
+            failure = latch_direct_process_closure_unproven(error.process)
+            raise failure from error
     finally:
         os.close(devnull)
 
@@ -1855,6 +1923,69 @@ def publish_prompt_via_helper(
             _kill_direct(process)
 
 
+class CheckoutWorkerTermination(BaseException):
+    def __init__(self, signal_number: int) -> None:
+        self.signal_number = signal_number
+        super().__init__(f"checkout worker received signal {signal_number}")
+
+
+@dataclass(frozen=True)
+class CheckoutWorkerSignalGuard:
+    signals: tuple[int, ...]
+    previous_handlers: tuple[Any, ...]
+    previous_mask: set[signal.Signals]
+    interrupt: DeferredSignalInterrupt
+
+
+def _install_checkout_worker_signal_handlers() -> CheckoutWorkerSignalGuard:
+    handled = (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, handled)
+    previous_handlers: list[Any] = []
+    interrupt = DeferredSignalInterrupt(CheckoutWorkerTermination)
+
+    def terminate(signal_number: int, _frame: Any) -> None:
+        interrupt.request(signal_number)
+
+    try:
+        for signal_number in handled:
+            previous_handlers.append(signal.signal(signal_number, terminate))
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    except BaseException:
+        signal.pthread_sigmask(signal.SIG_BLOCK, handled)
+        for signal_number, previous in zip(
+            handled[: len(previous_handlers)],
+            previous_handlers,
+            strict=True,
+        ):
+            signal.signal(signal_number, previous)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        raise
+    return CheckoutWorkerSignalGuard(
+        signals=handled,
+        previous_handlers=tuple(previous_handlers),
+        previous_mask=previous_mask,
+        interrupt=interrupt,
+    )
+
+
+def _block_checkout_worker_signals(guard: CheckoutWorkerSignalGuard) -> None:
+    signal.pthread_sigmask(signal.SIG_BLOCK, guard.signals)
+
+
+def _restore_checkout_worker_signal_handlers(
+    guard: CheckoutWorkerSignalGuard,
+) -> None:
+    try:
+        for signal_number, previous in zip(
+            guard.signals,
+            guard.previous_handlers,
+            strict=True,
+        ):
+            signal.signal(signal_number, previous)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, guard.previous_mask)
+
+
 def checkout_worker_main(
     *,
     attempt_dir: pathlib.Path,
@@ -1864,7 +1995,11 @@ def checkout_worker_main(
 ) -> int:
     control = socket.socket(fileno=control_fd)
     materializer: RawMaterializer | None = None
+    signal_guard: CheckoutWorkerSignalGuard | None = None
+    signal_binding: Any | None = None
     try:
+        signal_guard = _install_checkout_worker_signal_handlers()
+        signal_binding = activate_deferred_signal_interrupt(signal_guard.interrupt)
         state, _, _ = read_attempt_state(attempt_dir)
         custody = _custody(state["helper_custody"])
         if identity_from_stat(os.fstat(source_fd)) != custody.source_identity:
@@ -1988,6 +2123,12 @@ def checkout_worker_main(
         return 0
     except BaseException as error:
         failure = error.failure if isinstance(error, SupervisorError) else None
+        detached_process_closure_unproven = isinstance(
+            error,
+            GitProcessClosureUnproven,
+        )
+        if detached_process_closure_unproven and retry_git_process_closure(error):
+            detached_process_closure_unproven = False
         try:
             send_record(
                 control,
@@ -1997,6 +2138,9 @@ def checkout_worker_main(
                     "status": failure.status if failure else "inconclusive",
                     "stage": failure.stage if failure else "checkout",
                     "code": failure.code if failure else "checkout-worker-failed",
+                    "detached_process_closure": (
+                        "unproven" if detached_process_closure_unproven else None
+                    ),
                     "error": failure.message
                     if failure
                     else f"{type(error).__name__}: {error}",
@@ -2007,10 +2151,18 @@ def checkout_worker_main(
             pass
         return 1
     finally:
-        if materializer is not None:
-            materializer.close()
-        os.close(source_fd)
-        control.close()
+        if signal_guard is not None:
+            _block_checkout_worker_signals(signal_guard)
+        try:
+            if materializer is not None:
+                materializer.close()
+            os.close(source_fd)
+            control.close()
+        finally:
+            if signal_guard is not None:
+                if signal_binding is not None:
+                    deactivate_deferred_signal_interrupt(signal_binding)
+                _restore_checkout_worker_signal_handlers(signal_guard)
 
 
 class OuterAbandoned(RuntimeError):
@@ -2530,6 +2682,8 @@ def _run_authenticated_review_boundary(
 ) -> tuple[AuthenticatedReviewResult | None, bool]:
     try:
         return run_authenticated_review(**arguments), False
+    except UnprovenDirectHelperClosure:
+        raise
     except BaseException:
         return None, True
 
@@ -2694,6 +2848,30 @@ def _run_checkout(
     parent, child = socket_pair()
     token = os.urandom(32).hex()
     worker: SpawnedProcess | None = None
+
+    def raise_worker_failure(record: dict[str, Any]) -> None:
+        nonlocal worker
+        if worker is None:
+            raise ValueError("checkout worker failure has no process owner")
+        wait_terminal(worker.pid, deadline=deadline)
+        exit_code = reap(worker.pid, deadline=deadline)
+        worker = None
+        if exit_code == 0:
+            raise ValueError("checkout worker reported failure with a zero exit")
+        closure = record.get("detached_process_closure")
+        if closure == "unproven":
+            raise PrelaunchWorkerClosureUnproven(
+                "checkout worker reported unproven detached-process closure"
+            )
+        if closure is not None:
+            raise ValueError("checkout worker closure evidence is malformed")
+        raise SupervisorError(
+            record.get("error", "checkout worker failed"),
+            status=record.get("status", "inconclusive"),
+            stage=record.get("stage", "checkout"),
+            code=record.get("code", "checkout-worker-failed"),
+        )
+
     try:
         worker = _spawn_internal(
             entrypoint=entrypoint,
@@ -2716,12 +2894,7 @@ def _run_checkout(
         await_exec(worker, deadline=deadline)
         created = _wait_child_record(child=parent, outer=outer, deadline=deadline)
         if created.get("type") == "checkout-failed":
-            raise SupervisorError(
-                created.get("error", "checkout worker failed"),
-                status=created.get("status", "inconclusive"),
-                stage=created.get("stage", "checkout"),
-                code=created.get("code", "checkout-worker-failed"),
-            )
+            raise_worker_failure(created)
         if created.get("type") != "worktree-created" or created.get("token") != token:
             raise ValueError("checkout worker registration record is invalid")
         registration_value = created.get("registration")
@@ -2747,12 +2920,7 @@ def _run_checkout(
             child=parent, outer=outer, deadline=deadline
         )
         if index_complete.get("type") == "checkout-failed":
-            raise SupervisorError(
-                index_complete.get("error", "checkout worker failed"),
-                status=index_complete.get("status", "inconclusive"),
-                stage=index_complete.get("stage", "checkout"),
-                code=index_complete.get("code", "checkout-worker-failed"),
-            )
+            raise_worker_failure(index_complete)
         if (
             index_complete.get("type") != "index-initialized"
             or index_complete.get("token") != token
@@ -2786,12 +2954,7 @@ def _run_checkout(
         )
         phase0 = _wait_child_record(child=parent, outer=outer, deadline=deadline)
         if phase0.get("type") == "checkout-failed":
-            raise SupervisorError(
-                phase0.get("error", "checkout worker failed"),
-                status=phase0.get("status", "inconclusive"),
-                stage=phase0.get("stage", "checkout"),
-                code=phase0.get("code", "checkout-worker-failed"),
-            )
+            raise_worker_failure(phase0)
         if phase0.get("type") != "phase0-complete" or phase0.get("token") != token:
             raise ValueError("checkout worker phase-0 record is invalid")
         state, state_digest = commit_via_helper(
@@ -2814,12 +2977,7 @@ def _run_checkout(
         )
         complete = _wait_child_record(child=parent, outer=outer, deadline=deadline)
         if complete.get("type") == "checkout-failed":
-            raise SupervisorError(
-                complete.get("error", "checkout worker failed"),
-                status=complete.get("status", "inconclusive"),
-                stage=complete.get("stage", "checkout"),
-                code=complete.get("code", "checkout-worker-failed"),
-            )
+            raise_worker_failure(complete)
         if (
             complete.get("type") != "checkout-complete"
             or complete.get("token") != token
@@ -2855,10 +3013,14 @@ def _run_checkout(
             try:
                 _terminate_group(worker)
             except BaseException as cleanup_error:
+                if isinstance(error, UnprovenDirectHelperClosure):
+                    raise error from cleanup_error
                 raise PrelaunchWorkerClosureUnproven(
                     "checkout worker group closure is unproven"
                 ) from cleanup_error
             worker = None
+            if isinstance(error, UnprovenDirectHelperClosure):
+                raise
             raise PrelaunchWorkerClosureUnproven(
                 "checkout worker descendants cannot be proven absent"
             ) from error
@@ -3034,6 +3196,7 @@ def _cleanup_worktree(
     state: dict[str, Any],
     state_digest: str,
 ) -> tuple[dict[str, Any], str]:
+    require_direct_process_closure_proven()
     worktree = pathlib.Path(state["worktree_path"])
     registration_value = state.get("registration")
     checkout_parent_fd: int | None = None
@@ -3466,6 +3629,13 @@ def _cleanup_worktree(
         )
         return state, state_digest
     except BaseException as error:
+        if isinstance(error, UnprovenDirectHelperClosure):
+            raise
+        if isinstance(
+            error, GitProcessClosureUnproven
+        ) and not retry_git_process_closure(error):
+            raise
+        require_direct_process_closure_proven()
         disk_state, _, disk_digest = read_attempt_state(attempt_dir)
         return _manual_worktree_recovery(
             entrypoint=entrypoint,
@@ -3844,6 +4014,14 @@ def attempt_supervisor_main(
         if isinstance(error, OuterAbandoned):
             abandoned = True
         if (
+            isinstance(
+                error,
+                (UnprovenDirectHelperClosure, PrelaunchWorkerClosureUnproven),
+            )
+            or direct_process_closure_failure() is not None
+        ):
+            state = None
+        elif (
             state is not None
             and state_digest is not None
             and state.get("handoff") == "complete"
@@ -3876,6 +4054,7 @@ def attempt_supervisor_main(
         os.close(lease_fd)
         return 2
     try:
+        require_direct_process_closure_proven()
         state, state_digest = _cleanup_worktree(
             entrypoint=entrypoint,
             attempt_dir=attempt_dir,

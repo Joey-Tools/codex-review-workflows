@@ -20,6 +20,7 @@ from review_supervisor.auth_refresh import (
     ManagedAuthRefreshResult,
 )
 from review_supervisor.direct_gate import AppServerProcessResult, ProcessCustodyState
+from review_supervisor.errors import UnprovenDirectHelperClosure
 from review_supervisor.no_child_profile import LaunchedNoChildProcess
 from review_supervisor import review_execution as execution
 
@@ -882,6 +883,43 @@ class ReviewExecutionTests(unittest.TestCase):
             )
         self.assertFalse(any(event[0] == "closed" for event in lifecycle.events))
         self.assertTrue(lease.retained)
+
+    def test_unproven_lifecycle_helper_skips_custody_cleanup(self) -> None:
+        process = _launched()
+        lifecycle = Mock()
+        lifecycle.closed.side_effect = UnprovenDirectHelperClosure(
+            "synthetic direct-helper closure gap"
+        )
+        custody = Mock()
+        writable_roots = Mock()
+        lease = _Lease(pathlib.Path("/unused"))
+        state = ProcessCustodyState(
+            process_id=process.pid,
+            process_group_id=process.pgid,
+            leader_reaped=True,
+            process_group_empty=True,
+            pipes_closed=True,
+            exit_code=17,
+        )
+
+        with self.assertRaises(UnprovenDirectHelperClosure):
+            execution._finalize_custodied_stage(
+                stage="reviewer",
+                custody=custody,
+                writable_roots=writable_roots,
+                handoff_token="e" * 64,
+                state=state,
+                launched=process,
+                lifecycle=lifecycle,
+                lifecycle_launched=True,
+                completed=False,
+                lease=lease,
+            )
+
+        self.assertTrue(lease.retained)
+        writable_roots.close.assert_called_once()
+        custody.confirm_process_quiescence.assert_not_called()
+        custody.cleanup.assert_not_called()
 
     def test_settlement_does_not_signal_a_reaped_leader_process_group(self) -> None:
         process = _launched()

@@ -27,6 +27,22 @@ class SpawnedProcess:
     start_identity: str | None = None
 
 
+class ForkedProcessClosureUnproven(RuntimeError):
+    def __init__(
+        self,
+        process: SpawnedProcess,
+        identity_error: BaseException,
+        cleanup_error: BaseException,
+    ) -> None:
+        self.process = process
+        super().__init__(
+            "post-fork process closure is unproven: "
+            f"pid={process.pid}, "
+            f"identity_error={type(identity_error).__name__}, "
+            f"cleanup_error={type(cleanup_error).__name__}"
+        )
+
+
 @dataclass(frozen=True)
 class AuthenticatedNoChildProcessProfile:
     leader_pid: int
@@ -101,6 +117,32 @@ def _safe_duplicates(fds: Sequence[int]) -> list[int]:
     return duplicates
 
 
+def _settle_unidentified_fork(
+    process: SpawnedProcess,
+    *,
+    own_process_group: bool,
+    deadline: float,
+) -> None:
+    try:
+        os.kill(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    wait_terminal(process.pid, deadline=deadline)
+    if own_process_group:
+        while True:
+            members = process_group_members(process.pid, deadline=deadline)
+            if not any(pid != process.pid for pid in members):
+                break
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError("post-fork process-group cleanup timed out")
+            time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+    reap(process.pid, deadline=deadline)
+
+
 def fork_exec(
     argv: Sequence[str],
     *,
@@ -120,17 +162,38 @@ def fork_exec(
         os.close(ack_write)
         try:
             start_identity = process_start_identity(pid)
-        except BaseException:
+        except BaseException as identity_error:
             os.close(ack_read)
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            try:
-                os.waitpid(pid, 0)
-            except ChildProcessError:
-                pass
-            raise
+            process = SpawnedProcess(
+                pid=pid,
+                pgid=pid if own_process_group else os.getpgrp(),
+                acknowledgement_fd=-1,
+                passed_fd_numbers=passed_targets,
+                start_identity=None,
+            )
+            cleanup_error: BaseException | None = None
+            cleanup_control_flow: BaseException | None = None
+            for cleanup_seconds in (2.0, 5.0):
+                try:
+                    _settle_unidentified_fork(
+                        process,
+                        own_process_group=own_process_group,
+                        deadline=time.monotonic() + cleanup_seconds,
+                    )
+                except BaseException as error:
+                    cleanup_error = error
+                    if not isinstance(error, Exception):
+                        cleanup_control_flow = error
+                    continue
+                if cleanup_control_flow is not None:
+                    raise cleanup_control_flow
+                raise identity_error
+            assert cleanup_error is not None
+            raise ForkedProcessClosureUnproven(
+                process,
+                identity_error,
+                cleanup_error,
+            ) from cleanup_error
         return SpawnedProcess(
             pid=pid,
             pgid=pid if own_process_group else os.getpgrp(),

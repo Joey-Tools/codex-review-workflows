@@ -3,11 +3,94 @@ from __future__ import annotations
 import os
 import signal
 import threading
+from contextvars import ContextVar, Token
 from types import FrameType
-from typing import Any
+from typing import Any, Callable
 
 
 OWNED_TERMINATION_SIGNALS = (signal.SIGHUP, signal.SIGTERM, signal.SIGQUIT)
+
+
+class DeferredSignalInterrupt:
+    """Delay one signal exception across a process-ownership critical section."""
+
+    def __init__(self, exception_factory: Callable[[int], BaseException]) -> None:
+        self._exception_factory = exception_factory
+        self._defer_depth = 0
+        self._requested_signal: int | None = None
+        self._delivered = False
+
+    def request(self, signal_number: int) -> None:
+        if self._delivered:
+            return
+        if self._requested_signal is None:
+            self._requested_signal = signal_number
+        if self._defer_depth == 0:
+            self.checkpoint()
+
+    def checkpoint(self, *, force: bool = False) -> None:
+        if (
+            (self._defer_depth != 0 and not force)
+            or self._requested_signal is None
+            or self._delivered
+        ):
+            return
+        self._delivered = True
+        raise self._exception_factory(self._requested_signal)
+
+    def begin_deferral(self) -> None:
+        self._defer_depth += 1
+
+    def end_deferral(self) -> None:
+        if self._defer_depth <= 0:
+            raise RuntimeError("signal-interrupt deferral is not active")
+        self._defer_depth -= 1
+
+
+class DeferredSignalScope:
+    def __init__(self, interrupt: DeferredSignalInterrupt) -> None:
+        self._interrupt = interrupt
+        self._active = True
+        interrupt.begin_deferral()
+
+    def finish(self, *, deliver: bool = True) -> None:
+        if not self._active:
+            return
+        self._interrupt.end_deferral()
+        self._active = False
+        if deliver:
+            self._interrupt.checkpoint()
+
+
+_BOUND_SIGNAL_INTERRUPT: ContextVar[DeferredSignalInterrupt | None] = ContextVar(
+    "bounded_git_signal_interrupt",
+    default=None,
+)
+
+
+def activate_deferred_signal_interrupt(
+    interrupt: DeferredSignalInterrupt,
+) -> Token[DeferredSignalInterrupt | None]:
+    return _BOUND_SIGNAL_INTERRUPT.set(interrupt)
+
+
+def deactivate_deferred_signal_interrupt(
+    token: Token[DeferredSignalInterrupt | None],
+) -> None:
+    _BOUND_SIGNAL_INTERRUPT.reset(token)
+
+
+def begin_bound_signal_deferral() -> DeferredSignalScope | None:
+    interrupt = _BOUND_SIGNAL_INTERRUPT.get()
+    if interrupt is None:
+        return None
+    return DeferredSignalScope(interrupt)
+
+
+def checkpoint_bound_signal_interrupt(*, force: bool = False) -> None:
+    interrupt = _BOUND_SIGNAL_INTERRUPT.get()
+    if interrupt is not None:
+        interrupt.checkpoint(force=force)
 
 
 class ForwardedHostSignal(BaseException):

@@ -756,3 +756,56 @@ metadata behavior.
   changed-file formatting, Python 3.13 compileall, project-journal validation,
   the official skill validator, and `git diff --check` pass. No local Python
   3.10 run was performed.
+- Fresh-context review of `faa78095bb7d0b8d0e51562f68adb051885636e0`
+  found that the checkout worker's own process group did not own the fresh Git
+  sessions launched beneath it, and that a timed-out direct helper could be
+  forgotten before another lease-bearing state helper started. Checkout workers
+  now install cancellation ownership before the first Git process, defer signal
+  delivery to bounded lifecycle checkpoints, retain exact Git process handles
+  and group anchors across cleanup failure, and make one fresh closure retry.
+  A still-unproven closure is explicit evidence that prevents later failure
+  writers and worktree cleanup. Direct helpers likewise receive a second bounded
+  termination attempt; any final signaling, waiting, or reaping uncertainty is
+  latched process-wide and prevents later helpers, recovery, custody deletion,
+  or destructive cleanup.
+- Follow-up source audit found four propagation gaps before the replacement
+  commit. The phase-0 worker failure path did not reap and classify through the
+  common closure record; repository inspection and raw materialization wrapped
+  `GitProcessClosureUnproven` as ordinary validation failures; final worktree
+  cleanup could write manual-recovery state after an unproven Git cleanup; and
+  the direct-helper latch covered repeated timeouts but not other signaling or
+  wait failures. All four boundaries now preserve or freshly settle the closure
+  marker before any writer. Python 3.13 passes the 5 exact regressions, the
+  93-test combined Git/runtime/review/supervisor set, and the expanded
+  327-test deterministic supervisor gate in 107.901 seconds. No local Python
+  3.10 run was performed.
+- An intermediate pre-commit validation used only Python 3.13. The complete host-level
+  suite passed all 2,299 tests in 429.182 seconds with 6 expected
+  platform/filesystem skips. The 60 repository contract tests, Ruff lint and
+  changed-file format gates, compileall, project-journal validation, the
+  official skill validator, and `git diff --check` pass. The host Python 3.13
+  installation does not include PyYAML, so the official validator ran in a
+  Python 3.13 `uv --with pyyaml` environment. No local Python 3.10 run was
+  performed.
+- Two follow-up read-only marker-propagation audits found five additional
+  fail-closed gaps after that intermediate full-suite pass. A post-fork identity
+  failure could lose its child receipt; incomplete attempt-supervisor handoff
+  cleanup could discard a still-live group; sanitized-view cleanup could delete
+  paths before Git closure retry; `run_bounded()` finalizers could replace the
+  receipt-bearing marker; and pre-handoff abort could swallow an unresolved Git
+  closure. Fork failures now retain a partial `SpawnedProcess`, make two bounded
+  PID/original-group settlement attempts before reap, and enter the same
+  process-wide latch on final failure. Incomplete handoff proves the entire
+  anchored group empty, sanitized views remain retained while Git closure is
+  unknown, finalizer diagnostics cannot replace the marker, and pre-handoff
+  abort promotes the closure gap into the outer terminal result. Eight exact
+  Python 3.13 regressions pass, and deterministic discovery is pinned at 331
+  tests. No local Python 3.10 run was performed.
+- Final post-audit validation used only Python 3.13. The complete host-level
+  suite passed all 2,299 tests in 417.109 seconds with 6 expected
+  platform/filesystem skips; the 331-test deterministic supervisor gate passed
+  in 116.759 seconds, and the 97-test combined Git/runtime/review/supervisor set
+  passed in 61.943 seconds. The 60 contract tests, Ruff lint and changed-file
+  formatting, compileall, project-journal validation, the official skill
+  validator, and `git diff --check` pass. No local Python 3.10 run was
+  performed.

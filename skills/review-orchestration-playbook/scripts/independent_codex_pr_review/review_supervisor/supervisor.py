@@ -29,8 +29,18 @@ from .constants import (
     UNSUPPORTED_CLAUSES,
 )
 from .custody import CustodyHandles, authenticate_helper_state
-from .errors import SupervisorError, blocked, inconclusive
-from .gitraw import enumerate_tree, inspect_repository, manifest_digest
+from .errors import (
+    SupervisorError,
+    UnprovenDirectHelperClosure,
+    blocked,
+    inconclusive,
+)
+from .gitraw import (
+    GitProcessClosureUnproven,
+    enumerate_tree,
+    inspect_repository,
+    manifest_digest,
+)
 from .ledger import (
     RetentionLease,
     acquire_retention_lease,
@@ -41,7 +51,9 @@ from .ledger import (
 )
 from .models import Identity
 from .process import (
+    ForkedProcessClosureUnproven,
     SpawnedProcess,
+    anchored_group_members,
     await_exec,
     fork_exec,
     process_start_identity,
@@ -74,7 +86,10 @@ from .runtime import (
     build_final_authorization_rewrite,
     commit_via_helper,
     complete_final_authorization_rewrite,
+    direct_process_closure_failure,
+    latch_direct_process_closure_unproven,
     publish_prompt_via_helper,
+    require_direct_process_closure_proven,
     validate_final_authorization_rewrite,
 )
 from .secureio import (
@@ -394,6 +409,7 @@ def _spawn_attempt_supervisor(
     lease_fd: int,
     token: str,
 ) -> SpawnedProcess:
+    require_direct_process_closure_proven()
     devnull = os.open("/dev/null", os.O_RDWR | os.O_CLOEXEC)
     try:
         argv = (
@@ -411,26 +427,63 @@ def _spawn_attempt_supervisor(
             "--handoff-token",
             token,
         )
-        return fork_exec(
-            argv,
-            cwd=attempt_dir,
-            stdin_fd=devnull,
-            stdout_fd=devnull,
-            stderr_fd=devnull,
-            pass_fds=(control_child.fileno(), lease_fd),
-            own_process_group=True,
-        )
+        try:
+            return fork_exec(
+                argv,
+                cwd=attempt_dir,
+                stdin_fd=devnull,
+                stdout_fd=devnull,
+                stderr_fd=devnull,
+                pass_fds=(control_child.fileno(), lease_fd),
+                own_process_group=True,
+            )
+        except ForkedProcessClosureUnproven as error:
+            failure = latch_direct_process_closure_unproven(error.process)
+            raise failure from error
     finally:
         os.close(devnull)
 
 
-def _terminate_incomplete_handoff(process: SpawnedProcess) -> int:
-    deadline = time.monotonic() + 5
+def _terminate_incomplete_handoff_once(
+    process: SpawnedProcess,
+    *,
+    deadline: float,
+) -> int:
     signal_anchored_group(process, signal.SIGTERM)
     time.sleep(0.05)
     signal_anchored_group(process, signal.SIGKILL)
     wait_terminal(process.pid, deadline=deadline)
+    while True:
+        members = anchored_group_members(process, deadline=deadline)
+        if not any(pid != process.pid for pid in members):
+            break
+        signal_anchored_group(process, signal.SIGKILL)
+        if time.monotonic() >= deadline:
+            raise TimeoutError("incomplete-handoff process group survived cleanup")
+        time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
     return reap(process.pid, deadline=deadline)
+
+
+def _terminate_incomplete_handoff(process: SpawnedProcess) -> int:
+    cleanup_error: BaseException | None = None
+    cleanup_control_flow: BaseException | None = None
+    for cleanup_seconds in (2.0, 5.0):
+        try:
+            exit_code = _terminate_incomplete_handoff_once(
+                process,
+                deadline=time.monotonic() + cleanup_seconds,
+            )
+        except BaseException as error:
+            cleanup_error = error
+            if not isinstance(error, Exception):
+                cleanup_control_flow = error
+            continue
+        if cleanup_control_flow is not None:
+            raise cleanup_control_flow
+        return exit_code
+    assert cleanup_error is not None
+    failure = latch_direct_process_closure_unproven(process)
+    raise failure from cleanup_error
 
 
 def _acquire_source_custody_via_helper(
@@ -439,6 +492,7 @@ def _acquire_source_custody_via_helper(
     prepared: PreparedRun,
     deadline: float,
 ) -> CustodyHandles:
+    require_direct_process_closure_proven()
     parent, child = socket_pair()
     token = os.urandom(32).hex()
     process: SpawnedProcess | None = None
@@ -462,15 +516,19 @@ def _acquire_source_custody_via_helper(
             "--token",
             token,
         )
-        process = fork_exec(
-            argv,
-            cwd=prepared.attempt_dir,
-            stdin_fd=devnull,
-            stdout_fd=devnull,
-            stderr_fd=devnull,
-            pass_fds=(child.fileno(),),
-            own_process_group=False,
-        )
+        try:
+            process = fork_exec(
+                argv,
+                cwd=prepared.attempt_dir,
+                stdin_fd=devnull,
+                stdout_fd=devnull,
+                stderr_fd=devnull,
+                pass_fds=(child.fileno(),),
+                own_process_group=False,
+            )
+        except ForkedProcessClosureUnproven as error:
+            failure = latch_direct_process_closure_unproven(error.process)
+            raise failure from error
         child.close()
         await_exec(process, deadline=deadline)
         ready, _ = receive_record(parent, deadline=deadline)
@@ -540,6 +598,7 @@ def _prequiescence_abort(
     lease: RetentionLease,
     message: str,
 ) -> None:
+    require_direct_process_closure_proven()
     try:
         state, _, digest = read_attempt_state(attempt_dir)
         state, digest = commit_via_helper(
@@ -595,6 +654,8 @@ def _prequiescence_abort(
             state=state,
             state_digest=digest,
         )
+    except (GitProcessClosureUnproven, UnprovenDirectHelperClosure):
+        raise
     except BaseException:
         return
 
@@ -1223,7 +1284,8 @@ def run(
                     final_authorization_exact=True,
                 )
         return exit_code, summary
-    except BaseException as error:
+    except BaseException as caught_error:
+        failure_error = caught_error
         if custody is not None:
             custody.close()
             custody = None
@@ -1242,6 +1304,9 @@ def run(
                 try:
                     _terminate_incomplete_handoff(supervisor)
                     incomplete_handoff_writers_stopped = True
+                except UnprovenDirectHelperClosure as closure_error:
+                    failure_error = closure_error
+                    incomplete_handoff_writers_stopped = False
                 except BaseException:
                     incomplete_handoff_writers_stopped = False
             supervisor = None
@@ -1250,14 +1315,27 @@ def run(
             and not ownership_complete
             and incomplete_handoff_writers_stopped
             and lease.fd >= 0
+            and not isinstance(failure_error, UnprovenDirectHelperClosure)
+            and direct_process_closure_failure() is None
         ):
-            _prequiescence_abort(
-                entrypoint=entrypoint,
-                attempt_dir=attempt_dir,
-                lease=lease,
-                message=f"{type(error).__name__}: {error}",
-            )
-        failure = error.failure if isinstance(error, SupervisorError) else None
+            try:
+                _prequiescence_abort(
+                    entrypoint=entrypoint,
+                    attempt_dir=attempt_dir,
+                    lease=lease,
+                    message=(f"{type(failure_error).__name__}: {failure_error}"),
+                )
+            except (
+                GitProcessClosureUnproven,
+                UnprovenDirectHelperClosure,
+            ) as closure_error:
+                failure_error = closure_error
+                incomplete_handoff_writers_stopped = False
+        failure = (
+            failure_error.failure
+            if isinstance(failure_error, SupervisorError)
+            else None
+        )
         return 2, {
             "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
             "named_lane_eligible": NAMED_LANE_ELIGIBLE,
@@ -1267,7 +1345,7 @@ def run(
             "failure_code": failure.code if failure else "outer-supervisor-failed",
             "message": failure.message
             if failure
-            else f"{type(error).__name__}: {error}",
+            else f"{type(failure_error).__name__}: {failure_error}",
             "attempt_dir": str(attempt_dir) if attempt_dir else None,
             "unsupported_clauses": list(UNSUPPORTED_CLAUSES),
         }

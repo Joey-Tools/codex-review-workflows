@@ -41,6 +41,11 @@ from .secureio import (
     read_fd_exact,
     validate_private_directory_fd,
 )
+from .signal_relay import (
+    DeferredSignalScope,
+    begin_bound_signal_deferral,
+    checkpoint_bound_signal_interrupt,
+)
 
 
 CAT_FILE_CLOSE_TIMEOUT_SECONDS = 5.0
@@ -48,6 +53,43 @@ CAT_FILE_READ_TIMEOUT_SECONDS = 30.0
 CAT_FILE_STDERR_LIMIT_BYTES = 8192
 PROCESS_GROUP_TERMINATE_GRACE_SECONDS = 0.1
 PROCESS_GROUP_CLEANUP_TIMEOUT_SECONDS = 2.0
+
+
+class GitProcessClosureUnproven(RuntimeError):
+    def __init__(
+        self,
+        process: subprocess.Popen[bytes],
+        group_anchor: SpawnedProcess | None,
+        cleanup_error: BaseException,
+    ) -> None:
+        self.process = process
+        self.pid = process.pid
+        self.group_anchor = group_anchor
+        identity = (
+            group_anchor.start_identity if group_anchor is not None else "unbound"
+        )
+        super().__init__(
+            "Git process closure is unproven: "
+            f"pid={process.pid}, start_identity={identity}, "
+            f"cleanup_error={type(cleanup_error).__name__}"
+        )
+
+
+def retry_git_process_closure(failure: GitProcessClosureUnproven) -> bool:
+    process = failure.process
+    try:
+        if process.returncode is None:
+            if failure.group_anchor is None:
+                _abort_unanchored_fresh_session(process)
+            else:
+                _terminate_process(process, group_anchor=failure.group_anchor)
+    except BaseException:
+        return False
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None and not stream.closed:
+            stream.close()
+    checkpoint_bound_signal_interrupt(force=True)
+    return True
 
 
 @dataclass(frozen=True)
@@ -231,21 +273,26 @@ def run_bounded(
     stderr_limit: int,
     input_bytes: bytes | None = None,
 ) -> tuple[int, bytes, bytes]:
-    process = subprocess.Popen(
-        argv,
-        cwd=cwd,
-        env=environment,
-        stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        close_fds=True,
-        start_new_session=True,
-    )
+    process: subprocess.Popen[bytes] | None = None
     group_anchor: SpawnedProcess | None = None
     selector: selectors.BaseSelector | None = None
     returncode: int | None = None
+    signal_scope = begin_bound_signal_deferral()
+    pending_error: BaseException | None = None
+    closure_failure: GitProcessClosureUnproven | None = None
     try:
+        process = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=environment,
+            stdin=(subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            start_new_session=True,
+        )
         group_anchor = _bind_fresh_session(process)
+        checkpoint_bound_signal_interrupt(force=True)
         if (
             process.stdout is None
             or process.stderr is None
@@ -270,10 +317,12 @@ def run_bounded(
             selector.register(input_fd, selectors.EVENT_WRITE)
         deadline = time.monotonic() + timeout
         while selector.get_map():
+            checkpoint_bound_signal_interrupt(force=True)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("bounded Git command timed out")
             events = selector.select(min(remaining, 0.25))
+            checkpoint_bound_signal_interrupt(force=True)
             for key, _ in events:
                 fd = key.fd
                 if input_fd is not None and fd == input_fd:
@@ -329,24 +378,52 @@ def run_bounded(
             bytes(buffers[process.stderr.fileno()]),
         )
     except BaseException as error:
+        pending_error = error
         try:
-            if process.returncode is None:
+            if process is not None and process.returncode is None:
                 if group_anchor is None:
                     _abort_unanchored_fresh_session(process)
                 else:
                     _terminate_process(process, group_anchor=group_anchor)
         except BaseException as cleanup_error:
-            raise error from cleanup_error
+            assert process is not None
+            closure_failure = GitProcessClosureUnproven(
+                process,
+                group_anchor,
+                cleanup_error,
+            )
+            pending_error = closure_failure
+            raise closure_failure from error
+        checkpoint_bound_signal_interrupt(force=True)
         raise
     finally:
+        finalizer_errors: list[BaseException] = []
         if selector is not None:
-            selector.close()
-        if process.stdin is not None and not process.stdin.closed:
-            process.stdin.close()
-        if process.stdout is not None and not process.stdout.closed:
-            process.stdout.close()
-        if process.stderr is not None and not process.stderr.closed:
-            process.stderr.close()
+            try:
+                selector.close()
+            except BaseException as error:
+                finalizer_errors.append(error)
+        if process is not None:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is None or stream.closed:
+                    continue
+                try:
+                    stream.close()
+                except BaseException as error:
+                    finalizer_errors.append(error)
+        if signal_scope is not None:
+            try:
+                signal_scope.finish(deliver=closure_failure is None)
+            except BaseException as error:
+                finalizer_errors.append(error)
+        control_flow = next(
+            (error for error in finalizer_errors if not isinstance(error, Exception)),
+            None,
+        )
+        if control_flow is not None and closure_failure is None:
+            raise control_flow
+        if finalizer_errors and pending_error is None:
+            raise finalizer_errors[0]
 
 
 def _drain_started_process(
@@ -372,10 +449,12 @@ def _drain_started_process(
             os.set_blocking(descriptor, False)
             selector.register(descriptor, selectors.EVENT_READ)
         while selector.get_map():
+            checkpoint_bound_signal_interrupt(force=True)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("bounded Git shutdown timed out")
             events = selector.select(min(remaining, 0.25))
+            checkpoint_bound_signal_interrupt(force=True)
             if not events and group_anchor is None and process.poll() is not None:
                 events = [
                     (key, selectors.EVENT_READ) for key in selector.get_map().values()
@@ -509,6 +588,8 @@ def inspect_repository(
             head_sha=head_sha,
             git_executable=str(executable),
         )
+    except GitProcessClosureUnproven:
+        raise
     except Exception as error:
         raise blocked(
             f"cannot authenticate repository and frozen range: {error}",
@@ -687,43 +768,71 @@ class CatFileBatch:
             "cat-file",
             "--batch",
         )
-        self.process = subprocess.Popen(
-            argv,
-            cwd=info.repo,
-            env=sanitized_git_environment(),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-            close_fds=True,
-            start_new_session=True,
-        )
-        self.process_group = self.process.pid
+        process: subprocess.Popen[bytes] | None = None
+        group_anchor: SpawnedProcess | None = None
+        self._signal_scope: DeferredSignalScope | None = begin_bound_signal_deferral()
         try:
-            start_identity = process_start_identity(self.process.pid)
-        except BaseException:
-            _abort_unanchored_fresh_session(self.process)
-            raise
-        self.group_anchor = SpawnedProcess(
-            pid=self.process.pid,
-            pgid=self.process_group,
-            acknowledgement_fd=-1,
-            passed_fd_numbers=(),
-            start_identity=start_identity,
-        )
-        if (
-            self.process.stdin is None
-            or self.process.stdout is None
-            or self.process.stderr is None
-        ):
-            _terminate_process(
-                self.process,
-                group_anchor=self.group_anchor,
+            process = subprocess.Popen(
+                argv,
+                cwd=info.repo,
+                env=sanitized_git_environment(),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                close_fds=True,
+                start_new_session=True,
             )
-            raise RuntimeError("cannot create cat-file batch pipes")
+            self.process = process
+            self.process_group = process.pid
+            group_anchor = _bind_fresh_session(process)
+            self.group_anchor = group_anchor
+            checkpoint_bound_signal_interrupt(force=True)
+            if (
+                process.stdin is None
+                or process.stdout is None
+                or process.stderr is None
+            ):
+                raise RuntimeError("cannot create cat-file batch pipes")
+        except BaseException as error:
+            try:
+                try:
+                    if process is not None and process.returncode is None:
+                        if group_anchor is None:
+                            _abort_unanchored_fresh_session(process)
+                        else:
+                            _terminate_process(
+                                process,
+                                group_anchor=group_anchor,
+                            )
+                finally:
+                    if process is not None:
+                        for stream in (
+                            process.stdin,
+                            process.stdout,
+                            process.stderr,
+                        ):
+                            if stream is not None and not stream.closed:
+                                stream.close()
+            except BaseException as cleanup_error:
+                assert process is not None
+                raise GitProcessClosureUnproven(
+                    process,
+                    group_anchor,
+                    cleanup_error,
+                ) from error
+            self._finish_signal_scope()
+            raise
         self.requests = 0
         self.closed = False
         self.stderr = bytearray()
+
+    def _finish_signal_scope(self, *, deliver: bool = True) -> None:
+        scope = getattr(self, "_signal_scope", None)
+        if scope is None:
+            return
+        self._signal_scope = None
+        scope.finish(deliver=deliver)
 
     def read_blob(
         self,
@@ -756,10 +865,12 @@ class CatFileBatch:
             selector.register(stderr_fd, selectors.EVENT_READ, "stderr")
 
             while protocol_state != "done":
+                checkpoint_bound_signal_interrupt(force=True)
                 remaining_time = deadline - time.monotonic()
                 if remaining_time <= 0:
                     raise TimeoutError("cat-file blob request timed out")
                 events = selector.select(min(remaining_time, 0.25))
+                checkpoint_bound_signal_interrupt(force=True)
                 events.sort(key=lambda event: event[0].data != "stderr")
                 for key, _ in events:
                     descriptor = key.fd
@@ -891,7 +1002,7 @@ class CatFileBatch:
     def close(self) -> None:
         if self.closed:
             return
-        self.closed = True
+        group_settled = False
         try:
             self.process.stdin.close()
             stderr_limit = CAT_FILE_STDERR_LIMIT_BYTES - len(self.stderr)
@@ -904,24 +1015,29 @@ class CatFileBatch:
                 stderr_limit=stderr_limit,
                 group_anchor=self.group_anchor,
             )
+            group_settled = True
             self.stderr.extend(stderr)
         except (OverflowError, subprocess.TimeoutExpired, TimeoutError) as error:
+            self._settle_after_error(error)
+            group_settled = True
             raise ValueError(
                 "cat-file producer failed or emitted invalid bounded shutdown output"
             ) from error
-        except BaseException:
-            _terminate_process(
-                self.process,
-                group_anchor=self.group_anchor,
-            )
-            for stream in (
-                self.process.stdin,
-                self.process.stdout,
-                self.process.stderr,
-            ):
-                if stream is not None and not stream.closed:
-                    stream.close()
+        except BaseException as error:
+            self._settle_after_error(error)
+            group_settled = True
             raise
+        finally:
+            if group_settled:
+                for stream in (
+                    self.process.stdin,
+                    self.process.stdout,
+                    self.process.stderr,
+                ):
+                    if stream is not None and not stream.closed:
+                        stream.close()
+                self.closed = True
+                self._finish_signal_scope()
         if extra:
             raise ValueError("cat-file emitted bytes after the exact request stream")
         if len(stderr) > CAT_FILE_STDERR_LIMIT_BYTES or returncode != 0:
@@ -929,20 +1045,45 @@ class CatFileBatch:
                 "cat-file producer failed or emitted oversized diagnostics"
             )
 
-    def abort(self) -> None:
-        if not self.closed:
-            self.closed = True
+    def _settle_after_error(self, error: BaseException) -> None:
+        if self.process.returncode is not None:
+            return
+        try:
             _terminate_process(
                 self.process,
                 group_anchor=self.group_anchor,
             )
-            for stream in (
-                self.process.stdin,
-                self.process.stdout,
-                self.process.stderr,
-            ):
-                if stream is not None:
-                    stream.close()
+        except BaseException as cleanup_error:
+            raise GitProcessClosureUnproven(
+                self.process,
+                self.group_anchor,
+                cleanup_error,
+            ) from error
+
+    def abort(self) -> None:
+        if self.closed:
+            return
+        try:
+            if self.process.returncode is None:
+                _terminate_process(
+                    self.process,
+                    group_anchor=self.group_anchor,
+                )
+        except BaseException as cleanup_error:
+            raise GitProcessClosureUnproven(
+                self.process,
+                self.group_anchor,
+                cleanup_error,
+            ) from cleanup_error
+        for stream in (
+            self.process.stdin,
+            self.process.stdout,
+            self.process.stderr,
+        ):
+            if stream is not None and not stream.closed:
+                stream.close()
+        self.closed = True
+        self._finish_signal_scope()
 
     def __enter__(self) -> "CatFileBatch":
         return self

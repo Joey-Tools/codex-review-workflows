@@ -51,6 +51,7 @@ from .direct_gate import (
     _verify_snapshot_mutation_denials,
     run_bounded_appserver_process,
 )
+from .errors import UnprovenDirectHelperClosure
 from .no_child_profile import (
     LaunchedNoChildProcess,
     PreparedNoChildProfile,
@@ -447,6 +448,7 @@ def _run_auth_refresh(
     launch: _PreparedCustodiedLaunch | None = None
     capability: _RefreshLaunchCapability | None = None
     completed = False
+    direct_helper_closure_unproven = False
     schema_work_root = (
         lease.make_directory("auth-refresh-schema-work")
         if aggregate_schema_path is None
@@ -501,6 +503,9 @@ def _run_auth_refresh(
             raise RuntimeError("managed-auth refresh returned incomplete evidence")
         completed = True
         return result
+    except UnprovenDirectHelperClosure:
+        direct_helper_closure_unproven = True
+        raise
     finally:
         if capability is not None:
             capability.process_state.pipes_closed = True
@@ -526,6 +531,7 @@ def _run_auth_refresh(
             lifecycle_launched=lifecycle_launched,
             completed=completed,
             lease=lease,
+            direct_helper_closure_unproven=direct_helper_closure_unproven,
         )
 
 
@@ -557,6 +563,7 @@ def _run_review(
     completed = False
     result: AppServerProcessResult | None = None
     process_boundary_entered = False
+    direct_helper_closure_unproven = False
     auth_checks = {"launch": False, "serialization": False}
     schema_work_root = (
         lease.make_directory("review-schema-work")
@@ -634,6 +641,9 @@ def _run_review(
             )
         completed = True
         return result, state, auth_checks
+    except UnprovenDirectHelperClosure:
+        direct_helper_closure_unproven = True
+        raise
     finally:
         if not process_boundary_entered:
             state.pipes_closed = True
@@ -648,6 +658,7 @@ def _run_review(
             lifecycle_launched=lifecycle_launched,
             completed=completed,
             lease=lease,
+            direct_helper_closure_unproven=direct_helper_closure_unproven,
         )
 
 
@@ -722,6 +733,7 @@ def _finalize_custodied_stage(
     lifecycle_launched: bool,
     completed: bool,
     lease: _RuntimeLease,
+    direct_helper_closure_unproven: bool = False,
 ) -> None:
     errors: list[BaseException] = []
     try:
@@ -735,9 +747,23 @@ def _finalize_custodied_stage(
         errors.append(error)
 
     closure_proven = _closure_proven(state)
+    if direct_helper_closure_unproven:
+        lease.retain()
+        if writable_roots is not None:
+            writable_roots.close()
+        if errors:
+            raise RuntimeError(
+                "custodied process finalization was inconclusive"
+            ) from errors[0]
+        return
     if lifecycle_launched and closure_proven and state.exit_code is not None:
         try:
             lifecycle.closed(stage, exit_code=state.exit_code)
+        except UnprovenDirectHelperClosure:
+            lease.retain()
+            if writable_roots is not None:
+                writable_roots.close()
+            raise
         except BaseException as error:
             errors.append(error)
 
