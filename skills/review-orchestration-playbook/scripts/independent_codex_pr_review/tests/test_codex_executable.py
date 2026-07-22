@@ -1047,7 +1047,7 @@ class CodexExecutableAuthenticationTests(unittest.TestCase):
                     runner = FakeRunner(changed)
                     with self.assertRaisesRegex(
                         CodexExecutableError,
-                        "not a (regular file|directory)",
+                        "(not a (regular file|directory)|group/world-writable)",
                     ):
                         _authenticate(changed, runner)
                     self.assertEqual(runner.calls, [])
@@ -1070,9 +1070,14 @@ class CodexExecutableAuthenticationTests(unittest.TestCase):
                     self.assertEqual(runner.calls, [])
             os.chmod(fixture.source.parent, 0o700)
             os.chmod(fixture.source, 0o700)
+            if os.getuid() == 0:
+                os.chown(fixture.source, 1, -1)
+                wrong_owner_uid = 2
+            else:
+                wrong_owner_uid = os.getuid() + 10000
             runner = FakeRunner(fixture)
             with self.assertRaisesRegex(CodexExecutableError, "untrusted owner"):
-                _authenticate(fixture, runner, owner_uid=os.getuid() + 10000)
+                _authenticate(fixture, runner, owner_uid=wrong_owner_uid)
 
     def test_only_exact_root_admin_applications_directory_is_trusted(self) -> None:
         try:
@@ -1363,7 +1368,10 @@ class CodexExecutableAuthenticationTests(unittest.TestCase):
             real_schema = fixture.schema.with_name("schema-real.json")
             fixture.schema.rename(real_schema)
             os.symlink(real_schema.name, fixture.schema)
-            with self.assertRaisesRegex(CodexExecutableError, "not a regular file"):
+            with self.assertRaisesRegex(
+                CodexExecutableError,
+                "(not a regular file|group/world-writable)",
+            ):
                 _authenticate(fixture, FakeRunner(fixture))
             self.assertEqual(list(fixture.snapshot_parent.iterdir()), [])
 

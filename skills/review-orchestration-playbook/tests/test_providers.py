@@ -3939,7 +3939,7 @@ class ProviderPolicyTest(unittest.TestCase):
         unsafe_metadata = (
             types.SimpleNamespace(
                 st_mode=stat.S_IFDIR | 0o755,
-                st_uid=os.geteuid(),
+                st_uid=os.geteuid() or 1,
                 st_gid=0,
             ),
             types.SimpleNamespace(
