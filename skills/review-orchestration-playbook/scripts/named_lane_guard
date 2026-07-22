@@ -38,6 +38,12 @@ _CLAUDE_PREFLIGHT_SOURCES = (
     ("review_runtime", "__init__.py", True),
     ("review_runtime.common", "common.py", False),
     (
+        "review_runtime.claude_version_policy",
+        "claude_version_policy.py",
+        False,
+    ),
+    ("review_runtime.claude_capabilities", "claude_capabilities.py", False),
+    (
         "review_runtime.claude_refresh_lock",
         "claude_refresh_lock.py",
         False,
@@ -45,8 +51,29 @@ _CLAUDE_PREFLIGHT_SOURCES = (
     ("review_runtime.claude_linux", "claude_linux.py", False),
     ("review_runtime.claude_provenance", "claude_provenance.py", False),
     (
+        "review_runtime.claude_stream_contract",
+        "claude_stream_contract.py",
+        False,
+    ),
+    (
         "review_runtime.named_claude_preflight",
         "named_claude_preflight.py",
+        False,
+    ),
+)
+_CLAUDE_STREAM_RUNTIME_SOURCES = (
+    ("review_runtime", "__init__.py", True),
+    ("review_runtime.common", "common.py", False),
+    (
+        "review_runtime.claude_version_policy",
+        "claude_version_policy.py",
+        False,
+    ),
+    ("review_runtime.claude_capabilities", "claude_capabilities.py", False),
+    ("review_runtime.claude_provenance", "claude_provenance.py", False),
+    (
+        "review_runtime.claude_stream_contract",
+        "claude_stream_contract.py",
         False,
     ),
 )
@@ -267,14 +294,22 @@ def _is_bound_namespace(name: str, namespace_root: str) -> bool:
     return name == namespace_root or name.startswith(f"{namespace_root}.")
 
 
+def _remove_bound_namespace(namespace_root: str) -> None:
+    for module_name in tuple(sys.modules):
+        if _is_bound_namespace(module_name, namespace_root):
+            sys.modules.pop(module_name, None)
+
+
 def _load_bound_sources(
     source_root: pathlib.Path,
     source_specs: tuple[tuple[str, str, bool], ...],
     *,
     namespace_root: str,
     entry_module_name: str,
+    entry_attribute: str | None = "main",
     constant_bindings: tuple[tuple[str, str, pathlib.Path], ...] = (),
     byte_bindings: tuple[tuple[str, str, bytes], ...] = (),
+    source_byte_bindings: tuple[tuple[str, bytes], ...] = (),
 ) -> object:
     bound_files = _read_bound_files(
         source_root,
@@ -289,6 +324,9 @@ def _load_bound_sources(
         )
         for module_name, source_name, is_package in source_specs
     }
+    for module_name, expected_payload in source_byte_bindings:
+        if module_name not in sources or sources[module_name][1] != expected_payload:
+            raise _fail(f"bound source bytes changed: {module_name}")
     code_objects: dict[str, types.CodeType] = {}
     for module_name, (source_path, payload, _is_package) in sources.items():
         try:
@@ -348,15 +386,16 @@ def _load_bound_sources(
             setattr(module, attribute_name, payload)
             if getattr(module, attribute_name, None) is not payload:
                 raise ImportError(f"cannot bind companion bytes: {attribute_name}")
-        entrypoint = getattr(modules[entry_module_name], "main", None)
-        if not callable(entrypoint):
-            raise ImportError("bound entrypoint is missing or not callable")
+        if entry_attribute is None:
+            entrypoint = modules[entry_module_name]
+        else:
+            entrypoint = getattr(modules[entry_module_name], entry_attribute, None)
+            if not callable(entrypoint):
+                raise ImportError("bound entrypoint is missing or not callable")
     except BaseException as error:
         for module_name in reversed(module_names):
             sys.modules.pop(module_name, None)
-        for module_name in tuple(sys.modules):
-            if _is_bound_namespace(module_name, namespace_root):
-                sys.modules.pop(module_name, None)
+        _remove_bound_namespace(namespace_root)
         raise _fail("runtime execution failed", error)
     for module_name, module in modules.items():
         parent_name, separator, child_name = module_name.rpartition(".")
@@ -373,6 +412,42 @@ def _validate_bound_companion(path: pathlib.Path) -> _CompanionBinding:
     )
     _bound_path, payload, _identity = files[path.name]
     return payload
+
+
+def _stream_companion_bindings(
+    scripts_root: pathlib.Path,
+) -> tuple[tuple[pathlib.Path, _CompanionBinding], ...]:
+    runtime_root = scripts_root / "review_runtime"
+    paths = (
+        scripts_root.parent / "references" / "claude-stream-compatibility.json",
+        scripts_root.parent / "references" / "claude-2.1.212-stream-schema.json",
+        runtime_root / "claude_capabilities.py",
+    )
+    return tuple((path, _validate_bound_companion(path)) for path in paths)
+
+
+def _bind_stream_contract_reader(
+    module: object,
+    companions: tuple[tuple[pathlib.Path, _CompanionBinding], ...],
+) -> None:
+    namespace = getattr(module, "__dict__", None)
+    if type(namespace) is not dict or not callable(namespace.get("_read_stable")):
+        raise _fail("stream-contract byte reader is unavailable")
+    error_type = namespace.get("ClaudeStreamContractError")
+    if not isinstance(error_type, type) or not issubclass(error_type, Exception):
+        raise _fail("stream-contract error type is unavailable")
+    bound_payloads = dict(companions)
+    if len(bound_payloads) != len(companions):
+        raise _fail("stream-contract companion paths are not unique")
+
+    def read_bound(path: pathlib.Path) -> bytes:
+        if not isinstance(path, pathlib.Path) or path not in bound_payloads:
+            raise error_type("stream contract path is not guard-bound")
+        return bound_payloads[path]
+
+    namespace["_read_stable"] = read_bound
+    if namespace.get("_read_stable") is not read_bound:
+        raise _fail("stream-contract byte reader could not be bound")
 
 
 def _guard_companions(
@@ -422,64 +497,159 @@ def _bind_preflight_account_home(entrypoint: object) -> object:
 
 
 def _load_default_entrypoint(scripts_root: pathlib.Path) -> object:
-    return _load_bound_sources(
+    entrypoint = _load_bound_sources(
         scripts_root / "review_runtime",
         _DEFAULT_RUNTIME_SOURCES,
         namespace_root="review_runtime",
         entry_module_name="review_runtime.named_lane",
     )
+    fd_exec_path = scripts_root / "review_runtime" / "fd_exec.py"
+    fd_exec_bytes = _validate_bound_companion(fd_exec_path)
+    return _guard_companions(entrypoint, ((fd_exec_path, fd_exec_bytes),))
 
 
 def _load_claude_preflight_entrypoint(scripts_root: pathlib.Path) -> object:
     runtime_root = scripts_root / "review_runtime"
     release_key_path = runtime_root / "claude_code_release.asc"
     release_key_bytes = _validate_bound_companion(release_key_path)
-    entrypoint = _load_bound_sources(
-        runtime_root,
-        _CLAUDE_PREFLIGHT_SOURCES,
-        namespace_root="review_runtime",
-        entry_module_name="review_runtime.named_claude_preflight",
-        constant_bindings=(
-            (
-                "review_runtime.claude_provenance",
-                "CLAUDE_RELEASE_KEY_PATH",
-                release_key_path,
+    stream_companions = _stream_companion_bindings(scripts_root)
+    compatibility_path, _compatibility_bytes = stream_companions[0]
+    baseline_path, _baseline_bytes = stream_companions[1]
+    capability_path, capability_bytes = stream_companions[2]
+    fd_exec_path = runtime_root / "fd_exec.py"
+    fd_exec_bytes = _validate_bound_companion(fd_exec_path)
+    try:
+        entrypoint = _load_bound_sources(
+            runtime_root,
+            _CLAUDE_PREFLIGHT_SOURCES,
+            namespace_root="review_runtime",
+            entry_module_name="review_runtime.named_claude_preflight",
+            constant_bindings=(
+                (
+                    "review_runtime.claude_provenance",
+                    "CLAUDE_RELEASE_KEY_PATH",
+                    release_key_path,
+                ),
+                (
+                    "review_runtime.claude_stream_contract",
+                    "COMPATIBILITY_PATH",
+                    compatibility_path,
+                ),
+                (
+                    "review_runtime.claude_stream_contract",
+                    "BASELINE_PATH",
+                    baseline_path,
+                ),
+                (
+                    "review_runtime.claude_stream_contract",
+                    "CAPABILITY_PATH",
+                    capability_path,
+                ),
             ),
-        ),
-        byte_bindings=(
-            (
-                "review_runtime.claude_provenance",
-                "CLAUDE_RELEASE_KEY_BYTES",
-                release_key_bytes,
+            byte_bindings=(
+                (
+                    "review_runtime.claude_provenance",
+                    "CLAUDE_RELEASE_KEY_BYTES",
+                    release_key_bytes,
+                ),
             ),
-        ),
-    )
+            source_byte_bindings=(
+                ("review_runtime.claude_capabilities", capability_bytes),
+            ),
+        )
+        _bind_stream_contract_reader(
+            sys.modules["review_runtime.claude_stream_contract"],
+            stream_companions,
+        )
+    except BaseException:
+        _remove_bound_namespace("review_runtime")
+        raise
     return _guard_companions(
         _bind_preflight_account_home(entrypoint),
-        ((release_key_path, release_key_bytes),),
+        (
+            (release_key_path, release_key_bytes),
+            *stream_companions,
+            (fd_exec_path, fd_exec_bytes),
+        ),
     )
 
 
 def _load_claude_stream_validator_entrypoint(scripts_root: pathlib.Path) -> object:
-    schema_path = (
-        scripts_root.parent / "references" / "claude-2.1.212-stream-schema.json"
-    )
-    schema_bytes = _validate_bound_companion(schema_path)
-    entrypoint = _load_bound_sources(
-        scripts_root,
-        _CLAUDE_STREAM_VALIDATOR_SOURCES,
-        namespace_root="validate_claude_stream",
-        entry_module_name="validate_claude_stream",
-        constant_bindings=(("validate_claude_stream", "SCHEMA_PATH", schema_path),),
-        byte_bindings=(
-            (
-                "validate_claude_stream",
-                "SCHEMA_BYTES",
-                schema_bytes,
+    runtime_root = scripts_root / "review_runtime"
+    stream_companions = _stream_companion_bindings(scripts_root)
+    compatibility_path, compatibility_bytes = stream_companions[0]
+    baseline_path, baseline_bytes = stream_companions[1]
+    capability_path, capability_bytes = stream_companions[2]
+    try:
+        stream_contract_module = _load_bound_sources(
+            runtime_root,
+            _CLAUDE_STREAM_RUNTIME_SOURCES,
+            namespace_root="review_runtime",
+            entry_module_name="review_runtime.claude_stream_contract",
+            entry_attribute=None,
+            constant_bindings=(
+                (
+                    "review_runtime.claude_stream_contract",
+                    "COMPATIBILITY_PATH",
+                    compatibility_path,
+                ),
+                (
+                    "review_runtime.claude_stream_contract",
+                    "BASELINE_PATH",
+                    baseline_path,
+                ),
+                (
+                    "review_runtime.claude_stream_contract",
+                    "CAPABILITY_PATH",
+                    capability_path,
+                ),
             ),
-        ),
-    )
-    return _guard_companions(entrypoint, ((schema_path, schema_bytes),))
+            source_byte_bindings=(
+                ("review_runtime.claude_capabilities", capability_bytes),
+            ),
+        )
+        _bind_stream_contract_reader(stream_contract_module, stream_companions)
+        entrypoint = _load_bound_sources(
+            scripts_root,
+            _CLAUDE_STREAM_VALIDATOR_SOURCES,
+            namespace_root="validate_claude_stream",
+            entry_module_name="validate_claude_stream",
+            constant_bindings=(
+                (
+                    "validate_claude_stream",
+                    "COMPATIBILITY_PATH",
+                    compatibility_path,
+                ),
+                ("validate_claude_stream", "SCHEMA_PATH", baseline_path),
+                (
+                    "validate_claude_stream",
+                    "CAPABILITY_PATH",
+                    capability_path,
+                ),
+            ),
+            byte_bindings=(
+                (
+                    "validate_claude_stream",
+                    "COMPATIBILITY_JSON_BYTES",
+                    compatibility_bytes,
+                ),
+                (
+                    "validate_claude_stream",
+                    "BASELINE_SCHEMA_BYTES",
+                    baseline_bytes,
+                ),
+                (
+                    "validate_claude_stream",
+                    "CAPABILITY_SOURCE_BYTES",
+                    capability_bytes,
+                ),
+            ),
+        )
+    except BaseException:
+        _remove_bound_namespace("validate_claude_stream")
+        _remove_bound_namespace("review_runtime")
+        raise
+    return _guard_companions(entrypoint, stream_companions)
 
 
 def _select_entrypoint(

@@ -4,10 +4,13 @@ import copy
 import io
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from unittest import mock
 
@@ -16,16 +19,30 @@ SKILL_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = SKILL_ROOT / "scripts"
 VALIDATOR = SCRIPTS / "validate_claude_stream.py"
 SCHEMA = SKILL_ROOT / "references/claude-2.1.212-stream-schema.json"
+COMPATIBILITY = SKILL_ROOT / "references/claude-stream-compatibility.json"
+CAPABILITY_SOURCE = SCRIPTS / "review_runtime/claude_capabilities.py"
 sys.path.insert(0, str(SCRIPTS))
 
 import validate_claude_stream as validator  # noqa: E402
+from review_runtime import (  # noqa: E402
+    claude_capabilities,
+    claude_provenance,
+    claude_stream_contract,
+    claude_version_policy,
+)
 
 
 class ClaudeStreamValidatorTest(unittest.TestCase):
     def setUp(self) -> None:
         temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(temporary_directory.cleanup)
-        self.cwd = Path(temporary_directory.name).resolve()
+        self.temporary_root = Path(temporary_directory.name).resolve()
+        self.cwd = self.temporary_root / "review-workspace"
+        self.cwd.mkdir(mode=0o700)
+        self.parent_state = self.temporary_root / "parent-state"
+        self.parent_state.mkdir(mode=0o700)
+        self.preflight_path = self.parent_state / "named-claude-preflight.json"
+        self._write_preflight_evidence(self.preflight_path)
         self.init_event = {
             "type": "system",
             "subtype": "init",
@@ -67,6 +84,78 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         }
 
     @staticmethod
+    def _preflight_evidence(version: str = "2.1.212") -> dict[str, object]:
+        binding, _compatibility_raw, _baseline_raw = (
+            claude_stream_contract.load_stream_contract()
+        )
+        manifest_url, signature_url = claude_provenance.release_artifact_urls(version)
+        artifact_size = 128
+        return {
+            "capability_contract": {
+                "required_options": list(claude_capabilities.CLAUDE_REQUIRED_OPTIONS),
+                "status": "accepted",
+            },
+            "classification": "accepted",
+            "compatible_version_range": (
+                claude_version_policy.CLAUDE_COMPATIBILITY_SPEC
+            ),
+            "declared_version": version,
+            "identity": {
+                "device": 1,
+                "inode": 2,
+                "file_type": stat.S_IFREG,
+                "mode": stat.S_IFREG | 0o500,
+                "nlink": 1,
+                "uid": os.geteuid(),
+                "gid": os.getegid(),
+                "size": artifact_size,
+                "mtime_ns": 3,
+                "ctime_ns": 4,
+            },
+            "observed_version": version,
+            "publisher_verification": {
+                "artifact_size": artifact_size,
+                "binary": "claude",
+                "checksum": "a" * 64,
+                "manifest_url": manifest_url,
+                "platform": "darwin-arm64",
+                "release_version": version,
+                "signature_url": signature_url,
+                "signer_fingerprint": (
+                    claude_provenance.CLAUDE_RELEASE_KEY_FINGERPRINT
+                ),
+            },
+            "reason": "compatible-version-selected",
+            "resolved_path": "/trusted/claude",
+            "selected_version": version,
+            "source": "side-by-side-compatible",
+            "stream_contract": {
+                "baseline_digest": binding.baseline_digest,
+                "capability_digest": binding.capability_digest,
+                "compatibility_digest": binding.compatibility_digest,
+                "digest": binding.digest,
+                "schema_id": binding.schema_id,
+            },
+        }
+
+    def _write_preflight_evidence(
+        self,
+        path: Path,
+        *,
+        version: str = "2.1.212",
+        evidence: dict[str, object] | None = None,
+    ) -> None:
+        path.write_text(
+            json.dumps(
+                evidence if evidence is not None else self._preflight_evidence(version),
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+
+    @staticmethod
     def _raw(events: list[object], *, blank_edges: bool = False) -> bytes:
         lines = [
             json.dumps(
@@ -93,16 +182,30 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         raw: bytes | None = None,
         requested_model: str = "claude-opus-4-8",
         api_key_source: str = "none",
+        selected_version: str = "2.1.212",
+        preflight_result: Path | None = None,
         process_returncode: object = 0,
         limits: validator.StreamLimits | None = None,
     ) -> dict[str, object]:
         if raw is None:
             raw = self._raw(events if events is not None else self._full_events())
+        if preflight_result is None:
+            if selected_version == "2.1.212":
+                preflight_result = self.preflight_path
+            else:
+                preflight_result = self.parent_state / (
+                    f"named-claude-preflight-{selected_version}.json"
+                )
+                self._write_preflight_evidence(
+                    preflight_result,
+                    version=selected_version,
+                )
         return validator.validate_claude_stream_bytes(
             raw,
             expected_cwd=self.cwd,
             requested_model=requested_model,
             api_key_source=api_key_source,
+            preflight_result=preflight_result,
             process_returncode=process_returncode,
             limits=limits,
         )
@@ -115,6 +218,43 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             self.assertEqual(outcome["classification"], classification)
         self.assertNotIn("findings", outcome)
         self.assertTrue(outcome["reasons"])
+
+    def assert_raises_without_blocking_on_fifo(
+        self,
+        *,
+        fifo: Path,
+        action: Callable[[], object],
+        expected_error: type[BaseException],
+    ) -> None:
+        returned: list[object] = []
+        errors: list[BaseException] = []
+        finished = threading.Event()
+
+        def invoke() -> None:
+            try:
+                returned.append(action())
+            except BaseException as error:  # pragma: no cover - diagnostic only
+                errors.append(error)
+            finally:
+                finished.set()
+
+        thread = threading.Thread(target=invoke, daemon=True)
+        thread.start()
+        blocked = not finished.wait(1.0)
+        if blocked:
+            descriptor = os.open(fifo, os.O_RDWR | getattr(os, "O_NONBLOCK", 0))
+            try:
+                os.write(descriptor, b"{}\n")
+            finally:
+                os.close(descriptor)
+            finished.wait(1.0)
+        thread.join(timeout=0.1)
+
+        self.assertFalse(blocked, f"{action!r} blocked while opening FIFO evidence")
+        self.assertFalse(thread.is_alive(), "FIFO reader thread remained alive")
+        self.assertEqual(returned, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], expected_error)
 
     def test_machine_schema_defines_complete_init_and_stream_bounds(self) -> None:
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
@@ -197,6 +337,29 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             {"result", "modelUsage"},
         )
 
+    def test_compatibility_profile_keeps_exact_baseline_separate_from_range(
+        self,
+    ) -> None:
+        profile = json.loads(
+            claude_stream_contract.COMPATIBILITY_PATH.read_text(encoding="utf-8")
+        )
+        binding, _compatibility_raw, _baseline_raw = (
+            claude_stream_contract.load_stream_contract()
+        )
+
+        self.assertEqual(profile["baseline_version"], "2.1.212")
+        self.assertEqual(
+            profile["version_policy"],
+            "review_runtime.claude_version_policy.CLAUDE_COMPATIBILITY_SPEC",
+        )
+        self.assertEqual(
+            claude_version_policy.CLAUDE_COMPATIBILITY_SPEC,
+            ">=2.1.211,<3.0.0",
+        )
+        self.assertEqual(binding.schema_id, "claude-code-stream-compatible-v1")
+        self.assertEqual(len(binding.capability_digest), 64)
+        self.assertNotIn("required_version", profile)
+
     def test_loader_rejects_process_returncode_contract_drift(self) -> None:
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
         schema["process_returncode"]["nonzero_precedence"]["blocked"] = "inconclusive"
@@ -204,35 +367,133 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         schema_path.write_text(json.dumps(schema), encoding="utf-8")
 
         with (
-            mock.patch.object(validator, "SCHEMA_BYTES", None),
             mock.patch.object(validator, "SCHEMA_PATH", schema_path),
             self.assertRaises(validator._ContractError),
         ):
             validator._load_contract()
 
-    def test_injected_schema_bytes_win_when_path_is_replaced(self) -> None:
-        replacement_path = self.cwd / "replacement-stream-schema.json"
-        replacement_path.write_bytes(b"{}")
+    def test_injected_stream_companion_bytes_win_when_paths_are_replaced(self) -> None:
+        replacement_compatibility = self.cwd / "replacement-compatibility.json"
+        replacement_schema = self.cwd / "replacement-stream-schema.json"
+        replacement_capability = self.cwd / "replacement-capabilities.py"
+        for replacement in (
+            replacement_compatibility,
+            replacement_schema,
+            replacement_capability,
+        ):
+            replacement.write_bytes(b"{}")
 
         with (
-            mock.patch.object(validator, "SCHEMA_BYTES", SCHEMA.read_bytes()),
-            mock.patch.object(validator, "SCHEMA_PATH", replacement_path),
+            mock.patch.object(
+                validator,
+                "COMPATIBILITY_JSON_BYTES",
+                COMPATIBILITY.read_bytes(),
+            ),
+            mock.patch.object(
+                validator,
+                "BASELINE_SCHEMA_BYTES",
+                SCHEMA.read_bytes(),
+            ),
+            mock.patch.object(
+                validator,
+                "CAPABILITY_SOURCE_BYTES",
+                CAPABILITY_SOURCE.read_bytes(),
+            ),
+            mock.patch.object(
+                validator,
+                "COMPATIBILITY_PATH",
+                replacement_compatibility,
+            ),
+            mock.patch.object(validator, "SCHEMA_PATH", replacement_schema),
+            mock.patch.object(validator, "CAPABILITY_PATH", replacement_capability),
+        ):
+            contract, binding = validator._load_contract_with_binding()
+
+        self.assertEqual(contract["claude_code_version"], "2.1.212")
+        expected, _compatibility_raw, _baseline_raw = (
+            claude_stream_contract.load_stream_contract()
+        )
+        self.assertEqual(binding, expected)
+
+    def test_stream_companion_paths_remain_the_compatibility_fallback(self) -> None:
+        replacement_compatibility = self.cwd / "replacement-compatibility.json"
+        replacement_schema = self.cwd / "replacement-stream-schema.json"
+        replacement_capability = self.cwd / "replacement-capabilities.py"
+        replacement_compatibility.write_bytes(COMPATIBILITY.read_bytes())
+        replacement_schema.write_bytes(SCHEMA.read_bytes())
+        replacement_capability.write_bytes(CAPABILITY_SOURCE.read_bytes())
+
+        with (
+            mock.patch.object(validator, "COMPATIBILITY_JSON_BYTES", None),
+            mock.patch.object(validator, "BASELINE_SCHEMA_BYTES", None),
+            mock.patch.object(validator, "CAPABILITY_SOURCE_BYTES", None),
+            mock.patch.object(
+                validator,
+                "COMPATIBILITY_PATH",
+                replacement_compatibility,
+            ),
+            mock.patch.object(validator, "SCHEMA_PATH", replacement_schema),
+            mock.patch.object(
+                claude_stream_contract,
+                "CAPABILITY_PATH",
+                replacement_capability,
+            ),
         ):
             contract = validator._load_contract()
 
         self.assertEqual(contract["claude_code_version"], "2.1.212")
 
-    def test_schema_path_remains_the_compatibility_fallback(self) -> None:
-        replacement_path = self.cwd / "replacement-stream-schema.json"
-        replacement_path.write_bytes(SCHEMA.read_bytes())
-
-        with (
-            mock.patch.object(validator, "SCHEMA_BYTES", None),
-            mock.patch.object(validator, "SCHEMA_PATH", replacement_path),
+    def test_incomplete_bound_stream_companions_fail_closed(self) -> None:
+        with mock.patch.object(
+            validator,
+            "BASELINE_SCHEMA_BYTES",
+            SCHEMA.read_bytes(),
         ):
-            contract = validator._load_contract()
+            self.assertEqual(
+                self._validate(),
+                {
+                    "classification": "inconclusive",
+                    "reasons": ["validator.contract-invalid"],
+                },
+            )
 
-        self.assertEqual(contract["claude_code_version"], "2.1.212")
+    def test_validator_rejects_unknown_root_and_ignored_field_rule_drift(
+        self,
+    ) -> None:
+        baseline = json.loads(SCHEMA.read_text(encoding="utf-8"))
+
+        def add_unknown_root(schema: dict[str, object]) -> None:
+            schema["unknown_root_contract"] = {"rule": "accept"}
+
+        def weaken_init_rule(schema: dict[str, object]) -> None:
+            schema["init_event"]["field_contracts"]["tools"]["mismatch_failure"] = (
+                "inconclusive"
+            )
+
+        def weaken_terminal_rule(schema: dict[str, object]) -> None:
+            schema["terminal_result"]["optional_field_contracts"]["duration_ms"][
+                "rule"
+            ] = "positive_integer"
+
+        cases: dict[str, Callable[[dict[str, object]], None]] = {
+            "unknown-root": add_unknown_root,
+            "ignored-init-field-rule": weaken_init_rule,
+            "ignored-terminal-field-rule": weaken_terminal_rule,
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                schema = copy.deepcopy(baseline)
+                mutate(schema)
+                schema_path = self.parent_state / f"{name}.json"
+                schema_path.write_text(json.dumps(schema), encoding="utf-8")
+                with mock.patch.object(validator, "SCHEMA_PATH", schema_path):
+                    self.assertEqual(
+                        self._validate(),
+                        {
+                            "classification": "inconclusive",
+                            "reasons": ["validator.contract-invalid"],
+                        },
+                    )
 
     def test_accepts_complete_stream_and_preserves_findings_verbatim(self) -> None:
         outcome = self._validate(raw=self._raw(self._full_events(), blank_edges=True))
@@ -240,6 +501,171 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         self.assertEqual(
             outcome,
             {"classification": "accepted", "findings": "\nNo findings.\n"},
+        )
+
+    def test_accepts_compatible_selected_versions_and_binds_init_exactly(self) -> None:
+        for version in ("2.1.211", "2.1.216", "2.99.999"):
+            with self.subTest(version=version):
+                events = self._full_events()
+                events[0]["claude_code_version"] = version
+                self.assertEqual(
+                    self._validate(events, selected_version=version),
+                    {
+                        "classification": "accepted",
+                        "findings": "\nNo findings.\n",
+                    },
+                )
+
+        mismatched = self._full_events()
+        mismatched[0]["claude_code_version"] = "2.1.211"
+        outcome = self._validate(mismatched, selected_version="2.1.216")
+        self.assertEqual(outcome["classification"], "blocked")
+        self.assertIn("init.claude_code_version.mismatch", outcome["reasons"])
+        self.assertNotIn("findings", outcome)
+
+    def test_future_compatible_version_unknown_shapes_fail_closed(self) -> None:
+        for surface in ("init", "terminal"):
+            with self.subTest(surface=surface):
+                events = self._full_events()
+                events[0]["claude_code_version"] = "2.1.216"
+                target = events[0] if surface == "init" else events[-1]
+                target["future_field"] = True
+
+                outcome = self._validate(events, selected_version="2.1.216")
+
+                self.assertEqual(outcome["classification"], "inconclusive")
+                self.assertNotIn("findings", outcome)
+
+    def test_tampered_preflight_evidence_never_releases_findings(self) -> None:
+        def update_nested(
+            key: str,
+            values: dict[str, object],
+        ) -> Callable[[dict[str, object]], None]:
+            def mutate(evidence: dict[str, object]) -> None:
+                nested = evidence[key]
+                assert isinstance(nested, dict)
+                nested.update(values)
+
+            return mutate
+
+        cases: dict[str, Callable[[dict[str, object]], None]] = {
+            "extra-field": lambda evidence: evidence.update({"unexpected": True}),
+            "range": lambda evidence: evidence.update(
+                {"compatible_version_range": "==2.1.212"}
+            ),
+            "selected-version": lambda evidence: evidence.update(
+                {"selected_version": "2.1.217"}
+            ),
+            "retired-source": lambda evidence: evidence.update(
+                {"source": "side-by-side-exact"}
+            ),
+            "identity-size": update_nested("identity", {"size": 129}),
+            "publisher-version": update_nested(
+                "publisher_verification",
+                {"release_version": "2.1.211"},
+            ),
+            "capability": update_nested(
+                "capability_contract",
+                {"status": "unaccepted"},
+            ),
+            "stream-digest": update_nested(
+                "stream_contract",
+                {"digest": "0" * 64},
+            ),
+            "capability-digest": update_nested(
+                "stream_contract",
+                {"capability_digest": "0" * 64},
+            ),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                evidence = self._preflight_evidence("2.1.216")
+                mutate(evidence)
+                preflight_result = self.parent_state / f"tampered-{name}.json"
+                self._write_preflight_evidence(
+                    preflight_result,
+                    evidence=evidence,
+                )
+                events = self._full_events()
+                events[0]["claude_code_version"] = "2.1.216"
+
+                self.assertEqual(
+                    self._validate(events, preflight_result=preflight_result),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": ["validator.preflight-evidence-invalid"],
+                    },
+                )
+
+    def test_preflight_evidence_file_must_be_parent_private_and_not_a_symlink(
+        self,
+    ) -> None:
+        public_path = self.parent_state / "public-preflight.json"
+        self._write_preflight_evidence(public_path)
+        public_path.chmod(0o644)
+        self.assertEqual(
+            self._validate(preflight_result=public_path),
+            {
+                "classification": "inconclusive",
+                "reasons": ["validator.preflight-evidence-invalid"],
+            },
+        )
+
+        alias = self.parent_state / "preflight-alias.json"
+        alias.symlink_to(self.preflight_path)
+        self.assertEqual(
+            self._validate(preflight_result=alias),
+            {
+                "classification": "inconclusive",
+                "reasons": ["validator.preflight-evidence-invalid"],
+            },
+        )
+
+    def test_preflight_evidence_inside_review_workspace_fails_closed(self) -> None:
+        workspace_local = self.cwd / "workspace-local-preflight.json"
+        self._write_preflight_evidence(workspace_local)
+
+        self.assertEqual(
+            self._validate(preflight_result=workspace_local),
+            {
+                "classification": "inconclusive",
+                "reasons": ["validator.preflight-evidence-invalid"],
+            },
+        )
+
+    def test_hardlinked_preflight_evidence_fails_closed(self) -> None:
+        hardlink = self.parent_state / "hardlinked-preflight.json"
+        os.link(self.preflight_path, hardlink)
+
+        self.assertEqual(
+            self._validate(preflight_result=hardlink),
+            {
+                "classification": "inconclusive",
+                "reasons": ["validator.preflight-evidence-invalid"],
+            },
+        )
+
+    def test_fifo_contract_inputs_fail_closed_without_blocking(self) -> None:
+        preflight_fifo = self.parent_state / "preflight.fifo"
+        os.mkfifo(preflight_fifo, mode=0o600)
+        self.assert_raises_without_blocking_on_fifo(
+            fifo=preflight_fifo,
+            action=lambda: validator._read_preflight_evidence(
+                preflight_fifo,
+                reviewer_cwd=self.cwd,
+            ),
+            expected_error=validator._ContractError,
+        )
+
+        compatibility_fifo = self.parent_state / "compatibility.fifo"
+        os.mkfifo(compatibility_fifo, mode=0o600)
+        self.assert_raises_without_blocking_on_fifo(
+            fifo=compatibility_fifo,
+            action=lambda: claude_stream_contract.load_stream_contract(
+                compatibility_path=compatibility_fifo,
+                baseline_path=claude_stream_contract.BASELINE_PATH,
+            ),
+            expected_error=claude_stream_contract.ClaudeStreamContractError,
         )
 
     def test_accepts_init_without_optional_session_id(self) -> None:
@@ -289,6 +715,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 expected_cwd=self.cwd,
                 requested_model="claude-opus-4-8",
                 api_key_source="none",
+                preflight_result=self.preflight_path,
             ),
             {
                 "classification": "inconclusive",
@@ -388,12 +815,13 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             expected_cwd=self.cwd,
             requested_model="claude-opus-4-8",
             api_key_source="none",
+            preflight_result=self.preflight_path,
             process_returncode=0,
         )
         self.assert_fail_closed(outcome, "inconclusive")
 
     def test_json_parser_exceptions_fail_closed(self) -> None:
-        contract = validator._load_contract()
+        contract_with_binding = validator._load_contract_with_binding()
         parser_errors = (
             ValueError("integer conversion limit"),
             RecursionError("maximum recursion depth exceeded"),
@@ -404,7 +832,14 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             with self.subTest(error=type(error).__name__):
                 with (
                     mock.patch.object(
-                        validator, "_load_contract", return_value=contract
+                        validator,
+                        "_load_contract_with_binding",
+                        return_value=contract_with_binding,
+                    ),
+                    mock.patch.object(
+                        validator,
+                        "_read_preflight_evidence",
+                        return_value=self._preflight_evidence(),
                     ),
                     mock.patch.object(
                         validator, "_strict_json_loads", side_effect=error
@@ -987,6 +1422,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                         str(self.cwd),
                         "--model",
                         "claude-opus-4-8",
+                        "--preflight-result",
+                        str(self.preflight_path),
                         "--api-key-source",
                         "none",
                         "--process-returncode",
@@ -1022,6 +1459,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 str(self.cwd),
                 "--model",
                 "claude-opus-4-8",
+                "--preflight-result",
+                str(self.preflight_path),
                 "--api-key-source",
                 "none",
                 "--process-returncode",
@@ -1058,6 +1497,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 str(self.cwd),
                 "--model",
                 "claude-opus-4-8",
+                "--preflight-result",
+                str(self.preflight_path),
                 "--api-key-source",
                 "none",
                 "--process-returncode",
@@ -1113,6 +1554,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                         str(self.cwd),
                         "--model",
                         "claude-opus-4-8",
+                        "--preflight-result",
+                        str(self.preflight_path),
                         "--api-key-source",
                         "none",
                         "--process-returncode",
@@ -1143,6 +1586,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "missing-cwd": [
                 "--model",
                 "claude-opus-4-8",
+                "--preflight-result",
+                str(self.preflight_path),
                 "--api-key-source",
                 "none",
                 "--process-returncode",
@@ -1153,6 +1598,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 str(self.cwd),
                 "--model",
                 "claude-opus-4-8",
+                "--preflight-result",
+                str(self.preflight_path),
                 "--api-key-source",
                 "none",
             ],
@@ -1161,6 +1608,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 str(self.cwd),
                 "--model",
                 "claude-opus-4-8",
+                "--preflight-result",
+                str(self.preflight_path),
                 "--api-key-source",
                 "none",
                 "--process-returncode",
@@ -1181,6 +1630,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 str(self.cwd),
                 "--model",
                 "claude-opus-4-8",
+                "--preflight-result",
+                str(self.preflight_path),
                 "--api-key-source",
                 "none",
                 "--process-returncode",
@@ -1227,6 +1678,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 str(self.cwd),
                 "--model",
                 "claude-opus-4-8",
+                "--preflight-result",
+                str(self.preflight_path),
                 "--api-key-source",
                 "none",
                 "--process-returncode",
@@ -1269,6 +1722,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 str(self.cwd),
                 "--model",
                 "claude-opus-4-8",
+                "--preflight-result",
+                str(self.preflight_path),
                 "--api-key-source",
                 "none",
                 "--process-returncode",

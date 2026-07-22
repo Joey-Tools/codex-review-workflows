@@ -9,7 +9,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import traceback
 import unittest
 from unittest import mock
 
@@ -82,6 +84,10 @@ class ReleaseVersionTest(unittest.TestCase):
             (2, 1, 211),
         )
         self.assertEqual(
+            claude_provenance.require_supported_release_version("2.1.216"),
+            (2, 1, 216),
+        )
+        self.assertEqual(
             claude_provenance.require_supported_release_version("2.99.1000"),
             (2, 99, 1000),
         )
@@ -117,6 +123,50 @@ class ReleaseVersionTest(unittest.TestCase):
 
 
 class SignedManifestFetchTest(unittest.TestCase):
+    def test_deadline_cleanup_legacy_fallback_respects_context_visibility(
+        self,
+    ) -> None:
+        class LegacyError(RuntimeError):
+            add_note = None
+
+        sensitive_path = "/fixture/private/suppressed-provenance-context/auth.json"
+        for suppress_context in (False, True):
+            with self.subTest(suppress_context=suppress_context):
+                marker = (
+                    sensitive_path if suppress_context else "visible-provenance-context"
+                )
+                original_context = RuntimeError(marker)
+                primary = LegacyError("primary deadline failure")
+                primary.__context__ = original_context
+                primary.__suppress_context__ = suppress_context
+
+                claude_provenance._add_deadline_cleanup_note(
+                    primary,
+                    OSError("deadline cleanup failed"),
+                )
+
+                diagnostic = primary.__cause__
+                self.assertIsInstance(
+                    diagnostic,
+                    claude_provenance._FetchDeadlineCleanupDiagnostic,
+                )
+                assert diagnostic is not None
+                if suppress_context:
+                    self.assertIsNone(diagnostic.__context__)
+                else:
+                    self.assertIs(diagnostic.__context__, original_context)
+                formatted = "".join(
+                    traceback.format_exception(
+                        type(primary),
+                        primary,
+                        primary.__traceback__,
+                    )
+                )
+                if suppress_context:
+                    self.assertNotIn(marker, formatted)
+                else:
+                    self.assertIn(marker, formatted)
+
     def test_deadline_rejects_blocked_sigalrm_before_installing_handler(self) -> None:
         with (
             mock.patch.object(
@@ -1803,6 +1853,73 @@ class GpgVerificationTest(unittest.TestCase):
             ):
                 claude_provenance.resolve_trusted_gpg((native,))
 
+    @unittest.skipUnless(
+        hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"),
+        "requires POSIX FIFO support",
+    )
+    def test_trusted_gpg_fifo_replacement_after_stat_does_not_block(self) -> None:
+        with tempfile.TemporaryDirectory(
+            dir=pathlib.Path(__file__).resolve().parent
+        ) as raw:
+            native = pathlib.Path(raw) / "gpg"
+            native.write_bytes(b"\x7fELF" + b"\x00" * 16)
+            native.chmod(0o700)
+            resolved = native.resolve(strict=True)
+            replacement = native.with_name("gpg.fifo")
+            os.mkfifo(replacement, mode=0o700)
+            real_open = os.open
+            requested_flags: list[int] = []
+            failures: list[BaseException] = []
+            values: list[pathlib.Path] = []
+            swapped = False
+
+            def swap_before_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+                nonlocal swapped
+                if pathlib.Path(path) == resolved and not swapped:
+                    swapped = True
+                    requested_flags.append(flags)
+                    os.replace(replacement, native)
+                return real_open(path, flags, *args, **kwargs)
+
+            def resolve() -> None:
+                try:
+                    values.append(claude_provenance.resolve_trusted_gpg((native,)))
+                except BaseException as error:
+                    failures.append(error)
+
+            worker = threading.Thread(target=resolve, daemon=True)
+            with (
+                mock.patch.object(
+                    claude_provenance.os,
+                    "open",
+                    side_effect=swap_before_open,
+                ),
+                mock.patch.object(
+                    claude_provenance.os,
+                    "read",
+                    side_effect=AssertionError(
+                        "replaced GPG descriptor must be rejected before read"
+                    ),
+                ) as reader,
+            ):
+                worker.start()
+                worker.join(timeout=1.0)
+                if worker.is_alive():
+                    rescue = real_open(native, os.O_RDWR | os.O_NONBLOCK)
+                    os.close(rescue)
+                    worker.join(timeout=1.0)
+
+            self.assertFalse(worker.is_alive(), "trusted GPG FIFO open blocked")
+            self.assertTrue(swapped)
+            self.assertTrue(requested_flags[0] & os.O_NONBLOCK)
+            self.assertFalse(values)
+            self.assertEqual(len(failures), 1)
+            self.assertIsInstance(
+                failures[0],
+                claude_provenance.ClaudeProvenanceInconclusive,
+            )
+            reader.assert_not_called()
+
     def test_default_linux_gpg_candidates_are_root_owned_usr_bin_only(self) -> None:
         with (
             mock.patch.object(claude_provenance.sys, "platform", "linux"),
@@ -2108,6 +2225,60 @@ class ExecutableVerificationTest(unittest.TestCase):
             ),
         ):
             claude_provenance.verify_release_executable(self.executable, wrong)
+
+    @unittest.skipUnless(
+        hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"),
+        "requires POSIX FIFO support",
+    )
+    def test_fifo_replacement_after_stat_is_inconclusive_without_blocking(
+        self,
+    ) -> None:
+        real_open = os.open
+        resolved_target = self.executable.resolve(strict=True)
+        replacement = self.executable.with_name("claude-real.fifo")
+        os.mkfifo(replacement, mode=0o700)
+        requested_flags: list[int] = []
+        failures: list[BaseException] = []
+        swapped = False
+
+        def swap_before_open(path, flags, *args, **kwargs):  # type: ignore[no-untyped-def]
+            nonlocal swapped
+            if pathlib.Path(path) == resolved_target and not swapped:
+                swapped = True
+                requested_flags.append(flags)
+                os.replace(replacement, self.executable)
+            return real_open(path, flags, *args, **kwargs)
+
+        def verify() -> None:
+            try:
+                claude_provenance.verify_release_executable(
+                    self.executable,
+                    self.artifact,
+                )
+            except BaseException as error:
+                failures.append(error)
+
+        worker = threading.Thread(target=verify, daemon=True)
+        with mock.patch.object(
+            claude_provenance.os,
+            "open",
+            side_effect=swap_before_open,
+        ):
+            worker.start()
+            worker.join(timeout=1.0)
+            if worker.is_alive():
+                rescue = real_open(self.executable, os.O_RDWR | os.O_NONBLOCK)
+                os.close(rescue)
+                worker.join(timeout=1.0)
+
+        self.assertFalse(worker.is_alive(), "executable FIFO open blocked verification")
+        self.assertTrue(swapped)
+        self.assertTrue(requested_flags[0] & os.O_NONBLOCK)
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(
+            failures[0],
+            claude_provenance.ClaudeProvenanceInconclusive,
+        )
 
     def test_rejects_digest_mismatch(self) -> None:
         wrong = claude_provenance.ClaudeReleaseArtifact(

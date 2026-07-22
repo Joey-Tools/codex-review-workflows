@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import dis
 import errno
 import hashlib
 import io
@@ -20,6 +21,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import unittest
 from collections.abc import Callable
 from unittest import mock
@@ -64,6 +66,45 @@ CLAUDE_SAFE_MODE_DESCRIPTION = (
     "still apply. Auth, model selection, built-in tools, and permissions work "
     "normally. Sets CLAUDE_CODE_SAFE_MODE=1."
 )
+
+
+def publish_thread_start_fixture(
+    owner: object | None,
+    outcome: providers._ClaudeThreadStartOutcome,
+) -> None:
+    if owner is None:
+        return
+    owner_fields = getattr(type(owner), "__dataclass_fields__", {})
+    if "snapshot" in owner_fields:
+        setattr(owner, "snapshot", outcome)
+        return
+    if outcome.state is providers._ClaudeThreadStartState.UNKNOWN:
+        owner.publish_unknown()
+    elif outcome.state is providers._ClaudeThreadStartState.CONFIRMED:
+        owner.publish_unknown()
+        owner.publish_confirmed()
+    setattr(owner, "error", outcome.error)
+
+
+_FAST_LOCAL_LOAD_OPNAMES = frozenset({"LOAD_FAST", "LOAD_FAST_BORROW"})
+_FAST_LOCAL_PAIR_LOAD_OPNAMES = frozenset(
+    {"LOAD_FAST_LOAD_FAST", "LOAD_FAST_BORROW_LOAD_FAST_BORROW"}
+)
+
+
+def _instruction_loads_fast_local(
+    instruction: object,
+    local_name: str,
+) -> bool:
+    opname = getattr(instruction, "opname", None)
+    argval = getattr(instruction, "argval", None)
+    if opname in _FAST_LOCAL_LOAD_OPNAMES:
+        return argval == local_name
+    return (
+        opname in _FAST_LOCAL_PAIR_LOAD_OPNAMES
+        and isinstance(argval, tuple)
+        and local_name in argval
+    )
 
 
 def claude_help_fixture(*, safe_mode: str | None = None) -> bytes:
@@ -217,6 +258,9 @@ def _blocked_keychain_handler_worker(connection: object, mode: str) -> None:
 
 
 class ProviderPolicyTest(unittest.TestCase):
+    class LegacyInspectionError(providers.ClaudeCredentialInspectionInconclusive):
+        add_note = None
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         root = pathlib.Path(self.temporary.name).resolve()
@@ -380,10 +424,26 @@ class ProviderPolicyTest(unittest.TestCase):
             side_effect=self.fake_prepare_claude_keychain_broker,
         )
         self.keychain_broker_patcher.start()
-        self.claude_keychain_runtime = providers._claude_keychain_runtime
+        self.claude_keychain_runtime_impl = providers._claude_keychain_runtime
+
+        def claude_keychain_runtime(*args: object, **kwargs: object):
+            kwargs.setdefault("process_started", lambda: False)
+            return self.claude_keychain_runtime_impl(*args, **kwargs)
+
+        self.claude_keychain_runtime = claude_keychain_runtime
+        self.claude_macos_carrier_coordination = (
+            providers._claude_macos_carrier_coordination
+        )
+        self.macos_coordination_patcher = mock.patch.object(
+            providers,
+            "_claude_macos_carrier_coordination",
+            side_effect=self.fake_claude_macos_carrier_coordination,
+        )
+        self.macos_coordination_patcher.start()
         self.claude_refresh_lock_protocol = (
             claude_refresh_lock.CLAUDE_REFRESH_LOCK_PROTOCOL_2_1_211
         )
+        self.claude_coordination_exits: dict[int, str] = {}
         self.keychain_runtime_patcher = mock.patch.object(
             providers,
             "_claude_keychain_runtime",
@@ -482,6 +542,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.keychain_runtime_patcher.stop()
+        self.macos_coordination_patcher.stop()
         self.keychain_broker_patcher.stop()
         self.trusted_release_patcher.stop()
         self.claude_macos_platform_patcher.stop()
@@ -492,6 +553,27 @@ class ProviderPolicyTest(unittest.TestCase):
         for patcher in reversed(self.host_dependency_patchers):
             patcher.stop()
         self.temporary.cleanup()
+
+    def test_instruction_loads_fast_local_accepts_borrowed_forms(self) -> None:
+        for opname, argval, expected in (
+            ("LOAD_FAST", "owner", True),
+            ("LOAD_FAST_BORROW", "owner", True),
+            ("LOAD_FAST_LOAD_FAST", ("thread", "owner"), True),
+            (
+                "LOAD_FAST_BORROW_LOAD_FAST_BORROW",
+                ("thread", "owner"),
+                True,
+            ),
+            ("LOAD_FAST_BORROW", "other", False),
+            ("LOAD_FAST_CHECK", "owner", False),
+            ("LOAD_DEREF", "owner", False),
+        ):
+            with self.subTest(opname=opname, argval=argval):
+                instruction = mock.Mock(opname=opname, argval=argval)
+                self.assertIs(
+                    _instruction_loads_fast_local(instruction, "owner"),
+                    expected,
+                )
 
     def fake_prepare_claude_keychain_broker(
         self,
@@ -508,12 +590,55 @@ class ProviderPolicyTest(unittest.TestCase):
         return result
 
     @contextlib.contextmanager
+    def fake_claude_macos_carrier_coordination(
+        self,
+        _refresh_lock_protocol: providers.ClaudeRefreshLockProtocol,
+        *,
+        require_explicit_context_release: bool = False,
+    ):
+        lease = mock.Mock(
+            spec=[
+                "assert_held",
+                "abandon",
+                "release",
+            ]
+        )
+        lease.abandon.return_value = (
+            claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                "fixture refresh transaction was abandoned"
+            )
+        )
+        try:
+            yield lease
+        except BaseException:
+            self.claude_coordination_exits[id(lease)] = "exceptional"
+            if not require_explicit_context_release and not lease.abandon.called:
+                lease.release()
+            raise
+        else:
+            self.claude_coordination_exits[id(lease)] = "normal"
+            if not lease.abandon.called:
+                lease.release()
+
+    def fake_claude_macos_coordination_result(
+        self,
+        lease: mock.Mock,
+        coordination_options: dict[str, object],
+    ) -> mock.Mock:
+        del coordination_options
+        return lease
+
+    @contextlib.contextmanager
     def fake_claude_keychain_runtime(
         self,
         _review: ReviewWorkspace,
         env: dict[str, str],
         _refresh_lock_protocol: providers.ClaudeRefreshLockProtocol | None,
+        *,
+        process_started: Callable[[], bool] | None = None,
+        process_quiescent: Callable[[], bool] | None = None,
     ):
+        del process_started, process_quiescent
         result = dict(env)
         if not result.get("ANTHROPIC_API_KEY"):
             result[providers.CLAUDE_KEYCHAIN_BROKER_PORT_ENV] = "43211"
@@ -532,7 +657,70 @@ class ProviderPolicyTest(unittest.TestCase):
             direct_cause,
             providers.ClaudeCredentialCleanupDiagnostic,
         )
-        self.assertIs(direct_cause.__cause__, original_cause)
+        current = direct_cause
+        seen: set[int] = set()
+        for _ in range(32):
+            if current is original_cause:
+                return
+            identity = id(current)
+            if identity in seen:
+                break
+            seen.add(identity)
+            if isinstance(current.__cause__, BaseException):
+                current = current.__cause__
+                continue
+            break
+        self.fail("original cause is missing from the visible cleanup cause chain")
+
+    def format_exception_text(self, error: BaseException) -> str:
+        return "".join(
+            traceback.format_exception(
+                type(error),
+                error,
+                error.__traceback__,
+            )
+        )
+
+    def assert_exception_visible_exact_or_rendered(
+        self,
+        error: BaseException,
+        expected: BaseException,
+    ) -> None:
+        if providers._claude_visible_error_chain_contains(error, expected):
+            return
+        self.assertIn(
+            f"{type(expected).__name__}: {expected}",
+            self.format_exception_text(error),
+        )
+
+    def assert_cleanup_diagnostic_visible(
+        self,
+        error: BaseException,
+    ) -> None:
+        pending = [error]
+        visited: set[int] = set()
+        for _ in range(16):
+            if not pending:
+                break
+            current = pending.pop(0)
+            identity = id(current)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            if any(
+                "Claude credential operation also had a cleanup failure" in note
+                for note in getattr(current, "__notes__", ())
+            ):
+                return
+            if isinstance(
+                current,
+                providers.ClaudeCredentialCleanupDiagnostic,
+            ):
+                return
+            for related in (current.__cause__, current.__context__):
+                if related is not None:
+                    pending.append(related)
+        self.fail("Claude credential cleanup diagnostic is missing")
 
     def assert_persistence_diagnostic_visible(
         self,
@@ -672,10 +860,7 @@ class ProviderPolicyTest(unittest.TestCase):
             )
 
     def test_cleanup_diagnostic_fallback_preserves_original_cause(self) -> None:
-        class LegacyInspectionError(providers.ClaudeCredentialInspectionInconclusive):
-            add_note = None
-
-        primary = LegacyInspectionError("injected legacy primary")
+        primary = self.LegacyInspectionError("injected legacy primary")
         original_cause = RuntimeError("injected original cause")
         primary.__cause__ = original_cause
 
@@ -688,6 +873,1681 @@ class ProviderPolicyTest(unittest.TestCase):
             primary,
             original_cause,
         )
+
+    def test_cleanup_diagnostic_descriptor_marker_hides_path_metadata(
+        self,
+    ) -> None:
+        primary = self.LegacyInspectionError("fixture legacy primary")
+        unvalidated_path = "/unvalidated/replacement/.oauth_refresh.lock"
+        setattr(
+            primary,
+            "_codex_claude_refresh_lock_paths",
+            (unvalidated_path,),
+        )
+        setattr(
+            primary,
+            "_codex_claude_refresh_lock_descriptor_bound",
+            True,
+        )
+
+        providers._attach_claude_credential_cleanup_failure(
+            primary,
+            OSError("fixture cleanup failure"),
+        )
+
+        formatted = self.format_exception_text(primary)
+        self.assertIn(
+            "descriptor-bound lock directories may remain",
+            formatted,
+        )
+        self.assertNotIn(unvalidated_path, formatted)
+
+    def test_cleanup_diagnostic_scans_suppressed_primary_context(
+        self,
+    ) -> None:
+        for recovery_state in ("descriptor-bound", "incomplete"):
+            with self.subTest(recovery_state=recovery_state):
+                primary = self.LegacyInspectionError("fixture legacy primary")
+                unvalidated_path = (
+                    f"/unvalidated/suppressed-{recovery_state}/.oauth_refresh.lock"
+                )
+                setattr(
+                    primary,
+                    "_codex_claude_refresh_lock_paths",
+                    (unvalidated_path,),
+                )
+                hidden = RuntimeError("fixture suppressed primary context")
+                primary.__context__ = hidden
+                primary.__suppress_context__ = True
+                if recovery_state == "descriptor-bound":
+                    setattr(
+                        hidden,
+                        "_codex_claude_refresh_lock_descriptor_bound",
+                        True,
+                    )
+                    expected = "descriptor-bound lock directories may remain"
+                else:
+                    hidden.__cause__ = primary
+                    expected = "refresh-lock recovery evidence is incomplete"
+
+                providers._attach_claude_credential_cleanup_failure(
+                    primary,
+                    OSError("fixture cleanup failure"),
+                )
+
+                formatted = self.format_exception_text(primary)
+                self.assertIn(expected, formatted)
+                self.assertNotIn(unvalidated_path, formatted)
+
+    def test_cleanup_diagnostic_sanitizes_known_primary_message_and_notes(
+        self,
+    ) -> None:
+        for leak_source in ("message", "note"):
+            with self.subTest(leak_source=leak_source):
+                unvalidated_path = (
+                    f"/unvalidated/primary-{leak_source}/.oauth_refresh.lock"
+                )
+                message = (
+                    f"fixture primary failure at {unvalidated_path}"
+                    if leak_source == "message"
+                    else "fixture primary failure"
+                )
+                primary = self.LegacyInspectionError(message)
+                if leak_source == "note":
+                    primary.__notes__ = [f"fixture primary note at {unvalidated_path}"]
+                setattr(
+                    primary,
+                    "_codex_claude_refresh_lock_descriptor_bound",
+                    True,
+                )
+
+                providers._attach_claude_credential_cleanup_failure(
+                    primary,
+                    OSError("fixture cleanup failure"),
+                )
+
+                formatted = self.format_exception_text(primary)
+                self.assertIn(
+                    "descriptor-bound lock directories may remain",
+                    formatted,
+                )
+                self.assertNotIn(unvalidated_path, formatted)
+
+    def test_cleanup_diagnostic_sanitizes_forwarded_signal_detail_in_place(
+        self,
+    ) -> None:
+        unvalidated_path = "/unvalidated/signal/.oauth_refresh.lock"
+        primary = providers.ForwardedSignal(
+            signal.SIGTERM,
+            detail=f"fixture signal detail at {unvalidated_path}",
+        )
+        original_identity = id(primary)
+        setattr(
+            primary,
+            "_codex_claude_refresh_lock_descriptor_bound",
+            True,
+        )
+
+        providers._raise_or_attach_claude_credential_cleanup(
+            primary,
+            [OSError("fixture cleanup failure")],
+            message="fixture cleanup failure",
+        )
+
+        self.assertEqual(id(primary), original_identity)
+        self.assertIsInstance(primary, providers.ForwardedSignal)
+        formatted = self.format_exception_text(primary)
+        self.assertIn(
+            "descriptor-bound lock directories may remain",
+            formatted,
+        )
+        self.assertNotIn(unvalidated_path, formatted)
+
+    def test_cleanup_diagnostic_sanitizes_callable_add_note_primary_root(
+        self,
+    ) -> None:
+        unvalidated_path = "/unvalidated/callable-note/.oauth_refresh.lock"
+        primary = providers.ClaudeCredentialInspectionInconclusive(
+            f"fixture primary failure at {unvalidated_path}"
+        )
+        primary.__notes__ = [f"fixture raw note at {unvalidated_path}"]
+        raw_cause = RuntimeError(f"fixture raw cause at {unvalidated_path}")
+        raw_context = RuntimeError(f"fixture raw context at {unvalidated_path}")
+        raw_evidence = RuntimeError(
+            f"fixture raw cleanup evidence at {unvalidated_path}"
+        )
+        primary.__cause__ = raw_cause
+        primary.__context__ = raw_context
+        primary.__suppress_context__ = False
+        setattr(
+            primary,
+            "_codex_claude_refresh_lock_cleanup_evidence",
+            raw_evidence,
+        )
+        setattr(
+            primary,
+            "_codex_claude_refresh_lock_paths",
+            (unvalidated_path,),
+        )
+        setattr(
+            primary,
+            "_codex_claude_refresh_lock_descriptor_bound",
+            True,
+        )
+
+        providers._attach_claude_credential_cleanup_failure(
+            primary,
+            OSError("fixture cleanup failure"),
+        )
+
+        formatted = self.format_exception_text(primary)
+        self.assertIn(
+            "descriptor-bound lock directories may remain",
+            formatted,
+        )
+        self.assertNotIn(unvalidated_path, formatted)
+        self.assertIsNone(primary.__context__)
+        self.assertTrue(primary.__suppress_context__)
+        self.assertIsInstance(
+            primary.__cause__,
+            providers.ClaudeCredentialCleanupDiagnostic,
+        )
+        self.assertIsNot(primary.__cause__, raw_cause)
+        self.assertIsNot(
+            getattr(
+                primary,
+                "_codex_claude_refresh_lock_cleanup_evidence",
+                None,
+            ),
+            raw_evidence,
+        )
+        self.assertIsNone(getattr(primary, "_codex_claude_refresh_lock_paths", None))
+
+    def test_cleanup_diagnostic_sanitizes_oserror_fields_in_place(self) -> None:
+        unvalidated_path = "/unvalidated/oserror/.oauth_refresh.lock"
+        secondary = RuntimeError("fixture descriptor-bound cleanup")
+        setattr(
+            secondary,
+            "_codex_claude_refresh_lock_descriptor_bound",
+            True,
+        )
+        primary = OSError(
+            errno.ENOENT,
+            f"fixture raw strerror at {unvalidated_path}",
+            unvalidated_path,
+            None,
+            f"{unvalidated_path}.replacement",
+        )
+        original_identity = id(primary)
+
+        providers._attach_claude_credential_cleanup_failure(
+            primary,
+            secondary,
+        )
+
+        self.assertEqual(id(primary), original_identity)
+        self.assertEqual(primary.errno, errno.ENOENT)
+        self.assertIsNone(primary.filename)
+        self.assertIsNone(primary.filename2)
+        self.assertNotIn(unvalidated_path, primary.strerror or "")
+        self.assertTrue(
+            all(unvalidated_path not in str(value) for value in primary.args)
+        )
+        self.assertNotIn(unvalidated_path, self.format_exception_text(primary))
+
+    def test_cleanup_diagnostic_sanitizes_only_cleanup_error(self) -> None:
+        if sys.version_info < (3, 11):
+            self.skipTest("requires ExceptionGroup")
+        exception_group = getattr(sys.modules["builtins"], "ExceptionGroup")
+        unvalidated_path = "/unvalidated/only-cleanup/.oauth_refresh.lock"
+        for error_shape in ("oserror", "exception-group"):
+            with self.subTest(error_shape=error_shape):
+                leaf = OSError(
+                    errno.ENOENT,
+                    f"fixture raw cleanup strerror at {unvalidated_path}",
+                    unvalidated_path,
+                )
+                cleanup_error = (
+                    leaf
+                    if error_shape == "oserror"
+                    else exception_group(
+                        f"fixture raw cleanup group at {unvalidated_path}",
+                        [leaf],
+                    )
+                )
+                setattr(
+                    cleanup_error,
+                    "_codex_claude_refresh_lock_descriptor_bound",
+                    True,
+                )
+
+                with self.assertRaises(
+                    providers.ClaudeCredentialInspectionInconclusive
+                ) as raised:
+                    providers._raise_or_attach_claude_credential_cleanup(
+                        None,
+                        [cleanup_error],
+                        message="fixture cleanup-only failure",
+                    )
+
+                formatted = self.format_exception_text(raised.exception)
+                self.assertNotIn(unvalidated_path, formatted)
+                self.assertFalse(
+                    providers._claude_error_graph_contains(
+                        raised.exception,
+                        cleanup_error,
+                    )
+                )
+
+    def test_cleanup_diagnostic_sanitizes_only_cleanup_control_flow(
+        self,
+    ) -> None:
+        if sys.version_info < (3, 11):
+            self.skipTest("requires BaseExceptionGroup")
+        exception_group = getattr(sys.modules["builtins"], "ExceptionGroup")
+        base_exception_group = getattr(
+            sys.modules["builtins"],
+            "BaseExceptionGroup",
+        )
+        unvalidated_path = "/unvalidated/only-cleanup-control-flow/.oauth_refresh.lock"
+        grouped_interrupt = KeyboardInterrupt(
+            f"fixture grouped interruption at {unvalidated_path}"
+        )
+        cleanup_group = base_exception_group(
+            f"fixture raw base group at {unvalidated_path}",
+            [
+                grouped_interrupt,
+                OSError(f"fixture grouped cleanup at {unvalidated_path}"),
+            ],
+        )
+        forwarded = providers.ForwardedSignal(
+            signal.SIGTERM,
+            detail=f"fixture forwarded cleanup at {unvalidated_path}",
+        )
+        for error_shape, cleanup_error in (
+            ("base-exception-group", cleanup_group),
+            ("forwarded-signal", forwarded),
+        ):
+            with self.subTest(error_shape=error_shape):
+                setattr(
+                    cleanup_error,
+                    "_codex_claude_refresh_lock_descriptor_bound",
+                    True,
+                )
+
+                with self.assertRaises(BaseException) as raised:
+                    providers._raise_or_attach_claude_credential_cleanup(
+                        None,
+                        [cleanup_error],
+                        message="fixture cleanup-only control flow",
+                    )
+
+                formatted = self.format_exception_text(raised.exception)
+                self.assertNotIn(unvalidated_path, formatted)
+                if error_shape == "base-exception-group":
+                    self.assertIsNot(raised.exception, cleanup_error)
+                    self.assertIsInstance(
+                        raised.exception,
+                        base_exception_group,
+                    )
+                    self.assertNotIsInstance(
+                        raised.exception,
+                        exception_group,
+                    )
+                    self.assertFalse(
+                        providers._claude_error_graph_contains(
+                            raised.exception,
+                            cleanup_error,
+                        )
+                    )
+                else:
+                    self.assertIs(raised.exception, cleanup_error)
+
+    def test_cleanup_diagnostic_clears_sanitized_root_traceback(self) -> None:
+        dynamic_filename = "/unvalidated/generated/credential_cleanup.py"
+        primary: OSError | None = None
+        try:
+            exec(
+                compile(
+                    "raise OSError('fixture dynamic cleanup failure')",
+                    dynamic_filename,
+                    "exec",
+                ),
+                {},
+            )
+        except OSError as error:
+            primary = error
+        else:  # pragma: no cover - compile fixture always raises
+            self.fail("dynamic cleanup fixture did not raise")
+        self.assertIsInstance(primary, OSError)
+        assert primary is not None
+        self.assertIsNotNone(primary.__traceback__)
+        setattr(
+            primary,
+            "_codex_claude_refresh_lock_descriptor_bound",
+            True,
+        )
+
+        effective = providers._attach_claude_credential_cleanup_failure(
+            primary,
+            OSError("fixture cleanup failure"),
+        )
+
+        self.assertIs(effective, primary)
+        self.assertIsNone(primary.__traceback__)
+        self.assertNotIn(dynamic_filename, self.format_exception_text(primary))
+
+    def test_cleanup_diagnostic_sanitizes_builtin_control_flow_in_place(
+        self,
+    ) -> None:
+        unvalidated_path = "/unvalidated/control-flow/.oauth_refresh.lock"
+        cases: tuple[tuple[str, BaseException, object], ...] = (
+            (
+                "keyboard-interrupt",
+                KeyboardInterrupt(f"fixture interruption at {unvalidated_path}"),
+                None,
+            ),
+            ("system-exit-none", SystemExit(None), None),
+            ("system-exit-integer", SystemExit(23), 23),
+            ("system-exit-string", SystemExit(unvalidated_path), 1),
+        )
+        for name, primary, expected_code in cases:
+            with self.subTest(name=name):
+                original_identity = id(primary)
+                primary.__notes__ = [f"fixture control-flow note at {unvalidated_path}"]
+                setattr(
+                    primary,
+                    "_codex_claude_refresh_lock_descriptor_bound",
+                    True,
+                )
+
+                providers._raise_or_attach_claude_credential_cleanup(
+                    primary,
+                    [OSError("fixture cleanup failure")],
+                    message="fixture cleanup failure",
+                )
+
+                self.assertEqual(id(primary), original_identity)
+                if isinstance(primary, SystemExit):
+                    self.assertEqual(primary.code, expected_code)
+                self.assertNotIn(
+                    unvalidated_path,
+                    self.format_exception_text(primary),
+                )
+
+    def test_cleanup_diagnostic_preserves_non_risky_primary_fields(self) -> None:
+        primary = OSError(
+            errno.EIO,
+            "fixture original strerror",
+            "/fixture/original-source",
+            None,
+            "/fixture/original-target",
+        )
+        primary.__notes__ = ["fixture original note"]
+        original_cause = RuntimeError("fixture original cause")
+        original_context = RuntimeError("fixture original context")
+        cleanup_evidence = RuntimeError("fixture ordinary cleanup evidence")
+        primary.__cause__ = original_cause
+        primary.__context__ = original_context
+        primary.__suppress_context__ = False
+        setattr(
+            primary,
+            "_codex_claude_refresh_lock_cleanup_evidence",
+            cleanup_evidence,
+        )
+        recovery_paths = ("/fixture/original-recovery",)
+        setattr(
+            primary,
+            "_codex_claude_refresh_lock_paths",
+            recovery_paths,
+        )
+        original_args = primary.args
+        original_errno = primary.errno
+        original_strerror = primary.strerror
+        original_filename = primary.filename
+        original_filename2 = primary.filename2
+
+        providers._attach_claude_credential_cleanup_failure(
+            primary,
+            RuntimeError("fixture ordinary cleanup failure"),
+        )
+
+        self.assertEqual(primary.args, original_args)
+        self.assertEqual(primary.errno, original_errno)
+        self.assertEqual(primary.strerror, original_strerror)
+        self.assertEqual(primary.filename, original_filename)
+        self.assertEqual(primary.filename2, original_filename2)
+        self.assert_cleanup_diagnostic_preserves_original_cause(
+            primary,
+            original_cause,
+        )
+        self.assertIs(primary.__context__, original_context)
+        self.assertIs(
+            getattr(
+                primary,
+                "_codex_claude_refresh_lock_cleanup_evidence",
+                None,
+            ),
+            cleanup_evidence,
+        )
+        self.assertEqual(
+            getattr(primary, "_codex_claude_refresh_lock_paths", None),
+            recovery_paths,
+        )
+        self.assertEqual(primary.__notes__[0], "fixture original note")
+        self.assert_cleanup_diagnostic_visible(primary)
+
+    def test_cleanup_diagnostic_replaces_risky_exception_group_root(
+        self,
+    ) -> None:
+        if sys.version_info < (3, 11):
+            self.skipTest("requires ExceptionGroup")
+        exception_group = getattr(sys.modules["builtins"], "ExceptionGroup")
+        for marker_source in ("root", "child"):
+            with self.subTest(marker_source=marker_source):
+                unvalidated_path = (
+                    f"/unvalidated/group-{marker_source}/.oauth_refresh.lock"
+                )
+                child = ValueError(
+                    f"fixture exception-group child at {unvalidated_path}"
+                )
+                group = exception_group(
+                    f"fixture exception-group root at {unvalidated_path}",
+                    [child],
+                )
+                marker = group if marker_source == "root" else child
+                setattr(
+                    marker,
+                    "_codex_claude_refresh_lock_descriptor_bound",
+                    True,
+                )
+
+                effective = providers._attach_claude_credential_cleanup_failure(
+                    group,
+                    OSError("fixture cleanup failure"),
+                )
+
+                self.assertIsNot(effective, group)
+                self.assertIsInstance(
+                    effective,
+                    exception_group,
+                )
+                formatted = self.format_exception_text(effective)
+                self.assertIn(
+                    "descriptor-bound lock directories may remain",
+                    formatted,
+                )
+                self.assertNotIn(unvalidated_path, formatted)
+                self.assertFalse(
+                    providers._claude_error_graph_contains(effective, group)
+                )
+
+    def test_cleanup_diagnostic_bounds_nested_exception_group_graph(self) -> None:
+        if sys.version_info < (3, 11):
+            self.skipTest("requires ExceptionGroup")
+        exception_group = getattr(sys.modules["builtins"], "ExceptionGroup")
+        for graph_shape in ("nested-marker", "over-budget"):
+            with self.subTest(graph_shape=graph_shape):
+                unvalidated_path = (
+                    f"/unvalidated/group-{graph_shape}/.oauth_refresh.lock"
+                )
+                if graph_shape == "nested-marker":
+                    marked_child = ValueError(
+                        f"fixture nested marked child at {unvalidated_path}"
+                    )
+                    setattr(
+                        marked_child,
+                        "_codex_claude_refresh_lock_descriptor_bound",
+                        True,
+                    )
+                    group = exception_group(
+                        "fixture outer group",
+                        [exception_group("fixture inner group", [marked_child])],
+                    )
+                    expected = "descriptor-bound lock directories may remain"
+                else:
+                    children = [
+                        ValueError(f"fixture group child {index} at {unvalidated_path}")
+                        for index in range(33)
+                    ]
+                    group = exception_group("fixture over-budget group", children)
+                    expected = "refresh-lock recovery evidence is incomplete"
+
+                effective = providers._attach_claude_credential_cleanup_failure(
+                    group,
+                    OSError("fixture cleanup failure"),
+                )
+
+                self.assertIsNot(effective, group)
+                formatted = self.format_exception_text(effective)
+                self.assertIn(expected, formatted)
+                self.assertNotIn(unvalidated_path, formatted)
+                if graph_shape == "nested-marker":
+                    self.assertFalse(
+                        providers._claude_error_graph_contains(effective, group)
+                    )
+                self.assertTrue(
+                    all(child is not group for child in effective.exceptions)
+                )
+
+    def test_cleanup_diagnostic_caps_structured_group_nodes(self) -> None:
+        if sys.version_info < (3, 11):
+            self.skipTest("requires BaseExceptionGroup")
+        exception_group = getattr(sys.modules["builtins"], "ExceptionGroup")
+        base_exception_group = getattr(
+            sys.modules["builtins"],
+            "BaseExceptionGroup",
+        )
+
+        wide_group: BaseException = exception_group(
+            "fixture wide group",
+            [ValueError(f"fixture child {index}") for index in range(64)],
+        )
+        deep_group: BaseException = ValueError("fixture deep leaf")
+        for index in range(64):
+            deep_group = exception_group(
+                f"fixture deep group {index}",
+                [deep_group],
+            )
+        wide_base_group: BaseException = base_exception_group(
+            "fixture wide base group",
+            [
+                *[ValueError(f"fixture ordinary child {index}") for index in range(64)],
+                KeyboardInterrupt("fixture control-flow child"),
+            ],
+        )
+        deep_base_group: BaseException = KeyboardInterrupt(
+            "fixture deep control-flow leaf"
+        )
+        for index in range(64):
+            deep_base_group = base_exception_group(
+                f"fixture deep base group {index}",
+                [deep_base_group],
+            )
+
+        for graph_shape, group, preserves_control_flow in (
+            ("wide", wide_group, False),
+            ("deep", deep_group, False),
+            ("wide-base", wide_base_group, True),
+            ("deep-base", deep_base_group, True),
+        ):
+            with self.subTest(graph_shape=graph_shape):
+                effective = providers._attach_claude_credential_cleanup_failure(
+                    group,
+                    OSError("fixture cleanup failure"),
+                )
+                pending = [effective]
+                structured_node_count = 0
+                while pending:
+                    current = pending.pop()
+                    structured_node_count += 1
+                    pending.extend(providers._claude_exception_group_children(current))
+
+                self.assertLessEqual(
+                    structured_node_count,
+                    providers._CLAUDE_ERROR_GRAPH_NODE_BUDGET,
+                )
+                self.assertEqual(
+                    not isinstance(effective, Exception),
+                    preserves_control_flow,
+                )
+
+    def test_cleanup_diagnostic_sanitizes_base_exception_group_children(
+        self,
+    ) -> None:
+        if sys.version_info < (3, 11):
+            self.skipTest("requires BaseExceptionGroup")
+        exception_group = getattr(sys.modules["builtins"], "ExceptionGroup")
+        base_exception_group = getattr(
+            sys.modules["builtins"],
+            "BaseExceptionGroup",
+        )
+        unvalidated_path = "/unvalidated/base-group/.oauth_refresh.lock"
+        child = KeyboardInterrupt(f"fixture grouped interruption at {unvalidated_path}")
+        original_child_identity = id(child)
+        setattr(
+            child,
+            "_codex_claude_refresh_lock_descriptor_bound",
+            True,
+        )
+        group = base_exception_group("fixture safe base group", [child])
+
+        effective = providers._attach_claude_credential_cleanup_failure(
+            group,
+            OSError("fixture cleanup failure"),
+        )
+
+        self.assertIsNot(effective, group)
+        self.assertIsInstance(effective, base_exception_group)
+        self.assertNotIsInstance(effective, exception_group)
+        self.assertEqual(id(effective.exceptions[0]), original_child_identity)
+        self.assertNotIn(unvalidated_path, self.format_exception_text(effective))
+
+    def test_cleanup_diagnostic_sanitizes_syntax_error_fields(self) -> None:
+        unvalidated_path = "/unvalidated/syntax/.oauth_refresh.lock"
+        primary = SyntaxError(
+            f"fixture raw syntax message at {unvalidated_path}",
+            (
+                unvalidated_path,
+                7,
+                3,
+                f"fixture raw syntax text at {unvalidated_path}\n",
+                7,
+                9,
+            ),
+        )
+        original_identity = id(primary)
+        setattr(
+            primary,
+            "_codex_claude_refresh_lock_descriptor_bound",
+            True,
+        )
+
+        effective = providers._attach_claude_credential_cleanup_failure(
+            primary,
+            OSError("fixture cleanup failure"),
+        )
+
+        self.assertIs(effective, primary)
+        self.assertEqual(id(primary), original_identity)
+        self.assertIsNone(primary.filename)
+        self.assertIsNone(primary.text)
+        self.assertIsNone(primary.lineno)
+        self.assertIsNone(primary.offset)
+        self.assertIsNone(primary.end_lineno)
+        self.assertIsNone(primary.end_offset)
+        self.assertNotIn(unvalidated_path, primary.msg)
+        self.assertNotIn(unvalidated_path, self.format_exception_text(primary))
+
+    def test_cleanup_diagnostic_sanitizes_descriptor_bound_secondary_message(
+        self,
+    ) -> None:
+        for recovery_state in ("descriptor-bound", "incomplete"):
+            with self.subTest(recovery_state=recovery_state):
+                primary = self.LegacyInspectionError("fixture legacy primary")
+                unvalidated_path = (
+                    f"/unvalidated/secondary-{recovery_state}/.oauth_refresh.lock"
+                )
+                secondary = OSError(f"fixture cleanup failure at {unvalidated_path}")
+                if recovery_state == "descriptor-bound":
+                    setattr(
+                        secondary,
+                        "_codex_claude_refresh_lock_descriptor_bound",
+                        True,
+                    )
+                else:
+                    cycle = RuntimeError("fixture cleanup evidence cycle")
+                    secondary.__cause__ = cycle
+                    cycle.__cause__ = secondary
+
+                providers._attach_claude_credential_cleanup_failure(
+                    primary,
+                    secondary,
+                )
+
+                diagnostic = primary.__cause__
+                self.assertIsInstance(
+                    diagnostic,
+                    providers.ClaudeCredentialCleanupDiagnostic,
+                )
+                formatted = self.format_exception_text(primary)
+                self.assertIn("raw exception details hidden", formatted)
+                self.assertNotIn(unvalidated_path, formatted)
+                self.assertIsNot(diagnostic.__cause__, secondary)
+
+    def test_cleanup_diagnostic_sanitizes_descriptor_bound_existing_cause(
+        self,
+    ) -> None:
+        for recovery_state in ("descriptor-bound", "incomplete"):
+            with self.subTest(recovery_state=recovery_state):
+                primary = self.LegacyInspectionError("fixture legacy primary")
+                unvalidated_path = (
+                    f"/unvalidated/existing-{recovery_state}/.oauth_refresh.lock"
+                )
+                existing = RuntimeError(f"fixture existing cause at {unvalidated_path}")
+                primary.__cause__ = existing
+                if recovery_state == "descriptor-bound":
+                    setattr(
+                        existing,
+                        "_codex_claude_refresh_lock_descriptor_bound",
+                        True,
+                    )
+                else:
+                    cycle = RuntimeError("fixture existing evidence cycle")
+                    existing.__cause__ = cycle
+                    cycle.__cause__ = existing
+
+                providers._attach_claude_credential_cleanup_failure(
+                    primary,
+                    OSError("fixture cleanup failure"),
+                )
+
+                diagnostic = primary.__cause__
+                self.assertIsInstance(
+                    diagnostic,
+                    providers.ClaudeCredentialCleanupDiagnostic,
+                )
+                formatted = self.format_exception_text(primary)
+                self.assertIn("raw exception details hidden", formatted)
+                self.assertNotIn(unvalidated_path, formatted)
+                self.assertIsNot(diagnostic.__cause__, existing)
+
+    def test_cleanup_diagnostic_scans_related_evidence_before_paths(
+        self,
+    ) -> None:
+        for evidence_source in (
+            "existing-marker",
+            "secondary-marker",
+            "existing-incomplete",
+        ):
+            with self.subTest(evidence_source=evidence_source):
+                primary = self.LegacyInspectionError("fixture legacy primary")
+                unvalidated_path = f"/unvalidated/{evidence_source}/.oauth_refresh.lock"
+                setattr(
+                    primary,
+                    "_codex_claude_refresh_lock_paths",
+                    (unvalidated_path,),
+                )
+                existing = RuntimeError("fixture existing primary cause")
+                primary.__cause__ = existing
+                secondary = OSError("fixture cleanup failure")
+                evidence = (
+                    existing if evidence_source.startswith("existing") else secondary
+                )
+                if evidence_source.endswith("marker"):
+                    setattr(
+                        evidence,
+                        "_codex_claude_refresh_lock_descriptor_bound",
+                        True,
+                    )
+                    expected = "descriptor-bound lock directories may remain"
+                else:
+                    cycle = RuntimeError("fixture existing evidence cycle")
+                    existing.__cause__ = cycle
+                    cycle.__cause__ = existing
+                    expected = "refresh-lock recovery evidence is incomplete"
+
+                providers._attach_claude_credential_cleanup_failure(
+                    primary,
+                    secondary,
+                )
+
+                formatted = self.format_exception_text(primary)
+                self.assertIn(expected, formatted)
+                self.assertNotIn(unvalidated_path, formatted)
+
+    def test_cleanup_diagnostic_follows_trusted_cleanup_evidence_edge(
+        self,
+    ) -> None:
+        for evidence_shape in ("marker", "cycle", "over-budget"):
+            with self.subTest(evidence_shape=evidence_shape):
+                primary = self.LegacyInspectionError("fixture legacy primary")
+                unvalidated_path = (
+                    f"/unvalidated/evidence-{evidence_shape}/.oauth_refresh.lock"
+                )
+                setattr(
+                    primary,
+                    "_codex_claude_refresh_lock_paths",
+                    (unvalidated_path,),
+                )
+                secondary = OSError("fixture cleanup root")
+                evidence = RuntimeError("fixture linked cleanup evidence")
+                setattr(
+                    secondary,
+                    "_codex_claude_refresh_lock_cleanup_evidence",
+                    evidence,
+                )
+                if evidence_shape == "marker":
+                    setattr(
+                        evidence,
+                        "_codex_claude_refresh_lock_descriptor_bound",
+                        True,
+                    )
+                    expected = "descriptor-bound lock directories may remain"
+                elif evidence_shape == "cycle":
+                    setattr(
+                        evidence,
+                        "_codex_claude_refresh_lock_cleanup_evidence",
+                        secondary,
+                    )
+                    expected = "refresh-lock recovery evidence is incomplete"
+                else:
+                    current = evidence
+                    for index in range(32):
+                        related = RuntimeError(
+                            f"fixture linked cleanup evidence {index}"
+                        )
+                        setattr(
+                            current,
+                            "_codex_claude_refresh_lock_cleanup_evidence",
+                            related,
+                        )
+                        current = related
+                    expected = "refresh-lock recovery evidence is incomplete"
+
+                providers._attach_claude_credential_cleanup_failure(
+                    primary,
+                    secondary,
+                )
+
+                diagnostic = primary.__cause__
+                self.assertIsInstance(
+                    diagnostic,
+                    providers.ClaudeCredentialCleanupDiagnostic,
+                )
+                self.assertIs(
+                    getattr(
+                        diagnostic,
+                        "_codex_claude_refresh_lock_descriptor_bound",
+                        False,
+                    ),
+                    True,
+                )
+                formatted = self.format_exception_text(primary)
+                self.assertIn(expected, formatted)
+                self.assertNotIn(unvalidated_path, formatted)
+
+    def test_cleanup_diagnostic_selects_falsey_existing_link_explicitly(
+        self,
+    ) -> None:
+        class FalseyError(RuntimeError):
+            def __bool__(self) -> bool:
+                return False
+
+        cases = (
+            ("cause", True, False, True),
+            ("context", False, False, True),
+            ("suppressed-context", False, True, False),
+        )
+        for name, use_cause, suppress_context, should_render in cases:
+            with self.subTest(name=name):
+                primary = self.LegacyInspectionError(
+                    f"fixture legacy primary for {name}"
+                )
+                falsey_link = FalseyError(f"fixture falsey {name}")
+                alternate_context = RuntimeError(
+                    f"fixture alternate context for {name}"
+                )
+                if use_cause:
+                    primary.__cause__ = falsey_link
+                    primary.__context__ = alternate_context
+                else:
+                    primary.__context__ = falsey_link
+                primary.__suppress_context__ = suppress_context
+
+                providers._attach_claude_credential_cleanup_failure(
+                    primary,
+                    OSError(f"fixture cleanup for {name}"),
+                )
+
+                formatted = self.format_exception_text(primary)
+                if should_render:
+                    self.assertIn(str(falsey_link), formatted)
+                else:
+                    self.assertNotIn(str(falsey_link), formatted)
+                self.assertNotIn(str(alternate_context), formatted)
+
+    def test_cleanup_diagnostic_fallback_renders_secondary_with_existing_link(
+        self,
+    ) -> None:
+        for existing_link in ("cause", "context"):
+            with self.subTest(existing_link=existing_link):
+                primary = self.LegacyInspectionError(
+                    f"fixture legacy primary with {existing_link}"
+                )
+                original_link = RuntimeError(f"fixture original {existing_link}")
+                if existing_link == "cause":
+                    primary.__cause__ = original_link
+                else:
+                    primary.__context__ = original_link
+                    primary.__suppress_context__ = False
+                secondary = OSError(
+                    f"fixture visible cleanup secondary for {existing_link}"
+                )
+                secondary_cause = ValueError(
+                    f"fixture cleanup cause for {existing_link}"
+                )
+                secondary.__cause__ = secondary_cause
+
+                providers._attach_claude_credential_cleanup_failure(
+                    primary,
+                    secondary,
+                )
+
+                formatted = self.format_exception_text(primary)
+                self.assertIn(str(original_link), formatted)
+                self.assertIn(str(secondary_cause), formatted)
+                self.assertIn(str(secondary), formatted)
+                self.assertIs(secondary.__cause__, secondary_cause)
+                self.assertIsNone(secondary_cause.__cause__)
+
+    def test_cleanup_diagnostic_fallback_preserves_unique_shared_tail_prefix(
+        self,
+    ) -> None:
+        primary = self.LegacyInspectionError("fixture legacy primary")
+        shared_tail = RuntimeError("fixture shared chain tail")
+        original_cause = ValueError("fixture original cause")
+        original_cause.__cause__ = shared_tail
+        primary.__cause__ = original_cause
+        secondary = OSError("fixture cleanup root")
+        unique_detail = providers.ForwardedSignal(
+            signal.SIGTERM,
+            detail="fixture unique cleanup control flow",
+        )
+        retained_path = "/fixture/.claude/.oauth_refresh.lock"
+        setattr(
+            unique_detail,
+            "_codex_claude_refresh_lock_paths",
+            (retained_path,),
+        )
+        secondary.__cause__ = unique_detail
+        unique_detail.__cause__ = shared_tail
+
+        providers._attach_claude_credential_cleanup_failure(
+            primary,
+            secondary,
+        )
+
+        formatted = self.format_exception_text(primary)
+        for expected in (
+            str(shared_tail),
+            str(original_cause),
+            str(unique_detail),
+            str(secondary),
+        ):
+            self.assertIn(expected, formatted)
+        self.assertIs(secondary.__cause__, unique_detail)
+        self.assertIs(unique_detail.__cause__, shared_tail)
+        self.assertIs(original_cause.__cause__, shared_tail)
+        self.assertIsNone(shared_tail.__cause__)
+        self.assertEqual(
+            getattr(
+                unique_detail,
+                "_codex_claude_refresh_lock_paths",
+                None,
+            ),
+            (retained_path,),
+        )
+
+    def test_cleanup_diagnostic_reuses_secondary_without_cross_linking(
+        self,
+    ) -> None:
+        secondary = OSError("fixture cached cleanup root")
+        unique_detail = providers.ForwardedSignal(
+            signal.SIGTERM,
+            detail="fixture cached cleanup control flow",
+        )
+        cleanup_tail = RuntimeError("fixture cached cleanup tail")
+        secondary.__cause__ = unique_detail
+        unique_detail.__cause__ = cleanup_tail
+        primary_a = self.LegacyInspectionError("fixture primary A")
+        cause_a = RuntimeError("fixture cause A")
+        primary_a.__cause__ = cause_a
+        primary_b = self.LegacyInspectionError("fixture primary B")
+        cause_b = RuntimeError("fixture cause B")
+        primary_b.__cause__ = cause_b
+
+        providers._attach_claude_credential_cleanup_failure(
+            primary_a,
+            secondary,
+        )
+        formatted_a_before = self.format_exception_text(primary_a)
+        providers._attach_claude_credential_cleanup_failure(
+            primary_b,
+            secondary,
+        )
+
+        self.assertEqual(
+            self.format_exception_text(primary_a),
+            formatted_a_before,
+        )
+        self.assertNotIn(str(cause_b), formatted_a_before)
+        self.assertNotIn(str(cause_a), self.format_exception_text(primary_b))
+        self.assertIs(secondary.__cause__, unique_detail)
+        self.assertIs(unique_detail.__cause__, cleanup_tail)
+        self.assertIsNone(cleanup_tail.__cause__)
+
+    def test_cleanup_diagnostic_complex_graph_preserves_safe_recovery_marker(
+        self,
+    ) -> None:
+        primary = self.LegacyInspectionError("fixture legacy primary")
+        shared_tail = RuntimeError("fixture shared visible tail")
+        shared_hidden = RuntimeError("fixture shared hidden node")
+        original_cause = ValueError("fixture original cause")
+        original_cause.__cause__ = shared_tail
+        original_cause.__context__ = shared_hidden
+        primary.__cause__ = original_cause
+        secondary = OSError("fixture cleanup root")
+        unique_detail = RuntimeError("fixture unique recovery detail")
+        unique_detail.__cause__ = shared_tail
+        unique_detail.__context__ = shared_hidden
+        setattr(
+            shared_hidden,
+            "_codex_claude_refresh_lock_descriptor_bound",
+            True,
+        )
+        unvalidated_path = "/unvalidated/replacement/.oauth_refresh.lock"
+        setattr(
+            shared_hidden,
+            "_codex_claude_refresh_lock_paths",
+            (unvalidated_path,),
+        )
+        secondary.__cause__ = unique_detail
+
+        providers._attach_claude_credential_cleanup_failure(
+            primary,
+            secondary,
+        )
+
+        diagnostic = primary.__cause__
+        self.assertIsInstance(
+            diagnostic,
+            providers.ClaudeCredentialCleanupDiagnostic,
+        )
+        self.assertIs(
+            getattr(
+                diagnostic,
+                "_codex_claude_refresh_lock_descriptor_bound",
+                False,
+            ),
+            True,
+        )
+        self.assertIs(unique_detail.__cause__, shared_tail)
+        self.assertIs(original_cause.__cause__, shared_tail)
+        self.assertIsNone(shared_tail.__cause__)
+        formatted = self.format_exception_text(primary)
+        self.assertNotIn(str(secondary), formatted)
+        self.assertNotIn(str(unique_detail), formatted)
+        self.assertIn("Cleanup exception type: OSError", formatted)
+        self.assertIn("Selected existing exception type: ValueError", formatted)
+        self.assertIn("raw exception details hidden", formatted)
+        self.assertIn(
+            "descriptor-bound refresh-lock recovery evidence",
+            formatted,
+        )
+        self.assertNotIn(unvalidated_path, formatted)
+
+    def test_cleanup_diagnostic_without_existing_link_bounds_incomplete_graph(
+        self,
+    ) -> None:
+        for graph_name in ("over-budget", "cycle"):
+            with self.subTest(graph=graph_name):
+                primary = self.LegacyInspectionError(
+                    f"fixture legacy primary for {graph_name}"
+                )
+                unique_detail = providers.ForwardedSignal(
+                    signal.SIGTERM,
+                    detail=f"fixture {graph_name} control flow",
+                )
+                if graph_name == "over-budget":
+                    cleanup: list[BaseException] = [
+                        RuntimeError(f"fixture cleanup node {index}")
+                        for index in range(32)
+                    ]
+                    cleanup.append(unique_detail)
+                    for current, related in zip(cleanup, cleanup[1:]):
+                        current.__cause__ = related
+                    cleanup_root = cleanup[0]
+                    preserved_owner = cleanup[-2]
+                else:
+                    cleanup_root = RuntimeError("fixture cyclic cleanup root")
+                    cleanup_root.__cause__ = unique_detail
+                    unique_detail.__cause__ = cleanup_root
+                    preserved_owner = unique_detail
+                unvalidated_path = f"/unvalidated/{graph_name}/.oauth_refresh.lock"
+                setattr(
+                    unique_detail,
+                    "_codex_claude_refresh_lock_descriptor_bound",
+                    True,
+                )
+                setattr(
+                    unique_detail,
+                    "_codex_claude_refresh_lock_paths",
+                    (unvalidated_path,),
+                )
+
+                providers._attach_claude_credential_cleanup_failure(
+                    primary,
+                    cleanup_root,
+                )
+
+                diagnostic = primary.__cause__
+                self.assertIsInstance(
+                    diagnostic,
+                    providers.ClaudeCredentialCleanupDiagnostic,
+                )
+                self.assertIs(
+                    getattr(
+                        diagnostic,
+                        "_codex_claude_refresh_lock_descriptor_bound",
+                        False,
+                    ),
+                    True,
+                )
+                expected_related = (
+                    unique_detail if graph_name == "over-budget" else cleanup_root
+                )
+                self.assertIs(preserved_owner.__cause__, expected_related)
+                formatted = self.format_exception_text(primary)
+                self.assertIn(
+                    "cleanup control-flow or descriptor-bound recovery "
+                    "evidence may be hidden beyond the safety limit",
+                    formatted,
+                )
+                self.assertNotIn(unvalidated_path, formatted)
+
+    def test_refresh_transaction_abandonment_preserves_legacy_cleanup_chain(
+        self,
+    ) -> None:
+        class LegacyKeyboardInterrupt(KeyboardInterrupt):
+            add_note = None
+
+        class LegacySystemExit(SystemExit):
+            add_note = None
+
+        class LegacyOSError(OSError):
+            add_note = None
+
+        def chain_contains(
+            root: BaseException,
+            expected: BaseException,
+        ) -> bool:
+            pending = [root]
+            seen: set[int] = set()
+            while pending and len(seen) < 32:
+                current = pending.pop()
+                if current is expected:
+                    return True
+                if id(current) in seen:
+                    continue
+                seen.add(id(current))
+                for related in (current.__cause__, current.__context__):
+                    if isinstance(related, BaseException):
+                        pending.append(related)
+            return False
+
+        primary_factories = (
+            lambda: LegacyKeyboardInterrupt("fixture interruption"),
+            lambda: LegacySystemExit("fixture exit"),
+            lambda: LegacyOSError("fixture I/O failure"),
+        )
+        retained_path = "/fixture/.claude/.oauth_refresh.lock"
+        for primary_factory in primary_factories:
+            for descriptor_bound in (False, True):
+                for existing_chain in ("cause", "context"):
+                    with self.subTest(
+                        primary=primary_factory().__class__.__name__,
+                        descriptor_bound=descriptor_bound,
+                        existing_chain=existing_chain,
+                    ):
+                        primary = primary_factory()
+                        original_cause = RuntimeError(
+                            f"fixture original {existing_chain}"
+                        )
+                        if existing_chain == "cause":
+                            primary.__cause__ = original_cause
+                        else:
+                            primary.__context__ = original_cause
+                            primary.__suppress_context__ = False
+                        cleanup_error = (
+                            claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                                "fixture exact refresh-lock cleanup failure"
+                            )
+                        )
+                        if descriptor_bound:
+                            setattr(
+                                cleanup_error,
+                                ("_codex_claude_refresh_lock_descriptor_bound"),
+                                True,
+                            )
+                        else:
+                            setattr(
+                                cleanup_error,
+                                "_codex_claude_refresh_lock_paths",
+                                (retained_path,),
+                            )
+                        lease = mock.Mock(spec=["abandon"])
+                        lease.abandon.return_value = cleanup_error
+
+                        providers._abandon_claude_macos_refresh_transaction(
+                            lease,
+                            "fixture abandonment",
+                            primary,
+                        )
+
+                        lease.abandon.assert_called_once_with("fixture abandonment")
+                        formatted = self.format_exception_text(primary)
+                        self.assertIn(str(primary), formatted)
+                        self.assertIn(
+                            "Claude credential operation also had a cleanup failure",
+                            formatted,
+                        )
+                        if descriptor_bound:
+                            self.assertIs(
+                                getattr(
+                                    primary,
+                                    ("_codex_claude_refresh_lock_descriptor_bound"),
+                                    False,
+                                ),
+                                True,
+                            )
+                            self.assertIn(
+                                "descriptor-bound lock directories may remain",
+                                formatted,
+                            )
+                            self.assertFalse(chain_contains(primary, original_cause))
+                            self.assertNotIn(str(cleanup_error), formatted)
+                            self.assertNotIn(str(original_cause), formatted)
+                            self.assertIn(
+                                "Cleanup exception type: "
+                                "ClaudeRefreshLockCleanupInconclusive",
+                                formatted,
+                            )
+                            self.assertIn(
+                                "Selected existing exception type: "
+                                "ClaudeRefreshLockCleanupDiagnostic",
+                                formatted,
+                            )
+                            self.assertIn(
+                                "raw exception details hidden",
+                                formatted,
+                            )
+                        else:
+                            self.assertTrue(chain_contains(primary, original_cause))
+                            self.assertIn(str(cleanup_error), formatted)
+                            self.assertIn(str(original_cause), formatted)
+                            self.assertEqual(
+                                getattr(
+                                    primary,
+                                    "_codex_claude_refresh_lock_paths",
+                                    None,
+                                ),
+                                (retained_path,),
+                            )
+                            self.assertIn(retained_path, formatted)
+
+    def test_cleanup_error_graph_budget_fails_closed(self) -> None:
+        def build_deep_graph(node_count: int) -> BaseException:
+            errors = [
+                RuntimeError(f"fixture deep cleanup node {index}")
+                for index in range(node_count)
+            ]
+            for current, related in zip(errors, errors[1:]):
+                current.__cause__ = related
+            return errors[0]
+
+        def build_wide_graph(node_count: int) -> BaseException:
+            errors = [
+                RuntimeError(f"fixture wide cleanup node {index}")
+                for index in range(node_count)
+            ]
+            for index, related in enumerate(errors[1:], start=1):
+                parent = errors[(index - 1) // 2]
+                if index % 2:
+                    parent.__cause__ = related
+                else:
+                    parent.__context__ = related
+                    parent.__suppress_context__ = False
+            return errors[0]
+
+        primary = RuntimeError("fixture primary")
+        for graph_name, build_graph in (
+            ("deep", build_deep_graph),
+            ("wide", build_wide_graph),
+        ):
+            with self.subTest(graph=graph_name, nodes=32):
+                exact_boundary = build_graph(32)
+                self.assertFalse(
+                    providers._claude_error_graph_contains(
+                        exact_boundary,
+                        primary,
+                    )
+                )
+                self.assertIs(
+                    providers._claude_cleanup_error_without_primary_backlink(
+                        exact_boundary,
+                        primary,
+                    ),
+                    exact_boundary,
+                )
+
+            with self.subTest(graph=graph_name, nodes=33):
+                over_boundary = build_graph(33)
+                self.assertTrue(
+                    providers._claude_error_graph_contains(
+                        over_boundary,
+                        primary,
+                    )
+                )
+                rendered = providers._claude_cleanup_error_without_primary_backlink(
+                    over_boundary,
+                    primary,
+                )
+                self.assertIsNot(rendered, over_boundary)
+                self.assertFalse(
+                    providers._claude_error_graph_contains(rendered, primary)
+                )
+
+        shallow = RuntimeError("fixture shallow cleanup")
+        shallow.__cause__ = RuntimeError("fixture shallow cause")
+        self.assertIs(
+            providers._claude_cleanup_error_without_primary_backlink(
+                shallow,
+                primary,
+            ),
+            shallow,
+        )
+
+        shared = RuntimeError("fixture shared cleanup leaf")
+        diamond_left = RuntimeError("fixture diamond left")
+        diamond_right = RuntimeError("fixture diamond right")
+        diamond_root = RuntimeError("fixture diamond root")
+        diamond_left.__cause__ = shared
+        diamond_right.__context__ = shared
+        diamond_right.__suppress_context__ = False
+        diamond_root.__cause__ = diamond_left
+        diamond_root.__context__ = diamond_right
+        diamond_root.__suppress_context__ = False
+        self.assertFalse(providers._claude_error_graph_contains(diamond_root, primary))
+        self.assertIs(
+            providers._claude_cleanup_error_without_primary_backlink(
+                diamond_root,
+                primary,
+            ),
+            diamond_root,
+        )
+
+        cycle_root = RuntimeError("fixture cyclic cleanup root")
+        cycle_tail = RuntimeError("fixture cyclic cleanup tail")
+        cycle_root.__cause__ = cycle_tail
+        cycle_tail.__context__ = cycle_root
+        cycle_tail.__suppress_context__ = False
+        self.assertTrue(providers._claude_error_graph_contains(cycle_root, primary))
+        cycle_root.__context__ = primary
+        cycle_root.__suppress_context__ = False
+        rendered_cycle = providers._claude_cleanup_error_without_primary_backlink(
+            cycle_root,
+            primary,
+        )
+        self.assertIsNot(rendered_cycle, cycle_root)
+        self.assertFalse(
+            providers._claude_error_graph_contains(rendered_cycle, primary)
+        )
+
+    def test_persistence_source_graph_lookup_is_bounded(self) -> None:
+        persistence_source = RuntimeError("fixture persistence source")
+        setattr(
+            persistence_source,
+            "_codex_claude_refresh_persistence_failed",
+            True,
+        )
+        root = RuntimeError("fixture lookup root")
+        root.__context__ = persistence_source
+        root.__suppress_context__ = False
+
+        source, complete = providers._claude_persistence_source_from_error_graph(root)
+
+        self.assertTrue(complete)
+        self.assertIs(source, persistence_source)
+
+        cycle = RuntimeError("fixture lookup cycle")
+        persistence_source.__cause__ = cycle
+        cycle.__context__ = persistence_source
+        cycle.__suppress_context__ = False
+
+        source, complete = providers._claude_persistence_source_from_error_graph(root)
+
+        self.assertFalse(complete)
+        self.assertIsNone(source)
+
+        errors = [RuntimeError(f"fixture lookup node {index}") for index in range(33)]
+        for current, related in zip(errors, errors[1:]):
+            current.__cause__ = related
+        setattr(
+            errors[-1],
+            "_codex_claude_refresh_persistence_failed",
+            True,
+        )
+
+        source, complete = providers._claude_persistence_source_from_error_graph(
+            errors[0]
+        )
+
+        self.assertFalse(complete)
+        self.assertIsNone(source)
+
+    def test_cleanup_error_detach_rejects_independent_cycle(self) -> None:
+        primary = RuntimeError("fixture primary")
+        secondary = OSError("fixture cleanup failure")
+        cycle_root = RuntimeError("fixture independent cycle root")
+        cycle_tail = RuntimeError("fixture independent cycle tail")
+        cycle_root.__cause__ = cycle_tail
+        cycle_tail.__context__ = cycle_root
+        cycle_tail.__suppress_context__ = False
+        secondary.__cause__ = primary
+        secondary.__context__ = cycle_root
+        secondary.__suppress_context__ = False
+
+        self.assertTrue(providers._claude_error_graph_contains(cycle_root, primary))
+        rendered = providers._claude_cleanup_error_without_primary_backlink(
+            secondary,
+            primary,
+        )
+
+        self.assertIsNot(rendered, secondary)
+        self.assertIsNone(rendered.__cause__)
+        self.assertIsNone(rendered.__context__)
+        self.assertFalse(providers._claude_error_graph_contains(rendered, primary))
+
+    def test_cleanup_error_detach_respects_context_visibility(self) -> None:
+        sensitive_path = "/fixture/private/suppressed-detached-context/auth.json"
+        for suppress_context in (False, True):
+            with self.subTest(suppress_context=suppress_context):
+                primary = RuntimeError("fixture primary")
+                marker = sensitive_path if suppress_context else "visible-detached-context"
+                original_context = RuntimeError(marker)
+                secondary = OSError("fixture cleanup failure")
+                secondary.__cause__ = primary
+                secondary.__context__ = original_context
+                secondary.__suppress_context__ = suppress_context
+
+                rendered = providers._claude_cleanup_error_without_primary_backlink(
+                    secondary,
+                    primary,
+                )
+
+                self.assertIsNot(rendered, secondary)
+                self.assertIsNone(rendered.__cause__)
+                if suppress_context:
+                    self.assertIsNone(rendered.__context__)
+                else:
+                    self.assertIs(rendered.__context__, original_context)
+                formatted = self.format_exception_text(rendered)
+                if suppress_context:
+                    self.assertNotIn(marker, formatted)
+                else:
+                    self.assertIn(marker, formatted)
+
+    def test_abandonment_double_control_flow_keeps_primary_recovery_metadata(
+        self,
+    ) -> None:
+        class LegacyForwardedSignal(providers.ForwardedSignal):
+            add_note = None
+
+        class LegacyKeyboardInterrupt(KeyboardInterrupt):
+            add_note = None
+
+        def assert_acyclic(
+            root: BaseException,
+        ) -> dict[int, BaseException]:
+            visited: dict[int, BaseException] = {}
+            active: set[int] = set()
+
+            def visit(current: BaseException) -> None:
+                identity = id(current)
+                if identity in active:
+                    self.fail("cleanup diagnostic cause/context graph contains a cycle")
+                if identity in visited:
+                    return
+                active.add(identity)
+                for related in (current.__cause__, current.__context__):
+                    if isinstance(related, BaseException):
+                        visit(related)
+                active.remove(identity)
+                visited[identity] = current
+
+            visit(root)
+            return visited
+
+        retained_path = "/fixture/.claude/.oauth_refresh.lock"
+        primary_factories: tuple[Callable[[], BaseException], ...] = (
+            lambda: LegacyForwardedSignal(signal.SIGTERM),
+            lambda: LegacyKeyboardInterrupt("fixture primary interruption"),
+        )
+
+        for primary_factory in primary_factories:
+            for descriptor_bound in (False, True):
+                with self.subTest(
+                    primary=type(primary_factory()).__name__,
+                    descriptor_bound=descriptor_bound,
+                ):
+                    primary = primary_factory()
+                    primary_identity = id(primary)
+                    original_link = RuntimeError(
+                        "fixture existing primary exception link"
+                    )
+                    if descriptor_bound:
+                        primary.__context__ = original_link
+                        primary.__suppress_context__ = False
+                    else:
+                        primary.__cause__ = original_link
+                    cleanup = providers.ForwardedSignal(signal.SIGINT)
+                    cleanup_cause = RuntimeError("fixture independent cleanup cause")
+                    cleanup.__cause__ = cleanup_cause
+                    if descriptor_bound:
+                        setattr(
+                            cleanup,
+                            ("_codex_claude_refresh_lock_descriptor_bound"),
+                            True,
+                        )
+                        expected_marker = "descriptor-bound"
+                    else:
+                        setattr(
+                            cleanup,
+                            "_codex_claude_refresh_lock_paths",
+                            (retained_path,),
+                        )
+                        expected_marker = retained_path
+                    lease = mock.Mock(spec=["abandon"])
+                    lease.abandon.side_effect = cleanup
+
+                    propagated: BaseException | None = None
+                    try:
+                        try:
+                            raise primary
+                        except BaseException as active_primary:
+                            self.assertIs(active_primary, primary)
+                            providers._abandon_claude_macos_refresh_transaction(
+                                lease,
+                                "fixture double-control-flow abandonment",
+                                active_primary,
+                            )
+                            raise
+                    except BaseException as final_error:
+                        propagated = final_error
+
+                    self.assertIs(propagated, primary)
+                    self.assertEqual(id(primary), primary_identity)
+                    self.assertIs(cleanup.__context__, primary)
+                    visible_exceptions = assert_acyclic(primary)
+                    if descriptor_bound:
+                        self.assertNotIn(id(original_link), visible_exceptions)
+                        self.assertTrue(
+                            any(
+                                isinstance(
+                                    error,
+                                    providers.ClaudeCredentialCleanupDiagnostic,
+                                )
+                                and "Selected existing exception type" in str(error)
+                                for error in visible_exceptions.values()
+                            )
+                        )
+                    else:
+                        self.assertIn(id(original_link), visible_exceptions)
+                    self.assertLessEqual(
+                        len(visible_exceptions),
+                        providers._CLAUDE_ERROR_GRAPH_NODE_BUDGET,
+                    )
+                    self.assertNotIn(id(cleanup), visible_exceptions)
+                    self.assertNotIn(id(cleanup_cause), visible_exceptions)
+                    lease.abandon.assert_called_once_with(
+                        "fixture double-control-flow abandonment"
+                    )
+                    if descriptor_bound:
+                        self.assertIs(
+                            getattr(
+                                primary,
+                                ("_codex_claude_refresh_lock_descriptor_bound"),
+                                False,
+                            ),
+                            True,
+                        )
+                        self.assertIsNone(
+                            getattr(
+                                primary,
+                                "_codex_claude_refresh_lock_paths",
+                                None,
+                            )
+                        )
+                    else:
+                        self.assertEqual(
+                            getattr(
+                                primary,
+                                "_codex_claude_refresh_lock_paths",
+                                None,
+                            ),
+                            (retained_path,),
+                        )
+                        self.assertFalse(
+                            getattr(
+                                primary,
+                                ("_codex_claude_refresh_lock_descriptor_bound"),
+                                False,
+                            )
+                        )
+                    visible = "\n".join(
+                        (
+                            str(primary),
+                            getattr(primary, "detail", None) or "",
+                            *getattr(primary, "__notes__", ()),
+                            "".join(
+                                traceback.format_exception(
+                                    type(primary),
+                                    primary,
+                                    primary.__traceback__,
+                                )
+                            ),
+                        )
+                    )
+                    self.assertIn(expected_marker, visible)
+                    self.assertIn(
+                        "Claude credential operation also had a cleanup failure",
+                        visible,
+                    )
+                    if descriptor_bound:
+                        self.assertNotIn(
+                            "fixture independent cleanup cause",
+                            visible,
+                        )
+                    else:
+                        self.assertIn(
+                            "ForwardedSignal: review orchestration received signal 2",
+                            visible,
+                        )
+                        self.assertIn(
+                            "RuntimeError: fixture independent cleanup cause",
+                            visible,
+                        )
 
     def test_persistence_diagnostic_fallback_preserves_control_flow(self) -> None:
         class LegacyKeyboardInterrupt(KeyboardInterrupt):
@@ -712,6 +2572,43 @@ class ProviderPolicyTest(unittest.TestCase):
             )
         )
         self.assert_persistence_diagnostic_visible(interruption)
+
+    def test_persistence_diagnostic_legacy_fallback_respects_context_visibility(
+        self,
+    ) -> None:
+        class LegacyError(RuntimeError):
+            add_note = None
+
+        sensitive_path = "/fixture/private/suppressed-provider-context/auth.json"
+        for suppress_context in (False, True):
+            with self.subTest(suppress_context=suppress_context):
+                marker = sensitive_path if suppress_context else "visible-provider-context"
+                original_context = RuntimeError(marker)
+                primary = LegacyError("primary persistence failure")
+                primary.__context__ = original_context
+                primary.__suppress_context__ = suppress_context
+
+                providers._add_claude_persistence_note(
+                    primary,
+                    OSError("secondary persistence failure"),
+                )
+
+                diagnostic = primary.__cause__
+                self.assertIsInstance(
+                    diagnostic,
+                    providers.ClaudeCredentialPersistenceDiagnostic,
+                )
+                assert diagnostic is not None
+                if suppress_context:
+                    self.assertIsNone(diagnostic.__context__)
+                else:
+                    self.assertIs(diagnostic.__context__, original_context)
+                self.assertIs(primary.__context__, original_context)
+                formatted = self.format_exception_text(primary)
+                if suppress_context:
+                    self.assertNotIn(marker, formatted)
+                else:
+                    self.assertIn(marker, formatted)
 
     def attempt(
         self,
@@ -1169,6 +3066,2865 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(credential, bytearray(len(credential)))
 
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "POSIX pthread signal masks are unavailable",
+    )
+    def test_claude_worker_thread_inherits_forwarded_signal_mask(self) -> None:
+        creator_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        worker_masks: list[set[signal.Signals]] = []
+
+        def capture_mask() -> None:
+            worker_masks.append(signal.pthread_sigmask(signal.SIG_BLOCK, set()))
+
+        thread = threading.Thread(target=capture_mask)
+        outcome = providers._start_claude_thread_inheriting_forwarded_signal_mask(
+            thread
+        )
+        thread.join(timeout=5)
+
+        self.assertTrue(outcome.started)
+        self.assertIsNone(outcome.error)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(worker_masks), 1)
+        self.assertTrue(set(providers.forwarded_signals()).issubset(worker_masks[0]))
+        self.assertEqual(
+            signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+            creator_mask,
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "POSIX pthread signal masks are unavailable",
+    )
+    def test_claude_server_handlers_inherit_forwarded_signal_mask(self) -> None:
+        creator_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        forwarded = set(providers.forwarded_signals())
+        worker_masks: dict[str, set[signal.Signals]] = {}
+        worker_events = {
+            name: threading.Event() for name in ("keychain", "tcp", "unix")
+        }
+        started_names: list[str] = []
+        real_start = providers._start_claude_thread_inheriting_forwarded_signal_mask
+
+        def record_start(
+            thread: threading.Thread,
+            *,
+            thread_start_owner: providers._ClaudeThreadStartOwner | None = None,
+        ) -> providers._ClaudeThreadStartOutcome:
+            started_names.append(thread.name)
+            return real_start(
+                thread,
+                thread_start_owner=thread_start_owner,
+            )
+
+        def capture_mask(name: str) -> Callable[[object], None]:
+            def capture(_handler: object) -> None:
+                worker_masks[name] = signal.pthread_sigmask(
+                    signal.SIG_BLOCK,
+                    set(),
+                )
+                worker_events[name].set()
+
+            return capture
+
+        with (
+            mock.patch.object(
+                providers,
+                "_start_claude_thread_inheriting_forwarded_signal_mask",
+                side_effect=record_start,
+            ),
+            mock.patch.object(
+                providers._ClaudeKeychainCredentialHandler,
+                "handle",
+                new=capture_mask("keychain"),
+            ),
+        ):
+            with providers._claude_keychain_credential_server(
+                None,
+                bytes.fromhex("01" * 32),
+            ) as port:
+                with socket.create_connection(("127.0.0.1", port), timeout=5):
+                    self.assertTrue(worker_events["keychain"].wait(timeout=5))
+
+        with (
+            mock.patch.object(
+                providers,
+                "_start_claude_thread_inheriting_forwarded_signal_mask",
+                side_effect=record_start,
+            ),
+            mock.patch.object(
+                providers._ClaudeProxyHandler,
+                "handle",
+                new=capture_mask("tcp"),
+            ),
+        ):
+            with providers._claude_connect_proxy({}) as port:
+                with socket.create_connection(("127.0.0.1", port), timeout=5):
+                    self.assertTrue(worker_events["tcp"].wait(timeout=5))
+
+        with (
+            mock.patch.object(
+                providers,
+                "_start_claude_thread_inheriting_forwarded_signal_mask",
+                side_effect=record_start,
+            ),
+            mock.patch.object(
+                providers._ClaudeProxyHandler,
+                "handle",
+                new=capture_mask("unix"),
+            ),
+        ):
+            with providers._claude_unix_connect_proxy(
+                self.review,
+                {},
+            ) as socket_path:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                    client.settimeout(5)
+                    client.connect(str(socket_path))
+                    self.assertTrue(worker_events["unix"].wait(timeout=5))
+
+        for name in ("keychain", "tcp", "unix"):
+            self.assertTrue(forwarded.issubset(worker_masks[name]))
+        self.assertTrue(
+            {
+                "claude-review-keychain-broker",
+                "claude-review-keychain-handler",
+                "claude-review-keychain-shutdown",
+                "claude-review-connect-proxy",
+                "claude-review-unix-connect-proxy",
+            }.issubset(started_names)
+        )
+        self.assertEqual(
+            signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+            creator_mask,
+        )
+
+    def test_claude_worker_thread_start_tracks_mask_start_and_restore(
+        self,
+    ) -> None:
+        previous_mask = {signal.SIGINT}
+        block_error = OSError("fixture mask block failure")
+        start_error = providers.ForwardedSignal(signal.SIGTERM)
+        restore_error = KeyboardInterrupt("fixture creator mask restore interruption")
+
+        blocked_thread = mock.Mock()
+        with mock.patch.object(
+            providers.signal,
+            "pthread_sigmask",
+            side_effect=block_error,
+            create=True,
+        ) as pthread_sigmask:
+            blocked = providers._start_claude_thread_inheriting_forwarded_signal_mask(
+                blocked_thread
+            )
+        self.assertFalse(blocked.started)
+        self.assertIs(blocked.error, block_error)
+        blocked_thread.start.assert_not_called()
+        pthread_sigmask.assert_called_once_with(
+            signal.SIG_BLOCK,
+            set(),
+        )
+
+        interrupted_thread = mock.Mock()
+        interrupted_thread.ident = 123
+        interrupted_thread.start.side_effect = start_error
+        with mock.patch.object(
+            providers.signal,
+            "pthread_sigmask",
+            side_effect=(set(), previous_mask, restore_error, set()),
+            create=True,
+        ) as pthread_sigmask:
+            interrupted = (
+                providers._start_claude_thread_inheriting_forwarded_signal_mask(
+                    interrupted_thread
+                )
+            )
+        self.assertFalse(interrupted.started)
+        self.assertTrue(interrupted.may_have_started)
+        self.assertIs(interrupted.error, start_error)
+        if callable(getattr(start_error, "add_note", None)):
+            self.assertTrue(
+                any(
+                    "cleanup failure" in note
+                    for note in getattr(start_error, "__notes__", ())
+                )
+            )
+        else:
+            rendered_chain = "".join(
+                traceback.format_exception(
+                    type(start_error),
+                    start_error,
+                    start_error.__traceback__,
+                )
+            )
+            self.assertIn(
+                "KeyboardInterrupt: fixture creator mask restore interruption",
+                rendered_chain,
+            )
+        self.assertFalse(
+            providers._claude_error_graph_contains(
+                start_error,
+                RuntimeError("fixture unrelated error"),
+            )
+        )
+        self.assertEqual(
+            pthread_sigmask.call_args_list,
+            [
+                mock.call(signal.SIG_BLOCK, set()),
+                mock.call(
+                    signal.SIG_BLOCK,
+                    providers.forwarded_signals(),
+                ),
+                mock.call(signal.SIG_SETMASK, previous_mask),
+                mock.call(signal.SIG_SETMASK, previous_mask),
+            ],
+        )
+
+        started_thread = mock.Mock()
+        with mock.patch.object(
+            providers.signal,
+            "pthread_sigmask",
+            side_effect=(set(), previous_mask, restore_error, set()),
+            create=True,
+        ):
+            restored = providers._start_claude_thread_inheriting_forwarded_signal_mask(
+                started_thread
+            )
+        self.assertTrue(restored.started)
+        self.assertIs(restored.error, restore_error)
+
+        unsupported_thread = mock.Mock()
+        with (
+            mock.patch.object(providers.os, "name", "nt"),
+            mock.patch.object(
+                providers.signal,
+                "pthread_sigmask",
+                create=True,
+            ) as pthread_sigmask,
+        ):
+            unsupported = (
+                providers._start_claude_thread_inheriting_forwarded_signal_mask(
+                    unsupported_thread
+                )
+            )
+        self.assertTrue(unsupported.started)
+        self.assertIsNone(unsupported.error)
+        unsupported_thread.start.assert_called_once_with()
+        pthread_sigmask.assert_not_called()
+
+    def test_claude_signal_mask_apply_failure_restores_queried_mask(
+        self,
+    ) -> None:
+        queried_mask = {signal.SIGINT}
+        apply_error = providers.ForwardedSignal(signal.SIGTERM)
+        restore_error = KeyboardInterrupt("fixture failed mask-apply rollback")
+        thread = mock.Mock()
+
+        with mock.patch.object(
+            providers.signal,
+            "pthread_sigmask",
+            side_effect=(queried_mask, apply_error, restore_error),
+            create=True,
+        ) as pthread_sigmask:
+            outcome = providers._start_claude_thread_inheriting_forwarded_signal_mask(
+                thread
+            )
+
+        self.assertFalse(outcome.may_have_started)
+        self.assertIs(outcome.error, apply_error)
+        thread.start.assert_not_called()
+        self.assertEqual(
+            pthread_sigmask.call_args_list,
+            [
+                mock.call(signal.SIG_BLOCK, set()),
+                mock.call(
+                    signal.SIG_BLOCK,
+                    providers.forwarded_signals(),
+                ),
+                mock.call(signal.SIG_SETMASK, queried_mask),
+            ],
+        )
+
+    def test_claude_signal_mask_block_result_store_interruption_rolls_back(
+        self,
+    ) -> None:
+        acquisition = providers._acquire_claude_forwarded_signal_mask
+        instructions = tuple(dis.get_instructions(acquisition))
+        matching_offsets = [
+            instruction.offset
+            for index, instruction in enumerate(instructions)
+            if instruction.opname == "STORE_FAST"
+            and instruction.argval == "previous_mask"
+            and index > 0
+            and instructions[index - 1].opname.startswith("CALL")
+        ]
+        self.assertEqual(len(matching_offsets), 1)
+        target_offset = matching_offsets[0]
+        queried_mask = {signal.SIGINT}
+        current_mask = set(queried_mask)
+        interruption = RuntimeError(
+            "fixture pthread_sigmask CALL-to-STORE interruption"
+        )
+
+        def pthread_sigmask(
+            operation: int,
+            signals: set[signal.Signals] | tuple[signal.Signals, ...],
+        ) -> set[signal.Signals]:
+            nonlocal current_mask
+            previous = set(current_mask)
+            if operation == signal.SIG_BLOCK:
+                current_mask.update(signals)
+            elif operation == signal.SIG_SETMASK:
+                current_mask = set(signals)
+            else:  # pragma: no cover - fixed helper operations only
+                self.fail(f"unexpected pthread_sigmask operation: {operation}")
+            return previous
+
+        injected = False
+
+        def interrupt_result_store(
+            frame: object,
+            event: str,
+            _argument: object,
+        ) -> object:
+            nonlocal injected
+            if getattr(frame, "f_code", None) is not acquisition.__code__:
+                return interrupt_result_store
+            setattr(frame, "f_trace_opcodes", True)
+            if (
+                not injected
+                and event == "opcode"
+                and getattr(frame, "f_lasti", None) == target_offset
+            ):
+                injected = True
+                raise interruption
+            return interrupt_result_store
+
+        try:
+            with mock.patch.object(
+                providers.signal,
+                "pthread_sigmask",
+                side_effect=pthread_sigmask,
+                create=True,
+            ) as masked:
+                sys.settrace(interrupt_result_store)
+                outcome = acquisition(main_thread_only=False)
+        finally:
+            sys.settrace(None)
+
+        self.assertTrue(injected)
+        self.assertIs(outcome.error, interruption)
+        self.assertIsNone(outcome.previous_mask)
+        self.assertEqual(current_mask, queried_mask)
+        self.assertEqual(
+            masked.call_args_list,
+            [
+                mock.call(signal.SIG_BLOCK, set()),
+                mock.call(
+                    signal.SIG_BLOCK,
+                    providers.forwarded_signals(),
+                ),
+                mock.call(signal.SIG_SETMASK, queried_mask),
+            ],
+        )
+
+    def test_claude_terminal_signal_mask_fails_closed_off_main_thread(
+        self,
+    ) -> None:
+        signal_mask_owner = providers._ClaudeSignalMaskOwner()
+        captured_errors: list[BaseException] = []
+
+        def block_in_worker() -> None:
+            try:
+                providers.block_forwarded_signals(
+                    signal_mask_owner=signal_mask_owner,
+                )
+            except BaseException as error:
+                captured_errors.append(error)
+
+        with (
+            mock.patch.object(providers.os, "name", "posix"),
+            mock.patch.object(
+                providers.signal,
+                "pthread_sigmask",
+                create=True,
+            ) as pthread_sigmask,
+        ):
+            worker = threading.Thread(target=block_in_worker)
+            worker.start()
+            worker.join(timeout=5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(captured_errors), 1)
+        self.assertIsInstance(
+            captured_errors[0],
+            providers.ClaudeCredentialInspectionInconclusive,
+        )
+        self.assertIn("main thread", str(captured_errors[0]))
+        self.assertFalse(signal_mask_owner.signal_mask_owner_active)
+        pthread_sigmask.assert_not_called()
+
+    def test_claude_terminal_signal_mask_fails_closed_without_platform_mask(
+        self,
+    ) -> None:
+        signal_mask_owner = providers._ClaudeSignalMaskOwner()
+
+        with (
+            mock.patch.object(providers.os, "name", "nt"),
+            mock.patch.object(
+                providers.signal,
+                "pthread_sigmask",
+                create=True,
+            ) as pthread_sigmask,
+            self.assertRaises(
+                providers.ClaudeCredentialInspectionInconclusive
+            ) as raised,
+        ):
+            providers.block_forwarded_signals(
+                signal_mask_owner=signal_mask_owner,
+            )
+
+        self.assertIn("on this platform", str(raised.exception))
+        self.assertFalse(signal_mask_owner.signal_mask_owner_active)
+        pthread_sigmask.assert_not_called()
+
+    def test_claude_macos_terminal_handoff_abandons_off_main_thread(
+        self,
+    ) -> None:
+        handoff = providers._ClaudeMacOSTerminalHandoff()
+        lease = mock.Mock(spec=["abandon"])
+        cleanup = claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+            "fixture off-main handoff retained the refresh lock"
+        )
+        lease.abandon.return_value = cleanup
+        captured_errors: list[BaseException] = []
+
+        def begin_in_worker() -> None:
+            try:
+                providers._begin_claude_macos_terminal_handoff(
+                    self.review,
+                    lease,
+                    None,
+                    handoff,
+                )
+            except BaseException as error:
+                captured_errors.append(error)
+
+        with (
+            mock.patch.object(providers.os, "name", "posix"),
+            mock.patch.object(
+                providers.signal,
+                "pthread_sigmask",
+                create=True,
+            ) as pthread_sigmask,
+        ):
+            worker = threading.Thread(target=begin_in_worker)
+            worker.start()
+            worker.join(timeout=5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(captured_errors), 1)
+        self.assertIsInstance(
+            captured_errors[0],
+            providers.ClaudeCredentialInspectionInconclusive,
+        )
+        self.assertIs(handoff.recovery_source, captured_errors[0])
+        self.assertTrue(handoff.abandonment_attempted)
+        self.assertFalse(handoff.signal_mask_owner_active)
+        lease.abandon.assert_called_once_with(
+            "Claude refresh transaction terminal signal handoff could not be "
+            "established"
+        )
+        pthread_sigmask.assert_not_called()
+
+    def test_claude_thread_mask_acquisition_call_result_restores_owner(
+        self,
+    ) -> None:
+        starter = providers._start_claude_thread_inheriting_forwarded_signal_mask
+        instructions = tuple(dis.get_instructions(starter))
+        matching_offsets = [
+            instruction.offset
+            for index, instruction in enumerate(instructions)
+            if instruction.opname == "STORE_FAST"
+            and instruction.argval == "acquisition"
+            and index > 0
+            and instructions[index - 1].opname.startswith("CALL")
+        ]
+        self.assertEqual(len(matching_offsets), 1)
+        target_offset = matching_offsets[0]
+        prior_mask = {signal.SIGINT}
+        mask_blocked = False
+        interruption = RuntimeError(
+            "fixture thread mask acquisition CALL-result interruption"
+        )
+        thread = mock.Mock()
+
+        def acquire_mask(
+            *,
+            main_thread_only: bool,
+            signal_mask_owner: object | None = None,
+        ) -> providers._ClaudeSignalMaskAcquisition:
+            nonlocal mask_blocked
+            self.assertIs(main_thread_only, False)
+            mask_blocked = True
+            if signal_mask_owner is not None:
+                signal_mask_owner.publish_previous_signal_mask(prior_mask)
+            return providers._ClaudeSignalMaskAcquisition(
+                previous_mask=prior_mask,
+                error=None,
+            )
+
+        def restore_mask(previous: set[signal.Signals] | None) -> None:
+            nonlocal mask_blocked
+            self.assertIs(previous, prior_mask)
+            mask_blocked = False
+
+        injected = False
+
+        def interrupt_result_store(
+            frame: object,
+            event: str,
+            _argument: object,
+        ) -> object:
+            nonlocal injected
+            if getattr(frame, "f_code", None) is not starter.__code__:
+                return interrupt_result_store
+            setattr(frame, "f_trace_opcodes", True)
+            if (
+                not injected
+                and event == "opcode"
+                and getattr(frame, "f_lasti", None) == target_offset
+            ):
+                injected = True
+                raise interruption
+            return interrupt_result_store
+
+        try:
+            with (
+                mock.patch.object(
+                    providers,
+                    "_acquire_claude_forwarded_signal_mask",
+                    side_effect=acquire_mask,
+                ),
+                mock.patch.object(
+                    providers,
+                    "restore_signal_mask",
+                    side_effect=restore_mask,
+                ) as restore,
+                self.assertRaises(RuntimeError) as raised,
+            ):
+                sys.settrace(interrupt_result_store)
+                starter(thread)
+        finally:
+            sys.settrace(None)
+
+        self.assertTrue(injected)
+        self.assertIs(raised.exception, interruption)
+        self.assertFalse(mask_blocked)
+        restore.assert_called_once_with(prior_mask)
+        thread.start.assert_not_called()
+
+    def test_claude_thread_post_acquisition_check_restores_owner(self) -> None:
+        starter = providers._start_claude_thread_inheriting_forwarded_signal_mask
+        instructions = tuple(dis.get_instructions(starter))
+        acquisition_store_indexes = [
+            index
+            for index, instruction in enumerate(instructions[:-1])
+            if instruction.opname == "STORE_FAST"
+            and instruction.argval == "acquisition"
+            and index > 0
+            and instructions[index - 1].opname.startswith("CALL")
+        ]
+        self.assertEqual(len(acquisition_store_indexes), 1)
+        target_instruction = instructions[acquisition_store_indexes[0] + 1]
+        self.assertTrue(
+            _instruction_loads_fast_local(target_instruction, "acquisition")
+        )
+        prior_mask = {signal.SIGINT}
+        mask_blocked = False
+        interruption = RuntimeError(
+            "fixture post-acquisition ownership-check interruption"
+        )
+        thread = mock.Mock()
+
+        def acquire_mask(
+            *,
+            main_thread_only: bool,
+            signal_mask_owner: object | None = None,
+        ) -> providers._ClaudeSignalMaskAcquisition:
+            nonlocal mask_blocked
+            self.assertIs(main_thread_only, False)
+            mask_blocked = True
+            assert signal_mask_owner is not None
+            signal_mask_owner.publish_previous_signal_mask(prior_mask)
+            return providers._ClaudeSignalMaskAcquisition(
+                previous_mask=prior_mask,
+                error=None,
+            )
+
+        def restore_mask(previous: set[signal.Signals] | None) -> None:
+            nonlocal mask_blocked
+            self.assertIs(previous, prior_mask)
+            mask_blocked = False
+
+        injected = False
+
+        def interrupt_post_acquisition_check(
+            frame: object,
+            event: str,
+            _argument: object,
+        ) -> object:
+            nonlocal injected
+            if getattr(frame, "f_code", None) is not starter.__code__:
+                return interrupt_post_acquisition_check
+            setattr(frame, "f_trace_opcodes", True)
+            if (
+                not injected
+                and event == "opcode"
+                and getattr(frame, "f_lasti", None) == target_instruction.offset
+            ):
+                injected = True
+                raise interruption
+            return interrupt_post_acquisition_check
+
+        try:
+            with (
+                mock.patch.object(
+                    providers,
+                    "_acquire_claude_forwarded_signal_mask",
+                    side_effect=acquire_mask,
+                ),
+                mock.patch.object(
+                    providers,
+                    "restore_signal_mask",
+                    side_effect=restore_mask,
+                ) as restore,
+                self.assertRaises(RuntimeError) as raised,
+            ):
+                sys.settrace(interrupt_post_acquisition_check)
+                starter(thread)
+        finally:
+            sys.settrace(None)
+
+        self.assertTrue(injected)
+        self.assertIs(raised.exception, interruption)
+        self.assertFalse(mask_blocked)
+        restore.assert_called_once_with(prior_mask)
+        thread.start.assert_not_called()
+
+    def test_claude_thread_post_start_processing_restores_owner(self) -> None:
+        starter = providers._start_claude_thread_inheriting_forwarded_signal_mask
+        instructions = tuple(dis.get_instructions(starter))
+        start_call_indexes = [
+            index
+            for index, instruction in enumerate(instructions)
+            if instruction.opname.startswith("CALL")
+            and index > 0
+            and any(
+                candidate.opname in {"LOAD_ATTR", "LOAD_METHOD"}
+                and candidate.argval == "start"
+                for candidate in instructions[max(0, index - 3) : index]
+            )
+        ]
+        self.assertEqual(len(start_call_indexes), 1)
+        start_call_index = start_call_indexes[0]
+        outcome_state_targets = [
+            instruction
+            for instruction in instructions[start_call_index + 1 :]
+            if instruction.opname == "STORE_FAST"
+            and instruction.argval == "outcome_state"
+        ]
+        outcome_targets = [
+            instruction
+            for instruction in instructions[start_call_index + 1 :]
+            if (
+                instruction.opname == "POP_TOP"
+                or (
+                    instruction.opname == "STORE_FAST"
+                    and instruction.argval == "outcome"
+                )
+            )
+        ]
+        target_instructions = (
+            outcome_state_targets
+            or outcome_targets
+            or [
+                instruction
+                for instruction in instructions[start_call_index + 1 :]
+                if instruction.opname == "STORE_FAST"
+                and instruction.argval == "restore_error"
+            ]
+        )
+        self.assertTrue(target_instructions)
+        target_instruction = min(
+            target_instructions,
+            key=lambda instruction: instruction.offset,
+        )
+        prior_mask = {signal.SIGINT}
+
+        for start_succeeds in (True, False):
+            with self.subTest(start_succeeds=start_succeeds):
+                mask_blocked = False
+                interruption = RuntimeError(
+                    "fixture post-start outcome-processing interruption"
+                )
+                start_error = providers.ForwardedSignal(signal.SIGTERM)
+                thread = mock.Mock()
+                if not start_succeeds:
+                    thread.start.side_effect = start_error
+
+                def acquire_mask(
+                    *,
+                    main_thread_only: bool,
+                    signal_mask_owner: object | None = None,
+                ) -> providers._ClaudeSignalMaskAcquisition:
+                    nonlocal mask_blocked
+                    self.assertIs(main_thread_only, False)
+                    mask_blocked = True
+                    assert signal_mask_owner is not None
+                    signal_mask_owner.publish_previous_signal_mask(prior_mask)
+                    return providers._ClaudeSignalMaskAcquisition(
+                        previous_mask=prior_mask,
+                        error=None,
+                    )
+
+                def restore_mask(
+                    previous: set[signal.Signals] | None,
+                ) -> None:
+                    nonlocal mask_blocked
+                    self.assertIs(previous, prior_mask)
+                    mask_blocked = False
+
+                injected = False
+
+                def interrupt_post_start_processing(
+                    frame: object,
+                    event: str,
+                    _argument: object,
+                ) -> object:
+                    nonlocal injected
+                    if getattr(frame, "f_code", None) is not starter.__code__:
+                        return interrupt_post_start_processing
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_instruction.offset
+                    ):
+                        injected = True
+                        raise interruption
+                    return interrupt_post_start_processing
+
+                try:
+                    with (
+                        mock.patch.object(
+                            providers,
+                            "_acquire_claude_forwarded_signal_mask",
+                            side_effect=acquire_mask,
+                        ),
+                        mock.patch.object(
+                            providers,
+                            "restore_signal_mask",
+                            side_effect=restore_mask,
+                        ) as restore,
+                    ):
+                        sys.settrace(interrupt_post_start_processing)
+                        outcome = starter(thread)
+                finally:
+                    sys.settrace(None)
+
+                self.assertTrue(injected)
+                self.assertFalse(mask_blocked)
+                restore.assert_called_once_with(prior_mask)
+                if start_succeeds:
+                    self.assertIs(
+                        outcome.state,
+                        providers._ClaudeThreadStartState.CONFIRMED,
+                    )
+                    self.assertIs(outcome.error, interruption)
+                else:
+                    self.assertIs(
+                        outcome.state,
+                        providers._ClaudeThreadStartState.UNKNOWN,
+                    )
+                    self.assertIs(outcome.error, start_error)
+                    self.assert_exception_visible_exact_or_rendered(
+                        start_error,
+                        interruption,
+                    )
+
+    def test_claude_thread_post_outcome_store_preserves_interruption(
+        self,
+    ) -> None:
+        starter = providers._start_claude_thread_inheriting_forwarded_signal_mask
+        instructions = tuple(dis.get_instructions(starter))
+        start_call_indexes = [
+            index
+            for index, instruction in enumerate(instructions)
+            if instruction.opname.startswith("CALL")
+            and index > 0
+            and any(
+                candidate.opname in {"LOAD_ATTR", "LOAD_METHOD"}
+                and candidate.argval == "start"
+                for candidate in instructions[max(0, index - 3) : index]
+            )
+        ]
+        self.assertEqual(len(start_call_indexes), 1)
+        outcome_store_indexes = [
+            index
+            for index in range(start_call_indexes[0] + 1, len(instructions) - 1)
+            if instructions[index].opname == "STORE_FAST"
+            and instructions[index].argval == "outcome"
+        ]
+        self.assertTrue(outcome_store_indexes)
+        outcome_store_index = min(outcome_store_indexes)
+        restore_call_indexes = [
+            index
+            for index, instruction in enumerate(instructions)
+            if instruction.opname.startswith("CALL")
+            and any(
+                candidate.opname in {"LOAD_ATTR", "LOAD_GLOBAL", "LOAD_METHOD"}
+                and candidate.argval
+                in {
+                    "restore_previous_signal_mask",
+                    "_restore_claude_signal_mask_owner_bounded",
+                }
+                for candidate in instructions[max(0, index - 3) : index]
+            )
+        ]
+        self.assertTrue(restore_call_indexes)
+        self.assertLess(min(restore_call_indexes), outcome_store_index)
+        target_instruction = instructions[outcome_store_index + 1]
+        prior_mask = {signal.SIGINT}
+        mask_blocked = False
+        interruption = RuntimeError("fixture post-outcome-STORE interruption")
+        thread = mock.Mock()
+
+        def acquire_mask(
+            *,
+            main_thread_only: bool,
+            signal_mask_owner: object | None = None,
+        ) -> providers._ClaudeSignalMaskAcquisition:
+            nonlocal mask_blocked
+            self.assertIs(main_thread_only, False)
+            mask_blocked = True
+            assert signal_mask_owner is not None
+            signal_mask_owner.publish_previous_signal_mask(prior_mask)
+            return providers._ClaudeSignalMaskAcquisition(
+                previous_mask=prior_mask,
+                error=None,
+            )
+
+        def restore_mask(previous: set[signal.Signals] | None) -> None:
+            nonlocal mask_blocked
+            self.assertIs(previous, prior_mask)
+            mask_blocked = False
+
+        injected = False
+
+        def interrupt_after_outcome_store(
+            frame: object,
+            event: str,
+            _argument: object,
+        ) -> object:
+            nonlocal injected
+            if getattr(frame, "f_code", None) is not starter.__code__:
+                return interrupt_after_outcome_store
+            setattr(frame, "f_trace_opcodes", True)
+            if (
+                not injected
+                and event == "opcode"
+                and getattr(frame, "f_lasti", None) == target_instruction.offset
+            ):
+                injected = True
+                raise interruption
+            return interrupt_after_outcome_store
+
+        try:
+            with (
+                mock.patch.object(
+                    providers,
+                    "_acquire_claude_forwarded_signal_mask",
+                    side_effect=acquire_mask,
+                ),
+                mock.patch.object(
+                    providers,
+                    "restore_signal_mask",
+                    side_effect=restore_mask,
+                ) as restore,
+                self.assertRaises(RuntimeError) as raised,
+            ):
+                sys.settrace(interrupt_after_outcome_store)
+                starter(thread)
+        finally:
+            sys.settrace(None)
+
+        self.assertTrue(injected)
+        self.assertFalse(mask_blocked)
+        restore.assert_called_once_with(prior_mask)
+        thread.start.assert_called_once_with()
+        self.assertIs(raised.exception, interruption)
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "POSIX pthread signal masks are unavailable",
+    )
+    def test_claude_thread_start_failure_before_publication_is_unknown(
+        self,
+    ) -> None:
+        bootstrap_gate = threading.Event()
+        target_ran = threading.Event()
+        start_error = providers.ForwardedSignal(signal.SIGTERM)
+
+        class DelayedBootstrapThread(threading.Thread):
+            def _bootstrap_inner(self) -> None:
+                bootstrap_gate.wait()
+                super()._bootstrap_inner()
+
+        thread = DelayedBootstrapThread(target=target_ran.set, daemon=True)
+        original_wait = thread._started.wait
+
+        def interrupted_wait(_timeout: float | None = None) -> bool:
+            raise start_error
+
+        thread._started.wait = interrupted_wait
+        try:
+            outcome = providers._start_claude_thread_inheriting_forwarded_signal_mask(
+                thread
+            )
+        finally:
+            thread._started.wait = original_wait
+
+        self.assertFalse(outcome.started)
+        self.assertTrue(outcome.may_have_started)
+        self.assertIs(outcome.error, start_error)
+        self.assertIsNone(thread.ident)
+
+        quiescent, quiescence_error = providers._bounded_claude_thread_quiescence(
+            thread,
+            outcome.state,
+            0.0,
+        )
+        self.assertFalse(quiescent)
+        self.assertIsNone(quiescence_error)
+        self.assertFalse(target_ran.is_set())
+
+        bootstrap_gate.set()
+        quiescent, quiescence_error = providers._bounded_claude_thread_quiescence(
+            thread,
+            outcome.state,
+            5.0,
+        )
+        self.assertTrue(quiescent)
+        self.assertIsNone(quiescence_error)
+        self.assertTrue(target_ran.is_set())
+        self.assertFalse(thread.is_alive())
+
+    def test_claude_thread_final_snapshot_store_is_conservative_and_complete(
+        self,
+    ) -> None:
+        starter = providers._start_claude_thread_inheriting_forwarded_signal_mask
+        instructions = tuple(dis.get_instructions(starter))
+        snapshot_store_indexes = [
+            index
+            for index, instruction in enumerate(instructions)
+            if instruction.opname == "STORE_ATTR" and instruction.argval == "snapshot"
+        ]
+        self.assertGreaterEqual(len(snapshot_store_indexes), 2)
+        return_publication_indexes = [
+            index
+            for index in snapshot_store_indexes
+            if any(
+                instruction.opname == "RETURN_VALUE"
+                for instruction in instructions[index + 1 : index + 4]
+            )
+        ]
+        self.assertEqual(len(return_publication_indexes), 1)
+        final_store_index = return_publication_indexes[0]
+
+        for interrupt_after_store in (False, True):
+            with self.subTest(interrupt_after_store=interrupt_after_store):
+                target_index = final_store_index + int(interrupt_after_store)
+                self.assertLess(target_index, len(instructions))
+                target_offset = instructions[target_index].offset
+                restore_error = RuntimeError("fixture final snapshot restore failure")
+                interruption = RuntimeError(
+                    "fixture final snapshot publication interruption"
+                )
+                thread = mock.Mock()
+                owner = providers._ClaudeThreadStartOwner()
+                injected = False
+
+                def interrupt_snapshot_publication(
+                    frame: object,
+                    event: str,
+                    _argument: object,
+                ) -> object:
+                    nonlocal injected
+                    if getattr(frame, "f_code", None) is not starter.__code__:
+                        return interrupt_snapshot_publication
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        raise interruption
+                    return interrupt_snapshot_publication
+
+                try:
+                    with (
+                        mock.patch.object(
+                            providers,
+                            "_acquire_claude_forwarded_signal_mask",
+                            return_value=providers._ClaudeSignalMaskAcquisition(
+                                previous_mask=None,
+                                error=None,
+                            ),
+                        ),
+                        mock.patch.object(
+                            providers._ClaudeSignalMaskOwner,
+                            "restore_previous_signal_mask",
+                            side_effect=restore_error,
+                        ),
+                        self.assertRaises(RuntimeError) as raised,
+                    ):
+                        sys.settrace(interrupt_snapshot_publication)
+                        starter(thread, thread_start_owner=owner)
+                finally:
+                    sys.settrace(None)
+
+                self.assertTrue(injected)
+                self.assertIs(raised.exception, interruption)
+                expected_state = (
+                    providers._ClaudeThreadStartState.CONFIRMED
+                    if interrupt_after_store
+                    else providers._ClaudeThreadStartState.UNKNOWN
+                )
+                self.assertIs(owner.snapshot.state, expected_state)
+                self.assertTrue(
+                    providers._claude_visible_error_chain_contains(
+                        owner.snapshot.error,
+                        restore_error,
+                    )
+                )
+
+    def test_claude_thread_selector_interval_preserves_raw_snapshot(
+        self,
+    ) -> None:
+        starter = providers._start_claude_thread_inheriting_forwarded_signal_mask
+        instructions = tuple(dis.get_instructions(starter))
+        selected_error_store_indexes = [
+            index
+            for index, instruction in enumerate(instructions)
+            if instruction.opname == "STORE_FAST"
+            and instruction.argval == "selected_error"
+        ]
+        self.assertGreaterEqual(len(selected_error_store_indexes), 2)
+        selected_error_store_index = max(selected_error_store_indexes)
+        selector_load_index = max(
+            index
+            for index, instruction in enumerate(
+                instructions[:selected_error_store_index]
+            )
+            if instruction.opname == "LOAD_GLOBAL"
+            and instruction.argval == "_select_claude_thread_start_related_error"
+        )
+        targets = (
+            ("before_selector", instructions[selector_load_index]),
+            (
+                "after_selector",
+                instructions[selected_error_store_index],
+            ),
+        )
+
+        for phase, target_instruction in targets:
+            with self.subTest(phase=phase):
+                startup_error = RuntimeError(
+                    "fixture selector interval startup failure"
+                )
+                restore_error = RuntimeError(
+                    "fixture selector interval restore failure"
+                )
+                interruption = KeyboardInterrupt(
+                    "fixture selector interval interruption"
+                )
+                thread = mock.Mock()
+                thread.start.side_effect = startup_error
+                owner = providers._ClaudeThreadStartOwner()
+                injected = False
+
+                def interrupt_selector_interval(
+                    frame: object,
+                    event: str,
+                    _argument: object,
+                ) -> object:
+                    nonlocal injected
+                    if getattr(frame, "f_code", None) is not starter.__code__:
+                        return interrupt_selector_interval
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_instruction.offset
+                    ):
+                        injected = True
+                        raise interruption
+                    return interrupt_selector_interval
+
+                try:
+                    with (
+                        mock.patch.object(
+                            providers,
+                            "_acquire_claude_forwarded_signal_mask",
+                            return_value=providers._ClaudeSignalMaskAcquisition(
+                                previous_mask=None,
+                                error=None,
+                            ),
+                        ),
+                        mock.patch.object(
+                            providers._ClaudeSignalMaskOwner,
+                            "restore_previous_signal_mask",
+                            side_effect=restore_error,
+                        ),
+                        self.assertRaises(KeyboardInterrupt) as raised,
+                    ):
+                        sys.settrace(interrupt_selector_interval)
+                        starter(thread, thread_start_owner=owner)
+                finally:
+                    sys.settrace(None)
+
+                self.assertTrue(injected)
+                self.assertIs(raised.exception, interruption)
+                self.assertIs(
+                    owner.snapshot.state,
+                    providers._ClaudeThreadStartState.UNKNOWN,
+                )
+                self.assertTrue(
+                    providers._claude_visible_error_chain_contains(
+                        owner.snapshot.error,
+                        startup_error,
+                    )
+                )
+                self.assertTrue(
+                    providers._claude_visible_error_chain_contains(
+                        owner.snapshot.error,
+                        restore_error,
+                    )
+                )
+
+    def test_thread_start_reverse_backlink_control_flow_has_priority_without_cycle(
+        self,
+    ) -> None:
+        control_flow_errors = (
+            KeyboardInterrupt("fixture reverse backlink keyboard interrupt"),
+            providers.ForwardedSignal(signal.SIGTERM),
+            SystemExit("fixture reverse backlink system exit"),
+        )
+
+        for later_error in control_flow_errors:
+            with self.subTest(later_type=type(later_error).__name__):
+                earlier_error = RuntimeError("fixture reverse backlink earlier failure")
+                later_error.__cause__ = earlier_error
+
+                selected = providers._select_claude_thread_start_related_error(
+                    earlier_error,
+                    later_error,
+                )
+
+                self.assertIs(selected, later_error)
+                self.assertTrue(
+                    providers._claude_visible_error_chain_contains(
+                        selected,
+                        earlier_error,
+                    )
+                )
+                self.assertFalse(
+                    providers._claude_error_graph_contains(
+                        selected,
+                        RuntimeError("fixture unrelated error"),
+                    )
+                )
+
+    def test_thread_start_selector_does_not_relink_peer_after_sealed_merge(
+        self,
+    ) -> None:
+        for sealed_first in (True, False):
+            with self.subTest(sealed_first=sealed_first):
+                sealed = providers.ClaudeCredentialInspectionInconclusive(
+                    providers._CLAUDE_TIMEOUT_SEALED_SAFE_NOTE
+                )
+                setattr(
+                    sealed,
+                    "_codex_claude_timeout_root_sealed_safe",
+                    True,
+                )
+                state = providers._ClaudeTimeoutRootState(
+                    lock=threading.RLock(),
+                    fail_closed_root=providers._claude_macos_recovery_root(self.review),
+                    root=sealed,
+                    sealed=True,
+                )
+                setattr(sealed, "_codex_claude_timeout_root_state", state)
+                sensitive_path = (
+                    f"/fixture/private/thread-start-sealed-peer-{sealed_first}"
+                )
+                peer = providers.ForwardedSignal(signal.SIGTERM)
+                peer.detail = (
+                    f"fixture thread-start peer interruption at {sensitive_path}"
+                )
+                setattr(
+                    peer,
+                    "_codex_claude_refresh_lock_descriptor_bound",
+                    True,
+                )
+                earlier, later = (sealed, peer) if sealed_first else (peer, sealed)
+
+                selected = providers._select_claude_thread_start_related_error(
+                    earlier,
+                    later,
+                )
+
+                self.assertIs(selected, sealed)
+                self.assertIsNone(sealed.__cause__)
+                self.assertIsNone(sealed.__context__)
+                self.assertNotIn(
+                    sensitive_path,
+                    self.format_exception_text(sealed),
+                )
+                self.assertFalse(providers._claude_error_graph_contains(sealed, peer))
+
+    def test_thread_start_processing_error_is_published_before_selector(
+        self,
+    ) -> None:
+        starter = providers._start_claude_thread_inheriting_forwarded_signal_mask
+        instructions = tuple(dis.get_instructions(starter))
+        start_call_index = next(
+            index
+            for index, instruction in enumerate(instructions)
+            if instruction.opname.startswith("CALL")
+            and any(
+                candidate.opname in {"LOAD_ATTR", "LOAD_METHOD"}
+                and candidate.argval == "start"
+                for candidate in instructions[max(0, index - 3) : index]
+            )
+        )
+        target_instruction = next(
+            instruction
+            for instruction in instructions[start_call_index + 1 :]
+            if instruction.opname == "STORE_FAST"
+            and instruction.argval == "outcome_state"
+        )
+        startup_error = RuntimeError("fixture initial thread startup failure")
+        processing_error = RuntimeError("fixture post-start processing interruption")
+        selector_interruption = KeyboardInterrupt(
+            "fixture processing selector interruption"
+        )
+        thread = mock.Mock()
+        thread.start.side_effect = startup_error
+        owner = providers._ClaudeThreadStartOwner()
+        injected = False
+
+        def interrupt_processing(
+            frame: object,
+            event: str,
+            _argument: object,
+        ) -> object:
+            nonlocal injected
+            if getattr(frame, "f_code", None) is not starter.__code__:
+                return interrupt_processing
+            setattr(frame, "f_trace_opcodes", True)
+            if (
+                not injected
+                and event == "opcode"
+                and getattr(frame, "f_lasti", None) == target_instruction.offset
+            ):
+                injected = True
+                raise processing_error
+            return interrupt_processing
+
+        def interrupt_selector(
+            earlier_error: BaseException | None,
+            later_error: BaseException | None,
+        ) -> BaseException | None:
+            self.assertIs(earlier_error, startup_error)
+            self.assertIs(later_error, processing_error)
+            raise selector_interruption
+
+        try:
+            with (
+                mock.patch.object(
+                    providers,
+                    "_acquire_claude_forwarded_signal_mask",
+                    return_value=providers._ClaudeSignalMaskAcquisition(
+                        previous_mask=None,
+                        error=None,
+                    ),
+                ),
+                mock.patch.object(
+                    providers,
+                    "_select_claude_thread_start_related_error",
+                    side_effect=interrupt_selector,
+                ),
+                self.assertRaises(KeyboardInterrupt) as raised,
+            ):
+                sys.settrace(interrupt_processing)
+                starter(thread, thread_start_owner=owner)
+        finally:
+            sys.settrace(None)
+
+        self.assertTrue(injected)
+        self.assertIs(raised.exception, selector_interruption)
+        self.assertIs(
+            owner.snapshot.state,
+            providers._ClaudeThreadStartState.UNKNOWN,
+        )
+        self.assertIs(owner.snapshot.error, processing_error)
+
+    def test_thread_start_restore_error_is_published_before_graph_work(
+        self,
+    ) -> None:
+        startup_error = RuntimeError("fixture initial thread startup failure")
+        restore_error = RuntimeError("fixture signal mask restore failure")
+        graph_interruption = KeyboardInterrupt("fixture restore graph interruption")
+        thread = mock.Mock()
+        thread.start.side_effect = startup_error
+        owner = providers._ClaudeThreadStartOwner()
+
+        def interrupt_graph(
+            root: BaseException | None,
+            candidate: BaseException,
+        ) -> bool:
+            self.assertIs(root, startup_error)
+            self.assertIs(candidate, restore_error)
+            raise graph_interruption
+
+        with (
+            mock.patch.object(
+                providers,
+                "_acquire_claude_forwarded_signal_mask",
+                return_value=providers._ClaudeSignalMaskAcquisition(
+                    previous_mask=None,
+                    error=None,
+                ),
+            ),
+            mock.patch.object(
+                providers._ClaudeSignalMaskOwner,
+                "restore_previous_signal_mask",
+                side_effect=restore_error,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_error_graph_contains",
+                side_effect=interrupt_graph,
+            ),
+            self.assertRaises(KeyboardInterrupt) as raised,
+        ):
+            providers._start_claude_thread_inheriting_forwarded_signal_mask(
+                thread,
+                thread_start_owner=owner,
+            )
+
+        self.assertIs(raised.exception, graph_interruption)
+        self.assertIs(
+            owner.snapshot.state,
+            providers._ClaudeThreadStartState.UNKNOWN,
+        )
+        self.assertIs(owner.snapshot.error, restore_error)
+
+    def test_keychain_handler_start_call_result_retains_owner(self) -> None:
+        caller = providers._ClaudeKeychainCredentialServer.process_request
+        instructions = tuple(dis.get_instructions(caller))
+        target_offsets = [
+            instruction.offset
+            for index, instruction in enumerate(instructions)
+            if (
+                instruction.opname == "POP_TOP"
+                or (
+                    instruction.opname == "STORE_FAST"
+                    and instruction.argval == "outcome"
+                )
+            )
+            and index > 0
+            and instructions[index - 1].opname.startswith("CALL")
+            and any(
+                candidate.opname == "LOAD_GLOBAL"
+                and candidate.argval
+                == "_start_claude_thread_inheriting_forwarded_signal_mask"
+                for candidate in instructions[max(0, index - 8) : index]
+            )
+        ]
+        self.assertEqual(len(target_offsets), 1)
+        target_offset = target_offsets[0]
+        interruption = RuntimeError("fixture handler start CALL-result interruption")
+        thread = mock.Mock()
+        request = mock.Mock()
+        server = object.__new__(providers._ClaudeKeychainCredentialServer)
+        server._handler_condition = threading.Condition()
+        server._handler_threads = set()
+        server._handler_sockets = {}
+        server._closing = False
+        server.process_request_thread = mock.Mock()  # type: ignore[method-assign]
+        server.shutdown_request = mock.Mock()  # type: ignore[method-assign]
+
+        def publish_start(
+            _thread: threading.Thread,
+            *,
+            thread_start_owner: object | None = None,
+        ) -> providers._ClaudeThreadStartOutcome:
+            outcome = providers._ClaudeThreadStartOutcome(
+                state=providers._ClaudeThreadStartState.CONFIRMED,
+                error=None,
+            )
+            publish_thread_start_fixture(thread_start_owner, outcome)
+            return outcome
+
+        injected = False
+
+        def interrupt_result_store(
+            frame: object,
+            event: str,
+            _argument: object,
+        ) -> object:
+            nonlocal injected
+            if getattr(frame, "f_code", None) is not caller.__code__:
+                return interrupt_result_store
+            setattr(frame, "f_trace_opcodes", True)
+            if (
+                not injected
+                and event == "opcode"
+                and getattr(frame, "f_lasti", None) == target_offset
+            ):
+                injected = True
+                raise interruption
+            return interrupt_result_store
+
+        try:
+            with (
+                mock.patch.object(providers.threading, "Thread", return_value=thread),
+                mock.patch.object(
+                    providers,
+                    "_start_claude_thread_inheriting_forwarded_signal_mask",
+                    side_effect=publish_start,
+                ),
+                self.assertRaises(RuntimeError) as raised,
+            ):
+                sys.settrace(interrupt_result_store)
+                server.process_request(request, ("127.0.0.1", 12345))
+        finally:
+            sys.settrace(None)
+
+        self.assertTrue(injected)
+        self.assertIs(raised.exception, interruption)
+        self.assertIn(thread, server._handler_threads)
+        self.assertIs(server._handler_sockets.get(thread), request)
+        server.shutdown_request.assert_called_once_with(request)
+
+    def test_keychain_handler_owner_recovery_interruption_still_cleans_up(
+        self,
+    ) -> None:
+        caller = providers._ClaudeKeychainCredentialServer.process_request
+        instructions = tuple(dis.get_instructions(caller))
+        recovery_offsets = [
+            instruction.offset
+            for index, instruction in enumerate(instructions)
+            if instruction.opname == "STORE_FAST"
+            and instruction.argval == "outcome"
+            and index > 0
+            and instructions[index - 1].opname.startswith("CALL")
+            and any(
+                candidate.opname in {"LOAD_ATTR", "LOAD_METHOD"}
+                and candidate.argval == "outcome"
+                for candidate in instructions[max(0, index - 6) : index]
+            )
+        ]
+        self.assertLessEqual(len(recovery_offsets), 1)
+        startup_error = RuntimeError("fixture handler startup interruption")
+        recovery_error = providers.ForwardedSignal(signal.SIGTERM)
+        thread = mock.Mock()
+        request = mock.Mock()
+        server = object.__new__(providers._ClaudeKeychainCredentialServer)
+        server._handler_condition = threading.Condition()
+        server._handler_threads = set()
+        server._handler_sockets = {}
+        server._closing = False
+        server.process_request_thread = mock.Mock()  # type: ignore[method-assign]
+        server.shutdown_request = mock.Mock()  # type: ignore[method-assign]
+
+        def fail_after_publication(
+            _thread: threading.Thread,
+            *,
+            thread_start_owner: object | None = None,
+        ) -> providers._ClaudeThreadStartOutcome:
+            publish_thread_start_fixture(
+                thread_start_owner,
+                providers._ClaudeThreadStartOutcome(
+                    state=providers._ClaudeThreadStartState.CONFIRMED,
+                    error=startup_error,
+                ),
+            )
+            raise startup_error
+
+        injected = False
+
+        def interrupt_recovery_store(
+            frame: object,
+            event: str,
+            _argument: object,
+        ) -> object:
+            nonlocal injected
+            if getattr(frame, "f_code", None) is not caller.__code__:
+                return interrupt_recovery_store
+            setattr(frame, "f_trace_opcodes", True)
+            if (
+                recovery_offsets
+                and not injected
+                and event == "opcode"
+                and getattr(frame, "f_lasti", None) == recovery_offsets[0]
+            ):
+                injected = True
+                raise recovery_error
+            return interrupt_recovery_store
+
+        try:
+            with (
+                mock.patch.object(providers.threading, "Thread", return_value=thread),
+                mock.patch.object(
+                    providers,
+                    "_start_claude_thread_inheriting_forwarded_signal_mask",
+                    side_effect=fail_after_publication,
+                ),
+                self.assertRaises(BaseException),
+            ):
+                sys.settrace(interrupt_recovery_store)
+                server.process_request(request, ("127.0.0.1", 12345))
+        finally:
+            sys.settrace(None)
+
+        self.assertEqual(injected, bool(recovery_offsets))
+        self.assertIn(thread, server._handler_threads)
+        self.assertIs(server._handler_sockets.get(thread), request)
+        server.shutdown_request.assert_called_once_with(request)
+
+    def test_keychain_handler_start_result_preserves_prepublished_error(
+        self,
+    ) -> None:
+        caller = providers._ClaudeKeychainCredentialServer.process_request
+        instructions = tuple(dis.get_instructions(caller))
+        helper_load_index = next(
+            index
+            for index, instruction in enumerate(instructions)
+            if instruction.opname == "LOAD_GLOBAL"
+            and instruction.argval
+            == "_start_claude_thread_inheriting_forwarded_signal_mask"
+        )
+        call_index = next(
+            index
+            for index in range(helper_load_index, len(instructions))
+            if instructions[index].opname.startswith("CALL")
+        )
+        target_offset = instructions[call_index + 1].offset
+        startup_error = RuntimeError("fixture prepublished startup failure")
+        interruption = providers.ForwardedSignal(signal.SIGTERM)
+        thread = mock.Mock()
+        request = mock.Mock()
+        server = object.__new__(providers._ClaudeKeychainCredentialServer)
+        server._handler_condition = threading.Condition()
+        server._handler_threads = set()
+        server._handler_sockets = {}
+        server._closing = False
+        server.process_request_thread = mock.Mock()  # type: ignore[method-assign]
+        server.shutdown_request = mock.Mock()  # type: ignore[method-assign]
+
+        def return_failed_start(
+            _thread: threading.Thread,
+            *,
+            thread_start_owner: object | None = None,
+        ) -> providers._ClaudeThreadStartOutcome:
+            outcome = providers._ClaudeThreadStartOutcome(
+                state=providers._ClaudeThreadStartState.CONFIRMED,
+                error=startup_error,
+            )
+            publish_thread_start_fixture(thread_start_owner, outcome)
+            return outcome
+
+        injected = False
+
+        def interrupt_result_consumer(
+            frame: object,
+            event: str,
+            _argument: object,
+        ) -> object:
+            nonlocal injected
+            if getattr(frame, "f_code", None) is not caller.__code__:
+                return interrupt_result_consumer
+            setattr(frame, "f_trace_opcodes", True)
+            if (
+                not injected
+                and event == "opcode"
+                and getattr(frame, "f_lasti", None) == target_offset
+            ):
+                injected = True
+                raise interruption
+            return interrupt_result_consumer
+
+        try:
+            with (
+                mock.patch.object(providers.threading, "Thread", return_value=thread),
+                mock.patch.object(
+                    providers,
+                    "_start_claude_thread_inheriting_forwarded_signal_mask",
+                    side_effect=return_failed_start,
+                ),
+                self.assertRaises(providers.ForwardedSignal) as raised,
+            ):
+                sys.settrace(interrupt_result_consumer)
+                server.process_request(request, ("127.0.0.1", 12345))
+        finally:
+            sys.settrace(None)
+
+        self.assertTrue(injected)
+        self.assertIs(raised.exception, interruption)
+        self.assert_exception_visible_exact_or_rendered(
+            raised.exception,
+            startup_error,
+        )
+        self.assertIn(thread, server._handler_threads)
+        server.shutdown_request.assert_called_once_with(request)
+
+    def test_bounded_abandonment_start_call_result_quiesces_owner(self) -> None:
+        caller = providers._bounded_claude_keychain_abandonment
+        instructions = tuple(dis.get_instructions(caller))
+        target_offsets = [
+            instruction.offset
+            for index, instruction in enumerate(instructions)
+            if (
+                instruction.opname == "POP_TOP"
+                or (
+                    instruction.opname == "STORE_FAST"
+                    and instruction.argval == "start_outcome"
+                )
+            )
+            and index > 0
+            and instructions[index - 1].opname.startswith("CALL")
+            and any(
+                candidate.opname == "LOAD_GLOBAL"
+                and candidate.argval
+                == "_start_claude_thread_inheriting_forwarded_signal_mask"
+                for candidate in instructions[max(0, index - 8) : index]
+            )
+        ]
+        self.assertEqual(len(target_offsets), 1)
+        target_offset = target_offsets[0]
+        interruption = RuntimeError(
+            "fixture abandonment start CALL-result interruption"
+        )
+
+        def publish_start(
+            thread: threading.Thread,
+            *,
+            thread_start_owner: object | None = None,
+        ) -> providers._ClaudeThreadStartOutcome:
+            outcome = providers._ClaudeThreadStartOutcome(
+                state=providers._ClaudeThreadStartState.CONFIRMED,
+                error=None,
+            )
+            publish_thread_start_fixture(thread_start_owner, outcome)
+            thread.run()
+            return outcome
+
+        injected = False
+
+        def interrupt_result_store(
+            frame: object,
+            event: str,
+            _argument: object,
+        ) -> object:
+            nonlocal injected
+            if getattr(frame, "f_code", None) is not caller.__code__:
+                return interrupt_result_store
+            setattr(frame, "f_trace_opcodes", True)
+            if (
+                not injected
+                and event == "opcode"
+                and getattr(frame, "f_lasti", None) == target_offset
+            ):
+                injected = True
+                raise interruption
+            return interrupt_result_store
+
+        try:
+            with mock.patch.object(
+                providers,
+                "_start_claude_thread_inheriting_forwarded_signal_mask",
+                side_effect=publish_start,
+            ):
+                sys.settrace(interrupt_result_store)
+                completed, error = providers._bounded_claude_keychain_abandonment(
+                    lambda: None,
+                    1.0,
+                )
+        finally:
+            sys.settrace(None)
+
+        self.assertTrue(injected)
+        self.assertFalse(completed)
+        self.assertIs(error, interruption)
+
+    def test_abandonment_second_start_handoff_interruption_still_waits(
+        self,
+    ) -> None:
+        caller = providers._bounded_claude_keychain_abandonment
+        instructions = tuple(dis.get_instructions(caller))
+        interruption_store_indexes = [
+            index
+            for index, instruction in enumerate(instructions)
+            if instruction.opname == "STORE_FAST"
+            and instruction.argval == "start_interruption"
+            and index > 0
+            and instructions[index - 1].opname == "LOAD_FAST"
+            and instructions[index - 1].argval == "error"
+        ]
+        snapshot_store_indexes = [
+            index
+            for index, instruction in enumerate(instructions)
+            if instruction.opname == "STORE_FAST"
+            and instruction.argval == "start_snapshot"
+        ]
+        self.assertGreaterEqual(len(interruption_store_indexes), 1)
+        interruption_store_index = min(interruption_store_indexes)
+        self.assertTrue(snapshot_store_indexes)
+        snapshot_store_index = min(snapshot_store_indexes)
+        second_targets = (
+            ("interruption-store", interruption_store_index),
+            ("snapshot-store", snapshot_store_index),
+            ("after-snapshot-store", snapshot_store_index + 1),
+        )
+
+        for label, second_target_index in second_targets:
+            with self.subTest(label=label):
+                event = mock.Mock()
+                event.wait.return_value = True
+                startup_error = RuntimeError(
+                    f"fixture {label} prepublished startup failure"
+                )
+                first_interruption = providers.ForwardedSignal(signal.SIGTERM)
+                second_interruption = KeyboardInterrupt(
+                    f"fixture {label} second handoff interruption"
+                )
+                target_offset = instructions[second_target_index].offset
+                injected = 0
+
+                def return_failed_start(
+                    _thread: threading.Thread,
+                    *,
+                    thread_start_owner: object | None = None,
+                ) -> providers._ClaudeThreadStartOutcome:
+                    outcome = providers._ClaudeThreadStartOutcome(
+                        state=providers._ClaudeThreadStartState.CONFIRMED,
+                        error=startup_error,
+                    )
+                    publish_thread_start_fixture(thread_start_owner, outcome)
+                    raise first_interruption
+
+                def interrupt_handoff(
+                    frame: object,
+                    trace_event: str,
+                    _argument: object,
+                ) -> object:
+                    nonlocal injected
+                    if getattr(frame, "f_code", None) is not caller.__code__:
+                        return interrupt_handoff
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        trace_event == "opcode"
+                        and injected == 0
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected += 1
+                        raise second_interruption
+                    return interrupt_handoff
+
+                try:
+                    with (
+                        mock.patch.object(
+                            providers.threading,
+                            "Event",
+                            return_value=event,
+                        ),
+                        mock.patch.object(
+                            providers,
+                            "_start_claude_thread_inheriting_forwarded_signal_mask",
+                            side_effect=return_failed_start,
+                        ),
+                    ):
+                        sys.settrace(interrupt_handoff)
+                        with contextlib.suppress(BaseException):
+                            providers._bounded_claude_keychain_abandonment(
+                                lambda: None,
+                                1.0,
+                            )
+                finally:
+                    sys.settrace(None)
+
+                self.assertEqual(injected, 1)
+                event.wait.assert_called_once()
+
+    def test_fail_closed_start_result_preserves_prepublished_error(self) -> None:
+        caller = providers._bounded_claude_keychain_fail_closed_error
+        instructions = tuple(dis.get_instructions(caller))
+        helper_load_index = next(
+            index
+            for index, instruction in enumerate(instructions)
+            if instruction.opname == "LOAD_GLOBAL"
+            and instruction.argval
+            == "_start_claude_thread_inheriting_forwarded_signal_mask"
+        )
+        call_index = next(
+            index
+            for index in range(helper_load_index, len(instructions))
+            if instructions[index].opname.startswith("CALL")
+        )
+        target_offset = instructions[call_index + 1].offset
+        startup_error = RuntimeError("fixture fail-closed startup failure")
+        interruption = providers.ForwardedSignal(signal.SIGTERM)
+
+        def return_failed_start(
+            thread: threading.Thread,
+            *,
+            thread_start_owner: object | None = None,
+        ) -> providers._ClaudeThreadStartOutcome:
+            outcome = providers._ClaudeThreadStartOutcome(
+                state=providers._ClaudeThreadStartState.CONFIRMED,
+                error=startup_error,
+            )
+            publish_thread_start_fixture(thread_start_owner, outcome)
+            thread.run()
+            return outcome
+
+        injected = False
+
+        def interrupt_result_consumer(
+            frame: object,
+            event: str,
+            _argument: object,
+        ) -> object:
+            nonlocal injected
+            if getattr(frame, "f_code", None) is not caller.__code__:
+                return interrupt_result_consumer
+            setattr(frame, "f_trace_opcodes", True)
+            if (
+                not injected
+                and event == "opcode"
+                and getattr(frame, "f_lasti", None) == target_offset
+            ):
+                injected = True
+                raise interruption
+            return interrupt_result_consumer
+
+        try:
+            with mock.patch.object(
+                providers,
+                "_start_claude_thread_inheriting_forwarded_signal_mask",
+                side_effect=return_failed_start,
+            ):
+                sys.settrace(interrupt_result_consumer)
+                captured, error = providers._bounded_claude_keychain_fail_closed_error(
+                    lambda: RuntimeError("fixture captured failure"),
+                    1.0,
+                )
+        finally:
+            sys.settrace(None)
+
+        self.assertTrue(injected)
+        self.assertIsNone(captured)
+        self.assertIs(error, interruption)
+        self.assert_exception_visible_exact_or_rendered(
+            error,
+            startup_error,
+        )
+
+    def test_shutdown_start_result_preserves_error_and_quiesces(self) -> None:
+        caller = providers._bounded_claude_keychain_server_shutdown
+        instructions = tuple(dis.get_instructions(caller))
+        helper_load_index = next(
+            index
+            for index, instruction in enumerate(instructions)
+            if instruction.opname == "LOAD_GLOBAL"
+            and instruction.argval
+            == "_start_claude_thread_inheriting_forwarded_signal_mask"
+        )
+        call_index = next(
+            index
+            for index in range(helper_load_index, len(instructions))
+            if instructions[index].opname.startswith("CALL")
+        )
+        target_offset = instructions[call_index + 1].offset
+        startup_error = RuntimeError("fixture shutdown startup failure")
+        interruption = providers.ForwardedSignal(signal.SIGTERM)
+        server = mock.Mock()
+        server.begin_closing.return_value = ()
+        server.wait_for_handlers.return_value = True
+        server.serve_error.return_value = None
+        server.handler_errors.return_value = ()
+        serve_thread = mock.Mock()
+
+        def return_failed_start(
+            thread: threading.Thread,
+            *,
+            thread_start_owner: object | None = None,
+        ) -> providers._ClaudeThreadStartOutcome:
+            outcome = providers._ClaudeThreadStartOutcome(
+                state=providers._ClaudeThreadStartState.CONFIRMED,
+                error=startup_error,
+            )
+            publish_thread_start_fixture(thread_start_owner, outcome)
+            thread.run()
+            return outcome
+
+        injected = False
+
+        def interrupt_result_consumer(
+            frame: object,
+            event: str,
+            _argument: object,
+        ) -> object:
+            nonlocal injected
+            if getattr(frame, "f_code", None) is not caller.__code__:
+                return interrupt_result_consumer
+            setattr(frame, "f_trace_opcodes", True)
+            if (
+                not injected
+                and event == "opcode"
+                and getattr(frame, "f_lasti", None) == target_offset
+            ):
+                injected = True
+                raise interruption
+            return interrupt_result_consumer
+
+        try:
+            with (
+                mock.patch.object(
+                    providers,
+                    "_start_claude_thread_inheriting_forwarded_signal_mask",
+                    side_effect=return_failed_start,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_bounded_claude_thread_quiescence",
+                    return_value=(True, None),
+                ) as quiesce,
+            ):
+                sys.settrace(interrupt_result_consumer)
+                shutdown = providers._bounded_claude_keychain_server_shutdown(
+                    server,
+                    serve_thread,
+                )
+        finally:
+            sys.settrace(None)
+
+        self.assertTrue(injected)
+        self.assertTrue(shutdown.quiescent)
+        self.assertEqual(len(shutdown.errors), 1)
+        self.assertIs(shutdown.errors[0], interruption)
+        self.assert_exception_visible_exact_or_rendered(
+            shutdown.errors[0],
+            startup_error,
+        )
+        shutdown_thread = quiesce.call_args_list[0].args[0]
+        self.assertEqual(
+            quiesce.call_args_list[0].args[1],
+            providers._ClaudeThreadStartState.CONFIRMED,
+        )
+        self.assertIs(quiesce.call_args_list[1].args[0], serve_thread)
+        self.assertIsNot(shutdown_thread, serve_thread)
+        server.server_close.assert_called_once_with()
+
+    def test_recovery_start_result_preserves_prepublished_error(self) -> None:
+        caller = providers._bounded_claude_keychain_quiescence_recovery
+        instructions = tuple(dis.get_instructions(caller))
+        helper_load_index = next(
+            index
+            for index, instruction in enumerate(instructions)
+            if instruction.opname == "LOAD_GLOBAL"
+            and instruction.argval
+            == "_start_claude_thread_inheriting_forwarded_signal_mask"
+        )
+        call_index = next(
+            index
+            for index in range(helper_load_index, len(instructions))
+            if instructions[index].opname.startswith("CALL")
+        )
+        target_offset = instructions[call_index + 1].offset
+        startup_error = RuntimeError("fixture recovery startup failure")
+        interruption = providers.ForwardedSignal(signal.SIGTERM)
+        pending = bytearray(b"fixture-pending-update")
+        callbacks = providers._ClaudeKeychainQuiescenceCallbacks(
+            abandon=lambda: None,
+            recover=lambda _pending: None,
+            timeout_error=lambda: RuntimeError("unexpected recovery timeout"),
+        )
+
+        def return_failed_start(
+            thread: threading.Thread,
+            *,
+            thread_start_owner: object | None = None,
+        ) -> providers._ClaudeThreadStartOutcome:
+            outcome = providers._ClaudeThreadStartOutcome(
+                state=providers._ClaudeThreadStartState.CONFIRMED,
+                error=startup_error,
+            )
+            publish_thread_start_fixture(thread_start_owner, outcome)
+            thread.run()
+            return outcome
+
+        injected = False
+
+        def interrupt_result_consumer(
+            frame: object,
+            event: str,
+            _argument: object,
+        ) -> object:
+            nonlocal injected
+            if getattr(frame, "f_code", None) is not caller.__code__:
+                return interrupt_result_consumer
+            setattr(frame, "f_trace_opcodes", True)
+            if (
+                not injected
+                and event == "opcode"
+                and getattr(frame, "f_lasti", None) == target_offset
+            ):
+                injected = True
+                raise interruption
+            return interrupt_result_consumer
+
+        try:
+            with mock.patch.object(
+                providers,
+                "_start_claude_thread_inheriting_forwarded_signal_mask",
+                side_effect=return_failed_start,
+            ):
+                sys.settrace(interrupt_result_consumer)
+                error = providers._bounded_claude_keychain_quiescence_recovery(
+                    callbacks,
+                    pending,
+                    already_abandoned=True,
+                )
+        finally:
+            sys.settrace(None)
+
+        self.assertTrue(injected)
+        self.assertIs(error, interruption)
+        self.assert_exception_visible_exact_or_rendered(
+            error,
+            startup_error,
+        )
+        self.assertEqual(pending, bytearray(len(pending)))
+
+    def test_recovery_wait_interruption_keeps_sealed_timeout_root(self) -> None:
+        sealed = providers.ClaudeCredentialInspectionInconclusive(
+            providers._CLAUDE_TIMEOUT_SEALED_SAFE_NOTE
+        )
+        setattr(
+            sealed,
+            "_codex_claude_timeout_root_sealed_safe",
+            True,
+        )
+        state = providers._ClaudeTimeoutRootState(
+            lock=threading.RLock(),
+            fail_closed_root=providers._claude_macos_recovery_root(self.review),
+            root=sealed,
+            sealed=True,
+        )
+        setattr(sealed, "_codex_claude_timeout_root_state", state)
+        setattr(sealed, "_codex_claude_refresh_persistence_failed", True)
+        sensitive_path = "/fixture/private/recovery-wait-interruption"
+        wait_error = providers.ForwardedSignal(signal.SIGTERM)
+        wait_error.detail = f"fixture recovery wait interruption at {sensitive_path}"
+        setattr(
+            wait_error,
+            "_codex_claude_refresh_lock_descriptor_bound",
+            True,
+        )
+        callbacks = providers._ClaudeKeychainQuiescenceCallbacks(
+            abandon=lambda: None,
+            recover=lambda _pending: None,
+            timeout_error=lambda: sealed,
+        )
+        real_wait = threading.Event.wait
+        caller = providers._bounded_claude_keychain_quiescence_recovery
+
+        def interrupt_recovery_wait(
+            event: threading.Event,
+            timeout: float | None = None,
+        ) -> bool:
+            if sys._getframe(1).f_code is caller.__code__:
+                raise wait_error
+            return real_wait(event, timeout)
+
+        with mock.patch.object(
+            threading.Event,
+            "wait",
+            new=interrupt_recovery_wait,
+        ):
+            selected = caller(
+                callbacks,
+                None,
+                already_abandoned=True,
+            )
+
+        self.assertIs(selected, sealed)
+        self.assertIsNone(sealed.__cause__)
+        self.assertIsNone(sealed.__context__)
+        self.assertNotIn(
+            sensitive_path,
+            self.format_exception_text(sealed),
+        )
+        self.assertFalse(providers._claude_error_graph_contains(sealed, wait_error))
+
+    def test_keychain_broker_start_call_result_quiesces_owner(self) -> None:
+        caller = providers._claude_keychain_credential_server.__wrapped__
+        instructions = tuple(dis.get_instructions(caller))
+        target_offsets = [
+            instruction.offset
+            for index, instruction in enumerate(instructions)
+            if (
+                instruction.opname == "POP_TOP"
+                or (
+                    instruction.opname == "STORE_FAST"
+                    and instruction.argval == "start_outcome"
+                )
+            )
+            and index > 0
+            and instructions[index - 1].opname.startswith("CALL")
+            and any(
+                candidate.opname == "LOAD_GLOBAL"
+                and candidate.argval
+                == "_start_claude_thread_inheriting_forwarded_signal_mask"
+                for candidate in instructions[max(0, index - 8) : index]
+            )
+        ]
+        self.assertEqual(len(target_offsets), 1)
+        target_offset = target_offsets[0]
+        interruption = RuntimeError("fixture broker start CALL-result interruption")
+        server = mock.Mock()
+        thread = mock.Mock()
+
+        def publish_start(
+            _thread: threading.Thread,
+            *,
+            thread_start_owner: object | None = None,
+        ) -> providers._ClaudeThreadStartOutcome:
+            outcome = providers._ClaudeThreadStartOutcome(
+                state=providers._ClaudeThreadStartState.CONFIRMED,
+                error=None,
+            )
+            publish_thread_start_fixture(thread_start_owner, outcome)
+            return outcome
+
+        injected = False
+
+        def interrupt_result_store(
+            frame: object,
+            event: str,
+            _argument: object,
+        ) -> object:
+            nonlocal injected
+            if getattr(frame, "f_code", None) is not caller.__code__:
+                return interrupt_result_store
+            setattr(frame, "f_trace_opcodes", True)
+            if (
+                not injected
+                and event == "opcode"
+                and getattr(frame, "f_lasti", None) == target_offset
+            ):
+                injected = True
+                raise interruption
+            return interrupt_result_store
+
+        try:
+            with (
+                mock.patch.object(
+                    providers,
+                    "_ClaudeKeychainCredentialServer",
+                    return_value=server,
+                ),
+                mock.patch.object(providers.threading, "Thread", return_value=thread),
+                mock.patch.object(
+                    providers,
+                    "_start_claude_thread_inheriting_forwarded_signal_mask",
+                    side_effect=publish_start,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_bounded_claude_thread_quiescence",
+                    return_value=(True, None),
+                ) as quiesce,
+                self.assertRaises(
+                    providers.ClaudeCredentialInspectionInconclusive
+                ) as raised,
+            ):
+                sys.settrace(interrupt_result_store)
+                with providers._claude_keychain_credential_server(
+                    None,
+                    bytes.fromhex("01" * 32),
+                ):
+                    self.fail("interrupted broker unexpectedly yielded")
+        finally:
+            sys.settrace(None)
+
+        self.assertTrue(injected)
+        self.assertIs(raised.exception.__cause__, interruption)
+        quiesce.assert_called_once_with(
+            thread,
+            providers._ClaudeThreadStartState.CONFIRMED,
+            providers.CLAUDE_KEYCHAIN_SERVER_SHUTDOWN_TIMEOUT_SECONDS,
+        )
+        server.server_close.assert_called_once_with()
+
+    def test_proxy_start_result_cleanup_quiesces_closes_and_unlinks(self) -> None:
+        for kind, caller in (
+            ("tcp", providers._claude_connect_proxy.__wrapped__),
+            ("unix", providers._claude_unix_connect_proxy.__wrapped__),
+        ):
+            with self.subTest(kind=kind):
+                instructions = tuple(dis.get_instructions(caller))
+                helper_load_index = next(
+                    index
+                    for index, instruction in enumerate(instructions)
+                    if instruction.opname == "LOAD_GLOBAL"
+                    and instruction.argval
+                    == "_start_claude_thread_inheriting_forwarded_signal_mask"
+                )
+                call_index = next(
+                    index
+                    for index in range(helper_load_index, len(instructions))
+                    if instructions[index].opname.startswith("CALL")
+                )
+                target_offset = instructions[call_index + 1].offset
+                interruption = RuntimeError(
+                    f"fixture {kind} proxy result-consumer interruption"
+                )
+                server = mock.Mock()
+                server.is_serving.return_value = False
+                server.serve_error.return_value = None
+                thread = mock.Mock()
+                socket_paths: list[pathlib.Path] = []
+                unlink_calls: list[pathlib.Path] = []
+
+                def return_started(
+                    _thread: threading.Thread,
+                    *,
+                    thread_start_owner: object | None = None,
+                ) -> providers._ClaudeThreadStartOutcome:
+                    outcome = providers._ClaudeThreadStartOutcome(
+                        state=providers._ClaudeThreadStartState.CONFIRMED,
+                        error=None,
+                    )
+                    publish_thread_start_fixture(thread_start_owner, outcome)
+                    return outcome
+
+                def create_unix_server(
+                    socket_path: pathlib.Path,
+                    **_kwargs: object,
+                ) -> mock.Mock:
+                    socket_path.touch(mode=0o600)
+                    socket_paths.append(socket_path)
+                    return server
+
+                real_unlink = pathlib.Path.unlink
+
+                def track_unlink(
+                    path: pathlib.Path,
+                    *args: object,
+                    **kwargs: object,
+                ) -> None:
+                    unlink_calls.append(path)
+                    real_unlink(path, *args, **kwargs)
+
+                injected = False
+
+                def interrupt_result_consumer(
+                    frame: object,
+                    event: str,
+                    _argument: object,
+                ) -> object:
+                    nonlocal injected
+                    if getattr(frame, "f_code", None) is not caller.__code__:
+                        return interrupt_result_consumer
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        raise interruption
+                    return interrupt_result_consumer
+
+                try:
+                    with contextlib.ExitStack() as stack:
+                        if kind == "tcp":
+                            stack.enter_context(
+                                mock.patch.object(
+                                    providers,
+                                    "_ClaudeProxyServer",
+                                    return_value=server,
+                                )
+                            )
+                        else:
+                            stack.enter_context(
+                                mock.patch.object(
+                                    providers,
+                                    "_ClaudeUnixProxyServer",
+                                    side_effect=create_unix_server,
+                                )
+                            )
+                            stack.enter_context(
+                                mock.patch.object(
+                                    pathlib.Path,
+                                    "unlink",
+                                    new=track_unlink,
+                                )
+                            )
+                        stack.enter_context(
+                            mock.patch.object(
+                                providers.threading,
+                                "Thread",
+                                return_value=thread,
+                            )
+                        )
+                        stack.enter_context(
+                            mock.patch.object(
+                                providers,
+                                "_start_claude_thread_inheriting_forwarded_signal_mask",
+                                side_effect=return_started,
+                            )
+                        )
+                        quiesce = stack.enter_context(
+                            mock.patch.object(
+                                providers,
+                                "_bounded_claude_thread_quiescence",
+                                return_value=(True, None),
+                            )
+                        )
+                        raised = stack.enter_context(
+                            self.assertRaises(
+                                providers.ClaudeCredentialInspectionInconclusive
+                            )
+                        )
+                        sys.settrace(interrupt_result_consumer)
+                        if kind == "tcp":
+                            with providers._claude_connect_proxy({}):
+                                self.fail("interrupted proxy unexpectedly yielded")
+                        else:
+                            with providers._claude_unix_connect_proxy(
+                                self.review,
+                                {},
+                            ):
+                                self.fail("interrupted proxy unexpectedly yielded")
+                finally:
+                    sys.settrace(None)
+
+                self.assertTrue(injected)
+                self.assertIs(raised.exception.__cause__, interruption)
+                quiesce.assert_called_once_with(
+                    thread,
+                    providers._ClaudeThreadStartState.CONFIRMED,
+                    providers.CLAUDE_PROXY_SERVER_SHUTDOWN_TIMEOUT_SECONDS,
+                )
+                server.server_close.assert_called_once_with()
+                if kind == "unix":
+                    self.assertEqual(len(socket_paths), 1)
+                    self.assertIn(socket_paths[0], unlink_calls)
+
+    def test_context_second_start_handoff_interruption_still_cleans_up(
+        self,
+    ) -> None:
+        contexts = (
+            (
+                "keychain",
+                providers._claude_keychain_credential_server.__wrapped__,
+            ),
+            ("tcp", providers._claude_connect_proxy.__wrapped__),
+            ("unix", providers._claude_unix_connect_proxy.__wrapped__),
+        )
+
+        for kind, caller in contexts:
+            with self.subTest(kind=kind):
+                instructions = tuple(dis.get_instructions(caller))
+                snapshot_store_indexes = [
+                    index
+                    for index, instruction in enumerate(instructions)
+                    if instruction.opname == "STORE_FAST"
+                    and instruction.argval == "final_start_snapshot"
+                ]
+                self.assertTrue(snapshot_store_indexes)
+                target_offsets = {
+                    instructions[index].offset for index in snapshot_store_indexes
+                }
+                startup_error = RuntimeError(
+                    f"fixture {kind} prepublished startup failure"
+                )
+                first_interruption = providers.ForwardedSignal(signal.SIGTERM)
+                second_interruption = KeyboardInterrupt(
+                    f"fixture {kind} second handoff interruption"
+                )
+                server = mock.Mock()
+                server.is_serving.return_value = False
+                server.serve_error.return_value = None
+                thread = mock.Mock()
+                socket_paths: list[pathlib.Path] = []
+                unlink_calls: list[pathlib.Path] = []
+                helper_failed = False
+
+                def fail_after_publication(
+                    _thread: threading.Thread,
+                    *,
+                    thread_start_owner: object | None = None,
+                ) -> providers._ClaudeThreadStartOutcome:
+                    nonlocal helper_failed
+                    outcome = providers._ClaudeThreadStartOutcome(
+                        state=providers._ClaudeThreadStartState.CONFIRMED,
+                        error=startup_error,
+                    )
+                    publish_thread_start_fixture(thread_start_owner, outcome)
+                    helper_failed = True
+                    raise first_interruption
+
+                def create_unix_server(
+                    socket_path: pathlib.Path,
+                    **_kwargs: object,
+                ) -> mock.Mock:
+                    socket_path.touch(mode=0o600)
+                    socket_paths.append(socket_path)
+                    return server
+
+                real_unlink = pathlib.Path.unlink
+
+                def track_unlink(
+                    path: pathlib.Path,
+                    *args: object,
+                    **kwargs: object,
+                ) -> None:
+                    unlink_calls.append(path)
+                    real_unlink(path, *args, **kwargs)
+
+                injected = False
+                snapshot_reads = 0
+                raised_error: BaseException | None = None
+
+                def interrupt_handoff(
+                    frame: object,
+                    trace_event: str,
+                    _argument: object,
+                ) -> object:
+                    nonlocal injected, snapshot_reads
+                    if getattr(frame, "f_code", None) is not caller.__code__:
+                        return interrupt_handoff
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and helper_failed
+                        and trace_event == "opcode"
+                        and getattr(frame, "f_lasti", None) in target_offsets
+                    ):
+                        snapshot_reads += 1
+                        if snapshot_reads == 2:
+                            injected = True
+                            raise second_interruption
+                    return interrupt_handoff
+
+                try:
+                    with contextlib.ExitStack() as stack:
+                        if kind == "keychain":
+                            stack.enter_context(
+                                mock.patch.object(
+                                    providers,
+                                    "_ClaudeKeychainCredentialServer",
+                                    return_value=server,
+                                )
+                            )
+                        elif kind == "tcp":
+                            stack.enter_context(
+                                mock.patch.object(
+                                    providers,
+                                    "_ClaudeProxyServer",
+                                    return_value=server,
+                                )
+                            )
+                        else:
+                            stack.enter_context(
+                                mock.patch.object(
+                                    providers,
+                                    "_ClaudeUnixProxyServer",
+                                    side_effect=create_unix_server,
+                                )
+                            )
+                            stack.enter_context(
+                                mock.patch.object(
+                                    pathlib.Path,
+                                    "unlink",
+                                    new=track_unlink,
+                                )
+                            )
+                        stack.enter_context(
+                            mock.patch.object(
+                                providers.threading,
+                                "Thread",
+                                return_value=thread,
+                            )
+                        )
+                        stack.enter_context(
+                            mock.patch.object(
+                                providers,
+                                "_start_claude_thread_inheriting_forwarded_signal_mask",
+                                side_effect=fail_after_publication,
+                            )
+                        )
+                        quiesce = stack.enter_context(
+                            mock.patch.object(
+                                providers,
+                                "_bounded_claude_thread_quiescence",
+                                return_value=(True, None),
+                            )
+                        )
+                        sys.settrace(interrupt_handoff)
+                        try:
+                            if kind == "keychain":
+                                with providers._claude_keychain_credential_server(
+                                    None,
+                                    bytes.fromhex("01" * 32),
+                                ):
+                                    self.fail("interrupted broker unexpectedly yielded")
+                            elif kind == "tcp":
+                                with providers._claude_connect_proxy({}):
+                                    self.fail("interrupted proxy unexpectedly yielded")
+                            else:
+                                with providers._claude_unix_connect_proxy(
+                                    self.review,
+                                    {},
+                                ):
+                                    self.fail("interrupted proxy unexpectedly yielded")
+                        except BaseException as error:
+                            raised_error = error
+                finally:
+                    sys.settrace(None)
+
+                self.assertTrue(injected)
+                self.assertEqual(snapshot_reads, 2)
+                self.assertEqual(quiesce.call_count, 1)
+                self.assertEqual(
+                    quiesce.call_args.args[1],
+                    providers._ClaudeThreadStartState.CONFIRMED,
+                )
+                server.server_close.assert_called_once_with()
+                if kind in {"tcp", "unix"}:
+                    self.assertIs(raised_error, first_interruption)
+                    rendered_chain = "".join(
+                        traceback.format_exception(
+                            type(raised_error),
+                            raised_error,
+                            raised_error.__traceback__,
+                        )
+                    )
+                    self.assertIn(
+                        "KeyboardInterrupt: fixture "
+                        f"{kind} second handoff interruption",
+                        rendered_chain,
+                    )
+                    self.assert_exception_visible_exact_or_rendered(
+                        raised_error,
+                        startup_error,
+                    )
+                    self.assertFalse(
+                        providers._claude_error_graph_contains(
+                            raised_error,
+                            RuntimeError("fixture unrelated error"),
+                        )
+                    )
+                if kind == "unix":
+                    self.assertEqual(len(socket_paths), 1)
+                    self.assertIn(socket_paths[0], unlink_calls)
+
+    def test_context_cancel_interruption_releases_gate_and_cleans_up(
+        self,
+    ) -> None:
+        contexts = (
+            (
+                "keychain",
+                providers._claude_keychain_credential_server.__wrapped__,
+            ),
+            ("tcp", providers._claude_connect_proxy.__wrapped__),
+            ("unix", providers._claude_unix_connect_proxy.__wrapped__),
+        )
+
+        for kind, caller in contexts:
+            instructions = tuple(dis.get_instructions(caller))
+            cancel_call_indexes = [
+                index
+                for index, instruction in enumerate(instructions)
+                if instruction.opname.startswith("CALL")
+                and any(
+                    _instruction_loads_fast_local(
+                        candidate,
+                        "serve_cancelled",
+                    )
+                    or (
+                        candidate.opname == "LOAD_DEREF"
+                        and candidate.argval == "serve_cancelled"
+                    )
+                    for candidate in instructions[max(0, index - 6) : index]
+                )
+                and any(
+                    candidate.opname in {"LOAD_ATTR", "LOAD_METHOD"}
+                    and candidate.argval == "set"
+                    for candidate in instructions[max(0, index - 4) : index]
+                )
+            ]
+            self.assertTrue(cancel_call_indexes)
+
+            for phase in ("call_entry", "call_result"):
+                with self.subTest(kind=kind, phase=phase):
+                    target_offsets = {
+                        instructions[index + int(phase == "call_result")].offset
+                        for index in cancel_call_indexes
+                    }
+                    startup_error = RuntimeError(
+                        f"fixture {kind} prepublished startup failure"
+                    )
+                    first_interruption = providers.ForwardedSignal(signal.SIGTERM)
+                    cancel_interruption = KeyboardInterrupt(
+                        f"fixture {kind} cancel {phase} interruption"
+                    )
+                    server = mock.Mock()
+                    server.is_serving.return_value = False
+                    server.serve_error.return_value = None
+                    thread = mock.Mock()
+                    serve_gate = mock.Mock()
+                    serve_cancelled = mock.Mock()
+                    socket_paths: list[pathlib.Path] = []
+                    unlink_calls: list[pathlib.Path] = []
+                    helper_failed = False
+
+                    def fail_after_publication(
+                        _thread: threading.Thread,
+                        *,
+                        thread_start_owner: object | None = None,
+                    ) -> providers._ClaudeThreadStartOutcome:
+                        nonlocal helper_failed
+                        self.assertTrue(serve_cancelled.set.called)
+                        serve_cancelled.clear.assert_not_called()
+                        outcome = providers._ClaudeThreadStartOutcome(
+                            state=providers._ClaudeThreadStartState.CONFIRMED,
+                            error=startup_error,
+                        )
+                        publish_thread_start_fixture(
+                            thread_start_owner,
+                            outcome,
+                        )
+                        helper_failed = True
+                        raise first_interruption
+
+                    def create_unix_server(
+                        socket_path: pathlib.Path,
+                        **_kwargs: object,
+                    ) -> mock.Mock:
+                        socket_path.touch(mode=0o600)
+                        socket_paths.append(socket_path)
+                        return server
+
+                    real_unlink = pathlib.Path.unlink
+
+                    def track_unlink(
+                        path: pathlib.Path,
+                        *args: object,
+                        **kwargs: object,
+                    ) -> None:
+                        unlink_calls.append(path)
+                        real_unlink(path, *args, **kwargs)
+
+                    injected = False
+
+                    def interrupt_cancel(
+                        frame: object,
+                        trace_event: str,
+                        _argument: object,
+                    ) -> object:
+                        nonlocal injected
+                        if getattr(frame, "f_code", None) is not caller.__code__:
+                            return interrupt_cancel
+                        setattr(frame, "f_trace_opcodes", True)
+                        if (
+                            not injected
+                            and helper_failed
+                            and trace_event == "opcode"
+                            and getattr(frame, "f_lasti", None) in target_offsets
+                        ):
+                            injected = True
+                            raise cancel_interruption
+                        return interrupt_cancel
+
+                    try:
+                        with contextlib.ExitStack() as stack:
+                            if kind == "keychain":
+                                stack.enter_context(
+                                    mock.patch.object(
+                                        providers,
+                                        "_ClaudeKeychainCredentialServer",
+                                        return_value=server,
+                                    )
+                                )
+                            elif kind == "tcp":
+                                stack.enter_context(
+                                    mock.patch.object(
+                                        providers,
+                                        "_ClaudeProxyServer",
+                                        return_value=server,
+                                    )
+                                )
+                            else:
+                                stack.enter_context(
+                                    mock.patch.object(
+                                        providers,
+                                        "_ClaudeUnixProxyServer",
+                                        side_effect=create_unix_server,
+                                    )
+                                )
+                                stack.enter_context(
+                                    mock.patch.object(
+                                        pathlib.Path,
+                                        "unlink",
+                                        new=track_unlink,
+                                    )
+                                )
+                            stack.enter_context(
+                                mock.patch.object(
+                                    providers.threading,
+                                    "Event",
+                                    side_effect=(serve_gate, serve_cancelled),
+                                )
+                            )
+                            stack.enter_context(
+                                mock.patch.object(
+                                    providers.threading,
+                                    "Thread",
+                                    return_value=thread,
+                                )
+                            )
+                            stack.enter_context(
+                                mock.patch.object(
+                                    providers,
+                                    "_start_claude_thread_inheriting_forwarded_signal_mask",
+                                    side_effect=fail_after_publication,
+                                )
+                            )
+                            quiesce = stack.enter_context(
+                                mock.patch.object(
+                                    providers,
+                                    "_bounded_claude_thread_quiescence",
+                                    return_value=(True, None),
+                                )
+                            )
+                            sys.settrace(interrupt_cancel)
+                            with contextlib.suppress(BaseException):
+                                if kind == "keychain":
+                                    with providers._claude_keychain_credential_server(
+                                        None,
+                                        bytes.fromhex("01" * 32),
+                                    ):
+                                        self.fail(
+                                            "interrupted broker unexpectedly yielded"
+                                        )
+                                elif kind == "tcp":
+                                    with providers._claude_connect_proxy({}):
+                                        self.fail(
+                                            "interrupted proxy unexpectedly yielded"
+                                        )
+                                else:
+                                    with providers._claude_unix_connect_proxy(
+                                        self.review,
+                                        {},
+                                    ):
+                                        self.fail(
+                                            "interrupted proxy unexpectedly yielded"
+                                        )
+                    finally:
+                        sys.settrace(None)
+
+                    self.assertTrue(injected)
+                    serve_gate.set.assert_called()
+                    self.assertEqual(quiesce.call_count, 1)
+                    server.server_close.assert_called_once_with()
+                    if kind == "keychain":
+                        server.scrub_initial_credential.assert_called_once_with()
+                    if kind == "unix":
+                        self.assertEqual(len(socket_paths), 1)
+                        self.assertIn(socket_paths[0], unlink_calls)
+
+    def test_all_production_thread_start_calls_bind_owner_before_call(
+        self,
+    ) -> None:
+        callers = (
+            providers._ClaudeKeychainCredentialServer.process_request,
+            providers._bounded_claude_keychain_abandonment,
+            providers._bounded_claude_keychain_fail_closed_error,
+            providers._bounded_claude_keychain_server_shutdown,
+            providers._bounded_claude_keychain_quiescence_recovery,
+            providers._claude_keychain_credential_server.__wrapped__,
+            providers._claude_connect_proxy.__wrapped__,
+            providers._claude_unix_connect_proxy.__wrapped__,
+        )
+
+        for caller in callers:
+            with self.subTest(caller=caller.__qualname__):
+                instructions = tuple(dis.get_instructions(caller))
+                helper_load_indexes = [
+                    index
+                    for index, instruction in enumerate(instructions)
+                    if instruction.opname == "LOAD_GLOBAL"
+                    and instruction.argval
+                    == "_start_claude_thread_inheriting_forwarded_signal_mask"
+                ]
+                self.assertEqual(len(helper_load_indexes), 1)
+                helper_load_index = helper_load_indexes[0]
+                helper_call_indexes = [
+                    index
+                    for index in range(
+                        helper_load_index + 1,
+                        min(helper_load_index + 8, len(instructions)),
+                    )
+                    if instructions[index].opname.startswith("CALL")
+                ]
+                self.assertEqual(len(helper_call_indexes), 1)
+                call_window = instructions[
+                    helper_load_index + 1 : helper_call_indexes[0]
+                ]
+                self.assertTrue(
+                    any(
+                        _instruction_loads_fast_local(
+                            instruction,
+                            "thread_start_owner",
+                        )
+                        for instruction in call_window
+                    )
+                )
+
+                owner_store_indexes = [
+                    index
+                    for index in range(helper_load_index)
+                    if instructions[index].opname == "STORE_FAST"
+                    and instructions[index].argval == "thread_start_owner"
+                    and any(
+                        candidate.opname == "LOAD_GLOBAL"
+                        and candidate.argval == "_ClaudeThreadStartOwner"
+                        for candidate in instructions[max(0, index - 5) : index]
+                    )
+                ]
+                self.assertEqual(len(owner_store_indexes), 1)
+
     def test_keychain_broker_thread_failure_closes_server_and_zeroes_credential(
         self,
     ) -> None:
@@ -1209,6 +5965,8 @@ class ProviderPolicyTest(unittest.TestCase):
         thread.ident = 123
         thread.is_alive.return_value = False
         thread.start.side_effect = forwarded
+        thread._started = threading.Event()
+        thread._started.set()
 
         with (
             mock.patch.object(
@@ -1329,6 +6087,756 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(credential, bytearray(len(credential)))
 
     @unittest.skipUnless(hasattr(signal, "SIGTERM"), "requires SIGTERM")
+    def test_keychain_broker_teardown_signal_runs_fail_closed_recovery(
+        self,
+    ) -> None:
+        credential = bytearray(b"fixture-value")
+        forwarded = providers.ForwardedSignal(signal.SIGTERM)
+        server = mock.Mock()
+        server.server_address = ("127.0.0.1", 43211)
+        server.wait_until_serving.return_value = True
+        server.try_abandon_and_detach_pending_update.return_value = (
+            True,
+            None,
+        )
+        abandon = mock.Mock()
+        recover = mock.Mock(return_value=None)
+        timeout_failure = RuntimeError("fixture recovery timeout")
+        fail_closed_failure = RuntimeError("fixture fail-closed snapshot")
+        callbacks = providers._ClaudeKeychainQuiescenceCallbacks(
+            abandon=abandon,
+            recover=recover,
+            timeout_error=mock.Mock(return_value=timeout_failure),
+            fail_closed_error=mock.Mock(return_value=fail_closed_failure),
+        )
+
+        with (
+            mock.patch.object(
+                providers,
+                "_ClaudeKeychainCredentialServer",
+                return_value=server,
+            ),
+            mock.patch.object(
+                providers,
+                "_bounded_claude_keychain_server_shutdown",
+                side_effect=forwarded,
+            ),
+            self.assertRaises(providers.ForwardedSignal) as raised,
+        ):
+            with providers._claude_keychain_credential_server(
+                credential,
+                bytes.fromhex("01" * 32),
+                quiescence_callbacks=callbacks,
+            ):
+                pass
+
+        self.assertIs(raised.exception, forwarded)
+        self.assertTrue(
+            getattr(
+                raised.exception,
+                "_codex_claude_keychain_handler_quiescence_unproven",
+                False,
+            )
+        )
+        abandon.assert_called()
+        recover.assert_called_once_with(None)
+        server.try_abandon_and_detach_pending_update.assert_called_once()
+        server.scrub_initial_credential.assert_not_called()
+        self.assertEqual(credential, bytearray(len(credential)))
+
+    def test_keychain_broker_finalizer_keeps_sealed_retention_root(
+        self,
+    ) -> None:
+        sealed = providers.ClaudeCredentialInspectionInconclusive(
+            providers._CLAUDE_TIMEOUT_SEALED_SAFE_NOTE
+        )
+        setattr(
+            sealed,
+            "_codex_claude_timeout_root_sealed_safe",
+            True,
+        )
+        state = providers._ClaudeTimeoutRootState(
+            lock=threading.RLock(),
+            fail_closed_root=providers._claude_macos_recovery_root(self.review),
+            root=sealed,
+            sealed=True,
+        )
+        setattr(sealed, "_codex_claude_timeout_root_state", state)
+        setattr(sealed, "_codex_claude_refresh_persistence_failed", True)
+        old_proof = providers._ClaudeRetainedCredentialProof(
+            artifact=(
+                self.review.container_dir
+                / "fixture-finalizer-old"
+                / "config"
+                / providers.CLAUDE_CREDENTIAL_FILE_NAME
+            ),
+            digest=b"\x01" * hashlib.sha256().digest_size,
+            file_identity=(1,),
+            ancestor_identities=((1,),),
+        )
+        new_proof = providers._ClaudeRetainedCredentialProof(
+            artifact=(
+                self.review.container_dir
+                / "fixture-finalizer-new"
+                / "config"
+                / providers.CLAUDE_CREDENTIAL_FILE_NAME
+            ),
+            digest=b"\x02" * hashlib.sha256().digest_size,
+            file_identity=(2,),
+            ancestor_identities=((2,),),
+        )
+        providers._set_claude_retained_credential_proof(sealed, old_proof)
+        late_update_requested = threading.Event()
+        late_update_done = threading.Event()
+        sealed_add_calls: list[tuple[BaseException, BaseException]] = []
+        sealed_control_flow_checks = 0
+        real_add = providers._add_claude_persistence_note
+        real_copy = providers._copy_claude_retained_credential_proof
+        real_get = providers._get_claude_retained_credential_proof
+        real_set = providers._set_claude_retained_credential_proof
+        real_is_control_flow = providers._is_claude_control_flow_error
+
+        def publish_late_proof() -> None:
+            if not late_update_requested.wait(timeout=2.0):
+                return
+            with state.lock:
+                real_set(sealed, new_proof)
+            late_update_done.set()
+
+        def expose_self_copy_race(
+            source: BaseException,
+            target: BaseException,
+        ) -> bool:
+            if source is sealed and target is sealed:
+                stale_proof = real_get(source)
+                self.assertIs(stale_proof, old_proof)
+                late_update_requested.set()
+                self.assertTrue(late_update_done.wait(timeout=2.0))
+                assert stale_proof is not None
+                real_set(target, stale_proof)
+                return True
+            return real_copy(source, target)
+
+        def observe_persistence_add(
+            error: BaseException,
+            persistence_error: BaseException,
+        ) -> None:
+            if error is sealed:
+                sealed_add_calls.append((error, persistence_error))
+            real_add(error, persistence_error)
+
+        def publish_without_self_copy(error: BaseException) -> bool:
+            nonlocal sealed_control_flow_checks
+            result = real_is_control_flow(error)
+            if error is sealed:
+                sealed_control_flow_checks += 1
+                if (
+                    sealed_control_flow_checks >= 2
+                    and not late_update_requested.is_set()
+                ):
+                    late_update_requested.set()
+                    self.assertTrue(late_update_done.wait(timeout=2.0))
+            return result
+
+        late_thread = threading.Thread(target=publish_late_proof)
+        late_thread.start()
+        sensitive_path = "/fixture/private/finalizer-shutdown-peer"
+        shutdown_error = OSError(
+            errno.EIO,
+            f"fixture finalizer shutdown failure at {sensitive_path}",
+            sensitive_path,
+        )
+        setattr(
+            shutdown_error,
+            "_codex_claude_refresh_lock_descriptor_bound",
+            True,
+        )
+        callbacks = providers._ClaudeKeychainQuiescenceCallbacks(
+            abandon=lambda: None,
+            recover=lambda _pending: sealed,
+            timeout_error=lambda: sealed,
+            fail_closed_error=lambda: fail_closed_scope_error,
+        )
+        server = mock.Mock()
+        server.server_address = ("127.0.0.1", 43211)
+        server.wait_until_serving.return_value = True
+        server.try_abandon_and_detach_pending_update.return_value = (
+            True,
+            None,
+        )
+        fail_closed_scope_error = RuntimeError("fixture distinct fail-closed scope")
+        shutdown = providers._ClaudeKeychainServerShutdown(
+            quiescent=False,
+            pending_update=None,
+            errors=(shutdown_error,),
+            abandonment_latched=False,
+            pending_update_detached=False,
+        )
+
+        try:
+            with (
+                mock.patch.object(
+                    providers,
+                    "_ClaudeKeychainCredentialServer",
+                    return_value=server,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_bounded_claude_keychain_server_shutdown",
+                    return_value=shutdown,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_add_claude_persistence_note",
+                    side_effect=observe_persistence_add,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_copy_claude_retained_credential_proof",
+                    side_effect=expose_self_copy_race,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_is_claude_control_flow_error",
+                    side_effect=publish_without_self_copy,
+                ),
+                self.assertRaises(BaseException) as raised,
+            ):
+                with providers._claude_keychain_credential_server(
+                    None,
+                    bytes.fromhex("01" * 32),
+                    quiescence_callbacks=callbacks,
+                ):
+                    pass
+        finally:
+            late_update_requested.set()
+            late_thread.join(timeout=2.0)
+
+        self.assertIs(raised.exception, sealed)
+        self.assertFalse(late_thread.is_alive())
+        self.assertTrue(late_update_done.is_set())
+        with self.subTest(invariant="no-direct-add-to-sealed-root"):
+            self.assertEqual(sealed_add_calls, [])
+        with self.subTest(invariant="late-proof-remains-current"):
+            self.assertIs(
+                providers._get_claude_retained_credential_proof(sealed),
+                new_proof,
+            )
+        self.assertIsNone(sealed.__cause__)
+        self.assertIsNone(sealed.__context__)
+        self.assertNotIn(
+            sensitive_path,
+            self.format_exception_text(sealed),
+        )
+        self.assertFalse(providers._claude_error_graph_contains(sealed, shutdown_error))
+        self.assertTrue(
+            getattr(
+                sealed,
+                "_codex_claude_keychain_handler_quiescence_unproven",
+                False,
+            )
+        )
+
+    def test_persistence_note_self_source_is_noop(self) -> None:
+        error = RuntimeError("fixture persistence self-source")
+        proof = providers._ClaudeRetainedCredentialProof(
+            artifact=(
+                self.review.container_dir
+                / "fixture-persistence-self-source"
+                / "config"
+                / providers.CLAUDE_CREDENTIAL_FILE_NAME
+            ),
+            digest=b"\x03" * hashlib.sha256().digest_size,
+            file_identity=(3,),
+            ancestor_identities=((3,),),
+        )
+        providers._set_claude_retained_credential_proof(error, proof)
+        error.__notes__ = ["fixture original note"]
+
+        providers._add_claude_persistence_note(error, error)
+
+        self.assertFalse(
+            getattr(
+                error,
+                "_codex_claude_refresh_persistence_failed",
+                False,
+            )
+        )
+        self.assertIs(
+            providers._get_claude_retained_credential_proof(error),
+            proof,
+        )
+        self.assertEqual(
+            getattr(error, "__notes__", []),
+            ["fixture original note"],
+        )
+        self.assertIsNone(error.__cause__)
+        self.assertIsNone(error.__context__)
+
+    def test_persistence_note_rejects_sealed_source_for_raw_target(
+        self,
+    ) -> None:
+        target = RuntimeError("fixture raw persistence target")
+        sealed = providers.ClaudeCredentialInspectionInconclusive(
+            providers._CLAUDE_TIMEOUT_SEALED_SAFE_NOTE
+        )
+        state = providers._ClaudeTimeoutRootState(
+            lock=threading.RLock(),
+            fail_closed_root=providers._claude_macos_recovery_root(self.review),
+            root=sealed,
+            sealed=True,
+        )
+        setattr(sealed, "_codex_claude_timeout_root_state", state)
+        setattr(sealed, "_codex_claude_timeout_root_sealed_safe", True)
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "state-aware selector",
+        ):
+            providers._add_claude_persistence_note(target, sealed)
+
+        self.assertFalse(
+            getattr(
+                target,
+                "_codex_claude_refresh_persistence_failed",
+                False,
+            )
+        )
+        self.assertIsNone(target.__cause__)
+        self.assertIsNone(target.__context__)
+        self.assertEqual(getattr(target, "__notes__", []), [])
+
+    def test_keychain_broker_abandonment_sealed_control_flow_uses_state_merge(
+        self,
+    ) -> None:
+        state_lock = threading.RLock()
+        monitor_direct_mutation = threading.Event()
+        unsafe_direct_mutations: list[str] = []
+
+        def state_lock_is_owned() -> bool:
+            is_owned = getattr(state_lock, "_is_owned", None)
+            return bool(callable(is_owned) and is_owned())
+
+        class ObservedForwardedSignal(providers.ForwardedSignal):
+            def __setattr__(self, name: str, value: object) -> None:
+                if (
+                    monitor_direct_mutation.is_set()
+                    and name.startswith("_codex_")
+                    and not state_lock_is_owned()
+                ):
+                    unsafe_direct_mutations.append(f"setattr:{name}")
+                super().__setattr__(name, value)
+
+            def add_note(self, note: str) -> None:
+                if monitor_direct_mutation.is_set() and not state_lock_is_owned():
+                    unsafe_direct_mutations.append("add_note")
+                super().add_note(note)
+
+        sealed = ObservedForwardedSignal(signal.SIGTERM)
+        state = providers._ClaudeTimeoutRootState(
+            lock=state_lock,
+            fail_closed_root=providers._claude_macos_recovery_root(self.review),
+            root=sealed,
+            sealed=True,
+        )
+        setattr(sealed, "_codex_claude_timeout_root_state", state)
+        setattr(sealed, "_codex_claude_timeout_root_sealed_safe", True)
+        setattr(sealed, "_codex_claude_refresh_persistence_failed", True)
+        monitor_direct_mutation.set()
+        fail_closed_failure = RuntimeError(
+            "fixture sealed abandonment fail-closed scope"
+        )
+        selector_calls: list[tuple[BaseException, BaseException]] = []
+        real_selector = (
+            providers._attach_claude_persistence_failure_preserving_control_flow
+        )
+
+        def abandon() -> None:
+            raise sealed
+
+        def observe_persistence_selector(
+            primary: BaseException,
+            secondary: BaseException,
+        ) -> BaseException:
+            if primary is sealed or secondary is sealed:
+                selector_calls.append((primary, secondary))
+            return real_selector(primary, secondary)
+
+        callbacks = providers._ClaudeKeychainQuiescenceCallbacks(
+            abandon=abandon,
+            recover=lambda _pending: None,
+            timeout_error=lambda: fail_closed_failure,
+            fail_closed_error=lambda: fail_closed_failure,
+        )
+        server = mock.Mock()
+        server.server_address = ("127.0.0.1", 43211)
+        server.wait_until_serving.return_value = True
+        server.close_pending_update_publication.return_value = True
+        shutdown = providers._ClaudeKeychainServerShutdown(
+            quiescent=False,
+            pending_update=None,
+            errors=(),
+            abandonment_latched=False,
+            pending_update_detached=False,
+        )
+
+        with (
+            mock.patch.object(
+                providers,
+                "_ClaudeKeychainCredentialServer",
+                return_value=server,
+            ),
+            mock.patch.object(
+                providers,
+                "_bounded_claude_keychain_server_shutdown",
+                return_value=shutdown,
+            ),
+            mock.patch.object(
+                providers,
+                "_attach_claude_persistence_failure_preserving_control_flow",
+                side_effect=observe_persistence_selector,
+            ),
+            self.assertRaises(BaseException) as raised,
+        ):
+            with providers._claude_keychain_credential_server(
+                None,
+                bytes.fromhex("01" * 32),
+                quiescence_callbacks=callbacks,
+            ):
+                pass
+
+        self.assertIs(raised.exception, sealed)
+        self.assertEqual(
+            selector_calls,
+            [
+                (fail_closed_failure, sealed),
+                (sealed, fail_closed_failure),
+            ],
+        )
+        self.assertEqual(unsafe_direct_mutations, [])
+        self.assertFalse(
+            providers._claude_error_graph_contains(
+                sealed,
+                fail_closed_failure,
+            )
+        )
+
+    def test_keychain_broker_skips_direct_annotation_of_sealed_primary(
+        self,
+    ) -> None:
+        class TrackingRLock:
+            def __init__(self) -> None:
+                self._lock = threading.RLock()
+                self._owner: int | None = None
+                self._depth = 0
+
+            def acquire(self, *args: object, **kwargs: object) -> bool:
+                acquired = self._lock.acquire(*args, **kwargs)
+                if acquired:
+                    identity = threading.get_ident()
+                    if self._owner == identity:
+                        self._depth += 1
+                    else:
+                        self._owner = identity
+                        self._depth = 1
+                return acquired
+
+            def release(self) -> None:
+                self._depth -= 1
+                if self._depth == 0:
+                    self._owner = None
+                self._lock.release()
+
+            def is_owned_by_current_thread(self) -> bool:
+                return self._owner == threading.get_ident()
+
+            def __enter__(self) -> TrackingRLock:
+                self.acquire()
+                return self
+
+            def __exit__(
+                self,
+                _error_type: object,
+                _error: object,
+                _traceback: object,
+            ) -> None:
+                self.release()
+
+        tracking_lock = TrackingRLock()
+
+        class ObservedSealedPrimary(providers.ClaudeCredentialInspectionInconclusive):
+            def __setattr__(self, name: str, value: object) -> None:
+                if (
+                    name == "_codex_claude_keychain_handler_quiescence_unproven"
+                    and getattr(self, "_monitor_direct_mutation", False)
+                    and not tracking_lock.is_owned_by_current_thread()
+                ):
+                    self._unsafe_direct_mutations.append("setattr")
+                super().__setattr__(name, value)
+
+            def add_note(self, note: str) -> None:
+                if (
+                    getattr(self, "_monitor_direct_mutation", False)
+                    and not tracking_lock.is_owned_by_current_thread()
+                ):
+                    self._unsafe_direct_mutations.append("add_note")
+                super().add_note(note)
+
+        sealed = ObservedSealedPrimary(providers._CLAUDE_TIMEOUT_SEALED_SAFE_NOTE)
+        sealed._unsafe_direct_mutations = []
+        sealed._monitor_direct_mutation = False
+        state = providers._ClaudeTimeoutRootState(
+            lock=tracking_lock,
+            fail_closed_root=providers._claude_macos_recovery_root(self.review),
+            root=sealed,
+            sealed=True,
+        )
+        setattr(sealed, "_codex_claude_timeout_root_state", state)
+        setattr(sealed, "_codex_claude_timeout_root_sealed_safe", True)
+        setattr(sealed, "_codex_claude_refresh_persistence_failed", True)
+        sealed._monitor_direct_mutation = True
+        server = mock.Mock()
+        server.server_address = ("127.0.0.1", 43211)
+        server.wait_until_serving.return_value = True
+        shutdown = providers._ClaudeKeychainServerShutdown(
+            quiescent=False,
+            pending_update=None,
+            errors=(),
+            abandonment_latched=True,
+            pending_update_detached=True,
+        )
+
+        with (
+            mock.patch.object(
+                providers,
+                "_ClaudeKeychainCredentialServer",
+                return_value=server,
+            ),
+            mock.patch.object(
+                providers,
+                "_bounded_claude_keychain_server_shutdown",
+                return_value=shutdown,
+            ),
+            self.assertRaises(BaseException) as raised,
+        ):
+            with providers._claude_keychain_credential_server(
+                None,
+                bytes.fromhex("01" * 32),
+            ):
+                raise sealed
+
+        self.assertIs(raised.exception, sealed)
+        self.assertEqual(sealed._unsafe_direct_mutations, [])
+
+    def test_recovery_control_flow_uses_state_aware_persistence_selector(
+        self,
+    ) -> None:
+        runtime = providers._claude_keychain_runtime_coordinated.__wrapped__
+        recovery_codes = [
+            constant
+            for constant in runtime.__code__.co_consts
+            if getattr(constant, "co_name", None) == "recover_unquiescent_handler"
+        ]
+        self.assertEqual(len(recovery_codes), 1)
+        instructions = tuple(dis.get_instructions(recovery_codes[0]))
+        state_aware_loads = [
+            instruction
+            for instruction in instructions
+            if instruction.opname == "LOAD_GLOBAL"
+            and instruction.argval
+            == "_attach_claude_persistence_failure_preserving_control_flow"
+        ]
+        direct_add_loads = [
+            instruction
+            for instruction in instructions
+            if instruction.opname == "LOAD_GLOBAL"
+            and instruction.argval == "_add_claude_persistence_note"
+        ]
+        tail_sealed_state_loads = [
+            instruction
+            for instruction in instructions
+            if instruction.opname == "LOAD_GLOBAL"
+            and instruction.argval == "_claude_timeout_root_state"
+        ]
+        ensure_codes = [
+            constant
+            for constant in recovery_codes[0].co_consts
+            if getattr(constant, "co_name", None) == "ensure_recovery_scope"
+        ]
+        self.assertEqual(len(ensure_codes), 1)
+        ensure_instructions = tuple(dis.get_instructions(ensure_codes[0]))
+        ensure_state_loads = [
+            instruction
+            for instruction in ensure_instructions
+            if instruction.opname == "LOAD_GLOBAL"
+            and instruction.argval == "_claude_timeout_root_state"
+        ]
+        ensure_proof_loads = [
+            instruction
+            for instruction in ensure_instructions
+            if instruction.opname == "LOAD_GLOBAL"
+            and instruction.argval == "_get_claude_retained_credential_proof"
+        ]
+
+        self.assertEqual(len(state_aware_loads), 2)
+        self.assertEqual(len(direct_add_loads), 3)
+        self.assertEqual(len(tail_sealed_state_loads), 1)
+        self.assertEqual(len(ensure_state_loads), 1)
+        self.assertEqual(len(ensure_proof_loads), 1)
+        self.assertLess(
+            ensure_state_loads[0].offset,
+            ensure_proof_loads[0].offset,
+        )
+
+    def test_outer_fail_closed_sealed_source_keeps_root_and_late_proof(
+        self,
+    ) -> None:
+        sealed = providers.ClaudeCredentialInspectionInconclusive(
+            providers._CLAUDE_TIMEOUT_SEALED_SAFE_NOTE
+        )
+        state = providers._ClaudeTimeoutRootState(
+            lock=threading.RLock(),
+            fail_closed_root=providers._claude_macos_recovery_root(self.review),
+            root=sealed,
+            sealed=True,
+        )
+        setattr(sealed, "_codex_claude_timeout_root_state", state)
+        setattr(sealed, "_codex_claude_timeout_root_sealed_safe", True)
+        setattr(sealed, "_codex_claude_refresh_persistence_failed", True)
+        old_proof = providers._ClaudeRetainedCredentialProof(
+            artifact=(
+                self.review.container_dir
+                / "fixture-outer-source-old"
+                / "config"
+                / providers.CLAUDE_CREDENTIAL_FILE_NAME
+            ),
+            digest=b"\x04" * hashlib.sha256().digest_size,
+            file_identity=(4,),
+            ancestor_identities=((4,),),
+        )
+        new_proof = providers._ClaudeRetainedCredentialProof(
+            artifact=(
+                self.review.container_dir
+                / "fixture-outer-source-new"
+                / "config"
+                / providers.CLAUDE_CREDENTIAL_FILE_NAME
+            ),
+            digest=b"\x05" * hashlib.sha256().digest_size,
+            file_identity=(5,),
+            ancestor_identities=((5,),),
+        )
+        providers._set_claude_retained_credential_proof(sealed, old_proof)
+        abandonment_error = providers.ForwardedSignal(signal.SIGTERM)
+        copy_calls: list[tuple[BaseException, BaseException]] = []
+        late_update_requested = threading.Event()
+        late_update_done = threading.Event()
+        real_copy = providers._copy_claude_retained_credential_proof
+        real_get = providers._get_claude_retained_credential_proof
+        real_set = providers._set_claude_retained_credential_proof
+        real_selector = (
+            providers._attach_claude_persistence_failure_preserving_control_flow
+        )
+
+        def publish_late_proof() -> None:
+            if not late_update_requested.wait(timeout=2.0):
+                return
+            with state.lock:
+                real_set(sealed, new_proof)
+            late_update_done.set()
+
+        def expose_source_copy(
+            source: BaseException,
+            target: BaseException,
+        ) -> bool:
+            if source is sealed and target is abandonment_error:
+                copy_calls.append((source, target))
+                stale = real_get(source)
+                late_update_requested.set()
+                self.assertTrue(late_update_done.wait(timeout=2.0))
+                if stale is not None:
+                    real_set(target, stale)
+                    return True
+                return False
+            return real_copy(source, target)
+
+        def observe_state_aware_selector(
+            primary: BaseException,
+            secondary: BaseException,
+        ) -> BaseException:
+            if {id(primary), id(secondary)} == {
+                id(sealed),
+                id(abandonment_error),
+            }:
+                late_update_requested.set()
+                self.assertTrue(late_update_done.wait(timeout=2.0))
+            return real_selector(primary, secondary)
+
+        def abandon() -> None:
+            raise abandonment_error
+
+        callbacks = providers._ClaudeKeychainQuiescenceCallbacks(
+            abandon=abandon,
+            recover=lambda _pending: None,
+            timeout_error=lambda: sealed,
+            fail_closed_error=lambda: sealed,
+        )
+        server = mock.Mock()
+        server.server_address = ("127.0.0.1", 43211)
+        server.wait_until_serving.return_value = True
+        server.close_pending_update_publication.return_value = True
+        shutdown = providers._ClaudeKeychainServerShutdown(
+            quiescent=False,
+            pending_update=None,
+            errors=(),
+            abandonment_latched=False,
+            pending_update_detached=False,
+        )
+        late_thread = threading.Thread(target=publish_late_proof)
+        late_thread.start()
+        try:
+            with (
+                mock.patch.object(
+                    providers,
+                    "_ClaudeKeychainCredentialServer",
+                    return_value=server,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_bounded_claude_keychain_server_shutdown",
+                    return_value=shutdown,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_copy_claude_retained_credential_proof",
+                    side_effect=expose_source_copy,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_attach_claude_persistence_failure_preserving_control_flow",
+                    side_effect=observe_state_aware_selector,
+                ),
+                self.assertRaises(BaseException) as raised,
+            ):
+                with providers._claude_keychain_credential_server(
+                    None,
+                    bytes.fromhex("01" * 32),
+                    quiescence_callbacks=callbacks,
+                ):
+                    pass
+        finally:
+            late_update_requested.set()
+            late_thread.join(timeout=2.0)
+
+        self.assertFalse(late_thread.is_alive())
+        self.assertTrue(late_update_done.is_set())
+        with self.subTest(invariant="no-sealed-source-copy"):
+            self.assertEqual(copy_calls, [])
+        with self.subTest(invariant="sealed-root-wins"):
+            self.assertIs(raised.exception, sealed)
+        with self.subTest(invariant="late-proof-remains-current"):
+            self.assertIs(real_get(sealed), new_proof)
+
+    @unittest.skipUnless(hasattr(signal, "SIGTERM"), "requires SIGTERM")
     def test_blocked_keychain_handler_preserves_timeout_and_signal(self) -> None:
         context = multiprocessing.get_context("spawn")
         for mode, expected_error, recovery_completed in (
@@ -1415,6 +6923,123 @@ class ProviderPolicyTest(unittest.TestCase):
                 sock = PartialSocket(fail=fail)
                 self.assertIsNone(providers._recv_exact(sock, 8))  # type: ignore[arg-type]
                 self.assertEqual(sock.buffer, bytearray(8))
+
+    def test_keychain_server_latches_write_before_payload(self) -> None:
+        capability = bytes.fromhex("01" * 32)
+        write_observed = threading.Event()
+        callbacks = providers._ClaudeKeychainQuiescenceCallbacks(
+            abandon=lambda: None,
+            recover=lambda _pending: None,
+            timeout_error=lambda: providers.ClaudeCredentialInspectionInconclusive(
+                "fixture broker quiescence timeout"
+            ),
+            write_observed=write_observed.set,
+        )
+        try:
+            with providers._claude_keychain_credential_server(
+                None,
+                capability,
+                quiescence_callbacks=callbacks,
+            ) as port:
+                with socket.create_connection(
+                    ("127.0.0.1", port),
+                    timeout=2.0,
+                ) as client:
+                    client.sendall(capability + b"W")
+                    client.shutdown(socket.SHUT_WR)
+                self.assertTrue(write_observed.wait(timeout=2.0))
+        except providers.ClaudeLoopbackUnavailable:
+            self.skipTest("loopback bind is unavailable in the current sandbox")
+
+    def test_keychain_server_passes_observed_write_generation(self) -> None:
+        capability = bytes.fromhex("01" * 32)
+        payload = b"fixture-rotation"
+        latest_generation = 0
+        callbacks: list[tuple[bytes, int]] = []
+
+        def observe_write() -> int:
+            nonlocal latest_generation
+            latest_generation += 1
+            return latest_generation
+
+        def update_callback(
+            updated: bytearray,
+            commit_pending: Callable[[Callable[[], bool]], bool],
+            _claim_terminal: Callable[[], bool],
+            observed_generation: int,
+        ) -> bool:
+            callbacks.append((bytes(updated), observed_generation))
+            return commit_pending(lambda: True)
+
+        try:
+            server = providers._ClaudeKeychainCredentialServer(
+                None,
+                capability,
+                update_callback,
+                observe_write,
+            )
+        except OSError:
+            self.skipTest("loopback bind is unavailable in the current sandbox")
+        with server.credential_lock:
+            server.consumed = True
+        serve_thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": 0.01},
+            daemon=True,
+        )
+        serve_thread.start()
+        try:
+            with socket.create_connection(
+                ("127.0.0.1", int(server.server_address[1])),
+                timeout=2.0,
+            ) as client:
+                client.sendall(
+                    capability + b"W" + len(payload).to_bytes(4, "big") + payload
+                )
+                self.assertEqual(client.recv(1), b"\x00")
+        finally:
+            server.shutdown()
+            server.server_close()
+            serve_thread.join(timeout=2.0)
+
+        self.assertFalse(serve_thread.is_alive())
+        self.assertEqual(callbacks, [(payload, 1)])
+
+    def test_refresh_transaction_verified_generation_does_not_regress(
+        self,
+    ) -> None:
+        transaction = providers._ClaudeMacOSRefreshTransaction()
+        older_generation = transaction.observe_refresh()
+        newer_generation = transaction.observe_refresh()
+
+        self.assertEqual(
+            transaction.refresh_generations(),
+            (newer_generation, 0),
+        )
+        transaction.mark_host_commit_verified(newer_generation)
+        transaction.mark_host_commit_verified(older_generation)
+
+        self.assertEqual(
+            transaction.refresh_generations(),
+            (newer_generation, newer_generation),
+        )
+        self.assertFalse(transaction.final_carrier_snapshot_is_verified())
+        transaction.mark_final_carrier_snapshot_verified()
+        self.assertTrue(transaction.final_carrier_snapshot_is_verified())
+        transaction.observe_refresh()
+        self.assertFalse(transaction.final_carrier_snapshot_is_verified())
+
+    def test_refresh_transaction_generation_zero_requires_snapshot_proof(
+        self,
+    ) -> None:
+        transaction = providers._ClaudeMacOSRefreshTransaction()
+
+        self.assertEqual(transaction.refresh_generations(), (0, 0))
+        self.assertFalse(transaction.final_carrier_snapshot_is_verified())
+
+        transaction.mark_final_carrier_snapshot_verified()
+
+        self.assertTrue(transaction.final_carrier_snapshot_is_verified())
 
     def test_keychain_server_pending_generation_preserves_latest_update(
         self,
@@ -3519,6 +9144,7 @@ class ProviderPolicyTest(unittest.TestCase):
             self.review,
             updated_snapshot,
             self.claude_refresh_lock_protocol,
+            coordinated_refresh_lock=mock.ANY,
         )
         report = common.read_json(self.review.container_dir / "claude-runtime.json")
         self.assertEqual(report["authentication"]["source"], "macos-keychain")
@@ -3565,7 +9191,18 @@ class ProviderPolicyTest(unittest.TestCase):
             callback_payload[:] = b"\x00" * len(callback_payload)
             yield 43211
 
-        lease = mock.Mock(spec=["assert_held"])
+        lease = mock.Mock(
+            spec=[
+                "assert_held",
+                "abandon",
+                "release",
+            ]
+        )
+        lease.abandon.return_value = (
+            claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                "fixture refresh transaction was abandoned"
+            )
+        )
         common.write_json(
             self.review.container_dir / "claude-runtime.json",
             {"authentication": {}, "phase": "runtime-launching"},
@@ -3634,6 +9271,10 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(
             write_keychain.call_count,
             providers.CLAUDE_MACOS_DUAL_CARRIER_KEYCHAIN_ATTEMPTS,
+        )
+        lease.abandon.assert_called_once_with(
+            "the latest observed Claude credential write was not verified "
+            "in host carriers"
         )
         write_file.assert_not_called()
         self.assertIn(str(carrier), str(raised.exception))
@@ -3725,11 +9366,22 @@ class ProviderPolicyTest(unittest.TestCase):
             self.review.container_dir / "claude-runtime.json",
             {"authentication": {}, "phase": "runtime-launching"},
         )
+        lease = mock.Mock(spec=["assert_held", "abandon"])
+        lease.abandon.return_value = (
+            claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                "fixture durable cleanup retained the refresh lock"
+            )
+        )
         with (
             mock.patch.object(
                 providers,
                 "_remove_claude_macos_recovery_carrier",
                 side_effect=fail_cleanup,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+                return_value=contextlib.nullcontext(lease),
             ),
             self.assertRaisesRegex(
                 providers.ClaudeCredentialInspectionInconclusive,
@@ -3744,6 +9396,9 @@ class ProviderPolicyTest(unittest.TestCase):
                 pass
 
         persist_credential.assert_called_once()
+        lease.abandon.assert_called_once_with(
+            "durable Claude recovery cleanup remained incomplete"
+        )
         self.assertEqual(len(retained_carriers), 1)
         retained = retained_carriers[0]
         self.assertTrue(retained.is_dir())
@@ -3760,6 +9415,749 @@ class ProviderPolicyTest(unittest.TestCase):
             report["authentication"]["recovery_cleanup_artifact"],
             str(retained / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME),
         )
+
+    def test_out_of_order_observed_generation_nacks_older_update(
+        self,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        newer_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
+        newer_value["claudeAiOauth"]["refreshToken"] = (
+            "fixture-out-of-order-newer-refresh"
+        )
+        older_value = json.loads(oauth_credential_fixture(expires_in_seconds=3600))
+        older_value["claudeAiOauth"]["refreshToken"] = (
+            "fixture-out-of-order-older-refresh"
+        )
+        newer = bytearray(json.dumps(newer_value).encode())
+        older = bytearray(json.dumps(older_value).encode())
+        newer_bytes = bytes(newer)
+        selected_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(original),
+            file_digest=None,
+            file_snapshot=None,
+        )
+        updated_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(newer),
+            file_digest=None,
+            file_snapshot=None,
+        )
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=selected_snapshot,
+        )
+        responses: dict[str, bool] = {}
+        thread_errors: list[BaseException] = []
+        older_observed = threading.Event()
+        release_older_payload = threading.Event()
+        host_updates: list[bytes] = []
+
+        @contextlib.contextmanager
+        def broker(
+            _credential: bytearray,
+            _capability: bytes,
+            *,
+            update_callback: Callable[..., bool] | None = None,
+            quiescence_callbacks: (
+                providers._ClaudeKeychainQuiescenceCallbacks | None
+            ) = None,
+            **_kwargs: object,
+        ):
+            assert update_callback is not None
+            assert quiescence_callbacks is not None
+            assert quiescence_callbacks.write_observed is not None
+            older_generation = quiescence_callbacks.write_observed()
+
+            def commit_pending(publish: Callable[[], bool]) -> bool:
+                return publish()
+
+            def delayed_older_handler() -> None:
+                try:
+                    older_observed.set()
+                    if not release_older_payload.wait(timeout=2.0):
+                        raise RuntimeError("fixture older payload was not released")
+                    responses["older"] = update_callback(
+                        older,
+                        commit_pending,
+                        lambda: True,
+                        older_generation,
+                    )
+                except BaseException as error:
+                    thread_errors.append(error)
+
+            older_thread = threading.Thread(
+                target=delayed_older_handler,
+                name="fixture-delayed-older-write",
+            )
+            older_thread.start()
+            try:
+                self.assertTrue(older_observed.wait(timeout=2.0))
+                newer_generation = quiescence_callbacks.write_observed()
+                responses["newer"] = update_callback(
+                    newer,
+                    commit_pending,
+                    lambda: True,
+                    newer_generation,
+                )
+            finally:
+                release_older_payload.set()
+                older_thread.join(timeout=2.0)
+            self.assertFalse(older_thread.is_alive())
+            self.assertEqual(thread_errors, [])
+            self.assertEqual(responses, {"newer": True, "older": False})
+            carriers = list(
+                providers._claude_macos_recovery_root(self.review).glob(
+                    f"{providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX}*"
+                )
+            )
+            self.assertEqual(len(carriers), 1)
+            self.assertEqual(
+                (
+                    carriers[0] / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                ).read_bytes(),
+                newer_bytes,
+            )
+            yield 43211
+
+        def persist(
+            _review: ReviewWorkspace,
+            _selected: providers._ClaudeLocalCredential,
+            updated: bytearray,
+            *_args: object,
+            **_kwargs: object,
+        ) -> providers._ClaudeMacOSCarrierSnapshot:
+            host_updates.append(bytes(updated))
+            return updated_snapshot
+
+        with (
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+                side_effect=persist,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_snapshot_is_current",
+                return_value=True,
+            ),
+            mock.patch.object(
+                providers,
+                "_commit_claude_macos_durable_stage",
+                wraps=providers._commit_claude_macos_durable_stage,
+            ) as commit,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        self.assertEqual(commit.call_count, 1)
+        self.assertEqual(host_updates, [newer_bytes])
+        self.assertEqual(
+            list(
+                providers._claude_macos_recovery_root(self.review).glob(
+                    f"{providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX}*"
+                )
+            ),
+            [],
+        )
+        older[:] = b"\x00" * len(older)
+        newer[:] = b"\x00" * len(newer)
+
+    def test_callback_entry_stale_generation_cannot_trigger_cleanup(
+        self,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        newer_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
+        newer_value["claudeAiOauth"]["refreshToken"] = (
+            "fixture-stale-cleanup-newer-refresh"
+        )
+        older_value = json.loads(oauth_credential_fixture(expires_in_seconds=3600))
+        older_value["claudeAiOauth"]["refreshToken"] = (
+            "fixture-stale-cleanup-older-refresh"
+        )
+        newer = bytearray(json.dumps(newer_value).encode())
+        older = bytearray(json.dumps(older_value).encode())
+        newer_bytes = bytes(newer)
+        selected_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(original),
+            file_digest=None,
+            file_snapshot=None,
+        )
+        updated_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(newer),
+            file_digest=None,
+            file_snapshot=None,
+        )
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=selected_snapshot,
+        )
+        responses: dict[str, bool] = {}
+        older_observed = threading.Event()
+        release_older_payload = threading.Event()
+        host_updates: list[bytes] = []
+        retained_cleanup_artifacts: list[pathlib.Path] = []
+        lease = mock.Mock(spec=["assert_held", "abandon", "release"])
+        lease.abandon.return_value = (
+            claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                "fixture stale-generation cleanup retained the refresh lock"
+            )
+        )
+
+        @contextlib.contextmanager
+        def transaction(
+            _protocol: providers.ClaudeRefreshLockProtocol,
+            **_coordination_options: object,
+        ):
+            try:
+                yield self.fake_claude_macos_coordination_result(
+                    lease,
+                    _coordination_options,
+                )
+            finally:
+                if not lease.abandon.called:
+                    lease.release()
+
+        @contextlib.contextmanager
+        def broker(
+            _credential: bytearray,
+            _capability: bytes,
+            *,
+            update_callback: Callable[..., bool] | None = None,
+            quiescence_callbacks: (
+                providers._ClaudeKeychainQuiescenceCallbacks | None
+            ) = None,
+            **_kwargs: object,
+        ):
+            assert update_callback is not None
+            assert quiescence_callbacks is not None
+            assert quiescence_callbacks.write_observed is not None
+            older_generation = quiescence_callbacks.write_observed()
+
+            def delayed_older_handler() -> None:
+                older_observed.set()
+                if not release_older_payload.wait(timeout=2.0):
+                    return
+                responses["older"] = update_callback(
+                    older,
+                    lambda publish: publish(),
+                    lambda: True,
+                    older_generation,
+                )
+
+            older_thread = threading.Thread(target=delayed_older_handler)
+            older_thread.start()
+            try:
+                self.assertTrue(older_observed.wait(timeout=2.0))
+                newer_generation = quiescence_callbacks.write_observed()
+                responses["newer"] = update_callback(
+                    newer,
+                    lambda publish: publish(),
+                    lambda: True,
+                    newer_generation,
+                )
+            finally:
+                release_older_payload.set()
+                older_thread.join(timeout=2.0)
+            self.assertFalse(older_thread.is_alive())
+            self.assertEqual(responses, {"newer": True, "older": False})
+            yield 43211
+
+        real_remove = providers._remove_claude_macos_recovery_carrier
+
+        def fail_stale_cleanup(
+            review: ReviewWorkspace,
+            carrier: pathlib.Path,
+            digest: bytes,
+        ) -> None:
+            artifact = carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
+            if artifact.read_bytes() == newer_bytes:
+                retained_cleanup_artifacts.append(artifact)
+                failure = providers.ClaudeCredentialInspectionInconclusive(
+                    "injected stale-generation cleanup failure"
+                )
+                providers._mark_claude_macos_recovery_cleanup_artifact(
+                    failure,
+                    artifact,
+                )
+                raise failure
+            real_remove(review, carrier, digest)
+
+        def persist(
+            _review: ReviewWorkspace,
+            _selected: providers._ClaudeLocalCredential,
+            updated: bytearray,
+            *_args: object,
+            **_kwargs: object,
+        ) -> providers._ClaudeMacOSCarrierSnapshot:
+            host_updates.append(bytes(updated))
+            return updated_snapshot
+
+        with (
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+                side_effect=transaction,
+            ),
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+                side_effect=persist,
+            ),
+            mock.patch.object(
+                providers,
+                "_remove_claude_macos_recovery_carrier",
+                side_effect=fail_stale_cleanup,
+            ),
+            mock.patch.object(
+                providers,
+                "_commit_claude_macos_durable_stage",
+                wraps=providers._commit_claude_macos_durable_stage,
+            ) as commit,
+            self.assertRaises(
+                providers.ClaudeCredentialInspectionInconclusive
+            ) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        self.assertEqual(commit.call_count, 1)
+        self.assertEqual(host_updates, [newer_bytes])
+        self.assertEqual(len(retained_cleanup_artifacts), 1)
+        self.assertEqual(
+            getattr(
+                raised.exception,
+                "_codex_claude_retained_cleanup_artifact",
+                None,
+            ),
+            str(retained_cleanup_artifacts[0]),
+        )
+        lease.abandon.assert_called_once_with(
+            "durable Claude recovery cleanup remained incomplete"
+        )
+        lease.release.assert_not_called()
+        older[:] = b"\x00" * len(older)
+        newer[:] = b"\x00" * len(newer)
+
+    def test_truncated_newer_write_retains_completed_older_generation(
+        self,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        completed_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
+        completed_value["claudeAiOauth"]["refreshToken"] = (
+            "fixture-completed-before-truncated-write"
+        )
+        completed = bytearray(json.dumps(completed_value).encode())
+        completed_bytes = bytes(completed)
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+        lease = mock.Mock(spec=["assert_held", "abandon", "release"])
+        lease.abandon.return_value = (
+            claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                "fixture truncated successor retained the refresh lock"
+            )
+        )
+
+        @contextlib.contextmanager
+        def transaction(
+            _protocol: providers.ClaudeRefreshLockProtocol,
+            **_coordination_options: object,
+        ):
+            try:
+                yield self.fake_claude_macos_coordination_result(
+                    lease,
+                    _coordination_options,
+                )
+            finally:
+                if not lease.abandon.called:
+                    lease.release()
+
+        @contextlib.contextmanager
+        def broker(
+            _credential: bytearray,
+            _capability: bytes,
+            *,
+            update_callback: Callable[..., bool] | None = None,
+            quiescence_callbacks: (
+                providers._ClaudeKeychainQuiescenceCallbacks | None
+            ) = None,
+            **_kwargs: object,
+        ):
+            assert update_callback is not None
+            assert quiescence_callbacks is not None
+            assert quiescence_callbacks.write_observed is not None
+            completed_generation = quiescence_callbacks.write_observed()
+
+            def observe_truncated_successor(
+                publish: Callable[[], bool],
+            ) -> bool:
+                # The first payload is already durable. A second authorized
+                # handler then sends `W` but disconnects before its payload.
+                quiescence_callbacks.write_observed()
+                return publish()
+
+            self.assertFalse(
+                update_callback(
+                    completed,
+                    observe_truncated_successor,
+                    lambda: True,
+                    completed_generation,
+                )
+            )
+            carriers = list(
+                providers._claude_macos_recovery_root(self.review).glob(
+                    f"{providers.CLAUDE_MACOS_DURABLE_STAGE_COMMITTED_PREFIX}*"
+                )
+            )
+            self.assertEqual(len(carriers), 1)
+            self.assertEqual(
+                (
+                    carriers[0] / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                ).read_bytes(),
+                completed_bytes,
+            )
+            yield 43211
+
+        with (
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+                side_effect=transaction,
+            ),
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+            ) as persist,
+            self.assertRaises(
+                providers.ClaudeCredentialInspectionInconclusive
+            ) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        persist.assert_not_called()
+        self.assert_macos_recovery_carrier(
+            raised.exception,
+            completed_bytes,
+        )
+        lease.abandon.assert_called_once_with(
+            "the latest observed Claude credential write was not verified "
+            "in host carriers"
+        )
+        lease.release.assert_not_called()
+        completed[:] = b"\x00" * len(completed)
+
+    def test_callback_entry_stale_generation_consumes_no_stage_quota(
+        self,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        stale = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
+        current_value = json.loads(oauth_credential_fixture(expires_in_seconds=7200))
+        current_value["claudeAiOauth"]["refreshToken"] = (
+            "fixture-current-after-stale-callbacks"
+        )
+        current = bytearray(json.dumps(current_value).encode())
+        current_bytes = bytes(current)
+        malformed = bytearray(b'{"notClaudeOauth":true}')
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+        updated_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(current),
+            file_digest=None,
+            file_snapshot=None,
+        )
+        claim_terminal_calls = 0
+        host_updates: list[bytes] = []
+
+        @contextlib.contextmanager
+        def broker(
+            _credential: bytearray,
+            _capability: bytes,
+            *,
+            update_callback: Callable[..., bool] | None = None,
+            quiescence_callbacks: (
+                providers._ClaudeKeychainQuiescenceCallbacks | None
+            ) = None,
+            **_kwargs: object,
+        ):
+            nonlocal claim_terminal_calls
+            assert update_callback is not None
+            assert quiescence_callbacks is not None
+            assert quiescence_callbacks.write_observed is not None
+            malformed_generation = quiescence_callbacks.write_observed()
+            stale_generation = quiescence_callbacks.write_observed()
+            current_generation = quiescence_callbacks.write_observed()
+
+            def claim_terminal() -> bool:
+                nonlocal claim_terminal_calls
+                claim_terminal_calls += 1
+                return True
+
+            self.assertFalse(
+                update_callback(
+                    malformed,
+                    lambda publish: publish(),
+                    claim_terminal,
+                    malformed_generation,
+                )
+            )
+            self.assertFalse(
+                update_callback(
+                    stale,
+                    lambda publish: publish(),
+                    claim_terminal,
+                    stale_generation,
+                )
+            )
+            self.assertTrue(
+                update_callback(
+                    current,
+                    lambda publish: publish(),
+                    claim_terminal,
+                    current_generation,
+                )
+            )
+            self.assertEqual(claim_terminal_calls, 0)
+            yield 43211
+
+        def persist(
+            _review: ReviewWorkspace,
+            _selected: providers._ClaudeLocalCredential,
+            updated: bytearray,
+            *_args: object,
+            **_kwargs: object,
+        ) -> providers._ClaudeMacOSCarrierSnapshot:
+            host_updates.append(bytes(updated))
+            return updated_snapshot
+
+        real_validate = providers._validate_claude_local_credential
+        validation_payloads: list[bytes] = []
+
+        def record_validation(payload: bytearray, *, source: str) -> object:
+            validation_payloads.append(bytes(payload))
+            return real_validate(payload, source=source)
+
+        with (
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers,
+                "CLAUDE_MACOS_DURABLE_STAGE_MAX_GENERATIONS",
+                2,
+            ),
+            mock.patch.object(
+                providers,
+                "_validate_claude_local_credential",
+                side_effect=record_validation,
+            ),
+            mock.patch.object(
+                providers,
+                "_retain_claude_macos_refreshed_credential",
+                wraps=providers._retain_claude_macos_refreshed_credential,
+            ) as retain,
+            mock.patch.object(
+                providers,
+                "_commit_claude_macos_durable_stage",
+                wraps=providers._commit_claude_macos_durable_stage,
+            ) as commit,
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+                side_effect=persist,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_snapshot_is_current",
+                return_value=True,
+            ),
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        self.assertEqual((retain.call_count, commit.call_count), (1, 1))
+        self.assertEqual(claim_terminal_calls, 0)
+        self.assertEqual(host_updates, [current_bytes])
+        self.assertEqual(validation_payloads, [current_bytes, current_bytes])
+        malformed[:] = b"\x00" * len(malformed)
+        stale[:] = b"\x00" * len(stale)
+        current[:] = b"\x00" * len(current)
+
+    def test_cleanup_artifact_inspection_uncertainty_abandons_transaction(
+        self,
+    ) -> None:
+        cleanup_artifact = str(
+            self.review.container_dir / "claude-runtime" / "macos" / "residue"
+        )
+        inspection_reason = (
+            "durable Claude recovery cleanup identity could not be proven"
+        )
+
+        for mode in ("inspection-inconclusive", "forwarded-signal"):
+            with self.subTest(mode=mode):
+                primary = providers.ClaudeCredentialInspectionInconclusive(
+                    f"fixture retained cleanup declaration for {mode}"
+                )
+                setattr(
+                    primary,
+                    "_codex_claude_retained_cleanup_artifact",
+                    cleanup_artifact,
+                )
+                lease = mock.Mock(
+                    spec=[
+                        "assert_held",
+                        "abandon",
+                        "release",
+                    ]
+                )
+                lock_cleanup = claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                    "fixture cleanup-inspection refresh lock residue"
+                )
+                setattr(
+                    lock_cleanup,
+                    "_codex_claude_refresh_lock_descriptor_bound",
+                    True,
+                )
+                lease.abandon.return_value = lock_cleanup
+                forwarded = providers.ForwardedSignal(signal.SIGTERM)
+
+                @contextlib.contextmanager
+                def transaction(
+                    _protocol: providers.ClaudeRefreshLockProtocol,
+                    **_coordination_options: object,
+                ):
+                    yield self.fake_claude_macos_coordination_result(
+                        lease,
+                        _coordination_options,
+                    )
+
+                @contextlib.contextmanager
+                def fail_runtime(*_args: object, **_kwargs: object):
+                    raise primary
+                    yield {}  # pragma: no cover
+
+                inspection_result: object = (
+                    None if mode == "inspection-inconclusive" else forwarded
+                )
+                patch_kwargs = (
+                    {"return_value": inspection_result}
+                    if mode == "inspection-inconclusive"
+                    else {"side_effect": inspection_result}
+                )
+                expected = primary if mode == "inspection-inconclusive" else forwarded
+                with (
+                    mock.patch.object(
+                        providers,
+                        "_claude_macos_carrier_coordination",
+                        side_effect=transaction,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_claude_keychain_runtime_coordinated",
+                        side_effect=fail_runtime,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_validated_claude_retained_cleanup_artifact",
+                        **patch_kwargs,
+                    ),
+                    self.assertRaises(type(expected)) as raised,
+                ):
+                    with self.claude_keychain_runtime(
+                        self.review,
+                        {},
+                        self.claude_refresh_lock_protocol,
+                    ):
+                        pass
+
+                self.assertIs(raised.exception, expected)
+                lease.abandon.assert_called_once_with(inspection_reason)
+                lease.release.assert_not_called()
+                if mode == "forwarded-signal":
+                    self.assertNotIn(inspection_reason, forwarded.detail or "")
+                    self.assertIn(
+                        "descriptor-bound lock directories may remain",
+                        forwarded.detail or "",
+                    )
+                    self.assertEqual(
+                        getattr(
+                            forwarded,
+                            "_codex_claude_retained_cleanup_artifact",
+                            None,
+                        ),
+                        cleanup_artifact,
+                    )
 
     def test_removed_recovery_carrier_fsync_failure_has_no_cleanup_path(
         self,
@@ -7068,6 +13466,8 @@ class ProviderPolicyTest(unittest.TestCase):
         self,
     ) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        first_stage_error = OSError("injected first durable stage failure")
+        second_stage_error = OSError("injected second durable stage failure")
         updates = [
             bytearray(oauth_credential_fixture(expires_in_seconds=3600 + index))
             for index in range(3)
@@ -7120,8 +13520,8 @@ class ProviderPolicyTest(unittest.TestCase):
                 providers,
                 "_retain_claude_macos_refreshed_credential",
                 side_effect=(
-                    OSError("injected first durable stage failure"),
-                    OSError("injected second durable stage failure"),
+                    first_stage_error,
+                    second_stage_error,
                 ),
             ) as retain,
             mock.patch.object(
@@ -7147,11 +13547,11 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(retain.call_count, 2)
         commit.assert_not_called()
         persist.assert_not_called()
-        self.assertIsInstance(raised.exception.__cause__, OSError)
-        self.assertIn(
-            "first durable stage failure",
-            str(raised.exception.__cause__),
+        self.assert_cleanup_diagnostic_preserves_original_cause(
+            raised.exception,
+            first_stage_error,
         )
+        self.assert_cleanup_diagnostic_visible(raised.exception)
         for attribute in (
             "_codex_claude_retained_credential_carrier",
             "_codex_claude_retained_credential_artifact",
@@ -8416,6 +14816,96 @@ class ProviderPolicyTest(unittest.TestCase):
         for payload in (first, second, third):
             payload[:] = b"\x00" * len(payload)
 
+    def test_recovery_update_artifact_replacement_is_raised(self) -> None:
+        first = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
+        second = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        third = bytearray(oauth_credential_fixture(expires_in_seconds=10800))
+        carrier = providers._retain_claude_macos_refreshed_credential(
+            self.review,
+            first,
+        )
+        real_replace = providers.os.replace
+        real_unlink = providers.os.unlink
+        replace_failed = False
+
+        def fail_first_replace(*args: object, **kwargs: object) -> None:
+            nonlocal replace_failed
+            if (
+                not replace_failed
+                and len(args) >= 2
+                and isinstance(args[0], str)
+                and args[0].startswith(providers.CLAUDE_MACOS_RECOVERY_UPDATE_PREFIX)
+                and args[1] == providers.CLAUDE_CREDENTIAL_FILE_NAME
+            ):
+                replace_failed = True
+                raise OSError("fixture initial recovery replacement failure")
+            real_replace(*args, **kwargs)
+
+        with mock.patch.object(
+            providers.os,
+            "replace",
+            side_effect=fail_first_replace,
+        ):
+            with self.assertRaises(OSError) as initial:
+                providers._replace_claude_macos_recovery_credential(
+                    self.review,
+                    carrier,
+                    second,
+                )
+        artifact_value = getattr(
+            initial.exception,
+            "_codex_claude_retained_credential_artifact",
+            None,
+        )
+        self.assertIsInstance(artifact_value, str)
+        artifact = pathlib.Path(artifact_value)
+        replacement = providers.ClaudeCredentialInspectionInconclusive(
+            "fixture effective recovery cleanup root"
+        )
+
+        def fail_stale_unlink(
+            name: str,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            if name == artifact.name:
+                raise OSError("fixture stale recovery cleanup failure")
+            real_unlink(name, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                providers.os,
+                "unlink",
+                side_effect=fail_stale_unlink,
+            ),
+            mock.patch.object(
+                providers,
+                "_mark_claude_macos_recovery_update_artifact",
+                return_value=replacement,
+            ),
+            self.assertRaises(BaseException) as raised,
+        ):
+            providers._replace_claude_macos_recovery_credential(
+                self.review,
+                carrier,
+                third,
+            )
+
+        self.assertIs(raised.exception, replacement)
+        self.assertFalse(
+            providers._claude_error_graph_contains(
+                raised.exception,
+                initial.exception,
+            )
+        )
+        providers._replace_claude_macos_recovery_credential(
+            self.review,
+            carrier,
+            third,
+        )
+        for payload in (first, second, third):
+            payload[:] = b"\x00" * len(payload)
+
     def test_post_commit_replacement_failures_retain_current_proof(
         self,
     ) -> None:
@@ -8606,7 +15096,12 @@ class ProviderPolicyTest(unittest.TestCase):
             callback_payload[:] = b"\x00" * len(callback_payload)
             yield 43211
 
-        lease = mock.Mock(spec=["assert_held"])
+        lease = mock.Mock(spec=["assert_held", "abandon"])
+        lease.abandon.return_value = (
+            claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                "fixture refresh transaction was abandoned"
+            )
+        )
         with (
             mock.patch.object(
                 providers,
@@ -8661,6 +15156,10 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         write_file.assert_called_once()
         write_keychain.assert_not_called()
+        lease.abandon.assert_called_once_with(
+            "the latest observed Claude credential write was not verified "
+            "in host carriers"
+        )
 
     def test_malformed_refresh_does_not_create_recovery_carrier(self) -> None:
         original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
@@ -9262,6 +15761,7 @@ class ProviderPolicyTest(unittest.TestCase):
         complete_carriers: list[pathlib.Path] = []
         real_commit = providers._commit_claude_macos_durable_stage
         commit_calls = 0
+        third_commit_error = OSError("injected third durable generation commit failure")
 
         def fail_third_commit(
             review: ReviewWorkspace,
@@ -9272,7 +15772,7 @@ class ProviderPolicyTest(unittest.TestCase):
             nonlocal commit_calls
             commit_calls += 1
             if commit_calls == 3:
-                raise OSError("injected third durable generation commit failure")
+                raise third_commit_error
             return real_commit(
                 review,
                 pending,
@@ -9335,11 +15835,11 @@ class ProviderPolicyTest(unittest.TestCase):
 
         persist.assert_not_called()
         self.assertEqual(commit_calls, 3)
-        self.assertIsInstance(raised.exception.__cause__, OSError)
-        self.assertIn(
-            "third durable generation commit failure",
-            str(raised.exception.__cause__),
+        self.assert_cleanup_diagnostic_preserves_original_cause(
+            raised.exception,
+            third_commit_error,
         )
+        self.assert_cleanup_diagnostic_visible(raised.exception)
         latest_carrier = self.assert_macos_recovery_carrier(
             raised.exception,
             latest_bytes,
@@ -10106,6 +16606,1296 @@ class ProviderPolicyTest(unittest.TestCase):
         first[:] = b"\x00" * len(first)
         second[:] = b"\x00" * len(second)
 
+    def test_timeout_effective_root_is_written_back_to_shared_slot(self) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+        captured: dict[str, BaseException] = {}
+        forwarded = providers.ForwardedSignal(signal.SIGTERM)
+        real_lock = threading.Lock
+        lock_calls = 0
+
+        class SnapshotFailingLock:
+            def __init__(self) -> None:
+                self._lock = real_lock()
+
+            def acquire(
+                self,
+                blocking: bool = True,
+                timeout: float = -1,
+            ) -> bool:
+                if not blocking:
+                    raise forwarded
+                return self._lock.acquire(blocking, timeout)
+
+            def release(self) -> None:
+                self._lock.release()
+
+            def __enter__(self) -> SnapshotFailingLock:
+                self.acquire()
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                self.release()
+
+        def lock_factory() -> object:
+            nonlocal lock_calls
+            lock_calls += 1
+            if lock_calls == 1:
+                return SnapshotFailingLock()
+            return real_lock()
+
+        @contextlib.contextmanager
+        def broker(
+            _credential: bytearray,
+            _capability: bytes,
+            *,
+            update_callback: Callable[..., bool] | None = None,
+            quiescence_callbacks: (
+                providers._ClaudeKeychainQuiescenceCallbacks | None
+            ) = None,
+        ):
+            assert update_callback is not None
+            assert quiescence_callbacks is not None
+            quiescence_callbacks.abandon()
+            timeout_error = quiescence_callbacks.timeout_error()
+            try:
+                recovery_error = quiescence_callbacks.recover(bytearray(refreshed))
+            except BaseException as error:
+                recovery_error = error
+            closure = quiescence_callbacks.recover.__closure__
+            self.assertIsNotNone(closure)
+            assert closure is not None
+            nonlocals = {
+                name: cell.cell_contents
+                for name, cell in zip(
+                    quiescence_callbacks.recover.__code__.co_freevars,
+                    closure,
+                    strict=True,
+                )
+            }
+            captured["returned"] = timeout_error
+            assert recovery_error is not None
+            captured["recovery"] = recovery_error
+            snapshot_failure = nonlocals["snapshot_quiescence_timeout_failure"]
+            captured["shared"] = snapshot_failure()
+            raise timeout_error
+            yield 43211
+
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}, "phase": "runtime-launching"},
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers.threading,
+                "Lock",
+                side_effect=lock_factory,
+            ),
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+            ) as persist,
+            self.assertRaises(BaseException) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        self.assertIs(raised.exception, forwarded)
+        self.assertIs(captured["returned"], forwarded)
+        self.assertIs(captured["recovery"], forwarded)
+        self.assertIs(captured["shared"], forwarded)
+        persist.assert_not_called()
+        original[:] = b"\x00" * len(original)
+        refreshed[:] = b"\x00" * len(refreshed)
+
+    def test_timeout_slot_serializes_reader_and_callback_replacements(
+        self,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+        forwarded = providers.ForwardedSignal(signal.SIGTERM)
+        snapshot_started = threading.Event()
+        release_snapshot = threading.Event()
+        real_lock = threading.Lock
+        real_thread = threading.Thread
+        lock_calls = 0
+        captured: dict[str, BaseException] = {}
+
+        class SnapshotBarrierLock:
+            def __init__(self) -> None:
+                self._lock = real_lock()
+
+            def acquire(
+                self,
+                blocking: bool = True,
+                timeout: float = -1,
+            ) -> bool:
+                if not blocking:
+                    snapshot_started.set()
+                    if not release_snapshot.wait(timeout=2.0):
+                        raise RuntimeError(
+                            "fixture timeout snapshot barrier was not released"
+                        )
+                    raise forwarded
+                return self._lock.acquire(blocking, timeout)
+
+            def release(self) -> None:
+                self._lock.release()
+
+            def __enter__(self) -> SnapshotBarrierLock:
+                self.acquire()
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                self.release()
+
+        def lock_factory() -> object:
+            nonlocal lock_calls
+            lock_calls += 1
+            if lock_calls == 1:
+                return SnapshotBarrierLock()
+            return real_lock()
+
+        @contextlib.contextmanager
+        def broker(
+            _credential: bytearray,
+            _capability: bytes,
+            *,
+            quiescence_callbacks: (
+                providers._ClaudeKeychainQuiescenceCallbacks | None
+            ) = None,
+            **_kwargs: object,
+        ):
+            assert quiescence_callbacks is not None
+            quiescence_callbacks.abandon()
+
+            def call_timeout() -> None:
+                try:
+                    captured["callback"] = quiescence_callbacks.timeout_error()
+                except BaseException as error:
+                    captured["callback"] = error
+
+            timeout_thread = real_thread(target=call_timeout)
+            timeout_thread.start()
+            self.assertTrue(snapshot_started.wait(timeout=2.0))
+            closure = quiescence_callbacks.recover.__closure__
+            self.assertIsNotNone(closure)
+            assert closure is not None
+            nonlocals = {
+                name: cell.cell_contents
+                for name, cell in zip(
+                    quiescence_callbacks.recover.__code__.co_freevars,
+                    closure,
+                    strict=True,
+                )
+            }
+            attach_timeout = nonlocals["attach_quiescence_timeout_failure"]
+            reader_failure = OSError("fixture concurrent timeout reader")
+            captured["reader-transform"] = attach_timeout(reader_failure)
+            release_snapshot.set()
+            timeout_thread.join(timeout=2.0)
+            self.assertFalse(timeout_thread.is_alive())
+            try:
+                recovery_error = quiescence_callbacks.recover(bytearray(refreshed))
+            except BaseException as error:
+                recovery_error = error
+            assert recovery_error is not None
+            captured["reader"] = recovery_error
+            snapshot_failure = nonlocals["snapshot_quiescence_timeout_failure"]
+            captured["shared"] = snapshot_failure()
+            raise captured["callback"]
+            yield 43211
+
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}, "phase": "runtime-launching"},
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers.threading,
+                "Lock",
+                side_effect=lock_factory,
+            ),
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+            ) as persist,
+            self.assertRaises(BaseException) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        self.assertIs(captured["callback"], forwarded)
+        self.assertIs(captured["reader"], forwarded)
+        self.assertIs(captured["shared"], forwarded)
+        self.assertIs(raised.exception, forwarded)
+        self.assertIsNotNone(captured["reader-transform"])
+        persist.assert_not_called()
+        original[:] = b"\x00" * len(original)
+        refreshed[:] = b"\x00" * len(refreshed)
+
+    def test_timeout_slot_seals_root_before_late_recovery_replacement(
+        self,
+    ) -> None:
+        if sys.version_info < (3, 11):
+            self.skipTest("requires BaseExceptionGroup")
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+        sensitive_path = "/fixture/private/late-timeout-proof.json"
+        direct_signal_path = "/fixture/private/late-timeout-signal"
+        direct_signal = providers.ForwardedSignal(signal.SIGTERM)
+        direct_signal.detail = f"fixture direct late signal at {direct_signal_path}"
+        setattr(
+            direct_signal,
+            "_codex_claude_refresh_lock_descriptor_bound",
+            True,
+        )
+        late_leaf = OSError(
+            errno.EIO,
+            f"fixture late proof failure at {sensitive_path}",
+            sensitive_path,
+        )
+        late_group = getattr(
+            sys.modules["builtins"],
+            "BaseExceptionGroup",
+        )(
+            f"fixture late recovery group at {sensitive_path}",
+            [KeyboardInterrupt("fixture late recovery interruption"), late_leaf],
+        )
+        outer_group = getattr(
+            sys.modules["builtins"],
+            "BaseExceptionGroup",
+        )(
+            "fixture timeout state interruption",
+            [KeyboardInterrupt("fixture timeout state interruption")],
+        )
+        setattr(
+            late_group,
+            "_codex_claude_refresh_lock_descriptor_bound",
+            True,
+        )
+        capture_started = threading.Event()
+        release_capture = threading.Event()
+        real_capture = providers._capture_claude_retained_credential_proof
+        real_lock = threading.Lock
+        real_thread = threading.Thread
+        lock_calls = 0
+        recovery_thread: threading.Thread | None = None
+        recovery_results: list[BaseException | None] = []
+        captured: dict[str, BaseException] = {}
+
+        class TimeoutSnapshotUnavailableLock:
+            def __init__(self) -> None:
+                self._lock = real_lock()
+
+            def acquire(
+                self,
+                blocking: bool = True,
+                timeout: float = -1,
+            ) -> bool:
+                if not blocking:
+                    raise outer_group
+                return self._lock.acquire(blocking, timeout)
+
+            def release(self) -> None:
+                self._lock.release()
+
+            def __enter__(self) -> TimeoutSnapshotUnavailableLock:
+                self.acquire()
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                self.release()
+
+        def lock_factory() -> object:
+            nonlocal lock_calls
+            lock_calls += 1
+            if lock_calls == 1:
+                return TimeoutSnapshotUnavailableLock()
+            return real_lock()
+
+        def block_late_recovery_proof(
+            artifact: pathlib.Path,
+            *,
+            expected_digest: bytes,
+        ) -> providers._ClaudeRetainedCredentialProof:
+            if threading.current_thread() is recovery_thread:
+                capture_started.set()
+                if not release_capture.wait(timeout=2.0):
+                    raise RuntimeError("fixture late recovery proof was not released")
+                raise late_group
+            return real_capture(
+                artifact,
+                expected_digest=expected_digest,
+            )
+
+        @contextlib.contextmanager
+        def broker(
+            _credential: bytearray,
+            _capability: bytes,
+            *,
+            update_callback: Callable[..., bool] | None = None,
+            quiescence_callbacks: (
+                providers._ClaudeKeychainQuiescenceCallbacks | None
+            ) = None,
+        ):
+            nonlocal recovery_thread
+            assert update_callback is not None
+            assert quiescence_callbacks is not None
+            self.assertTrue(update_callback(refreshed))
+            quiescence_callbacks.abandon()
+            callback_root = quiescence_callbacks.timeout_error()
+            captured["callback"] = callback_root
+            captured["outer"] = callback_root
+            closure = quiescence_callbacks.recover.__closure__
+            self.assertIsNotNone(closure)
+            assert closure is not None
+            nonlocals = {
+                name: cell.cell_contents
+                for name, cell in zip(
+                    quiescence_callbacks.recover.__code__.co_freevars,
+                    closure,
+                    strict=True,
+                )
+            }
+            attach_timeout = nonlocals["attach_quiescence_timeout_failure"]
+            captured["direct"] = attach_timeout(direct_signal)
+
+            def recover_late() -> None:
+                try:
+                    recovery_results.append(
+                        quiescence_callbacks.recover(bytearray(refreshed))
+                    )
+                except BaseException as error:
+                    recovery_results.append(error)
+
+            recovery_thread = real_thread(target=recover_late)
+            recovery_thread.start()
+            try:
+                self.assertTrue(capture_started.wait(timeout=2.0))
+            finally:
+                release_capture.set()
+            recovery_thread.join(timeout=2.0)
+            self.assertFalse(recovery_thread.is_alive())
+            self.assertEqual(len(recovery_results), 1)
+            recovery_error = recovery_results[0]
+            self.assertIsNotNone(recovery_error)
+            assert recovery_error is not None
+            captured["recovery"] = recovery_error
+            snapshot_failure = nonlocals["snapshot_quiescence_timeout_failure"]
+            captured["shared"] = snapshot_failure()
+            raise callback_root
+            yield 43211
+
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}, "phase": "runtime-launching"},
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers.threading,
+                "Lock",
+                side_effect=lock_factory,
+            ),
+            mock.patch.object(
+                providers,
+                "_capture_claude_retained_credential_proof",
+                side_effect=block_late_recovery_proof,
+            ),
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+            ) as persist,
+            self.assertRaises(BaseException) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        self.assertIs(captured["outer"], captured["callback"])
+        self.assertIs(captured["outer"], captured["direct"])
+        self.assertIs(captured["outer"], captured["recovery"])
+        self.assertIs(captured["outer"], captured["shared"])
+        self.assertIs(captured["outer"], raised.exception)
+        self.assertNotIn(
+            sensitive_path,
+            self.format_exception_text(raised.exception),
+        )
+        self.assertNotIn(
+            direct_signal_path,
+            self.format_exception_text(raised.exception),
+        )
+        self.assertFalse(
+            providers._claude_error_graph_contains(
+                raised.exception,
+                late_group,
+            )
+        )
+        self.assertFalse(
+            providers._claude_error_graph_contains(
+                raised.exception,
+                direct_signal,
+            )
+        )
+        self.assertGreaterEqual(
+            getattr(
+                raised.exception,
+                "_codex_claude_timeout_late_control_flow_count",
+                0,
+            ),
+            2,
+        )
+        self.assertEqual(
+            getattr(raised.exception, "__notes__", []).count(
+                providers._CLAUDE_TIMEOUT_LATE_CONTROL_FLOW_NOTE
+            ),
+            1,
+        )
+        persist.assert_not_called()
+        original[:] = b"\x00" * len(original)
+        refreshed[:] = b"\x00" * len(refreshed)
+
+    def test_sealed_timeout_late_aggregates_remain_bounded(self) -> None:
+        root = providers.ClaudeCredentialInspectionInconclusive(
+            providers._CLAUDE_TIMEOUT_SEALED_SAFE_NOTE
+        )
+        setattr(root, "_codex_claude_timeout_root_sealed_safe", True)
+        root_state = providers._ClaudeTimeoutRootState(
+            lock=threading.RLock(),
+            fail_closed_root=providers._claude_macos_recovery_root(self.review),
+            root=root,
+            sealed=True,
+        )
+        setattr(root, "_codex_claude_timeout_root_state", root_state)
+        late_signal_path = "/fixture/private/sealed-late-signal"
+        late_signal = providers.ForwardedSignal(signal.SIGTERM)
+        late_signal.detail = f"fixture late signal at {late_signal_path}"
+        setattr(
+            late_signal,
+            "_codex_claude_refresh_lock_descriptor_bound",
+            True,
+        )
+        late_signal.__cause__ = late_signal
+        self.assertIs(
+            providers._attach_claude_credential_cleanup_failure(
+                root,
+                late_signal,
+            ),
+            root,
+        )
+
+        late_errors: list[BaseException] = [late_signal]
+        for index in range(64):
+            sensitive_path = f"/fixture/private/sealed-late-{index}"
+            late_error = OSError(
+                errno.EIO,
+                f"fixture sealed late failure at {sensitive_path}",
+                sensitive_path,
+            )
+            setattr(
+                late_error,
+                "_codex_claude_refresh_lock_descriptor_bound",
+                True,
+            )
+            if index == 0:
+                late_error.__cause__ = root
+            late_errors.append(late_error)
+            self.assertIs(
+                providers._attach_claude_credential_cleanup_failure(
+                    root,
+                    late_error,
+                ),
+                root,
+            )
+
+        formatted = self.format_exception_text(root)
+        self.assertNotIn("/fixture/private/sealed-late", formatted)
+        self.assertEqual(
+            getattr(
+                root,
+                "_codex_claude_timeout_late_control_flow_count",
+                None,
+            ),
+            1,
+        )
+        self.assertEqual(
+            getattr(
+                root,
+                "_codex_claude_timeout_late_ordinary_count",
+                None,
+            ),
+            64,
+        )
+        self.assertEqual(
+            getattr(root, "__notes__", []).count(
+                providers._CLAUDE_TIMEOUT_LATE_CONTROL_FLOW_NOTE
+            ),
+            1,
+        )
+        self.assertEqual(
+            getattr(root, "__notes__", []).count(
+                providers._CLAUDE_TIMEOUT_LATE_ORDINARY_NOTE
+            ),
+            1,
+        )
+        self.assertLessEqual(len(getattr(root, "__notes__", [])), 3)
+        self.assertIsNone(root.__cause__)
+        self.assertIsNone(root.__context__)
+        for late_error in late_errors:
+            self.assertFalse(providers._claude_error_graph_contains(root, late_error))
+
+    def test_sealed_timeout_selectors_keep_primary_root(self) -> None:
+        for selector in (
+            "persistence",
+            "persistence-sealed-secondary",
+            "terminal-handoff",
+        ):
+            with self.subTest(selector=selector):
+                primary = providers.ClaudeCredentialInspectionInconclusive(
+                    providers._CLAUDE_TIMEOUT_SEALED_SAFE_NOTE
+                )
+                setattr(
+                    primary,
+                    "_codex_claude_timeout_root_sealed_safe",
+                    True,
+                )
+                primary_state = providers._ClaudeTimeoutRootState(
+                    lock=threading.RLock(),
+                    fail_closed_root=providers._claude_macos_recovery_root(self.review),
+                    root=primary,
+                    sealed=True,
+                )
+                setattr(
+                    primary,
+                    "_codex_claude_timeout_root_state",
+                    primary_state,
+                )
+                sensitive_path = f"/fixture/private/sealed-selector-{selector}"
+                secondary = providers.ForwardedSignal(signal.SIGTERM)
+                secondary.detail = f"fixture selector interruption at {sensitive_path}"
+                setattr(
+                    secondary,
+                    "_codex_claude_refresh_lock_descriptor_bound",
+                    True,
+                )
+
+                if selector == "persistence":
+                    effective = providers._attach_claude_persistence_failure_preserving_control_flow(
+                        primary,
+                        secondary,
+                    )
+                elif selector == "persistence-sealed-secondary":
+                    effective = providers._attach_claude_persistence_failure_preserving_control_flow(
+                        secondary,
+                        primary,
+                    )
+                else:
+                    effective = providers._select_claude_macos_terminal_handoff_error(
+                        primary,
+                        [secondary],
+                    )
+
+                self.assertIs(effective, primary)
+                self.assertNotIn(
+                    sensitive_path,
+                    self.format_exception_text(primary),
+                )
+                self.assertFalse(
+                    providers._claude_error_graph_contains(primary, secondary)
+                )
+
+    def test_retained_credential_error_promotes_sanitized_control_flow(
+        self,
+    ) -> None:
+        if sys.version_info < (3, 11):
+            self.skipTest("requires BaseExceptionGroup")
+        credential = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        digest = providers._claude_credential_digest(credential)
+        carrier = providers._retain_claude_macos_refreshed_credential(
+            self.review,
+            credential,
+        )
+        artifact = carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
+
+        for error_shape in ("forwarded-signal", "base-exception-group"):
+            with self.subTest(error_shape=error_shape):
+                sensitive_path = f"/fixture/private/retained-control-flow-{error_shape}"
+                if error_shape == "forwarded-signal":
+                    source: BaseException = providers.ForwardedSignal(signal.SIGTERM)
+                    source.detail = f"fixture retained interruption at {sensitive_path}"
+                else:
+                    source = getattr(
+                        sys.modules["builtins"],
+                        "BaseExceptionGroup",
+                    )(
+                        f"fixture retained group at {sensitive_path}",
+                        [
+                            KeyboardInterrupt("fixture retained grouped interruption"),
+                            OSError(
+                                errno.EIO,
+                                f"fixture retained leaf at {sensitive_path}",
+                                sensitive_path,
+                            ),
+                        ],
+                    )
+                setattr(
+                    source,
+                    "_codex_claude_refresh_lock_descriptor_bound",
+                    True,
+                )
+
+                effective = providers._retained_claude_macos_credential_error(
+                    carrier,
+                    source,
+                    expected_digest=digest,
+                )
+
+                if error_shape == "forwarded-signal":
+                    self.assertIs(effective, source)
+                else:
+                    self.assertIsNot(effective, source)
+                    self.assertIsInstance(
+                        effective,
+                        getattr(
+                            sys.modules["builtins"],
+                            "BaseExceptionGroup",
+                        ),
+                    )
+                    self.assertFalse(
+                        providers._claude_error_graph_contains(
+                            effective,
+                            source,
+                        )
+                    )
+                proof = providers._get_claude_retained_credential_proof(effective)
+                self.assertIsNotNone(proof)
+                assert proof is not None
+                self.assertEqual(proof.artifact, artifact)
+                self.assertEqual(
+                    getattr(
+                        effective,
+                        "_codex_claude_retained_credential_carrier",
+                        None,
+                    ),
+                    str(carrier),
+                )
+                self.assertNotIn(
+                    sensitive_path,
+                    self.format_exception_text(effective),
+                )
+        credential[:] = b"\x00" * len(credential)
+
+    def test_timeout_seal_revalidates_published_proof(self) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+        captured: dict[str, BaseException] = {}
+
+        @contextlib.contextmanager
+        def broker(
+            _credential: bytearray,
+            _capability: bytes,
+            *,
+            quiescence_callbacks: (
+                providers._ClaudeKeychainQuiescenceCallbacks | None
+            ) = None,
+            **_kwargs: object,
+        ):
+            assert quiescence_callbacks is not None
+            quiescence_callbacks.abandon()
+            recovery_error = quiescence_callbacks.recover(bytearray(refreshed))
+            self.assertIsNotNone(recovery_error)
+            assert recovery_error is not None
+            self.assertIsNotNone(
+                providers._get_claude_retained_credential_proof(recovery_error)
+            )
+            closure = quiescence_callbacks.timeout_error.__closure__
+            self.assertIsNotNone(closure)
+            assert closure is not None
+            cells = {
+                name: cell
+                for name, cell in zip(
+                    quiescence_callbacks.timeout_error.__code__.co_freevars,
+                    closure,
+                    strict=True,
+                )
+            }
+            published_cell = cells["published_recovery_claim_is_current"]
+            real_published = published_cell.cell_contents
+
+            def validate_then_clear(
+                error: BaseException,
+                expectation: providers._ClaudeRecoveryExpectation | None = None,
+            ) -> bool:
+                validated = real_published(error, expectation)
+                self.assertTrue(validated)
+                providers._clear_claude_retained_credential_proof(error)
+                return validated
+
+            published_cell.cell_contents = validate_then_clear
+            try:
+                timeout_root = quiescence_callbacks.timeout_error()
+            finally:
+                published_cell.cell_contents = real_published
+            captured["timeout"] = timeout_root
+            raise timeout_root
+            yield 43211
+
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}, "phase": "runtime-launching"},
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+            ) as persist,
+            self.assertRaises(BaseException) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        self.assertIs(raised.exception, captured["timeout"])
+        self.assertIsNone(
+            providers._get_claude_retained_credential_proof(raised.exception)
+        )
+        self.assertIsNone(
+            getattr(
+                raised.exception,
+                "_codex_claude_retained_credential_carrier",
+                None,
+            )
+        )
+        self.assertEqual(
+            getattr(
+                raised.exception,
+                "_codex_claude_retained_cleanup_artifact",
+                None,
+            ),
+            str(providers._claude_macos_recovery_root(self.review)),
+        )
+        persist.assert_not_called()
+        original[:] = b"\x00" * len(original)
+        refreshed[:] = b"\x00" * len(refreshed)
+
+    def test_sealed_timeout_restores_scope_after_late_proof_failure(
+        self,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+        proof_path = "/fixture/private/sealed-late-proof"
+        cleanup_path = "/fixture/private/sealed-late-cleanup"
+        proof_error = OSError(
+            errno.EIO,
+            f"fixture late proof failure at {proof_path}",
+            proof_path,
+        )
+        cleanup_error = OSError(
+            errno.EIO,
+            f"fixture late cleanup failure at {cleanup_path}",
+            cleanup_path,
+        )
+        for error in (proof_error, cleanup_error):
+            setattr(
+                error,
+                "_codex_claude_refresh_lock_descriptor_bound",
+                True,
+            )
+        setattr(
+            cleanup_error,
+            "_codex_claude_retained_cleanup_artifact",
+            cleanup_path,
+        )
+        captured: dict[str, BaseException] = {}
+
+        @contextlib.contextmanager
+        def broker(
+            _credential: bytearray,
+            _capability: bytes,
+            *,
+            quiescence_callbacks: (
+                providers._ClaudeKeychainQuiescenceCallbacks | None
+            ) = None,
+            **_kwargs: object,
+        ):
+            assert quiescence_callbacks is not None
+            quiescence_callbacks.abandon()
+            recovery_error = quiescence_callbacks.recover(bytearray(refreshed))
+            self.assertIsNotNone(recovery_error)
+            timeout_root = quiescence_callbacks.timeout_error()
+            self.assertIsNotNone(
+                providers._get_claude_retained_credential_proof(timeout_root)
+            )
+            self.assertIsNone(
+                getattr(
+                    timeout_root,
+                    "_codex_claude_retained_cleanup_artifact",
+                    None,
+                )
+            )
+            closure = quiescence_callbacks.recover.__closure__
+            self.assertIsNotNone(closure)
+            assert closure is not None
+            nonlocals = {
+                name: cell.cell_contents
+                for name, cell in zip(
+                    quiescence_callbacks.recover.__code__.co_freevars,
+                    closure,
+                    strict=True,
+                )
+            }
+            mark_artifact = nonlocals["mark_quiescence_timeout_recovery_artifact"]
+            proof = providers._get_claude_retained_credential_proof(timeout_root)
+            assert proof is not None
+            with mock.patch.object(
+                providers,
+                "_capture_claude_retained_credential_proof",
+                side_effect=proof_error,
+            ):
+                captured["proof"] = mark_artifact(
+                    proof.artifact,
+                    expected_digest=proof.digest,
+                )
+            attach_timeout = nonlocals["attach_quiescence_timeout_failure"]
+            captured["cleanup"] = attach_timeout(cleanup_error)
+            captured["timeout"] = timeout_root
+            raise timeout_root
+            yield 43211
+
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}, "phase": "runtime-launching"},
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+            ) as persist,
+            self.assertRaises(BaseException) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        self.assertIs(raised.exception, captured["timeout"])
+        self.assertIs(raised.exception, captured["proof"])
+        self.assertIs(raised.exception, captured["cleanup"])
+        self.assertIsNone(
+            providers._get_claude_retained_credential_proof(raised.exception)
+        )
+        self.assertIsNone(
+            getattr(
+                raised.exception,
+                "_codex_claude_retained_credential_carrier",
+                None,
+            )
+        )
+        self.assertEqual(
+            getattr(
+                raised.exception,
+                "_codex_claude_retained_cleanup_artifact",
+                None,
+            ),
+            str(providers._claude_macos_recovery_root(self.review)),
+        )
+        formatted = self.format_exception_text(raised.exception)
+        self.assertNotIn(proof_path, formatted)
+        self.assertNotIn(cleanup_path, formatted)
+        persist.assert_not_called()
+        original[:] = b"\x00" * len(original)
+        refreshed[:] = b"\x00" * len(refreshed)
+
+    def test_sealed_timeout_direct_merge_serializes_with_slot_proof_update(
+        self,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        late_credential = bytearray(oauth_credential_fixture(expires_in_seconds=10800))
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+        late_digest = providers._claude_credential_digest(late_credential)
+        late_carrier = providers._retain_claude_macos_refreshed_credential(
+            self.review,
+            late_credential,
+        )
+        late_artifact = late_carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
+        direct_path = "/fixture/private/direct-slot-proof-race"
+        direct_error = OSError(
+            errno.EIO,
+            f"fixture direct merge failure at {direct_path}",
+            direct_path,
+        )
+        setattr(
+            direct_error,
+            "_codex_claude_refresh_lock_descriptor_bound",
+            True,
+        )
+        clear_started = threading.Event()
+        release_clear = threading.Event()
+        late_lock_acquire_attempt = threading.Event()
+        late_root_proof_set = threading.Event()
+        real_clear = providers._clear_claude_retained_credential_proof
+        real_set = providers._set_claude_retained_credential_proof
+        real_thread = threading.Thread
+        real_rlock = threading.RLock
+        direct_thread: threading.Thread | None = None
+        late_thread: threading.Thread | None = None
+        captured: dict[str, BaseException] = {}
+
+        class InstrumentedRLock:
+            def __init__(self) -> None:
+                self._lock = real_rlock()
+
+            def acquire(self, *args: object, **kwargs: object) -> bool:
+                if threading.current_thread() is late_thread:
+                    late_lock_acquire_attempt.set()
+                return self._lock.acquire(*args, **kwargs)
+
+            def release(self) -> None:
+                self._lock.release()
+
+            def __enter__(self) -> InstrumentedRLock:
+                self.acquire()
+                return self
+
+            def __exit__(
+                self,
+                _error_type: object,
+                _error: object,
+                _traceback: object,
+            ) -> None:
+                self.release()
+
+        shared_lock = InstrumentedRLock()
+
+        def block_direct_clear(error: BaseException) -> None:
+            if threading.current_thread() is direct_thread and error is captured.get(
+                "timeout"
+            ):
+                clear_started.set()
+                if not release_clear.wait(timeout=2.0):
+                    raise RuntimeError("fixture direct timeout merge was not released")
+            real_clear(error)
+
+        def observe_late_root_proof(
+            error: BaseException,
+            proof: providers._ClaudeRetainedCredentialProof,
+        ) -> None:
+            real_set(error, proof)
+            if (
+                threading.current_thread() is late_thread
+                and error is captured.get("timeout")
+                and proof.artifact == late_artifact
+            ):
+                late_root_proof_set.set()
+
+        @contextlib.contextmanager
+        def broker(
+            _credential: bytearray,
+            _capability: bytes,
+            *,
+            quiescence_callbacks: (
+                providers._ClaudeKeychainQuiescenceCallbacks | None
+            ) = None,
+            **_kwargs: object,
+        ):
+            nonlocal direct_thread, late_thread
+            assert quiescence_callbacks is not None
+            quiescence_callbacks.abandon()
+            timeout_root = quiescence_callbacks.timeout_error()
+            captured["timeout"] = timeout_root
+            root_state = getattr(
+                timeout_root,
+                "_codex_claude_timeout_root_state",
+                None,
+            )
+            self.assertIsNotNone(root_state)
+            self.assertIs(root_state.lock, shared_lock)
+            closure = quiescence_callbacks.recover.__closure__
+            self.assertIsNotNone(closure)
+            assert closure is not None
+            nonlocals = {
+                name: cell.cell_contents
+                for name, cell in zip(
+                    quiescence_callbacks.recover.__code__.co_freevars,
+                    closure,
+                    strict=True,
+                )
+            }
+            mark_artifact = nonlocals["mark_quiescence_timeout_recovery_artifact"]
+
+            def merge_direct() -> None:
+                captured["direct"] = (
+                    providers._attach_claude_credential_cleanup_failure(
+                        timeout_root,
+                        direct_error,
+                    )
+                )
+
+            def publish_late_proof() -> None:
+                captured["late"] = mark_artifact(
+                    late_artifact,
+                    expected_digest=late_digest,
+                )
+
+            direct_thread = real_thread(target=merge_direct)
+            direct_thread.start()
+            self.assertTrue(clear_started.wait(timeout=2.0))
+            late_thread = real_thread(target=publish_late_proof)
+            late_thread.start()
+            try:
+                self.assertTrue(late_lock_acquire_attempt.wait(timeout=1.0))
+                self.assertFalse(late_root_proof_set.is_set())
+            finally:
+                release_clear.set()
+                direct_thread.join(timeout=2.0)
+                late_thread.join(timeout=2.0)
+            self.assertFalse(direct_thread.is_alive())
+            self.assertFalse(late_thread.is_alive())
+            self.assertTrue(late_root_proof_set.is_set())
+            snapshot_failure = nonlocals["snapshot_quiescence_timeout_failure"]
+            captured["shared"] = snapshot_failure()
+            raise timeout_root
+            yield 43211
+
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}, "phase": "runtime-launching"},
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers,
+                "_clear_claude_retained_credential_proof",
+                side_effect=block_direct_clear,
+            ),
+            mock.patch.object(
+                providers,
+                "_set_claude_retained_credential_proof",
+                side_effect=observe_late_root_proof,
+            ),
+            mock.patch.object(
+                providers.threading,
+                "RLock",
+                return_value=shared_lock,
+            ),
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+            ) as persist,
+            self.assertRaises(BaseException) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        self.assertIs(raised.exception, captured["timeout"])
+        self.assertIs(raised.exception, captured["direct"])
+        self.assertIs(raised.exception, captured["late"])
+        self.assertIs(raised.exception, captured["shared"])
+        proof = providers._get_claude_retained_credential_proof(raised.exception)
+        self.assertIsNotNone(proof)
+        assert proof is not None
+        self.assertEqual(proof.artifact, late_artifact)
+        self.assertEqual(proof.digest, late_digest)
+        self.assertEqual(
+            getattr(
+                raised.exception,
+                "_codex_claude_retained_credential_carrier",
+                None,
+            ),
+            str(late_carrier),
+        )
+        self.assertNotIn(
+            direct_path,
+            self.format_exception_text(raised.exception),
+        )
+        self.assertFalse(
+            providers._claude_error_graph_contains(
+                raised.exception,
+                direct_error,
+            )
+        )
+        persist.assert_not_called()
+        original[:] = b"\x00" * len(original)
+        late_credential[:] = b"\x00" * len(late_credential)
+
+    def test_retained_credential_error_does_not_relink_sanitized_raw_causes(
+        self,
+    ) -> None:
+        source_path = "/fixture/private/retained-source.json"
+        proof_path = "/fixture/private/retained-proof.json"
+        source_error = OSError(
+            errno.EIO,
+            f"fixture retained source failure at {source_path}",
+            source_path,
+        )
+        proof_error = OSError(
+            errno.EIO,
+            f"fixture retained proof failure at {proof_path}",
+            proof_path,
+        )
+        for error in (source_error, proof_error):
+            setattr(
+                error,
+                "_codex_claude_refresh_lock_descriptor_bound",
+                True,
+            )
+        carrier = self.review.container_dir / "claude-carrier-retained-cause"
+
+        with mock.patch.object(
+            providers,
+            "_capture_claude_retained_credential_proof",
+            side_effect=proof_error,
+        ):
+            retained = providers._retained_claude_macos_credential_error(
+                carrier,
+                source_error,
+                expected_digest=b"\x00" * hashlib.sha256().digest_size,
+            )
+
+        formatted = self.format_exception_text(retained)
+        self.assertNotIn(proof_path, formatted)
+        self.assertNotIn(source_path, formatted)
+        self.assertFalse(providers._claude_error_graph_contains(retained, proof_error))
+        self.assertFalse(providers._claude_error_graph_contains(retained, source_error))
+
     def test_recovery_marker_failure_promotes_root_cleanup_scope(
         self,
     ) -> None:
@@ -10298,6 +18088,312 @@ class ProviderPolicyTest(unittest.TestCase):
         )
         persist.assert_not_called()
         refreshed[:] = b"\x00" * len(refreshed)
+
+    def _assert_sealed_recovery_scope_early_branch_preserves_late_proof(
+        self,
+        *,
+        wait_for_inflight: bool,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(original),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+        branch = "inflight-wait" if wait_for_inflight else "no-payload"
+        old_proof = providers._ClaudeRetainedCredentialProof(
+            artifact=(
+                self.review.container_dir
+                / f"fixture-{branch}-old"
+                / "config"
+                / providers.CLAUDE_CREDENTIAL_FILE_NAME
+            ),
+            digest=b"\x08" * hashlib.sha256().digest_size,
+            file_identity=(8,),
+            ancestor_identities=((8,),),
+        )
+        new_proof = providers._ClaudeRetainedCredentialProof(
+            artifact=(
+                self.review.container_dir
+                / f"fixture-{branch}-new"
+                / "config"
+                / providers.CLAUDE_CREDENTIAL_FILE_NAME
+            ),
+            digest=b"\x09" * hashlib.sha256().digest_size,
+            file_identity=(9,),
+            ancestor_identities=((9,),),
+        )
+        commit_started = threading.Event()
+        release_commit = threading.Event()
+        late_update_requested = threading.Event()
+        late_update_done = threading.Event()
+        callback_errors: list[BaseException] = []
+        callback_thread: threading.Thread | None = None
+        late_thread: threading.Thread | None = None
+        timeout_root: BaseException | None = None
+        timeout_state: providers._ClaudeTimeoutRootState | None = None
+        validation_calls: list[BaseException] = []
+        guard_calls: list[BaseException] = []
+        recovery_root_calls: list[BaseException] = []
+        cleanup_mark_calls: list[BaseException] = []
+        captured: dict[str, object] = {}
+        real_commit = providers._commit_claude_macos_durable_stage
+        real_state = providers._claude_timeout_root_state
+        real_validate = providers._validated_claude_retained_credential_artifact
+        real_recovery_root = providers._claude_macos_recovery_root
+        real_cleanup_mark = providers._mark_claude_macos_recovery_cleanup_artifact
+        real_get = providers._get_claude_retained_credential_proof
+        real_set = providers._set_claude_retained_credential_proof
+
+        def called_from_recovery_scope() -> bool:
+            return any(
+                frame.name == "ensure_recovery_scope"
+                for frame in traceback.extract_stack()
+            )
+
+        def blocking_commit(
+            review: providers.ReviewWorkspace,
+            pending: pathlib.Path,
+            committed: pathlib.Path,
+            credential: bytearray,
+        ) -> pathlib.Path:
+            if wait_for_inflight:
+                commit_started.set()
+                if not release_commit.wait(timeout=2.0):
+                    raise RuntimeError("fixture durable commit was not released")
+                return real_commit(review, pending, committed, credential)
+            committed_carrier = real_commit(
+                review,
+                pending,
+                committed,
+                credential,
+            )
+            commit_started.set()
+            if not release_commit.wait(timeout=2.0):
+                raise RuntimeError("fixture durable commit was not released")
+            raise providers._retained_claude_macos_credential_error(
+                committed_carrier,
+                providers.ClaudeCredentialInspectionInconclusive(
+                    "fixture completed post-commit failure"
+                ),
+                expected_digest=providers._claude_credential_digest(credential),
+            )
+
+        def publish_late_proof() -> None:
+            if not late_update_requested.wait(timeout=2.0):
+                return
+            assert timeout_root is not None
+            assert timeout_state is not None
+            with timeout_state.lock:
+                real_set(timeout_root, new_proof)
+                setattr(
+                    timeout_root,
+                    "_codex_claude_retained_credential_carrier",
+                    str(new_proof.artifact.parent.parent),
+                )
+            late_update_done.set()
+
+        def observe_timeout_state(
+            error: BaseException,
+        ) -> providers._ClaudeTimeoutRootState | None:
+            state = real_state(error)
+            if (
+                state is not None
+                and error is timeout_root
+                and called_from_recovery_scope()
+            ):
+                guard_calls.append(error)
+                late_update_requested.set()
+                self.assertTrue(late_update_done.wait(timeout=2.0))
+            return state
+
+        def expose_stale_validation(
+            review: providers.ReviewWorkspace,
+            error: BaseException,
+        ) -> str | None:
+            if error is timeout_root and called_from_recovery_scope():
+                validation_calls.append(error)
+                late_update_requested.set()
+                self.assertTrue(late_update_done.wait(timeout=2.0))
+                return None
+            return real_validate(review, error)
+
+        def expose_scope_root_resolution(
+            review: providers.ReviewWorkspace,
+        ) -> pathlib.Path:
+            if timeout_root is not None and called_from_recovery_scope():
+                recovery_root_calls.append(timeout_root)
+                late_update_requested.set()
+                self.assertTrue(late_update_done.wait(timeout=2.0))
+            return real_recovery_root(review)
+
+        def observe_scope_cleanup_mark(
+            error: BaseException,
+            artifact: pathlib.Path,
+        ) -> None:
+            if error is timeout_root and called_from_recovery_scope():
+                cleanup_mark_calls.append(error)
+            real_cleanup_mark(error, artifact)
+
+        @contextlib.contextmanager
+        def broker(
+            _credential: bytearray,
+            _capability: bytes,
+            *,
+            update_callback: Callable[..., bool] | None = None,
+            quiescence_callbacks: (
+                providers._ClaudeKeychainQuiescenceCallbacks | None
+            ) = None,
+        ):
+            nonlocal callback_thread
+            nonlocal late_thread
+            nonlocal timeout_root
+            nonlocal timeout_state
+            assert update_callback is not None
+            assert quiescence_callbacks is not None
+
+            def run_callback() -> None:
+                try:
+                    update_callback(refreshed)
+                except BaseException as error:
+                    callback_errors.append(error)
+
+            callback_thread = threading.Thread(target=run_callback)
+            callback_thread.start()
+            self.assertTrue(commit_started.wait(timeout=2.0))
+
+            quiescence_callbacks.abandon()
+            timeout_root = quiescence_callbacks.timeout_error()
+            timeout_state = real_state(timeout_root)
+            self.assertIsNotNone(timeout_state)
+            assert timeout_state is not None
+            with timeout_state.lock:
+                real_set(timeout_root, old_proof)
+                setattr(
+                    timeout_root,
+                    "_codex_claude_retained_credential_carrier",
+                    str(old_proof.artifact.parent.parent),
+                )
+            if not wait_for_inflight:
+                release_commit.set()
+                callback_thread.join(timeout=2.0)
+                self.assertFalse(callback_thread.is_alive())
+
+            late_thread = threading.Thread(target=publish_late_proof)
+            late_thread.start()
+            try:
+                recovery_error = quiescence_callbacks.recover(None)
+                captured["recovery"] = recovery_error
+                captured["proof_after_recovery"] = real_get(timeout_root)
+            finally:
+                late_update_requested.set()
+                late_thread.join(timeout=2.0)
+                release_commit.set()
+                if callback_thread is not None:
+                    callback_thread.join(timeout=2.0)
+            raise timeout_root
+            yield 43211
+
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}, "phase": "runtime-launching"},
+        )
+        try:
+            with (
+                mock.patch.object(
+                    providers,
+                    "_select_claude_macos_credential",
+                    return_value=selected,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_claude_keychain_credential_server",
+                    side_effect=broker,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_commit_claude_macos_durable_stage",
+                    side_effect=blocking_commit,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_claude_timeout_root_state",
+                    side_effect=observe_timeout_state,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_validated_claude_retained_credential_artifact",
+                    side_effect=expose_stale_validation,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_claude_macos_recovery_root",
+                    side_effect=expose_scope_root_resolution,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_mark_claude_macos_recovery_cleanup_artifact",
+                    side_effect=observe_scope_cleanup_mark,
+                ),
+                mock.patch.object(
+                    providers,
+                    "CLAUDE_KEYCHAIN_RECOVERY_TIMEOUT_SECONDS",
+                    0.05,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_persist_claude_macos_refreshed_credential",
+                ) as persist,
+                self.assertRaises(BaseException) as raised,
+            ):
+                with self.claude_keychain_runtime(
+                    self.review,
+                    {},
+                    self.claude_refresh_lock_protocol,
+                ):
+                    pass
+        finally:
+            late_update_requested.set()
+            release_commit.set()
+            if late_thread is not None:
+                late_thread.join(timeout=2.0)
+            if callback_thread is not None:
+                callback_thread.join(timeout=2.0)
+
+        self.assertEqual(callback_errors, [])
+        self.assertIsNotNone(timeout_root)
+        assert timeout_root is not None
+        self.assertIs(raised.exception, timeout_root)
+        self.assertIs(captured.get("recovery"), timeout_root)
+        self.assertTrue(late_update_done.is_set())
+        self.assertEqual(validation_calls, [])
+        self.assertEqual(guard_calls, [timeout_root])
+        self.assertEqual(recovery_root_calls, [])
+        self.assertEqual(cleanup_mark_calls, [])
+        self.assertIs(captured.get("proof_after_recovery"), new_proof)
+        persist.assert_not_called()
+        original[:] = b"\x00" * len(original)
+        refreshed[:] = b"\x00" * len(refreshed)
+
+    def test_inflight_wait_timeout_sealed_scope_guard_preserves_late_proof(
+        self,
+    ) -> None:
+        self._assert_sealed_recovery_scope_early_branch_preserves_late_proof(
+            wait_for_inflight=True,
+        )
+
+    def test_no_payload_sealed_scope_guard_preserves_late_proof(
+        self,
+    ) -> None:
+        self._assert_sealed_recovery_scope_early_branch_preserves_late_proof(
+            wait_for_inflight=False,
+        )
 
     def test_unquiescent_no_payload_prefers_inflight_exact_proof(
         self,
@@ -11609,10 +19705,17 @@ class ProviderPolicyTest(unittest.TestCase):
         persist.assert_not_called()
         recovery_root = providers._claude_macos_recovery_root(self.review)
         report = common.read_json(self.review.container_dir / "claude-runtime.json")
+        authentication = report["authentication"]
         self.assertEqual(
-            report["authentication"]["recovery_cleanup_artifact"],
-            str(recovery_root),
+            authentication["secondary_diagnostic"],
+            providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC,
         )
+        for key in (
+            "recovery_carrier",
+            "recovery_artifact",
+            "recovery_cleanup_artifact",
+        ):
+            self.assertNotIn(key, authentication)
         self.assertEqual(
             getattr(
                 raised.exception,
@@ -11697,7 +19800,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     True,
                 )
                 if recovery_error is not None:
-                    providers._add_claude_persistence_note(
+                    failure = providers._attach_claude_persistence_failure_preserving_control_flow(
                         failure,
                         recovery_error,
                     )
@@ -11803,6 +19906,8 @@ class ProviderPolicyTest(unittest.TestCase):
         real_commit = providers._commit_claude_macos_durable_stage
         real_replace = providers._replace_claude_macos_recovery_credential
         real_thread = threading.Thread
+        real_validate = providers._validated_claude_retained_credential_artifact
+        sealed_validation_calls: list[BaseException] = []
         commit_calls = 0
 
         def blocking_second_commit(
@@ -11838,6 +19943,17 @@ class ProviderPolicyTest(unittest.TestCase):
             if kwargs.get("name") == "claude-review-keychain-recovery":
                 recovery_threads.append(thread)
             return thread
+
+        def observe_retained_validation(
+            review: providers.ReviewWorkspace,
+            error: BaseException,
+        ) -> str | None:
+            if providers._claude_timeout_root_state(error) is not None and any(
+                frame.name == "ensure_recovery_scope"
+                for frame in traceback.extract_stack()
+            ):
+                sealed_validation_calls.append(error)
+            return real_validate(review, error)
 
         @contextlib.contextmanager
         def broker(
@@ -11880,7 +19996,7 @@ class ProviderPolicyTest(unittest.TestCase):
                     True,
                 )
                 if recovery_error is not None:
-                    providers._add_claude_persistence_note(
+                    failure = providers._attach_claude_persistence_failure_preserving_control_flow(
                         failure,
                         recovery_error,
                     )
@@ -11913,6 +20029,11 @@ class ProviderPolicyTest(unittest.TestCase):
                 "Thread",
                 side_effect=tracking_thread,
             ),
+            mock.patch.object(
+                providers,
+                "_validated_claude_retained_credential_artifact",
+                side_effect=observe_retained_validation,
+            ),
             self.assertRaises(
                 providers.ClaudeCredentialInspectionInconclusive
             ) as raised,
@@ -11934,6 +20055,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
         self.assertEqual(callback_errors, [])
         self.assertEqual(callback_results, [False])
+        self.assertEqual(sealed_validation_calls, [])
         self.assertEqual(commit_calls, 2)
         self.assertEqual(len(recovery_threads), 1)
         self.assertFalse(recovery_threads[0].is_alive())
@@ -11948,14 +20070,25 @@ class ProviderPolicyTest(unittest.TestCase):
             [reported],
         )
         report = common.read_json(self.review.container_dir / "claude-runtime.json")
+        authentication = report["authentication"]
         self.assertEqual(
-            report["authentication"]["recovery_carrier"],
-            str(reported),
+            authentication["secondary_diagnostic"],
+            providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC,
         )
         self.assertEqual(
-            report["authentication"]["recovery_cleanup_artifact"],
+            getattr(
+                raised.exception,
+                "_codex_claude_retained_cleanup_artifact",
+                None,
+            ),
             str(recovery_root),
         )
+        for key in (
+            "recovery_carrier",
+            "recovery_artifact",
+            "recovery_cleanup_artifact",
+        ):
+            self.assertNotIn(key, authentication)
         first[:] = b"\x00" * len(first)
         second[:] = b"\x00" * len(second)
 
@@ -12831,6 +20964,105 @@ class ProviderPolicyTest(unittest.TestCase):
                         "_codex_claude_refresh_persistence_failed",
                         True,
                     )
+                    sealed_state = providers._ClaudeTimeoutRootState(
+                        lock=threading.RLock(),
+                        fail_closed_root=real_recovery_root(self.review),
+                        root=marked_primary,
+                        sealed=True,
+                    )
+                    setattr(
+                        marked_primary,
+                        "_codex_claude_timeout_root_state",
+                        sealed_state,
+                    )
+                    setattr(
+                        marked_primary,
+                        "_codex_claude_timeout_root_sealed_safe",
+                        True,
+                    )
+                else:
+                    sealed_state = None
+                exercise_late_proof = (
+                    marked_primary is not None and label == "forwarded-signal"
+                )
+                old_proof = providers._ClaudeRetainedCredentialProof(
+                    artifact=(
+                        self.review.container_dir
+                        / "fixture-final-abandonment-old"
+                        / "config"
+                        / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                    ),
+                    digest=b"\x06" * hashlib.sha256().digest_size,
+                    file_identity=(6,),
+                    ancestor_identities=((6,),),
+                )
+                new_proof = providers._ClaudeRetainedCredentialProof(
+                    artifact=(
+                        self.review.container_dir
+                        / "fixture-final-abandonment-new"
+                        / "config"
+                        / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                    ),
+                    digest=b"\x07" * hashlib.sha256().digest_size,
+                    file_identity=(7,),
+                    ancestor_identities=((7,),),
+                )
+                if exercise_late_proof:
+                    assert marked_primary is not None
+                    providers._set_claude_retained_credential_proof(
+                        marked_primary,
+                        old_proof,
+                    )
+                copy_calls: list[tuple[BaseException, BaseException]] = []
+                late_update_requested = threading.Event()
+                late_update_done = threading.Event()
+                real_copy = providers._copy_claude_retained_credential_proof
+                real_get = providers._get_claude_retained_credential_proof
+                real_set = providers._set_claude_retained_credential_proof
+                real_selector = (
+                    providers._attach_claude_persistence_failure_preserving_control_flow
+                )
+
+                def publish_late_proof() -> None:
+                    if not late_update_requested.wait(timeout=2.0):
+                        return
+                    assert marked_primary is not None
+                    assert sealed_state is not None
+                    with sealed_state.lock:
+                        real_set(marked_primary, new_proof)
+                    late_update_done.set()
+
+                def expose_sealed_source_copy(
+                    source: BaseException,
+                    target: BaseException,
+                ) -> bool:
+                    if (
+                        exercise_late_proof
+                        and source is marked_primary
+                        and target is scope_interruption
+                    ):
+                        copy_calls.append((source, target))
+                        stale = real_get(source)
+                        late_update_requested.set()
+                        self.assertTrue(late_update_done.wait(timeout=2.0))
+                        if stale is not None:
+                            real_set(target, stale)
+                            return True
+                        return False
+                    return real_copy(source, target)
+
+                def observe_state_aware_selector(
+                    primary: BaseException,
+                    secondary: BaseException,
+                ) -> BaseException:
+                    if exercise_late_proof and {id(primary), id(secondary)} == {
+                        id(marked_primary),
+                        id(scope_interruption),
+                    }:
+                        late_update_requested.set()
+                        self.assertTrue(late_update_done.wait(timeout=2.0))
+                    return real_selector(primary, secondary)
+
                 original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
                 updates: list[bytearray] = []
                 for generation in range(1, 5):
@@ -12927,66 +21159,100 @@ class ProviderPolicyTest(unittest.TestCase):
                     self.review.container_dir / "claude-runtime.json",
                     {"authentication": {}, "phase": "runtime-launching"},
                 )
-                with (
-                    mock.patch.object(
-                        providers,
-                        "_select_claude_macos_credential",
-                        return_value=selected,
-                    ),
-                    mock.patch.object(
-                        providers,
-                        "_claude_keychain_credential_server",
-                        side_effect=broker,
-                    ),
-                    mock.patch.object(
-                        providers,
-                        "CLAUDE_MACOS_DURABLE_STAGE_MAX_GENERATIONS",
-                        5,
-                    ),
-                    mock.patch.object(
-                        providers,
-                        "CLAUDE_MACOS_DURABLE_STAGE_MAX_BYTES",
-                        sum(len(update) for update in updates)
-                        + providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES,
-                    ),
-                    mock.patch.object(
-                        providers,
-                        "_remove_claude_macos_recovery_carrier",
-                        side_effect=fail_two_cleanup_paths,
-                    ),
-                    mock.patch.object(
-                        providers,
-                        "_claude_macos_recovery_root",
-                        side_effect=guarded_recovery_root,
-                    ),
-                    mock.patch.object(
-                        providers,
-                        "_persist_claude_macos_refreshed_credential",
-                        return_value=updated_snapshot,
-                    ) as persist,
-                    self.assertRaises(type(scope_interruption)) as raised,
-                ):
-                    with self.claude_keychain_runtime(
-                        self.review,
-                        {},
-                        self.claude_refresh_lock_protocol,
+                late_thread = (
+                    threading.Thread(target=publish_late_proof)
+                    if exercise_late_proof
+                    else None
+                )
+                if late_thread is not None:
+                    late_thread.start()
+                try:
+                    with (
+                        mock.patch.object(
+                            providers,
+                            "_select_claude_macos_credential",
+                            return_value=selected,
+                        ),
+                        mock.patch.object(
+                            providers,
+                            "_claude_keychain_credential_server",
+                            side_effect=broker,
+                        ),
+                        mock.patch.object(
+                            providers,
+                            "CLAUDE_MACOS_DURABLE_STAGE_MAX_GENERATIONS",
+                            5,
+                        ),
+                        mock.patch.object(
+                            providers,
+                            "CLAUDE_MACOS_DURABLE_STAGE_MAX_BYTES",
+                            sum(len(update) for update in updates)
+                            + providers.CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES,
+                        ),
+                        mock.patch.object(
+                            providers,
+                            "_remove_claude_macos_recovery_carrier",
+                            side_effect=fail_two_cleanup_paths,
+                        ),
+                        mock.patch.object(
+                            providers,
+                            "_claude_macos_recovery_root",
+                            side_effect=guarded_recovery_root,
+                        ),
+                        mock.patch.object(
+                            providers,
+                            "_persist_claude_macos_refreshed_credential",
+                            return_value=updated_snapshot,
+                        ) as persist,
+                        mock.patch.object(
+                            providers,
+                            "_copy_claude_retained_credential_proof",
+                            side_effect=expose_sealed_source_copy,
+                        ),
+                        mock.patch.object(
+                            providers,
+                            "_attach_claude_persistence_failure_preserving_control_flow",
+                            side_effect=observe_state_aware_selector,
+                        ),
+                        self.assertRaises(BaseException) as raised,
                     ):
-                        pass
+                        with self.claude_keychain_runtime(
+                            self.review,
+                            {},
+                            self.claude_refresh_lock_protocol,
+                        ):
+                            pass
+                finally:
+                    if late_thread is not None:
+                        late_update_requested.set()
+                        late_thread.join(timeout=2.0)
 
-                self.assertIs(raised.exception, scope_interruption)
-                if marked_primary is not None:
-                    self.assertIsNot(raised.exception, marked_primary)
+                expected = marked_primary or scope_interruption
+                self.assertIs(raised.exception, expected)
+                if exercise_late_proof:
+                    assert late_thread is not None
+                    assert marked_primary is not None
+                    self.assertFalse(late_thread.is_alive())
+                    self.assertTrue(late_update_done.is_set())
+                    self.assertEqual(copy_calls, [])
+                    self.assertIs(real_get(marked_primary), new_proof)
                 self.assertEqual(len(cleanup_errors), 2)
                 self.assertGreaterEqual(remove_calls, 2)
                 persist.assert_called_once()
                 self.assertTrue(
                     getattr(
-                        scope_interruption,
+                        expected,
                         "_codex_claude_refresh_persistence_failed",
                         False,
                     )
                 )
-                self.assert_persistence_diagnostic_visible(scope_interruption)
+                if marked_primary is None:
+                    self.assert_persistence_diagnostic_visible(expected)
+                else:
+                    self.assertIn(
+                        providers._CLAUDE_TIMEOUT_SEALED_SAFE_NOTE,
+                        self.format_exception_text(expected),
+                    )
 
         for abandoned_primary in (False, True):
             for label, interruption_factory in scope_interruption_factories:
@@ -13350,11 +21616,15 @@ class ProviderPolicyTest(unittest.TestCase):
         observed_baselines: list[bytes] = []
         observed_updates: list[bytes] = []
 
-        def persist(*args: object) -> providers._ClaudeMacOSCarrierSnapshot:
+        def persist(
+            *args: object,
+            **kwargs: object,
+        ) -> providers._ClaudeMacOSCarrierSnapshot:
             updated = args[2]
             baseline = args[3]
             assert isinstance(updated, bytearray)
             assert isinstance(baseline, bytearray)
+            self.assertIsNotNone(kwargs.get("coordinated_refresh_lock"))
             observed_updates.append(bytes(updated))
             observed_baselines.append(bytes(baseline))
             return second_snapshot
@@ -13387,9 +21657,5194 @@ class ProviderPolicyTest(unittest.TestCase):
             self.review,
             second_snapshot,
             self.claude_refresh_lock_protocol,
+            coordinated_refresh_lock=mock.ANY,
         )
         first[:] = b"\x00" * len(first)
         second[:] = b"\x00" * len(second)
+
+    def test_final_carrier_revalidation_failure_abandons_refresh_transaction(
+        self,
+    ) -> None:
+        failure_cases: tuple[tuple[str, object, type[BaseException]], ...] = (
+            (
+                "changed",
+                False,
+                providers.ClaudeCredentialInspectionInconclusive,
+            ),
+            (
+                "ordinary-error",
+                RuntimeError("fixture final revalidation error"),
+                RuntimeError,
+            ),
+            (
+                "forwarded-signal",
+                providers.ForwardedSignal(signal.SIGTERM),
+                providers.ForwardedSignal,
+            ),
+            (
+                "keyboard-interrupt",
+                KeyboardInterrupt("fixture final revalidation interrupted"),
+                KeyboardInterrupt,
+            ),
+        )
+
+        for label, revalidation_result, expected_error in failure_cases:
+            with self.subTest(label=label):
+                original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+                refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
+                initial_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+                    keychain_digest=providers._claude_credential_digest(original),
+                    file_digest=None,
+                    file_snapshot=None,
+                    keychain_refresh_digest=(
+                        providers._claude_credential_refresh_digest(original)
+                    ),
+                )
+                refreshed_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+                    keychain_digest=providers._claude_credential_digest(refreshed),
+                    file_digest=None,
+                    file_snapshot=None,
+                    keychain_refresh_digest=(
+                        providers._claude_credential_refresh_digest(refreshed)
+                    ),
+                )
+                selected = providers._ClaudeLocalCredential(
+                    source="macos-keychain",
+                    payload=original,
+                    expires_at_ms=0,
+                    carrier_snapshot=initial_snapshot,
+                )
+                lease = mock.Mock(
+                    spec=[
+                        "assert_held",
+                        "abandon",
+                        "release",
+                    ]
+                )
+                retained_lock = pathlib.Path(
+                    f"/fixture/{label}/.claude/.oauth_refresh.lock"
+                )
+                cleanup_error = (
+                    claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                        "fixture final revalidation retained the refresh lock"
+                    )
+                )
+                setattr(
+                    cleanup_error,
+                    "_codex_claude_refresh_lock_paths",
+                    (str(retained_lock),),
+                )
+                lease.abandon.return_value = cleanup_error
+
+                @contextlib.contextmanager
+                def transaction(
+                    _protocol: providers.ClaudeRefreshLockProtocol,
+                    **_coordination_options: object,
+                ):
+                    try:
+                        yield self.fake_claude_macos_coordination_result(
+                            lease,
+                            _coordination_options,
+                        )
+                    finally:
+                        if not lease.abandon.called:
+                            lease.release()
+
+                @contextlib.contextmanager
+                def broker(
+                    _credential: bytearray,
+                    _capability: bytes,
+                    *,
+                    update_callback: Callable[..., bool] | None = None,
+                    **_kwargs: object,
+                ):
+                    assert update_callback is not None
+                    self.assertTrue(update_callback(refreshed))
+                    yield 43211
+
+                common.write_json(
+                    self.review.container_dir / "claude-runtime.json",
+                    {"authentication": {}, "phase": "pending"},
+                )
+
+                def revalidate_snapshot(*_args: object, **_kwargs: object) -> bool:
+                    if isinstance(revalidation_result, BaseException):
+                        raise revalidation_result
+                    self.assertIs(revalidation_result, False)
+                    return False
+
+                with (
+                    mock.patch.object(
+                        providers,
+                        "_claude_macos_carrier_coordination",
+                        side_effect=transaction,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_select_claude_macos_credential",
+                        return_value=selected,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_claude_keychain_credential_server",
+                        side_effect=broker,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_persist_claude_macos_refreshed_credential",
+                        return_value=refreshed_snapshot,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_claude_macos_carrier_snapshot_is_current",
+                        side_effect=revalidate_snapshot,
+                    ),
+                    self.assertRaises(expected_error) as raised,
+                ):
+                    with self.claude_keychain_runtime(
+                        self.review,
+                        {},
+                        self.claude_refresh_lock_protocol,
+                        process_started=lambda: False,
+                    ):
+                        pass
+
+                if isinstance(revalidation_result, BaseException):
+                    self.assertIs(raised.exception, revalidation_result)
+                lease.abandon.assert_called_once_with(
+                    "the final Claude credential carrier snapshot was not verified"
+                )
+                lease.release.assert_not_called()
+                self.assertEqual(
+                    getattr(
+                        raised.exception,
+                        "_codex_claude_refresh_lock_paths",
+                        None,
+                    ),
+                    (str(retained_lock),),
+                )
+                if isinstance(
+                    raised.exception,
+                    providers.ForwardedSignal,
+                ):
+                    self.assertIn(
+                        str(retained_lock),
+                        raised.exception.detail or "",
+                    )
+                refreshed[:] = b"\x00" * len(refreshed)
+
+    def test_started_zero_update_requires_final_carrier_proof(
+        self,
+    ) -> None:
+        failure_cases: tuple[tuple[str, object, type[BaseException]], ...] = (
+            (
+                "changed",
+                False,
+                providers.ClaudeCredentialInspectionInconclusive,
+            ),
+            (
+                "ordinary-error",
+                RuntimeError("fixture generation-zero revalidation error"),
+                RuntimeError,
+            ),
+            (
+                "forwarded-signal",
+                providers.ForwardedSignal(signal.SIGTERM),
+                providers.ForwardedSignal,
+            ),
+            (
+                "keyboard-interrupt",
+                KeyboardInterrupt("fixture generation-zero revalidation interrupt"),
+                KeyboardInterrupt,
+            ),
+        )
+
+        for label, revalidation_result, expected_error in failure_cases:
+            with self.subTest(label=label):
+                original = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
+                selected = providers._ClaudeLocalCredential(
+                    source="macos-keychain",
+                    payload=original,
+                    expires_at_ms=0,
+                    carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                        keychain_digest=(providers._claude_credential_digest(original)),
+                        file_digest=None,
+                        file_snapshot=None,
+                        keychain_refresh_digest=(
+                            providers._claude_credential_refresh_digest(original)
+                        ),
+                    ),
+                )
+                retained_lock = pathlib.Path(
+                    f"/fixture/{label}/.claude/.oauth_refresh.lock"
+                )
+                cleanup = claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                    "fixture generation-zero final proof retained the lock"
+                )
+                setattr(
+                    cleanup,
+                    "_codex_claude_refresh_lock_paths",
+                    (str(retained_lock),),
+                )
+                lease = mock.Mock(
+                    spec=[
+                        "assert_held",
+                        "abandon",
+                        "release",
+                    ]
+                )
+                events: list[str] = []
+
+                def abandon(reason: str) -> BaseException:
+                    events.append(f"abandon:{reason}")
+                    return cleanup
+
+                lease.abandon.side_effect = abandon
+
+                @contextlib.contextmanager
+                def transaction(
+                    _protocol: providers.ClaudeRefreshLockProtocol,
+                    **_coordination_options: object,
+                ):
+                    try:
+                        yield self.fake_claude_macos_coordination_result(
+                            lease,
+                            _coordination_options,
+                        )
+                    except BaseException:
+                        events.append("coordination-exceptional-exit")
+                        raise
+                    else:
+                        events.append("coordination-normal-exit")
+                        events.append("release")
+                        lease.release()
+
+                @contextlib.contextmanager
+                def broker(*_args: object, **_kwargs: object):
+                    yield 43211
+
+                def revalidate_snapshot(
+                    *_args: object,
+                    **_kwargs: object,
+                ) -> bool:
+                    events.append("final-snapshot-proof")
+                    if isinstance(revalidation_result, BaseException):
+                        raise revalidation_result
+                    self.assertIs(revalidation_result, False)
+                    return False
+
+                def restore_signals(
+                    _previous: set[signal.Signals] | None,
+                ) -> None:
+                    events.append("mask-restored")
+
+                common.write_json(
+                    self.review.container_dir / "claude-runtime.json",
+                    {"authentication": {}, "phase": "pending"},
+                )
+                with (
+                    mock.patch.object(
+                        providers,
+                        "_claude_macos_carrier_coordination",
+                        side_effect=transaction,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_select_claude_macos_credential",
+                        return_value=selected,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_claude_keychain_credential_server",
+                        side_effect=broker,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_claude_macos_carrier_snapshot_is_current",
+                        side_effect=revalidate_snapshot,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "block_forwarded_signals",
+                        return_value=set(),
+                    ),
+                    mock.patch.object(
+                        providers,
+                        ("_consume_claude_macos_owned_pending_forwarded_signal"),
+                        return_value=None,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "restore_signal_mask",
+                        side_effect=restore_signals,
+                    ),
+                    self.assertRaises(expected_error) as raised,
+                ):
+                    with self.claude_keychain_runtime(
+                        self.review,
+                        {},
+                        self.claude_refresh_lock_protocol,
+                        process_started=lambda: True,
+                        process_quiescent=lambda: True,
+                    ):
+                        pass
+
+                if isinstance(revalidation_result, BaseException):
+                    self.assertIs(raised.exception, revalidation_result)
+                lease.abandon.assert_called_once_with(
+                    "the final Claude credential carrier snapshot was not verified"
+                )
+                lease.release.assert_not_called()
+                self.assertEqual(
+                    getattr(
+                        raised.exception,
+                        "_codex_claude_refresh_lock_paths",
+                        None,
+                    ),
+                    (str(retained_lock),),
+                )
+                self.assertLess(
+                    events.index(
+                        "abandon:the final Claude credential carrier "
+                        "snapshot was not verified"
+                    ),
+                    events.index("coordination-exceptional-exit"),
+                )
+                self.assertLess(
+                    events.index("coordination-exceptional-exit"),
+                    events.index("mask-restored"),
+                )
+                if isinstance(
+                    raised.exception,
+                    providers.ForwardedSignal,
+                ):
+                    self.assertIn(
+                        str(retained_lock),
+                        raised.exception.detail or "",
+                    )
+                original[:] = b"\x00" * len(original)
+
+    def test_keychain_runtime_holds_refresh_transaction_across_runtime(self) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
+        snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(original),
+            file_digest=None,
+            file_snapshot=None,
+            keychain_refresh_digest=(
+                providers._claude_credential_refresh_digest(original)
+            ),
+        )
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=snapshot,
+        )
+        lease = mock.Mock(
+            spec=[
+                "assert_held",
+                "abandon",
+                "release",
+            ]
+        )
+        transaction_active = False
+
+        @contextlib.contextmanager
+        def transaction(
+            _protocol: providers.ClaudeRefreshLockProtocol,
+            **_coordination_options: object,
+        ):
+            nonlocal transaction_active
+            self.assertFalse(transaction_active)
+            transaction_active = True
+            try:
+                try:
+                    yield self.fake_claude_macos_coordination_result(
+                        lease,
+                        _coordination_options,
+                    )
+                except BaseException:
+                    self.claude_coordination_exits[id(lease)] = "exceptional"
+                    raise
+                else:
+                    self.claude_coordination_exits[id(lease)] = "normal"
+                    if not lease.abandon.called:
+                        lease.release()
+            finally:
+                self.assertTrue(transaction_active)
+                transaction_active = False
+
+        def select_credential(
+            _review: ReviewWorkspace,
+        ) -> providers._ClaudeLocalCredential:
+            self.assertTrue(
+                transaction_active,
+                "host refresh transaction must precede credential exposure",
+            )
+            return selected
+
+        @contextlib.contextmanager
+        def broker(
+            _credential: bytearray,
+            _capability: bytes,
+            **_kwargs: object,
+        ):
+            self.assertTrue(transaction_active)
+            yield 43211
+            self.assertTrue(transaction_active)
+
+        def snapshot_is_current(
+            _review: ReviewWorkspace,
+            observed: providers._ClaudeMacOSCarrierSnapshot,
+            _protocol: providers.ClaudeRefreshLockProtocol,
+            *,
+            coordinated_refresh_lock: providers.ClaudeRefreshLockLease | None = None,
+        ) -> bool:
+            self.assertTrue(transaction_active)
+            self.assertIs(observed, snapshot)
+            self.assertIs(coordinated_refresh_lock, lease)
+            return True
+
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+                side_effect=transaction,
+            ) as coordinate,
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                side_effect=select_credential,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_snapshot_is_current",
+                side_effect=snapshot_is_current,
+            ),
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+                process_started=lambda: False,
+            ):
+                self.assertTrue(transaction_active)
+
+        self.assertFalse(transaction_active)
+        coordinate.assert_called_once_with(
+            self.claude_refresh_lock_protocol,
+            require_explicit_context_release=True,
+        )
+        lease.abandon.assert_not_called()
+        self.assertEqual(self.claude_coordination_exits[id(lease)], "normal")
+        lease.release.assert_called_once_with()
+
+    def test_macos_carrier_coordination_selects_release_contract(
+        self,
+    ) -> None:
+        automatic_lease = mock.Mock(spec=["assert_held"])
+        explicit_lease = mock.Mock(spec=["assert_held"])
+        selected_contracts: list[str] = []
+
+        @contextlib.contextmanager
+        def automatic_refresh_lock_context(
+            _config_dir: pathlib.Path,
+            *,
+            protocol: providers.ClaudeRefreshLockProtocol,
+        ):
+            del protocol
+            selected_contracts.append("automatic")
+            yield automatic_lease
+
+        @contextlib.contextmanager
+        def release_on_success_context(
+            _config_dir: pathlib.Path,
+            *,
+            protocol: providers.ClaudeRefreshLockProtocol,
+        ):
+            del protocol
+            selected_contracts.append("release-on-success")
+            yield explicit_lease
+
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_credential_update_lock",
+                side_effect=lambda _name: contextlib.nullcontext(),
+            ),
+            mock.patch.object(
+                providers,
+                "claude_refresh_lock",
+                side_effect=automatic_refresh_lock_context,
+            ),
+            mock.patch.object(
+                providers,
+                "claude_refresh_lock_release_on_success",
+                side_effect=release_on_success_context,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_refresh_lock_config_directory",
+                return_value=pathlib.Path("/fixture/.claude"),
+            ),
+            mock.patch.object(providers, "block_forwarded_signals", return_value=set()),
+            mock.patch.object(providers, "restore_signal_mask"),
+        ):
+            with self.claude_macos_carrier_coordination(
+                self.claude_refresh_lock_protocol,
+            ) as observed:
+                self.assertIs(observed, automatic_lease)
+            with self.claude_macos_carrier_coordination(
+                self.claude_refresh_lock_protocol,
+                require_explicit_context_release=True,
+            ) as observed:
+                self.assertIs(observed, explicit_lease)
+
+        self.assertEqual(
+            selected_contracts,
+            ["automatic", "release-on-success"],
+        )
+
+    def test_keychain_runtime_rechecks_lock_after_credential_selection(
+        self,
+    ) -> None:
+        payload = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=payload,
+            expires_at_ms=0,
+            carrier_snapshot=providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(payload),
+                file_digest=None,
+                file_snapshot=None,
+            ),
+        )
+        lease = mock.Mock(spec=["assert_held"])
+        lease.assert_held.side_effect = (
+            claude_refresh_lock.ClaudeRefreshLockCompromised(
+                "fixture .claude directory retargeted during selection"
+            )
+        )
+
+        with (
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ) as select_credential,
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+            ) as broker,
+            self.assertRaises(claude_refresh_lock.ClaudeRefreshLockCompromised),
+        ):
+            with providers._claude_keychain_runtime_coordinated(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+                lease,
+                providers._ClaudeMacOSRefreshTransaction(),
+            ):
+                self.fail("retargeted credential unexpectedly reached runtime")
+
+        select_credential.assert_called_once_with(self.review)
+        lease.assert_held.assert_called_once_with()
+        broker.assert_not_called()
+        self.assertEqual(payload, bytearray(len(payload)))
+
+    def test_delayed_lock_error_keeps_coordination_translation_and_recovery(
+        self,
+    ) -> None:
+        credential = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        carrier = providers._retain_claude_macos_refreshed_credential(
+            self.review,
+            credential,
+        )
+        artifact = carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
+        retained_lock = "/fixture/.claude/.oauth_refresh.lock"
+        cases: tuple[
+            tuple[
+                str,
+                Callable[[], claude_refresh_lock.ClaudeRefreshLockError],
+                type[BaseException],
+            ],
+            ...,
+        ] = (
+            (
+                "stale",
+                lambda: claude_refresh_lock.ClaudeRefreshLockStale(
+                    "fixture stale refresh lock"
+                ),
+                providers.ClaudeCredentialStaleRefreshLock,
+            ),
+            (
+                "compromised",
+                lambda: claude_refresh_lock.ClaudeRefreshLockCompromised(
+                    "fixture refresh lock retargeted"
+                ),
+                providers.ClaudeCredentialInspectionInconclusive,
+            ),
+        )
+
+        @contextlib.contextmanager
+        def real_macos_coordination():
+            self.macos_coordination_patcher.stop()
+            try:
+                yield
+            finally:
+                self.macos_coordination_patcher.start()
+
+        for label, lock_error_factory, expected_type in cases:
+            with self.subTest(label=label):
+                lock_error = lock_error_factory()
+                setattr(
+                    lock_error,
+                    "_codex_claude_refresh_persistence_failed",
+                    True,
+                )
+                setattr(
+                    lock_error,
+                    "_codex_claude_retained_credential_carrier",
+                    str(carrier),
+                )
+                providers._mark_claude_macos_recovery_update_artifact(
+                    lock_error,
+                    artifact,
+                    expected_digest=(providers._claude_credential_digest(credential)),
+                )
+                setattr(
+                    lock_error,
+                    "_codex_claude_refresh_lock_paths",
+                    (retained_lock,),
+                )
+                lease = mock.Mock(spec=["assert_held", "abandon", "release"])
+                lease.assert_held.side_effect = (None, lock_error)
+                events: list[str] = []
+
+                def release() -> None:
+                    events.append("release")
+
+                lease.release.side_effect = release
+
+                @contextlib.contextmanager
+                def release_on_success_refresh_lock_context(
+                    _config_dir: pathlib.Path,
+                    *,
+                    protocol: providers.ClaudeRefreshLockProtocol,
+                ):
+                    del protocol
+                    events.append("acquire")
+                    try:
+                        yield lease
+                    except BaseException:
+                        events.append("exceptional-retain")
+                        raise
+                    else:
+                        lease.release()
+
+                @contextlib.contextmanager
+                def runtime(
+                    _review: ReviewWorkspace,
+                    _env: dict[str, str],
+                    _protocol: providers.ClaudeRefreshLockProtocol,
+                    coordinated_refresh_lock: providers.ClaudeRefreshLockLease,
+                    _transaction: providers._ClaudeMacOSRefreshTransaction,
+                ):
+                    yield {}
+                    events.append("second-assert")
+                    coordinated_refresh_lock.assert_held()
+
+                restore_count = 0
+
+                def restore_signals(
+                    _previous: set[signal.Signals] | None,
+                ) -> None:
+                    nonlocal restore_count
+                    restore_count += 1
+                    events.append(f"restore-{restore_count}")
+
+                with (
+                    real_macos_coordination(),
+                    mock.patch.object(
+                        providers,
+                        "_claude_credential_update_lock",
+                        side_effect=lambda _name: contextlib.nullcontext(),
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "claude_refresh_lock_release_on_success",
+                        side_effect=release_on_success_refresh_lock_context,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_claude_refresh_lock_config_directory",
+                        return_value=pathlib.Path("/fixture/.claude"),
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "block_forwarded_signals",
+                        return_value=set(),
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_consume_claude_macos_owned_pending_forwarded_signal",
+                        return_value=None,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "restore_signal_mask",
+                        side_effect=restore_signals,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_claude_keychain_runtime_coordinated",
+                        side_effect=runtime,
+                    ),
+                    self.assertRaises(expected_type) as raised,
+                ):
+                    with self.claude_keychain_runtime(
+                        self.review,
+                        {},
+                        self.claude_refresh_lock_protocol,
+                        process_started=lambda: False,
+                    ):
+                        pass
+
+                self.assertIs(type(raised.exception), expected_type)
+                self.assertIs(raised.exception.__cause__, lock_error)
+                self.assertIs(
+                    getattr(
+                        raised.exception,
+                        "_codex_claude_refresh_persistence_failed",
+                        False,
+                    ),
+                    True,
+                )
+                self.assertEqual(
+                    getattr(
+                        raised.exception,
+                        "_codex_claude_retained_credential_carrier",
+                        None,
+                    ),
+                    str(carrier),
+                )
+                self.assertEqual(
+                    providers._validated_claude_retained_credential_artifact(
+                        self.review,
+                        raised.exception,
+                    ),
+                    str(artifact),
+                )
+                self.assertEqual(
+                    getattr(
+                        raised.exception,
+                        "_codex_claude_refresh_lock_paths",
+                        None,
+                    ),
+                    (retained_lock,),
+                )
+                self.assertEqual(
+                    events,
+                    ["acquire", "restore-1", "second-assert", "release", "restore-2"],
+                )
+                lease.assert_held.assert_has_calls([mock.call(), mock.call()])
+                lease.abandon.assert_not_called()
+                lease.release.assert_called_once_with()
+
+        credential[:] = b"\x00" * len(credential)
+
+    def test_keychain_runtime_api_key_bypasses_refresh_transaction(self) -> None:
+        env = {"ANTHROPIC_API_KEY": "fixture-api-key", "PATH": "/usr/bin"}
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+            ) as coordinate,
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+            ) as select_credential,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                env,
+                None,
+                process_started=lambda: True,
+                process_quiescent=lambda: False,
+            ) as runtime_env:
+                self.assertEqual(runtime_env, env)
+
+        coordinate.assert_not_called()
+        select_credential.assert_not_called()
+
+    def test_keychain_runtime_pre_handoff_control_flow_retains_outer_lock(
+        self,
+    ) -> None:
+        credential = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        carrier = providers._retain_claude_macos_refreshed_credential(
+            self.review,
+            credential,
+        )
+        artifact = carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
+        retained_lock = "/fixture/.claude/.oauth_refresh.lock"
+        interruption_factories: tuple[tuple[str, Callable[[], BaseException]], ...] = (
+            (
+                "forwarded-signal",
+                lambda: providers.ForwardedSignal(signal.SIGTERM),
+            ),
+            (
+                "keyboard-interrupt",
+                lambda: KeyboardInterrupt("fixture pre-handoff terminal interrupt"),
+            ),
+        )
+
+        for interruption_name, interruption_factory in interruption_factories:
+            with self.subTest(interruption=interruption_name):
+                primary = providers.ClaudeCredentialInspectionInconclusive(
+                    "fixture inner persistence failure"
+                )
+                setattr(
+                    primary,
+                    "_codex_claude_refresh_persistence_failed",
+                    True,
+                )
+                setattr(
+                    primary,
+                    "_codex_claude_retained_credential_carrier",
+                    str(carrier),
+                )
+                providers._mark_claude_macos_recovery_update_artifact(
+                    primary,
+                    artifact,
+                    expected_digest=(providers._claude_credential_digest(credential)),
+                )
+                setattr(
+                    primary,
+                    "_codex_claude_retained_cleanup_artifact",
+                    str(carrier),
+                )
+                setattr(
+                    primary,
+                    "_codex_claude_refresh_lock_paths",
+                    (retained_lock,),
+                )
+                interruption = interruption_factory()
+                cleanup = claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                    "fixture explicit outer lease retained the lock"
+                )
+                setattr(
+                    cleanup,
+                    "_codex_claude_refresh_lock_paths",
+                    (retained_lock,),
+                )
+                lease = mock.Mock(
+                    spec=[
+                        "assert_held",
+                        "abandon",
+                        "release",
+                    ]
+                )
+                lease.abandon.return_value = cleanup
+                coordination_exits: list[str] = []
+
+                @contextlib.contextmanager
+                def retain_on_exception_refresh_lock_context(
+                    _config_dir: pathlib.Path,
+                    *,
+                    protocol: providers.ClaudeRefreshLockProtocol,
+                ):
+                    del protocol
+                    try:
+                        yield lease
+                    except BaseException as body_error:
+                        coordination_exits.append("exceptional")
+                        recovery = lease.abandon(
+                            "fixture exceptional exit retained the lock"
+                        )
+                        providers.attach_claude_refresh_lock_recovery(
+                            body_error,
+                            recovery,
+                        )
+                        raise
+                    else:
+                        coordination_exits.append("normal")
+
+                @contextlib.contextmanager
+                def runtime(*_args: object, **_kwargs: object):
+                    raise primary
+                    yield {}
+
+                def begin_handoff_failure(
+                    _review: ReviewWorkspace,
+                    _lease: providers.ClaudeRefreshLockLease,
+                    primary_error: BaseException | None,
+                    _handoff: providers._ClaudeMacOSTerminalHandoff,
+                ) -> providers._ClaudeMacOSTerminalHandoff:
+                    self.assertIs(primary_error, primary)
+                    raise interruption
+
+                with (
+                    mock.patch.object(
+                        providers,
+                        "_claude_macos_carrier_coordination",
+                        side_effect=self.claude_macos_carrier_coordination,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_claude_credential_update_lock",
+                        side_effect=lambda _name: contextlib.nullcontext(),
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "claude_refresh_lock_release_on_success",
+                        side_effect=retain_on_exception_refresh_lock_context,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_claude_refresh_lock_config_directory",
+                        return_value=pathlib.Path("/fixture/.claude"),
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "restore_signal_mask",
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_claude_keychain_runtime_coordinated",
+                        side_effect=runtime,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_begin_claude_macos_terminal_handoff",
+                        side_effect=begin_handoff_failure,
+                    ) as begin_handoff,
+                    mock.patch.object(
+                        providers,
+                        "_settle_claude_macos_refresh_transaction",
+                    ) as settle,
+                    mock.patch.object(
+                        providers,
+                        "_complete_claude_macos_terminal_handoff",
+                    ) as complete,
+                    self.assertRaises(type(interruption)) as raised,
+                ):
+                    with self.claude_keychain_runtime(
+                        self.review,
+                        {},
+                        self.claude_refresh_lock_protocol,
+                        process_started=lambda: True,
+                        process_quiescent=lambda: False,
+                    ):
+                        pass
+
+                self.assertIs(raised.exception, interruption)
+                self.assertIs(interruption.__context__, primary)
+                self.assertTrue(
+                    providers._claude_error_graph_contains(
+                        interruption,
+                        primary,
+                    )
+                )
+                begin_handoff.assert_called_once()
+                settle.assert_not_called()
+                complete.assert_not_called()
+                self.assertEqual(coordination_exits, ["exceptional"])
+                lease.abandon.assert_called_once_with(
+                    "fixture exceptional exit retained the lock"
+                )
+                lease.release.assert_not_called()
+                self.assertEqual(
+                    getattr(
+                        interruption,
+                        "_codex_claude_refresh_lock_paths",
+                        None,
+                    ),
+                    (retained_lock,),
+                )
+                self.assertIs(
+                    getattr(
+                        interruption,
+                        "_codex_claude_refresh_persistence_failed",
+                        False,
+                    ),
+                    True,
+                )
+                self.assertEqual(
+                    getattr(
+                        interruption,
+                        "_codex_claude_retained_credential_carrier",
+                        None,
+                    ),
+                    str(carrier),
+                )
+                self.assertEqual(
+                    providers._validated_claude_retained_credential_carrier(
+                        self.review,
+                        interruption,
+                    ),
+                    str(carrier),
+                )
+                self.assertEqual(
+                    providers._validated_claude_retained_credential_artifact(
+                        self.review,
+                        interruption,
+                    ),
+                    str(artifact),
+                )
+                self.assertEqual(
+                    getattr(
+                        interruption,
+                        "_codex_claude_retained_cleanup_artifact",
+                        None,
+                    ),
+                    str(carrier),
+                )
+                self.assertEqual(
+                    providers._validated_claude_retained_cleanup_artifact(
+                        self.review,
+                        interruption,
+                    ),
+                    str(carrier),
+                )
+                if isinstance(interruption, providers.ForwardedSignal):
+                    detail = interruption.detail or ""
+                    self.assertIn(str(carrier), detail)
+                    self.assertIn(str(artifact), detail)
+
+        credential[:] = b"\x00" * len(credential)
+
+    def test_keychain_runtime_store_before_save_control_flow_recovers_context(
+        self,
+    ) -> None:
+        credential = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        carrier = providers._retain_claude_macos_refreshed_credential(
+            self.review,
+            credential,
+        )
+        artifact = carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
+        retained_lock = "/fixture/.claude/.oauth_refresh.lock"
+        generator = self.claude_keychain_runtime_impl.__wrapped__
+        instructions = tuple(dis.get_instructions(generator))
+        injection_sites: tuple[tuple[str, str, Callable[[], BaseException]], ...] = (
+            (
+                "terminal-error-store",
+                "error",
+                lambda: providers.ForwardedSignal(signal.SIGTERM),
+            ),
+            (
+                "pre-handoff-error-store",
+                "terminal_error",
+                lambda: KeyboardInterrupt("fixture pre-handoff save interrupt"),
+            ),
+        )
+
+        for site_name, source_name, interruption_factory in injection_sites:
+            with self.subTest(site=site_name):
+                matching_offsets = [
+                    instruction.offset
+                    for index, instruction in enumerate(instructions)
+                    if instruction.opname == "STORE_FAST"
+                    and instruction.argval
+                    == (
+                        "terminal_error"
+                        if site_name == "terminal-error-store"
+                        else "pre_handoff_error"
+                    )
+                    and index > 0
+                    and instructions[index - 1].opname == "LOAD_FAST"
+                    and instructions[index - 1].argval == source_name
+                ]
+                self.assertEqual(len(matching_offsets), 1)
+                target_offset = matching_offsets[0]
+                primary = providers.ClaudeCredentialInspectionInconclusive(
+                    "fixture inner persistence failure"
+                )
+                setattr(
+                    primary,
+                    "_codex_claude_refresh_persistence_failed",
+                    True,
+                )
+                setattr(
+                    primary,
+                    "_codex_claude_retained_credential_carrier",
+                    str(carrier),
+                )
+                providers._mark_claude_macos_recovery_update_artifact(
+                    primary,
+                    artifact,
+                    expected_digest=(providers._claude_credential_digest(credential)),
+                )
+                setattr(
+                    primary,
+                    "_codex_claude_retained_cleanup_artifact",
+                    str(carrier),
+                )
+                setattr(
+                    primary,
+                    "_codex_claude_refresh_lock_paths",
+                    (retained_lock,),
+                )
+                interruption = interruption_factory()
+                cleanup = claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                    "fixture explicit outer lease retained the lock"
+                )
+                setattr(
+                    cleanup,
+                    "_codex_claude_refresh_lock_paths",
+                    (retained_lock,),
+                )
+                lease = mock.Mock(
+                    spec=[
+                        "assert_held",
+                        "abandon",
+                        "release",
+                    ]
+                )
+                lease.abandon.return_value = cleanup
+                coordination_exits: list[str] = []
+
+                @contextlib.contextmanager
+                def retain_on_exception_refresh_lock_context(
+                    _config_dir: pathlib.Path,
+                    *,
+                    protocol: providers.ClaudeRefreshLockProtocol,
+                ):
+                    del protocol
+                    try:
+                        yield lease
+                    except BaseException as body_error:
+                        coordination_exits.append("exceptional")
+                        recovery = lease.abandon(
+                            "fixture exceptional exit retained the lock"
+                        )
+                        providers.attach_claude_refresh_lock_recovery(
+                            body_error,
+                            recovery,
+                        )
+                        raise
+                    else:
+                        coordination_exits.append("normal")
+                        lease.release()
+
+                @contextlib.contextmanager
+                def runtime(*_args: object, **_kwargs: object):
+                    raise primary
+                    yield {}
+
+                injected = False
+
+                def interrupt_before_store(
+                    frame: object,
+                    event: str,
+                    _argument: object,
+                ) -> object:
+                    nonlocal injected
+                    if getattr(frame, "f_code", None) is not generator.__code__:
+                        return interrupt_before_store
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        raise interruption
+                    return interrupt_before_store
+
+                try:
+                    with (
+                        mock.patch.object(
+                            providers,
+                            "_claude_macos_carrier_coordination",
+                            side_effect=self.claude_macos_carrier_coordination,
+                        ),
+                        mock.patch.object(
+                            providers,
+                            "_claude_credential_update_lock",
+                            side_effect=lambda _name: contextlib.nullcontext(),
+                        ),
+                        mock.patch.object(
+                            providers,
+                            "claude_refresh_lock_release_on_success",
+                            side_effect=(retain_on_exception_refresh_lock_context),
+                        ),
+                        mock.patch.object(
+                            providers,
+                            "_claude_refresh_lock_config_directory",
+                            return_value=pathlib.Path("/fixture/.claude"),
+                        ),
+                        mock.patch.object(
+                            providers,
+                            "block_forwarded_signals",
+                            return_value=set(),
+                        ),
+                        mock.patch.object(providers, "restore_signal_mask"),
+                        mock.patch.object(
+                            providers,
+                            "_claude_keychain_runtime_coordinated",
+                            side_effect=runtime,
+                        ),
+                        mock.patch.object(
+                            providers,
+                            "_begin_claude_macos_terminal_handoff",
+                        ) as begin_handoff,
+                        mock.patch.object(
+                            providers,
+                            "_settle_claude_macos_refresh_transaction",
+                        ) as settle,
+                        mock.patch.object(
+                            providers,
+                            "_complete_claude_macos_terminal_handoff",
+                        ) as complete,
+                        self.assertRaises(type(interruption)) as raised,
+                    ):
+                        sys.settrace(interrupt_before_store)
+                        with self.claude_keychain_runtime(
+                            self.review,
+                            {},
+                            self.claude_refresh_lock_protocol,
+                            process_started=lambda: True,
+                            process_quiescent=lambda: False,
+                        ):
+                            pass
+                finally:
+                    sys.settrace(None)
+
+                self.assertTrue(injected)
+                self.assertIs(raised.exception, interruption)
+                if isinstance(
+                    interruption,
+                    providers.ForwardedSignal,
+                ) or callable(getattr(interruption, "add_note", None)):
+                    self.assertIsNone(interruption.__cause__)
+                else:
+                    self.assertIsInstance(
+                        interruption.__cause__,
+                        claude_refresh_lock.ClaudeRefreshLockCleanupDiagnostic,
+                    )
+                self.assertIs(interruption.__context__, primary)
+                self.assert_exception_visible_exact_or_rendered(
+                    interruption,
+                    primary,
+                )
+                begin_handoff.assert_not_called()
+                settle.assert_not_called()
+                complete.assert_not_called()
+                self.assertEqual(coordination_exits, ["exceptional"])
+                lease.abandon.assert_called_once_with(
+                    "fixture exceptional exit retained the lock"
+                )
+                lease.release.assert_not_called()
+                self.assertEqual(
+                    getattr(
+                        interruption,
+                        "_codex_claude_refresh_lock_paths",
+                        None,
+                    ),
+                    (retained_lock,),
+                )
+                self.assertIs(
+                    getattr(
+                        interruption,
+                        "_codex_claude_refresh_persistence_failed",
+                        False,
+                    ),
+                    True,
+                )
+                self.assertEqual(
+                    getattr(
+                        interruption,
+                        "_codex_claude_retained_credential_carrier",
+                        None,
+                    ),
+                    str(carrier),
+                )
+                self.assertEqual(
+                    providers._validated_claude_retained_credential_carrier(
+                        self.review,
+                        interruption,
+                    ),
+                    str(carrier),
+                )
+                self.assertEqual(
+                    providers._validated_claude_retained_credential_artifact(
+                        self.review,
+                        interruption,
+                    ),
+                    str(artifact),
+                )
+                self.assertEqual(
+                    getattr(
+                        interruption,
+                        "_codex_claude_retained_cleanup_artifact",
+                        None,
+                    ),
+                    str(carrier),
+                )
+                self.assertEqual(
+                    providers._validated_claude_retained_cleanup_artifact(
+                        self.review,
+                        interruption,
+                    ),
+                    str(carrier),
+                )
+                if isinstance(interruption, providers.ForwardedSignal):
+                    detail = interruption.detail or ""
+                    self.assertIn(str(carrier), detail)
+                    self.assertIn(str(artifact), detail)
+                    self.assertIn(
+                        providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC,
+                        detail,
+                    )
+
+        credential[:] = b"\x00" * len(credential)
+
+    def test_keychain_runtime_terminal_handoff_abandons_before_control_flow(
+        self,
+    ) -> None:
+        retained_lock = pathlib.Path("/fixture/.claude/.oauth_refresh.lock")
+        interruption_factories: tuple[tuple[str, Callable[[], BaseException]], ...] = (
+            (
+                "forwarded-signal",
+                lambda: providers.ForwardedSignal(signal.SIGTERM),
+            ),
+            (
+                "keyboard-interrupt",
+                lambda: KeyboardInterrupt("fixture terminal handoff interrupt"),
+            ),
+        )
+
+        for runtime_path in ("exception", "normal"):
+            for injection_site in ("accessor", "handoff"):
+                for interruption_name, interruption_factory in interruption_factories:
+                    with self.subTest(
+                        runtime_path=runtime_path,
+                        injection_site=injection_site,
+                        interruption=interruption_name,
+                    ):
+                        interruption = interruption_factory()
+                        primary = providers.ReviewTimeoutError(
+                            "fixture runtime primary"
+                        )
+                        cleanup_error = (
+                            claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                                "fixture terminal handoff retained the lock"
+                            )
+                        )
+                        setattr(
+                            cleanup_error,
+                            "_codex_claude_refresh_lock_paths",
+                            (str(retained_lock),),
+                        )
+                        lease = mock.Mock(
+                            spec=[
+                                "assert_held",
+                                "abandon",
+                                "release",
+                            ]
+                        )
+                        events: list[str] = []
+
+                        def abandon(reason: str) -> BaseException:
+                            events.append("abandon")
+                            return cleanup_error
+
+                        lease.abandon.side_effect = abandon
+                        prior_mask: set[signal.Signals] = set()
+
+                        def block_signals(
+                            *,
+                            signal_mask_owner: (
+                                providers._ClaudeMacOSTerminalHandoff | None
+                            ) = None,
+                        ) -> set[signal.Signals]:
+                            if signal_mask_owner is not None:
+                                signal_mask_owner.publish_previous_signal_mask(
+                                    prior_mask
+                                )
+                            events.append("signals-blocked")
+                            return prior_mask
+
+                        def restore_signals(
+                            observed: set[signal.Signals] | None,
+                        ) -> None:
+                            self.assertIs(observed, prior_mask)
+                            if injection_site == "handoff":
+                                self.assertEqual(
+                                    getattr(
+                                        interruption,
+                                        ("_codex_claude_refresh_lock_paths"),
+                                        None,
+                                    ),
+                                    (str(retained_lock),),
+                                )
+                            events.append("mask-restored")
+
+                        def consume_pending_signal(
+                            _previous: set[signal.Signals] | None,
+                        ) -> signal.Signals | None:
+                            events.append("pending-consumed")
+                            if injection_site != "handoff":
+                                return None
+                            raise interruption
+
+                        @contextlib.contextmanager
+                        def transaction(
+                            _protocol: providers.ClaudeRefreshLockProtocol,
+                            **_coordination_options: object,
+                        ):
+                            try:
+                                yield self.fake_claude_macos_coordination_result(
+                                    lease,
+                                    _coordination_options,
+                                )
+                            finally:
+                                events.append("coordination-exit")
+                                if not lease.abandon.called:
+                                    events.append("release")
+                                    lease.release()
+
+                        @contextlib.contextmanager
+                        def runtime(*_args: object, **_kwargs: object):
+                            if runtime_path == "exception":
+                                raise primary
+                            yield {}
+
+                        def process_started() -> bool:
+                            events.append("terminal-state")
+                            if injection_site == "accessor":
+                                raise interruption
+                            return True
+
+                        def process_quiescent() -> bool:
+                            return False
+
+                        with (
+                            mock.patch.object(
+                                providers,
+                                "_claude_macos_carrier_coordination",
+                                side_effect=transaction,
+                            ),
+                            mock.patch.object(
+                                providers,
+                                "_claude_keychain_runtime_coordinated",
+                                side_effect=runtime,
+                            ),
+                            mock.patch.object(
+                                providers,
+                                "block_forwarded_signals",
+                                side_effect=block_signals,
+                            ),
+                            mock.patch.object(
+                                providers,
+                                (
+                                    "_consume_claude_macos_owned_pending_"
+                                    "forwarded_signal"
+                                ),
+                                side_effect=consume_pending_signal,
+                            ),
+                            mock.patch.object(
+                                providers,
+                                "restore_signal_mask",
+                                side_effect=restore_signals,
+                            ),
+                            self.assertRaises(type(interruption)) as raised,
+                        ):
+                            with self.claude_keychain_runtime(
+                                self.review,
+                                {},
+                                self.claude_refresh_lock_protocol,
+                                process_started=process_started,
+                                process_quiescent=process_quiescent,
+                            ):
+                                pass
+
+                        self.assertIs(raised.exception, interruption)
+                        expected_reason = (
+                            "Claude refresh transaction terminal state could "
+                            "not be inspected"
+                            if injection_site == "accessor"
+                            else "reviewer process quiescence was not proven"
+                        )
+                        lease.abandon.assert_called_once_with(expected_reason)
+                        lease.release.assert_not_called()
+                        self.assertEqual(
+                            getattr(
+                                raised.exception,
+                                "_codex_claude_refresh_lock_paths",
+                                None,
+                            ),
+                            (str(retained_lock),),
+                        )
+                        if isinstance(
+                            raised.exception,
+                            providers.ForwardedSignal,
+                        ):
+                            self.assertIn(
+                                str(retained_lock),
+                                raised.exception.detail or "",
+                            )
+                        self.assertLess(
+                            events.index("signals-blocked"),
+                            events.index("terminal-state"),
+                        )
+                        self.assertLess(
+                            events.index("terminal-state"),
+                            events.index("abandon"),
+                        )
+                        self.assertLess(
+                            events.index("abandon"),
+                            events.index("pending-consumed"),
+                        )
+                        self.assertLess(
+                            events.index("pending-consumed"),
+                            events.index("mask-restored"),
+                        )
+                        self.assertLess(
+                            events.index("coordination-exit"),
+                            events.index("mask-restored"),
+                        )
+                        self.assertNotIn("release", events)
+
+    def test_keychain_runtime_begin_handoff_call_result_is_preowned(
+        self,
+    ) -> None:
+        generator = self.claude_keychain_runtime_impl.__wrapped__
+        instructions = tuple(dis.get_instructions(generator))
+        injection_sites: list[tuple[int, int]] = []
+        for index, instruction in enumerate(instructions[:-1]):
+            if not instruction.opname.startswith("CALL"):
+                continue
+            if not any(
+                candidate.opname == "LOAD_GLOBAL"
+                and candidate.argval == "_begin_claude_macos_terminal_handoff"
+                for candidate in instructions[max(0, index - 12) : index]
+            ):
+                continue
+            result_instruction = instructions[index + 1]
+            if (
+                result_instruction.opname == "STORE_FAST"
+                and result_instruction.argval == "handoff"
+            ) or result_instruction.opname == "POP_TOP":
+                source_line = next(
+                    line
+                    for candidate in reversed(
+                        instructions[max(0, index - 12) : index + 1]
+                    )
+                    if (
+                        line := (
+                            getattr(
+                                getattr(candidate, "positions", None),
+                                "lineno",
+                                None,
+                            )
+                            or (
+                                candidate.starts_line
+                                if isinstance(candidate.starts_line, int)
+                                and not isinstance(
+                                    candidate.starts_line,
+                                    bool,
+                                )
+                                else None
+                            )
+                        )
+                    )
+                    is not None
+                )
+                injection_sites.append((result_instruction.offset, source_line))
+
+        self.assertEqual(len(injection_sites), 2, injection_sites)
+        exception_call_line = min(line for _offset, line in injection_sites)
+        prior_mask: set[signal.Signals] = set()
+        retained_lock = "/fixture/.claude/.oauth_refresh.lock"
+
+        for target_offset, source_line in injection_sites:
+            with self.subTest(
+                target_offset=target_offset,
+                source_line=source_line,
+            ):
+                interruption = RuntimeError(
+                    "fixture CALL-to-handoff-publication interruption"
+                )
+                cleanup = claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                    "fixture opcode interruption retained the lock"
+                )
+                setattr(
+                    cleanup,
+                    "_codex_claude_refresh_lock_paths",
+                    (retained_lock,),
+                )
+                lease = mock.Mock(spec=["assert_held", "abandon", "release"])
+                lease.abandon.return_value = cleanup
+
+                @contextlib.contextmanager
+                def transaction(
+                    _protocol: providers.ClaudeRefreshLockProtocol,
+                    **_coordination_options: object,
+                ):
+                    try:
+                        yield self.fake_claude_macos_coordination_result(
+                            lease,
+                            _coordination_options,
+                        )
+                    except BaseException as body_error:
+                        recovery = lease.abandon(
+                            "fixture exceptional exit retained the lock"
+                        )
+                        providers.attach_claude_refresh_lock_recovery(
+                            body_error,
+                            recovery,
+                        )
+                        raise
+                    else:
+                        lease.release()
+
+                @contextlib.contextmanager
+                def runtime(*_args: object, **_kwargs: object):
+                    if source_line == exception_call_line:
+                        raise providers.ReviewTimeoutError(
+                            "fixture body failure before handoff"
+                        )
+                    yield {}
+
+                injected = False
+
+                def interrupt_after_call(
+                    frame: object,
+                    event: str,
+                    _argument: object,
+                ) -> object:
+                    nonlocal injected
+                    if getattr(frame, "f_code", None) is not generator.__code__:
+                        return interrupt_after_call
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        raise interruption
+                    return interrupt_after_call
+
+                try:
+                    with (
+                        mock.patch.object(
+                            providers,
+                            "_claude_macos_carrier_coordination",
+                            side_effect=transaction,
+                        ),
+                        mock.patch.object(
+                            providers,
+                            "_claude_keychain_runtime_coordinated",
+                            side_effect=runtime,
+                        ),
+                        mock.patch.object(
+                            providers,
+                            "block_forwarded_signals",
+                            return_value=prior_mask,
+                        ),
+                        mock.patch.object(
+                            providers,
+                            ("_consume_claude_macos_owned_pending_forwarded_signal"),
+                            return_value=signal.SIGTERM,
+                        ) as consume_pending,
+                        mock.patch.object(
+                            providers,
+                            "restore_signal_mask",
+                        ) as restore_mask,
+                        self.assertRaises(providers.ForwardedSignal) as raised,
+                    ):
+                        sys.settrace(interrupt_after_call)
+                        with self.claude_keychain_runtime(
+                            self.review,
+                            {},
+                            self.claude_refresh_lock_protocol,
+                            process_started=lambda: False,
+                        ):
+                            pass
+                finally:
+                    sys.settrace(None)
+
+                self.assertTrue(injected)
+                self.assertEqual(raised.exception.signum, signal.SIGTERM)
+                consume_pending.assert_called_once_with(prior_mask)
+                restore_mask.assert_called_once_with(prior_mask)
+                lease.abandon.assert_called_once_with(
+                    "fixture exceptional exit retained the lock"
+                )
+                lease.release.assert_not_called()
+
+    def test_keychain_runtime_block_result_is_prepublished_to_handoff(
+        self,
+    ) -> None:
+        prior_mask: set[signal.Signals] = set()
+        retained_lock = "/fixture/.claude/.oauth_refresh.lock"
+        injection_cases = (
+            (
+                "begin-block-result",
+                providers._begin_claude_macos_terminal_handoff,
+                "block_forwarded_signals",
+                "previous_signal_mask",
+            ),
+            (
+                "block-acquisition-result",
+                providers.block_forwarded_signals,
+                "_acquire_claude_forwarded_signal_mask",
+                "acquisition",
+            ),
+        )
+
+        for label, traced_function, called_name, stored_name in injection_cases:
+            with self.subTest(label=label):
+                instructions = tuple(dis.get_instructions(traced_function))
+                matching_offsets = [
+                    instruction.offset
+                    for index, instruction in enumerate(instructions)
+                    if instruction.opname == "STORE_FAST"
+                    and instruction.argval == stored_name
+                    and index > 0
+                    and instructions[index - 1].opname.startswith("CALL")
+                    and any(
+                        candidate.opname == "LOAD_GLOBAL"
+                        and candidate.argval == called_name
+                        for candidate in instructions[max(0, index - 12) : index]
+                    )
+                ]
+                self.assertEqual(len(matching_offsets), 1)
+                target_offset = matching_offsets[0]
+                interruption = RuntimeError(f"fixture {label} opcode interruption")
+                cleanup = claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                    "fixture internal block interruption retained lock"
+                )
+                setattr(
+                    cleanup,
+                    "_codex_claude_refresh_lock_paths",
+                    (retained_lock,),
+                )
+                lease = mock.Mock(spec=["assert_held", "abandon", "release"])
+                lease.abandon.return_value = cleanup
+
+                @contextlib.contextmanager
+                def transaction(
+                    _protocol: providers.ClaudeRefreshLockProtocol,
+                    **_coordination_options: object,
+                ):
+                    try:
+                        yield self.fake_claude_macos_coordination_result(
+                            lease,
+                            _coordination_options,
+                        )
+                    except BaseException as body_error:
+                        if not lease.abandon.called:
+                            recovery = lease.abandon(
+                                "fixture exceptional exit retained the lock"
+                            )
+                            providers.attach_claude_refresh_lock_recovery(
+                                body_error,
+                                recovery,
+                            )
+                        raise
+                    else:
+                        lease.release()
+
+                @contextlib.contextmanager
+                def runtime(*_args: object, **_kwargs: object):
+                    yield {}
+
+                def block_signals(
+                    *,
+                    signal_mask_owner: (
+                        providers._ClaudeMacOSTerminalHandoff | None
+                    ) = None,
+                ) -> set[signal.Signals]:
+                    assert signal_mask_owner is not None
+                    signal_mask_owner.publish_previous_signal_mask(prior_mask)
+                    return prior_mask
+
+                def acquire_signals(
+                    *,
+                    main_thread_only: bool,
+                    signal_mask_owner: (
+                        providers._ClaudeMacOSTerminalHandoff | None
+                    ) = None,
+                ) -> providers._ClaudeSignalMaskAcquisition:
+                    self.assertIs(main_thread_only, True)
+                    assert signal_mask_owner is not None
+                    signal_mask_owner.publish_previous_signal_mask(prior_mask)
+                    return providers._ClaudeSignalMaskAcquisition(
+                        previous_mask=prior_mask,
+                        error=None,
+                    )
+
+                injected = False
+
+                def interrupt_result_store(
+                    frame: object,
+                    event: str,
+                    _argument: object,
+                ) -> object:
+                    nonlocal injected
+                    if getattr(frame, "f_code", None) is not traced_function.__code__:
+                        return interrupt_result_store
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        raise interruption
+                    return interrupt_result_store
+
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(
+                        mock.patch.object(
+                            providers,
+                            "_claude_macos_carrier_coordination",
+                            side_effect=transaction,
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            providers,
+                            "_claude_keychain_runtime_coordinated",
+                            side_effect=runtime,
+                        )
+                    )
+                    if label == "begin-block-result":
+                        stack.enter_context(
+                            mock.patch.object(
+                                providers,
+                                "block_forwarded_signals",
+                                side_effect=block_signals,
+                            )
+                        )
+                    else:
+                        stack.enter_context(
+                            mock.patch.object(
+                                providers,
+                                "_acquire_claude_forwarded_signal_mask",
+                                side_effect=acquire_signals,
+                            )
+                        )
+                    consume_pending = stack.enter_context(
+                        mock.patch.object(
+                            providers,
+                            ("_consume_claude_macos_owned_pending_forwarded_signal"),
+                            return_value=signal.SIGTERM,
+                        )
+                    )
+                    restore_mask = stack.enter_context(
+                        mock.patch.object(
+                            providers,
+                            "restore_signal_mask",
+                        )
+                    )
+                    raised = stack.enter_context(
+                        self.assertRaises(providers.ForwardedSignal)
+                    )
+                    try:
+                        sys.settrace(interrupt_result_store)
+                        with self.claude_keychain_runtime(
+                            self.review,
+                            {},
+                            self.claude_refresh_lock_protocol,
+                            process_started=lambda: False,
+                        ):
+                            pass
+                    finally:
+                        sys.settrace(None)
+
+                self.assertTrue(injected)
+                self.assertEqual(raised.exception.signum, signal.SIGTERM)
+                consume_pending.assert_called_once_with(prior_mask)
+                restore_mask.assert_called_once_with(prior_mask)
+                lease.abandon.assert_called_once_with(
+                    "Claude refresh transaction terminal signal handoff "
+                    "could not be established"
+                )
+                lease.release.assert_not_called()
+
+    def test_keychain_runtime_mask_publication_callback_transfers_owner(
+        self,
+    ) -> None:
+        publisher = getattr(
+            providers._ClaudeMacOSTerminalHandoff,
+            "publish_previous_signal_mask",
+            None,
+        )
+        if publisher is None:
+            publisher_codes = [
+                constant
+                for constant in (
+                    providers._begin_claude_macos_terminal_handoff.__code__.co_consts
+                )
+                if getattr(constant, "co_name", None) == "<lambda>"
+            ]
+            self.assertEqual(len(publisher_codes), 1)
+            publisher_code = publisher_codes[0]
+            publisher_instructions = tuple(dis.get_instructions(publisher_code))
+            matching_offsets = [
+                instruction.offset
+                for index, instruction in enumerate(publisher_instructions)
+                if instruction.opname == "RETURN_VALUE"
+                and index > 0
+                and publisher_instructions[index - 1].opname.startswith("CALL")
+            ]
+        else:
+            publisher_code = publisher.__code__
+            publisher_instructions = tuple(dis.get_instructions(publisher_code))
+            matching_offsets = [
+                publisher_instructions[index + 1].offset
+                for index, instruction in enumerate(publisher_instructions[:-1])
+                if instruction.opname == "STORE_ATTR"
+                and instruction.argval == "signal_mask_owner_state"
+            ]
+        self.assertEqual(len(matching_offsets), 1)
+        target_offset = matching_offsets[0]
+
+        current_mask: set[signal.Signals] = set()
+        forwarded = set(providers.forwarded_signals())
+        prior_mask: set[signal.Signals] = set()
+        retained_lock = "/fixture/.claude/.oauth_refresh.lock"
+        events: list[str] = []
+        pending_observed_blocked: list[bool] = []
+        interruption = RuntimeError("fixture publication callback return interruption")
+        cleanup = claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+            "fixture publication interruption retained the lock"
+        )
+        setattr(
+            cleanup,
+            "_codex_claude_refresh_lock_paths",
+            (retained_lock,),
+        )
+        lease = mock.Mock(spec=["assert_held", "abandon", "release"])
+
+        def abandon(reason: str) -> BaseException:
+            events.append("abandon")
+            return cleanup
+
+        lease.abandon.side_effect = abandon
+
+        @contextlib.contextmanager
+        def transaction(
+            _protocol: providers.ClaudeRefreshLockProtocol,
+            **_coordination_options: object,
+        ):
+            try:
+                yield self.fake_claude_macos_coordination_result(
+                    lease,
+                    _coordination_options,
+                )
+            except BaseException:
+                if not lease.abandon.called:
+                    lease.abandon("fixture exceptional exit retained the lock")
+                raise
+            else:
+                lease.release()
+
+        @contextlib.contextmanager
+        def runtime(*_args: object, **_kwargs: object):
+            yield {}
+
+        def pthread_sigmask(
+            operation: int,
+            signals: set[signal.Signals] | tuple[signal.Signals, ...],
+        ) -> set[signal.Signals]:
+            nonlocal current_mask
+            previous = set(current_mask)
+            if operation == signal.SIG_BLOCK:
+                if signals:
+                    events.append("signals-blocked")
+                    current_mask.update(signals)
+                else:
+                    events.append("mask-queried")
+            elif operation == signal.SIG_SETMASK:
+                events.append("acquisition-rollback")
+                current_mask = set(signals)
+            else:  # pragma: no cover - fixed helper operations only
+                self.fail(f"unexpected pthread_sigmask operation: {operation}")
+            return previous
+
+        def consume_pending_signal(
+            previous: set[signal.Signals] | None,
+        ) -> signal.Signals:
+            self.assertEqual(previous, prior_mask)
+            pending_observed_blocked.append(forwarded.issubset(current_mask))
+            events.append("pending-consumed")
+            return signal.SIGTERM
+
+        def restore_signals(
+            previous: set[signal.Signals] | None,
+        ) -> None:
+            nonlocal current_mask
+            self.assertEqual(previous, prior_mask)
+            events.append("outer-restored")
+            current_mask = set(previous)
+
+        injected = False
+
+        def interrupt_after_publication(
+            frame: object,
+            event: str,
+            _argument: object,
+        ) -> object:
+            nonlocal injected
+            if getattr(frame, "f_code", None) is not publisher_code:
+                return interrupt_after_publication
+            setattr(frame, "f_trace_opcodes", True)
+            if (
+                not injected
+                and event == "opcode"
+                and getattr(frame, "f_lasti", None) == target_offset
+            ):
+                injected = True
+                raise interruption
+            return interrupt_after_publication
+
+        try:
+            with (
+                mock.patch.object(
+                    providers,
+                    "_claude_macos_carrier_coordination",
+                    side_effect=transaction,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_claude_keychain_runtime_coordinated",
+                    side_effect=runtime,
+                ),
+                mock.patch.object(
+                    providers.signal,
+                    "pthread_sigmask",
+                    side_effect=pthread_sigmask,
+                    create=True,
+                ),
+                mock.patch.object(
+                    providers,
+                    ("_consume_claude_macos_owned_pending_forwarded_signal"),
+                    side_effect=consume_pending_signal,
+                ),
+                mock.patch.object(
+                    providers,
+                    "restore_signal_mask",
+                    side_effect=restore_signals,
+                ),
+                self.assertRaises(providers.ForwardedSignal) as raised,
+            ):
+                sys.settrace(interrupt_after_publication)
+                with self.claude_keychain_runtime(
+                    self.review,
+                    {},
+                    self.claude_refresh_lock_protocol,
+                    process_started=lambda: False,
+                ):
+                    pass
+        finally:
+            sys.settrace(None)
+
+        self.assertTrue(injected)
+        self.assertEqual(raised.exception.signum, signal.SIGTERM)
+        self.assertEqual(pending_observed_blocked, [True])
+        self.assertNotIn("acquisition-rollback", events)
+        self.assertLess(events.index("signals-blocked"), events.index("abandon"))
+        self.assertLess(events.index("abandon"), events.index("pending-consumed"))
+        self.assertLess(
+            events.index("pending-consumed"), events.index("outer-restored")
+        )
+        self.assertEqual(current_mask, prior_mask)
+        lease.abandon.assert_called_once_with(
+            "Claude refresh transaction terminal signal handoff could not "
+            "be established"
+        )
+        lease.release.assert_not_called()
+
+    def test_keychain_runtime_mask_publication_before_commit_rolls_back(
+        self,
+    ) -> None:
+        publisher = providers._ClaudeMacOSTerminalHandoff.publish_previous_signal_mask
+        publisher_instructions = tuple(dis.get_instructions(publisher))
+        matching_offsets = [
+            publisher_instructions[index + 1].offset
+            for index, instruction in enumerate(publisher_instructions[:-1])
+            if instruction.opname == "STORE_ATTR"
+            and instruction.argval == "previous_signal_mask"
+        ]
+        self.assertEqual(len(matching_offsets), 1)
+        target_offset = matching_offsets[0]
+
+        current_mask: set[signal.Signals] = set()
+        prior_mask: set[signal.Signals] = set()
+        interruption = RuntimeError("fixture publication pre-commit interruption")
+        cleanup = claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+            "fixture pre-commit interruption retained the lock"
+        )
+        lease = mock.Mock(spec=["assert_held", "abandon", "release"])
+        lease.abandon.return_value = cleanup
+        events: list[str] = []
+
+        @contextlib.contextmanager
+        def transaction(
+            _protocol: providers.ClaudeRefreshLockProtocol,
+            **_coordination_options: object,
+        ):
+            try:
+                yield self.fake_claude_macos_coordination_result(
+                    lease,
+                    _coordination_options,
+                )
+            except BaseException:
+                raise
+            else:
+                lease.release()
+
+        @contextlib.contextmanager
+        def runtime(*_args: object, **_kwargs: object):
+            yield {}
+
+        def pthread_sigmask(
+            operation: int,
+            signals: set[signal.Signals] | tuple[signal.Signals, ...],
+        ) -> set[signal.Signals]:
+            nonlocal current_mask
+            previous = set(current_mask)
+            if operation == signal.SIG_BLOCK:
+                current_mask.update(signals)
+            elif operation == signal.SIG_SETMASK:
+                events.append("acquisition-rollback")
+                current_mask = set(signals)
+            else:  # pragma: no cover - fixed helper operations only
+                self.fail(f"unexpected pthread_sigmask operation: {operation}")
+            return previous
+
+        injected = False
+
+        def interrupt_before_publication_commit(
+            frame: object,
+            event: str,
+            _argument: object,
+        ) -> object:
+            nonlocal injected
+            if getattr(frame, "f_code", None) is not publisher.__code__:
+                return interrupt_before_publication_commit
+            setattr(frame, "f_trace_opcodes", True)
+            if (
+                not injected
+                and event == "opcode"
+                and getattr(frame, "f_lasti", None) == target_offset
+            ):
+                injected = True
+                raise interruption
+            return interrupt_before_publication_commit
+
+        try:
+            with (
+                mock.patch.object(
+                    providers,
+                    "_claude_macos_carrier_coordination",
+                    side_effect=transaction,
+                ),
+                mock.patch.object(
+                    providers,
+                    "_claude_keychain_runtime_coordinated",
+                    side_effect=runtime,
+                ),
+                mock.patch.object(
+                    providers.signal,
+                    "pthread_sigmask",
+                    side_effect=pthread_sigmask,
+                    create=True,
+                ),
+                mock.patch.object(
+                    providers,
+                    ("_consume_claude_macos_owned_pending_forwarded_signal"),
+                ) as consume_pending,
+                mock.patch.object(
+                    providers,
+                    "restore_signal_mask",
+                ) as restore_mask,
+                self.assertRaises(RuntimeError) as raised,
+            ):
+                sys.settrace(interrupt_before_publication_commit)
+                with self.claude_keychain_runtime(
+                    self.review,
+                    {},
+                    self.claude_refresh_lock_protocol,
+                    process_started=lambda: False,
+                ):
+                    pass
+        finally:
+            sys.settrace(None)
+
+        self.assertTrue(injected)
+        self.assertIs(raised.exception, interruption)
+        self.assertEqual(events, ["acquisition-rollback"])
+        self.assertEqual(current_mask, prior_mask)
+        consume_pending.assert_not_called()
+        restore_mask.assert_not_called()
+        lease.abandon.assert_called_once_with(
+            "Claude refresh transaction terminal signal handoff could not "
+            "be established"
+        )
+        lease.release.assert_not_called()
+
+    def test_keychain_runtime_mask_acquisition_failure_abandons_fail_closed(
+        self,
+    ) -> None:
+        failure_factories: tuple[tuple[str, Callable[[], BaseException]], ...] = (
+            (
+                "ordinary",
+                lambda: OSError("fixture mask acquisition failure"),
+            ),
+            (
+                "forwarded-signal",
+                lambda: providers.ForwardedSignal(signal.SIGTERM),
+            ),
+            (
+                "keyboard-interrupt",
+                lambda: KeyboardInterrupt("fixture mask acquisition interrupt"),
+            ),
+        )
+        runtime_factories: tuple[
+            tuple[str, Callable[[], BaseException | None]], ...
+        ] = (
+            (
+                "ordinary-exception",
+                lambda: providers.ReviewTimeoutError("fixture runtime primary"),
+            ),
+            (
+                "forwarded-exception",
+                lambda: providers.ForwardedSignal(signal.SIGTERM),
+            ),
+            (
+                "keyboard-exception",
+                lambda: KeyboardInterrupt("fixture runtime interrupt"),
+            ),
+            ("normal", lambda: None),
+        )
+        retained_lock = "/fixture/.claude/.oauth_refresh.lock"
+
+        for runtime_path, runtime_factory in runtime_factories:
+            for failure_name, failure_factory in failure_factories:
+                with self.subTest(
+                    runtime_path=runtime_path,
+                    failure=failure_name,
+                ):
+                    mask_error = failure_factory()
+                    body_error = runtime_factory()
+                    expected = (
+                        body_error
+                        if body_error is not None
+                        and (
+                            providers._is_claude_control_flow_error(body_error)
+                            or not providers._is_claude_control_flow_error(mask_error)
+                        )
+                        else mask_error
+                    )
+                    assert expected is not None
+                    cleanup_error = (
+                        claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                            "fixture mask failure retained the lock"
+                        )
+                    )
+                    setattr(
+                        cleanup_error,
+                        "_codex_claude_refresh_lock_paths",
+                        (retained_lock,),
+                    )
+                    lease = mock.Mock(
+                        spec=[
+                            "assert_held",
+                            "abandon",
+                            "release",
+                        ]
+                    )
+                    lease.abandon.return_value = cleanup_error
+                    process_started = mock.Mock(return_value=True)
+
+                    @contextlib.contextmanager
+                    def transaction(
+                        _protocol: providers.ClaudeRefreshLockProtocol,
+                        **_coordination_options: object,
+                    ):
+                        try:
+                            yield self.fake_claude_macos_coordination_result(
+                                lease,
+                                _coordination_options,
+                            )
+                        finally:
+                            if not lease.abandon.called:
+                                lease.release()
+
+                    @contextlib.contextmanager
+                    def runtime(*_args: object, **_kwargs: object):
+                        if body_error is not None:
+                            raise body_error
+                        yield {}
+
+                    with (
+                        mock.patch.object(
+                            providers,
+                            "_claude_macos_carrier_coordination",
+                            side_effect=transaction,
+                        ),
+                        mock.patch.object(
+                            providers,
+                            "_claude_keychain_runtime_coordinated",
+                            side_effect=runtime,
+                        ),
+                        mock.patch.object(
+                            providers,
+                            "block_forwarded_signals",
+                            side_effect=mask_error,
+                        ),
+                        self.assertRaises(type(expected)) as raised,
+                    ):
+                        with self.claude_keychain_runtime(
+                            self.review,
+                            {},
+                            self.claude_refresh_lock_protocol,
+                            process_started=process_started,
+                        ):
+                            pass
+
+                    self.assertIs(raised.exception, expected)
+                    process_started.assert_not_called()
+                    lease.abandon.assert_called_once_with(
+                        "Claude refresh transaction terminal signal handoff "
+                        "could not be established"
+                    )
+                    lease.release.assert_not_called()
+                    self.assertEqual(
+                        getattr(
+                            raised.exception,
+                            "_codex_claude_refresh_lock_paths",
+                            None,
+                        ),
+                        (retained_lock,),
+                    )
+
+    def test_keychain_runtime_terminal_inspection_preserves_primary_priority(
+        self,
+    ) -> None:
+        cases: tuple[
+            tuple[
+                str,
+                BaseException | None,
+                BaseException,
+                str,
+                str,
+            ],
+            ...,
+        ] = (
+            (
+                "ordinary-body-ordinary-inspection",
+                providers.ReviewTimeoutError("fixture body timeout"),
+                OSError("fixture generation inspection failure"),
+                "generation",
+                "body",
+            ),
+            (
+                "forwarded-body-ordinary-inspection",
+                providers.ForwardedSignal(signal.SIGTERM),
+                OSError("fixture generation inspection failure"),
+                "generation",
+                "body",
+            ),
+            (
+                "forwarded-body-keyboard-inspection",
+                providers.ForwardedSignal(signal.SIGTERM),
+                KeyboardInterrupt("fixture accessor interrupt"),
+                "accessor",
+                "body",
+            ),
+            (
+                "keyboard-body-forwarded-inspection",
+                KeyboardInterrupt("fixture body interrupt"),
+                providers.ForwardedSignal(signal.SIGTERM),
+                "accessor",
+                "body",
+            ),
+            (
+                "ordinary-body-forwarded-inspection",
+                providers.ReviewTimeoutError("fixture body timeout"),
+                providers.ForwardedSignal(signal.SIGTERM),
+                "accessor",
+                "inspection",
+            ),
+            (
+                "normal-ordinary-inspection",
+                None,
+                OSError("fixture generation inspection failure"),
+                "generation",
+                "inspection",
+            ),
+        )
+        retained_lock = "/fixture/.claude/.oauth_refresh.lock"
+
+        for label, body_error, inspection_error, site, expected in cases:
+            with self.subTest(label=label):
+                cleanup_error = (
+                    claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                        "fixture terminal inspection retained the lock"
+                    )
+                )
+                setattr(
+                    cleanup_error,
+                    "_codex_claude_refresh_lock_paths",
+                    (retained_lock,),
+                )
+                lease = mock.Mock(
+                    spec=[
+                        "assert_held",
+                        "abandon",
+                        "release",
+                    ]
+                )
+                lease.abandon.return_value = cleanup_error
+
+                @contextlib.contextmanager
+                def transaction(
+                    _protocol: providers.ClaudeRefreshLockProtocol,
+                    **_coordination_options: object,
+                ):
+                    try:
+                        yield self.fake_claude_macos_coordination_result(
+                            lease,
+                            _coordination_options,
+                        )
+                    finally:
+                        if not lease.abandon.called:
+                            lease.release()
+
+                @contextlib.contextmanager
+                def runtime(*_args: object, **_kwargs: object):
+                    if body_error is not None:
+                        raise body_error
+                    yield {}
+
+                def process_started() -> bool:
+                    if site == "accessor":
+                        raise inspection_error
+                    return False
+
+                generation_patch = (
+                    mock.patch.object(
+                        providers._ClaudeMacOSRefreshTransaction,
+                        "refresh_generations",
+                        side_effect=inspection_error,
+                    )
+                    if site == "generation"
+                    else contextlib.nullcontext()
+                )
+                selected = body_error if expected == "body" else inspection_error
+                assert selected is not None
+
+                with (
+                    mock.patch.object(
+                        providers,
+                        "_claude_macos_carrier_coordination",
+                        side_effect=transaction,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_claude_keychain_runtime_coordinated",
+                        side_effect=runtime,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "block_forwarded_signals",
+                        return_value=set(),
+                    ),
+                    mock.patch.object(
+                        providers,
+                        ("_consume_claude_macos_owned_pending_forwarded_signal"),
+                        return_value=None,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "restore_signal_mask",
+                    ),
+                    generation_patch,
+                    self.assertRaises(type(selected)) as raised,
+                ):
+                    with self.claude_keychain_runtime(
+                        self.review,
+                        {},
+                        self.claude_refresh_lock_protocol,
+                        process_started=process_started,
+                    ):
+                        pass
+
+                self.assertIs(raised.exception, selected)
+                lease.abandon.assert_called_once_with(
+                    "Claude refresh transaction terminal state could not be inspected"
+                )
+                lease.release.assert_not_called()
+                self.assertEqual(
+                    getattr(
+                        raised.exception,
+                        "_codex_claude_refresh_lock_paths",
+                        None,
+                    ),
+                    (retained_lock,),
+                )
+
+    def test_keychain_runtime_safe_terminal_state_releases_after_handoff(
+        self,
+    ) -> None:
+        lease = mock.Mock(
+            spec=[
+                "assert_held",
+                "abandon",
+                "release",
+            ]
+        )
+        prior_mask = {signal.SIGINT}
+        events: list[str] = []
+
+        @contextlib.contextmanager
+        def transaction(
+            _protocol: providers.ClaudeRefreshLockProtocol,
+            **_coordination_options: object,
+        ):
+            try:
+                yield self.fake_claude_macos_coordination_result(
+                    lease,
+                    _coordination_options,
+                )
+            except BaseException:
+                events.append("coordination-exceptional-exit")
+                raise
+            else:
+                events.append("coordination-normal-exit")
+                events.append("release")
+                lease.release()
+
+        @contextlib.contextmanager
+        def runtime(*_args: object, **_kwargs: object):
+            yield {}
+
+        def process_started() -> bool:
+            events.append("terminal-state-safe")
+            return False
+
+        def block_signals(
+            *,
+            signal_mask_owner: (providers._ClaudeMacOSTerminalHandoff | None) = None,
+        ) -> set[signal.Signals]:
+            if signal_mask_owner is not None:
+                signal_mask_owner.publish_previous_signal_mask(prior_mask)
+            events.append("signals-blocked")
+            return prior_mask
+
+        def restore_signals(
+            observed: set[signal.Signals] | None,
+        ) -> None:
+            self.assertIs(observed, prior_mask)
+            events.append("mask-restored")
+
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+                side_effect=transaction,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_runtime_coordinated",
+                side_effect=runtime,
+            ),
+            mock.patch.object(
+                providers,
+                "block_forwarded_signals",
+                side_effect=block_signals,
+            ),
+            mock.patch.object(
+                providers,
+                ("_consume_claude_macos_owned_pending_forwarded_signal"),
+                return_value=None,
+            ) as consume_pending,
+            mock.patch.object(
+                providers,
+                "restore_signal_mask",
+                side_effect=restore_signals,
+            ),
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+                process_started=process_started,
+            ):
+                pass
+
+        lease.abandon.assert_not_called()
+        lease.release.assert_called_once_with()
+        consume_pending.assert_called_once_with(prior_mask)
+        self.assertEqual(
+            events,
+            [
+                "signals-blocked",
+                "terminal-state-safe",
+                "coordination-normal-exit",
+                "release",
+                "mask-restored",
+            ],
+        )
+
+    def test_keychain_runtime_safe_exception_commits_before_handoff_complete(
+        self,
+    ) -> None:
+        primary = providers.ReviewTimeoutError("fixture safe runtime failure")
+        lease = mock.Mock(
+            spec=[
+                "assert_held",
+                "abandon",
+                "release",
+            ]
+        )
+        prior_mask = {signal.SIGINT}
+        events: list[str] = []
+
+        @contextlib.contextmanager
+        def transaction(
+            _protocol: providers.ClaudeRefreshLockProtocol,
+            **_coordination_options: object,
+        ):
+            try:
+                yield self.fake_claude_macos_coordination_result(
+                    lease,
+                    _coordination_options,
+                )
+            except BaseException:
+                events.append("coordination-exceptional-exit")
+                raise
+            else:
+                events.append("coordination-normal-exit")
+                events.append("release")
+                lease.release()
+
+        @contextlib.contextmanager
+        def runtime(*_args: object, **_kwargs: object):
+            raise primary
+            yield {}
+
+        def process_started() -> bool:
+            events.append("terminal-state-safe")
+            return False
+
+        def block_signals(
+            *,
+            signal_mask_owner: (providers._ClaudeMacOSTerminalHandoff | None) = None,
+        ) -> set[signal.Signals]:
+            if signal_mask_owner is not None:
+                signal_mask_owner.publish_previous_signal_mask(prior_mask)
+            events.append("signals-blocked")
+            return prior_mask
+
+        def restore_signals(
+            observed: set[signal.Signals] | None,
+        ) -> None:
+            self.assertIs(observed, prior_mask)
+            events.append("mask-restored")
+
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+                side_effect=transaction,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_runtime_coordinated",
+                side_effect=runtime,
+            ),
+            mock.patch.object(
+                providers,
+                "block_forwarded_signals",
+                side_effect=block_signals,
+            ),
+            mock.patch.object(
+                providers,
+                "_consume_claude_macos_owned_pending_forwarded_signal",
+                return_value=None,
+            ),
+            mock.patch.object(
+                providers,
+                "restore_signal_mask",
+                side_effect=restore_signals,
+            ),
+            self.assertRaises(providers.ReviewTimeoutError) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+                process_started=process_started,
+            ):
+                pass
+
+        self.assertIs(raised.exception, primary)
+        lease.abandon.assert_not_called()
+        lease.release.assert_called_once_with()
+        self.assertEqual(
+            events,
+            [
+                "signals-blocked",
+                "terminal-state-safe",
+                "coordination-normal-exit",
+                "release",
+                "mask-restored",
+            ],
+        )
+
+    def test_started_zero_update_snapshot_mark_permits_release_commit(
+        self,
+    ) -> None:
+        lease = mock.Mock(
+            spec=[
+                "assert_held",
+                "abandon",
+                "release",
+            ]
+        )
+        events: list[str] = []
+
+        @contextlib.contextmanager
+        def transaction(
+            _protocol: providers.ClaudeRefreshLockProtocol,
+            **_coordination_options: object,
+        ):
+            try:
+                yield self.fake_claude_macos_coordination_result(
+                    lease,
+                    _coordination_options,
+                )
+            except BaseException:
+                events.append("coordination-exceptional-exit")
+                raise
+            else:
+                events.append("coordination-normal-exit")
+                events.append("release")
+                lease.release()
+
+        @contextlib.contextmanager
+        def runtime(
+            _review: ReviewWorkspace,
+            _env: dict[str, str],
+            _protocol: providers.ClaudeRefreshLockProtocol,
+            _lease: providers.ClaudeRefreshLockLease,
+            refresh_transaction: providers._ClaudeMacOSRefreshTransaction,
+        ):
+            self.assertEqual(refresh_transaction.refresh_generations(), (0, 0))
+            refresh_transaction.mark_final_carrier_snapshot_verified()
+            events.append("generation-zero-snapshot-verified")
+            yield {}
+
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+                side_effect=transaction,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_runtime_coordinated",
+                side_effect=runtime,
+            ),
+            mock.patch.object(
+                providers,
+                "block_forwarded_signals",
+                return_value=set(),
+            ),
+            mock.patch.object(
+                providers,
+                "_consume_claude_macos_owned_pending_forwarded_signal",
+                return_value=None,
+            ),
+            mock.patch.object(providers, "restore_signal_mask"),
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+                process_started=lambda: True,
+                process_quiescent=lambda: True,
+            ):
+                pass
+
+        lease.abandon.assert_not_called()
+        lease.release.assert_called_once_with()
+        self.assertLess(
+            events.index("generation-zero-snapshot-verified"),
+            events.index("coordination-normal-exit"),
+        )
+
+    def test_release_on_success_control_flow_keeps_priority_and_recovery(
+        self,
+    ) -> None:
+        interruption_factories: tuple[tuple[str, Callable[[], BaseException]], ...] = (
+            (
+                "forwarded-signal",
+                lambda: providers.ForwardedSignal(signal.SIGTERM),
+            ),
+            (
+                "keyboard-interrupt",
+                lambda: KeyboardInterrupt("fixture release-on-success interrupt"),
+            ),
+        )
+
+        for label, interruption_factory in interruption_factories:
+            with self.subTest(label=label):
+                primary = providers.ReviewTimeoutError(
+                    "fixture safe terminal runtime failure"
+                )
+                interruption = interruption_factory()
+                retained_lock = pathlib.Path(
+                    f"/fixture/{label}/.claude/.oauth_refresh.lock"
+                )
+                cleanup = claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                    "fixture interrupted safe release retained the lock"
+                )
+                setattr(
+                    cleanup,
+                    "_codex_claude_refresh_lock_paths",
+                    (str(retained_lock),),
+                )
+                lease = mock.Mock(spec=["assert_held", "abandon", "release"])
+                events: list[str] = []
+
+                def abandon(reason: str) -> BaseException:
+                    events.append(f"abandon:{reason}")
+                    return cleanup
+
+                lease.abandon.side_effect = abandon
+
+                @contextlib.contextmanager
+                def transaction(
+                    _protocol: providers.ClaudeRefreshLockProtocol,
+                    **_coordination_options: object,
+                ):
+                    try:
+                        yield self.fake_claude_macos_coordination_result(
+                            lease,
+                            _coordination_options,
+                        )
+                    except BaseException:
+                        events.append("coordination-exceptional-exit")
+                        raise
+                    else:
+                        events.append("coordination-normal-exit")
+                        events.append("release-on-success")
+                        recovery = lease.abandon("release-on-success was interrupted")
+                        providers.attach_claude_refresh_lock_recovery(
+                            interruption,
+                            recovery,
+                        )
+                        raise interruption
+
+                @contextlib.contextmanager
+                def runtime(*_args: object, **_kwargs: object):
+                    raise primary
+                    yield {}
+
+                def restore_signals(
+                    _previous: set[signal.Signals] | None,
+                ) -> None:
+                    events.append("mask-restored")
+
+                with (
+                    mock.patch.object(
+                        providers,
+                        "_claude_macos_carrier_coordination",
+                        side_effect=transaction,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_claude_keychain_runtime_coordinated",
+                        side_effect=runtime,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "block_forwarded_signals",
+                        return_value=set(),
+                    ),
+                    mock.patch.object(
+                        providers,
+                        ("_consume_claude_macos_owned_pending_forwarded_signal"),
+                        return_value=None,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "restore_signal_mask",
+                        side_effect=restore_signals,
+                    ),
+                    self.assertRaises(type(interruption)) as raised,
+                ):
+                    with self.claude_keychain_runtime(
+                        self.review,
+                        {},
+                        self.claude_refresh_lock_protocol,
+                        process_started=lambda: False,
+                    ):
+                        pass
+
+                self.assertIs(raised.exception, interruption)
+                notes = getattr(interruption, "__notes__", ())
+                self.assertTrue(
+                    any("cleanup failure" in note for note in notes)
+                    or interruption.__cause__ is not None
+                    or interruption.__context__ is not None
+                )
+                lease.abandon.assert_called_once_with(
+                    "release-on-success was interrupted"
+                )
+                lease.release.assert_not_called()
+                self.assertEqual(
+                    getattr(
+                        interruption,
+                        "_codex_claude_refresh_lock_paths",
+                        None,
+                    ),
+                    (str(retained_lock),),
+                )
+                if isinstance(interruption, providers.ForwardedSignal):
+                    self.assertIn(
+                        str(retained_lock),
+                        interruption.detail or "",
+                    )
+                self.assertLess(
+                    events.index("release-on-success"),
+                    events.index("abandon:release-on-success was interrupted"),
+                )
+                self.assertLess(
+                    events.index("abandon:release-on-success was interrupted"),
+                    events.index("mask-restored"),
+                )
+
+    def test_release_failure_preserves_primary_control_flow_and_recovery(
+        self,
+    ) -> None:
+        primary = providers.ForwardedSignal(signal.SIGINT)
+        retained_lock = "/fixture/.claude/.oauth_refresh.lock"
+        release_error = providers.ClaudeCredentialInspectionInconclusive(
+            "fixture release-on-success cleanup failed"
+        )
+        setattr(
+            release_error,
+            "_codex_claude_refresh_lock_paths",
+            (retained_lock,),
+        )
+        lease = mock.Mock(spec=["assert_held", "abandon", "release"])
+        events: list[str] = []
+
+        @contextlib.contextmanager
+        def transaction(
+            _protocol: providers.ClaudeRefreshLockProtocol,
+            **_coordination_options: object,
+        ):
+            del _coordination_options
+            try:
+                yield lease
+            except BaseException:
+                events.append("coordination-exceptional-exit")
+                raise
+            else:
+                events.append("coordination-normal-exit")
+                events.append("release-failed")
+                raise release_error
+
+        @contextlib.contextmanager
+        def runtime(*_args: object, **_kwargs: object):
+            raise primary
+            yield {}
+
+        def restore_signals(
+            _previous: set[signal.Signals] | None,
+        ) -> None:
+            events.append("mask-restored")
+
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+                side_effect=transaction,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_runtime_coordinated",
+                side_effect=runtime,
+            ),
+            mock.patch.object(
+                providers,
+                "block_forwarded_signals",
+                return_value=set(),
+            ),
+            mock.patch.object(
+                providers,
+                "_consume_claude_macos_owned_pending_forwarded_signal",
+                return_value=None,
+            ),
+            mock.patch.object(
+                providers,
+                "restore_signal_mask",
+                side_effect=restore_signals,
+            ),
+            self.assertRaises(providers.ForwardedSignal) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+                process_started=lambda: False,
+            ):
+                pass
+
+        self.assertIs(raised.exception, primary)
+        self.assertEqual(
+            getattr(primary, "_codex_claude_refresh_lock_paths", None),
+            (retained_lock,),
+        )
+        self.assertIn(retained_lock, primary.detail or "")
+        lease.abandon.assert_not_called()
+        lease.release.assert_not_called()
+        self.assertEqual(
+            events,
+            [
+                "coordination-normal-exit",
+                "release-failed",
+                "mask-restored",
+            ],
+        )
+
+    def test_keychain_runtime_missing_process_start_proof_does_not_commit(
+        self,
+    ) -> None:
+        cleanup = claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+            "fixture missing process-start proof retained the lock"
+        )
+        lease = mock.Mock(
+            spec=[
+                "assert_held",
+                "abandon",
+                "release",
+            ]
+        )
+        lease.abandon.return_value = cleanup
+
+        @contextlib.contextmanager
+        def transaction(
+            _protocol: providers.ClaudeRefreshLockProtocol,
+            **_coordination_options: object,
+        ):
+            try:
+                yield self.fake_claude_macos_coordination_result(
+                    lease,
+                    _coordination_options,
+                )
+            finally:
+                if not lease.abandon.called:
+                    lease.release()
+
+        @contextlib.contextmanager
+        def runtime(*_args: object, **_kwargs: object):
+            yield {}
+
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+                side_effect=transaction,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_runtime_coordinated",
+                side_effect=runtime,
+            ),
+            mock.patch.object(
+                providers,
+                "block_forwarded_signals",
+                return_value=set(),
+            ),
+            mock.patch.object(
+                providers,
+                "_consume_claude_macos_owned_pending_forwarded_signal",
+                return_value=None,
+            ),
+            mock.patch.object(providers, "restore_signal_mask"),
+            self.assertRaisesRegex(
+                providers.ClaudeCredentialInspectionInconclusive,
+                "safe terminal state",
+            ),
+        ):
+            with self.claude_keychain_runtime_impl(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                pass
+
+        lease.abandon.assert_called_once_with(
+            "reviewer process-start state was not tracked"
+        )
+        lease.release.assert_not_called()
+
+    def test_keychain_runtime_failed_initial_lock_proof_does_not_commit(
+        self,
+    ) -> None:
+        compromised = claude_refresh_lock.ClaudeRefreshLockCompromised(
+            "fixture initial lock proof failed"
+        )
+        lease = mock.Mock(
+            spec=[
+                "assert_held",
+                "abandon",
+                "release",
+            ]
+        )
+        lease.assert_held.side_effect = compromised
+
+        @contextlib.contextmanager
+        def transaction(
+            _protocol: providers.ClaudeRefreshLockProtocol,
+            **_coordination_options: object,
+        ):
+            try:
+                yield self.fake_claude_macos_coordination_result(
+                    lease,
+                    _coordination_options,
+                )
+            except BaseException:
+                lease.abandon("fixture terminal release was not committed")
+                raise
+
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+                side_effect=transaction,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_runtime_coordinated",
+            ) as runtime,
+            self.assertRaises(
+                claude_refresh_lock.ClaudeRefreshLockCompromised
+            ) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+                process_started=lambda: False,
+            ):
+                pass
+
+        self.assertIs(raised.exception, compromised)
+        runtime.assert_not_called()
+        lease.abandon.assert_called_once_with(
+            "fixture terminal release was not committed"
+        )
+        lease.release.assert_not_called()
+
+    def test_macos_terminal_handoff_consumes_only_owned_pending_signals(
+        self,
+    ) -> None:
+        forwarded = set(providers.forwarded_signals())
+        self.assertIn(signal.SIGINT, forwarded)
+        self.assertIn(signal.SIGTERM, forwarded)
+        optional = sorted(
+            forwarded - {signal.SIGINT, signal.SIGTERM},
+            key=int,
+        )
+        cases: list[
+            tuple[
+                str,
+                set[signal.Signals],
+                set[signal.Signals],
+                list[signal.Signals],
+                signal.Signals | None,
+            ]
+        ] = [
+            (
+                "outer-int-owned-term",
+                {signal.SIGINT},
+                {signal.SIGINT, signal.SIGTERM},
+                [signal.SIGTERM],
+                signal.SIGTERM,
+            ),
+            (
+                "outer-term-owned-int",
+                {signal.SIGTERM},
+                {signal.SIGINT, signal.SIGTERM},
+                [signal.SIGINT],
+                signal.SIGINT,
+            ),
+            (
+                "outer-owns-all",
+                forwarded,
+                forwarded,
+                [],
+                None,
+            ),
+        ]
+        if optional:
+            first_optional = optional[0]
+            cases.append(
+                (
+                    "multiple-owned-pending",
+                    {signal.SIGTERM},
+                    {signal.SIGTERM, signal.SIGINT, first_optional},
+                    sorted(
+                        {signal.SIGINT, first_optional},
+                        key=int,
+                    ),
+                    min(signal.SIGINT, first_optional, key=int),
+                )
+            )
+
+        for label, previous, pending, consumed, expected in cases:
+            with self.subTest(label=label):
+                observed_waits: list[signal.Signals] = []
+
+                def sigwait(candidates: set[signal.Signals]) -> int:
+                    self.assertEqual(len(candidates), 1)
+                    observed = next(iter(candidates))
+                    observed_waits.append(observed)
+                    return int(observed)
+
+                with (
+                    mock.patch.object(
+                        providers.signal,
+                        "sigpending",
+                        return_value=pending,
+                    ),
+                    mock.patch.object(
+                        providers.signal,
+                        "sigwait",
+                        side_effect=sigwait,
+                    ),
+                ):
+                    result = (
+                        providers._consume_claude_macos_owned_pending_forwarded_signal(
+                            previous
+                        )
+                    )
+
+                self.assertEqual(result, expected)
+                self.assertEqual(observed_waits, consumed)
+                self.assertTrue(previous.intersection(pending))
+                self.assertTrue(
+                    previous.intersection(pending).isdisjoint(observed_waits)
+                )
+
+    def test_macos_terminal_handoff_retries_mask_restore_and_keeps_first_error(
+        self,
+    ) -> None:
+        prior_mask = {signal.SIGINT}
+        first_restore_error = providers.ForwardedSignal(signal.SIGTERM)
+        handoff = providers._ClaudeMacOSTerminalHandoff()
+        handoff.publish_previous_signal_mask(prior_mask)
+
+        with (
+            mock.patch.object(
+                providers,
+                "_consume_claude_macos_owned_pending_forwarded_signal",
+                return_value=None,
+            ),
+            mock.patch.object(
+                providers,
+                "_bind_claude_macos_terminal_handoff_recovery",
+                return_value=[],
+            ),
+            mock.patch.object(
+                providers,
+                "restore_signal_mask",
+                side_effect=(first_restore_error, None),
+            ) as restore,
+            self.assertRaises(providers.ForwardedSignal) as raised,
+        ):
+            providers._complete_claude_macos_terminal_handoff(
+                self.review,
+                handoff,
+                None,
+            )
+
+        self.assertIs(raised.exception, first_restore_error)
+        self.assertEqual(
+            restore.call_args_list,
+            [mock.call(prior_mask), mock.call(prior_mask)],
+        )
+        self.assertFalse(handoff.signal_mask_owner_active)
+        self.assertIs(
+            handoff.signal_mask_owner_state,
+            providers._ClaudeSignalMaskOwnerState.RESTORE_ATTEMPTED,
+        )
+
+    def test_begin_handoff_control_flow_inherits_saved_persistence_state(
+        self,
+    ) -> None:
+        credential = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        carrier = providers._retain_claude_macos_refreshed_credential(
+            self.review,
+            credential,
+        )
+        artifact = carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
+        retained_lock = "/fixture/.claude/.oauth_refresh.lock"
+        winner_factories: tuple[tuple[str, Callable[[], BaseException]], ...] = (
+            (
+                "forwarded-signal",
+                lambda: providers.ForwardedSignal(signal.SIGTERM),
+            ),
+            (
+                "keyboard-interrupt",
+                lambda: KeyboardInterrupt("fixture begin handoff interrupt"),
+            ),
+        )
+
+        for label, winner_factory in winner_factories:
+            with self.subTest(label=label):
+                body_error = providers.ReviewTimeoutError(
+                    "fixture persistence-marked body"
+                )
+                setattr(
+                    body_error,
+                    "_codex_claude_refresh_persistence_failed",
+                    True,
+                )
+                setattr(
+                    body_error,
+                    "_codex_claude_retained_credential_carrier",
+                    str(carrier),
+                )
+                providers._mark_claude_macos_recovery_update_artifact(
+                    body_error,
+                    artifact,
+                    expected_digest=(providers._claude_credential_digest(credential)),
+                )
+                setattr(
+                    body_error,
+                    "_codex_claude_retained_cleanup_artifact",
+                    str(carrier),
+                )
+                setattr(
+                    body_error,
+                    "_codex_claude_refresh_lock_paths",
+                    (retained_lock,),
+                )
+                winner = winner_factory()
+                lease = mock.Mock(spec=["assert_held", "abandon", "release"])
+                exits: list[str] = []
+
+                @contextlib.contextmanager
+                def transaction(
+                    _protocol: providers.ClaudeRefreshLockProtocol,
+                    **coordination_options: object,
+                ):
+                    self.assertIs(
+                        coordination_options.get("require_explicit_context_release"),
+                        True,
+                    )
+                    try:
+                        yield lease
+                    except BaseException:
+                        exits.append("exceptional-retain")
+                        raise
+                    else:
+                        exits.append("normal-release")
+                        lease.release()
+
+                @contextlib.contextmanager
+                def runtime(*_args: object, **_kwargs: object):
+                    raise body_error
+                    yield {}  # pragma: no cover
+
+                def begin(*_args: object, **_kwargs: object):
+                    raise winner
+
+                with (
+                    mock.patch.object(
+                        providers,
+                        "_claude_macos_carrier_coordination",
+                        side_effect=transaction,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_claude_keychain_runtime_coordinated",
+                        side_effect=runtime,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_begin_claude_macos_terminal_handoff",
+                        side_effect=begin,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_settle_claude_macos_refresh_transaction",
+                    ) as settle,
+                    mock.patch.object(
+                        providers,
+                        "_complete_claude_macos_terminal_handoff",
+                    ) as complete,
+                    self.assertRaises(type(winner)) as raised,
+                ):
+                    with self.claude_keychain_runtime(
+                        self.review,
+                        {},
+                        self.claude_refresh_lock_protocol,
+                        process_started=lambda: True,
+                        process_quiescent=lambda: False,
+                    ):
+                        pass
+
+                self.assertIs(raised.exception, winner)
+                self.assertIs(winner.__context__, body_error)
+                self.assertIs(
+                    getattr(
+                        winner,
+                        "_codex_claude_refresh_persistence_failed",
+                        False,
+                    ),
+                    True,
+                )
+                self.assertEqual(
+                    getattr(
+                        winner,
+                        "_codex_claude_retained_credential_carrier",
+                        None,
+                    ),
+                    str(carrier),
+                )
+                self.assertEqual(
+                    providers._validated_claude_retained_credential_artifact(
+                        self.review,
+                        winner,
+                    ),
+                    str(artifact),
+                )
+                self.assertEqual(
+                    getattr(
+                        winner,
+                        "_codex_claude_retained_cleanup_artifact",
+                        None,
+                    ),
+                    str(carrier),
+                )
+                self.assertEqual(
+                    getattr(
+                        winner,
+                        "_codex_claude_refresh_lock_paths",
+                        None,
+                    ),
+                    (retained_lock,),
+                )
+                if isinstance(winner, providers.ForwardedSignal):
+                    detail = winner.detail or ""
+                    self.assertIn(str(carrier), detail)
+                    self.assertIn(str(artifact), detail)
+                    self.assertIn(retained_lock, detail)
+                self.assertEqual(exits, ["exceptional-retain"])
+                settle.assert_not_called()
+                complete.assert_not_called()
+                lease.abandon.assert_not_called()
+                lease.release.assert_not_called()
+
+        credential[:] = b"\x00" * len(credential)
+
+    def test_keychain_handoff_propagates_validated_persistence_to_control_flow(
+        self,
+    ) -> None:
+        credential = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        carrier = providers._retain_claude_macos_refreshed_credential(
+            self.review,
+            credential,
+        )
+        artifact = carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
+        retained_lock = "/fixture/.claude/.oauth_refresh.lock"
+        winner_factories: tuple[tuple[str, Callable[[], BaseException]], ...] = (
+            (
+                "forwarded-signal",
+                lambda: providers.ForwardedSignal(signal.SIGTERM),
+            ),
+            (
+                "keyboard-interrupt",
+                lambda: KeyboardInterrupt("fixture handoff interrupt"),
+            ),
+        )
+
+        for stage in ("mask", "pending", "restore"):
+            for winner_name, winner_factory in winner_factories:
+                with self.subTest(stage=stage, winner=winner_name):
+                    body_error = providers.ReviewTimeoutError(
+                        "fixture persistence-marked body"
+                    )
+                    setattr(
+                        body_error,
+                        "_codex_claude_refresh_persistence_failed",
+                        True,
+                    )
+                    setattr(
+                        body_error,
+                        "_codex_claude_retained_credential_carrier",
+                        str(carrier),
+                    )
+                    providers._mark_claude_macos_recovery_update_artifact(
+                        body_error,
+                        artifact,
+                        expected_digest=(
+                            providers._claude_credential_digest(credential)
+                        ),
+                    )
+                    setattr(
+                        body_error,
+                        "_codex_claude_retained_cleanup_artifact",
+                        str(carrier),
+                    )
+                    winner = winner_factory()
+                    lock_cleanup = (
+                        claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                            "fixture persistence handoff retained the lock"
+                        )
+                    )
+                    setattr(
+                        lock_cleanup,
+                        "_codex_claude_refresh_lock_paths",
+                        (retained_lock,),
+                    )
+                    lease = mock.Mock(spec=["assert_held", "abandon", "release"])
+                    lease.abandon.return_value = lock_cleanup
+
+                    @contextlib.contextmanager
+                    def transaction(
+                        _protocol: providers.ClaudeRefreshLockProtocol,
+                        **_coordination_options: object,
+                    ):
+                        try:
+                            yield self.fake_claude_macos_coordination_result(
+                                lease,
+                                _coordination_options,
+                            )
+                        finally:
+                            if not lease.abandon.called:
+                                lease.release()
+
+                    @contextlib.contextmanager
+                    def runtime(*_args: object, **_kwargs: object):
+                        raise body_error
+                        yield {}  # pragma: no cover
+
+                    block_patch = (
+                        mock.patch.object(
+                            providers,
+                            "block_forwarded_signals",
+                            side_effect=winner,
+                        )
+                        if stage == "mask"
+                        else mock.patch.object(
+                            providers,
+                            "block_forwarded_signals",
+                            return_value=set(),
+                        )
+                    )
+                    pending_patch = mock.patch.object(
+                        providers,
+                        ("_consume_claude_macos_owned_pending_forwarded_signal"),
+                        side_effect=(winner if stage == "pending" else None),
+                        return_value=None,
+                    )
+                    restore_patch = mock.patch.object(
+                        providers,
+                        "restore_signal_mask",
+                        side_effect=(winner if stage == "restore" else None),
+                    )
+
+                    with (
+                        mock.patch.object(
+                            providers,
+                            "_claude_macos_carrier_coordination",
+                            side_effect=transaction,
+                        ),
+                        mock.patch.object(
+                            providers,
+                            "_claude_keychain_runtime_coordinated",
+                            side_effect=runtime,
+                        ),
+                        block_patch,
+                        pending_patch,
+                        restore_patch,
+                        self.assertRaises(type(winner)) as raised,
+                    ):
+                        with self.claude_keychain_runtime(
+                            self.review,
+                            {},
+                            self.claude_refresh_lock_protocol,
+                            process_started=lambda: True,
+                            process_quiescent=lambda: False,
+                        ):
+                            pass
+
+                    self.assertIs(raised.exception, winner)
+                    self.assertIs(
+                        getattr(
+                            winner,
+                            "_codex_claude_refresh_persistence_failed",
+                            False,
+                        ),
+                        True,
+                    )
+                    self.assertEqual(
+                        getattr(
+                            winner,
+                            "_codex_claude_retained_credential_carrier",
+                            None,
+                        ),
+                        str(carrier),
+                    )
+                    self.assertEqual(
+                        providers._validated_claude_retained_credential_artifact(
+                            self.review,
+                            winner,
+                        ),
+                        str(artifact),
+                    )
+                    self.assertEqual(
+                        getattr(
+                            winner,
+                            "_codex_claude_retained_cleanup_artifact",
+                            None,
+                        ),
+                        str(carrier),
+                    )
+                    if isinstance(winner, providers.ForwardedSignal):
+                        detail = winner.detail or ""
+                        self.assertIn(str(carrier), detail)
+                        self.assertIn(str(artifact), detail)
+                        self.assertIn(
+                            providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC,
+                            detail,
+                        )
+                    lease.abandon.assert_called_once()
+                    lease.release.assert_not_called()
+
+        invalid_carrier = (
+            self.review.container_dir
+            / "claude-runtime"
+            / "macos"
+            / "claude-carrier-missing"
+        )
+        invalid_artifact = (
+            invalid_carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
+        )
+        invalid_cleanup = invalid_carrier / "cleanup-missing"
+        invalid_body = providers.ReviewTimeoutError(
+            "fixture invalid persistence identity"
+        )
+        setattr(
+            invalid_body,
+            "_codex_claude_refresh_persistence_failed",
+            True,
+        )
+        setattr(
+            invalid_body,
+            "_codex_claude_retained_credential_carrier",
+            str(invalid_carrier),
+        )
+        setattr(
+            invalid_body,
+            "_codex_claude_retained_credential_artifact",
+            str(invalid_artifact),
+        )
+        setattr(
+            invalid_body,
+            "_codex_claude_retained_cleanup_artifact",
+            str(invalid_cleanup),
+        )
+        invalid_winner = providers.ForwardedSignal(signal.SIGTERM)
+        invalid_lease = mock.Mock(spec=["abandon"])
+        invalid_lease.abandon.return_value = (
+            claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                "fixture invalid identity retained the refresh lock"
+            )
+        )
+
+        with (
+            mock.patch.object(
+                providers,
+                "block_forwarded_signals",
+                side_effect=invalid_winner,
+            ),
+            self.assertRaises(providers.ForwardedSignal) as invalid_raised,
+        ):
+            providers._begin_claude_macos_terminal_handoff(
+                self.review,
+                invalid_lease,
+                invalid_body,
+            )
+
+        self.assertIs(invalid_raised.exception, invalid_winner)
+        self.assertIs(
+            getattr(
+                invalid_winner,
+                "_codex_claude_refresh_persistence_failed",
+                False,
+            ),
+            True,
+        )
+        self.assertIsNone(
+            getattr(
+                invalid_winner,
+                "_codex_claude_retained_credential_carrier",
+                None,
+            )
+        )
+        self.assertIsNone(
+            getattr(
+                invalid_winner,
+                "_codex_claude_retained_credential_artifact",
+                None,
+            )
+        )
+        self.assertIsNone(
+            getattr(
+                invalid_winner,
+                "_codex_claude_retained_cleanup_artifact",
+                None,
+            )
+        )
+        invalid_detail = invalid_winner.detail or ""
+        self.assertIn(
+            providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC,
+            invalid_detail,
+        )
+        self.assertNotIn(str(invalid_carrier), invalid_detail)
+        self.assertNotIn(str(invalid_artifact), invalid_detail)
+        self.assertNotIn(str(invalid_cleanup), invalid_detail)
+        invalid_lease.abandon.assert_called_once()
+
+        credential[:] = b"\x00" * len(credential)
+
+    def test_abandonment_control_flow_inherits_validated_persistence_source(
+        self,
+    ) -> None:
+        credential = bytearray(oauth_credential_fixture(expires_in_seconds=7200))
+        carrier = providers._retain_claude_macos_refreshed_credential(
+            self.review,
+            credential,
+        )
+        artifact = carrier / "config" / providers.CLAUDE_CREDENTIAL_FILE_NAME
+        retained_lock = "/fixture/.claude/.oauth_refresh.lock"
+        winner_factories: tuple[Callable[[], BaseException], ...] = (
+            lambda: providers.ForwardedSignal(signal.SIGTERM),
+            lambda: KeyboardInterrupt("fixture abandonment interruption"),
+        )
+
+        def persistence_source() -> BaseException:
+            source = providers.ReviewTimeoutError("fixture persistence-marked primary")
+            setattr(source, "_codex_claude_refresh_persistence_failed", True)
+            setattr(
+                source,
+                "_codex_claude_retained_credential_carrier",
+                str(carrier),
+            )
+            providers._mark_claude_macos_recovery_update_artifact(
+                source,
+                artifact,
+                expected_digest=providers._claude_credential_digest(credential),
+            )
+            setattr(
+                source,
+                "_codex_claude_retained_cleanup_artifact",
+                str(carrier),
+            )
+            setattr(
+                source,
+                "_codex_claude_refresh_lock_paths",
+                (retained_lock,),
+            )
+            return source
+
+        for path in ("begin", "settle"):
+            for winner_factory in winner_factories:
+                winner = winner_factory()
+                source = persistence_source()
+                lease = mock.Mock(spec=["abandon"])
+                lease.abandon.side_effect = winner
+
+                with self.subTest(path=path, winner=type(winner).__name__):
+                    if path == "begin":
+                        with (
+                            mock.patch.object(
+                                providers,
+                                "block_forwarded_signals",
+                                side_effect=OSError("fixture mask acquisition failure"),
+                            ),
+                            self.assertRaises(type(winner)) as raised,
+                        ):
+                            providers._begin_claude_macos_terminal_handoff(
+                                self.review,
+                                lease,
+                                source,
+                            )
+                    else:
+                        with mock.patch.object(
+                            providers,
+                            "block_forwarded_signals",
+                            return_value=set(),
+                        ):
+                            handoff = providers._begin_claude_macos_terminal_handoff(
+                                self.review,
+                                lease,
+                                source,
+                            )
+                        transaction = providers._ClaudeMacOSRefreshTransaction(
+                            process_started=lambda: True,
+                            process_quiescent=lambda: False,
+                        )
+                        with (
+                            mock.patch.object(providers, "restore_signal_mask"),
+                            self.assertRaises(type(winner)) as raised,
+                        ):
+                            try:
+                                providers._settle_claude_macos_refresh_transaction(
+                                    self.review,
+                                    transaction,
+                                    lease,
+                                    source,
+                                    handoff,
+                                )
+                            except BaseException as settling_error:
+                                providers._complete_claude_macos_terminal_handoff(
+                                    self.review,
+                                    handoff,
+                                    settling_error,
+                                )
+                                raise
+
+                    self.assertIs(raised.exception, winner)
+                    self.assertIs(
+                        getattr(
+                            winner,
+                            "_codex_claude_refresh_persistence_failed",
+                            False,
+                        ),
+                        True,
+                    )
+                    self.assertEqual(
+                        getattr(
+                            winner,
+                            "_codex_claude_retained_credential_carrier",
+                            None,
+                        ),
+                        str(carrier),
+                    )
+                    self.assertEqual(
+                        providers._validated_claude_retained_credential_artifact(
+                            self.review,
+                            winner,
+                        ),
+                        str(artifact),
+                    )
+                    self.assertEqual(
+                        getattr(
+                            winner,
+                            "_codex_claude_retained_cleanup_artifact",
+                            None,
+                        ),
+                        str(carrier),
+                    )
+                    self.assertEqual(
+                        getattr(
+                            winner,
+                            "_codex_claude_refresh_lock_paths",
+                            None,
+                        ),
+                        (retained_lock,),
+                    )
+                    if isinstance(winner, providers.ForwardedSignal):
+                        detail = winner.detail or ""
+                        self.assertIn(
+                            providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC,
+                            detail,
+                        )
+                        self.assertIn(str(carrier), detail)
+                        self.assertIn(str(artifact), detail)
+                    for related in (winner.__cause__, winner.__context__):
+                        if isinstance(related, BaseException):
+                            self.assertFalse(
+                                providers._claude_error_graph_contains(
+                                    related,
+                                    winner,
+                                )
+                            )
+                    lease.abandon.assert_called_once()
+
+        credential[:] = b"\x00" * len(credential)
+
+    def test_abandonment_control_flow_keeps_first_validation_winner(
+        self,
+    ) -> None:
+        source = providers.ReviewTimeoutError("fixture persistence-marked primary")
+        setattr(source, "_codex_claude_refresh_persistence_failed", True)
+        setattr(
+            source,
+            "_codex_claude_retained_credential_carrier",
+            "/fixture/private/unverified-carrier",
+        )
+        setattr(
+            source,
+            "_codex_claude_refresh_lock_paths",
+            ("/fixture/.claude/.oauth_refresh.lock",),
+        )
+        abandonment_signal = providers.ForwardedSignal(signal.SIGTERM)
+        validation_signal = providers.ForwardedSignal(signal.SIGINT)
+        lease = mock.Mock(spec=["abandon"])
+        lease.abandon.side_effect = abandonment_signal
+
+        with (
+            mock.patch.object(
+                providers,
+                "block_forwarded_signals",
+                side_effect=OSError("fixture mask acquisition failure"),
+            ),
+            mock.patch.object(
+                providers,
+                "_validated_claude_retained_credential_carrier",
+                side_effect=validation_signal,
+            ),
+            self.assertRaises(providers.ForwardedSignal) as raised,
+        ):
+            providers._begin_claude_macos_terminal_handoff(
+                self.review,
+                lease,
+                source,
+            )
+
+        self.assertIs(raised.exception, abandonment_signal)
+        for error in (abandonment_signal, validation_signal):
+            self.assertIs(
+                getattr(
+                    error,
+                    "_codex_claude_refresh_persistence_failed",
+                    False,
+                ),
+                True,
+            )
+            self.assertIn(
+                providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC,
+                error.detail or "",
+            )
+            self.assertIsNone(
+                getattr(
+                    error,
+                    "_codex_claude_retained_credential_carrier",
+                    None,
+                )
+            )
+            for related in (error.__cause__, error.__context__):
+                if isinstance(related, BaseException):
+                    self.assertFalse(
+                        providers._claude_error_graph_contains(related, error)
+                    )
+        self.assertEqual(
+            getattr(
+                abandonment_signal,
+                "_codex_claude_refresh_lock_paths",
+                None,
+            ),
+            ("/fixture/.claude/.oauth_refresh.lock",),
+        )
+        lease.abandon.assert_called_once()
+
+    def test_mask_failure_abandons_before_persistence_validation_failure(
+        self,
+    ) -> None:
+        validation_factories: tuple[tuple[str, Callable[[], BaseException]], ...] = (
+            (
+                "ordinary",
+                lambda: OSError("fixture persistence validation failure"),
+            ),
+            (
+                "forwarded-signal",
+                lambda: providers.ForwardedSignal(signal.SIGINT),
+            ),
+            (
+                "keyboard-interrupt",
+                lambda: KeyboardInterrupt("fixture persistence validation interrupt"),
+            ),
+        )
+        retained_lock = "/fixture/.claude/.oauth_refresh.lock"
+
+        for label, validation_factory in validation_factories:
+            with self.subTest(label=label):
+                body_error = providers.ReviewTimeoutError(
+                    "fixture persistence-marked body"
+                )
+                setattr(
+                    body_error,
+                    "_codex_claude_refresh_persistence_failed",
+                    True,
+                )
+                mask_error = providers.ForwardedSignal(signal.SIGTERM)
+                validation_error = validation_factory()
+                cleanup_error = (
+                    claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                        "fixture validation retained the refresh lock"
+                    )
+                )
+                setattr(
+                    cleanup_error,
+                    "_codex_claude_refresh_lock_paths",
+                    (retained_lock,),
+                )
+                lease = mock.Mock(spec=["abandon"])
+                events: list[str] = []
+
+                def abandon(_reason: str) -> BaseException:
+                    events.append("abandon")
+                    return cleanup_error
+
+                def propagate(*_args: object, **_kwargs: object) -> None:
+                    self.assertTrue(lease.abandon.called)
+                    events.append("validate")
+                    raise validation_error
+
+                lease.abandon.side_effect = abandon
+                with (
+                    mock.patch.object(
+                        providers,
+                        "block_forwarded_signals",
+                        side_effect=mask_error,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_propagate_claude_persistence_state",
+                        side_effect=propagate,
+                    ),
+                    self.assertRaises(providers.ForwardedSignal) as raised,
+                ):
+                    providers._begin_claude_macos_terminal_handoff(
+                        self.review,
+                        lease,
+                        body_error,
+                    )
+
+                self.assertIs(raised.exception, mask_error)
+                self.assertEqual(events, ["abandon", "validate"])
+                self.assertEqual(
+                    getattr(
+                        mask_error,
+                        "_codex_claude_refresh_lock_paths",
+                        None,
+                    ),
+                    (retained_lock,),
+                )
+
+    def test_partial_pending_wait_keeps_first_consumed_signal_primary(
+        self,
+    ) -> None:
+        pending_signals = sorted(
+            {signal.SIGINT, signal.SIGTERM},
+            key=int,
+        )
+        first_signal, second_signal = pending_signals
+        wait_failure = OSError("fixture second sigwait failure")
+        retained_lock = "/fixture/.claude/.oauth_refresh.lock"
+        cleanup_error = claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+            "fixture partial wait retained the refresh lock"
+        )
+        setattr(
+            cleanup_error,
+            "_codex_claude_refresh_lock_paths",
+            (retained_lock,),
+        )
+        lease = mock.Mock(spec=["assert_held", "abandon", "release"])
+        lease.abandon.return_value = cleanup_error
+        observed_waits: list[signal.Signals] = []
+
+        def sigwait(candidates: set[signal.Signals]) -> int:
+            observed = next(iter(candidates))
+            observed_waits.append(observed)
+            if observed == second_signal:
+                raise wait_failure
+            return int(observed)
+
+        @contextlib.contextmanager
+        def transaction(
+            _protocol: providers.ClaudeRefreshLockProtocol,
+            **_coordination_options: object,
+        ):
+            try:
+                yield self.fake_claude_macos_coordination_result(
+                    lease,
+                    _coordination_options,
+                )
+            finally:
+                if not lease.abandon.called:
+                    lease.release()
+
+        @contextlib.contextmanager
+        def runtime(*_args: object, **_kwargs: object):
+            raise providers.ReviewTimeoutError("fixture runtime primary")
+            yield {}  # pragma: no cover
+
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+                side_effect=transaction,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_runtime_coordinated",
+                side_effect=runtime,
+            ),
+            mock.patch.object(
+                providers,
+                "block_forwarded_signals",
+                return_value=set(),
+            ),
+            mock.patch.object(
+                providers.signal,
+                "sigpending",
+                return_value=set(pending_signals),
+            ),
+            mock.patch.object(
+                providers.signal,
+                "sigwait",
+                side_effect=sigwait,
+            ),
+            mock.patch.object(providers, "restore_signal_mask") as restore,
+            self.assertRaises(providers.ForwardedSignal) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+                process_started=lambda: True,
+                process_quiescent=lambda: False,
+            ):
+                pass
+
+        self.assertEqual(raised.exception.signum, first_signal)
+        self.assertEqual(observed_waits, pending_signals)
+        restore.assert_called_once_with(set())
+        self.assertEqual(
+            getattr(
+                raised.exception,
+                "_codex_claude_refresh_lock_paths",
+                None,
+            ),
+            (retained_lock,),
+        )
+
+    def test_bind_validation_failure_still_restores_and_keeps_first_signal(
+        self,
+    ) -> None:
+        validation_factories: tuple[tuple[str, Callable[[], BaseException]], ...] = (
+            (
+                "ordinary",
+                lambda: OSError("fixture bind validation failure"),
+            ),
+            (
+                "forwarded-signal",
+                lambda: providers.ForwardedSignal(signal.SIGINT),
+            ),
+            (
+                "keyboard-interrupt",
+                lambda: KeyboardInterrupt("fixture bind validation interrupt"),
+            ),
+        )
+        retained_lock = "/fixture/.claude/.oauth_refresh.lock"
+
+        for label, validation_factory in validation_factories:
+            with self.subTest(label=label):
+                body_error = providers.ReviewTimeoutError(
+                    "fixture persistence-marked body"
+                )
+                setattr(
+                    body_error,
+                    "_codex_claude_refresh_persistence_failed",
+                    True,
+                )
+                pending_error = providers.ForwardedSignal(signal.SIGTERM)
+                validation_error = validation_factory()
+                cleanup_error = (
+                    claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                        "fixture bind failure retained the refresh lock"
+                    )
+                )
+                setattr(
+                    cleanup_error,
+                    "_codex_claude_refresh_lock_paths",
+                    (retained_lock,),
+                )
+                lease = mock.Mock(spec=["assert_held", "abandon", "release"])
+                lease.abandon.return_value = cleanup_error
+
+                @contextlib.contextmanager
+                def transaction(
+                    _protocol: providers.ClaudeRefreshLockProtocol,
+                    **_coordination_options: object,
+                ):
+                    try:
+                        yield self.fake_claude_macos_coordination_result(
+                            lease,
+                            _coordination_options,
+                        )
+                    finally:
+                        if not lease.abandon.called:
+                            lease.release()
+
+                @contextlib.contextmanager
+                def runtime(*_args: object, **_kwargs: object):
+                    raise body_error
+                    yield {}  # pragma: no cover
+
+                with (
+                    mock.patch.object(
+                        providers,
+                        "_claude_macos_carrier_coordination",
+                        side_effect=transaction,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_claude_keychain_runtime_coordinated",
+                        side_effect=runtime,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "block_forwarded_signals",
+                        return_value=set(),
+                    ),
+                    mock.patch.object(
+                        providers,
+                        ("_consume_claude_macos_owned_pending_forwarded_signal"),
+                        side_effect=pending_error,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_propagate_claude_persistence_state",
+                        side_effect=validation_error,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "restore_signal_mask",
+                    ) as restore,
+                    self.assertRaises(providers.ForwardedSignal) as raised,
+                ):
+                    with self.claude_keychain_runtime(
+                        self.review,
+                        {},
+                        self.claude_refresh_lock_protocol,
+                        process_started=lambda: True,
+                        process_quiescent=lambda: False,
+                    ):
+                        pass
+
+                self.assertIs(raised.exception, pending_error)
+                restore.assert_called_once_with(set())
+                self.assertEqual(
+                    getattr(
+                        pending_error,
+                        "_codex_claude_refresh_lock_paths",
+                        None,
+                    ),
+                    (retained_lock,),
+                )
+
+    def test_keychain_runtime_pending_handoff_preserves_primary_priority(
+        self,
+    ) -> None:
+        cases: tuple[
+            tuple[
+                str,
+                BaseException,
+                BaseException | signal.Signals,
+                BaseException | None,
+                str,
+            ],
+            ...,
+        ] = (
+            (
+                "ordinary-body-ordinary-pending-restore-forwarded",
+                providers.ReviewTimeoutError("fixture body timeout"),
+                OSError("fixture pending inspection failure"),
+                providers.ForwardedSignal(signal.SIGTERM),
+                "restore",
+            ),
+            (
+                "forwarded-body-keyboard-pending-restore-forwarded",
+                providers.ForwardedSignal(signal.SIGTERM),
+                KeyboardInterrupt("fixture pending interrupt"),
+                providers.ForwardedSignal(signal.SIGINT),
+                "body",
+            ),
+            (
+                "keyboard-body-forwarded-pending",
+                KeyboardInterrupt("fixture body interrupt"),
+                signal.SIGTERM,
+                None,
+                "body",
+            ),
+        )
+        retained_lock = "/fixture/.claude/.oauth_refresh.lock"
+
+        for label, body_error, pending, restore_error, expected_source in cases:
+            with self.subTest(label=label):
+                cleanup_error = (
+                    claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                        "fixture pending handoff retained the lock"
+                    )
+                )
+                setattr(
+                    cleanup_error,
+                    "_codex_claude_refresh_lock_paths",
+                    (retained_lock,),
+                )
+                lease = mock.Mock(spec=["assert_held", "abandon", "release"])
+                lease.abandon.return_value = cleanup_error
+
+                @contextlib.contextmanager
+                def transaction(
+                    _protocol: providers.ClaudeRefreshLockProtocol,
+                    **_coordination_options: object,
+                ):
+                    try:
+                        yield self.fake_claude_macos_coordination_result(
+                            lease,
+                            _coordination_options,
+                        )
+                    finally:
+                        if not lease.abandon.called:
+                            lease.release()
+
+                @contextlib.contextmanager
+                def runtime(*_args: object, **_kwargs: object):
+                    raise body_error
+                    yield {}  # pragma: no cover
+
+                def consume_pending_signal(
+                    _previous: set[signal.Signals] | None,
+                ) -> signal.Signals | None:
+                    if isinstance(pending, BaseException):
+                        raise pending
+                    return pending
+
+                def restore_signals(
+                    _observed: set[signal.Signals] | None,
+                ) -> None:
+                    if isinstance(pending, BaseException):
+                        self.assertEqual(
+                            getattr(
+                                pending,
+                                "_codex_claude_refresh_lock_paths",
+                                None,
+                            ),
+                            (retained_lock,),
+                        )
+                    if restore_error is not None:
+                        raise restore_error
+
+                expected = restore_error if expected_source == "restore" else body_error
+                assert expected is not None
+
+                with (
+                    mock.patch.object(
+                        providers,
+                        "_claude_macos_carrier_coordination",
+                        side_effect=transaction,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_claude_keychain_runtime_coordinated",
+                        side_effect=runtime,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "block_forwarded_signals",
+                        return_value=set(),
+                    ),
+                    mock.patch.object(
+                        providers,
+                        ("_consume_claude_macos_owned_pending_forwarded_signal"),
+                        side_effect=consume_pending_signal,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "restore_signal_mask",
+                        side_effect=restore_signals,
+                    ),
+                    self.assertRaises(type(expected)) as raised,
+                ):
+                    with self.claude_keychain_runtime(
+                        self.review,
+                        {},
+                        self.claude_refresh_lock_protocol,
+                        process_started=lambda: True,
+                        process_quiescent=lambda: False,
+                    ):
+                        pass
+
+                self.assertIs(raised.exception, expected)
+                lease.abandon.assert_called_once_with(
+                    "reviewer process quiescence was not proven"
+                )
+                lease.release.assert_not_called()
+                self.assertEqual(
+                    getattr(
+                        raised.exception,
+                        "_codex_claude_refresh_lock_paths",
+                        None,
+                    ),
+                    (retained_lock,),
+                )
+
+    def test_bind_validation_signal_becomes_generic_persistence_winner(
+        self,
+    ) -> None:
+        source = providers.ReviewTimeoutError("fixture persistence-marked primary")
+        setattr(source, "_codex_claude_refresh_persistence_failed", True)
+        setattr(
+            source,
+            "_codex_claude_retained_credential_carrier",
+            "/fixture/private/carrier",
+        )
+        setattr(
+            source,
+            "_codex_claude_retained_credential_artifact",
+            "/fixture/private/carrier/config/.credentials.json",
+        )
+        setattr(
+            source,
+            "_codex_claude_retained_cleanup_artifact",
+            "/fixture/private/carrier/cleanup",
+        )
+        pending_error = OSError("fixture ordinary pending inspection failure")
+        validation_signal = providers.ForwardedSignal(signal.SIGTERM)
+        handoff = providers._ClaudeMacOSTerminalHandoff(
+            previous_signal_mask=set(),
+            abandonment_attempted=True,
+            recovery_source=source,
+        )
+
+        with (
+            mock.patch.object(
+                providers,
+                "_consume_claude_macos_owned_pending_forwarded_signal",
+                side_effect=pending_error,
+            ),
+            mock.patch.object(
+                providers,
+                "_validated_claude_retained_credential_carrier",
+                return_value="/fixture/private/carrier",
+            ),
+            mock.patch.object(
+                providers,
+                "_validated_claude_retained_credential_artifact",
+                side_effect=validation_signal,
+            ),
+            mock.patch.object(
+                providers,
+                "_validated_claude_retained_cleanup_artifact",
+            ) as validate_cleanup,
+            mock.patch.object(providers, "restore_signal_mask") as restore,
+            self.assertRaises(providers.ForwardedSignal) as raised,
+        ):
+            providers._complete_claude_macos_terminal_handoff(
+                self.review,
+                handoff,
+                source,
+            )
+
+        self.assertIs(raised.exception, validation_signal)
+        self.assertIs(
+            getattr(
+                validation_signal,
+                "_codex_claude_refresh_persistence_failed",
+                False,
+            ),
+            True,
+        )
+        self.assertIn(
+            providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC,
+            validation_signal.detail or "",
+        )
+        self.assertIs(
+            getattr(
+                pending_error,
+                "_codex_claude_refresh_persistence_failed",
+                False,
+            ),
+            True,
+        )
+        for error in (pending_error, validation_signal):
+            self.assertIsNone(
+                getattr(
+                    error,
+                    "_codex_claude_retained_credential_carrier",
+                    None,
+                )
+            )
+            self.assertIsNone(
+                getattr(
+                    error,
+                    "_codex_claude_retained_credential_artifact",
+                    None,
+                )
+            )
+            self.assertIsNone(
+                getattr(
+                    error,
+                    "_codex_claude_retained_cleanup_artifact",
+                    None,
+                )
+            )
+            for related in (error.__cause__, error.__context__):
+                if isinstance(related, BaseException):
+                    self.assertFalse(
+                        providers._claude_error_graph_contains(related, error)
+                    )
+        validate_cleanup.assert_not_called()
+        restore.assert_called_once_with(set())
+
+    def test_mask_signal_keeps_generic_detail_when_validation_is_interrupted(
+        self,
+    ) -> None:
+        source = providers.ReviewTimeoutError("fixture persistence-marked body")
+        setattr(source, "_codex_claude_refresh_persistence_failed", True)
+        setattr(
+            source,
+            "_codex_claude_retained_credential_carrier",
+            "/fixture/private/unverified-carrier",
+        )
+        mask_signal = providers.ForwardedSignal(signal.SIGTERM)
+        validation_error = OSError("fixture retained-path validation failure")
+        lease = mock.Mock(spec=["abandon"])
+        lease.abandon.return_value = (
+            claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+                "fixture validation interruption retained the lock"
+            )
+        )
+
+        with (
+            mock.patch.object(
+                providers,
+                "block_forwarded_signals",
+                side_effect=mask_signal,
+            ),
+            mock.patch.object(
+                providers,
+                "_validated_claude_retained_credential_carrier",
+                side_effect=validation_error,
+            ),
+            self.assertRaises(providers.ForwardedSignal) as raised,
+        ):
+            providers._begin_claude_macos_terminal_handoff(
+                self.review,
+                lease,
+                source,
+            )
+
+        self.assertIs(raised.exception, mask_signal)
+        self.assertIs(
+            getattr(
+                mask_signal,
+                "_codex_claude_refresh_persistence_failed",
+                False,
+            ),
+            True,
+        )
+        self.assertIn(
+            providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC,
+            mask_signal.detail or "",
+        )
+        self.assertNotIn(
+            "/fixture/private/unverified-carrier", mask_signal.detail or ""
+        )
+        self.assertIsNone(
+            getattr(
+                mask_signal,
+                "_codex_claude_retained_credential_carrier",
+                None,
+            )
+        )
+        self.assertIs(
+            getattr(
+                validation_error,
+                "_codex_claude_refresh_persistence_failed",
+                False,
+            ),
+            True,
+        )
+        lease.abandon.assert_called_once()
+
+    def test_persistence_path_validation_failures_copy_no_unverified_path(
+        self,
+    ) -> None:
+        validators = (
+            "_validated_claude_retained_credential_carrier",
+            "_validated_claude_retained_credential_artifact",
+            "_validated_claude_retained_cleanup_artifact",
+        )
+        error_factories: tuple[Callable[[], BaseException], ...] = (
+            lambda: OSError("fixture retained-path validation failure"),
+            lambda: providers.ForwardedSignal(signal.SIGTERM),
+            lambda: KeyboardInterrupt("fixture retained-path validation interrupt"),
+        )
+
+        for failed_index, failed_validator in enumerate(validators):
+            for error_factory in error_factories:
+                validation_error = error_factory()
+                with self.subTest(
+                    validator=failed_validator,
+                    error=type(validation_error).__name__,
+                ):
+                    source = providers.ReviewTimeoutError(
+                        "fixture persistence-marked source"
+                    )
+                    setattr(
+                        source,
+                        "_codex_claude_refresh_persistence_failed",
+                        True,
+                    )
+                    target = providers.ForwardedSignal(signal.SIGINT)
+                    with contextlib.ExitStack() as stack:
+                        for index, validator in enumerate(validators):
+                            patcher = mock.patch.object(providers, validator)
+                            patched = stack.enter_context(patcher)
+                            if index == failed_index:
+                                patched.side_effect = validation_error
+                            else:
+                                patched.return_value = (
+                                    f"/fixture/private/unverified-{index}"
+                                )
+                        with self.assertRaises(type(validation_error)) as raised:
+                            providers._propagate_claude_persistence_state(
+                                self.review,
+                                source,
+                                target,
+                            )
+
+                    self.assertIs(raised.exception, validation_error)
+                    for error in (target, validation_error):
+                        self.assertIs(
+                            getattr(
+                                error,
+                                "_codex_claude_refresh_persistence_failed",
+                                False,
+                            ),
+                            True,
+                        )
+                        self.assertIsNone(
+                            getattr(
+                                error,
+                                "_codex_claude_retained_credential_carrier",
+                                None,
+                            )
+                        )
+                        self.assertIsNone(
+                            getattr(
+                                error,
+                                "_codex_claude_retained_credential_artifact",
+                                None,
+                            )
+                        )
+                        self.assertIsNone(
+                            getattr(
+                                error,
+                                "_codex_claude_retained_cleanup_artifact",
+                                None,
+                            )
+                        )
+                    self.assertIn(
+                        providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC,
+                        target.detail or "",
+                    )
+                    if isinstance(validation_error, providers.ForwardedSignal):
+                        self.assertIn(
+                            providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC,
+                            validation_error.detail or "",
+                        )
+                    for related in (
+                        validation_error.__cause__,
+                        validation_error.__context__,
+                    ):
+                        if isinstance(related, BaseException):
+                            self.assertFalse(
+                                providers._claude_error_graph_contains(
+                                    related,
+                                    validation_error,
+                                )
+                            )
+
+    def test_keychain_runtime_abandons_unquiescent_process_transaction(
+        self,
+    ) -> None:
+        payload = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
+        snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(payload),
+            file_digest=None,
+            file_snapshot=None,
+            keychain_refresh_digest=(
+                providers._claude_credential_refresh_digest(payload)
+            ),
+        )
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=payload,
+            expires_at_ms=0,
+            carrier_snapshot=snapshot,
+        )
+        lease = mock.Mock(spec=["assert_held", "abandon"])
+        retained_lock = pathlib.Path("/fixture/.claude/.oauth_refresh.lock")
+        cleanup_error = claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+            "fixture refresh transaction was abandoned"
+        )
+        setattr(
+            cleanup_error,
+            "_codex_claude_refresh_lock_paths",
+            (str(retained_lock),),
+        )
+        lease.abandon.return_value = cleanup_error
+
+        @contextlib.contextmanager
+        def broker(
+            _credential: bytearray,
+            _capability: bytes,
+            **_kwargs: object,
+        ):
+            yield 43211
+
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+                return_value=contextlib.nullcontext(lease),
+            ),
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_snapshot_is_current",
+                return_value=True,
+            ),
+            self.assertRaises(
+                providers.ClaudeCredentialInspectionInconclusive
+            ) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+                process_started=lambda: True,
+                process_quiescent=lambda: False,
+            ):
+                pass
+
+        lease.abandon.assert_called_once_with(
+            "reviewer process quiescence was not proven"
+        )
+        self.assertIn(str(retained_lock), str(raised.exception))
+
+    def test_keychain_runtime_abandons_unverified_refresh_without_release(
+        self,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        refreshed_value = json.loads(oauth_credential_fixture(expires_in_seconds=3600))
+        refreshed_value["claudeAiOauth"]["refreshToken"] = (
+            "fixture-unverified-transaction-refresh"
+        )
+        refreshed = bytearray(json.dumps(refreshed_value).encode())
+        snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(original),
+            file_digest=None,
+            file_snapshot=None,
+            keychain_refresh_digest=(
+                providers._claude_credential_refresh_digest(original)
+            ),
+        )
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=snapshot,
+        )
+        lease = mock.Mock(spec=["assert_held", "abandon", "release"])
+        retained_lock = pathlib.Path("/fixture/.claude/.oauth_refresh.lock")
+        cleanup_error = claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+            "fixture unverified refresh transaction was abandoned"
+        )
+        setattr(
+            cleanup_error,
+            "_codex_claude_refresh_lock_paths",
+            (str(retained_lock),),
+        )
+        lease.abandon.return_value = cleanup_error
+
+        @contextlib.contextmanager
+        def transaction(
+            _protocol: providers.ClaudeRefreshLockProtocol,
+            **_coordination_options: object,
+        ):
+            try:
+                yield self.fake_claude_macos_coordination_result(
+                    lease,
+                    _coordination_options,
+                )
+            finally:
+                if not lease.abandon.called:
+                    lease.release()
+
+        @contextlib.contextmanager
+        def broker(
+            _credential: bytearray,
+            _capability: bytes,
+            *,
+            update_callback: Callable[..., bool] | None = None,
+            **_kwargs: object,
+        ):
+            assert update_callback is not None
+            self.assertTrue(update_callback(refreshed))
+            yield 43211
+
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+                side_effect=transaction,
+            ),
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+                return_value=None,
+            ),
+            self.assertRaises(
+                providers.ClaudeCredentialInspectionInconclusive
+            ) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+                process_started=lambda: False,
+            ):
+                pass
+
+        lease.abandon.assert_called_once_with(
+            "the latest observed Claude credential write was not verified "
+            "in host carriers"
+        )
+        lease.release.assert_not_called()
+        self.assertEqual(
+            getattr(
+                raised.exception,
+                "_codex_claude_refresh_lock_paths",
+                None,
+            ),
+            (str(retained_lock),),
+        )
+        self.assertIn(str(retained_lock), str(raised.exception))
+        refreshed[:] = b"\x00" * len(refreshed)
+
+    def test_keychain_runtime_abandons_when_later_write_is_truncated(
+        self,
+    ) -> None:
+        original = bytearray(oauth_credential_fixture(expires_in_seconds=-60))
+        refreshed = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
+        original_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(original),
+            file_digest=None,
+            file_snapshot=None,
+            keychain_refresh_digest=(
+                providers._claude_credential_refresh_digest(original)
+            ),
+        )
+        refreshed_snapshot = providers._ClaudeMacOSCarrierSnapshot(
+            keychain_digest=providers._claude_credential_digest(refreshed),
+            file_digest=None,
+            file_snapshot=None,
+            keychain_refresh_digest=(
+                providers._claude_credential_refresh_digest(refreshed)
+            ),
+        )
+        selected = providers._ClaudeLocalCredential(
+            source="macos-keychain",
+            payload=original,
+            expires_at_ms=0,
+            carrier_snapshot=original_snapshot,
+        )
+        lease = mock.Mock(spec=["assert_held", "abandon", "release"])
+        retained_lock = pathlib.Path("/fixture/.claude/.oauth_refresh.lock")
+        cleanup_error = claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+            "fixture later truncated write retained the refresh lock"
+        )
+        setattr(
+            cleanup_error,
+            "_codex_claude_refresh_lock_paths",
+            (str(retained_lock),),
+        )
+        lease.abandon.return_value = cleanup_error
+
+        @contextlib.contextmanager
+        def transaction(
+            _protocol: providers.ClaudeRefreshLockProtocol,
+            **_coordination_options: object,
+        ):
+            try:
+                yield self.fake_claude_macos_coordination_result(
+                    lease,
+                    _coordination_options,
+                )
+            finally:
+                if not lease.abandon.called:
+                    lease.release()
+
+        @contextlib.contextmanager
+        def broker(
+            _credential: bytearray,
+            _capability: bytes,
+            *,
+            update_callback: Callable[..., bool] | None = None,
+            quiescence_callbacks: (
+                providers._ClaudeKeychainQuiescenceCallbacks | None
+            ) = None,
+        ):
+            assert update_callback is not None
+            assert quiescence_callbacks is not None
+            assert quiescence_callbacks.write_observed is not None
+            self.assertTrue(update_callback(refreshed))
+            # A later authorized client sent `W` but disconnected before its
+            # length/payload could be admitted to the durable journal.
+            quiescence_callbacks.write_observed()
+            yield 43211
+
+        common.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {"authentication": {}, "phase": "pending"},
+        )
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+                side_effect=transaction,
+            ),
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                return_value=selected,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers,
+                "_persist_claude_macos_refreshed_credential",
+                return_value=refreshed_snapshot,
+            ) as persist,
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_snapshot_is_current",
+                return_value=True,
+            ),
+            self.assertRaises(
+                providers.ClaudeCredentialInspectionInconclusive
+            ) as raised,
+        ):
+            with self.claude_keychain_runtime(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+                process_started=lambda: False,
+            ):
+                pass
+
+        persist.assert_called_once()
+        lease.abandon.assert_called_once_with(
+            "the latest observed Claude credential write was not verified "
+            "in host carriers"
+        )
+        lease.release.assert_not_called()
+        self.assertEqual(
+            getattr(raised.exception, "_codex_claude_refresh_lock_paths", None),
+            (str(retained_lock),),
+        )
+        refreshed[:] = b"\x00" * len(refreshed)
+
+    def test_keychain_runtime_serializes_credential_exposure_across_reviewers(
+        self,
+    ) -> None:
+        transaction_lock = threading.Lock()
+        first_runtime_entered = threading.Event()
+        second_transaction_attempted = threading.Event()
+        release_first_runtime = threading.Event()
+        selection_lock = threading.Lock()
+        selection_order: list[str] = []
+        thread_errors: list[BaseException] = []
+
+        @contextlib.contextmanager
+        def transaction(
+            _protocol: providers.ClaudeRefreshLockProtocol,
+            **_coordination_options: object,
+        ):
+            if threading.current_thread().name == "second-review":
+                second_transaction_attempted.set()
+            acquired = transaction_lock.acquire(timeout=2.0)
+            if not acquired:
+                raise AssertionError("fixture refresh transaction timed out")
+            lease = mock.Mock(spec=["assert_held"])
+            try:
+                yield self.fake_claude_macos_coordination_result(
+                    lease,
+                    _coordination_options,
+                )
+            finally:
+                transaction_lock.release()
+
+        def select_credential(
+            _review: ReviewWorkspace,
+        ) -> providers._ClaudeLocalCredential:
+            thread_name = threading.current_thread().name
+            with selection_lock:
+                selection_order.append(thread_name)
+            payload = bytearray(oauth_credential_fixture(expires_in_seconds=3600))
+            snapshot = providers._ClaudeMacOSCarrierSnapshot(
+                keychain_digest=providers._claude_credential_digest(payload),
+                file_digest=None,
+                file_snapshot=None,
+                keychain_refresh_digest=(
+                    providers._claude_credential_refresh_digest(payload)
+                ),
+            )
+            return providers._ClaudeLocalCredential(
+                source="macos-keychain",
+                payload=payload,
+                expires_at_ms=0,
+                carrier_snapshot=snapshot,
+            )
+
+        @contextlib.contextmanager
+        def broker(
+            _credential: bytearray,
+            _capability: bytes,
+            **_kwargs: object,
+        ):
+            yield 43211
+
+        def snapshot_is_current(
+            _review: ReviewWorkspace,
+            _snapshot: providers._ClaudeMacOSCarrierSnapshot,
+            _protocol: providers.ClaudeRefreshLockProtocol,
+            *,
+            coordinated_refresh_lock: providers.ClaudeRefreshLockLease | None = None,
+        ) -> bool:
+            self.assertIsNotNone(coordinated_refresh_lock)
+            return True
+
+        def block_signals(
+            *,
+            signal_mask_owner: providers._ClaudeSignalMaskOwner | None = None,
+        ) -> set[signal.Signals]:
+            previous_mask: set[signal.Signals] = set()
+            if signal_mask_owner is not None:
+                signal_mask_owner.publish_previous_signal_mask(previous_mask)
+            return previous_mask
+
+        def run_runtime(*, wait_for_release: bool) -> None:
+            try:
+                with self.claude_keychain_runtime(
+                    self.review,
+                    {},
+                    self.claude_refresh_lock_protocol,
+                    process_started=lambda: False,
+                ):
+                    if wait_for_release:
+                        first_runtime_entered.set()
+                        if not release_first_runtime.wait(timeout=2.0):
+                            raise AssertionError(
+                                "fixture first runtime release timed out"
+                            )
+            except BaseException as error:
+                thread_errors.append(error)
+
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+                side_effect=transaction,
+            ),
+            mock.patch.object(
+                providers,
+                "_select_claude_macos_credential",
+                side_effect=select_credential,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_credential_server",
+                side_effect=broker,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_snapshot_is_current",
+                side_effect=snapshot_is_current,
+            ),
+            mock.patch.object(
+                providers,
+                "block_forwarded_signals",
+                side_effect=block_signals,
+            ),
+            mock.patch.object(providers, "restore_signal_mask"),
+        ):
+            first = threading.Thread(
+                target=run_runtime,
+                kwargs={"wait_for_release": True},
+                name="first-review",
+            )
+            second = threading.Thread(
+                target=run_runtime,
+                kwargs={"wait_for_release": False},
+                name="second-review",
+            )
+            first.start()
+            self.assertTrue(first_runtime_entered.wait(timeout=2.0))
+            second.start()
+            self.assertTrue(second_transaction_attempted.wait(timeout=2.0))
+            with selection_lock:
+                self.assertEqual(selection_order, ["first-review"])
+            release_first_runtime.set()
+            first.join(timeout=2.0)
+            second.join(timeout=2.0)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(thread_errors, [])
+        self.assertEqual(selection_order, ["first-review", "second-review"])
 
     def test_same_refresh_token_dual_write_uses_each_carrier_baseline(self) -> None:
         keychain = bytearray(oauth_credential_fixture(expires_in_seconds=60))
@@ -19725,7 +33180,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(
                     providers.InvalidReviewerExecutable,
-                    "supported >=2.1.211,<3 range",
+                    "supported >=2.1.211,<3.0.0 range",
                 ):
                     providers._require_claude_identity(
                         pathlib.Path("/bin/claude"),
@@ -19972,8 +33427,11 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
         def run_after_spawn(*_args: object, **kwargs: object) -> Completed:
+            on_process_starting = kwargs.get("on_process_starting")
             on_process_started = kwargs.get("on_process_started")
+            assert callable(on_process_starting)
             assert callable(on_process_started)
+            on_process_starting()
             on_process_started()
             return completed
 
@@ -20156,8 +33614,11 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
         def run_after_spawn(*_args: object, **kwargs: object) -> Completed:
+            on_process_starting = kwargs.get("on_process_starting")
             on_process_started = kwargs.get("on_process_started")
+            assert callable(on_process_starting)
             assert callable(on_process_started)
+            on_process_starting()
             on_process_started()
             return completed
 
@@ -20381,8 +33842,11 @@ class ProviderPolicyTest(unittest.TestCase):
         original_update = providers._update_claude_runtime_report
 
         def run_after_spawn(*_args: object, **kwargs: object) -> Completed:
+            on_process_starting = kwargs.get("on_process_starting")
             on_process_started = kwargs.get("on_process_started")
+            assert callable(on_process_starting)
             assert callable(on_process_started)
+            on_process_starting()
             on_process_started()
             return completed
 
@@ -20480,8 +33944,11 @@ class ProviderPolicyTest(unittest.TestCase):
                 lifecycle_states.append((writer_started(), writer_quiescent()))
 
         def timeout_after_spawn(*_args: object, **kwargs: object) -> None:
+            on_process_starting = kwargs.get("on_process_starting")
             on_process_started = kwargs.get("on_process_started")
+            assert callable(on_process_starting)
             assert callable(on_process_started)
+            on_process_starting()
             on_process_started()
             raise providers.ReviewTimeoutError("review timed out")
 
@@ -20508,6 +33975,77 @@ class ProviderPolicyTest(unittest.TestCase):
                 side_effect=timeout_after_spawn,
             ),
             self.assertRaises(providers.ReviewTimeoutError),
+        ):
+            providers._claude_attempt(
+                review=self.review,
+                model=providers.CLAUDE_MODELS[0],
+                index=1,
+                env={},
+                executable=executable,
+                refresh_lock_protocol=self.claude_refresh_lock_protocol,
+            )
+
+        self.assertEqual(lifecycle_states, [(True, False)])
+
+    def test_claude_linux_incomplete_process_start_is_conservative(
+        self,
+    ) -> None:
+        executable = pathlib.Path("/verified/claude")
+        lifecycle_states: list[tuple[bool, bool]] = []
+
+        @contextlib.contextmanager
+        def observing_runtime(
+            *_args: object,
+            writer_started=None,
+            writer_quiescent=None,
+            **_kwargs: object,
+        ):
+            assert callable(writer_started)
+            assert callable(writer_quiescent)
+            self.assertFalse(writer_started())
+            self.assertFalse(writer_quiescent())
+            try:
+                yield mock.Mock(argv=("sandbox",), env={})
+            finally:
+                lifecycle_states.append((writer_started(), writer_quiescent()))
+
+        def fail_during_start_publication(
+            *_args: object,
+            **kwargs: object,
+        ) -> None:
+            on_process_starting = kwargs.get("on_process_starting")
+            assert callable(on_process_starting)
+            on_process_starting()
+            raise providers.ReviewProcessLeakError(
+                "process start publication was interrupted"
+            )
+
+        with (
+            mock.patch.object(providers, "_is_claude_linux_host", return_value=True),
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_linux_review_runtime",
+                side_effect=observing_runtime,
+            ),
+            mock.patch.object(
+                providers,
+                "run",
+                side_effect=fail_during_start_publication,
+            ),
+            self.assertRaisesRegex(
+                providers.ReviewProcessLeakError,
+                "start publication was interrupted",
+            ),
         ):
             providers._claude_attempt(
                 review=self.review,
@@ -20574,6 +34112,97 @@ class ProviderPolicyTest(unittest.TestCase):
             )
 
         self.assertEqual(lifecycle_states, [(False, False)])
+
+    def test_claude_macos_incomplete_process_start_is_conservative(
+        self,
+    ) -> None:
+        executable = self.review.container_dir / "verified-claude"
+        executable.write_bytes(b"snapshot")
+        lifecycle_states: list[tuple[bool, bool]] = []
+
+        providers.write_json(
+            self.review.container_dir / "claude-runtime.json",
+            {
+                "phase": "publisher-and-capabilities-verified",
+                "outer_sandbox": {"status": "pending-runtime-launch"},
+                "authentication": {"status": "pending"},
+            },
+        )
+
+        @contextlib.contextmanager
+        def observing_runtime(
+            _review: ReviewWorkspace,
+            env: dict[str, str],
+            _refresh_lock_protocol: object,
+            *,
+            process_started: Callable[[], bool],
+            process_quiescent: Callable[[], bool],
+        ):
+            self.assertFalse(process_started())
+            self.assertFalse(process_quiescent())
+            try:
+                yield dict(env)
+            finally:
+                lifecycle_states.append((process_started(), process_quiescent()))
+
+        def fail_during_start_publication(
+            *_args: object,
+            **kwargs: object,
+        ) -> None:
+            on_process_starting = kwargs.get("on_process_starting")
+            assert callable(on_process_starting)
+            on_process_starting()
+            raise providers.ReviewProcessLeakError(
+                "process start publication was interrupted"
+            )
+
+        with (
+            mock.patch.object(providers, "_is_claude_linux_host", return_value=False),
+            mock.patch.object(
+                providers,
+                "_with_claude_review_tool_path",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_prepare_claude_tls_environment",
+                side_effect=lambda _review, env: dict(env),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_keychain_runtime",
+                side_effect=observing_runtime,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_connect_proxy",
+                return_value=contextlib.nullcontext(43210),
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_review_sandbox_profile",
+                return_value="(version 1)",
+            ),
+            mock.patch.object(
+                providers,
+                "run",
+                side_effect=fail_during_start_publication,
+            ),
+            self.assertRaisesRegex(
+                providers.ReviewProcessLeakError,
+                "start publication was interrupted",
+            ),
+        ):
+            providers._claude_attempt(
+                review=self.review,
+                model=providers.CLAUDE_MODELS[0],
+                index=1,
+                env={},
+                executable=executable,
+                refresh_lock_protocol=self.claude_refresh_lock_protocol,
+            )
+
+        self.assertEqual(lifecycle_states, [(True, False)])
 
     def test_claude_persistence_diagnostic_reports_retained_private_carrier(
         self,
@@ -20787,6 +34416,336 @@ class ProviderPolicyTest(unittest.TestCase):
             str(carrier),
         )
 
+    def test_runtime_report_failure_preserves_sealed_persistence_source(
+        self,
+    ) -> None:
+        sealed = providers.ForwardedSignal(
+            signal.SIGTERM,
+            detail="fixture sealed report source",
+        )
+        state = providers._ClaudeTimeoutRootState(
+            lock=threading.RLock(),
+            fail_closed_root=providers._claude_macos_recovery_root(self.review),
+            root=sealed,
+            sealed=True,
+        )
+        setattr(sealed, "_codex_claude_timeout_root_state", state)
+        setattr(sealed, "_codex_claude_timeout_root_sealed_safe", True)
+        setattr(sealed, "_codex_claude_refresh_persistence_failed", True)
+        proof = providers._ClaudeRetainedCredentialProof(
+            artifact=(
+                self.review.container_dir
+                / "fixture-sealed-report-source"
+                / "config"
+                / providers.CLAUDE_CREDENTIAL_FILE_NAME
+            ),
+            digest=b"\x0c" * hashlib.sha256().digest_size,
+            file_identity=(12,),
+            ancestor_identities=((12,),),
+        )
+        providers._set_claude_retained_credential_proof(sealed, proof)
+        report_error = providers.ForwardedSignal(
+            signal.SIGINT,
+            detail="fixture report write signal",
+        )
+
+        with (
+            mock.patch.object(
+                providers,
+                "_update_claude_runtime_report",
+                side_effect=report_error,
+            ),
+            mock.patch.object(
+                providers,
+                "_validated_claude_retained_credential_carrier",
+                side_effect=AssertionError("sealed source was validated"),
+            ),
+            mock.patch.object(
+                providers,
+                "_validated_claude_retained_credential_artifact",
+                side_effect=AssertionError("sealed source was validated"),
+            ),
+            mock.patch.object(
+                providers,
+                "_validated_claude_retained_cleanup_artifact",
+                side_effect=AssertionError("sealed source was validated"),
+            ),
+        ):
+            providers._update_claude_runtime_report_preserving_persistence(
+                self.review,
+                {"phase": "fixture-sealed-source"},
+                sealed,
+            )
+
+        self.assertEqual(sealed.detail, "fixture sealed report source")
+        self.assertIs(
+            providers._get_claude_retained_credential_proof(sealed),
+            proof,
+        )
+        self.assertEqual(report_error.detail, "fixture report write signal")
+        self.assertFalse(
+            getattr(
+                report_error,
+                "_codex_claude_refresh_persistence_failed",
+                False,
+            )
+        )
+
+    def test_runtime_report_failure_reraises_sealed_target_unchanged(
+        self,
+    ) -> None:
+        sealed = providers.ForwardedSignal(
+            signal.SIGTERM,
+            detail="fixture sealed report target",
+        )
+        state = providers._ClaudeTimeoutRootState(
+            lock=threading.RLock(),
+            fail_closed_root=providers._claude_macos_recovery_root(self.review),
+            root=sealed,
+            sealed=True,
+        )
+        setattr(sealed, "_codex_claude_timeout_root_state", state)
+        setattr(sealed, "_codex_claude_timeout_root_sealed_safe", True)
+        proof = providers._ClaudeRetainedCredentialProof(
+            artifact=(
+                self.review.container_dir
+                / "fixture-sealed-report-target"
+                / "config"
+                / providers.CLAUDE_CREDENTIAL_FILE_NAME
+            ),
+            digest=b"\x0d" * hashlib.sha256().digest_size,
+            file_identity=(13,),
+            ancestor_identities=((13,),),
+        )
+        providers._set_claude_retained_credential_proof(sealed, proof)
+        source = RuntimeError("fixture raw report persistence source")
+        setattr(source, "_codex_claude_refresh_persistence_failed", True)
+
+        with (
+            mock.patch.object(
+                providers,
+                "_update_claude_runtime_report",
+                side_effect=sealed,
+            ),
+            mock.patch.object(
+                providers,
+                "_validated_claude_retained_credential_carrier",
+                side_effect=AssertionError("sealed target source was validated"),
+            ),
+            mock.patch.object(
+                providers,
+                "_validated_claude_retained_credential_artifact",
+                side_effect=AssertionError("sealed target source was validated"),
+            ),
+            mock.patch.object(
+                providers,
+                "_validated_claude_retained_cleanup_artifact",
+                side_effect=AssertionError("sealed target source was validated"),
+            ),
+            self.assertRaises(providers.ForwardedSignal) as raised,
+        ):
+            providers._update_claude_runtime_report_preserving_persistence(
+                self.review,
+                {"phase": "fixture-sealed-target"},
+                source,
+            )
+
+        self.assertIs(raised.exception, sealed)
+        self.assertEqual(sealed.detail, "fixture sealed report target")
+        self.assertIs(
+            providers._get_claude_retained_credential_proof(sealed),
+            proof,
+        )
+        self.assertFalse(
+            getattr(sealed, "_codex_claude_refresh_persistence_failed", False)
+        )
+
+    def test_coordination_translation_reraises_sealed_lock_error_without_read(
+        self,
+    ) -> None:
+        detail_reads = 0
+
+        class ObservedRefreshLockError(providers.ClaudeRefreshLockError):
+            def __str__(self) -> str:
+                nonlocal detail_reads
+                detail_reads += 1
+                return super().__str__()
+
+        sealed = ObservedRefreshLockError("fixture private sealed lock detail")
+        state = providers._ClaudeTimeoutRootState(
+            lock=threading.RLock(),
+            fail_closed_root=providers._claude_macos_recovery_root(self.review),
+            root=sealed,
+            sealed=True,
+        )
+        setattr(sealed, "_codex_claude_timeout_root_state", state)
+        setattr(sealed, "_codex_claude_timeout_root_sealed_safe", True)
+        proof = providers._ClaudeRetainedCredentialProof(
+            artifact=(
+                self.review.container_dir
+                / "fixture-sealed-coordination-error"
+                / "config"
+                / providers.CLAUDE_CREDENTIAL_FILE_NAME
+            ),
+            digest=b"\x0e" * hashlib.sha256().digest_size,
+            file_identity=(14,),
+            ancestor_identities=((14,),),
+        )
+        providers._set_claude_retained_credential_proof(sealed, proof)
+        handoff = providers._ClaudeMacOSTerminalHandoff()
+
+        with (
+            mock.patch.object(
+                providers,
+                "_complete_claude_macos_terminal_handoff",
+                side_effect=sealed,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_macos_refresh_lock_coordination_failure",
+            ) as translate,
+            self.assertRaises(ObservedRefreshLockError) as raised,
+        ):
+            providers._complete_claude_macos_terminal_handoff_with_coordination_translation(
+                self.review,
+                handoff,
+                None,
+            )
+
+        self.assertIs(raised.exception, sealed)
+        self.assertEqual(detail_reads, 0)
+        translate.assert_not_called()
+        self.assertIs(
+            providers._get_claude_retained_credential_proof(sealed),
+            proof,
+        )
+
+    def test_terminal_handoff_mask_failure_does_not_relink_sealed_root(
+        self,
+    ) -> None:
+        for label, abandonment_error in (
+            (
+                "forwarded-signal",
+                providers.ForwardedSignal(signal.SIGTERM),
+            ),
+            ("keyboard-interrupt", KeyboardInterrupt("fixture abandon interrupt")),
+        ):
+            with self.subTest(abandonment_error=label):
+                sealed = providers.ClaudeCredentialInspectionInconclusive(
+                    f"fixture sealed terminal handoff root {label}"
+                )
+                state = providers._ClaudeTimeoutRootState(
+                    lock=threading.RLock(),
+                    fail_closed_root=(
+                        providers._claude_macos_recovery_root(self.review)
+                    ),
+                    root=sealed,
+                    sealed=True,
+                )
+                setattr(sealed, "_codex_claude_timeout_root_state", state)
+                setattr(sealed, "_codex_claude_timeout_root_sealed_safe", True)
+                setattr(sealed, "_codex_claude_refresh_persistence_failed", True)
+                proof = providers._ClaudeRetainedCredentialProof(
+                    artifact=(
+                        self.review.container_dir
+                        / f"fixture-sealed-handoff-mask-{label}"
+                        / "config"
+                        / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                    ),
+                    digest=b"\x10" * hashlib.sha256().digest_size,
+                    file_identity=(16,),
+                    ancestor_identities=((16,),),
+                )
+                providers._set_claude_retained_credential_proof(sealed, proof)
+                mask_error = RuntimeError("fixture terminal handoff mask failure")
+                refresh_lock = mock.Mock()
+                refresh_lock.abandon.side_effect = abandonment_error
+
+                with (
+                    mock.patch.object(
+                        providers,
+                        "block_forwarded_signals",
+                        side_effect=mask_error,
+                    ),
+                    self.assertRaises(
+                        providers.ClaudeCredentialInspectionInconclusive
+                    ) as raised,
+                ):
+                    providers._begin_claude_macos_terminal_handoff(
+                        self.review,
+                        refresh_lock,
+                        sealed,
+                    )
+
+                self.assertIs(raised.exception, sealed)
+                self.assertIsNone(sealed.__cause__)
+                self.assertIsNone(sealed.__context__)
+                self.assertIs(
+                    providers._get_claude_retained_credential_proof(sealed),
+                    proof,
+                )
+
+    def test_outer_coordination_does_not_relink_distinct_sealed_pre_handoff_root(
+        self,
+    ) -> None:
+        sealed = providers.ClaudeCredentialInspectionInconclusive(
+            "fixture sealed pre-handoff root"
+        )
+        state = providers._ClaudeTimeoutRootState(
+            lock=threading.RLock(),
+            fail_closed_root=providers._claude_macos_recovery_root(self.review),
+            root=sealed,
+            sealed=True,
+        )
+        setattr(sealed, "_codex_claude_timeout_root_state", state)
+        setattr(sealed, "_codex_claude_timeout_root_sealed_safe", True)
+        setattr(sealed, "_codex_claude_refresh_persistence_failed", True)
+        proof = providers._ClaudeRetainedCredentialProof(
+            artifact=(
+                self.review.container_dir
+                / "fixture-sealed-pre-handoff"
+                / "config"
+                / providers.CLAUDE_CREDENTIAL_FILE_NAME
+            ),
+            digest=b"\x11" * hashlib.sha256().digest_size,
+            file_identity=(17,),
+            ancestor_identities=((17,),),
+        )
+        providers._set_claude_retained_credential_proof(sealed, proof)
+        coordination_error = RuntimeError("fixture distinct outer coordination failure")
+        carrier_coordination = mock.MagicMock()
+        carrier_coordination.__enter__.side_effect = coordination_error
+
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_macos_carrier_coordination",
+                return_value=carrier_coordination,
+            ),
+            mock.patch.object(
+                providers,
+                "_claude_persistence_source_from_error_graph",
+                return_value=(sealed, True),
+            ),
+            self.assertRaises(
+                providers.ClaudeCredentialInspectionInconclusive
+            ) as raised,
+        ):
+            with self.claude_keychain_runtime_impl(
+                self.review,
+                {},
+                self.claude_refresh_lock_protocol,
+            ):
+                self.fail("failing carrier coordination unexpectedly yielded")
+
+        self.assertIs(raised.exception, sealed)
+        self.assertIsNone(sealed.__cause__)
+        self.assertIsNone(sealed.__context__)
+        self.assertIs(
+            providers._get_claude_retained_credential_proof(sealed),
+            proof,
+        )
+
     def test_claude_persistence_diagnostic_populates_forwarded_signal_detail(
         self,
     ) -> None:
@@ -20825,6 +34784,363 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(
             report["authentication"]["recovery_carrier"],
             str(carrier),
+        )
+
+    def test_sealed_persistence_report_waits_for_state_and_stays_generic(
+        self,
+    ) -> None:
+        report_path = self.review.container_dir / "claude-runtime.json"
+        stale_paths = {
+            "recovery_carrier": "/fixture/private/stale-carrier",
+            "recovery_artifact": "/fixture/private/stale-artifact",
+            "recovery_cleanup_artifact": "/fixture/private/stale-cleanup",
+        }
+        providers.write_json(
+            report_path,
+            {"authentication": dict(stale_paths)},
+        )
+        sealed = providers.ForwardedSignal(
+            signal.SIGTERM,
+            detail="fixture sealed signal detail",
+        )
+        state = providers._ClaudeTimeoutRootState(
+            lock=threading.RLock(),
+            fail_closed_root=providers._claude_macos_recovery_root(self.review),
+            root=sealed,
+            sealed=True,
+        )
+        setattr(sealed, "_codex_claude_timeout_root_state", state)
+        setattr(sealed, "_codex_claude_timeout_root_sealed_safe", True)
+        setattr(sealed, "_codex_claude_refresh_persistence_failed", True)
+        validation_called = threading.Event()
+        call_started = threading.Event()
+        call_finished = threading.Event()
+        results: list[str | None] = []
+        errors: list[BaseException] = []
+
+        def expose_validation(
+            _review: providers.ReviewWorkspace,
+            _error: BaseException,
+        ) -> str | None:
+            validation_called.set()
+            return None
+
+        def record() -> None:
+            call_started.set()
+            try:
+                results.append(
+                    providers._record_claude_secondary_persistence_failure(
+                        self.review,
+                        sealed,
+                    )
+                )
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                call_finished.set()
+
+        worker = threading.Thread(target=record)
+        with (
+            mock.patch.object(
+                providers,
+                "_validated_claude_retained_credential_carrier",
+                side_effect=expose_validation,
+            ),
+            mock.patch.object(
+                providers,
+                "_validated_claude_retained_credential_artifact",
+                side_effect=expose_validation,
+            ),
+            mock.patch.object(
+                providers,
+                "_validated_claude_retained_cleanup_artifact",
+                side_effect=expose_validation,
+            ),
+        ):
+            with state.lock:
+                worker.start()
+                self.assertTrue(call_started.wait(timeout=2.0))
+                validation_before_release = validation_called.wait(timeout=0.2)
+                finished_before_release = call_finished.is_set()
+            worker.join(timeout=2.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(validation_before_release)
+        self.assertFalse(finished_before_release)
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC])
+        self.assertEqual(sealed.detail, "fixture sealed signal detail")
+        authentication = providers.read_json(report_path)["authentication"]
+        self.assertEqual(
+            authentication["refresh_persistence"],
+            "failed-after-attempt",
+        )
+        self.assertEqual(
+            authentication["secondary_diagnostic"],
+            providers.CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC,
+        )
+        for key in stale_paths:
+            self.assertNotIn(key, authentication)
+
+    def test_refresh_lock_recovery_wrapper_skips_each_sealed_role(
+        self,
+    ) -> None:
+        class LegacyError(RuntimeError):
+            add_note = None
+
+        for sealed_is_target in (True, False):
+            with self.subTest(sealed_is_target=sealed_is_target):
+                sealed = providers.ForwardedSignal(
+                    signal.SIGTERM,
+                    detail="fixture sealed recovery detail",
+                )
+                state = providers._ClaudeTimeoutRootState(
+                    lock=threading.RLock(),
+                    fail_closed_root=(
+                        providers._claude_macos_recovery_root(self.review)
+                    ),
+                    root=sealed,
+                    sealed=True,
+                )
+                setattr(sealed, "_codex_claude_timeout_root_state", state)
+                setattr(sealed, "_codex_claude_timeout_root_sealed_safe", True)
+                raw = RuntimeError("fixture raw refresh-lock peer")
+                recovery_path = f"/fixture/private/sealed-role-{sealed_is_target}"
+                source = raw if sealed_is_target else sealed
+                target = sealed if sealed_is_target else raw
+                setattr(
+                    source,
+                    "_codex_claude_refresh_lock_paths",
+                    (recovery_path,),
+                )
+                worker = threading.Thread(
+                    target=providers.attach_claude_refresh_lock_recovery,
+                    args=(target, source),
+                )
+
+                with state.lock:
+                    worker.start()
+                    worker.join(timeout=0.5)
+
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(sealed.detail, "fixture sealed recovery detail")
+                self.assertEqual(getattr(raw, "__notes__", []), [])
+                self.assertIsNone(
+                    getattr(target, "_codex_claude_refresh_lock_paths", None)
+                )
+
+        raw_target = LegacyError("fixture raw recovery target")
+        raw_source = RuntimeError("fixture raw recovery source")
+        raw_path = "/fixture/private/raw-recovery"
+        setattr(
+            raw_source,
+            "_codex_claude_refresh_lock_paths",
+            (raw_path,),
+        )
+
+        providers.attach_claude_refresh_lock_recovery(raw_target, raw_source)
+
+        self.assertEqual(
+            getattr(raw_target, "_codex_claude_refresh_lock_paths", None),
+            (raw_path,),
+        )
+        self.assertIsInstance(
+            raw_target.__cause__,
+            claude_refresh_lock.ClaudeRefreshLockCleanupDiagnostic,
+        )
+        self.assertIn(raw_path, self.format_exception_text(raw_target))
+
+        suppressed_target = LegacyError("fixture suppressed recovery target")
+        sensitive_path = "/fixture/private/suppressed-context/.oauth_refresh.lock"
+        hidden_context = RuntimeError(f"fixture hidden context at {sensitive_path}")
+        suppressed_target.__context__ = hidden_context
+        suppressed_target.__suppress_context__ = True
+        descriptor_source = RuntimeError("fixture descriptor-bound recovery source")
+        setattr(
+            descriptor_source,
+            "_codex_claude_refresh_lock_descriptor_bound",
+            True,
+        )
+
+        providers.attach_claude_refresh_lock_recovery(
+            suppressed_target,
+            descriptor_source,
+        )
+
+        self.assertIsInstance(
+            suppressed_target.__cause__,
+            claude_refresh_lock.ClaudeRefreshLockCleanupDiagnostic,
+        )
+        self.assertIsNone(suppressed_target.__cause__.__context__)
+        self.assertIs(suppressed_target.__context__, hidden_context)
+        self.assertTrue(suppressed_target.__suppress_context__)
+        self.assertNotIn(sensitive_path, self.format_exception_text(suppressed_target))
+
+    def test_terminal_handoff_binding_preserves_sealed_persistence_source(
+        self,
+    ) -> None:
+        sealed = providers.ForwardedSignal(
+            signal.SIGTERM,
+            detail="fixture sealed persistence source",
+        )
+        state = providers._ClaudeTimeoutRootState(
+            lock=threading.RLock(),
+            fail_closed_root=providers._claude_macos_recovery_root(self.review),
+            root=sealed,
+            sealed=True,
+        )
+        setattr(sealed, "_codex_claude_timeout_root_state", state)
+        setattr(sealed, "_codex_claude_timeout_root_sealed_safe", True)
+        setattr(sealed, "_codex_claude_refresh_persistence_failed", True)
+        proof = providers._ClaudeRetainedCredentialProof(
+            artifact=(
+                self.review.container_dir
+                / "fixture-sealed-bind-source"
+                / "config"
+                / providers.CLAUDE_CREDENTIAL_FILE_NAME
+            ),
+            digest=b"\x0a" * hashlib.sha256().digest_size,
+            file_identity=(10,),
+            ancestor_identities=((10,),),
+        )
+        providers._set_claude_retained_credential_proof(sealed, proof)
+        target = providers.ForwardedSignal(
+            signal.SIGINT,
+            detail="fixture raw handoff target",
+        )
+        handoff = providers._ClaudeMacOSTerminalHandoff(
+            abandonment_attempted=True,
+            recovery_source=sealed,
+            persistence_source=sealed,
+        )
+        validation_calls: list[BaseException] = []
+
+        def expose_validation(
+            _review: providers.ReviewWorkspace,
+            error: BaseException,
+        ) -> str:
+            validation_calls.append(error)
+            return "/fixture/private/sealed-source-path"
+
+        with (
+            mock.patch.object(
+                providers,
+                "_validated_claude_retained_credential_carrier",
+                side_effect=expose_validation,
+            ),
+            mock.patch.object(
+                providers,
+                "_validated_claude_retained_credential_artifact",
+                side_effect=expose_validation,
+            ),
+            mock.patch.object(
+                providers,
+                "_validated_claude_retained_cleanup_artifact",
+                side_effect=expose_validation,
+            ),
+        ):
+            binding_errors = providers._bind_claude_macos_terminal_handoff_recovery(
+                self.review,
+                handoff,
+                target,
+                sealed,
+            )
+
+        self.assertEqual(binding_errors, [sealed])
+        self.assertEqual(validation_calls, [])
+        self.assertEqual(sealed.detail, "fixture sealed persistence source")
+        self.assertIs(
+            providers._get_claude_retained_credential_proof(sealed),
+            proof,
+        )
+        self.assertEqual(target.detail, "fixture raw handoff target")
+        self.assertFalse(
+            getattr(target, "_codex_claude_refresh_persistence_failed", False)
+        )
+        self.assertIsNone(providers._get_claude_retained_credential_proof(target))
+        self.assertIsNone(
+            getattr(target, "_codex_claude_retained_cleanup_artifact", None)
+        )
+
+    def test_terminal_handoff_binding_does_not_mutate_sealed_target(
+        self,
+    ) -> None:
+        sealed = providers.ForwardedSignal(
+            signal.SIGTERM,
+            detail="fixture sealed handoff target",
+        )
+        state = providers._ClaudeTimeoutRootState(
+            lock=threading.RLock(),
+            fail_closed_root=providers._claude_macos_recovery_root(self.review),
+            root=sealed,
+            sealed=True,
+        )
+        setattr(sealed, "_codex_claude_timeout_root_state", state)
+        setattr(sealed, "_codex_claude_timeout_root_sealed_safe", True)
+        proof = providers._ClaudeRetainedCredentialProof(
+            artifact=(
+                self.review.container_dir
+                / "fixture-sealed-bind-target"
+                / "config"
+                / providers.CLAUDE_CREDENTIAL_FILE_NAME
+            ),
+            digest=b"\x0b" * hashlib.sha256().digest_size,
+            file_identity=(11,),
+            ancestor_identities=((11,),),
+        )
+        providers._set_claude_retained_credential_proof(sealed, proof)
+        source = RuntimeError("fixture raw persistence source")
+        setattr(source, "_codex_claude_refresh_persistence_failed", True)
+        handoff = providers._ClaudeMacOSTerminalHandoff(
+            abandonment_attempted=True,
+            recovery_source=source,
+            persistence_source=source,
+        )
+        validation_calls: list[BaseException] = []
+
+        def expose_validation(
+            _review: providers.ReviewWorkspace,
+            error: BaseException,
+        ) -> str:
+            validation_calls.append(error)
+            return "/fixture/private/sealed-target-path"
+
+        with (
+            mock.patch.object(
+                providers,
+                "_validated_claude_retained_credential_carrier",
+                side_effect=expose_validation,
+            ),
+            mock.patch.object(
+                providers,
+                "_validated_claude_retained_credential_artifact",
+                side_effect=expose_validation,
+            ),
+            mock.patch.object(
+                providers,
+                "_validated_claude_retained_cleanup_artifact",
+                side_effect=expose_validation,
+            ),
+        ):
+            binding_errors = providers._bind_claude_macos_terminal_handoff_recovery(
+                self.review,
+                handoff,
+                sealed,
+                source,
+            )
+
+        self.assertEqual(binding_errors, [])
+        self.assertEqual(validation_calls, [])
+        self.assertEqual(sealed.detail, "fixture sealed handoff target")
+        self.assertIs(
+            providers._get_claude_retained_credential_proof(sealed),
+            proof,
+        )
+        self.assertFalse(
+            getattr(sealed, "_codex_claude_refresh_persistence_failed", False)
+        )
+        self.assertIsNone(
+            getattr(sealed, "_codex_claude_retained_cleanup_artifact", None)
         )
 
     def test_claude_persistence_diagnostic_ignores_malformed_carrier_path(
@@ -20888,13 +35204,245 @@ class ProviderPolicyTest(unittest.TestCase):
                 providers.ClaudeCredentialInspectionInconclusive
             ) as raised,
         ):
-            with providers._claude_macos_carrier_coordination(
+            with self.claude_macos_carrier_coordination(
                 self.claude_refresh_lock_protocol
             ):
                 self.fail("inconclusive cleanup unexpectedly yielded")
 
         self.assertIn(str(lock_path), str(raised.exception))
         self.assertIn("no writer is active", str(raised.exception))
+
+    def test_macos_coordination_mask_call_result_restores_owner(self) -> None:
+        coordination = self.claude_macos_carrier_coordination.__wrapped__
+        instructions = tuple(dis.get_instructions(coordination))
+        matching_offsets = [
+            instruction.offset
+            for index, instruction in enumerate(instructions)
+            if instruction.opname in {"STORE_FAST", "POP_TOP"}
+            and index > 0
+            and instructions[index - 1].opname.startswith("CALL")
+            and any(
+                candidate.opname == "LOAD_GLOBAL"
+                and candidate.argval == "block_forwarded_signals"
+                for candidate in instructions[max(0, index - 12) : index]
+            )
+        ]
+        self.assertEqual(len(matching_offsets), 1)
+        target_offset = matching_offsets[0]
+        prior_mask = {signal.SIGINT}
+        mask_blocked = False
+        interruption = RuntimeError(
+            "fixture carrier coordination mask CALL-result interruption"
+        )
+
+        def block_signals(
+            *,
+            signal_mask_owner: object | None = None,
+        ) -> set[signal.Signals]:
+            nonlocal mask_blocked
+            mask_blocked = True
+            if signal_mask_owner is not None:
+                signal_mask_owner.publish_previous_signal_mask(prior_mask)
+            return prior_mask
+
+        def restore_mask(previous: set[signal.Signals] | None) -> None:
+            nonlocal mask_blocked
+            self.assertIs(previous, prior_mask)
+            mask_blocked = False
+
+        injected = False
+
+        def interrupt_result_store(
+            frame: object,
+            event: str,
+            _argument: object,
+        ) -> object:
+            nonlocal injected
+            if getattr(frame, "f_code", None) is not coordination.__code__:
+                return interrupt_result_store
+            setattr(frame, "f_trace_opcodes", True)
+            if (
+                not injected
+                and event == "opcode"
+                and getattr(frame, "f_lasti", None) == target_offset
+            ):
+                injected = True
+                raise interruption
+            return interrupt_result_store
+
+        try:
+            with (
+                mock.patch.object(
+                    providers,
+                    "_claude_credential_update_lock",
+                    side_effect=lambda _label: contextlib.nullcontext(),
+                ),
+                mock.patch.object(
+                    providers,
+                    "block_forwarded_signals",
+                    side_effect=block_signals,
+                ),
+                mock.patch.object(
+                    providers,
+                    "restore_signal_mask",
+                    side_effect=restore_mask,
+                ) as restore,
+                self.assertRaises(RuntimeError) as raised,
+            ):
+                sys.settrace(interrupt_result_store)
+                with self.claude_macos_carrier_coordination(
+                    self.claude_refresh_lock_protocol
+                ):
+                    pass
+        finally:
+            sys.settrace(None)
+
+        self.assertTrue(injected)
+        self.assertIs(raised.exception, interruption)
+        self.assertFalse(mask_blocked)
+        restore.assert_called_once_with(prior_mask)
+
+    def test_macos_coordination_retries_restore_before_lock_context_entry(
+        self,
+    ) -> None:
+        prior_mask = {signal.SIGINT}
+        pre_entry_signal = providers.ForwardedSignal(signal.SIGTERM)
+        first_restore_error = OSError("fixture first pre-entry restore failure")
+
+        def block_signals(
+            *,
+            signal_mask_owner: providers._ClaudeSignalMaskOwner | None = None,
+        ) -> set[signal.Signals]:
+            assert signal_mask_owner is not None
+            signal_mask_owner.publish_previous_signal_mask(prior_mask)
+            return prior_mask
+
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_credential_update_lock",
+                side_effect=lambda _label: contextlib.nullcontext(),
+            ),
+            mock.patch.object(
+                providers,
+                "block_forwarded_signals",
+                side_effect=block_signals,
+            ),
+            mock.patch.object(
+                providers,
+                "claude_refresh_lock",
+                side_effect=pre_entry_signal,
+            ),
+            mock.patch.object(
+                providers,
+                "restore_signal_mask",
+                side_effect=(first_restore_error, None),
+            ) as restore,
+            self.assertRaises(providers.ForwardedSignal) as raised,
+        ):
+            with self.claude_macos_carrier_coordination(
+                self.claude_refresh_lock_protocol
+            ):
+                self.fail("pre-entry interruption unexpectedly yielded")
+
+        self.assertIs(raised.exception, pre_entry_signal)
+        self.assertEqual(
+            restore.call_args_list,
+            [mock.call(prior_mask), mock.call(prior_mask)],
+        )
+        self.assert_cleanup_diagnostic_visible(pre_entry_signal)
+
+    def test_macos_coordination_masks_heartbeat_start_signal_until_cleanup(
+        self,
+    ) -> None:
+        lock_path = pathlib.Path("/fixture/.claude/.oauth_refresh.lock")
+        cleanup_error = claude_refresh_lock.ClaudeRefreshLockCleanupInconclusive(
+            "fixture heartbeat-start cleanup retained the refresh lock"
+        )
+        setattr(
+            cleanup_error,
+            "_codex_claude_refresh_lock_paths",
+            (str(lock_path),),
+        )
+        forwarded = providers.ForwardedSignal(signal.SIGTERM)
+        prior_mask = {signal.SIGINT}
+        events: list[str] = []
+        lease = mock.Mock(spec=["assert_held"])
+
+        def block_signals(
+            *,
+            signal_mask_owner: (providers._ClaudeMacOSTerminalHandoff | None) = None,
+        ) -> set[signal.Signals]:
+            if signal_mask_owner is not None:
+                signal_mask_owner.publish_previous_signal_mask(prior_mask)
+            events.append("signals-blocked")
+            return prior_mask
+
+        def restore_signals(observed: set[signal.Signals] | None) -> None:
+            self.assertIs(observed, prior_mask)
+            events.append("main-mask-restored")
+            raise forwarded
+
+        @contextlib.contextmanager
+        def refresh_lock(*_args: object, **_kwargs: object):
+            events.append("heartbeat-started")
+            try:
+                yield lease
+            except BaseException as error:
+                events.append("refresh-lock-cleanup")
+                claude_refresh_lock.attach_claude_refresh_lock_recovery(
+                    error,
+                    cleanup_error,
+                )
+                raise
+
+        with (
+            mock.patch.object(
+                providers,
+                "_claude_credential_update_lock",
+                side_effect=lambda _label: contextlib.nullcontext(),
+            ),
+            mock.patch.object(
+                providers,
+                "block_forwarded_signals",
+                side_effect=block_signals,
+            ),
+            mock.patch.object(
+                providers,
+                "restore_signal_mask",
+                side_effect=restore_signals,
+            ),
+            mock.patch.object(
+                providers,
+                "claude_refresh_lock",
+                side_effect=refresh_lock,
+            ),
+            self.assertRaises(providers.ForwardedSignal) as raised,
+        ):
+            with self.claude_macos_carrier_coordination(
+                self.claude_refresh_lock_protocol
+            ):
+                self.fail("signal during heartbeat start unexpectedly yielded")
+
+        self.assertIs(raised.exception, forwarded)
+        self.assertEqual(
+            events,
+            [
+                "signals-blocked",
+                "heartbeat-started",
+                "main-mask-restored",
+                "refresh-lock-cleanup",
+                "main-mask-restored",
+            ],
+        )
+        self.assertEqual(
+            getattr(
+                raised.exception,
+                "_codex_claude_refresh_lock_paths",
+                None,
+            ),
+            (str(lock_path),),
+        )
 
     def test_claude_linux_stages_single_attempt_credential_each_time(
         self,
@@ -20927,8 +35475,11 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
         def run_after_spawn(*_args: object, **kwargs: object) -> Completed:
+            on_process_starting = kwargs.get("on_process_starting")
             on_process_started = kwargs.get("on_process_started")
+            assert callable(on_process_starting)
             assert callable(on_process_started)
+            on_process_starting()
             on_process_started()
             return completed
 
@@ -22339,11 +36890,34 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
         @contextlib.contextmanager
-        def runtime(_review, env, _refresh_lock_protocol):
+        def runtime(
+            _review,
+            env,
+            _refresh_lock_protocol,
+            *,
+            process_started,
+            process_quiescent,
+        ):
+            self.assertFalse(process_started())
+            self.assertFalse(process_quiescent())
             yield dict(env)
+            self.assertTrue(process_started())
+            self.assertTrue(process_quiescent())
             raise providers.ClaudeKeychainCredentialUnavailable(
                 "refresh persistence failed"
             )
+
+        def run_review(*_args: object, **kwargs: object) -> Completed:
+            on_process_starting = kwargs.get("on_process_starting")
+            on_process_started = kwargs.get("on_process_started")
+            on_process_quiescent = kwargs.get("on_process_quiescent")
+            assert callable(on_process_starting)
+            assert callable(on_process_started)
+            assert callable(on_process_quiescent)
+            on_process_starting()
+            on_process_started()
+            on_process_quiescent()
+            return completed
 
         with (
             mock.patch.object(providers, "_is_claude_linux_host", return_value=False),
@@ -22370,7 +36944,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 "_claude_review_sandbox_profile",
                 return_value="(version 1)",
             ),
-            mock.patch.object(providers, "run", return_value=completed),
+            mock.patch.object(providers, "run", side_effect=run_review),
             self.assertRaisesRegex(
                 providers.ClaudeKeychainCredentialUnavailable,
                 "refresh persistence failed",
@@ -22402,6 +36976,415 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(attempt.category, "blocked-authentication")
         self.assertEqual(attempt.returncode, 0)
 
+    def test_claude_quiescence_mask_call_results_restore_owner(self) -> None:
+        attempt = providers._claude_attempt_with_output
+        instructions = tuple(dis.get_instructions(attempt))
+        injection_sites: list[tuple[int, int]] = []
+        for index, instruction in enumerate(instructions[:-1]):
+            if not instruction.opname.startswith("CALL"):
+                continue
+            loaded_globals = [
+                candidate.argval
+                for candidate in instructions[max(0, index - 12) : index]
+                if candidate.opname == "LOAD_GLOBAL"
+            ]
+            if not loaded_globals or loaded_globals[-1] != "block_forwarded_signals":
+                continue
+            result_instruction = instructions[index + 1]
+            if not (
+                result_instruction.opname == "STORE_FAST"
+                and result_instruction.argval == "quiescence_mask"
+            ):
+                continue
+            source_line = next(
+                line
+                for candidate in reversed(instructions[max(0, index - 12) : index + 1])
+                if (
+                    line := (
+                        getattr(
+                            getattr(candidate, "positions", None),
+                            "lineno",
+                            None,
+                        )
+                        or (
+                            candidate.starts_line
+                            if isinstance(candidate.starts_line, int)
+                            and not isinstance(candidate.starts_line, bool)
+                            else None
+                        )
+                    )
+                )
+                is not None
+            )
+            injection_sites.append((result_instruction.offset, source_line))
+
+        self.assertEqual(len(injection_sites), 2, injection_sites)
+        linux_source_line = min(line for _offset, line in injection_sites)
+        completed = Completed(
+            argv=("claude",),
+            returncode=0,
+            stdout=b"{}",
+            stderr=b"",
+        )
+        executable = pathlib.Path("/verified/claude")
+        prior_mask = {signal.SIGINT}
+
+        for target_offset, source_line in injection_sites:
+            linux = source_line == linux_source_line
+            with self.subTest(
+                platform="linux" if linux else "macos",
+                target_offset=target_offset,
+            ):
+                mask_blocked = False
+                interruption = RuntimeError(
+                    "fixture quiescence mask CALL-result interruption"
+                )
+                output = mock.create_autospec(providers.AttemptOutput, instance=True)
+                output.run_arguments.return_value = {}
+
+                def block_signals(
+                    *,
+                    signal_mask_owner: object | None = None,
+                ) -> set[signal.Signals]:
+                    nonlocal mask_blocked
+                    mask_blocked = True
+                    if signal_mask_owner is not None:
+                        signal_mask_owner.publish_previous_signal_mask(prior_mask)
+                    return prior_mask
+
+                def restore_mask(
+                    previous: set[signal.Signals] | None,
+                ) -> None:
+                    nonlocal mask_blocked
+                    self.assertIs(previous, prior_mask)
+                    mask_blocked = False
+
+                @contextlib.contextmanager
+                def linux_runtime(*_args: object, **_kwargs: object):
+                    yield mock.Mock(argv=("sandbox",), env={})
+
+                @contextlib.contextmanager
+                def keychain_runtime(
+                    _review: ReviewWorkspace,
+                    env: dict[str, str],
+                    *_args: object,
+                    **_kwargs: object,
+                ):
+                    yield dict(env)
+
+                injected = False
+
+                def interrupt_result_store(
+                    frame: object,
+                    event: str,
+                    _argument: object,
+                ) -> object:
+                    nonlocal injected
+                    if getattr(frame, "f_code", None) is not attempt.__code__:
+                        return interrupt_result_store
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        raise interruption
+                    return interrupt_result_store
+
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(
+                        mock.patch.object(
+                            providers,
+                            "_is_claude_linux_host",
+                            return_value=linux,
+                        )
+                    )
+                    for name, side_effect in (
+                        (
+                            "_with_claude_review_tool_path",
+                            lambda _review, env: dict(env),
+                        ),
+                        (
+                            "_prepare_claude_tls_environment",
+                            lambda _review, env: dict(env),
+                        ),
+                    ):
+                        stack.enter_context(
+                            mock.patch.object(
+                                providers,
+                                name,
+                                side_effect=side_effect,
+                            )
+                        )
+                    stack.enter_context(
+                        mock.patch.object(
+                            providers,
+                            "_update_claude_runtime_report",
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            providers,
+                            "_record_claude_secondary_persistence_failure",
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            providers,
+                            "run",
+                            return_value=completed,
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            providers,
+                            "block_forwarded_signals",
+                            side_effect=block_signals,
+                        )
+                    )
+                    restore = stack.enter_context(
+                        mock.patch.object(
+                            providers,
+                            "restore_signal_mask",
+                            side_effect=restore_mask,
+                        )
+                    )
+                    if linux:
+                        stack.enter_context(
+                            mock.patch.object(
+                                providers,
+                                "_claude_linux_review_runtime",
+                                side_effect=linux_runtime,
+                            )
+                        )
+                    else:
+                        stack.enter_context(
+                            mock.patch.object(
+                                providers,
+                                "_claude_keychain_runtime",
+                                side_effect=keychain_runtime,
+                            )
+                        )
+                        stack.enter_context(
+                            mock.patch.object(
+                                providers,
+                                "_claude_connect_proxy",
+                                return_value=contextlib.nullcontext(43210),
+                            )
+                        )
+                        stack.enter_context(
+                            mock.patch.object(
+                                providers,
+                                "_claude_review_sandbox_profile",
+                                return_value="(version 1)",
+                            )
+                        )
+                    raised = stack.enter_context(self.assertRaises(RuntimeError))
+                    try:
+                        sys.settrace(interrupt_result_store)
+                        attempt(
+                            review=self.review,
+                            model=providers.CLAUDE_MODELS[0],
+                            index=1,
+                            env={"ANTHROPIC_API_KEY": "fixture"},
+                            executable=executable,
+                            launch=None,
+                            refresh_lock_protocol=(self.claude_refresh_lock_protocol),
+                            output=output,
+                        )
+                    finally:
+                        sys.settrace(None)
+
+                self.assertTrue(injected)
+                self.assertIs(raised.exception, interruption)
+                self.assertFalse(mask_blocked)
+                restore.assert_called_once_with(prior_mask)
+
+    def test_claude_quiescence_keeps_body_signal_across_restore_retry(
+        self,
+    ) -> None:
+        completed = Completed(
+            argv=("claude",),
+            returncode=0,
+            stdout=b"{}",
+            stderr=b"",
+        )
+        executable = pathlib.Path("/verified/claude")
+        prior_mask = {signal.SIGINT}
+
+        class FixtureEvent:
+            def __init__(self, set_error: BaseException | None = None) -> None:
+                self._set = False
+                self._set_error = set_error
+
+            def is_set(self) -> bool:
+                return self._set
+
+            def set(self) -> None:
+                if self._set_error is not None:
+                    raise self._set_error
+                self._set = True
+
+        restore_error_factories: tuple[tuple[str, Callable[[], BaseException]], ...] = (
+            (
+                "forwarded-signal",
+                lambda: providers.ForwardedSignal(signal.SIGINT),
+            ),
+            ("ordinary", lambda: OSError("fixture transient restore failure")),
+        )
+
+        for linux in (True, False):
+            for restore_label, restore_error_factory in restore_error_factories:
+                with self.subTest(
+                    platform="linux" if linux else "macos",
+                    restore_error=restore_label,
+                ):
+                    primary_signal = providers.ForwardedSignal(signal.SIGTERM)
+                    restore_error = restore_error_factory()
+                    quiescent_event = FixtureEvent(primary_signal)
+                    observed_owners: list[providers._ClaudeSignalMaskOwner] = []
+
+                    def block_signals(
+                        *,
+                        signal_mask_owner: (
+                            providers._ClaudeSignalMaskOwner | None
+                        ) = None,
+                    ) -> set[signal.Signals]:
+                        assert signal_mask_owner is not None
+                        signal_mask_owner.publish_previous_signal_mask(prior_mask)
+                        observed_owners.append(signal_mask_owner)
+                        return prior_mask
+
+                    @contextlib.contextmanager
+                    def linux_runtime(*_args: object, **_kwargs: object):
+                        yield mock.Mock(argv=("sandbox",), env={})
+
+                    @contextlib.contextmanager
+                    def keychain_runtime(
+                        _review: ReviewWorkspace,
+                        env: dict[str, str],
+                        *_args: object,
+                        **_kwargs: object,
+                    ):
+                        yield dict(env)
+
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(
+                            mock.patch.object(
+                                providers,
+                                "_is_claude_linux_host",
+                                return_value=linux,
+                            )
+                        )
+                        for name, side_effect in (
+                            (
+                                "_with_claude_review_tool_path",
+                                lambda _review, env: dict(env),
+                            ),
+                            (
+                                "_prepare_claude_tls_environment",
+                                lambda _review, env: dict(env),
+                            ),
+                        ):
+                            stack.enter_context(
+                                mock.patch.object(
+                                    providers,
+                                    name,
+                                    side_effect=side_effect,
+                                )
+                            )
+                        stack.enter_context(
+                            mock.patch.object(
+                                providers,
+                                "_update_claude_runtime_report",
+                            )
+                        )
+                        stack.enter_context(
+                            mock.patch.object(
+                                providers,
+                                ("_record_claude_secondary_persistence_failure"),
+                            )
+                        )
+                        stack.enter_context(
+                            mock.patch.object(
+                                providers,
+                                "run",
+                                return_value=completed,
+                            )
+                        )
+                        stack.enter_context(
+                            mock.patch.object(
+                                providers.threading,
+                                "Event",
+                                return_value=quiescent_event,
+                            )
+                        )
+                        stack.enter_context(
+                            mock.patch.object(
+                                providers,
+                                "block_forwarded_signals",
+                                side_effect=block_signals,
+                            )
+                        )
+                        restore = stack.enter_context(
+                            mock.patch.object(
+                                providers,
+                                "restore_signal_mask",
+                                side_effect=(restore_error, None),
+                            )
+                        )
+                        if linux:
+                            stack.enter_context(
+                                mock.patch.object(
+                                    providers,
+                                    "_claude_linux_review_runtime",
+                                    side_effect=linux_runtime,
+                                )
+                            )
+                        else:
+                            stack.enter_context(
+                                mock.patch.object(
+                                    providers,
+                                    "_claude_keychain_runtime",
+                                    side_effect=keychain_runtime,
+                                )
+                            )
+                            stack.enter_context(
+                                mock.patch.object(
+                                    providers,
+                                    "_claude_connect_proxy",
+                                    return_value=contextlib.nullcontext(43210),
+                                )
+                            )
+                            stack.enter_context(
+                                mock.patch.object(
+                                    providers,
+                                    "_claude_review_sandbox_profile",
+                                    return_value="(version 1)",
+                                )
+                            )
+                        raised = stack.enter_context(
+                            self.assertRaises(providers.ForwardedSignal)
+                        )
+                        providers._claude_attempt(
+                            review=self.review,
+                            model=providers.CLAUDE_MODELS[0],
+                            index=1,
+                            env={"ANTHROPIC_API_KEY": "fixture"},
+                            executable=executable,
+                            refresh_lock_protocol=(self.claude_refresh_lock_protocol),
+                        )
+
+                    self.assertIs(raised.exception, primary_signal)
+                    self.assertEqual(
+                        restore.call_args_list,
+                        [mock.call(prior_mask), mock.call(prior_mask)],
+                    )
+                    self.assertEqual(len(observed_owners), 1)
+                    self.assertFalse(observed_owners[0].signal_mask_owner_active)
+                    self.assert_cleanup_diagnostic_visible(primary_signal)
+
     def test_claude_post_run_auth_rejection_precedes_inspection_failure(
         self,
     ) -> None:
@@ -22423,7 +37406,7 @@ class ProviderPolicyTest(unittest.TestCase):
         )
 
         @contextlib.contextmanager
-        def runtime(_review, env, _refresh_lock_protocol):
+        def runtime(_review, env, _refresh_lock_protocol, **_kwargs):
             yield dict(env)
             raise providers.ClaudeCredentialInspectionInconclusive(
                 "final credential snapshot unavailable"
@@ -22476,6 +37459,122 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIsInstance(attempt, providers.Attempt)
         self.assertEqual(attempt.category, "auth")
         self.assertEqual(attempt.returncode, 1)
+
+    def test_claude_post_run_sealed_inspection_root_is_not_relinked_or_annotated(
+        self,
+    ) -> None:
+        executable = self.review.container_dir / "verified-claude"
+        executable.write_bytes(b"snapshot")
+
+        for category, stderr in (
+            ("auth", b"Login expired; please run /login"),
+            ("other", b"fixture non-auth runtime failure"),
+        ):
+            with self.subTest(category=category):
+                providers.write_json(
+                    self.review.container_dir / "claude-runtime.json",
+                    {
+                        "phase": "publisher-and-capabilities-verified",
+                        "outer_sandbox": {"status": "pending-runtime-launch"},
+                        "authentication": {"status": "pending"},
+                    },
+                )
+                completed = Completed(
+                    argv=("claude",),
+                    returncode=1,
+                    stdout=b"",
+                    stderr=stderr,
+                )
+                sealed = providers.ClaudeCredentialInspectionInconclusive(
+                    f"fixture sealed {category} inspection root"
+                )
+                state = providers._ClaudeTimeoutRootState(
+                    lock=threading.RLock(),
+                    fail_closed_root=(
+                        providers._claude_macos_recovery_root(self.review)
+                    ),
+                    root=sealed,
+                    sealed=True,
+                )
+                setattr(sealed, "_codex_claude_timeout_root_state", state)
+                setattr(sealed, "_codex_claude_timeout_root_sealed_safe", True)
+                setattr(sealed, "_codex_claude_refresh_persistence_failed", True)
+                proof = providers._ClaudeRetainedCredentialProof(
+                    artifact=(
+                        self.review.container_dir
+                        / f"fixture-sealed-attempt-{category}"
+                        / "config"
+                        / providers.CLAUDE_CREDENTIAL_FILE_NAME
+                    ),
+                    digest=b"\x0f" * hashlib.sha256().digest_size,
+                    file_identity=(15,),
+                    ancestor_identities=((15,),),
+                )
+                providers._set_claude_retained_credential_proof(sealed, proof)
+
+                @contextlib.contextmanager
+                def runtime(
+                    _review: providers.ReviewWorkspace,
+                    env: dict[str, str],
+                    _refresh_lock_protocol: object,
+                    **_kwargs: object,
+                ):
+                    yield dict(env)
+                    raise sealed
+
+                with (
+                    mock.patch.object(
+                        providers,
+                        "_is_claude_linux_host",
+                        return_value=False,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_with_claude_review_tool_path",
+                        side_effect=lambda _review, env: dict(env),
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_prepare_claude_tls_environment",
+                        side_effect=lambda _review, env: dict(env),
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_claude_keychain_runtime",
+                        side_effect=runtime,
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_claude_connect_proxy",
+                        return_value=contextlib.nullcontext(43210),
+                    ),
+                    mock.patch.object(
+                        providers,
+                        "_claude_review_sandbox_profile",
+                        return_value="(version 1)",
+                    ),
+                    mock.patch.object(providers, "run", return_value=completed),
+                    self.assertRaises(
+                        providers.ClaudeCredentialInspectionInconclusive
+                    ) as raised,
+                ):
+                    providers._claude_attempt(
+                        review=self.review,
+                        model=providers.CLAUDE_MODELS[0],
+                        index=1,
+                        env={},
+                        executable=executable,
+                        refresh_lock_protocol=(self.claude_refresh_lock_protocol),
+                    )
+
+                self.assertIs(raised.exception, sealed)
+                self.assertIsNone(sealed.__cause__)
+                self.assertIsNone(sealed.__context__)
+                self.assertIs(
+                    providers._get_claude_retained_credential_proof(sealed),
+                    proof,
+                )
+                self.assertFalse(hasattr(sealed, "_codex_claude_persistence_attempt"))
 
     def test_claude_malformed_result_finalizes_runtime_report(self) -> None:
         executable = self.review.container_dir / "verified-claude"
@@ -23767,6 +38866,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
     def test_claude_unix_proxy_thread_failure_closes_server(self) -> None:
         server = mock.Mock()
+        server.is_serving.return_value = False
         thread = mock.Mock()
         thread.start.side_effect = RuntimeError("thread unavailable")
 
@@ -23807,6 +38907,8 @@ class ProviderPolicyTest(unittest.TestCase):
         thread.ident = 123
         thread.is_alive.return_value = False
         thread.start.side_effect = forwarded
+        thread._started = threading.Event()
+        thread._started.set()
 
         def create_server(
             socket_path: pathlib.Path,
@@ -24142,6 +39244,7 @@ class ProviderPolicyTest(unittest.TestCase):
 
     def test_claude_proxy_thread_failure_closes_server(self) -> None:
         server = mock.Mock()
+        server.is_serving.return_value = False
         thread = mock.Mock()
         thread.start.side_effect = RuntimeError("thread unavailable")
 
@@ -24173,6 +39276,8 @@ class ProviderPolicyTest(unittest.TestCase):
         thread.ident = 123
         thread.is_alive.return_value = False
         thread.start.side_effect = forwarded
+        thread._started = threading.Event()
+        thread._started.set()
 
         with (
             mock.patch.object(
@@ -24292,7 +39397,7 @@ class ProviderPolicyTest(unittest.TestCase):
             providers._shutdown_claude_proxy_server(
                 server,
                 thread,
-                thread_started=True,
+                thread_start_state=(providers._ClaudeThreadStartState.CONFIRMED),
                 primary_error=None,
             )
 
@@ -24325,7 +39430,9 @@ class ProviderPolicyTest(unittest.TestCase):
                     providers._shutdown_claude_proxy_server(
                         server,
                         thread,
-                        thread_started=True,
+                        thread_start_state=(
+                            providers._ClaudeThreadStartState.CONFIRMED
+                        ),
                         primary_error=body_error,
                     )
 

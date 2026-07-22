@@ -118,10 +118,22 @@ class NamedLaneGuardTest(unittest.TestCase):
         references = bundle / "references"
         references.mkdir()
         shutil.copy2(
+            SCRIPTS.parent / "references/claude-stream-compatibility.json",
+            references,
+        )
+        shutil.copy2(
             SCRIPTS.parent / "references/claude-2.1.212-stream-schema.json",
             references,
         )
         return scripts, guard
+
+    @staticmethod
+    def stream_companion_paths(scripts: pathlib.Path) -> tuple[pathlib.Path, ...]:
+        return (
+            scripts.parent / "references/claude-stream-compatibility.json",
+            scripts.parent / "references/claude-2.1.212-stream-schema.json",
+            scripts / "review_runtime/claude_capabilities.py",
+        )
 
     def isolated_guard_command(
         self,
@@ -466,11 +478,20 @@ class NamedLaneGuardTest(unittest.TestCase):
         expected_origins = {
             "review_runtime": str(runtime / "__init__.py"),
             "review_runtime.common": str(runtime / "common.py"),
+            "review_runtime.claude_version_policy": str(
+                runtime / "claude_version_policy.py"
+            ),
+            "review_runtime.claude_capabilities": str(
+                runtime / "claude_capabilities.py"
+            ),
             "review_runtime.claude_refresh_lock": str(
                 runtime / "claude_refresh_lock.py"
             ),
             "review_runtime.claude_linux": str(runtime / "claude_linux.py"),
             "review_runtime.claude_provenance": str(runtime / "claude_provenance.py"),
+            "review_runtime.claude_stream_contract": str(
+                runtime / "claude_stream_contract.py"
+            ),
             "review_runtime.named_claude_preflight": str(
                 runtime / "named_claude_preflight.py"
             ),
@@ -587,18 +608,20 @@ class NamedLaneGuardTest(unittest.TestCase):
             "import json\n"
             "module = sys.modules['review_runtime.named_claude_preflight']\n"
             "observed = {}\n"
-            "def capture(*, explicit_path, home):\n"
+            "def capture(*, explicit_path, explicit_version, home):\n"
             "    observed['explicit_path'] = explicit_path\n"
+            "    observed['explicit_version'] = explicit_version\n"
             "    observed['home'] = str(home)\n"
             "    return {\n"
             "        'classification': 'blocked',\n"
-            "        'reason': 'exact-version-unavailable',\n"
+            "        'reason': 'compatible-version-unavailable',\n"
             "    }\n"
             "module.preflight = capture\n"
             "returncode = namespace['main'](())\n"
             "print(json.dumps({\n"
             "    'home': observed['home'],\n"
             "    'explicit_path': observed['explicit_path'],\n"
+            "    'explicit_version': observed['explicit_version'],\n"
             "    'returncode': returncode,\n"
             "}, sort_keys=True))\n"
         )
@@ -622,7 +645,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             json.loads(lines[0]),
             {
                 "classification": "blocked",
-                "reason": "exact-version-unavailable",
+                "reason": "compatible-version-unavailable",
             },
         )
         observed = json.loads(lines[1])
@@ -631,10 +654,12 @@ class NamedLaneGuardTest(unittest.TestCase):
         )
         self.assertEqual(observed["home"], str(expected_home))
         self.assertIsNone(observed["explicit_path"])
+        self.assertIsNone(observed["explicit_version"])
         self.assertEqual(observed["returncode"], 1)
 
-    def test_validator_entrypoint_loads_only_bound_manifest_source(self) -> None:
+    def test_validator_entrypoint_loads_only_bound_manifest_sources(self) -> None:
         scripts, guard = self.copy_guard_bundle()
+        runtime = scripts / "review_runtime"
         argparse_marker = self.root / "validator-argparse-shadow.marker"
         json_marker = self.root / "validator-json-shadow.marker"
         pyc_marker = self.root / "validator-pyc.marker"
@@ -659,13 +684,34 @@ class NamedLaneGuardTest(unittest.TestCase):
         )
 
         expected_origin = str(scripts / "validate_claude_stream.py")
-        expected_schema = str(
-            scripts.parent / "references/claude-2.1.212-stream-schema.json"
-        )
+        expected_runtime_origins = {
+            "review_runtime": str(runtime / "__init__.py"),
+            "review_runtime.common": str(runtime / "common.py"),
+            "review_runtime.claude_version_policy": str(
+                runtime / "claude_version_policy.py"
+            ),
+            "review_runtime.claude_capabilities": str(
+                runtime / "claude_capabilities.py"
+            ),
+            "review_runtime.claude_provenance": str(runtime / "claude_provenance.py"),
+            "review_runtime.claude_stream_contract": str(
+                runtime / "claude_stream_contract.py"
+            ),
+        }
+        expected_companions = {
+            "COMPATIBILITY": str(
+                scripts.parent / "references/claude-stream-compatibility.json"
+            ),
+            "BASELINE": str(
+                scripts.parent / "references/claude-2.1.212-stream-schema.json"
+            ),
+            "CAPABILITY": str(runtime / "claude_capabilities.py"),
+        }
         body = (
             "module = sys.modules['validate_claude_stream']\n"
             f"expected_origin = {expected_origin!r}\n"
-            f"expected_schema = {expected_schema!r}\n"
+            f"expected_runtime = {expected_runtime_origins!r}\n"
+            f"expected_companions = {expected_companions!r}\n"
             "if module.__file__ != expected_origin:\n"
             "    raise RuntimeError(f'unexpected validator file: {module.__file__}')\n"
             "if module.__spec__.origin != expected_origin:\n"
@@ -674,14 +720,32 @@ class NamedLaneGuardTest(unittest.TestCase):
             "if module.__package__ != '':\n"
             "    raise RuntimeError(f'unexpected validator package: "
             "{module.__package__!r}')\n"
-            "if str(module.SCHEMA_PATH) != expected_schema:\n"
-            "    raise RuntimeError(f'unexpected schema path: {module.SCHEMA_PATH}')\n"
-            "if module.SCHEMA_BYTES != pathlib.Path(expected_schema).read_bytes():\n"
-            "    raise RuntimeError('schema bytes were not bound exactly')\n"
+            "for name, origin in expected_runtime.items():\n"
+            "    runtime_module = sys.modules[name]\n"
+            "    if runtime_module.__file__ != origin "
+            "or runtime_module.__spec__.origin != origin:\n"
+            "        raise RuntimeError(f'unexpected runtime origin for {name}')\n"
+            "if list(sys.modules['review_runtime'].__path__):\n"
+            "    raise RuntimeError('bound package search path must remain closed')\n"
+            "path_and_bytes = (\n"
+            "    ('COMPATIBILITY_PATH', 'COMPATIBILITY_JSON_BYTES', "
+            "expected_companions['COMPATIBILITY']),\n"
+            "    ('SCHEMA_PATH', 'BASELINE_SCHEMA_BYTES', "
+            "expected_companions['BASELINE']),\n"
+            "    ('CAPABILITY_PATH', 'CAPABILITY_SOURCE_BYTES', "
+            "expected_companions['CAPABILITY']),\n"
+            ")\n"
+            "for path_name, bytes_name, expected_path in path_and_bytes:\n"
+            "    if str(getattr(module, path_name)) != expected_path:\n"
+            "        raise RuntimeError(f'unexpected companion path: {path_name}')\n"
+            "    if getattr(module, bytes_name) != pathlib.Path(expected_path).read_bytes():\n"
+            "        raise RuntimeError(f'companion bytes were not bound: {bytes_name}')\n"
             "loaded = sorted(name for name in sys.modules "
-            "if name == 'validate_claude_stream' "
+            "if name == 'review_runtime' or name.startswith('review_runtime.') "
+            "or name == 'validate_claude_stream' "
             "or name.startswith('validate_claude_stream.'))\n"
-            "if loaded != ['validate_claude_stream']:\n"
+            "expected_loaded = sorted([*expected_runtime, 'validate_claude_stream'])\n"
+            "if loaded != expected_loaded:\n"
             "    raise RuntimeError(f'unexpected validator closure: {loaded}')\n"
             "if namespace['_MAIN_ARGV'] != ('--sentinel',):\n"
             "    raise RuntimeError(f'arguments not forwarded: "
@@ -714,9 +778,19 @@ class NamedLaneGuardTest(unittest.TestCase):
             ),
             (
                 "validate-claude-stream",
-                lambda scripts: (
-                    scripts.parent / "references/claude-2.1.212-stream-schema.json"
-                ),
+                lambda scripts: self.stream_companion_paths(scripts)[0],
+            ),
+            (
+                "validate-claude-stream",
+                lambda scripts: self.stream_companion_paths(scripts)[1],
+            ),
+            (
+                "validate-claude-stream",
+                lambda scripts: self.stream_companion_paths(scripts)[2],
+            ),
+            (
+                "preflight-claude",
+                lambda scripts: scripts / "review_runtime/fd_exec.py",
             ),
         )
         for subcommand, companion_path in cases:
@@ -751,108 +825,135 @@ class NamedLaneGuardTest(unittest.TestCase):
                     )
 
     def test_control_companion_same_content_replacement_is_allowed(self) -> None:
-        scripts, guard = self.copy_guard_bundle()
-        schema = scripts.parent / "references/claude-2.1.212-stream-schema.json"
-        replacement = schema.with_name("replacement-schema.json")
-        body = (
-            "import os\n"
-            f"schema = pathlib.Path({str(schema)!r})\n"
-            f"replacement = pathlib.Path({str(replacement)!r})\n"
-            "replacement.write_bytes(schema.read_bytes())\n"
-            "os.replace(replacement, schema)\n"
-            "result = namespace['main'](('--help',))\n"
-            "if result != 3:\n"
-            "    raise RuntimeError(f'unexpected validator result: {result}')\n"
-            "print('same-content replacement accepted')\n"
-        )
-        completed = subprocess.run(
-            self.guard_probe_command(
-                guard,
-                body,
-                guard_arguments=("validate-claude-stream",),
-            ),
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        for companion_index in range(3):
+            with self.subTest(companion_index=companion_index):
+                scripts, guard = self.copy_guard_bundle()
+                companion = self.stream_companion_paths(scripts)[companion_index]
+                replacement = companion.with_name(
+                    f"replacement-{companion_index}-{companion.name}"
+                )
+                body = (
+                    "import os\n"
+                    f"companion = pathlib.Path({str(companion)!r})\n"
+                    f"replacement = pathlib.Path({str(replacement)!r})\n"
+                    "replacement.write_bytes(companion.read_bytes())\n"
+                    "os.replace(replacement, companion)\n"
+                    "result = namespace['main'](('--help',))\n"
+                    "if result != 3:\n"
+                    "    raise RuntimeError(f'unexpected validator result: {result}')\n"
+                    "print('same-content replacement accepted')\n"
+                )
+                completed = subprocess.run(
+                    self.guard_probe_command(
+                        guard,
+                        body,
+                        guard_arguments=("validate-claude-stream",),
+                    ),
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(
-            completed.stdout.splitlines()[-1],
-            "same-content replacement accepted",
-        )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(
+                    completed.stdout.splitlines()[-1],
+                    "same-content replacement accepted",
+                )
 
     def test_control_companion_content_is_revalidated_before_main(self) -> None:
-        scripts, guard = self.copy_guard_bundle()
-        schema = scripts.parent / "references/claude-2.1.212-stream-schema.json"
-        body = (
-            "import os\n"
-            f"schema = pathlib.Path({str(schema)!r})\n"
-            "before = os.stat(schema, follow_symlinks=False)\n"
-            "with schema.open('r+b') as stream:\n"
-            "    original = stream.read(1)\n"
-            "    stream.seek(0)\n"
-            "    stream.write(b'X' if original != b'X' else b'Y')\n"
-            "    stream.flush()\n"
-            "    os.fsync(stream.fileno())\n"
-            "after = os.stat(schema, follow_symlinks=False)\n"
-            "identity = lambda value: (value.st_dev, value.st_ino, value.st_mode, "
-            "value.st_uid, value.st_size)\n"
-            "if identity(before) != identity(after):\n"
-            "    raise RuntimeError('fixture did not preserve companion identity')\n"
-            "try:\n"
-            "    namespace['main'](())\n"
-            "except SystemExit as error:\n"
-            "    failure = str(error)\n"
-            "else:\n"
-            "    raise RuntimeError('guard accepted companion content drift')\n"
-            "if 'companion content changed' not in failure:\n"
-            "    raise RuntimeError(f'unexpected guard failure: {failure}')\n"
-            "print(failure)\n"
-        )
-        completed = subprocess.run(
-            self.guard_probe_command(
-                guard,
-                body,
-                guard_arguments=("validate-claude-stream",),
-            ),
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        for companion_index in range(3):
+            with self.subTest(companion_index=companion_index):
+                scripts, guard = self.copy_guard_bundle()
+                companion = self.stream_companion_paths(scripts)[companion_index]
+                body = (
+                    "import os\n"
+                    f"companion = pathlib.Path({str(companion)!r})\n"
+                    "before = os.stat(companion, follow_symlinks=False)\n"
+                    "with companion.open('r+b') as stream:\n"
+                    "    original = stream.read(1)\n"
+                    "    stream.seek(0)\n"
+                    "    stream.write(b'X' if original != b'X' else b'Y')\n"
+                    "    stream.flush()\n"
+                    "    os.fsync(stream.fileno())\n"
+                    "after = os.stat(companion, follow_symlinks=False)\n"
+                    "identity = lambda value: (value.st_dev, value.st_ino, "
+                    "value.st_mode, value.st_uid, value.st_size)\n"
+                    "if identity(before) != identity(after):\n"
+                    "    raise RuntimeError('fixture did not preserve companion identity')\n"
+                    "try:\n"
+                    "    namespace['main'](())\n"
+                    "except SystemExit as error:\n"
+                    "    failure = str(error)\n"
+                    "else:\n"
+                    "    raise RuntimeError('guard accepted companion content drift')\n"
+                    "if 'companion content changed' not in failure:\n"
+                    "    raise RuntimeError(f'unexpected guard failure: {failure}')\n"
+                    "print(failure)\n"
+                )
+                completed = subprocess.run(
+                    self.guard_probe_command(
+                        guard,
+                        body,
+                        guard_arguments=("validate-claude-stream",),
+                    ),
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
 
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("companion content changed", completed.stdout)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertIn("companion content changed", completed.stdout)
 
     def test_control_consumer_uses_bound_bytes_after_final_revalidation(self) -> None:
         scripts, guard = self.copy_guard_bundle()
-        schema = scripts.parent / "references/claude-2.1.212-stream-schema.json"
-        replacement = schema.with_name("post-validation-schema.json")
+        companions = self.stream_companion_paths(scripts)
+        replacements = tuple(
+            companion.with_name(f"post-validation-{index}-{companion.name}")
+            for index, companion in enumerate(companions)
+        )
         body = (
             "import os\n"
-            f"schema = pathlib.Path({str(schema)!r})\n"
-            f"replacement = pathlib.Path({str(replacement)!r})\n"
+            f"companions = tuple(pathlib.Path(path) for path in {tuple(map(str, companions))!r})\n"
+            f"replacements = tuple(pathlib.Path(path) for path in {tuple(map(str, replacements))!r})\n"
             "module = sys.modules['validate_claude_stream']\n"
             "original_validate = namespace['_validate_bound_companion']\n"
-            "initial_binding = original_validate(schema)\n"
-            "replacement.write_bytes(b'not valid JSON')\n"
+            "initial_bindings = tuple(\n"
+            "    (path, original_validate(path)) for path in companions\n"
+            ")\n"
+            "replacement_by_path = dict(zip(companions, replacements))\n"
+            "for replacement in replacements:\n"
+            "    replacement.write_bytes(b'not valid companion bytes')\n"
             "def validate_then_replace(path):\n"
             "    binding = original_validate(path)\n"
-            "    os.replace(replacement, path)\n"
+            "    os.replace(replacement_by_path[path], path)\n"
             "    return binding\n"
             "namespace['_validate_bound_companion'] = validate_then_replace\n"
             "def consume(_argv):\n"
-            "    return module._load_contract()['claude_code_version']\n"
+            "    contract, binding = module._load_contract_with_binding()\n"
+            "    return contract['claude_code_version'], binding\n"
             "guarded = namespace['_guard_companions'](\n"
-            "    consume, ((schema, initial_binding),)\n"
+            "    consume, initial_bindings\n"
             ")\n"
-            "version = guarded(())\n"
+            "version, binding = guarded(())\n"
             "if version != '2.1.212':\n"
             "    raise RuntimeError(f'unexpected bound schema version: {version}')\n"
-            "if schema.read_bytes() != b'not valid JSON':\n"
-            "    raise RuntimeError('fixture did not replace the schema path')\n"
+            "if any(path.read_bytes() != b'not valid companion bytes' "
+            "for path in companions):\n"
+            "    raise RuntimeError('fixture did not replace every companion path')\n"
+            "if binding.compatibility_digest != __import__('hashlib').sha256(\n"
+            "    module.COMPATIBILITY_JSON_BYTES\n"
+            ").hexdigest():\n"
+            "    raise RuntimeError('validator did not consume bound compatibility bytes')\n"
+            "if binding.baseline_digest != __import__('hashlib').sha256(\n"
+            "    module.BASELINE_SCHEMA_BYTES\n"
+            ").hexdigest():\n"
+            "    raise RuntimeError('validator did not consume bound baseline bytes')\n"
+            "if binding.capability_digest != __import__('hashlib').sha256(\n"
+            "    module.CAPABILITY_SOURCE_BYTES\n"
+            ").hexdigest():\n"
+            "    raise RuntimeError('validator did not consume bound capability bytes')\n"
             "print(version)\n"
         )
         completed = subprocess.run(
@@ -874,16 +975,16 @@ class NamedLaneGuardTest(unittest.TestCase):
         cases = (
             (
                 "preflight-claude",
-                "review_runtime",
+                ("review_runtime",),
                 lambda scripts: scripts / "review_runtime/named_claude_preflight.py",
             ),
             (
                 "validate-claude-stream",
-                "validate_claude_stream",
+                ("review_runtime", "validate_claude_stream"),
                 lambda scripts: scripts / "validate_claude_stream.py",
             ),
         )
-        for subcommand, namespace_root, source_path in cases:
+        for subcommand, namespace_roots, source_path in cases:
             with self.subTest(subcommand=subcommand):
                 scripts, guard = self.copy_guard_bundle()
                 source = source_path(scripts)
@@ -897,7 +998,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     self.guard_failure_probe_command(
                         guard,
                         guard_arguments=(subcommand,),
-                        namespace_roots=(namespace_root,),
+                        namespace_roots=namespace_roots,
                     ),
                     check=False,
                     stdout=subprocess.PIPE,
@@ -919,6 +1020,8 @@ class NamedLaneGuardTest(unittest.TestCase):
                 str(self.repo.resolve()),
                 "--model",
                 "claude-opus-4-8",
+                "--preflight-result",
+                str(self.root / "missing-preflight.json"),
                 "--api-key-source",
                 "none",
                 "--process-returncode",

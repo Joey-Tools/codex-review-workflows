@@ -24,6 +24,8 @@ from review_runtime import (  # noqa: E402
     claude_capabilities,
     claude_linux,
     claude_refresh_lock,
+    claude_stream_contract,
+    claude_version_policy,
     cli,
     providers,
     state,
@@ -653,8 +655,12 @@ class RepositoryContractTest(unittest.TestCase):
         ) + inspect.getsource(providers._claude_attempt_with_output)
         pwd_home_source = inspect.getsource(providers._claude_pwd_home)
         select_source = inspect.getsource(providers._select_claude_macos_credential)
-        validate_source = inspect.getsource(providers._validate_claude_local_credential)
-        macos_runtime_source = inspect.getsource(providers._claude_keychain_runtime)
+        validate_source = inspect.getsource(
+            providers._validate_claude_local_credential
+        )
+        macos_runtime_source = inspect.getsource(
+            providers._claude_keychain_runtime
+        ) + inspect.getsource(providers._claude_keychain_runtime_coordinated)
         macos_persist_source = inspect.getsource(
             providers._persist_claude_macos_refreshed_credential
         ) + inspect.getsource(providers._persist_claude_macos_refreshed_credential_impl)
@@ -735,7 +741,14 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("stage_claude_credentials", linux_runtime_source)
         self.assertIn("writer_started", linux_runtime_source)
         self.assertIn("writer_quiescent", linux_runtime_source)
-        self.assertIn("on_process_started=writer_started.set", attempt_source)
+        self.assertIn(
+            "on_process_starting=writer_start.publish_starting",
+            attempt_source,
+        )
+        self.assertIn(
+            "on_process_started=writer_start.publish_started",
+            attempt_source,
+        )
         self.assertIn("writer_quiescent.set()", attempt_source)
         self.assertIn(
             "retain_for_recovery",
@@ -2173,14 +2186,14 @@ class RepositoryContractTest(unittest.TestCase):
             "global write denial",
             "critical sensitive roots",
             "not a global host-read whitelist",
-            "Claude Code 2.1.212",
+            "Claude Code `2.1.212` is the audited per-version stream-schema baseline, not a global eligibility pin.",
             "cannot attest the final merged sandbox",
             "actual Claude process",
         ):
             self.assertIn(anchor, contract)
         self.assertNotIn("Primary diff:", contract)
 
-    def test_named_claude_exact_version_preflight_is_fail_closed(self) -> None:
+    def test_named_claude_compatible_version_preflight_is_fail_closed(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
             encoding="utf-8"
@@ -2196,89 +2209,100 @@ class RepositoryContractTest(unittest.TestCase):
         provenance = (SCRIPTS / "review_runtime/claude_provenance.py").read_text(
             encoding="utf-8"
         )
+        capabilities = (SCRIPTS / "review_runtime/claude_capabilities.py").read_text(
+            encoding="utf-8"
+        )
+        policy_path = SCRIPTS / "review_runtime/claude_version_policy.py"
+        policy = policy_path.read_text(encoding="utf-8")
 
         for content in (skill, contracts, canonical):
             for anchor in (
                 "named_claude_preflight",
-                "2.1.212",
-                "$HOME/.local/share/claude/versions/2.1.212",
-                "exact-version-unavailable",
-                "exact-version-mismatch",
-                "publisher-verification-failed",
-                "candidate-inspection-inconclusive",
-                "fixed credential-free environment",
-                "never downloads",
-                "active symlink",
-                "<resolved-exact-claude-path>",
-                "a fresh descriptor-bound hash of the mutable source against the signed size and SHA-256 before acceptance",
-                "stat identity alone is not sufficient",
+                "`>=2.1.211,<3.0.0`",
+                "claude_version_policy.py",
+                "<resolved-compatible-claude-path>",
             ):
                 self.assertIn(anchor, content)
-            self.assertIn(
-                "no separate mandatory `--help` or advertised-capability probe",
-                content,
-            )
-            self.assertNotIn("capability verification", content)
-            self.assertNotIn(
-                "validate the advertised option/capability surface", content
-            )
+            self.assertIn("mandatory", content)
+            self.assertIn("`--help`", content)
+            self.assertIn("advertised capability surface", content)
+            self.assertIn("final merged sandbox", content)
             normalized = content.lower()
             self.assertIn("separate", normalized)
             self.assertIn("explicit", normalized)
             self.assertIn("official installer", normalized)
-            self.assertIn("does not authorize installation", normalized)
+            self.assertIn("authorization", normalized)
+            self.assertIn("install", normalized)
             self.assertIn("double", content)
             self.assertIn("blocked", content)
             self.assertIn("triple", content)
-        for content in (skill, contracts):
+        for content in (skill, canonical):
+            self.assertIn("compatible-version-selected", content)
+            self.assertIn("claude-stream-compatibility.json", content)
+        for content in (contracts, canonical):
             for anchor in (
-                "Candidate presence is tri-state",
-                "stops priority fallback as `candidate-inspection-inconclusive`",
-                "descriptor-bound strong source identity",
-                "including `ctime`",
-                "private digest-verified executable snapshot",
-                "never against the mutable installation path",
-                "Source-identity or digest drift is inconclusive and takes precedence over an observed wrong version",
+                "highest compatible",
+                "side-by-side",
+                "descriptor-bound source identity",
+                "private digest-verified",
+                "snapshot",
+                "--preflight-result",
             ):
                 self.assertIn(anchor, content)
         for anchor in (
             "explicit absolute `--claude-path` override",
             "An explicit override is authoritative",
-            "including an active `2.1.216`",
+            "Candidate presence is tri-state",
+            "highest compatible stable side-by-side install",
+            "candidate-inspection-inconclusive",
+            "compatible-version-unavailable",
+            "unsupported-version",
+            "signed-version-identity-mismatch",
+            "publisher-verification-failed",
+            "fixed credential-free environment",
+            "never downloads",
+            "active symlink",
             "empty stdin",
             "fixed `/` cwd",
             "no prompt, credential, repository, range, PR, or workspace input",
             "one bounded JSON object",
-            "fixed resolved absolute path",
-            "effective shape may be double",
-            "effective double is still incomplete and blocked",
-            "Caller `PATH` entries are ignored",
-            "before any version probe",
+            "fixed resolved source path",
+            "a requested double remains double-but-blocked",
+            "effective double is still incomplete until Claude succeeds",
+            "Caller `PATH` is ignored",
+            "before any probe",
             "private digest-verified executable snapshot",
-            "Scripts, interpreter wrappers, wrong signed artifacts, and caller-`PATH` candidates are never executed",
-            "resolves the configured system temporary parent to its canonical path",
+            "resolve the system temporary parent to its canonical path",
             "macOS `/tmp -> /private/tmp`",
-            "Never collapse inspection uncertainty into deterministic unavailability",
+            "a fresh descriptor-bound hash of the mutable source against the signed size and SHA-256",
+            "stat identity alone is insufficient",
+            "Never collapse uncertainty into deterministic unavailability",
         ):
             self.assertIn(anchor, canonical)
         self.assertTrue(helper_path.is_file())
         self.assertTrue(helper.startswith("#!/usr/bin/env python3\n"))
         for anchor in (
-            'REQUIRED_CLAUDE_VERSION = "2.1.212"',
+            "from .claude_version_policy import (",
+            "CLAUDE_COMPATIBILITY_SPEC",
             '"explicit-override"',
-            '"side-by-side-exact"',
+            '"side-by-side-compatible"',
             '"active-installed"',
             '"HOME": "/nonexistent"',
-            'VERSION_PROBE_CWD = pathlib.Path("/")',
+            'CAPABILITY_PROBE_CWD = pathlib.Path("/")',
             "stdin=None",
             '"classification": classification',
-            '"exact-version-unavailable"',
-            '"exact-version-mismatch"',
+            '"compatible-version-unavailable"',
+            '"unsupported-version"',
+            '"signed-version-identity-mismatch"',
             '"publisher-verification-failed"',
             "verify_claude_release(",
             "materialize_verified_executable(",
             "def _verified_source_matches_signed_artifact(",
             "version_probe(snapshot.executable)",
+            "help_probe(snapshot.executable)",
+            "_validate_help_probe(verified.help_probe_result)",
+            "load_stream_contract()",
+            '"compatible-version-selected"',
             '"ctime_ns"',
             '"executable-identity-drift"',
             '"/opt/homebrew/bin/claude"',
@@ -2289,19 +2313,163 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("_stat_identity(opened_before)", provenance)
         self.assertIn("_require_verified_source_identity", provenance)
         self.assertNotIn("version_probe(resolved)", module)
+        self.assertNotIn("help_probe(resolved)", module)
         self.assertNotIn("shutil.which", module)
         self.assertLess(
-            module.index("verified = verifier(resolved, version_probe)"),
-            module.index("completed = verified.probe_result"),
+            module.index("verified = verifier("),
+            module.index("completed = verified.version_probe_result"),
         )
         self.assertLess(
             module.index(
                 "if after_resolved != resolved or not _verified_source_matches_signed_artifact("
             ),
-            module.index("if observed_version != REQUIRED_CLAUDE_VERSION:"),
+            module.index("verified.artifact.version != declared_version"),
         )
+        self.assertEqual(
+            policy.count('CLAUDE_COMPATIBILITY_SPEC = ">=2.1.211,<3.0.0"'),
+            1,
+        )
+        for consumer in (module, provenance, capabilities):
+            self.assertIn("claude_version_policy", consumer)
+            self.assertNotIn('">=2.1.211,<3.0.0"', consumer)
 
-    def test_canonical_claude_stream_evidence_is_unique_exact_and_fail_closed(
+    def test_claude_compatibility_policy_is_floating_stable_and_not_exact_pinned(
+        self,
+    ) -> None:
+        self.assertEqual(
+            claude_version_policy.CLAUDE_COMPATIBILITY_SPEC,
+            ">=2.1.211,<3.0.0",
+        )
+        self.assertEqual(
+            claude_version_policy.CLAUDE_MINIMUM_VERSION,
+            (2, 1, 211),
+        )
+        self.assertEqual(
+            claude_version_policy.CLAUDE_MAXIMUM_VERSION,
+            (3, 0, 0),
+        )
+        policy_path = SCRIPTS / "review_runtime/claude_version_policy.py"
+        self.assertTrue(policy_path.is_file())
+        self.assertTrue(
+            (SCRIPTS / "review_runtime/claude_stream_contract.py").is_file()
+        )
+        self.assertTrue(claude_stream_contract.COMPATIBILITY_PATH.is_file())
+        self.assertTrue(claude_stream_contract.BASELINE_PATH.is_file())
+        production_python = sorted((SCRIPTS / "review_runtime").glob("*.py"))
+        production_python.append(SCRIPTS / "validate_claude_stream.py")
+        range_literal_sources = {
+            path.relative_to(SCRIPTS).as_posix(): path.read_text(
+                encoding="utf-8"
+            ).count(">=2.1.211,<3.0.0")
+            for path in production_python
+            if ">=2.1.211,<3.0.0" in path.read_text(encoding="utf-8")
+        }
+        self.assertEqual(
+            range_literal_sources,
+            {policy_path.relative_to(SCRIPTS).as_posix(): 1},
+        )
+        accepted = {
+            "2.1.211": (2, 1, 211),
+            "2.1.212": (2, 1, 212),
+            "2.1.216": (2, 1, 216),
+            "2.1.999": (2, 1, 999),
+            "2.99.0": (2, 99, 0),
+        }
+        for version, parsed in accepted.items():
+            with self.subTest(version=version):
+                self.assertEqual(
+                    claude_version_policy.parse_compatible_release_version(version),
+                    parsed,
+                )
+                self.assertTrue(
+                    claude_version_policy.is_compatible_release_version(version)
+                )
+        for version in (
+            "2.1.210",
+            "2.1.211-alpha.1",
+            "2.1.216+local",
+            "3.0.0",
+            "3.0.1",
+        ):
+            with self.subTest(version=version):
+                with self.assertRaises(claude_version_policy.ClaudeVersionPolicyError):
+                    claude_version_policy.parse_compatible_release_version(version)
+                self.assertFalse(
+                    claude_version_policy.is_compatible_release_version(version)
+                )
+
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        preflight = (SCRIPTS / "review_runtime/named_claude_preflight.py").read_text(
+            encoding="utf-8"
+        )
+        baseline_sentence = (
+            "Claude Code `2.1.212` is the audited per-version stream-schema "
+            "baseline, not a global eligibility pin."
+        )
+        for content in (skill, canonical):
+            self.assertIn("The canonical Claude Code compatibility range is", content)
+            self.assertIn("`>=2.1.211,<3.0.0`", content)
+            self.assertIn("defined once in", content)
+            self.assertIn("claude_version_policy.py", content)
+            self.assertIn(baseline_sentence, content)
+            self.assertNotIn("exact-version-mismatch", content)
+            self.assertNotIn("exact-version-unavailable", content)
+            self.assertNotIn(
+                "requires the publisher-verified Claude Code CLI version to be exactly",
+                content,
+            )
+            self.assertNotIn("require exactly Claude Code `2.1.212`", content)
+        for forbidden in (
+            "REQUIRED_CLAUDE_VERSION",
+            "exact-version-mismatch",
+            "exact-version-unavailable",
+            '"2.1.212"',
+        ):
+            self.assertNotIn(forbidden, preflight)
+
+        binding, compatibility_raw, baseline_raw = (
+            claude_stream_contract.load_stream_contract()
+        )
+        self.assertEqual(
+            binding.schema_id,
+            claude_stream_contract.COMPATIBILITY_SCHEMA_ID,
+        )
+        self.assertEqual(len(binding.digest), 64)
+        self.assertEqual(len(binding.compatibility_digest), 64)
+        self.assertEqual(len(binding.baseline_digest), 64)
+        self.assertEqual(len(binding.capability_digest), 64)
+        compatibility = json.loads(compatibility_raw)
+        baseline = json.loads(baseline_raw)
+        self.assertEqual(compatibility["baseline_version"], "2.1.212")
+        self.assertEqual(baseline["claude_code_version"], "2.1.212")
+        self.assertEqual(
+            compatibility["version_policy"],
+            "review_runtime.claude_version_policy.CLAUDE_COMPATIBILITY_SPEC",
+        )
+        self.assertEqual(
+            compatibility["adaptations"][
+                "init_event.field_contracts.claude_code_version"
+            ]["runtime_rule"],
+            "exact_preflight_selected_version",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            incompatible_path = pathlib.Path(temp_dir) / "compatibility.json"
+            incompatible_profile = dict(compatibility)
+            incompatible_profile["unknown_future_surface"] = True
+            incompatible_path.write_text(
+                json.dumps(incompatible_profile),
+                encoding="utf-8",
+            )
+            with self.assertRaises(claude_stream_contract.ClaudeStreamContractError):
+                claude_stream_contract.load_stream_contract(
+                    compatibility_path=incompatible_path,
+                    baseline_path=claude_stream_contract.BASELINE_PATH,
+                )
+
+    def test_canonical_claude_stream_evidence_is_unique_bound_and_fail_closed(
         self,
     ) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
@@ -2318,6 +2486,11 @@ class RepositoryContractTest(unittest.TestCase):
         validator = validator_path.read_text(encoding="utf-8")
         stream_schema = json.loads(
             (SKILL_ROOT / "references/claude-2.1.212-stream-schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        compatibility_profile = json.loads(
+            (SKILL_ROOT / "references/claude-stream-compatibility.json").read_text(
                 encoding="utf-8"
             )
         )
@@ -2347,7 +2520,12 @@ class RepositoryContractTest(unittest.TestCase):
             "`api_error_status`, when present, is `null` or a whitespace-only string",
             "`permission_denials`, when present, is an empty array",
             "nonempty/malformed `permission_denials` fails closed",
-            "A CLI version other than exact `2.1.212` is blocked before review input is exposed",
+            "The canonical Claude Code compatibility range is",
+            "`>=2.1.211,<3.0.0`",
+            "defined once in",
+            "claude_version_policy.py",
+            "Claude Code `2.1.212` is the audited per-version stream-schema baseline, not a global eligibility pin.",
+            "adapts only the baseline `claude_code_version` constant to the exact accepted preflight-selected version",
             "does not prove the final merged native sandbox",
             "merged admin-managed permission arrays",
             "path-rule evaluation",
@@ -2369,6 +2547,11 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("fail closed", content.lower())
         for content in (skill, contracts):
             self.assertIn("--process-returncode <child-returncode>", content)
+            self.assertIn("--preflight-result", content)
+            self.assertIn(
+                "outside the model-visible worktree", " ".join(content.split())
+            )
+        for content in (contracts,):
             self.assertIn("optional nonempty `session_id`", content)
             self.assertIn("unknown init field", content)
             self.assertIn("missing, invalid, or nonzero child return code", content)
@@ -2383,6 +2566,8 @@ class RepositoryContractTest(unittest.TestCase):
                 "outside the model-visible worktree",
                 " ".join(content.split()),
             )
+        for content in (skill, canonical):
+            self.assertIn("claude-stream-compatibility.json", content)
         self.assertTrue(validator_path.is_file())
         self.assertTrue(validator.startswith("#!/usr/bin/env python3\n"))
         for anchor in (
@@ -2399,6 +2584,11 @@ class RepositoryContractTest(unittest.TestCase):
             '"blocked-authentication": 2',
             '"inconclusive": 3',
             '"--process-returncode"',
+            '"--preflight-result"',
+            "_read_preflight_evidence",
+            "_validate_preflight_evidence",
+            "claude_stream_contract.load_stream_contract",
+            '"validator.preflight-evidence-invalid"',
             '"process.returncode.invalid"',
             '"process.returncode.nonzero"',
             '"init.unknown-field"',
@@ -2434,6 +2624,32 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(
             init_contract["optional_field_contracts"]["session_id"],
             {"rule": "nonempty_string", "failure": "inconclusive"},
+        )
+        self.assertEqual(
+            compatibility_profile,
+            {
+                "schema_id": "claude-code-stream-compatible-v1",
+                "version_policy": (
+                    "review_runtime.claude_version_policy.CLAUDE_COMPATIBILITY_SPEC"
+                ),
+                "compatibility_mode": "strict-structural-baseline",
+                "baseline_schema": "claude-2.1.212-stream-schema.json",
+                "baseline_version": "2.1.212",
+                "adaptations": {
+                    "init_event.field_contracts.claude_code_version": {
+                        "baseline_rule": "constant",
+                        "runtime_rule": "exact_preflight_selected_version",
+                    }
+                },
+                "fail_closed_surfaces": [
+                    "stream_envelope",
+                    "init_field_set",
+                    "init_field_values",
+                    "terminal_field_set",
+                    "terminal_variants",
+                    "model_identity",
+                ],
+            },
         )
         self.assertNotIn("when the runtime reports it", canonical)
 
@@ -2713,40 +2929,37 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(observed["unknown_error_field"], "inconclusive")
         for anchor in (
             "equals the requested concrete model string exactly",
-            "the only reviewed terminal aliases",
-            "The only reviewed auxiliary key",
+            "baseline-reviewed aliases for requested",
+            "The only baseline-reviewed auxiliary key",
             "with only or with both a `claude-opus-4-7` key",
             "`stop_reason`, when present, is exactly `null` or `end_turn`",
             "Any other value—including `max_tokens`",
             "`structured_output`, when present, is exactly `null`",
-            "closed top-level allowlist",
-            "Any other terminal field",
+            "closed top-level allowlists",
+            "Any other init or terminal field",
         ):
             self.assertIn(anchor, canonical)
 
-        self.assertIn("require exactly Claude Code `2.1.212`", canonical)
         self.assertIn(
-            "does not make another CLI version eligible for this named direct lane",
+            "Claude Code `2.1.212` is the audited per-version stream-schema baseline, not a global eligibility pin.",
             canonical,
         )
+        self.assertIn("`strict-structural-baseline`", canonical)
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn(
-            "currently requires the publisher-verified Claude Code CLI version to be exactly `2.1.212`",
+            "Claude Code `2.1.212` is the audited per-version stream-schema baseline, not a global eligibility pin.",
             skill,
         )
-        self.assertIn("its broader helper version range", skill)
+        self.assertIn("claude-stream-compatibility.json", skill)
         contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
             encoding="utf-8"
         )
         self.assertIn(
-            "including its exact Claude Code `2.1.212` gate before review input is exposed",
+            "Claude Code `2.1.212` is the audited per-version stream-schema baseline, not a global eligibility pin.",
             contracts,
         )
-        self.assertIn("its broader helper version range", contracts)
-        self.assertNotIn(
-            "obtain its version using a fixed credential-free environment and require `>=2.1.211,<3.0.0`",
-            canonical,
-        )
+        self.assertIn("stream-profile digest evidence", contracts)
+        self.assertNotIn("require exactly Claude Code `2.1.212`", canonical)
 
     def test_unsupported_mismatched_pr_stays_effective_double_but_not_ready(
         self,
@@ -2914,22 +3127,34 @@ class RepositoryContractTest(unittest.TestCase):
             loaded_bound_modules("preflight-claude"),
             [
                 "review_runtime",
+                "review_runtime.claude_capabilities",
                 "review_runtime.claude_linux",
                 "review_runtime.claude_provenance",
                 "review_runtime.claude_refresh_lock",
+                "review_runtime.claude_stream_contract",
+                "review_runtime.claude_version_policy",
                 "review_runtime.common",
                 "review_runtime.named_claude_preflight",
             ],
         )
         self.assertEqual(
             loaded_bound_modules("validate-claude-stream"),
-            ["validate_claude_stream"],
+            [
+                "review_runtime",
+                "review_runtime.claude_capabilities",
+                "review_runtime.claude_provenance",
+                "review_runtime.claude_stream_contract",
+                "review_runtime.claude_version_policy",
+                "review_runtime.common",
+                "validate_claude_stream",
+            ],
         )
 
         entrypoint = guard.read_text(encoding="utf-8")
         for anchor in (
             "_DEFAULT_RUNTIME_SOURCES",
             "_CLAUDE_PREFLIGHT_SOURCES",
+            "_CLAUDE_STREAM_RUNTIME_SOURCES",
             "_CLAUDE_STREAM_VALIDATOR_SOURCES",
             "_load_default_entrypoint",
             "_load_claude_preflight_entrypoint",
@@ -2939,7 +3164,10 @@ class RepositoryContractTest(unittest.TestCase):
             '"review_runtime.claude_linux"',
             '"claude_linux.py"',
             '"CLAUDE_RELEASE_KEY_BYTES"',
-            '"SCHEMA_BYTES"',
+            '"COMPATIBILITY_JSON_BYTES"',
+            '"BASELINE_SCHEMA_BYTES"',
+            '"CAPABILITY_SOURCE_BYTES"',
+            '"fd_exec.py"',
             'argv[0] == "preflight-claude"',
             'argv[0] == "validate-claude-stream"',
         ):
@@ -2959,7 +3187,12 @@ class RepositoryContractTest(unittest.TestCase):
             encoding="utf-8"
         )
 
-        for binding in ("CLAUDE_RELEASE_KEY_BYTES", "SCHEMA_BYTES"):
+        for binding in (
+            "CLAUDE_RELEASE_KEY_BYTES",
+            "COMPATIBILITY_JSON_BYTES",
+            "BASELINE_SCHEMA_BYTES",
+            "CAPABILITY_SOURCE_BYTES",
+        ):
             self.assertIn(f'"{binding}"', guard)
         self.assertIn("byte_bindings", guard)
         self.assertIn("_CompanionBinding = bytes", guard)
@@ -2983,24 +3216,30 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("release_key = bytes(bound_release_key)", provenance)
         self.assertEqual(provenance.count("CLAUDE_RELEASE_KEY_PATH.read_bytes()"), 1)
 
-        self.assertIn("SCHEMA_BYTES: bytes | None = None", validator)
-        self.assertIn("bound_schema = SCHEMA_BYTES", validator)
-        self.assertIn("if bound_schema is None:", validator)
-        self.assertIn("raw = bytes(bound_schema)", validator)
-        self.assertEqual(validator.count('SCHEMA_PATH.open("rb")'), 1)
+        for binding in (
+            "COMPATIBILITY_JSON_BYTES",
+            "BASELINE_SCHEMA_BYTES",
+            "CAPABILITY_SOURCE_BYTES",
+        ):
+            self.assertIn(f"{binding}: bytes | None = None", validator)
+        self.assertIn("bound_payloads = (", validator)
+        self.assertIn("if all(payload is None for payload in bound_payloads):", validator)
+        self.assertIn("elif any(payload is None for payload in bound_payloads):", validator)
+        self.assertIn("_load_bound_stream_contract(", validator)
 
         for anchor in (
             "retains those exact immutable bytes",
-            "gives that same buffer to the consumer",
-            "must not reopen the companion path after final validation",
+            "gives the same buffers to the consumer",
+            "must not reopen a companion path after final validation",
             "compares only complete bytes across the two reads",
             "does not compare dev/ino, `mtime`, or `ctime` across them",
             "same-content ordinary-file replacement is allowed",
             "same-inode and same-size content change",
             "CLAUDE_RELEASE_KEY_BYTES",
-            "without reopening `CLAUDE_RELEASE_KEY_PATH`",
-            "SCHEMA_BYTES",
-            "without reopening `SCHEMA_PATH`",
+            "COMPATIBILITY_JSON_BYTES",
+            "BASELINE_SCHEMA_BYTES",
+            "CAPABILITY_SOURCE_BYTES",
+            "consumers do not reopen those companions after final revalidation",
         ):
             self.assertIn(anchor, contracts)
 
@@ -3043,16 +3282,21 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/references/canonical-claude-lane.md",
             "skills/review-orchestration-playbook/references/claude-2.1.212-stream-schema.json",
             "skills/review-orchestration-playbook/references/claude-runtime-trust.md",
+            "skills/review-orchestration-playbook/references/claude-stream-compatibility.json",
             "skills/review-orchestration-playbook/references/review-lane-contracts.md",
             "skills/review-orchestration-playbook/references/review-prompt-templates.md",
             "skills/review-orchestration-playbook/scripts/named_claude_preflight",
             "skills/review-orchestration-playbook/scripts/named_lane_guard",
             "skills/review-orchestration-playbook/scripts/review_runtime/__init__.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_capabilities.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/claude_code_release.asc",
             "skills/review-orchestration-playbook/scripts/review_runtime/claude_linux.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/claude_provenance.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/claude_refresh_lock.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_stream_contract.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_version_policy.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/common.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/fd_exec.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/named_claude_preflight.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/named_lane.py",
             "skills/review-orchestration-playbook/scripts/validate_claude_stream.py",
@@ -3070,6 +3314,7 @@ class RepositoryContractTest(unittest.TestCase):
             "agents/reviewer.toml",
             "skills/review-orchestration-playbook/SKILL.md",
             "skills/review-orchestration-playbook/references/claude-2.1.212-stream-schema.json",
+            "skills/review-orchestration-playbook/references/claude-stream-compatibility.json",
             "skills/review-orchestration-playbook/references/review-lane-contracts.md",
             "skills/review-orchestration-playbook/references/review-prompt-templates.md",
             "skills/review-orchestration-playbook/references/canonical-claude-lane.md",
@@ -3077,21 +3322,26 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/scripts/named_claude_preflight",
             "skills/review-orchestration-playbook/scripts/named_lane_guard",
             "skills/review-orchestration-playbook/scripts/review_runtime/__init__.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_capabilities.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/claude_code_release.asc",
             "skills/review-orchestration-playbook/scripts/review_runtime/claude_linux.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/claude_provenance.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/claude_refresh_lock.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_stream_contract.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_version_policy.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/named_claude_preflight.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/named_lane.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/common.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/fd_exec.py",
             "skills/review-orchestration-playbook/scripts/validate_claude_stream.py",
             "immediately before each guard, Claude preflight, stream-validator, Claude-launch, and Codex-spawn use",
             "Recompute it after each lane",
             "exact bytes must match the manifest entry",
             "exact three-source bound-source raw loader",
             "default guard code-origin/import boundary",
-            "exact six-source closure",
-            "must not widen this control-plane closure to `review_runtime.workspace`, `review_runtime.prompt`, or `review_runtime.synthetic_tokens`",
+            "exact nine-source closure",
+            "exact seven-source closure",
+            "Neither profile may widen its control-plane closure to `review_runtime.workspace`, `review_runtime.prompt`, or `review_runtime.synthetic_tokens`",
             "preflight-claude",
             "validate-claude-stream",
         ):
@@ -3125,15 +3375,18 @@ class RepositoryContractTest(unittest.TestCase):
             "review_runtime.claude_refresh_lock",
             "review_runtime.claude_linux",
             "review_runtime.claude_provenance",
+            "review_runtime.claude_stream_contract",
+            "review_runtime.claude_version_policy",
+            "review_runtime.claude_capabilities",
             "review_runtime.named_claude_preflight",
             "claude_code_release.asc",
-            "standalone validator source",
-            "stream-schema companion",
+            "standalone validator plus its exact required runtime-source closure",
+            "stream compatibility profile, audited schema baseline, and capability-contract source",
             "same bounded bytes retained through final validation",
-            "must not reopen the companion path after final validation",
+            "must not reopen a companion path after final validation",
             "compatibility wrapper",
             "never the formal named-lane or self-policy-migration entry",
-            "never execute the candidate wrapper/importer",
+            "Neither profile may use the candidate wrapper",
             "Do not inherit ambient `HOME`",
             "pwd.getpwuid(os.getuid())",
             "without treating directory `mtime`, `ctime`, or child churn",
@@ -3695,8 +3948,10 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("not a global host-read whitelist", content)
             self.assertIn("global `denyWrite`", content)
             self.assertIn("critical-sensitive-root", content)
-            self.assertIn("Claude Code 2.1.212", content)
             self.assertIn("final merged", content)
+        for content in (skill, contracts):
+            self.assertIn("advertised capability surface", content)
+        self.assertIn("Capability probes and the first `system/init` event", runtime)
 
         for anchor in (
             '"denyRead"',
@@ -3704,7 +3959,7 @@ class RepositoryContractTest(unittest.TestCase):
             '"denyWrite": ["/"]',
             "critical sensitive roots",
             "not a global host-read whitelist",
-            "Claude Code 2.1.212",
+            "advertised capability surface",
             "final merged sandbox",
         ):
             self.assertIn(anchor, canonical)
@@ -3810,7 +4065,10 @@ class RepositoryContractTest(unittest.TestCase):
                 "a narrow CLI control-plane exception",
             ):
                 self.assertNotIn(overclaim, content)
-        self.assertIn("Apply **Canonical Executable Provenance**", lane_contracts)
+        self.assertIn(
+            "Apply **Compatible-Version Selection Preflight** and **Canonical Executable Provenance**",
+            lane_contracts,
+        )
         self.assertIn("recovery rules do not apply to this direct lane", lane_contracts)
         self.assertNotIn("authentication, credential-recovery", lane_contracts)
         if CI_PROFILE == "canonical":
@@ -3859,7 +4117,7 @@ class RepositoryContractTest(unittest.TestCase):
 
         for anchor in (
             "## Canonical Executable Provenance",
-            "one exact resolved path",
+            "one resolved path accepted by the selection preflight",
             "fixed credential-free environment",
             "`>=2.1.211,<3.0.0`",
             "fixed Anthropic release-signing key",
@@ -3873,7 +4131,10 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn(anchor, canonical)
         self.assertIn("do not create a helper snapshot", runtime)
         self.assertIn("For the low-level helper, after the signed manifest", runtime)
-        self.assertIn("Follow **Canonical Executable Provenance**", skill)
+        self.assertIn(
+            "Follow **Compatible-Version Selection**, **Canonical Executable Provenance**",
+            skill,
+        )
 
     def test_all_superseded_auth_journals_are_historical_helper_only(self) -> None:
         if CI_PROFILE != "canonical":
@@ -4111,6 +4372,31 @@ class RepositoryContractTest(unittest.TestCase):
             skill,
         )
         self.assertIn("No named shape authorizes a substitute external reviewer", skill)
+
+    def test_retained_refresh_locks_never_authorize_lexical_paths(self) -> None:
+        required = (
+            "Intentionally retained shared refresh-lock directories never "
+            "authorize a lexical recovery or cleanup pathname; report only "
+            "descriptor-bound residue."
+        )
+        candidates = (
+            SKILL_ROOT / "SKILL.md",
+            SKILL_ROOT / "references/helper-contract.md",
+            SKILL_ROOT / "references/claude-runtime-trust.md",
+        )
+        forbidden = (
+            "Report exact helper-owned lock paths only when",
+            "paths only after a quiesced descriptor/no-follow identity proof",
+            "Exact helper-owned paths are authoritative only after",
+            "authoritative path or descriptor-bound recovery evidence",
+            "Path-owned anchors may report exact recovery paths",
+        )
+        for candidate in candidates:
+            content = candidate.read_text(encoding="utf-8")
+            normalized = " ".join(content.split())
+            self.assertIn(required, normalized, str(candidate))
+            for phrase in forbidden:
+                self.assertNotIn(phrase, normalized, str(candidate))
 
     def test_selected_pr_requires_exact_merge_base_and_head_range(self) -> None:
         agents_policy = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
