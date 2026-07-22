@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import enum
 import errno
 import json
@@ -178,6 +179,24 @@ DESCRIPTOR_CWD_HANDOFF_TIMEOUT_SECONDS = 10.0
 GATED_ENVIRONMENT_MAGIC = b"CGR1"
 MAX_GATED_ENVIRONMENT_BYTES = 8 * 1024 * 1024
 FD_EXEC_ERROR_PREFIX = b"fd_exec.py: launch-error:"
+FD_EXEC_BYTES: bytes | None = None
+MAX_BOUND_FD_EXEC_BYTES = 64 * 1024
+_BOUND_FD_EXEC_FILENAME = "<guard-bound fd_exec.py>"
+_BOUND_FD_EXEC_BOOTSTRAP = (
+    "import base64, sys\n"
+    "source = base64.b64decode(sys.argv.pop(1), validate=True)\n"
+    f"filename = {_BOUND_FD_EXEC_FILENAME!r}\n"
+    "sys.argv[0] = 'fd_exec.py'\n"
+    "namespace = {\n"
+    "    '__name__': '__main__',\n"
+    "    '__file__': filename,\n"
+    "    '__package__': None,\n"
+    "    '__spec__': None,\n"
+    "    '__cached__': None,\n"
+    "}\n"
+    "exec(compile(source, filename, 'exec', dont_inherit=True), "
+    "namespace, namespace)\n"
+)
 _PROCESS_SPAWN_THREAD = threading.Thread
 
 
@@ -632,9 +651,6 @@ def _descriptor_cwd_command(
             ) from error
         if not stat.S_ISDIR(metadata.st_mode):
             raise ReviewError("descriptor-backed cwd is not a directory")
-    launcher = pathlib.Path(__file__).with_name("fd_exec.py")
-    if not launcher.is_file():
-        raise ReviewError("descriptor-backed cwd launcher is unavailable")
     inherited_descriptors = tuple(
         descriptor
         for descriptor in (cwd_fd, status_fd, gate_fd)
@@ -652,15 +668,47 @@ def _descriptor_cwd_command(
             str(status_fd) if status_fd is not None else "-",
             str(gate_fd),
         )
-    return (
-        (
+    bound_launcher = FD_EXEC_BYTES
+    if bound_launcher is None:
+        launcher = pathlib.Path(__file__).with_name("fd_exec.py")
+        if not launcher.is_file():
+            raise ReviewError("descriptor-backed cwd launcher is unavailable")
+        launcher_command = (
             sys.executable,
             "-I",
             "-S",
             str(launcher),
-            *launcher_arguments,
-            *command,
-        ),
+        )
+    else:
+        if (
+            type(bound_launcher) is not bytes
+            or not bound_launcher
+            or len(bound_launcher) > MAX_BOUND_FD_EXEC_BYTES
+        ):
+            raise ReviewError("guard-bound descriptor launcher bytes are invalid")
+        try:
+            compile(
+                bound_launcher,
+                _BOUND_FD_EXEC_FILENAME,
+                "exec",
+                dont_inherit=True,
+            )
+        except (SyntaxError, TypeError, ValueError) as error:
+            raise ReviewError(
+                "guard-bound descriptor launcher is not valid Python source"
+            ) from error
+        encoded_launcher = base64.b64encode(bound_launcher).decode("ascii")
+        launcher_command = (
+            sys.executable,
+            "-I",
+            "-B",
+            "-S",
+            "-c",
+            _BOUND_FD_EXEC_BOOTSTRAP,
+            encoded_launcher,
+        )
+    return (
+        (*launcher_command, *launcher_arguments, *command),
         inherited_descriptors,
     )
 

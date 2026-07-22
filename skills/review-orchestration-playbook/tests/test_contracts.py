@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import math
@@ -3167,6 +3168,7 @@ class RepositoryContractTest(unittest.TestCase):
             '"COMPATIBILITY_JSON_BYTES"',
             '"BASELINE_SCHEMA_BYTES"',
             '"CAPABILITY_SOURCE_BYTES"',
+            '"FD_EXEC_BYTES"',
             '"fd_exec.py"',
             'argv[0] == "preflight-claude"',
             'argv[0] == "validate-claude-stream"',
@@ -3182,6 +3184,7 @@ class RepositoryContractTest(unittest.TestCase):
         provenance = (SCRIPTS / "review_runtime/claude_provenance.py").read_text(
             encoding="utf-8"
         )
+        common = (SCRIPTS / "review_runtime/common.py").read_text(encoding="utf-8")
         validator = (SCRIPTS / "validate_claude_stream.py").read_text(encoding="utf-8")
         contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
             encoding="utf-8"
@@ -3196,6 +3199,16 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn(f'"{binding}"', guard)
         self.assertIn("byte_bindings", guard)
         self.assertIn("_CompanionBinding = bytes", guard)
+        self.assertIn('"FD_EXEC_BYTES"', guard)
+        self.assertIn("FD_EXEC_BYTES: bytes | None = None", common)
+        self.assertIn("bound_launcher = FD_EXEC_BYTES", common)
+        self.assertIn(
+            '"-I",\n            "-B",\n            "-S",\n            "-c"', common
+        )
+        descriptor_launcher = common.split("bound_launcher = FD_EXEC_BYTES", 1)[
+            1
+        ].split("def _descriptor_exec_error", 1)[0]
+        self.assertNotIn("str(launcher)", descriptor_launcher.split("else:", 1)[1])
         companion_validator = guard.split("def _validate_bound_companion(", 1)[1].split(
             "def _guard_companions(", 1
         )[0]
@@ -3239,6 +3252,9 @@ class RepositoryContractTest(unittest.TestCase):
             "COMPATIBILITY_JSON_BYTES",
             "BASELINE_SCHEMA_BYTES",
             "CAPABILITY_SOURCE_BYTES",
+            "FD_EXEC_BYTES",
+            "isolated `-I -B -S -c` bootstrap",
+            "never reopen the `review_runtime/fd_exec.py` path",
             "consumers do not reopen those companions after final revalidation",
         ):
             self.assertIn(anchor, contracts)
@@ -3279,10 +3295,14 @@ class RepositoryContractTest(unittest.TestCase):
         manifest_paths = (
             "agents/reviewer.toml",
             "skills/review-orchestration-playbook/SKILL.md",
+            "skills/review-orchestration-playbook/references/base-only-retarget-state-machine.json",
             "skills/review-orchestration-playbook/references/canonical-claude-lane.md",
             "skills/review-orchestration-playbook/references/claude-2.1.212-stream-schema.json",
             "skills/review-orchestration-playbook/references/claude-runtime-trust.md",
             "skills/review-orchestration-playbook/references/claude-stream-compatibility.json",
+            "skills/review-orchestration-playbook/references/egress-consent.md",
+            "skills/review-orchestration-playbook/references/github-pr-probes.md",
+            "skills/review-orchestration-playbook/references/pr-readiness.md",
             "skills/review-orchestration-playbook/references/review-lane-contracts.md",
             "skills/review-orchestration-playbook/references/review-prompt-templates.md",
             "skills/review-orchestration-playbook/scripts/named_claude_preflight",
@@ -3301,11 +3321,46 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/scripts/review_runtime/named_lane.py",
             "skills/review-orchestration-playbook/scripts/validate_claude_stream.py",
         )
+        self.assertEqual(
+            manifest_paths,
+            tuple(sorted(manifest_paths, key=lambda value: value.encode("utf-8"))),
+        )
         manifest_clause = (
             "; ".join(f"`{path}`" for path in manifest_paths[:-1])
             + f"; and `{manifest_paths[-1]}`."
         )
         self.assertIn(manifest_clause, contracts)
+
+        outcome_policy_paths = (
+            "skills/review-orchestration-playbook/references/base-only-retarget-state-machine.json",
+            "skills/review-orchestration-playbook/references/egress-consent.md",
+            "skills/review-orchestration-playbook/references/github-pr-probes.md",
+            "skills/review-orchestration-playbook/references/pr-readiness.md",
+        )
+
+        def manifest_digest(overrides: dict[str, bytes] | None = None) -> str:
+            replacements = overrides or {}
+            records = []
+            for relative_path in manifest_paths:
+                payload = replacements.get(
+                    relative_path,
+                    (policy_scope_root / relative_path).read_bytes(),
+                )
+                records.append(
+                    f"{hashlib.sha256(payload).hexdigest()}  {relative_path}\n".encode(
+                        "utf-8"
+                    )
+                )
+            return hashlib.sha256(b"".join(records)).hexdigest()
+
+        baseline_manifest_digest = manifest_digest()
+        for relative_path in outcome_policy_paths:
+            original = (policy_scope_root / relative_path).read_bytes()
+            self.assertNotEqual(
+                manifest_digest({relative_path: original + b"\0"}),
+                baseline_manifest_digest,
+                relative_path,
+            )
         for anchor in (
             "publisher-provided release identifier or frozen commit ID",
             "canonical UTF-8 manifest",
@@ -3315,6 +3370,10 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/SKILL.md",
             "skills/review-orchestration-playbook/references/claude-2.1.212-stream-schema.json",
             "skills/review-orchestration-playbook/references/claude-stream-compatibility.json",
+            "skills/review-orchestration-playbook/references/base-only-retarget-state-machine.json",
+            "skills/review-orchestration-playbook/references/egress-consent.md",
+            "skills/review-orchestration-playbook/references/github-pr-probes.md",
+            "skills/review-orchestration-playbook/references/pr-readiness.md",
             "skills/review-orchestration-playbook/references/review-lane-contracts.md",
             "skills/review-orchestration-playbook/references/review-prompt-templates.md",
             "skills/review-orchestration-playbook/references/canonical-claude-lane.md",
@@ -3333,6 +3392,9 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/scripts/review_runtime/named_lane.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/common.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/fd_exec.py",
+            "review_runtime.common.FD_EXEC_BYTES",
+            "isolated `-I -B -S -c` bootstrap",
+            "never reopen the `review_runtime/fd_exec.py` path",
             "skills/review-orchestration-playbook/scripts/validate_claude_stream.py",
             "immediately before each guard, Claude preflight, stream-validator, Claude-launch, and Codex-spawn use",
             "Recompute it after each lane",

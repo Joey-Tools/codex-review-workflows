@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import dis
 import json
 import os
@@ -18,6 +19,7 @@ from unittest import mock
 
 
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
+FD_EXEC_SOURCE = SCRIPTS / "review_runtime/fd_exec.py"
 sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime import common  # noqa: E402
@@ -1777,6 +1779,140 @@ class ChildEnvironmentTest(unittest.TestCase):
         payload[:] = b"\x00" * len(payload)
         completed.stdout[:] = b"\x00" * len(completed.stdout)
         completed.stderr[:] = b"\x00" * len(completed.stderr)
+
+    @unittest.skipUnless(os.name == "posix", "descriptor launch requires POSIX")
+    def test_guard_bound_descriptor_launcher_executes_bytes_without_path_reopen(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary).resolve()
+            directory_descriptor = os.open(root, os.O_RDONLY)
+            try:
+                bound_source = FD_EXEC_SOURCE.read_bytes()
+                with (
+                    mock.patch.object(common, "FD_EXEC_BYTES", bound_source),
+                    mock.patch.object(
+                        common.pathlib.Path,
+                        "is_file",
+                        side_effect=AssertionError("bound launch reopened its path"),
+                    ) as is_file,
+                ):
+                    spawn_command, pass_fds = common._descriptor_cwd_command(
+                        (
+                            sys.executable,
+                            "-c",
+                            "import os; os.write(1, os.getcwd().encode())",
+                        ),
+                        directory_descriptor,
+                    )
+                is_file.assert_not_called()
+                self.assertEqual(
+                    spawn_command[:5],
+                    (sys.executable, "-I", "-B", "-S", "-c"),
+                )
+                self.assertEqual(
+                    base64.b64decode(spawn_command[6], validate=True),
+                    bound_source,
+                )
+                self.assertNotIn(str(FD_EXEC_SOURCE), spawn_command)
+                self.assertEqual(
+                    spawn_command[7:9],
+                    (str(directory_descriptor), "-"),
+                )
+
+                completed = subprocess.run(
+                    spawn_command,
+                    check=False,
+                    pass_fds=pass_fds,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                with mock.patch.object(common, "FD_EXEC_BYTES", bound_source):
+                    gated_completed = common.run(
+                        (
+                            sys.executable,
+                            "-c",
+                            "import os; os.write(1, os.getcwd().encode())",
+                        ),
+                        cwd_fd=directory_descriptor,
+                        stdout_path=root / "gated-stdout.log",
+                        stderr_path=root / "gated-stderr.log",
+                        timeout_seconds=5,
+                        output_file_limit_bytes=4096,
+                    )
+            finally:
+                os.close(directory_descriptor)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, os.fsencode(root))
+        self.assertEqual(gated_completed.returncode, 0, gated_completed.stderr)
+        self.assertEqual(gated_completed.stdout, os.fsencode(root))
+
+    @unittest.skipUnless(os.name == "posix", "descriptor launch requires POSIX")
+    def test_guard_bound_descriptor_launcher_rejects_invalid_source(self) -> None:
+        cases = (
+            (bytearray(b"pass\n"), "bytes are invalid"),
+            (b"", "bytes are invalid"),
+            (b"x" * (common.MAX_BOUND_FD_EXEC_BYTES + 1), "bytes are invalid"),
+            (b"def invalid syntax\n", "not valid Python source"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            directory_descriptor = os.open(temporary, os.O_RDONLY)
+            try:
+                for payload, message in cases:
+                    with (
+                        self.subTest(message=message),
+                        mock.patch.object(common, "FD_EXEC_BYTES", payload),
+                        self.assertRaisesRegex(common.ReviewError, message),
+                    ):
+                        common._descriptor_cwd_command(
+                            ("reviewer",),
+                            directory_descriptor,
+                        )
+            finally:
+                os.close(directory_descriptor)
+
+    @unittest.skipUnless(os.name == "posix", "descriptor launch requires POSIX")
+    def test_guard_bound_descriptor_launcher_exact_max_preserves_gated_argv(
+        self,
+    ) -> None:
+        bound_source = b"#" + b"x" * (common.MAX_BOUND_FD_EXEC_BYTES - 2) + b"\n"
+        self.assertEqual(len(bound_source), common.MAX_BOUND_FD_EXEC_BYTES)
+        with tempfile.TemporaryDirectory() as temporary:
+            directory_descriptor = os.open(temporary, os.O_RDONLY)
+            try:
+                with mock.patch.object(common, "FD_EXEC_BYTES", bound_source):
+                    spawn_command, pass_fds = common._descriptor_cwd_command(
+                        ("reviewer", "argument"),
+                        directory_descriptor,
+                        status_fd=101,
+                        gate_fd=102,
+                    )
+            finally:
+                os.close(directory_descriptor)
+
+        encoded_source = spawn_command[6]
+        self.assertEqual(
+            base64.b64decode(encoded_source, validate=True),
+            bound_source,
+        )
+        self.assertEqual(len(encoded_source), 87_384)
+        self.assertLess(len(encoded_source) + 1, 128 * 1024)
+        self.assertEqual(
+            spawn_command[7:],
+            (
+                "--gated",
+                str(directory_descriptor),
+                "101",
+                "102",
+                "reviewer",
+                "argument",
+            ),
+        )
+        self.assertEqual(
+            pass_fds,
+            (directory_descriptor, 101, 102),
+        )
 
     @unittest.skipUnless(os.name == "posix", "descriptor reuse requires POSIX")
     def test_bounded_capture_avoids_closed_standard_descriptor_collisions(

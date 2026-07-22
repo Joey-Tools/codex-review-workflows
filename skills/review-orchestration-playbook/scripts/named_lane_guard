@@ -497,14 +497,15 @@ def _bind_preflight_account_home(entrypoint: object) -> object:
 
 
 def _load_default_entrypoint(scripts_root: pathlib.Path) -> object:
+    fd_exec_path = scripts_root / "review_runtime" / "fd_exec.py"
+    fd_exec_bytes = _validate_bound_companion(fd_exec_path)
     entrypoint = _load_bound_sources(
         scripts_root / "review_runtime",
         _DEFAULT_RUNTIME_SOURCES,
         namespace_root="review_runtime",
         entry_module_name="review_runtime.named_lane",
+        byte_bindings=(("review_runtime.common", "FD_EXEC_BYTES", fd_exec_bytes),),
     )
-    fd_exec_path = scripts_root / "review_runtime" / "fd_exec.py"
-    fd_exec_bytes = _validate_bound_companion(fd_exec_path)
     return _guard_companions(entrypoint, ((fd_exec_path, fd_exec_bytes),))
 
 
@@ -547,6 +548,11 @@ def _load_claude_preflight_entrypoint(scripts_root: pathlib.Path) -> object:
                 ),
             ),
             byte_bindings=(
+                (
+                    "review_runtime.common",
+                    "FD_EXEC_BYTES",
+                    fd_exec_bytes,
+                ),
                 (
                     "review_runtime.claude_provenance",
                     "CLAUDE_RELEASE_KEY_BYTES",

@@ -403,9 +403,11 @@ class NamedLaneGuardTest(unittest.TestCase):
             "review_runtime.common": str(runtime / "common.py"),
             "review_runtime.named_lane": str(runtime / "named_lane.py"),
         }
+        expected_fd_exec = str(runtime / "fd_exec.py")
         body = (
             "import json\n"
             f"expected = {expected_origins!r}\n"
+            f"expected_fd_exec = {expected_fd_exec!r}\n"
             f"forbidden_paths = {{{str(scripts)!r}, {str(runtime)!r}}}\n"
             "if forbidden_paths.intersection(sys.path):\n"
             "    raise RuntimeError('candidate control path leaked into sys.path')\n"
@@ -425,6 +427,9 @@ class NamedLaneGuardTest(unittest.TestCase):
             "if name == 'review_runtime' or name.startswith('review_runtime.'))\n"
             "if loaded != sorted(expected):\n"
             "    raise RuntimeError(f'unexpected runtime closure: {loaded}')\n"
+            "if sys.modules['review_runtime.common'].FD_EXEC_BYTES != "
+            "pathlib.Path(expected_fd_exec).read_bytes():\n"
+            "    raise RuntimeError('fd_exec bytes were not bound exactly')\n"
             "print(json.dumps(observed, sort_keys=True))\n"
         )
         completed = subprocess.run(
@@ -497,10 +502,12 @@ class NamedLaneGuardTest(unittest.TestCase):
             ),
         }
         expected_key = str(runtime / "claude_code_release.asc")
+        expected_fd_exec = str(runtime / "fd_exec.py")
         body = (
             "import json\n"
             f"expected = {expected_origins!r}\n"
             f"expected_key = {expected_key!r}\n"
+            f"expected_fd_exec = {expected_fd_exec!r}\n"
             "observed = {}\n"
             "for name, origin in expected.items():\n"
             "    module = sys.modules[name]\n"
@@ -521,6 +528,9 @@ class NamedLaneGuardTest(unittest.TestCase):
             "CLAUDE_RELEASE_KEY_BYTES\n"
             "if key_bytes != pathlib.Path(expected_key).read_bytes():\n"
             "    raise RuntimeError('release key bytes were not bound exactly')\n"
+            "if sys.modules['review_runtime.common'].FD_EXEC_BYTES != "
+            "pathlib.Path(expected_fd_exec).read_bytes():\n"
+            "    raise RuntimeError('fd_exec bytes were not bound exactly')\n"
             "if namespace['_MAIN_ARGV'] != ('--sentinel',):\n"
             "    raise RuntimeError(f'arguments not forwarded: "
             "{namespace['_MAIN_ARGV']!r}')\n"
@@ -727,6 +737,8 @@ class NamedLaneGuardTest(unittest.TestCase):
             "        raise RuntimeError(f'unexpected runtime origin for {name}')\n"
             "if list(sys.modules['review_runtime'].__path__):\n"
             "    raise RuntimeError('bound package search path must remain closed')\n"
+            "if sys.modules['review_runtime.common'].FD_EXEC_BYTES is not None:\n"
+            "    raise RuntimeError('validator unexpectedly bound process companion')\n"
             "path_and_bytes = (\n"
             "    ('COMPATIBILITY_PATH', 'COMPATIBILITY_JSON_BYTES', "
             "expected_companions['COMPATIBILITY']),\n"
@@ -905,6 +917,74 @@ class NamedLaneGuardTest(unittest.TestCase):
 
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 self.assertIn("companion content changed", completed.stdout)
+
+    @unittest.skipUnless(os.name == "posix", "descriptor launch requires POSIX")
+    def test_fd_exec_replacement_after_final_revalidation_uses_bound_bytes(
+        self,
+    ) -> None:
+        scripts, guard = self.copy_guard_bundle()
+        fd_exec = scripts / "review_runtime/fd_exec.py"
+        malicious = self.root / "malicious-fd-exec.py"
+        marker = self.root / "malicious-fd-exec.marker"
+        review_cwd = self.root / "bound-fd-exec-cwd"
+        review_cwd.mkdir()
+        malicious.write_text(
+            f"import pathlib\npathlib.Path({str(marker)!r}).write_text('reopened')\n",
+            encoding="utf-8",
+        )
+        body = (
+            "import os\n"
+            f"fd_exec = pathlib.Path({str(fd_exec)!r})\n"
+            f"malicious = pathlib.Path({str(malicious)!r})\n"
+            f"marker = pathlib.Path({str(marker)!r})\n"
+            f"review_cwd = pathlib.Path({str(review_cwd)!r})\n"
+            "common = sys.modules['review_runtime.common']\n"
+            "if common.FD_EXEC_BYTES != fd_exec.read_bytes():\n"
+            "    raise RuntimeError('formal common did not retain fd_exec bytes')\n"
+            "original_validate = namespace['_validate_bound_companion']\n"
+            "initial_binding = original_validate(fd_exec)\n"
+            "def validate_then_replace(path):\n"
+            "    binding = original_validate(path)\n"
+            "    path.unlink()\n"
+            "    path.symlink_to(malicious)\n"
+            "    return binding\n"
+            "namespace['_validate_bound_companion'] = validate_then_replace\n"
+            "def consume(_argv):\n"
+            "    directory_fd = os.open(review_cwd, os.O_RDONLY)\n"
+            "    try:\n"
+            "        return common.run(\n"
+            "            (sys.executable, '-c', "
+            "'import os; os.write(1, os.getcwd().encode())'),\n"
+            "            cwd_fd=directory_fd,\n"
+            "        )\n"
+            "    finally:\n"
+            "        os.close(directory_fd)\n"
+            "guarded = namespace['_guard_companions'](\n"
+            "    consume, ((fd_exec, initial_binding),)\n"
+            ")\n"
+            "completed = guarded(())\n"
+            "if completed.returncode != 0:\n"
+            "    raise RuntimeError(f'bound fd_exec failed: {completed.stderr!r}')\n"
+            "if completed.stdout != os.fsencode(review_cwd):\n"
+            "    raise RuntimeError(f'bound fd_exec used wrong cwd: "
+            "{completed.stdout!r}')\n"
+            "if marker.exists():\n"
+            "    raise RuntimeError('formal common reopened the fd_exec path')\n"
+            "if not fd_exec.is_symlink():\n"
+            "    raise RuntimeError('fixture did not replace fd_exec with a symlink')\n"
+            "print('bound fd_exec bytes executed')\n"
+        )
+        completed = subprocess.run(
+            self.guard_probe_command(guard, body),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "bound fd_exec bytes executed")
+        self.assertFalse(marker.exists())
 
     def test_control_consumer_uses_bound_bytes_after_final_revalidation(self) -> None:
         scripts, guard = self.copy_guard_bundle()
