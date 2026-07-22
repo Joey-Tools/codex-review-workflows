@@ -4286,6 +4286,8 @@ class RepositoryContractTest(unittest.TestCase):
                 "`process_reason`",
                 "`retained_path`",
                 "`retained_locator`",
+                "complete flushed",
+                "receipt write/flush failure",
             ):
                 with self.subTest(anchor=anchor):
                     self.assertIn(anchor, content)
@@ -4342,6 +4344,8 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn('"reason": "snapshot-cleanup"', implementation)
         self.assertIn("_output_parent_path_names_bound_directory", implementation)
         self.assertIn('payload["retained_locator"]', implementation)
+        self.assertIn("def _emit_claude_receipt", implementation)
+        self.assertIn("_receipt_emitter=_emit_claude_receipt", implementation)
         snapshot_creation = implementation.split(
             "def _create_claude_launch_snapshot(", 1
         )[1].split("def _cleanup_claude_launch_snapshot(", 1)[0]

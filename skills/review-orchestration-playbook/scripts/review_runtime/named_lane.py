@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import BinaryIO, Iterable, Mapping, Sequence
+from typing import BinaryIO, Callable, Iterable, Mapping, Sequence
 
 from .common import (
     ForwardedSignal,
@@ -4263,6 +4263,7 @@ def run_claude(
     stream_limit_bytes: int = DEFAULT_STREAM_LIMIT_BYTES,
     inherit_node_extra_ca_certs: bool = False,
     deadline_monotonic: float | None = None,
+    _receipt_emitter: Callable[[dict[str, object]], None] | None = None,
 ) -> dict[str, object]:
     deadline = _bounded_deadline(timeout_seconds, deadline_monotonic)
     _remaining_deadline_seconds(deadline, "Claude named lane")
@@ -4395,6 +4396,8 @@ def run_claude(
                 previous_handlers: dict[signal.Signals, object] = {}
                 publication_phase = "publishing"
                 deferred_signal: signal.Signals | None = None
+                receipt_committed = False
+                receipt_signals: list[signal.Signals] = []
 
                 def defer_publication_signal(signum: int, _frame: object) -> None:
                     nonlocal deferred_signal, publication_phase
@@ -4441,8 +4444,15 @@ def run_claude(
                     if deferred_signal is not None:
                         publication_phase = "interrupted"
                         raise ForwardedSignal(deferred_signal)
-                    restore_signal_mask(publication_mask)
-                    publication_phase = "committed"
+                    if _receipt_emitter is None:
+                        restore_signal_mask(publication_mask)
+                        publication_phase = "committed"
+                    else:
+                        receipt_signals = _install_post_terminal_signal_handlers()
+                        restore_signal_mask(publication_mask)
+                        _receipt_emitter(result)
+                        publication_phase = "committed"
+                        receipt_committed = True
                 except BaseException as publication_error:
                     publication_phase = "cleanup"
                     block_forwarded_signals()
@@ -4453,6 +4463,8 @@ def run_claude(
                         except BaseException as error:
                             cleanup_errors.append(error)
                         late_signal = consume_pending_forwarded_signal()
+                        if deferred_signal is None and receipt_signals:
+                            deferred_signal = receipt_signals[0]
                         if deferred_signal is None:
                             deferred_signal = late_signal
                         for forwarded, previous in previous_handlers.items():
@@ -4473,6 +4485,8 @@ def run_claude(
                         raise ForwardedSignal(deferred_signal) from publication_error
                     raise
                 else:
+                    if receipt_committed:
+                        return result
                     block_forwarded_signals()
                     handler_errors: list[BaseException] = []
                     try:
@@ -4557,7 +4571,12 @@ def _emit(payload: dict[str, object], *, stream: object | None = None) -> None:
     print(json.dumps(payload, sort_keys=True), file=stream)
 
 
-def _install_post_terminal_signal_handlers() -> None:
+def _emit_claude_receipt(payload: dict[str, object]) -> None:
+    _emit(payload)
+    sys.stdout.flush()
+
+
+def _install_post_terminal_signal_handlers() -> list[signal.Signals]:
     post_terminal_signals: list[signal.Signals] = []
 
     def record_post_terminal_signal(signum: int, _frame: object) -> None:
@@ -4565,6 +4584,7 @@ def _install_post_terminal_signal_handlers() -> None:
 
     for forwarded in forwarded_signals():
         signal.signal(forwarded, record_post_terminal_signal)
+    return post_terminal_signals
 
 
 def _emit_structured_terminal_failure(
@@ -4715,7 +4735,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             DEFAULT_STREAM_LIMIT_BYTES,
             "stream limit",
         )
-        with _structured_forwarded_signals():
+        with _structured_forwarded_signals() as signal_state:
             timeout = _validate_timeout_limit(args.timeout_seconds)
             deadline = time.monotonic() + timeout
             prompt = _read_control_prompt(
@@ -4741,9 +4761,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 stream_limit_bytes=stream_limit,
                 inherit_node_extra_ca_certs=args.inherit_node_extra_ca_certs,
                 deadline_monotonic=deadline,
+                _receipt_emitter=_emit_claude_receipt,
             )
-        _emit(result)
-        return 0 if result["status"] == "complete" else 1
+            signal_state.commit()
+            return 0 if result["status"] == "complete" else 1
     except _ClaudeLaunchSnapshotCleanupError as error:
         payload: dict[str, object] = {
             "status": "inconclusive",

@@ -54,7 +54,11 @@ cleanup is structured `inconclusive` / `snapshot-cleanup` evidence with exact
 binding is revalidated or descriptor-bound `retained_locator` device/inode/leaf
 evidence after lexical drift; no output is published. Cleanup uses the retained
 output-parent descriptor and recorded leaf identity, while lexical parent
-revalidation remains an output-publication gate. Before stream validation, the parent
+revalidation remains an output-publication gate. Output publication, rollback,
+and the complete flushed `launch_binding` receipt share one signal-masked CLI
+commit transaction: a pre-receipt signal or receipt write/flush failure removes
+the output pair, while a post-receipt signal cannot create a false failure.
+Before stream validation, the parent
 compares that receipt's preflight SHA-256, source identity/path, and signed
 artifact size/SHA-256 with the accepted launch binding. The validator separately
 rereads the preflight result and does not consume `launch_binding`. Sections below

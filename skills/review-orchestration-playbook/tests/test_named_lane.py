@@ -5427,7 +5427,13 @@ class NamedLaneGuardTest(unittest.TestCase):
         executable = self.make_executable(
             "import time\nwhile True:\n    time.sleep(0.05)\n"
         )
+        real_capture = named_lane_runtime.run_bounded_capture
         retained: pathlib.Path | None = None
+
+        def timeout_process_capture(argv: object, **kwargs: object) -> object:
+            if str(tuple(argv)[0]).startswith(str(self.root / ".named-lane-launch-")):
+                raise ReviewTimeoutError("synthetic Claude process deadline")
+            return real_capture(argv, **kwargs)
 
         def fail_cleanup(
             snapshot: object,
@@ -5444,6 +5450,11 @@ class NamedLaneGuardTest(unittest.TestCase):
                     "_cleanup_claude_launch_snapshot",
                     side_effect=fail_cleanup,
                 ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "run_bounded_capture",
+                    side_effect=timeout_process_capture,
+                ),
                 self.assertRaises(
                     named_lane_runtime._ClaudeLaunchSnapshotCleanupError
                 ) as context,
@@ -5455,7 +5466,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     command=(str(executable),),
                     preflight_result=self.preflight_result_path(executable),
                     prompt=b"",
-                    timeout_seconds=0.1,
+                    timeout_seconds=5.0,
                     stream_limit_bytes=64,
                 )
             self.assertEqual(context.exception.process_reason, "deadline")
@@ -6535,6 +6546,13 @@ class NamedLaneGuardTest(unittest.TestCase):
 
     def test_cli_prompt_read_shares_deadline_with_process(self) -> None:
         result = {"status": "complete"}
+
+        def complete_with_receipt(**kwargs: object) -> dict[str, object]:
+            receipt_emitter = kwargs["_receipt_emitter"]
+            self.assertTrue(callable(receipt_emitter))
+            receipt_emitter(result)
+            return result
+
         with (
             mock.patch.object(
                 named_lane_runtime.time,
@@ -6549,7 +6567,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             mock.patch.object(
                 named_lane_runtime,
                 "run_claude",
-                return_value=result,
+                side_effect=complete_with_receipt,
             ) as run,
             mock.patch.object(named_lane_runtime, "_emit") as emit,
         ):
@@ -6581,6 +6599,176 @@ class NamedLaneGuardTest(unittest.TestCase):
         )
         self.assertEqual(run.call_args.kwargs["timeout_seconds"], 3.5)
         self.assertEqual(run.call_args.kwargs["deadline_monotonic"], 105.0)
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "receipt handoff requires POSIX signal masks",
+    )
+    def test_cli_receipt_failure_rolls_back_output_pair(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable(
+            "import sys\n"
+            "sys.stdout.write('captured stdout')\n"
+            "sys.stderr.write('captured stderr')\n"
+        )
+        preflight = self.preflight_result_path(executable)
+        real_emit = named_lane_runtime._emit
+
+        cases = (
+            ("write-error", OSError("synthetic receipt failure"), 2),
+            (
+                "forwarded-signal",
+                ForwardedSignal(signal.SIGTERM),
+                128 + signal.SIGTERM,
+            ),
+        )
+        for label, receipt_error, expected_returncode in cases:
+            with self.subTest(label=label):
+                stdout_path = self.root / f"{label}-receipt.stdout"
+                stderr_path = self.root / f"{label}-receipt.stderr"
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                previous_handlers = {
+                    forwarded: signal.getsignal(forwarded)
+                    for forwarded in named_lane_runtime.forwarded_signals()
+                }
+                previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+                def fail_process_receipt(
+                    payload: dict[str, object],
+                    *,
+                    stream: object | None = None,
+                ) -> None:
+                    if "launch_binding" in payload:
+                        raise receipt_error
+                    real_emit(payload, stream=stream)
+
+                with (
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "_read_control_prompt",
+                        return_value=b"",
+                    ),
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "_emit",
+                        side_effect=fail_process_receipt,
+                    ),
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    returncode = named_lane_main(
+                        (
+                            "run-claude",
+                            "--worktree",
+                            str(self.repo.resolve()),
+                            "--preflight-result",
+                            str(preflight),
+                            "--stdout-path",
+                            str(stdout_path),
+                            "--stderr-path",
+                            str(stderr_path),
+                            "--timeout-seconds",
+                            "5",
+                            "--",
+                            str(executable),
+                        )
+                    )
+
+                self.assertEqual(returncode, expected_returncode)
+                self.assertEqual(stdout.getvalue(), "")
+                failure = json.loads(stderr.getvalue())
+                self.assertEqual(failure["status"], "inconclusive")
+                if isinstance(receipt_error, ForwardedSignal):
+                    self.assertEqual(failure["reason"], "forwarded-signal")
+                else:
+                    self.assertIn("synthetic receipt failure", failure["reason"])
+                self.assertFalse(stdout_path.exists())
+                self.assertFalse(stderr_path.exists())
+                self.assertEqual(tuple(self.root.glob(".named-lane-*")), ())
+                for forwarded, previous in previous_handlers.items():
+                    self.assertEqual(signal.getsignal(forwarded), previous)
+                self.assertEqual(
+                    signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+                    previous_mask,
+                )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "receipt handoff requires POSIX signal masks",
+    )
+    def test_cli_signal_after_flushed_receipt_keeps_output_pair(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable(
+            "import sys\n"
+            "sys.stdout.write('captured stdout')\n"
+            "sys.stderr.write('captured stderr')\n"
+        )
+        stdout_path = self.root / "flushed-receipt.stdout"
+        stderr_path = self.root / "flushed-receipt.stderr"
+        preflight = self.preflight_result_path(executable)
+        previous_handlers = {
+            forwarded: signal.getsignal(forwarded)
+            for forwarded in named_lane_runtime.forwarded_signals()
+        }
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+        class SignalAfterFlush(io.StringIO):
+            flush_calls = 0
+
+            def flush(inner_self) -> None:
+                super().flush()
+                inner_self.flush_calls += 1
+                if inner_self.flush_calls == 1:
+                    handler = signal.getsignal(signal.SIGTERM)
+                    self.assertTrue(callable(handler))
+                    handler(signal.SIGTERM, None)
+
+        stdout = SignalAfterFlush()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_read_control_prompt",
+                return_value=b"",
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(
+                (
+                    "run-claude",
+                    "--worktree",
+                    str(self.repo.resolve()),
+                    "--preflight-result",
+                    str(preflight),
+                    "--stdout-path",
+                    str(stdout_path),
+                    "--stderr-path",
+                    str(stderr_path),
+                    "--timeout-seconds",
+                    "5",
+                    "--",
+                    str(executable),
+                )
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(stdout.flush_calls, 1)
+        receipt = json.loads(stdout.getvalue())
+        self.assertEqual(receipt["status"], "complete")
+        self.assertEqual(receipt["launch_binding"]["mode"], "verified-snapshot")
+        self.assertEqual(stdout_path.read_bytes(), b"captured stdout")
+        self.assertEqual(stderr_path.read_bytes(), b"captured stderr")
+        for forwarded, previous in previous_handlers.items():
+            self.assertEqual(signal.getsignal(forwarded), previous)
+        self.assertEqual(
+            signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+            previous_mask,
+        )
 
     def test_worktree_git_resolution_uses_shared_remaining_deadline(self) -> None:
         observed_timeouts: list[float] = []
