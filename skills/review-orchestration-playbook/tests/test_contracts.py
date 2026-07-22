@@ -3559,6 +3559,40 @@ class RepositoryContractTest(unittest.TestCase):
                 content.lower(),
             )
 
+    def test_github_request_requires_terminal_local_lanes(self) -> None:
+        documents = {
+            "skill": SKILL_ROOT / "SKILL.md",
+            "PR readiness": SKILL_ROOT / "references/pr-readiness.md",
+            "lane contracts": SKILL_ROOT / "references/review-lane-contracts.md",
+            "GitHub probes": SKILL_ROOT / "references/github-pr-probes.md",
+            "prompt templates": SKILL_ROOT / "references/review-prompt-templates.md",
+        }
+        if CI_PROFILE == "canonical":
+            documents["README"] = REPO_ROOT / "README.md"
+        for name, path in documents.items():
+            content = " ".join(path.read_text(encoding="utf-8").split()).lower()
+            with self.subTest(policy_document=name):
+                self.assertIn("github-request-before-local-terminal", content)
+                self.assertIn("later local-lane completion does not cure", content)
+                self.assertIn("terminal payload cannot count", content)
+                self.assertIn("empty or anchor commit", content)
+
+        interface = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
+        self.assertIn("github-request-before-local-terminal", interface)
+        self.assertIn("both local terminals preceded", interface)
+        self.assertIn("cannot be cured by later local completion", interface)
+        self.assertIn("cannot be repeated on the unchanged head", interface)
+
+        readiness = documents["PR readiness"].read_text(encoding="utf-8")
+        self.assertLess(
+            readiness.index("Run the requested local lanes"),
+            readiness.index("Otherwise post the one exact `@codex review` comment"),
+        )
+        self.assertIn(
+            "only after both local lanes are terminal",
+            readiness,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

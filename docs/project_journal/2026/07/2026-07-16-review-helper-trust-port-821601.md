@@ -698,3 +698,36 @@ metadata behavior.
   launcher C syntax, project-journal validation, and `git diff --check` pass.
   Ruff 0.13.2 still identifies the same three unchanged baseline files outside
   this change range that it would reformat; they remain untouched.
+- A final orchestration audit found that the documented lane sequence required
+  both local reviewers to finish before `@codex review`, but did not classify an
+  accidentally early same-head request or prevent its later terminal payload
+  from counting. The policy now records
+  `github-request-before-local-terminal` as a fail-closed
+  `triple-inconclusive` outcome. Later local completion cannot cure the request,
+  the provider payload cannot count, and no second request is allowed until a
+  separately authorized ordinary change creates a new head. Contract tests bind
+  the rule across the skill, PR-readiness guide, lane contract, GitHub probes,
+  prompt template, agent interface, and canonical README.
+- Full-suite load also reproduced a supervisor timing bug: a cancelled spawn
+  worker received only the ordinary 0.5-second join budget even after `Popen`
+  had returned and the worker had become the sole owner of process-group
+  cleanup. That cleanup can legitimately consume three bounded termination
+  phases, so the parent could mark a live worker as leaked, skip the quiescence
+  callback, and retain only an inner cleanup diagnostic. The parent now keeps
+  the short budget for a factory still blocked inside `Popen`, but grants the
+  complete derived cleanup budget after `owner.completed` proves that no new
+  handle can arrive. Process-group polling also reaps an exited leader before
+  probing the group again, avoiding a full zombie-only grace interval on
+  platforms where `killpg(pid, 0)` reports zombies. A deterministic integration
+  test drives cleanup across both budgets and proves one owner, one termination,
+  no false leak, and one quiescence callback; a separate regression binds the
+  reap-before-reprobe behavior. Python 3.13 passes the 155-test common module,
+  the 60-test contract module, the 315-test deterministic supervisor gate, and
+  a 20-iteration reproduction probe with zero callback failures. The complete
+  host-level Python 3.13 suite passes all 2,299 tests in 430.726 seconds with 6
+  expected platform/filesystem skips. Its preceding inner-sandbox run reached
+  the same 2,299 tests but could not nest the keychain broker's own
+  `sandbox-exec`; that exact test and the complete suite both pass outside the
+  enclosing Codex Seatbelt. Ruff lint and changed-file formatting, Python 3.13
+  compileall, project-journal validation, the official skill validator, and
+  `git diff --check` also pass. No local Python 3.10 run was performed.

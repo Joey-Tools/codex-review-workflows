@@ -8,6 +8,16 @@ The canonical Claude lane captures bounded raw stdout outside the model-visible 
 
 ## Named Review Shapes
 
+A parent-owned control-order record must prove that both required local lanes
+had terminal artifacts before the third-lane request was written. An earlier
+request, or an unproved order, is
+`github-request-before-local-terminal`: the GitHub lane is
+`triple-inconclusive`, later local-lane completion does not cure the same-head
+request, its terminal payload cannot count, and no second request is allowed
+while the head is unchanged. Eligibility returns only after a separately
+authorized ordinary change produces a new head; never manufacture an empty or
+anchor commit.
+
 For the third lane, allow at most one acceptable exact `@codex review` request per unchanged head and never post a second one; reuse the recorded request when it already exists. Re-read complete authenticated request history immediately before accepting any result. Server timestamps prove ordering, not request/run lineage. Review/comment APIs expose no request/run identifier, so a review/comment is `triple-inconclusive` whenever an older request might overlap, even if its timestamp is later. Completion requires a complete terminal provider-authored findings payload from exact-bot review/comment evidence, bound to the current head, whole-PR range, and isolated request: fetch the review body plus every fully paginated associated inline review comment, or a terminal issue-comment body. Missing or ambiguous payload, terminal nature, or association is `triple-inconclusive`. An exact-App current-head check/run whose non-null `started_at` is strictly later than the request is service-start evidence only; it never completes triple or proves a clean/no-findings result, even when `completed` / `success`. A same-App check may be unrelated to the requested review, and check success can coexist with provider review findings. Same-head artifacts from an earlier request are stale. A base-only retarget after the request also invalidates the old whole-PR evidence, but it does not authorize a replacement same-head request: readiness is `blocked-input` (`base-changed-same-head`) and the requested triple is `triple-inconclusive` until a separately authorized ordinary change produces a new head. Do not manufacture an empty or anchor commit to escape this blocker.
 
 - **Single:** exactly one clear/fresh-context Codex `reviewer` agent launched with `fork_turns="none"` or the platform-equivalent zero inherited turns, in a separate clean Git worktree. The workspace is read-only. The agent loads applicable skills, scoped `AGENTS.md` files, and project guidance, then uses bounded Git/tool calls to obtain and review the frozen `base_sha..head_sha` itself. Its prompt carries control metadata but never embeds or attaches a prebuilt full diff.

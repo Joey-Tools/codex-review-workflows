@@ -604,6 +604,137 @@ class ChildEnvironmentTest(unittest.TestCase):
             signal_already_sent=False,
         )
 
+    def test_spawn_worker_join_allows_owned_process_cleanup_budget(self) -> None:
+        owner = common._ProcessSpawnOwner()
+        owner.completed.set()
+        thread = mock.Mock()
+        thread.is_alive.side_effect = (True, False)
+
+        common._join_process_spawn_worker(owner, thread)
+
+        self.assertEqual(
+            thread.join.call_args_list,
+            [
+                mock.call(timeout=common.PROCESS_GROUP_TERM_GRACE_SECONDS),
+                mock.call(timeout=common.PROCESS_SPAWN_CLEANUP_GRACE_SECONDS),
+            ],
+        )
+
+    def test_spawn_worker_join_keeps_blocked_factory_budget_short(self) -> None:
+        owner = common._ProcessSpawnOwner()
+        thread = mock.Mock()
+        thread.is_alive.return_value = True
+
+        common._join_process_spawn_worker(owner, thread)
+
+        thread.join.assert_called_once_with(
+            timeout=common.PROCESS_GROUP_TERM_GRACE_SECONDS
+        )
+
+    def test_timeout_waits_for_owned_spawn_cleanup_without_false_leak(
+        self,
+    ) -> None:
+        popen_entered = threading.Event()
+        release_popen = threading.Event()
+        terminate_entered = threading.Event()
+        release_termination = threading.Event()
+        created_threads: list[threading.Thread] = []
+        process = mock.Mock(pid=12345, returncode=0)
+        process.stdin = None
+        process.stdout = None
+        process.stderr = None
+        process.poll.return_value = 0
+
+        class CoordinatedJoinThread(threading.Thread):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                created_threads.append(self)
+
+            def join(self, timeout=None):
+                if not release_popen.is_set():
+                    release_popen.set()
+                    if not terminate_entered.wait(2):
+                        raise AssertionError("spawn cleanup did not start")
+                    return
+                release_termination.set()
+                return super().join(timeout=timeout)
+
+        def delayed_spawn(*_args, **_kwargs):
+            popen_entered.set()
+            if not release_popen.wait(2):
+                raise AssertionError("spawn factory was not released")
+            return process
+
+        def terminate_owned_process(*_args, **_kwargs):
+            terminate_entered.set()
+            if not release_termination.wait(2):
+                raise AssertionError("spawn cleanup budget was not granted")
+
+        def monotonic() -> float:
+            return 1.0 if popen_entered.is_set() else 0.0
+
+        callback = mock.Mock()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            with (
+                mock.patch.object(
+                    common,
+                    "_PROCESS_SPAWN_THREAD",
+                    CoordinatedJoinThread,
+                ),
+                mock.patch.object(
+                    common.subprocess,
+                    "Popen",
+                    side_effect=delayed_spawn,
+                ),
+                mock.patch.object(common.time, "monotonic", side_effect=monotonic),
+                mock.patch.object(common, "_release_exec_gate") as release_gate,
+                mock.patch.object(
+                    common,
+                    "terminate_process_group",
+                    side_effect=terminate_owned_process,
+                ) as terminate,
+                mock.patch.object(common, "_process_group_exists", return_value=False),
+                mock.patch.object(
+                    common.signal,
+                    "signal",
+                    return_value=signal.SIG_DFL,
+                ),
+                mock.patch.object(
+                    common,
+                    "block_forwarded_signals",
+                    return_value=None,
+                ),
+            ):
+                with self.assertRaises(common.ReviewTimeoutError) as raised:
+                    common.run(
+                        ("reviewer",),
+                        stdout_path=root / "stdout.log",
+                        stderr_path=root / "stderr.log",
+                        timeout_seconds=0.05,
+                        on_process_quiescent=callback,
+                    )
+
+        self.assertEqual(len(created_threads), 1)
+        self.assertFalse(created_threads[0].is_alive())
+        self.assertIsInstance(
+            raised.exception.__cause__,
+            common.subprocess.TimeoutExpired,
+        )
+        self.assertFalse(
+            any(
+                "spawn worker remains active" in message
+                for message in _visible_exception_messages(raised.exception)
+            )
+        )
+        release_gate.assert_not_called()
+        terminate.assert_called_once_with(
+            process,
+            initial_signal=signal.SIGTERM,
+            signal_already_sent=False,
+        )
+        callback.assert_called_once_with()
+
     def test_exec_handoff_uses_remaining_operation_deadline(self) -> None:
         read_descriptor, write_descriptor = os.pipe()
         try:
@@ -3552,6 +3683,44 @@ class ChildEnvironmentTest(unittest.TestCase):
 
         forward.assert_not_called()
         process.wait.assert_called_once_with(timeout=2.0)
+
+    def test_process_group_termination_reaps_leader_before_reprobe(self) -> None:
+        leader_reaped = False
+        process = mock.Mock(pid=12345)
+
+        def poll() -> int:
+            nonlocal leader_reaped
+            leader_reaped = True
+            return 0
+
+        process.poll.side_effect = poll
+
+        def group_exists(_pid: int) -> bool:
+            return not leader_reaped
+
+        with (
+            mock.patch.object(
+                common,
+                "_process_group_exists",
+                side_effect=group_exists,
+            ),
+            mock.patch.object(
+                common.time,
+                "monotonic",
+                side_effect=(0.0, 0.0, 1.0),
+            ),
+            mock.patch.object(common.time, "sleep"),
+            mock.patch.object(common, "signal_process_group") as forward,
+            mock.patch.object(common.os, "killpg") as killpg,
+        ):
+            common.terminate_process_group(process)
+
+        forward.assert_called_once_with(process, signal.SIGTERM)
+        process.poll.assert_called_once_with()
+        killpg.assert_not_called()
+        process.wait.assert_called_once_with(
+            timeout=common.PROCESS_GROUP_TERM_GRACE_SECONDS
+        )
 
     def test_logged_command_preserves_signal_arriving_during_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

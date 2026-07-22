@@ -186,6 +186,12 @@ BASE_ENV_KEYS = (
 PROCESS_GROUP_TERM_GRACE_SECONDS = 0.5
 PROCESS_GROUP_EXIT_GRACE_SECONDS = 0.5
 PROCESS_GROUP_POLL_SECONDS = 0.05
+# A cancelled spawn worker can spend one poll handing off ownership, then all
+# three bounded phases in terminate_process_group(). Keep a separate budget so
+# its parent does not mistake expected cleanup for a leaked worker.
+PROCESS_SPAWN_CLEANUP_GRACE_SECONDS = (3 * PROCESS_GROUP_TERM_GRACE_SECONDS) + (
+    2 * PROCESS_GROUP_POLL_SECONDS
+)
 STRICT_JSON_MAX_NESTING_DEPTH = 64
 STRICT_JSON_MAX_INTEGER_DIGITS = 1024
 REGULAR_FILE_LIMIT_WRAPPER = """
@@ -1267,6 +1273,10 @@ def terminate_process_group(
     deadline = time.monotonic() + grace_seconds
     while group_exists and time.monotonic() < deadline:
         time.sleep(PROCESS_GROUP_POLL_SECONDS)
+        # Reap an exited leader before probing the group again. On platforms
+        # where killpg(pid, 0) reports zombies, leaving it unreaped consumes the
+        # entire grace window even when no descendants remain.
+        process.poll()
         group_exists = _process_group_exists(process.pid)
     if group_exists:
         try:
@@ -1437,6 +1447,17 @@ class _ProcessSpawnOwner:
                 self.cleanup_failures.append(error)
         self.worker_cleaned_process = not self.cleanup_failures
         self.cleanup_completed.set()
+
+
+def _join_process_spawn_worker(
+    owner: _ProcessSpawnOwner,
+    thread: threading.Thread,
+) -> None:
+    """Wait for bounded spawn cancellation without hiding a blocked factory."""
+
+    thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
+    if thread.is_alive() and owner.completed.is_set():
+        thread.join(timeout=PROCESS_SPAWN_CLEANUP_GRACE_SECONDS)
 
 
 def _await_owned_process_spawn(
@@ -2379,7 +2400,8 @@ def _run_logged_process(
                         )
                 if worker_started:
                     try:
-                        spawn_thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
+                        assert spawn_owner is not None
+                        _join_process_spawn_worker(spawn_owner, spawn_thread)
                     except BaseException as error:
                         process_cleanup_inconclusive = True
                         cleanup_failures.append(
