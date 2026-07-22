@@ -26,6 +26,9 @@ from .constants import (
     FINAL_MESSAGE_BYTES,
     HANDOFF_SECONDS,
     LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+    MAX_EVIDENCE_CONTEXT_BYTES,
+    MAX_EVIDENCE_CONTEXT_FILE_BYTES,
+    MAX_EVIDENCE_CONTEXT_FILES,
     NAMED_LANE_ELIGIBLE,
     PRIMARY_DIFF_RELATIVE_PATH,
     PROCESS_TERM_GRACE_SECONDS,
@@ -41,7 +44,9 @@ from .evidence import (
 )
 from .errors import SupervisorError, UnprovenDirectHelperClosure, inconclusive
 from .gitraw import (
+    CatFileBatch,
     GitProcessClosureUnproven,
+    RepositoryInfo,
     WorktreeRegistration,
     add_detached_worktree,
     enumerate_registration,
@@ -54,7 +59,7 @@ from .gitraw import (
     verify_worktree_absent,
 )
 from .ledger import commit_state, read_attempt_state
-from .models import HelperCustody, Identity
+from .models import HelperCustody, Identity, TreeEntry, TreeManifest
 from .no_child_profile import LaunchedNoChildProcess
 from .process import (
     ForkedProcessClosureUnproven,
@@ -1986,6 +1991,207 @@ def _restore_checkout_worker_signal_handlers(
         signal.pthread_sigmask(signal.SIG_SETMASK, guard.previous_mask)
 
 
+_APP_SERVER_EVIDENCE_ATTESTATION_SCHEMA = "appserver-evidence-attestation-v1"
+_APP_SERVER_EVIDENCE_ATTESTATION_KEYS = frozenset(
+    {"schema", "manifest_sha256", "nearby_entries"}
+)
+_MANIFEST_ENTRY_KEYS = frozenset({"kind", "path", "sha256", "size"})
+# Inspect a bounded superset so rejected candidates do not spend the text budget.
+_MAX_NEARBY_CONTEXT_CANDIDATES = MAX_EVIDENCE_CONTEXT_FILES * 4
+
+
+def _tree_entry_fingerprint(entry: TreeEntry) -> tuple[int, str, str, int | None]:
+    return (entry.mode, entry.object_type, entry.object_id, entry.size)
+
+
+def _select_nearby_context_entries(
+    base: TreeManifest,
+    head: TreeManifest,
+) -> tuple[TreeEntry, ...]:
+    if not isinstance(base, TreeManifest) or not isinstance(head, TreeManifest):
+        raise EvidenceError("nearby context tree manifests are malformed")
+    if not all(
+        isinstance(entry, TreeEntry) for entry in (*base.entries, *head.entries)
+    ):
+        raise EvidenceError("nearby context tree entries are malformed")
+
+    base_by_path = {entry.path: entry for entry in base.entries}
+    head_by_path = {entry.path: entry for entry in head.entries}
+    if len(base_by_path) != len(base.entries) or len(head_by_path) != len(head.entries):
+        raise EvidenceError("nearby context tree contains duplicate paths")
+
+    candidates: list[TreeEntry] = []
+    for entry in head.entries:
+        previous = base_by_path.get(entry.path)
+        if not entry.is_regular or (
+            previous is not None
+            and _tree_entry_fingerprint(previous) == _tree_entry_fingerprint(entry)
+        ):
+            continue
+        if (
+            not isinstance(entry.path, bytes)
+            or not entry.path
+            or entry.object_type != "blob"
+            or isinstance(entry.size, bool)
+            or not isinstance(entry.size, int)
+            or entry.size < 0
+        ):
+            raise EvidenceError("nearby context tree entry is malformed")
+        candidates.append(entry)
+
+    selected: list[TreeEntry] = []
+    for entry in sorted(candidates, key=lambda candidate: candidate.path):
+        assert entry.size is not None
+        if entry.size > MAX_EVIDENCE_CONTEXT_FILE_BYTES:
+            continue
+        selected.append(entry)
+        if len(selected) >= _MAX_NEARBY_CONTEXT_CANDIDATES:
+            break
+    return tuple(selected)
+
+
+def _is_textual_nearby_context(content: bytes) -> bool:
+    try:
+        text = content.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        return False
+    return not any(
+        (ord(character) < 0x20 and character not in "\t\n\r") or ord(character) == 0x7F
+        for character in text
+    )
+
+
+def _authenticate_tracked_context_entries(
+    *,
+    info: RepositoryInfo,
+    entries: tuple[TreeEntry, ...],
+) -> tuple[ManifestEntry, ...]:
+    if not entries:
+        return ()
+    if len(entries) > _MAX_NEARBY_CONTEXT_CANDIDATES:
+        raise EvidenceError("too many nearby context candidates were selected")
+    authenticated: list[ManifestEntry] = []
+    authenticated_bytes = 0
+    with CatFileBatch(info) as batch:
+        for entry in entries:
+            if (
+                not entry.is_regular
+                or entry.object_type != "blob"
+                or isinstance(entry.size, bool)
+                or not isinstance(entry.size, int)
+                or not 0 <= entry.size <= MAX_EVIDENCE_CONTEXT_FILE_BYTES
+            ):
+                raise EvidenceError("selected nearby context entry is malformed")
+            content = batch.read_blob(entry, capture=True)
+            if content is None or len(content) != entry.size:
+                raise EvidenceError("selected nearby context blob is unavailable")
+            if not _is_textual_nearby_context(content):
+                continue
+
+            path = os.fsdecode(entry.path)
+            if os.fsencode(path) != entry.path:
+                raise EvidenceError("selected nearby context path is not reversible")
+            try:
+                candidate = ManifestEntry(
+                    path=path,
+                    kind="regular",
+                    size=len(content),
+                    sha256=sha256_bytes(content),
+                )
+            except EvidenceError:
+                continue
+            if authenticated_bytes + candidate.size > MAX_EVIDENCE_CONTEXT_BYTES:
+                continue
+            authenticated.append(candidate)
+            authenticated_bytes += candidate.size
+            if len(authenticated) >= MAX_EVIDENCE_CONTEXT_FILES:
+                break
+    if (
+        len(authenticated) > MAX_EVIDENCE_CONTEXT_FILES
+        or any(entry.size > MAX_EVIDENCE_CONTEXT_FILE_BYTES for entry in authenticated)
+        or sum(entry.size for entry in authenticated) > MAX_EVIDENCE_CONTEXT_BYTES
+    ):
+        raise EvidenceError("authenticated nearby context exceeds its bounds")
+    return tuple(authenticated)
+
+
+def _restore_appserver_evidence_manifest(
+    *,
+    primary_entry: ManifestEntry,
+    checkout_evidence: object,
+) -> tuple[AuthenticatedManifest, tuple[str, ...]]:
+    if not isinstance(checkout_evidence, dict):
+        raise EvidenceError("checkout evidence is unavailable")
+    attestation = checkout_evidence.get("appserver_evidence")
+    if (
+        not isinstance(attestation, dict)
+        or set(attestation) != _APP_SERVER_EVIDENCE_ATTESTATION_KEYS
+        or attestation.get("schema") != _APP_SERVER_EVIDENCE_ATTESTATION_SCHEMA
+    ):
+        raise EvidenceError("app-server evidence attestation is malformed")
+    raw_entries = attestation.get("nearby_entries")
+    if (
+        not isinstance(raw_entries, list)
+        or len(raw_entries) > MAX_EVIDENCE_CONTEXT_FILES
+    ):
+        raise EvidenceError("nearby context manifest count is invalid")
+
+    nearby_entries: list[ManifestEntry] = []
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, dict) or set(raw_entry) != _MANIFEST_ENTRY_KEYS:
+            raise EvidenceError("nearby context manifest entry is malformed")
+        entry = ManifestEntry(
+            path=raw_entry.get("path"),
+            kind=raw_entry.get("kind"),
+            size=raw_entry.get("size"),
+            sha256=raw_entry.get("sha256"),
+        )
+        if entry.kind != "regular" or entry.path == primary_entry.path:
+            raise EvidenceError("nearby context manifest role is invalid")
+        nearby_entries.append(entry)
+
+    if (
+        any(entry.size > MAX_EVIDENCE_CONTEXT_FILE_BYTES for entry in nearby_entries)
+        or sum(entry.size for entry in nearby_entries) > MAX_EVIDENCE_CONTEXT_BYTES
+    ):
+        raise EvidenceError("nearby context manifest exceeds its byte bounds")
+
+    expected_sha256 = attestation.get("manifest_sha256")
+    manifest = AuthenticatedManifest.authenticate(
+        (primary_entry, *nearby_entries),
+        expected_sha256=expected_sha256,
+    )
+    normalized_nearby = tuple(
+        entry for entry in manifest.entries if entry.path != primary_entry.path
+    )
+    if tuple(nearby_entries) != normalized_nearby:
+        raise EvidenceError("nearby context manifest order is not canonical")
+    return manifest, tuple(entry.path for entry in normalized_nearby)
+
+
+def _build_appserver_evidence_attestation(
+    *,
+    info: RepositoryInfo,
+    base: TreeManifest,
+    head: TreeManifest,
+    primary_entry: ManifestEntry,
+) -> dict[str, object]:
+    nearby_entries = _authenticate_tracked_context_entries(
+        info=info,
+        entries=_select_nearby_context_entries(base, head),
+    )
+    attestation: dict[str, object] = {
+        "schema": _APP_SERVER_EVIDENCE_ATTESTATION_SCHEMA,
+        "manifest_sha256": evidence_manifest_sha256((primary_entry, *nearby_entries)),
+        "nearby_entries": [entry.to_json() for entry in nearby_entries],
+    }
+    _restore_appserver_evidence_manifest(
+        primary_entry=primary_entry,
+        checkout_evidence={"appserver_evidence": attestation},
+    )
+    return attestation
+
+
 def checkout_worker_main(
     *,
     attempt_dir: pathlib.Path,
@@ -2111,12 +2317,25 @@ def checkout_worker_main(
         )
         materializer.phase1()
         evidence = materializer.materialize()
+        primary_entry = ManifestEntry(
+            path=PRIMARY_DIFF_RELATIVE_PATH,
+            kind="regular",
+            size=custody.diff_length,
+            sha256=custody.diff_sha256,
+        )
+        evidence_json = evidence.to_json()
+        evidence_json["appserver_evidence"] = _build_appserver_evidence_attestation(
+            info=info,
+            base=base,
+            head=head,
+            primary_entry=primary_entry,
+        )
         send_record(
             control,
             {
                 "type": "checkout-complete",
                 "token": token,
-                "evidence": evidence.to_json(),
+                "evidence": evidence_json,
             },
             deadline=deadline,
         )
@@ -2718,11 +2937,6 @@ def run_reviewer(
         size=state["diff_length"],
         sha256=state["diff_sha256"],
     )
-    evidence_manifest_digest = evidence_manifest_sha256((primary_entry,))
-    evidence_manifest = AuthenticatedManifest.authenticate(
-        (primary_entry,),
-        expected_sha256=evidence_manifest_digest,
-    )
     worktree = pathlib.Path(state["worktree_path"])
     root_fd, root_identity = open_absolute_directory_chain(worktree)
     try:
@@ -2732,6 +2946,10 @@ def run_reviewer(
         registered_identity = _registration(registration_value).worktree_identity
         if not directory_identities_match(root_identity, registered_identity):
             raise EvidenceError("evidence root identity differs from registration")
+        evidence_manifest, nearby_paths = _restore_appserver_evidence_manifest(
+            primary_entry=primary_entry,
+            checkout_evidence=state.get("checkout_evidence"),
+        )
         prepared_input = build_prelaunch_appserver_input(
             root_fd=root_fd,
             manifest=evidence_manifest,
@@ -2739,6 +2957,7 @@ def run_reviewer(
             base_sha=state["base_sha"],
             head_sha=state["head_sha"],
             forbidden_paths=(worktree,),
+            nearby_paths=nearby_paths,
         )
     except ValueError as evidence_error:
         raise inconclusive(
@@ -2994,6 +3213,16 @@ def _run_checkout(
             or evidence.get("sealed_diff_sha256") != state["diff_sha256"]
         ):
             raise ValueError("checkout worker sealed-diff evidence is malformed")
+        primary_entry = ManifestEntry(
+            path=PRIMARY_DIFF_RELATIVE_PATH,
+            kind="regular",
+            size=state["diff_length"],
+            sha256=state["diff_sha256"],
+        )
+        _restore_appserver_evidence_manifest(
+            primary_entry=primary_entry,
+            checkout_evidence=evidence,
+        )
         state, state_digest = commit_via_helper(
             entrypoint=entrypoint,
             attempt_dir=attempt_dir,

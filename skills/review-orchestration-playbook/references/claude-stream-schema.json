@@ -335,6 +335,15 @@
                   "usage"
                 ],
                 "optional_fields": [],
+                "profile_optional_field_contracts": {
+                  "legacy-base": {},
+                  "extended-2x": {
+                    "diagnostics": {
+                      "rule": "null",
+                      "failure": "inconclusive"
+                    }
+                  }
+                },
                 "additional_fields": false,
                 "fixed_values": {
                   "context_management": null,

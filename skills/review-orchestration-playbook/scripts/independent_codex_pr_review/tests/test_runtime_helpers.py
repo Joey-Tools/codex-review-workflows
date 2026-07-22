@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import pathlib
 import threading
@@ -11,11 +13,16 @@ from unittest import mock
 from review_supervisor.constants import (
     APP_SERVER_CLI_VERSION,
     LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+    MAX_EVIDENCE_CONTEXT_BYTES,
+    MAX_EVIDENCE_CONTEXT_FILE_BYTES,
+    MAX_EVIDENCE_CONTEXT_FILES,
     NAMED_LANE_ELIGIBLE,
     SCHEMA_VERSION,
 )
+from review_supervisor.evidence import ManifestEntry, manifest_sha256
 from review_supervisor.errors import SupervisorError, inconclusive
 from review_supervisor.ledger import acquire_retention_lease, read_attempt_state
+from review_supervisor.models import TreeEntry, TreeManifest
 from review_supervisor.process import (
     ForkedProcessClosureUnproven,
     SpawnedProcess,
@@ -27,6 +34,8 @@ from review_supervisor.runtime import (
     DurableProcessLifecycle,
     OuterAbandoned,
     PrelaunchWorkerClosureUnproven,
+    _MAX_NEARBY_CONTEXT_CANDIDATES,
+    _build_appserver_evidence_attestation,
     _kill_direct,
     _record_failure,
     _run_checkout,
@@ -56,6 +65,48 @@ from tests.support import owned_temporary_directory
 ENTRYPOINT = (
     pathlib.Path(__file__).resolve().parent.parent / "independent-codex-pr-review"
 )
+
+
+def _tracked_blob(path: bytes, content: bytes, object_number: int) -> TreeEntry:
+    return TreeEntry(
+        mode=0o100644,
+        object_type="blob",
+        object_id=f"{object_number:040x}",
+        size=len(content),
+        path=path,
+    )
+
+
+def _tree_manifest(entries: tuple[TreeEntry, ...]) -> TreeManifest:
+    return TreeManifest(
+        commit="2" * 40,
+        entries=entries,
+        metadata_bytes=0,
+        aggregate_regular_bytes=sum(entry.size or 0 for entry in entries),
+        gitlink_count=0,
+    )
+
+
+class _FakeCatFileBatch:
+    def __init__(
+        self,
+        blobs: dict[str, bytes],
+        inspected_paths: list[bytes],
+    ) -> None:
+        self._blobs = blobs
+        self._inspected_paths = inspected_paths
+
+    def __enter__(self) -> _FakeCatFileBatch:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def read_blob(self, entry: TreeEntry, *, capture: bool) -> bytes:
+        if not capture:
+            raise AssertionError("nearby context blob was not captured")
+        self._inspected_paths.append(entry.path)
+        return self._blobs[entry.object_id]
 
 
 class RuntimeHelperTests(unittest.TestCase):
@@ -844,15 +895,229 @@ class RuntimeHelperTests(unittest.TestCase):
                     },
                 )
 
+    def test_nearby_context_skips_git_paths_rejected_by_manifest(self) -> None:
+        diff = b"diff --git a/app/page.tsx b/app/page.tsx\n"
+        primary_entry = ManifestEntry(
+            path=".codex-review/review.diff",
+            kind="regular",
+            size=len(diff),
+            sha256=sha256_bytes(diff),
+        )
+        contents = {
+            b"app/[id]/page.tsx": b"export default function Page() {}\n",
+            b"src\\glob*.py": b"VALUE = 1\n",
+            b"z-valid.py": b"VALUE = 2\n",
+        }
+        entries = tuple(
+            _tracked_blob(path, content, index)
+            for index, (path, content) in enumerate(contents.items(), start=1)
+        )
+        blobs = {entry.object_id: contents[entry.path] for entry in entries}
+        inspected_paths: list[bytes] = []
+
+        with mock.patch(
+            "review_supervisor.runtime.CatFileBatch",
+            side_effect=lambda _info: _FakeCatFileBatch(blobs, inspected_paths),
+        ):
+            attestation = _build_appserver_evidence_attestation(
+                info=SimpleNamespace(object_format="sha1"),
+                base=_tree_manifest(()),
+                head=_tree_manifest(tuple(reversed(entries))),
+                primary_entry=primary_entry,
+            )
+
+        valid_content = contents[b"z-valid.py"]
+        valid_entry = ManifestEntry(
+            path="z-valid.py",
+            kind="regular",
+            size=len(valid_content),
+            sha256=sha256_bytes(valid_content),
+        )
+        self.assertEqual(inspected_paths, sorted(contents))
+        self.assertEqual(
+            [entry["path"] for entry in attestation["nearby_entries"]],
+            ["z-valid.py"],
+        )
+        self.assertEqual(
+            attestation["manifest_sha256"],
+            manifest_sha256((primary_entry, valid_entry)),
+        )
+
+    def test_binary_candidates_do_not_consume_text_context_budget(self) -> None:
+        candidate_contents: list[tuple[bytes, bytes]] = []
+        binary_size = MAX_EVIDENCE_CONTEXT_BYTES // MAX_EVIDENCE_CONTEXT_FILES
+        for index in range(MAX_EVIDENCE_CONTEXT_FILES):
+            prefix = b"\x00" if index % 2 == 0 else b"\xff"
+            candidate_contents.append(
+                (
+                    f"a-binary-{index:02d}.bin".encode(),
+                    prefix + b"x" * (binary_size - 1),
+                )
+            )
+        candidate_contents.append((b"b-text.py", b"VALUE = 1\n"))
+        for index in range(_MAX_NEARBY_CONTEXT_CANDIDATES - MAX_EVIDENCE_CONTEXT_FILES):
+            candidate_contents.append((f"z-binary-{index:03d}.bin".encode(), b"\x00"))
+
+        entries = tuple(
+            _tracked_blob(path, content, index)
+            for index, (path, content) in enumerate(candidate_contents, start=1)
+        )
+        blobs = {
+            entry.object_id: content
+            for entry, (_, content) in zip(entries, candidate_contents, strict=True)
+        }
+        inspected_paths: list[bytes] = []
+        primary_content = b"diff\n"
+        primary_entry = ManifestEntry(
+            path=".codex-review/review.diff",
+            kind="regular",
+            size=len(primary_content),
+            sha256=sha256_bytes(primary_content),
+        )
+
+        with mock.patch(
+            "review_supervisor.runtime.CatFileBatch",
+            side_effect=lambda _info: _FakeCatFileBatch(blobs, inspected_paths),
+        ):
+            attestation = _build_appserver_evidence_attestation(
+                info=SimpleNamespace(object_format="sha1"),
+                base=_tree_manifest(()),
+                head=_tree_manifest(tuple(reversed(entries))),
+                primary_entry=primary_entry,
+            )
+
+        expected_inspected = sorted(path for path, _ in candidate_contents)[
+            :_MAX_NEARBY_CONTEXT_CANDIDATES
+        ]
+        self.assertEqual(inspected_paths, expected_inspected)
+        self.assertEqual(len(inspected_paths), _MAX_NEARBY_CONTEXT_CANDIDATES)
+        self.assertEqual(
+            [entry["path"] for entry in attestation["nearby_entries"]],
+            ["b-text.py"],
+        )
+
     def test_reviewer_builds_primary_evidence_executes_and_authorizes(self) -> None:
         with owned_temporary_directory("runtime-appserver-gate-") as root:
             control = root / ".codex-review"
             control.mkdir()
             diff = b"diff --git a/a.py b/a.py\n+fixed\n"
             (control / "review.diff").write_bytes(diff)
+            source = root / "src"
+            source.mkdir()
+            old_alpha = b"def alpha():\n    return 1\n"
+            alpha = b"def alpha():\n    return 2\n"
+            old_zeta = b"def zeta():\n    return 3\n"
+            zeta = b"def zeta():\n    return 4\n"
+            (source / "a.py").write_bytes(alpha)
+            (source / "z.py").write_bytes(zeta)
+            (source / "a.py").chmod(0o644)
+            (source / "z.py").chmod(0o644)
+
+            def tracked_entry(path: bytes, content: bytes) -> TreeEntry:
+                digest = hashlib.sha1()
+                digest.update(f"blob {len(content)}\0".encode("ascii"))
+                digest.update(content)
+                return TreeEntry(
+                    mode=0o100644,
+                    object_type="blob",
+                    object_id=digest.hexdigest(),
+                    size=len(content),
+                    path=path,
+                )
+
+            base_manifest = TreeManifest(
+                commit="1" * 40,
+                entries=(
+                    tracked_entry(b"src/a.py", old_alpha),
+                    tracked_entry(b"src/z.py", old_zeta),
+                ),
+                metadata_bytes=0,
+                aggregate_regular_bytes=len(old_alpha) + len(old_zeta),
+                gitlink_count=0,
+            )
+            head_manifest = TreeManifest(
+                commit="2" * 40,
+                entries=(
+                    tracked_entry(b"src/z.py", zeta),
+                    tracked_entry(b"src/a.py", alpha),
+                ),
+                metadata_bytes=0,
+                aggregate_regular_bytes=len(alpha) + len(zeta),
+                gitlink_count=0,
+            )
+            oversized_manifest = TreeManifest(
+                commit="2" * 40,
+                entries=head_manifest.entries
+                + (
+                    TreeEntry(
+                        mode=0o100644,
+                        object_type="blob",
+                        object_id="0" * 40,
+                        size=MAX_EVIDENCE_CONTEXT_FILE_BYTES + 1,
+                        path=b"generated/oversized.txt",
+                    ),
+                ),
+                metadata_bytes=0,
+                aggregate_regular_bytes=(
+                    head_manifest.aggregate_regular_bytes
+                    + MAX_EVIDENCE_CONTEXT_FILE_BYTES
+                    + 1
+                ),
+                gitlink_count=0,
+            )
+            primary_entry = ManifestEntry(
+                path=".codex-review/review.diff",
+                kind="regular",
+                size=len(diff),
+                sha256=sha256_bytes(diff),
+            )
+            tracked_blobs = {
+                tracked_entry(b"src/a.py", alpha).object_id: alpha,
+                tracked_entry(b"src/z.py", zeta).object_id: zeta,
+            }
+
+            class FakeCatFileBatch:
+                def __init__(self, info: object) -> None:
+                    self.info = info
+
+                def __enter__(self) -> FakeCatFileBatch:
+                    return self
+
+                def __exit__(self, *args: object) -> None:
+                    return None
+
+                def read_blob(
+                    self,
+                    entry: TreeEntry,
+                    *,
+                    capture: bool,
+                ) -> bytes:
+                    if not capture:
+                        raise AssertionError("nearby context blob was not captured")
+                    return tracked_blobs[entry.object_id]
+
+            with mock.patch(
+                "review_supervisor.runtime.CatFileBatch",
+                FakeCatFileBatch,
+            ):
+                appserver_evidence = _build_appserver_evidence_attestation(
+                    info=SimpleNamespace(object_format="sha1"),
+                    base=base_manifest,
+                    head=oversized_manifest,
+                    primary_entry=primary_entry,
+                )
+            self.assertEqual(
+                [entry["path"] for entry in appserver_evidence["nearby_entries"]],
+                ["src/a.py", "src/z.py"],
+            )
+
             identity = identity_from_stat(os.stat(root, follow_symlinks=False))
             state = {
                 "base_sha": "1" * 40,
+                "checkout_evidence": {
+                    "appserver_evidence": appserver_evidence,
+                    "sealed_diff_sha256": sha256_bytes(diff),
+                },
                 "diff_length": len(diff),
                 "diff_sha256": sha256_bytes(diff),
                 "head_sha": "2" * 40,
@@ -919,6 +1184,23 @@ class RuntimeHelperTests(unittest.TestCase):
                         state_digest="digest",
                         prompt=b"control prompt",
                     )
+
+                    (source / "a.py").write_bytes(b"def alpha():\n    return 9\n")
+                    tampered_outer, tampered_peer = socket_pair()
+                    try:
+                        with self.assertRaises(SupervisorError) as raised:
+                            run_reviewer(
+                                entrypoint=ENTRYPOINT,
+                                attempt_dir=root,
+                                lease_fd=3,
+                                outer=tampered_outer,
+                                state=state,
+                                state_digest="digest",
+                                prompt=b"control prompt",
+                            )
+                    finally:
+                        tampered_outer.close()
+                        tampered_peer.close()
             finally:
                 outer.close()
                 peer.close()
@@ -935,10 +1217,34 @@ class RuntimeHelperTests(unittest.TestCase):
         model_prompt = execution_calls[0]["prompt"]
         self.assertIsInstance(model_prompt, bytes)
         self.assertGreater(len(model_prompt), len(diff))
+        bundle_payload = model_prompt.split(
+            b"BEGIN_AUTHENTICATED_EVIDENCE_BUNDLE\n", 1
+        )[1].split(b"\nEND_AUTHENTICATED_EVIDENCE_BUNDLE", 1)[0]
+        evidence_bundle = json.loads(bundle_payload)
+        self.assertEqual(
+            [artifact["role"] for artifact in evidence_bundle["artifacts"]],
+            ["primary_diff", "nearby_context", "nearby_context"],
+        )
+        self.assertEqual(
+            [artifact["content"] for artifact in evidence_bundle["artifacts"]],
+            [diff.decode(), alpha.decode(), zeta.decode()],
+        )
+        self.assertEqual(
+            evidence_bundle["manifest_sha256"],
+            appserver_evidence["manifest_sha256"],
+        )
         observed = publish.call_args.kwargs["observed_runtime"]
+        self.assertEqual(
+            observed["evidence_bundle_sha256"],
+            sha256_bytes(canonical_json(evidence_bundle)),
+        )
         self.assertEqual(observed["requested_model"], "gpt-5.6-sol")
         self.assertEqual(observed["transport"], "app-server-stdio")
         self.assertTrue(observed["actual_invocation_enabled"])
+        self.assertEqual(
+            raised.exception.failure.code, "appserver-evidence-inconclusive"
+        )
+        self.assertEqual(len(execution_calls), 1)
 
     def test_output_limit_termination_schedule_never_resets_grace(self) -> None:
         schedule = TerminationSchedule(grace_seconds=5.0, drain_seconds=2.0)

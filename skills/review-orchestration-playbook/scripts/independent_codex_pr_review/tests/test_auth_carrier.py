@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import json
 import os
 import pathlib
 import tempfile
+import threading
+import time
 import unittest
 from typing import Any
 from unittest import mock
@@ -102,11 +105,14 @@ class AuthCarrierTests(unittest.TestCase):
             evidence = load_external_auth(
                 path,
                 now=1_000,
+                monotonic_now=500,
                 minimum_remaining_seconds=2_700,
             )
         self.assertEqual(evidence.auth.chatgpt_account_id, "account-1")
         self.assertEqual(evidence.auth.chatgpt_plan_type, "pro")
         self.assertEqual(evidence.access_token_expires_at, 10_000)
+        self.assertEqual(evidence.wall_time_baseline, 1_000)
+        self.assertEqual(evidence.monotonic_time_baseline, 500)
         self.assertNotIn(evidence.auth.access_token, repr(evidence))
         self.assertNotIn(SYNTHETIC_REFRESH_TOKEN, repr(evidence))
         self.assertNotIn("account-1", json.dumps(evidence.to_json()))
@@ -476,20 +482,36 @@ class AuthCarrierTests(unittest.TestCase):
             evidence = load_external_auth(
                 path,
                 now=1_000,
+                monotonic_now=500,
                 minimum_remaining_seconds=2_700,
             )
 
-            revalidate_external_auth_source(path, evidence, now=7_300)
+            revalidate_external_auth_source(
+                path,
+                evidence,
+                now=7_300,
+                monotonic_now=6_800,
+            )
             with self.assertRaisesRegex(
                 AuthCarrierError,
                 "no longer covers the bounded review runtime",
             ):
-                revalidate_external_auth_source(path, evidence, now=7_300.001)
+                revalidate_external_auth_source(
+                    path,
+                    evidence,
+                    now=7_300.001,
+                    monotonic_now=6_800.001,
+                )
             with (
                 mock.patch.object(
                     auth_carrier.time,
                     "time",
                     return_value=7_300.001,
+                ),
+                mock.patch.object(
+                    auth_carrier,
+                    "_suspend_aware_monotonic",
+                    return_value=6_800.001,
                 ),
                 self.assertRaisesRegex(
                     AuthCarrierError,
@@ -498,12 +520,307 @@ class AuthCarrierTests(unittest.TestCase):
             ):
                 revalidate_external_auth_source(path, evidence)
 
+    def test_revalidation_rejects_wall_clock_rollback_beyond_tolerance(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = self.write_auth(pathlib.Path(raw_root), expiration=3_800)
+            with (
+                mock.patch.object(
+                    auth_carrier.time,
+                    "time",
+                    side_effect=(1_000, 900),
+                ) as wall_clock,
+                mock.patch.object(
+                    auth_carrier,
+                    "_suspend_aware_monotonic",
+                    side_effect=(500, 600),
+                ) as monotonic_clock,
+                self.assertRaisesRegex(
+                    AuthCarrierError,
+                    "wall clock moved backwards",
+                ),
+            ):
+                evidence = load_external_auth(
+                    path,
+                    minimum_remaining_seconds=2_700,
+                )
+                revalidate_external_auth_source(path, evidence)
+            self.assertEqual(wall_clock.call_count, 2)
+            self.assertEqual(monotonic_clock.call_count, 2)
+
+    def test_revalidation_tolerates_sampling_skew_without_extending_lifetime(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = self.write_auth(pathlib.Path(raw_root), expiration=3_710)
+            evidence = load_external_auth(
+                path,
+                now=1_000,
+                monotonic_now=500,
+                minimum_remaining_seconds=2_700,
+            )
+
+            with self.assertRaisesRegex(
+                AuthCarrierError,
+                "no longer covers the bounded review runtime",
+            ):
+                revalidate_external_auth_source(
+                    path,
+                    evidence,
+                    now=1_009.5,
+                    monotonic_now=510.5,
+                )
+            with self.assertRaisesRegex(
+                AuthCarrierError,
+                "wall clock moved backwards",
+            ):
+                revalidate_external_auth_source(
+                    path,
+                    evidence,
+                    now=1_009.499,
+                    monotonic_now=510.5,
+                )
+
+    def test_revalidation_uses_forward_wall_clock_drift_conservatively(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = self.write_auth(pathlib.Path(raw_root), expiration=3_800)
+            evidence = load_external_auth(
+                path,
+                now=1_000,
+                monotonic_now=500,
+                minimum_remaining_seconds=2_700,
+            )
+
+            revalidate_external_auth_source(
+                path,
+                evidence,
+                now=1_100,
+                monotonic_now=510,
+            )
+            with self.assertRaisesRegex(
+                AuthCarrierError,
+                "no longer covers the bounded review runtime",
+            ):
+                revalidate_external_auth_source(
+                    path,
+                    evidence,
+                    now=1_100.001,
+                    monotonic_now=510,
+                )
+
+    def test_revalidation_preserves_wall_and_monotonic_high_water(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = self.write_auth(pathlib.Path(raw_root), expiration=10_000)
+            evidence = load_external_auth(
+                path,
+                now=1_000,
+                monotonic_now=500,
+                minimum_remaining_seconds=2_700,
+            )
+
+            revalidate_external_auth_source(
+                path,
+                evidence,
+                now=1_100,
+                monotonic_now=510,
+            )
+            with self.assertRaisesRegex(
+                AuthCarrierError,
+                "wall clock moved backwards",
+            ):
+                revalidate_external_auth_source(
+                    path,
+                    evidence,
+                    now=1_011,
+                    monotonic_now=511,
+                )
+
+            fresh = load_external_auth(
+                path,
+                now=1_000,
+                monotonic_now=500,
+                minimum_remaining_seconds=2_700,
+            )
+            revalidate_external_auth_source(
+                path,
+                fresh,
+                now=1_100,
+                monotonic_now=600,
+            )
+            with self.assertRaisesRegex(
+                AuthCarrierError,
+                "monotonic clock moved backwards",
+            ):
+                revalidate_external_auth_source(
+                    path,
+                    fresh,
+                    now=1_050,
+                    monotonic_now=550,
+                )
+
+    def test_suspend_aware_elapsed_time_detects_sleep_during_wall_rollback(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = self.write_auth(pathlib.Path(raw_root), expiration=10_000)
+            evidence = load_external_auth(
+                path,
+                now=1_000,
+                monotonic_now=500,
+                minimum_remaining_seconds=2_700,
+            )
+
+            with self.assertRaisesRegex(
+                AuthCarrierError,
+                "wall clock moved backwards",
+            ):
+                revalidate_external_auth_source(
+                    path,
+                    evidence,
+                    now=1_000,
+                    monotonic_now=620,
+                )
+
+    def test_expiry_failure_latches_the_latest_clock_high_water(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = self.write_auth(pathlib.Path(raw_root), expiration=3_710)
+            evidence = load_external_auth(
+                path,
+                now=1_000,
+                monotonic_now=500,
+                minimum_remaining_seconds=2_700,
+            )
+
+            for now in (1_010.001, 1_009.5):
+                with (
+                    self.subTest(now=now),
+                    self.assertRaisesRegex(
+                        AuthCarrierError,
+                        "no longer covers the bounded review runtime",
+                    ),
+                ):
+                    revalidate_external_auth_source(
+                        path,
+                        evidence,
+                        now=now,
+                        monotonic_now=510.001,
+                    )
+
+    def test_revalidation_serializes_clock_sampling_with_state_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            path = self.write_auth(pathlib.Path(raw_root), expiration=10_000)
+            evidence = load_external_auth(
+                path,
+                now=1_000,
+                monotonic_now=500,
+                minimum_remaining_seconds=2_700,
+            )
+            start = threading.Barrier(3)
+            sample_lock = threading.Lock()
+            samples = iter(
+                (
+                    auth_carrier._ClockSample(1_010, 510),
+                    auth_carrier._ClockSample(1_011, 511),
+                )
+            )
+            active_samples = 0
+            maximum_active_samples = 0
+            errors: list[BaseException] = []
+
+            def sample_clock(*_args: object) -> auth_carrier._ClockSample:
+                nonlocal active_samples, maximum_active_samples
+                with sample_lock:
+                    active_samples += 1
+                    maximum_active_samples = max(
+                        maximum_active_samples,
+                        active_samples,
+                    )
+                time.sleep(0.02)
+                with sample_lock:
+                    active_samples -= 1
+                    return next(samples)
+
+            def revalidate() -> None:
+                try:
+                    start.wait()
+                    revalidate_external_auth_source(path, evidence)
+                except BaseException as error:
+                    errors.append(error)
+
+            workers = tuple(threading.Thread(target=revalidate) for _ in range(2))
+            with mock.patch.object(
+                auth_carrier,
+                "_validated_clock_sample",
+                side_effect=sample_clock,
+            ):
+                for worker in workers:
+                    worker.start()
+                start.wait()
+                for worker in workers:
+                    worker.join(timeout=2)
+
+            self.assertFalse(any(worker.is_alive() for worker in workers))
+            self.assertEqual(errors, [])
+            self.assertEqual(maximum_active_samples, 1)
+            self.assertEqual(evidence.clock_high_water.last_monotonic_time, 511)
+            self.assertEqual(evidence.clock_high_water.effective_wall_time, 1_011)
+
+    def test_suspend_aware_clock_selects_only_supported_sources(self) -> None:
+        with (
+            mock.patch.object(
+                auth_carrier.time,
+                "CLOCK_BOOTTIME",
+                7,
+                create=True,
+            ),
+            mock.patch.object(
+                auth_carrier.time,
+                "clock_gettime",
+                return_value=123.5,
+            ) as clock_gettime,
+        ):
+            self.assertEqual(auth_carrier._suspend_aware_monotonic(), 123.5)
+        clock_gettime.assert_called_once_with(7)
+
+        with (
+            mock.patch.object(
+                auth_carrier.time,
+                "CLOCK_BOOTTIME",
+                None,
+                create=True,
+            ),
+            mock.patch.object(auth_carrier.sys, "platform", "darwin"),
+            mock.patch.object(
+                auth_carrier,
+                "_darwin_continuous_seconds",
+                return_value=456.25,
+            ) as darwin_clock,
+        ):
+            self.assertEqual(auth_carrier._suspend_aware_monotonic(), 456.25)
+        darwin_clock.assert_called_once_with()
+
+        with (
+            mock.patch.object(
+                auth_carrier.time,
+                "CLOCK_BOOTTIME",
+                None,
+                create=True,
+            ),
+            mock.patch.object(auth_carrier.sys, "platform", "unsupported"),
+            self.assertRaisesRegex(OSError, "no suspend-aware"),
+        ):
+            auth_carrier._suspend_aware_monotonic()
+
     def test_revalidation_fails_closed_for_invalid_clock_values(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             path = self.write_auth(pathlib.Path(raw_root), expiration=10_000)
             evidence = load_external_auth(
                 path,
                 now=1_000,
+                monotonic_now=500,
                 minimum_remaining_seconds=2_700,
             )
 
@@ -516,6 +833,18 @@ class AuthCarrierTests(unittest.TestCase):
                         path,
                         evidence,
                         now=invalid_now,
+                        monotonic_now=500,
+                    )
+            for invalid_monotonic_now in (True, float("nan"), float("inf")):
+                with (
+                    self.subTest(monotonic_now=invalid_monotonic_now),
+                    self.assertRaisesRegex(AuthCarrierError, "clock value is invalid"),
+                ):
+                    revalidate_external_auth_source(
+                        path,
+                        evidence,
+                        now=1_000,
+                        monotonic_now=invalid_monotonic_now,
                     )
             with (
                 mock.patch.object(
@@ -526,6 +855,56 @@ class AuthCarrierTests(unittest.TestCase):
                 self.assertRaisesRegex(AuthCarrierError, "clock is unavailable"),
             ):
                 revalidate_external_auth_source(path, evidence)
+            with (
+                mock.patch.object(
+                    auth_carrier,
+                    "_suspend_aware_monotonic",
+                    side_effect=OSError("clock unavailable"),
+                ),
+                self.assertRaisesRegex(AuthCarrierError, "clock is unavailable"),
+            ):
+                revalidate_external_auth_source(path, evidence, now=1_000)
+            with self.assertRaisesRegex(
+                AuthCarrierError,
+                "monotonic clock moved backwards",
+            ):
+                revalidate_external_auth_source(
+                    path,
+                    evidence,
+                    now=1_000,
+                    monotonic_now=499.999,
+                )
+
+            for field in ("wall_time_baseline", "monotonic_time_baseline"):
+                malformed = dataclasses.replace(evidence, **{field: float("nan")})
+                with (
+                    self.subTest(evidence_field=field),
+                    self.assertRaisesRegex(
+                        AuthCarrierError,
+                        "external-auth evidence is malformed",
+                    ),
+                ):
+                    revalidate_external_auth_source(
+                        path,
+                        malformed,
+                        now=1_000,
+                        monotonic_now=500,
+                    )
+
+            malformed_state = dataclasses.replace(
+                evidence,
+                clock_high_water=object(),
+            )
+            with self.assertRaisesRegex(
+                AuthCarrierError,
+                "external-auth evidence is malformed",
+            ):
+                revalidate_external_auth_source(
+                    path,
+                    malformed_state,
+                    now=1_000,
+                    monotonic_now=500,
+                )
 
     def test_rejects_same_inode_write_during_descriptor_read(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:

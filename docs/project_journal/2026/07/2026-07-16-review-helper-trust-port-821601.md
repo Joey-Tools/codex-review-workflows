@@ -837,11 +837,12 @@ metadata behavior.
   supervision but correctly failed the 2.1.212 strict stream baseline because
   its init and terminal events contained newly added metadata fields. The
   baseline schema and global compatible range remain unchanged. The
-  compatibility profile now carries an exact-selected-version 2.1.216 additive
-  contract for those fields; the profile digest binds it into preflight
-  evidence, it cannot override baseline fields, later versions do not inherit
-  it, malformed metadata is inconclusive, and unreviewed semantic constants are
-  blocked. The 53-test Python 3.13 validator module and focused compatibility
+  `extended-2x` structural profile now owns the shared 2.1.216-and-later field
+  shape, while the exact-selected-version 2.1.216 overlay owns only its nullable
+  `estimated_tokens` and `estimated_tokens_delta` fields. The profile digest
+  binds both layers into preflight evidence; exact overlays cannot override
+  structural fields, malformed metadata is inconclusive, and unreviewed semantic
+  constants are blocked. The 53-test Python 3.13 validator module and focused compatibility
   contract tests pass. The complete host-level Python 3.13 suite passes all
   2,329 tests in 282.459 seconds with 6 expected skips, and the independent
   331-test deterministic supervisor gate passes in 86.958 seconds. Ruff lint,
@@ -851,7 +852,56 @@ metadata behavior.
 - The post-adaptation direct Claude Code 2.1.216 validation used the certified
   executable and the frozen whole-PR range. Process supervision returned zero,
   remained quiescent, produced no stderr or overflow, and the exact-version
-  compatibility profile accepted the 919,791-byte canonical stream. The
-  validated review artifact was clean, confirming that the additive init and
-  terminal metadata contract admits the observed 2.1.216 stream without
-  widening the 2.1.212 baseline or later-version behavior.
+  structural profile plus exact nullable estimated-token overlay accepted the
+  919,791-byte canonical stream. The validated review artifact was clean,
+  confirming that the structural/overlay split admits the observed 2.1.216
+  stream without widening the 2.1.212 legacy profile or unrelated exact-version
+  semantics.
+- The branch subsequently merged default-branch commit
+  `8cab8ffeb4b26f2ec74dcc801671624bfabe9fcf` as signed merge commit
+  `15c5c79ad310e6934c8c44551738ab87ee14da3b`. The resulting Python 3.13
+  host suite ran 2,581 tests with 6 expected skips; its only in-app failure was
+  the known nested `sandbox-exec` denial, and the exact broker test passed when
+  rerun outside the Desktop sandbox. No local Python 3.10 run was performed.
+- A fresh-context Codex review of
+  `8cab8ffeb4b26f2ec74dcc801671624bfabe9fcf..15c5c79ad310e6934c8c44551738ab87ee14da3b`
+  found two remaining production gaps. The app-server reviewer path authenticated
+  only the primary diff even though the evidence format supported bounded nearby
+  context, and auth lifetime revalidation relied on independent wall-clock reads.
+  The checkout worker now inspects at most 128 size-eligible changed regular
+  blobs in raw-path order, skips binary or unrepresentable candidates, and
+  authenticates up to 32 UTF-8 head blobs within the existing 64-KiB-per-file
+  and 512-KiB-total retained limits. The reviewer restores the exact manifest
+  and passes the verified paths through the production input builder. Auth
+  evidence now binds wall and suspend-aware monotonic baselines using
+  `CLOCK_BOOTTIME` on Linux/WSL and `mach_continuous_time` on Darwin. Locked
+  sampling and high-water updates reject rollback and preserve a failed expiry
+  decision across retries.
+- A separate current Claude Code 2.1.216 calibration run exposed two strict
+  launch/schema mismatches before its artifact could count: the direct launch
+  omitted `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, so init reported
+  `analytics_disabled: false`, and assistant messages carried an optional
+  `diagnostics: null` field. The fixed launch environment now requires disabled
+  nonessential traffic, while the closed extended stream profile permits
+  `diagnostics` only when it is exactly null. Missing diagnostics remains valid;
+  any non-null value remains inconclusive. No local Python 3.10 run was
+  performed.
+- Three focused read-only audits then exercised the finding repairs rather than
+  accepting their first implementation. They found that evidence-incompatible
+  legal Git paths could block the complete diff, binary candidates could consume
+  the text budget, repeated auth checks could lose their clock high water,
+  ordinary monotonic clocks did not charge system sleep, concurrent samples could
+  commit out of order, an expiry failure was not latched, and `diagnostics: null`
+  had been admitted by the legacy stream profile. The final implementation skips
+  optional invalid/binary context within a bounded 128-candidate scan, serializes
+  suspend-aware clock sampling and commits high water before expiry, and permits
+  optional-null `diagnostics` only for `extended-2x`; explicit regressions cover
+  every case. No local Python 3.10 run was performed.
+- The resulting pre-sync Python 3.13 host suite ran 2,584 tests in 2,252.670
+  seconds with 6 expected skips. Its only in-app failure was the known nested
+  `sandbox-exec` denial in the one-shot Claude keychain broker test; that exact
+  test passed in 2.762 seconds when rerun outside the Desktop sandbox. The
+  341-test deterministic supervisor gate, 78-test helper integration set,
+  162-test validator/contract set, Ruff lint and formatting, compileall, JSON
+  parsing, project-journal validation, the official skill validator, and
+  `git diff --check` also pass. No local Python 3.10 run was performed.

@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import base64
+import ctypes
+import functools
 import hashlib
 import json
 import math
 import os
 import pathlib
 import stat
+import sys
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .appserver_protocol import ExternalChatGPTAuth
@@ -23,6 +27,9 @@ from .secureio import identity_from_stat, open_regular_at, read_fd_exact
 MAX_AUTH_FILE_BYTES = 64 * 1024
 MAX_JWT_PAYLOAD_BYTES = 32 * 1024
 MIN_ACCESS_TOKEN_REMAINING_SECONDS = 45 * 60
+# One second covers cross-clock sampling skew. It never extends token lifetime:
+# revalidation preserves the latest observed, derived, or accepted high water.
+WALL_CLOCK_ROLLBACK_TOLERANCE_SECONDS = 1.0
 
 
 class AuthCarrierError(ValueError):
@@ -31,6 +38,13 @@ class AuthCarrierError(ValueError):
 
 class AuthCarrierRefreshRequired(AuthCarrierError):
     pass
+
+
+@dataclass(slots=True)
+class _ClockHighWater:
+    lock: Any
+    last_monotonic_time: float
+    effective_wall_time: float
 
 
 @dataclass(frozen=True)
@@ -44,6 +58,9 @@ class ExternalAuthEvidence:
     access_token_sha256: str
     account_id_sha256: str
     minimum_remaining_seconds: int
+    wall_time_baseline: float
+    monotonic_time_baseline: float
+    clock_high_water: _ClockHighWater = field(repr=False, compare=False)
 
     @property
     def source_size(self) -> int:
@@ -77,18 +94,26 @@ class _AuthSourceSnapshot:
     source_ctime_ns: int
 
 
+@dataclass(frozen=True, slots=True)
+class _ClockSample:
+    wall_time: float
+    monotonic_time: float
+
+
 def load_external_auth(
     auth_path: pathlib.Path,
     *,
     filesystem_metadata_verifier: FilesystemMetadataVerifier,
     minimum_remaining_seconds: int = MIN_ACCESS_TOKEN_REMAINING_SECONDS,
     now: float | None = None,
+    monotonic_now: float | None = None,
 ) -> ExternalAuthEvidence:
     outcome = _load_external_auth_boundary(
         auth_path=auth_path,
         filesystem_metadata_verifier=filesystem_metadata_verifier,
         minimum_remaining_seconds=minimum_remaining_seconds,
         now=now,
+        monotonic_now=monotonic_now,
     )
     if outcome.failure is not None:
         if outcome.failure.kind == "refresh":
@@ -109,6 +134,7 @@ def _load_external_auth_boundary(
     filesystem_metadata_verifier: FilesystemMetadataVerifier,
     minimum_remaining_seconds: int,
     now: float | None,
+    monotonic_now: float | None,
 ) -> _AuthLoadOutcome:
     try:
         return _AuthLoadOutcome(
@@ -117,6 +143,7 @@ def _load_external_auth_boundary(
                 filesystem_metadata_verifier=filesystem_metadata_verifier,
                 minimum_remaining_seconds=minimum_remaining_seconds,
                 now=now,
+                monotonic_now=monotonic_now,
             )
         )
     except AuthCarrierRefreshRequired as error:
@@ -142,6 +169,7 @@ def _load_external_auth_inner(
     filesystem_metadata_verifier: FilesystemMetadataVerifier,
     minimum_remaining_seconds: int,
     now: float | None,
+    monotonic_now: float | None,
 ) -> ExternalAuthEvidence:
     if (
         not auth_path.is_absolute()
@@ -194,8 +222,8 @@ def _load_external_auth_inner(
         account_id_bytes = account_id.encode("utf-8", "strict")
     except UnicodeEncodeError:
         raise AuthCarrierError("auth carrier token identity is malformed") from None
-    current_time = _validated_current_time(now)
-    if expiration < math.ceil(current_time) + minimum_remaining_seconds:
+    clock_sample = _validated_clock_sample(now, monotonic_now)
+    if expiration < math.ceil(clock_sample.wall_time) + minimum_remaining_seconds:
         refresh_token = tokens.get("refresh_token")
         if not isinstance(refresh_token, str) or not refresh_token:
             raise AuthCarrierError("auth carrier has no managed refresh token")
@@ -218,6 +246,13 @@ def _load_external_auth_inner(
         access_token_sha256=hashlib.sha256(access_token_bytes).hexdigest(),
         account_id_sha256=hashlib.sha256(account_id_bytes).hexdigest(),
         minimum_remaining_seconds=minimum_remaining_seconds,
+        wall_time_baseline=clock_sample.wall_time,
+        monotonic_time_baseline=clock_sample.monotonic_time,
+        clock_high_water=_ClockHighWater(
+            lock=threading.Lock(),
+            last_monotonic_time=clock_sample.monotonic_time,
+            effective_wall_time=clock_sample.wall_time,
+        ),
     )
 
 
@@ -227,12 +262,16 @@ def revalidate_external_auth_source(
     *,
     filesystem_metadata_verifier: FilesystemMetadataVerifier,
     now: float | None = None,
+    monotonic_now: float | None = None,
 ) -> None:
     if (
         not isinstance(evidence, ExternalAuthEvidence)
         or type(evidence.access_token_expires_at) is not int
         or type(evidence.minimum_remaining_seconds) is not int
         or not 60 <= evidence.minimum_remaining_seconds <= 24 * 60 * 60
+        or not _is_finite_clock_value(evidence.wall_time_baseline)
+        or not _is_finite_clock_value(evidence.monotonic_time_baseline)
+        or not isinstance(evidence.clock_high_water, _ClockHighWater)
     ):
         raise AuthCarrierError("external-auth evidence is malformed")
     snapshot = _inspect_auth_source(
@@ -245,13 +284,11 @@ def revalidate_external_auth_source(
         or _snapshot_generation(snapshot) != _evidence_generation(evidence)
     ):
         raise AuthCarrierError("auth carrier generation changed before use")
-    current_time = _validated_current_time(now)
-    if evidence.access_token_expires_at < (
-        math.ceil(current_time) + evidence.minimum_remaining_seconds
-    ):
-        raise AuthCarrierError(
-            "access token no longer covers the bounded review runtime"
-        )
+    _revalidate_clock_and_lifetime(
+        evidence,
+        now=now,
+        monotonic_now=monotonic_now,
+    )
 
 
 def _inspect_auth_source(
@@ -408,17 +445,140 @@ def _directory_object_identity(
     )
 
 
-def _validated_current_time(now: float | None) -> int | float:
-    if now is None:
+def _validated_clock_sample(
+    now: float | None,
+    monotonic_now: float | None,
+) -> _ClockSample:
+    # Sampling the suspend-aware clock first makes any delay before the wall read
+    # conservative while still accounting for time spent asleep.
+    monotonic_time = _read_clock_value(monotonic_now, _suspend_aware_monotonic)
+    return _ClockSample(
+        wall_time=_read_clock_value(now, time.time),
+        monotonic_time=monotonic_time,
+    )
+
+
+def _read_clock_value(
+    supplied_value: float | None,
+    clock: Any,
+) -> float:
+    if supplied_value is None:
         try:
-            current_time = time.time()
+            value = clock()
         except Exception:
             raise AuthCarrierError("external-auth clock is unavailable") from None
     else:
-        current_time = now
-    if type(current_time) not in {int, float} or not math.isfinite(current_time):
+        value = supplied_value
+    if not _is_finite_clock_value(value):
         raise AuthCarrierError("external-auth clock value is invalid")
-    return current_time
+    return float(value)
+
+
+def _is_finite_clock_value(value: object) -> bool:
+    if type(value) not in {int, float}:
+        return False
+    try:
+        return math.isfinite(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
+def _suspend_aware_monotonic() -> float:
+    boot_clock = getattr(time, "CLOCK_BOOTTIME", None)
+    if type(boot_clock) is int:
+        return time.clock_gettime(boot_clock)
+    if sys.platform == "darwin":
+        return _darwin_continuous_seconds()
+    raise OSError("no suspend-aware monotonic clock is available")
+
+
+@functools.cache
+def _darwin_continuous_clock_binding() -> tuple[Any, Any, int, int]:
+    class MachTimebaseInfo(ctypes.Structure):
+        _fields_ = (("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32))
+
+    try:
+        library = ctypes.CDLL(None)
+        clock = library.mach_continuous_time
+        clock.argtypes = ()
+        clock.restype = ctypes.c_uint64
+        timebase = library.mach_timebase_info
+        timebase.argtypes = (ctypes.POINTER(MachTimebaseInfo),)
+        timebase.restype = ctypes.c_int
+        info = MachTimebaseInfo()
+        status = timebase(ctypes.byref(info))
+    except Exception as error:
+        raise OSError("Darwin continuous clock is unavailable") from error
+    if status != 0 or info.numer == 0 or info.denom == 0:
+        raise OSError("Darwin continuous clock timebase is invalid")
+    return library, clock, int(info.numer), int(info.denom)
+
+
+def _darwin_continuous_seconds() -> float:
+    _, clock, numerator, denominator = _darwin_continuous_clock_binding()
+    ticks = int(clock())
+    if ticks < 0:
+        raise OSError("Darwin continuous clock returned an invalid value")
+    return (ticks * numerator) / denominator / 1_000_000_000
+
+
+def _revalidate_clock_and_lifetime(
+    evidence: ExternalAuthEvidence,
+    *,
+    now: float | None,
+    monotonic_now: float | None,
+) -> None:
+    state = evidence.clock_high_water
+    try:
+        with state.lock:
+            if not _is_finite_clock_value(
+                state.last_monotonic_time
+            ) or not _is_finite_clock_value(state.effective_wall_time):
+                raise AuthCarrierError("external-auth evidence is malformed")
+            clock_sample = _validated_clock_sample(now, monotonic_now)
+            monotonic_elapsed = (
+                clock_sample.monotonic_time - evidence.monotonic_time_baseline
+            )
+            if not math.isfinite(monotonic_elapsed):
+                raise AuthCarrierError("external-auth clock value is invalid")
+            if (
+                monotonic_elapsed < 0
+                or clock_sample.monotonic_time < state.last_monotonic_time
+            ):
+                raise AuthCarrierError("external-auth monotonic clock moved backwards")
+            expected_wall_time = evidence.wall_time_baseline + monotonic_elapsed
+            if not math.isfinite(expected_wall_time):
+                raise AuthCarrierError("external-auth clock value is invalid")
+            backward_drift = expected_wall_time - clock_sample.wall_time
+            if not math.isfinite(backward_drift):
+                raise AuthCarrierError("external-auth clock value is invalid")
+            if backward_drift > WALL_CLOCK_ROLLBACK_TOLERANCE_SECONDS:
+                raise AuthCarrierError("external-auth wall clock moved backwards")
+            candidate_wall_time = max(
+                clock_sample.wall_time,
+                expected_wall_time,
+            )
+            if (
+                state.effective_wall_time - candidate_wall_time
+                > WALL_CLOCK_ROLLBACK_TOLERANCE_SECONDS
+            ):
+                raise AuthCarrierError("external-auth wall clock moved backwards")
+            effective_wall_time = max(
+                candidate_wall_time,
+                state.effective_wall_time,
+            )
+            state.last_monotonic_time = clock_sample.monotonic_time
+            state.effective_wall_time = effective_wall_time
+            if evidence.access_token_expires_at < (
+                math.ceil(effective_wall_time) + evidence.minimum_remaining_seconds
+            ):
+                raise AuthCarrierError(
+                    "access token no longer covers the bounded review runtime"
+                )
+    except AuthCarrierError:
+        raise
+    except Exception:
+        raise AuthCarrierError("external-auth clock state is unavailable") from None
 
 
 def _auth_generation(value: os.stat_result) -> tuple[Identity, int, int, int]:

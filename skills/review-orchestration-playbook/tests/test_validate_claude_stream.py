@@ -479,9 +479,26 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             },
         )
         self.assertEqual(init_contract["profiles"], validator.INIT_PROFILE_CONTRACT)
+        intermediate_contract = schema["intermediate_events"]
         self.assertEqual(
-            schema["intermediate_events"],
+            intermediate_contract,
             validator.INTERMEDIATE_EVENT_CONTRACT,
+        )
+        assistant_message_contract = intermediate_contract["event_contracts"][
+            "reviewed-2x"
+        ]["assistant-message"]["field_contracts"]["message"]
+        self.assertEqual(assistant_message_contract["optional_fields"], [])
+        self.assertEqual(
+            assistant_message_contract["profile_optional_field_contracts"],
+            {
+                "legacy-base": {},
+                "extended-2x": {
+                    "diagnostics": {
+                        "rule": "null",
+                        "failure": "inconclusive",
+                    }
+                },
+            },
         )
         terminal_contract = schema["terminal_result"]
         self.assertFalse(terminal_contract["additional_fields"])
@@ -1008,6 +1025,56 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                     self._validate(events, claude_code_version=version),
                     {"classification": "accepted", "findings": "\nNo findings.\n"},
                 )
+
+    def test_extended_assistant_diagnostics_absent_or_null_is_accepted(self) -> None:
+        for version in ("2.1.216", "2.9.999"):
+            for case, include_diagnostics in (("absent", False), ("null", True)):
+                with self.subTest(version=version, case=case):
+                    events = self._full_events()
+                    events[0]["claude_code_version"] = version
+                    message = events[1]["message"]
+                    assert isinstance(message, dict)
+                    if include_diagnostics:
+                        message["diagnostics"] = None
+                    self.assertEqual(
+                        self._validate(events, claude_code_version=version),
+                        {
+                            "classification": "accepted",
+                            "findings": "\nNo findings.\n",
+                        },
+                    )
+
+    def test_extended_assistant_diagnostics_nonnull_is_inconclusive(self) -> None:
+        for version in ("2.1.216", "2.9.999"):
+            with self.subTest(version=version):
+                events = self._full_events()
+                events[0]["claude_code_version"] = version
+                message = events[1]["message"]
+                assert isinstance(message, dict)
+                message["diagnostics"] = {}
+                self.assertEqual(
+                    self._validate(events, claude_code_version=version),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": [
+                            "intermediate.assistant.message.diagnostics.nonnull"
+                        ],
+                    },
+                )
+
+    def test_legacy_assistant_diagnostics_presence_is_inconclusive(self) -> None:
+        events = self._legacy_events("2.1.215")
+        message = events[1]["message"]
+        assert isinstance(message, dict)
+        message["diagnostics"] = None
+
+        self.assertEqual(
+            self._validate(events, claude_code_version="2.1.215"),
+            {
+                "classification": "inconclusive",
+                "reasons": ["intermediate.assistant.message.unknown-field"],
+            },
+        )
 
     def test_accepts_structured_tool_paths_inside_exact_cwd(self) -> None:
         cases = {

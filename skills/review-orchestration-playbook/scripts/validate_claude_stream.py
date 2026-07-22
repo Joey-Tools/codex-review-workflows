@@ -283,6 +283,15 @@ ASSISTANT_MESSAGE_FIELDS = frozenset(
         "usage",
     )
 )
+ASSISTANT_MESSAGE_PROFILE_OPTIONAL_FIELD_CONTRACTS = {
+    "legacy-base": {},
+    "extended-2x": {
+        "diagnostics": {
+            "rule": "null",
+            "failure": "inconclusive",
+        }
+    },
+}
 ASSISTANT_CONTENT_BLOCK_FIELDS = {
     "thinking": frozenset(("type", "signature", "thinking")),
     "text": frozenset(("type", "text")),
@@ -429,6 +438,9 @@ INTERMEDIATE_EVENT_CONTRACT = {
                         "rule": "closed_object",
                         "required_fields": sorted(ASSISTANT_MESSAGE_FIELDS),
                         "optional_fields": [],
+                        "profile_optional_field_contracts": (
+                            ASSISTANT_MESSAGE_PROFILE_OPTIONAL_FIELD_CONTRACTS
+                        ),
                         "additional_fields": False,
                         "fixed_values": {
                             "context_management": None,
@@ -2403,6 +2415,7 @@ def _validate_assistant_content_block(
 def _validate_assistant_event(
     event: Mapping[str, Any],
     *,
+    profile_name: str,
     init_session_id: str | None,
     requested_model: str,
     allowed_tools: frozenset[str],
@@ -2437,9 +2450,13 @@ def _validate_assistant_event(
     if "message" not in event:
         return
     message_label = f"{label}.message"
+    optional_field_contracts = ASSISTANT_MESSAGE_PROFILE_OPTIONAL_FIELD_CONTRACTS[
+        profile_name
+    ]
     message = _validate_closed_object(
         event["message"],
         required_fields=ASSISTANT_MESSAGE_FIELDS,
+        optional_fields=frozenset(optional_field_contracts),
         label=message_label,
         evidence=evidence,
     )
@@ -2453,6 +2470,10 @@ def _validate_assistant_event(
     ):
         _validate_intermediate_null(
             message, field_name, label=message_label, evidence=evidence
+        )
+    if "diagnostics" in optional_field_contracts:
+        _validate_intermediate_null(
+            message, "diagnostics", label=message_label, evidence=evidence
         )
     _validate_intermediate_exact_value(
         message, "type", "message", label=message_label, evidence=evidence
@@ -2665,6 +2686,7 @@ def _validate_intermediate_events(
         elif event_type == "assistant":
             _validate_assistant_event(
                 event,
+                profile_name=profile_name,
                 init_session_id=init_session_id,
                 requested_model=requested_model,
                 allowed_tools=allowed_tools,

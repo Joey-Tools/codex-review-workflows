@@ -1568,7 +1568,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
         self.assertIn("expected_count != 7", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 331", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 341", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
@@ -2528,6 +2528,7 @@ class RepositoryContractTest(unittest.TestCase):
             "--strict-mcp-config",
             "--tools Read,Grep,Glob,Bash",
             "--disallowedTools Edit,Write,NotebookEdit,WebFetch,WebSearch,Task",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
             "disableBundledSkills: true",
             '"disableBundledSkills": true',
             "`--safe-mode` alone is not evidence that bundled skills are absent",
