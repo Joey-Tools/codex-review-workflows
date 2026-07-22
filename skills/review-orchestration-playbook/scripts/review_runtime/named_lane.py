@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -39,6 +40,8 @@ from .common import (
 DEFAULT_TIMEOUT_SECONDS = 1_800.0
 DEFAULT_STREAM_LIMIT_BYTES = 64 * 1024 * 1024
 DEFAULT_PROMPT_LIMIT_BYTES = 256 * 1024
+CLAUDE_PREFLIGHT_EVIDENCE_LIMIT_BYTES = 16 * 1024
+CLAUDE_BINARY_LIMIT_BYTES = 1024 * 1024 * 1024
 GIT_OUTPUT_LIMIT_BYTES = 32 * 1024 * 1024
 SYMLINK_TARGET_LIMIT_BYTES = 16 * 1024
 SYMLINK_COUNT_LIMIT = 4_096
@@ -84,6 +87,49 @@ class NamedLaneGuardError(ReviewError):
     """A named-lane safety or invocation precondition failed."""
 
 
+class _ClaudeLaunchSnapshotCleanupError(NamedLaneGuardError):
+    """A launch snapshot remains after bounded process supervision."""
+
+    def __init__(
+        self,
+        retained_path: pathlib.Path | None,
+        process_reason: str,
+        *,
+        retained_parent_identity: tuple[int, int] | None = None,
+        retained_leaf: str | None = None,
+    ) -> None:
+        if retained_path is None and (
+            retained_parent_identity is None or retained_leaf is None
+        ):
+            raise ValueError(
+                "descriptor-bound snapshot cleanup evidence requires parent "
+                "identity and leaf"
+            )
+        self.retained_path = retained_path
+        self.process_reason = process_reason
+        self.retained_parent_identity = retained_parent_identity
+        self.retained_leaf = retained_leaf
+        detail = f"retained path: {retained_path}"
+        if retained_path is None:
+            assert retained_parent_identity is not None
+            assert retained_leaf is not None
+            detail = (
+                "descriptor-bound retained locator: "
+                f"parent device={retained_parent_identity[0]}, "
+                f"inode={retained_parent_identity[1]}, leaf={retained_leaf}"
+            )
+        super().__init__(
+            "Claude launch snapshot cleanup failed after "
+            f"{process_reason}; {detail}"
+        )
+
+
+def _checkout_tree_output_limit(oid_length: int) -> int:
+    return MATERIALIZER_CHECKOUT_PATH_BYTES_LIMIT + (
+        MATERIALIZER_CHECKOUT_ENTRY_COUNT_LIMIT * (oid_length + 16)
+    )
+
+
 @dataclass(frozen=True)
 class WorktreeValidation:
     root: pathlib.Path
@@ -111,7 +157,19 @@ class _DirectoryIdentity:
 
 
 @dataclass(frozen=True)
+class _MaterializerSourceMarkerBinding:
+    path: pathlib.Path
+    expected_admin: pathlib.Path
+    device: int
+    inode: int
+    file_type: int
+    owner: int
+    is_gitfile: bool
+
+
+@dataclass(frozen=True)
 class _MaterializerSourceStorage:
+    marker: _MaterializerSourceMarkerBinding
     admin: pathlib.Path
     admin_identity: _DirectoryIdentity
     common: pathlib.Path
@@ -125,11 +183,28 @@ class _MaterializerSourceStorage:
 class _OutputTarget:
     path: pathlib.Path
     parent_fd: int
+    parent_identity: tuple[int, int]
 
 
 @dataclass(frozen=True)
 class _PublishedOutput:
     target: _OutputTarget
+    identity: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class _ClaudeExecutableBinding:
+    source_path: pathlib.Path
+    identity: Mapping[str, int]
+    artifact_size: int
+    artifact_checksum: str
+    preflight_checksum: str
+
+
+@dataclass(frozen=True)
+class _ClaudeLaunchSnapshot:
+    path: pathlib.Path
+    name: str
     identity: tuple[int, int]
 
 
@@ -306,7 +381,7 @@ def _verify_materializer_parent(
 
 def _resolve_materializer_source(
     source: pathlib.Path,
-) -> tuple[pathlib.Path, pathlib.Path]:
+) -> tuple[pathlib.Path, _MaterializerSourceMarkerBinding]:
     if not source.is_absolute():
         raise NamedLaneGuardError("materializer source path must be absolute")
     try:
@@ -334,6 +409,7 @@ def _resolve_materializer_source(
         raise NamedLaneGuardError(
             "materializer source must name an exact Git worktree root"
         )
+    is_gitfile = stat.S_ISREG(admin_metadata.st_mode)
     if stat.S_ISDIR(admin_metadata.st_mode):
         try:
             expected_admin = admin_marker.resolve(strict=True)
@@ -345,30 +421,11 @@ def _resolve_materializer_source(
             raise NamedLaneGuardError(
                 "materializer source Git admin directory must be a real directory"
             )
-    elif stat.S_ISREG(admin_metadata.st_mode):
-        if admin_metadata.st_size > 4096:
-            raise NamedLaneGuardError("materializer source Git admin file is too large")
+    elif is_gitfile:
+        expected_admin = _read_materializer_gitfile_admin(admin_marker, resolved)
         try:
-            raw_admin = admin_marker.read_bytes()
-        except OSError as error:
-            raise NamedLaneGuardError(
-                "materializer source Git admin file cannot be read"
-            ) from error
-        stripped_admin = raw_admin.rstrip(b"\r\n")
-        if (
-            not stripped_admin.startswith(b"gitdir: ")
-            or b"\n" in stripped_admin
-            or b"\r" in stripped_admin
-            or not stripped_admin[len(b"gitdir: ") :]
-        ):
-            raise NamedLaneGuardError("materializer source Git admin file is malformed")
-        admin_value = pathlib.Path(os.fsdecode(stripped_admin[len(b"gitdir: ") :]))
-        if not admin_value.is_absolute():
-            admin_value = resolved / admin_value
-        try:
-            expected_admin = admin_value.resolve(strict=True)
             expected_metadata = expected_admin.lstat()
-        except (OSError, RuntimeError) as error:
+        except OSError as error:
             raise NamedLaneGuardError(
                 "materializer source Git admin directory cannot be resolved safely"
             ) from error
@@ -384,7 +441,17 @@ def _resolve_materializer_source(
         raise NamedLaneGuardError(
             "materializer source must name an exact Git worktree root"
         )
-    return resolved, expected_admin
+    binding = _MaterializerSourceMarkerBinding(
+        path=admin_marker,
+        expected_admin=expected_admin,
+        device=admin_metadata.st_dev,
+        inode=admin_metadata.st_ino,
+        file_type=stat.S_IFMT(admin_metadata.st_mode),
+        owner=admin_metadata.st_uid,
+        is_gitfile=is_gitfile,
+    )
+    _verify_materializer_source_marker(binding, resolved)
+    return resolved, binding
 
 
 def _cleanup_materializer_path(
@@ -829,7 +896,10 @@ def _read_materializer_control_file(
             raise NamedLaneGuardError(f"materializer source {label} is not safe")
         descriptor = os.open(
             path,
-            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
         )
         descriptor_metadata = os.fstat(descriptor)
         if (
@@ -897,6 +967,111 @@ def _materializer_control_path(
         raise NamedLaneGuardError(
             f"materializer source {label} cannot be resolved safely"
         ) from error
+
+
+def _read_materializer_gitfile_admin(
+    marker: pathlib.Path,
+    source: pathlib.Path,
+) -> pathlib.Path:
+    payload = _read_materializer_control_file(
+        marker,
+        label="Git admin marker",
+    )
+    try:
+        stripped = bytes(payload).rstrip(b"\r\n")
+        prefix = b"gitdir: "
+        if (
+            not stripped.startswith(prefix)
+            or not stripped[len(prefix) :]
+            or b"\0" in stripped
+            or b"\n" in stripped
+            or b"\r" in stripped
+        ):
+            raise NamedLaneGuardError("materializer source Git admin file is malformed")
+        return _materializer_control_path(
+            stripped[len(prefix) :],
+            relative_to=source,
+            label="Git admin marker",
+        )
+    finally:
+        payload[:] = b"\x00" * len(payload)
+
+
+def _verify_materializer_source_marker(
+    binding: _MaterializerSourceMarkerBinding,
+    source: pathlib.Path,
+) -> None:
+    try:
+        metadata = binding.path.lstat()
+    except OSError as error:
+        raise NamedLaneGuardError(
+            "materializer source Git admin marker cannot be inspected"
+        ) from error
+    current_identity = (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_uid,
+    )
+    expected_identity = (
+        binding.device,
+        binding.inode,
+        binding.file_type,
+        binding.owner,
+    )
+    if current_identity != expected_identity or stat.S_ISLNK(metadata.st_mode):
+        raise NamedLaneGuardError(
+            "materializer source Git admin marker changed during materialization"
+        )
+    if binding.is_gitfile:
+        if not stat.S_ISREG(metadata.st_mode):
+            raise NamedLaneGuardError(
+                "materializer source Git admin marker changed during materialization"
+            )
+        current_admin = _read_materializer_gitfile_admin(binding.path, source)
+        if current_admin != binding.expected_admin:
+            raise NamedLaneGuardError(
+                "materializer source Git admin marker changed during materialization"
+            )
+        return
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise NamedLaneGuardError(
+            "materializer source Git admin marker changed during materialization"
+        )
+    try:
+        resolved = binding.path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError(
+            "materializer source Git admin marker cannot be resolved safely"
+        ) from error
+    if resolved != binding.expected_admin:
+        raise NamedLaneGuardError(
+            "materializer source Git admin marker changed during materialization"
+        )
+
+
+def _verify_materializer_source_back_pointer(
+    marker: _MaterializerSourceMarkerBinding,
+    admin: pathlib.Path,
+) -> None:
+    if not marker.is_gitfile:
+        return
+    gitdir_payload = _read_materializer_control_file(
+        admin / "gitdir",
+        label="Git admin back-pointer",
+    )
+    try:
+        back_pointer = _materializer_control_path(
+            gitdir_payload,
+            relative_to=admin,
+            label="Git admin back-pointer",
+        )
+    finally:
+        gitdir_payload[:] = b"\x00" * len(gitdir_payload)
+    if back_pointer != marker.path:
+        raise NamedLaneGuardError(
+            "materializer source Git admin directory does not match its exact marker"
+        )
 
 
 def _materializer_source_object_format(
@@ -973,6 +1148,8 @@ def _materializer_source_object_format(
 def _verify_materializer_source_storage(
     storage: _MaterializerSourceStorage,
 ) -> None:
+    _verify_materializer_source_marker(storage.marker, storage.marker.path.parent)
+    _verify_materializer_source_back_pointer(storage.marker, storage.admin)
     for path, expected, label in (
         (storage.admin, storage.admin_identity, "Git admin directory"),
         (storage.common, storage.common_identity, "Git common directory"),
@@ -1053,9 +1230,14 @@ def _verify_materializer_source_storage(
     try:
         with os.scandir(pack) as entries:
             for entry in entries:
-                if entry.name.casefold().endswith(".promisor"):
+                folded_name = entry.name.casefold()
+                if folded_name.endswith(".promisor"):
                     raise NamedLaneGuardError(
                         "materializer source Git promisor state is not allowed"
+                    )
+                if folded_name.endswith(".bitmap"):
+                    raise NamedLaneGuardError(
+                        "materializer source Git bitmap cache is not allowed"
                     )
     except NamedLaneGuardError:
         raise
@@ -1067,15 +1249,16 @@ def _verify_materializer_source_storage(
 
 def _validate_materializer_source_repository(
     source: pathlib.Path,
-    expected_admin: pathlib.Path,
+    marker_binding: _MaterializerSourceMarkerBinding,
     oid_length: int,
     git: pathlib.Path,
     environment: Mapping[str, str],
     hooks: pathlib.Path,
 ) -> _MaterializerSourceStorage:
-    marker = source / ".git"
-    marker_metadata = marker.lstat()
-    if stat.S_ISREG(marker_metadata.st_mode):
+    _verify_materializer_source_marker(marker_binding, source)
+    marker = marker_binding.path
+    expected_admin = marker_binding.expected_admin
+    if marker_binding.is_gitfile:
         gitdir_payload = _read_materializer_control_file(
             expected_admin / "gitdir",
             label="Git admin back-pointer",
@@ -1165,6 +1348,7 @@ def _validate_materializer_source_repository(
             "materializer source Git object directory cannot be encoded as an alternate"
         )
     storage = _MaterializerSourceStorage(
+        marker=marker_binding,
         admin=expected_admin,
         admin_identity=_directory_identity(admin_metadata),
         common=common,
@@ -1630,9 +1814,7 @@ def _materializer_validate_checkout_manifest(
     hooks: pathlib.Path,
 ) -> None:
     oid_length = len(head_sha)
-    output_limit = MATERIALIZER_CHECKOUT_PATH_BYTES_LIMIT + (
-        MATERIALIZER_CHECKOUT_ENTRY_COUNT_LIMIT * (oid_length + 16)
-    )
+    output_limit = _checkout_tree_output_limit(oid_length)
     try:
         payload = _materializer_git_capture(
             git,
@@ -1706,6 +1888,7 @@ def _materializer_pack_manifest(
         "--stdout",
         "--quiet",
         "--delta-base-offset",
+        "--no-use-bitmap-index",
         "--no-reuse-delta",
         "--no-reuse-object",
     )
@@ -1921,7 +2104,7 @@ def materialize_worktree(
         )
     frozen_base = base_sha.lower()
     frozen_head = head_sha.lower()
-    resolved_source, expected_source_admin = _resolve_materializer_source(source)
+    resolved_source, source_marker = _resolve_materializer_source(source)
     destination, parent, parent_identity = _validate_materializer_parent(worktree)
     git = resolve_git()
     control: pathlib.Path | None = None
@@ -1967,7 +2150,7 @@ def materialize_worktree(
         )
         source_storage = _validate_materializer_source_repository(
             resolved_source,
-            expected_source_admin,
+            source_marker,
             len(frozen_head),
             git,
             environment,
@@ -2583,6 +2766,7 @@ def _match_submodule_active_pathspecs(
             "--",
             *(os.fsdecode(pathspec) for pathspec in pathspecs),
         ),
+        output_limit_bytes=_checkout_tree_output_limit(len(frozen_head)),
     )
     matched = frozenset(
         pathlib.PurePosixPath(os.fsdecode(path))
@@ -2920,7 +3104,11 @@ def validate_worktree(
     if not actual_head or actual_head != frozen_head:
         raise NamedLaneGuardError("worktree HEAD does not match the frozen head")
     tree = _parse_tree(
-        _git_capture(root, ("ls-tree", "-r", "-z", "--full-tree", frozen_head))
+        _git_capture(
+            root,
+            ("ls-tree", "-r", "-z", "--full-tree", frozen_head),
+            output_limit_bytes=_checkout_tree_output_limit(len(frozen_head)),
+        )
     )
     gitlinks = frozenset(path for path, entry in tree.items() if entry[0] == "160000")
     for path in gitlinks:
@@ -2942,6 +3130,7 @@ def validate_worktree(
         _git_capture(
             root,
             ("ls-files", "--cached", "--full-name", "-v", "-z", "--"),
+            output_limit_bytes=_checkout_tree_output_limit(len(frozen_head)),
         )
     )
     # Status may interpret a materialized gitfile and traverse outside the
@@ -2964,6 +3153,7 @@ def validate_worktree(
             "--no-renames",
             "--",
         ),
+        output_limit_bytes=_checkout_tree_output_limit(len(frozen_head)),
     )
     if _status_has_disallowed_changes(status, absent_gitlinks):
         raise NamedLaneGuardError("worktree must be clean before reviewer launch")
@@ -3150,10 +3340,25 @@ def _revalidate_output_parent(target: _OutputTarget) -> None:
         or stat.S_IMODE(descriptor_metadata.st_mode) != 0o700
         or stat.S_IMODE(lexical_metadata.st_mode) != 0o700
         or resolved != parent
-        or (descriptor_metadata.st_dev, descriptor_metadata.st_ino)
-        != (lexical_metadata.st_dev, lexical_metadata.st_ino)
+        or _output_identity(descriptor_metadata) != target.parent_identity
+        or _output_identity(lexical_metadata) != target.parent_identity
     ):
         raise NamedLaneGuardError("Claude output parent changed after validation")
+
+
+def _output_parent_path_names_bound_directory(target: _OutputTarget) -> bool:
+    parent = target.path.parent
+    try:
+        lexical_metadata = parent.lstat()
+        resolved = parent.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    return (
+        stat.S_ISDIR(lexical_metadata.st_mode)
+        and not stat.S_ISLNK(lexical_metadata.st_mode)
+        and resolved == parent
+        and _output_identity(lexical_metadata) == target.parent_identity
+    )
 
 
 def _validate_output_path(path: pathlib.Path, worktree: pathlib.Path) -> _OutputTarget:
@@ -3218,7 +3423,11 @@ def _validate_output_path(path: pathlib.Path, worktree: pathlib.Path) -> _Output
     ):
         os.close(parent_fd)
         raise NamedLaneGuardError("Claude output parent changed during validation")
-    target = _OutputTarget(path=canonical, parent_fd=parent_fd)
+    target = _OutputTarget(
+        path=canonical,
+        parent_fd=parent_fd,
+        parent_identity=_output_identity(opened_metadata),
+    )
     try:
         _revalidate_output_parent(target)
         try:
@@ -3334,12 +3543,17 @@ def _claude_environment(
     return environment
 
 
-def _open_private_temporary(target: _OutputTarget) -> tuple[int, str]:
-    open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+def _open_private_temporary(
+    target: _OutputTarget,
+    *,
+    readable: bool = False,
+    prefix: str = ".named-lane-",
+) -> tuple[int, str]:
+    open_flags = (os.O_RDWR if readable else os.O_WRONLY) | os.O_CREAT | os.O_EXCL
     for flag_name in ("O_CLOEXEC", "O_NOFOLLOW"):
         open_flags |= getattr(os, flag_name, 0)
     for _attempt in range(16):
-        name = f".named-lane-{secrets.token_hex(16)}"
+        name = f"{prefix}{secrets.token_hex(16)}"
         try:
             descriptor = os.open(
                 name,
@@ -3413,6 +3627,518 @@ def _remove_private_output(output: _PublishedOutput) -> None:
         output.identity,
         label="Claude output",
     )
+
+
+_CLAUDE_PREFLIGHT_FIELDS = frozenset(
+    (
+        "capability_contract",
+        "classification",
+        "compatible_version_range",
+        "declared_version",
+        "identity",
+        "observed_version",
+        "publisher_verification",
+        "reason",
+        "resolved_path",
+        "selected_version",
+        "source",
+        "stream_contract",
+    )
+)
+_CLAUDE_PREFLIGHT_IDENTITY_FIELDS = frozenset(
+    (
+        "device",
+        "inode",
+        "file_type",
+        "mode",
+        "nlink",
+        "uid",
+        "gid",
+        "size",
+        "mtime_ns",
+        "ctime_ns",
+    )
+)
+_CLAUDE_PUBLISHER_FIELDS = frozenset(
+    (
+        "artifact_size",
+        "binary",
+        "checksum",
+        "manifest_url",
+        "platform",
+        "release_version",
+        "signature_url",
+        "signer_fingerprint",
+    )
+)
+_LOWER_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(_value: str) -> object:
+    raise ValueError("non-finite JSON number")
+
+
+def _read_claude_preflight_evidence(
+    path: pathlib.Path,
+    *,
+    worktree: pathlib.Path,
+) -> tuple[dict[str, object], str]:
+    if not path.is_absolute():
+        raise NamedLaneGuardError("Claude preflight result path must be absolute")
+    descriptor = -1
+    try:
+        parent_metadata = path.parent.lstat()
+        canonical_parent = path.parent.resolve(strict=True)
+        canonical_path = canonical_parent / path.name
+        if (
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or stat.S_ISLNK(parent_metadata.st_mode)
+            or canonical_parent != path.parent
+            or parent_metadata.st_uid != _current_user_id()
+            or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+        ):
+            raise NamedLaneGuardError(
+                "Claude preflight result parent must be a private real directory"
+            )
+        if canonical_path == worktree or is_relative_to(canonical_path, worktree):
+            raise NamedLaneGuardError(
+                "Claude preflight result must stay outside the worktree"
+            )
+        before = canonical_path.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != _current_user_id()
+            or stat.S_IMODE(before.st_mode) & 0o077
+            or before.st_size > CLAUDE_PREFLIGHT_EVIDENCE_LIMIT_BYTES
+        ):
+            raise NamedLaneGuardError(
+                "Claude preflight result must be a private single-link regular file"
+            )
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            raise NamedLaneGuardError(
+                "Claude preflight result validation requires O_NOFOLLOW"
+            )
+        descriptor = os.open(
+            canonical_path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+            | nofollow,
+        )
+        opened_before = os.fstat(descriptor)
+        payload = bytearray()
+        while len(payload) <= CLAUDE_PREFLIGHT_EVIDENCE_LIMIT_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(
+                    4096,
+                    CLAUDE_PREFLIGHT_EVIDENCE_LIMIT_BYTES + 1 - len(payload),
+                ),
+            )
+            if not chunk:
+                break
+            payload.extend(chunk)
+        opened_after = os.fstat(descriptor)
+        after = canonical_path.stat(follow_symlinks=False)
+    except NamedLaneGuardError:
+        raise
+    except (OSError, RuntimeError) as error:
+        raise NamedLaneGuardError("Claude preflight result is unreadable") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(payload) > CLAUDE_PREFLIGHT_EVIDENCE_LIMIT_BYTES:
+        payload[:] = b"\x00" * len(payload)
+        raise NamedLaneGuardError("Claude preflight result exceeds its size bound")
+
+    def evidence_identity(metadata: os.stat_result) -> tuple[int, ...]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_nlink,
+            metadata.st_uid,
+            metadata.st_gid,
+            metadata.st_size,
+        )
+
+    if (
+        len(
+            {
+                evidence_identity(metadata)
+                for metadata in (before, opened_before, opened_after, after)
+            }
+        )
+        != 1
+    ):
+        payload[:] = b"\x00" * len(payload)
+        raise NamedLaneGuardError("Claude preflight result changed while reading")
+    checksum = hashlib.sha256(payload).hexdigest()
+    try:
+        value = json.loads(
+            payload.decode("utf-8", errors="strict"),
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, ValueError) as error:
+        raise NamedLaneGuardError(
+            "Claude preflight result is not strict JSON"
+        ) from error
+    finally:
+        payload[:] = b"\x00" * len(payload)
+    if type(value) is not dict:
+        raise NamedLaneGuardError("Claude preflight result must be a JSON object")
+    return value, checksum
+
+
+def _load_claude_executable_binding(
+    preflight_result: pathlib.Path,
+    *,
+    worktree: pathlib.Path,
+    command_path: pathlib.Path,
+) -> _ClaudeExecutableBinding:
+    evidence, preflight_checksum = _read_claude_preflight_evidence(
+        preflight_result,
+        worktree=worktree,
+    )
+    if frozenset(evidence) != _CLAUDE_PREFLIGHT_FIELDS:
+        raise NamedLaneGuardError("Claude preflight result fields do not match")
+    if (
+        evidence.get("classification") != "accepted"
+        or evidence.get("reason") != "compatible-version-selected"
+    ):
+        raise NamedLaneGuardError("Claude preflight result is not accepted")
+    resolved_path = evidence.get("resolved_path")
+    if type(resolved_path) is not str or pathlib.Path(resolved_path) != command_path:
+        raise NamedLaneGuardError(
+            "Claude command does not match the accepted preflight executable"
+        )
+    selected_version = evidence.get("selected_version")
+    if (
+        type(selected_version) is not str
+        or not selected_version
+        or evidence.get("declared_version") != selected_version
+        or evidence.get("observed_version") != selected_version
+    ):
+        raise NamedLaneGuardError("Claude preflight version binding is invalid")
+    identity = evidence.get("identity")
+    if (
+        type(identity) is not dict
+        or frozenset(identity) != _CLAUDE_PREFLIGHT_IDENTITY_FIELDS
+        or any(type(item) is not int or item < 0 for item in identity.values())
+    ):
+        raise NamedLaneGuardError("Claude preflight executable identity is invalid")
+    publisher = evidence.get("publisher_verification")
+    if type(publisher) is not dict or frozenset(publisher) != _CLAUDE_PUBLISHER_FIELDS:
+        raise NamedLaneGuardError("Claude preflight publisher binding is invalid")
+    artifact_size = publisher.get("artifact_size")
+    artifact_checksum = publisher.get("checksum")
+    if (
+        type(artifact_size) is not int
+        or artifact_size <= 0
+        or artifact_size > CLAUDE_BINARY_LIMIT_BYTES
+        or artifact_size != identity["size"]
+        or type(artifact_checksum) is not str
+        or _LOWER_SHA256.fullmatch(artifact_checksum) is None
+        or publisher.get("release_version") != selected_version
+        or identity["file_type"] != stat.S_IFREG
+        or not identity["mode"] & 0o111
+    ):
+        raise NamedLaneGuardError("Claude preflight artifact binding is invalid")
+    return _ClaudeExecutableBinding(
+        source_path=command_path,
+        identity=dict(identity),
+        artifact_size=artifact_size,
+        artifact_checksum=artifact_checksum,
+        preflight_checksum=preflight_checksum,
+    )
+
+
+def _executable_identity(metadata: os.stat_result) -> dict[str, int]:
+    return {
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "file_type": stat.S_IFMT(metadata.st_mode),
+        "mode": metadata.st_mode,
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "size": metadata.st_size,
+    }
+
+
+def _expected_executable_identity(
+    binding: _ClaudeExecutableBinding,
+) -> dict[str, int]:
+    return {
+        key: binding.identity[key]
+        for key in ("device", "inode", "file_type", "mode", "uid", "gid", "size")
+    }
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    written = 0
+    while written < len(view):
+        count = os.write(descriptor, view[written:])
+        if count <= 0:
+            raise OSError("short write while creating Claude launch snapshot")
+        written += count
+
+
+def _create_claude_launch_snapshot(
+    binding: _ClaudeExecutableBinding,
+    target: _OutputTarget,
+    *,
+    deadline_monotonic: float,
+) -> _ClaudeLaunchSnapshot:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise NamedLaneGuardError("Claude executable binding requires O_NOFOLLOW")
+    source_descriptor = -1
+    snapshot_descriptor = -1
+    snapshot_name: str | None = None
+    snapshot_identity: tuple[int, int] | None = None
+    expected_identity = _expected_executable_identity(binding)
+    try:
+        before = binding.source_path.lstat()
+        if _executable_identity(before) != expected_identity:
+            raise NamedLaneGuardError(
+                "Claude executable changed after accepted preflight"
+            )
+        source_descriptor = os.open(
+            binding.source_path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+            | nofollow,
+        )
+        opened_before = os.fstat(source_descriptor)
+        path_after_open = binding.source_path.lstat()
+        if (
+            _executable_identity(opened_before) != expected_identity
+            or _executable_identity(path_after_open) != expected_identity
+        ):
+            raise NamedLaneGuardError(
+                "Claude executable changed after accepted preflight"
+            )
+        _revalidate_output_parent(target)
+        snapshot_descriptor, snapshot_name = _open_private_temporary(
+            target,
+            readable=True,
+            prefix=".named-lane-launch-",
+        )
+        try:
+            created = os.fstat(snapshot_descriptor)
+        except OSError as error:
+            raise NamedLaneGuardError(
+                "Claude launch snapshot cannot be inspected safely"
+            ) from error
+        snapshot_identity = _output_identity(created)
+        source_digest = hashlib.sha256()
+        copied = 0
+        while copied <= binding.artifact_size:
+            _remaining_deadline_seconds(
+                deadline_monotonic,
+                "Claude executable snapshot",
+            )
+            chunk = os.read(
+                source_descriptor,
+                min(1024 * 1024, binding.artifact_size + 1 - copied),
+            )
+            if not chunk:
+                break
+            copied += len(chunk)
+            if copied > binding.artifact_size:
+                raise NamedLaneGuardError(
+                    "Claude executable size changed during snapshot"
+                )
+            source_digest.update(chunk)
+            _write_all(snapshot_descriptor, chunk)
+        if copied != binding.artifact_size:
+            raise NamedLaneGuardError("Claude executable size changed during snapshot")
+        os.fchmod(snapshot_descriptor, 0o500)
+        os.fsync(snapshot_descriptor)
+        opened_after = os.fstat(source_descriptor)
+        path_after_copy = binding.source_path.lstat()
+        if (
+            _executable_identity(opened_after) != expected_identity
+            or _executable_identity(path_after_copy) != expected_identity
+            or source_digest.hexdigest() != binding.artifact_checksum
+        ):
+            raise NamedLaneGuardError("Claude executable changed during launch binding")
+        snapshot_metadata = os.fstat(snapshot_descriptor)
+        if (
+            not stat.S_ISREG(snapshot_metadata.st_mode)
+            or snapshot_metadata.st_uid != _current_user_id()
+            or snapshot_metadata.st_nlink != 1
+            or stat.S_IMODE(snapshot_metadata.st_mode) != 0o500
+            or snapshot_metadata.st_size != binding.artifact_size
+        ):
+            raise NamedLaneGuardError("Claude launch snapshot is not private and exact")
+        os.lseek(snapshot_descriptor, 0, os.SEEK_SET)
+        snapshot_digest = hashlib.sha256()
+        verified = 0
+        while verified < binding.artifact_size:
+            _remaining_deadline_seconds(
+                deadline_monotonic,
+                "Claude executable snapshot",
+            )
+            chunk = os.read(
+                snapshot_descriptor,
+                min(1024 * 1024, binding.artifact_size - verified),
+            )
+            if not chunk:
+                break
+            verified += len(chunk)
+            snapshot_digest.update(chunk)
+        if (
+            verified != binding.artifact_size
+            or snapshot_digest.hexdigest() != binding.artifact_checksum
+        ):
+            raise NamedLaneGuardError(
+                "Claude launch snapshot bytes do not match preflight"
+            )
+        snapshot_path = target.path.parent / snapshot_name
+        current_snapshot = os.stat(
+            snapshot_name,
+            dir_fd=target.parent_fd,
+            follow_symlinks=False,
+        )
+        if _output_identity(current_snapshot) != snapshot_identity:
+            raise NamedLaneGuardError("Claude launch snapshot changed before handoff")
+        return _ClaudeLaunchSnapshot(
+            path=snapshot_path,
+            name=snapshot_name,
+            identity=snapshot_identity,
+        )
+    except BaseException as error:
+        cleanup_error: BaseException | None = None
+        if (
+            snapshot_name is not None
+            and snapshot_identity is None
+            and snapshot_descriptor >= 0
+        ):
+            try:
+                snapshot_identity = _output_identity(os.fstat(snapshot_descriptor))
+            except OSError:
+                raise NamedLaneGuardError(
+                    "Claude launch snapshot cleanup cannot bind the retained path: "
+                    f"{target.path.parent / snapshot_name}"
+                ) from error
+        if snapshot_name is not None and snapshot_identity is not None:
+            try:
+                _unlink_output_if_observed_same(
+                    target,
+                    snapshot_name,
+                    snapshot_identity,
+                    label="Claude launch snapshot",
+                )
+            except BaseException as candidate:
+                cleanup_error = candidate
+        if cleanup_error is not None:
+            raise NamedLaneGuardError(
+                "Claude launch snapshot cleanup failed; retained path: "
+                f"{target.path.parent / snapshot_name}"
+            ) from cleanup_error
+        raise
+    finally:
+        for descriptor in (snapshot_descriptor, source_descriptor):
+            if descriptor >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+
+
+def _cleanup_claude_launch_snapshot(
+    snapshot: _ClaudeLaunchSnapshot,
+    target: _OutputTarget,
+) -> None:
+    _unlink_output_if_observed_same(
+        target,
+        snapshot.name,
+        snapshot.identity,
+        label="Claude launch snapshot",
+    )
+
+
+def _claude_launch_snapshot_cleanup_error(
+    snapshot: _ClaudeLaunchSnapshot,
+    target: _OutputTarget,
+    process_reason: str,
+) -> _ClaudeLaunchSnapshotCleanupError:
+    retained_path = (
+        snapshot.path if _output_parent_path_names_bound_directory(target) else None
+    )
+    return _ClaudeLaunchSnapshotCleanupError(
+        retained_path,
+        process_reason,
+        retained_parent_identity=target.parent_identity,
+        retained_leaf=snapshot.name,
+    )
+
+
+def _claude_process_failure_reason(error: BaseException | None) -> str:
+    if error is None:
+        return "complete"
+    if isinstance(error, ForwardedSignal):
+        return "forwarded-signal"
+    if isinstance(error, ReviewTimeoutError):
+        return "deadline"
+    if isinstance(error, ReviewOutputLimitError):
+        return "output-limit"
+    if isinstance(error, ReviewOutputDrainError):
+        return "output-drain"
+    if isinstance(error, ReviewProcessLeakError):
+        return "process-leak"
+    return "process-error"
+
+
+def _restore_claude_snapshot_signal_mask(
+    previous_mask: set[signal.Signals],
+) -> signal.Signals | None:
+    failures: list[OSError] = []
+    control_error: BaseException | None = None
+    for _attempt in range(2):
+        try:
+            restore_signal_mask(previous_mask)
+        except ForwardedSignal as error:
+            # The POSIX mask change completed before Python dispatched the
+            # pending signal through the installed structured handler.
+            if control_error is not None:
+                raise control_error.with_traceback(control_error.__traceback__) from error
+            return error.signum
+        except OSError as error:
+            failures.append(error)
+        except BaseException as error:
+            if control_error is None:
+                control_error = error
+        else:
+            if control_error is not None:
+                cause = failures[-1] if failures else None
+                if cause is not None:
+                    raise control_error.with_traceback(
+                        control_error.__traceback__
+                    ) from cause
+                raise control_error.with_traceback(control_error.__traceback__)
+            return None
+    if control_error is not None:
+        cause = failures[-1] if failures else None
+        if cause is not None:
+            raise control_error.with_traceback(control_error.__traceback__) from cause
+        raise control_error.with_traceback(control_error.__traceback__)
+    raise NamedLaneGuardError(
+        "Claude launch snapshot signal mask could not be restored"
+    ) from failures[-1]
 
 
 def _rollback_published_outputs(outputs: list[_PublishedOutput]) -> None:
@@ -3531,6 +4257,7 @@ def run_claude(
     stdout_path: pathlib.Path,
     stderr_path: pathlib.Path,
     command: Sequence[str],
+    preflight_result: pathlib.Path,
     prompt: bytes,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     stream_limit_bytes: int = DEFAULT_STREAM_LIMIT_BYTES,
@@ -3557,40 +4284,107 @@ def run_claude(
     executable = pathlib.Path(command[0])
     if not executable.is_absolute():
         raise NamedLaneGuardError("Claude executable path must be absolute")
-    try:
-        metadata = executable.lstat()
-        resolved_executable = executable.resolve(strict=True)
-    except (OSError, RuntimeError) as error:
-        raise NamedLaneGuardError(
-            "Claude executable is not safely accessible"
-        ) from error
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or stat.S_ISLNK(metadata.st_mode)
-        or resolved_executable != executable
-        or not os.access(executable, os.X_OK)
-    ):
-        raise NamedLaneGuardError(
-            "Claude executable must be an exact absolute executable regular file"
-        )
+    binding = _load_claude_executable_binding(
+        preflight_result,
+        worktree=root,
+        command_path=executable,
+    )
     stdout = _validate_output_path(stdout_path, root)
     try:
         stderr = _validate_output_path(stderr_path, root)
         try:
             if stdout.path == stderr.path:
                 raise NamedLaneGuardError("stdout and stderr paths must differ")
-            capture = run_bounded_capture(
-                command,
-                cwd=root,
-                env=_claude_environment(root, inherit_node_extra_ca_certs),
-                stdin=bytearray(prompt),
-                timeout_seconds=_remaining_deadline_seconds(
-                    deadline,
-                    "Claude process supervision",
-                ),
-                stdout_limit_bytes=stream_limit,
-                stderr_limit_bytes=stream_limit,
-            )
+            snapshot_mask = block_forwarded_signals()
+            if snapshot_mask is None:
+                raise NamedLaneGuardError(
+                    "Claude launch snapshot lifecycle requires main-thread signal masking"
+                )
+            snapshot: _ClaudeLaunchSnapshot | None = None
+            capture = None
+            process_error: BaseException | None = None
+            try:
+                snapshot = _create_claude_launch_snapshot(
+                    binding,
+                    stdout,
+                    deadline_monotonic=deadline,
+                )
+                snapshot_command = (str(snapshot.path), *tuple(command[1:]))
+                restore_signal_mask(snapshot_mask)
+                try:
+                    capture = run_bounded_capture(
+                        snapshot_command,
+                        cwd=root,
+                        env=_claude_environment(root, inherit_node_extra_ca_certs),
+                        stdin=bytearray(prompt),
+                        timeout_seconds=_remaining_deadline_seconds(
+                            deadline,
+                            "Claude process supervision",
+                        ),
+                        stdout_limit_bytes=stream_limit,
+                        stderr_limit_bytes=stream_limit,
+                    )
+                except BaseException as error:
+                    process_error = error
+            finally:
+                lifecycle_error = (
+                    process_error if process_error is not None else sys.exc_info()[1]
+                )
+                cleanup_error: BaseException | None = None
+                if snapshot is not None:
+                    try:
+                        if block_forwarded_signals() is None:
+                            raise NamedLaneGuardError(
+                                "Claude launch snapshot cleanup requires main-thread "
+                                "signal masking"
+                            )
+                        _cleanup_claude_launch_snapshot(snapshot, stdout)
+                    except BaseException as error:
+                        cleanup_error = error
+                    deferred_signal: signal.Signals | None = None
+                    mask_restore_error: BaseException | None = None
+                    try:
+                        deferred_signal = _restore_claude_snapshot_signal_mask(
+                            snapshot_mask
+                        )
+                    except BaseException as error:
+                        mask_restore_error = error
+                    if cleanup_error is not None:
+                        if capture is not None:
+                            capture.stdout[:] = b"\x00" * len(capture.stdout)
+                            capture.stderr[:] = b"\x00" * len(capture.stderr)
+                        cleanup_reason_error = lifecycle_error
+                        if deferred_signal is not None:
+                            cleanup_reason_error = ForwardedSignal(deferred_signal)
+                        if mask_restore_error is not None:
+                            cleanup_error = NamedLaneGuardError(
+                                f"{cleanup_error}; {mask_restore_error}"
+                            )
+                        raise _claude_launch_snapshot_cleanup_error(
+                            snapshot,
+                            stdout,
+                            _claude_process_failure_reason(cleanup_reason_error),
+                        ) from cleanup_error
+                    if mask_restore_error is not None:
+                        if capture is not None:
+                            capture.stdout[:] = b"\x00" * len(capture.stdout)
+                            capture.stderr[:] = b"\x00" * len(capture.stderr)
+                        raise mask_restore_error
+                    if deferred_signal is not None:
+                        if capture is not None:
+                            capture.stdout[:] = b"\x00" * len(capture.stdout)
+                            capture.stderr[:] = b"\x00" * len(capture.stderr)
+                        raise ForwardedSignal(deferred_signal)
+                else:
+                    deferred_signal = _restore_claude_snapshot_signal_mask(snapshot_mask)
+                    if deferred_signal is not None:
+                        raise ForwardedSignal(deferred_signal)
+            if process_error is not None:
+                raise process_error.with_traceback(process_error.__traceback__)
+            if capture is None:
+                raise NamedLaneGuardError(
+                    "Claude process supervision did not return a complete capture"
+                )
             try:
                 publication_mask = block_forwarded_signals()
                 if publication_mask is None:
@@ -3634,6 +4428,14 @@ def run_claude(
                         "stdout_bytes": len(capture.stdout),
                         "stderr_path": str(stderr.path),
                         "stderr_bytes": len(capture.stderr),
+                        "launch_binding": {
+                            "mode": "verified-snapshot",
+                            "preflight_sha256": binding.preflight_checksum,
+                            "resolved_path": str(binding.source_path),
+                            "identity": dict(_expected_executable_identity(binding)),
+                            "artifact_sha256": binding.artifact_checksum,
+                            "artifact_size": binding.artifact_size,
+                        },
                     }
                     deferred_signal = consume_pending_forwarded_signal()
                     if deferred_signal is not None:
@@ -3728,6 +4530,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Run an exact Claude executable under bounded process supervision.",
     )
     claude.add_argument("--worktree", required=True)
+    claude.add_argument("--preflight-result", required=True)
     claude.add_argument("--stdout-path", required=True)
     claude.add_argument("--stderr-path", required=True)
     claude.add_argument(
@@ -3929,6 +4732,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 stdout_path=pathlib.Path(args.stdout_path),
                 stderr_path=pathlib.Path(args.stderr_path),
                 command=command,
+                preflight_result=pathlib.Path(args.preflight_result),
                 prompt=prompt,
                 timeout_seconds=_remaining_deadline_seconds(
                     deadline,
@@ -3940,6 +4744,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         _emit(result)
         return 0 if result["status"] == "complete" else 1
+    except _ClaudeLaunchSnapshotCleanupError as error:
+        payload: dict[str, object] = {
+            "status": "inconclusive",
+            "reason": "snapshot-cleanup",
+            "process_reason": error.process_reason,
+        }
+        if error.retained_path is not None:
+            payload["retained_path"] = str(error.retained_path)
+        else:
+            assert error.retained_parent_identity is not None
+            assert error.retained_leaf is not None
+            payload["retained_locator"] = {
+                "parent_device": error.retained_parent_identity[0],
+                "parent_inode": error.retained_parent_identity[1],
+                "leaf": error.retained_leaf,
+            }
+        _emit(payload, stream=sys.stderr)
+        return 2
     except ForwardedSignal as error:
         status = "blocked-safety" if safety_command else "inconclusive"
         _emit(

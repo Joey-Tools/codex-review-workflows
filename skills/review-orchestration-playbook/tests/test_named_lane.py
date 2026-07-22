@@ -46,7 +46,7 @@ from review_runtime.named_lane import (  # noqa: E402
     _validate_materialized_symlink,
     main as named_lane_main,
     materialize_worktree,
-    run_claude,
+    run_claude as _run_claude,
     validate_worktree,
 )
 
@@ -69,6 +69,16 @@ def git(repo: pathlib.Path, *arguments: str) -> str:
         text=True,
     )
     return completed.stdout.strip()
+
+
+def run_claude(**kwargs: object) -> dict[str, object]:
+    if "preflight_result" not in kwargs:
+        command = kwargs["command"]
+        executable = pathlib.Path(command[0])
+        kwargs["preflight_result"] = executable.with_name(
+            f"{executable.name}.preflight.json"
+        )
+    return _run_claude(**kwargs)
 
 
 class NamedLaneGuardTest(unittest.TestCase):
@@ -101,7 +111,58 @@ class NamedLaneGuardTest(unittest.TestCase):
             encoding="utf-8",
         )
         executable.chmod(0o755)
-        return executable.resolve()
+        resolved = executable.resolve()
+        self.write_preflight_result(resolved)
+        return resolved
+
+    def preflight_result_path(self, executable: pathlib.Path) -> pathlib.Path:
+        return executable.with_name(f"{executable.name}.preflight.json")
+
+    def write_preflight_result(self, executable: pathlib.Path) -> pathlib.Path:
+        metadata = executable.lstat()
+        version = "2.1.212"
+        checksum = hashlib.sha256(executable.read_bytes()).hexdigest()
+        evidence = {
+            "capability_contract": {
+                "required_options": [],
+                "status": "accepted",
+            },
+            "classification": "accepted",
+            "compatible_version_range": ">=2.1.211,<3.0.0",
+            "declared_version": version,
+            "identity": {
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+                "file_type": stat.S_IFMT(metadata.st_mode),
+                "mode": metadata.st_mode,
+                "nlink": metadata.st_nlink,
+                "uid": metadata.st_uid,
+                "gid": metadata.st_gid,
+                "size": metadata.st_size,
+                "mtime_ns": metadata.st_mtime_ns,
+                "ctime_ns": metadata.st_ctime_ns,
+            },
+            "observed_version": version,
+            "publisher_verification": {
+                "artifact_size": metadata.st_size,
+                "binary": "claude",
+                "checksum": checksum,
+                "manifest_url": "https://example.invalid/manifest.json",
+                "platform": "test-platform",
+                "release_version": version,
+                "signature_url": "https://example.invalid/manifest.sig",
+                "signer_fingerprint": "test-fingerprint",
+            },
+            "reason": "compatible-version-selected",
+            "resolved_path": str(executable),
+            "selected_version": version,
+            "source": "explicit-override",
+            "stream_contract": {},
+        }
+        path = self.preflight_result_path(executable)
+        path.write_text(json.dumps(evidence, sort_keys=True), encoding="utf-8")
+        path.chmod(0o600)
+        return path
 
     def copy_guard_bundle(self) -> tuple[pathlib.Path, pathlib.Path]:
         bundle = self.root / f"bundle-{time.monotonic_ns()}"
@@ -533,7 +594,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             "pathlib.Path(expected_fd_exec).read_bytes():\n"
             "    raise RuntimeError('fd_exec bytes were not bound exactly')\n"
             "if namespace['_MAIN_ARGV'] != ('--sentinel',):\n"
-            "    raise RuntimeError(f\"arguments not forwarded: "
+            '    raise RuntimeError(f"arguments not forwarded: '
             "{namespace['_MAIN_ARGV']!r}\")\n"
             "print(json.dumps(observed, sort_keys=True))\n"
         )
@@ -762,7 +823,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             "if loaded != expected_loaded:\n"
             "    raise RuntimeError(f'unexpected validator closure: {loaded}')\n"
             "if namespace['_MAIN_ARGV'] != ('--sentinel',):\n"
-            "    raise RuntimeError(f\"arguments not forwarded: "
+            '    raise RuntimeError(f"arguments not forwarded: '
             "{namespace['_MAIN_ARGV']!r}\")\n"
             "print(module.__spec__.origin)\n"
         )
@@ -1518,6 +1579,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertIn("--stdout", pack)
         self.assertIn("--no-reuse-delta", pack)
         self.assertIn("--no-reuse-object", pack)
+        self.assertIn("--no-use-bitmap-index", pack)
         self.assertNotIn("--revs", pack)
         self.assertNotIn("--all", pack)
         index_pack = next(command for command in commands if "index-pack" in command)
@@ -1687,7 +1749,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         )
         self.assertEqual(validate_worktree(destination, head).head_sha, head)
 
-    def test_materializer_removes_pack_bitmap_caches_before_object_traversal(
+    def test_materializer_rejects_source_pack_bitmap_before_object_traversal(
         self,
     ) -> None:
         (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
@@ -1699,17 +1761,55 @@ class NamedLaneGuardTest(unittest.TestCase):
             (self.repo / ".git" / "objects" / "pack").glob("*.bitmap")
         )
         self.assertTrue(source_bitmaps)
-        expected_objects = set(
-            git(
-                self.repo,
-                "rev-list",
-                "--objects",
+        destination = self.root / "bitmap-free-lane"
+        commands: list[tuple[str, ...]] = []
+        original_capture = named_lane_runtime.run_bounded_capture
+
+        def capture_command(argv: object, **kwargs: object) -> object:
+            commands.append(tuple(str(item) for item in argv))
+            return original_capture(argv, **kwargs)
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "run_bounded_capture",
+                side_effect=capture_command,
+            ),
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "source Git bitmap cache is not allowed",
+            ),
+        ):
+            materialize_worktree(
+                self.repo.resolve(),
+                destination,
                 base,
                 head,
-                "--",
-            ).splitlines()
+            )
+
+        self.assertFalse(destination.exists())
+        self.assertEqual(
+            tuple((self.repo / ".git" / "objects" / "pack").glob("*.bitmap")),
+            source_bitmaps,
         )
-        destination = self.root / "bitmap-free-lane"
+        forbidden = {"rev-list", "cat-file", "pack-objects", "index-pack", "fsck"}
+        self.assertFalse(
+            any(
+                forbidden.intersection(command) or "checkout" in command
+                for command in commands
+            )
+        )
+
+    def test_materializer_accepts_source_pack_without_bitmap_cache(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit("head")
+        git(self.repo, "repack", "-a", "-d", "--no-write-bitmap-index")
+        source_pack = self.repo / ".git" / "objects" / "pack"
+        self.assertTrue(tuple(source_pack.glob("*.pack")))
+        self.assertEqual(tuple(source_pack.glob("*.bitmap")), ())
+        destination = self.root / "packed-source-lane"
 
         result = materialize_worktree(
             self.repo.resolve(),
@@ -1719,23 +1819,10 @@ class NamedLaneGuardTest(unittest.TestCase):
         )
 
         self.assertEqual(result.head_sha, head)
+        self.assertEqual(validate_worktree(destination, head).head_sha, head)
         self.assertEqual(
             tuple((destination / ".git" / "objects" / "pack").glob("*.bitmap")),
             (),
-        )
-        self.assertEqual(
-            set(
-                git(
-                    destination,
-                    "rev-list",
-                    "--objects",
-                    "--use-bitmap-index",
-                    base,
-                    head,
-                    "--",
-                ).splitlines()
-            ),
-            expected_objects,
         )
 
     def test_materializer_rejects_bundle_and_bare_suffix_dwim_sources(self) -> None:
@@ -2288,6 +2375,294 @@ class NamedLaneGuardTest(unittest.TestCase):
             (destination / ".git" / "objects" / "info" / "alternates").exists()
         )
 
+    def test_materializer_accepts_linked_source_marker_metadata_churn(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        head = base
+        linked_source = self.root / "linked-marker-metadata-source"
+        git(self.repo, "worktree", "add", "--detach", str(linked_source), head)
+        marker = linked_source / ".git"
+        extra_link = self.root / "linked-marker-extra-link"
+        destination = self.root / "linked-marker-metadata-lane"
+        original_validate = named_lane_runtime._validate_materializer_git_version
+        initial_metadata = marker.lstat()
+        mutated = False
+
+        def mutate_marker_metadata(*args: object, **kwargs: object) -> object:
+            nonlocal mutated
+            result = original_validate(*args, **kwargs)
+            time.sleep(0.01)
+            os.link(marker, extra_link)
+            os.utime(
+                marker,
+                ns=(
+                    initial_metadata.st_atime_ns,
+                    max(0, initial_metadata.st_mtime_ns - 1_000_000_000),
+                ),
+            )
+            current_metadata = marker.lstat()
+            self.assertEqual(current_metadata.st_ino, initial_metadata.st_ino)
+            self.assertEqual(current_metadata.st_nlink, initial_metadata.st_nlink + 1)
+            self.assertNotEqual(
+                current_metadata.st_mtime_ns,
+                initial_metadata.st_mtime_ns,
+            )
+            self.assertNotEqual(
+                current_metadata.st_ctime_ns,
+                initial_metadata.st_ctime_ns,
+            )
+            mutated = True
+            return result
+
+        try:
+            with mock.patch.object(
+                named_lane_runtime,
+                "_validate_materializer_git_version",
+                side_effect=mutate_marker_metadata,
+            ):
+                result = materialize_worktree(
+                    linked_source.resolve(),
+                    destination,
+                    base,
+                    head,
+                )
+        finally:
+            extra_link.unlink(missing_ok=True)
+
+        self.assertTrue(mutated)
+        self.assertEqual(result.head_sha, head)
+        self.assertEqual(validate_worktree(destination, head).head_sha, head)
+
+    def test_materializer_control_file_fifo_swap_fails_without_blocking(self) -> None:
+        control = self.root / "materializer-control"
+        control.write_text("control\n", encoding="utf-8")
+        original_open = os.open
+        observed_flags: int | None = None
+
+        def swap_to_fifo(
+            path: os.PathLike[str] | str,
+            flags: int,
+            *args: object,
+            **kwargs: object,
+        ) -> int:
+            nonlocal observed_flags
+            if pathlib.Path(path) == control:
+                control.unlink()
+                os.mkfifo(control)
+                observed_flags = flags
+                self.assertNotEqual(flags & os.O_NONBLOCK, 0)
+            return original_open(path, flags, *args, **kwargs)
+
+        started = time.monotonic()
+        with (
+            mock.patch.object(
+                named_lane_runtime.os,
+                "open",
+                side_effect=swap_to_fifo,
+            ),
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "Git admin back-pointer changed during inspection",
+            ),
+        ):
+            named_lane_runtime._read_materializer_control_file(
+                control,
+                label="Git admin back-pointer",
+            )
+
+        self.assertIsNotNone(observed_flags)
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_materializer_rejects_linked_source_marker_type_drift(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        (self.repo / "tracked.txt").write_text("head\n", encoding="utf-8")
+        head = self.commit("head")
+        linked_source = self.root / "linked-marker-type-source"
+        git(self.repo, "worktree", "add", "--detach", str(linked_source), head)
+        marker = linked_source / ".git"
+        backup = linked_source / ".git.original"
+        destination = self.root / "linked-marker-type-lane"
+        original_validate = named_lane_runtime._validate_materializer_git_version
+        mutated = False
+
+        def mutate_marker(*args: object, **kwargs: object) -> object:
+            nonlocal mutated
+            result = original_validate(*args, **kwargs)
+            marker.rename(backup)
+            marker.mkdir()
+            mutated = True
+            return result
+
+        try:
+            with (
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_validate_materializer_git_version",
+                    side_effect=mutate_marker,
+                ),
+                self.assertRaisesRegex(
+                    NamedLaneGuardError,
+                    "Git admin marker changed during materialization",
+                ),
+            ):
+                materialize_worktree(
+                    linked_source.resolve(),
+                    destination,
+                    base,
+                    head,
+                )
+        finally:
+            if marker.is_dir():
+                marker.rmdir()
+            if backup.exists():
+                backup.rename(marker)
+
+        self.assertTrue(mutated)
+        self.assertFalse(destination.exists())
+
+    def test_materializer_rejects_linked_source_marker_identity_drift(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        head = base
+        linked_source = self.root / "linked-marker-identity-source"
+        git(self.repo, "worktree", "add", "--detach", str(linked_source), head)
+        marker = linked_source / ".git"
+        original_payload = marker.read_bytes()
+        original_inode = marker.stat().st_ino
+        destination = self.root / "linked-marker-identity-lane"
+        original_validate = named_lane_runtime._validate_materializer_git_version
+        mutated = False
+
+        def mutate_marker(*args: object, **kwargs: object) -> object:
+            nonlocal mutated
+            result = original_validate(*args, **kwargs)
+            replacement = linked_source / ".git.replacement"
+            replacement.write_bytes(original_payload)
+            os.replace(replacement, marker)
+            mutated = marker.stat().st_ino != original_inode
+            return result
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_validate_materializer_git_version",
+                side_effect=mutate_marker,
+            ),
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "Git admin marker changed during materialization",
+            ),
+        ):
+            materialize_worktree(
+                linked_source.resolve(),
+                destination,
+                base,
+                head,
+            )
+
+        self.assertTrue(mutated)
+        self.assertFalse(destination.exists())
+
+    def test_materializer_rejects_linked_source_marker_target_drift(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        head = base
+        first_source = self.root / "linked-marker-target-source"
+        second_source = self.root / "linked-marker-other-source"
+        git(self.repo, "worktree", "add", "--detach", str(first_source), head)
+        git(self.repo, "worktree", "add", "--detach", str(second_source), head)
+        marker = first_source / ".git"
+        original_payload = marker.read_bytes()
+        other_payload = (second_source / ".git").read_bytes()
+        original_inode = marker.stat().st_ino
+        destination = self.root / "linked-marker-target-lane"
+        original_validate = named_lane_runtime._validate_materializer_git_version
+        mutated = False
+
+        def mutate_marker(*args: object, **kwargs: object) -> object:
+            nonlocal mutated
+            result = original_validate(*args, **kwargs)
+            marker.write_bytes(other_payload)
+            mutated = marker.stat().st_ino == original_inode
+            return result
+
+        try:
+            with (
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_validate_materializer_git_version",
+                    side_effect=mutate_marker,
+                ),
+                self.assertRaisesRegex(
+                    NamedLaneGuardError,
+                    "Git admin marker changed during materialization",
+                ),
+            ):
+                materialize_worktree(
+                    first_source.resolve(),
+                    destination,
+                    base,
+                    head,
+                )
+        finally:
+            marker.write_bytes(original_payload)
+
+        self.assertTrue(mutated)
+        self.assertFalse(destination.exists())
+
+    def test_materializer_rejects_linked_source_back_pointer_drift(self) -> None:
+        (self.repo / "AGENTS.md").write_text("base\n", encoding="utf-8")
+        base = self.commit("base")
+        head = base
+        first_source = self.root / "linked-back-pointer-source"
+        second_source = self.root / "linked-back-pointer-other-source"
+        git(self.repo, "worktree", "add", "--detach", str(first_source), head)
+        git(self.repo, "worktree", "add", "--detach", str(second_source), head)
+        first_admin = pathlib.Path(
+            git(first_source, "rev-parse", "--absolute-git-dir")
+        )
+        back_pointer = first_admin / "gitdir"
+        original_payload = back_pointer.read_bytes()
+        original_inode = back_pointer.lstat().st_ino
+        destination = self.root / "linked-back-pointer-lane"
+        original_validate = named_lane_runtime._materializer_validate_checkout_manifest
+        mutated = False
+
+        def mutate_back_pointer(*args: object, **kwargs: object) -> object:
+            nonlocal mutated
+            result = original_validate(*args, **kwargs)
+            back_pointer.write_text(
+                f"{second_source / '.git'}\n",
+                encoding="utf-8",
+            )
+            mutated = back_pointer.lstat().st_ino == original_inode
+            return result
+
+        try:
+            with (
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_materializer_validate_checkout_manifest",
+                    side_effect=mutate_back_pointer,
+                ),
+                self.assertRaisesRegex(
+                    NamedLaneGuardError,
+                    "Git admin directory does not match its exact marker",
+                ),
+            ):
+                materialize_worktree(
+                    first_source.resolve(),
+                    destination,
+                    base,
+                    head,
+                )
+        finally:
+            back_pointer.write_bytes(original_payload)
+
+        self.assertTrue(mutated)
+        self.assertFalse(destination.exists())
+
     def test_materializer_rejects_linked_source_per_worktree_shallow_state(
         self,
     ) -> None:
@@ -2483,6 +2858,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             ),
             (self.repo / ".git" / "shallow", b"", "shallow repository state"),
             (pack / "source.promisor", b"", "promisor state is not allowed"),
+            (pack / "source.BiTmAp", b"", "bitmap cache is not allowed"),
         )
 
         for index, (state_path, payload, expected) in enumerate(cases):
@@ -4191,6 +4567,51 @@ class NamedLaneGuardTest(unittest.TestCase):
         ):
             validate_worktree(self.repo.resolve(), head)
 
+    def test_validate_worktree_uses_the_materializer_path_output_envelope(
+        self,
+    ) -> None:
+        head = self.add_deinitialized_gitlink()
+        git(self.repo, "config", "submodule.active", "unrelated")
+        calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+        original_capture = named_lane_runtime._git_capture
+
+        def capture_call(
+            root: pathlib.Path,
+            arguments: object,
+            **kwargs: object,
+        ) -> bytes:
+            calls.append((tuple(str(item) for item in arguments), dict(kwargs)))
+            return original_capture(root, arguments, **kwargs)
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "_git_capture",
+            side_effect=capture_call,
+        ):
+            result = validate_worktree(self.repo.resolve(), head)
+
+        self.assertEqual(result.head_sha, head)
+        expected = named_lane_runtime._checkout_tree_output_limit(len(head))
+        self.assertEqual(expected, 72_708_864)
+        self.assertEqual(named_lane_runtime._checkout_tree_output_limit(64), 75_108_864)
+        for subcommand in ("ls-tree", "ls-files", "status"):
+            matching = [
+                kwargs
+                for command, kwargs in calls
+                if subcommand in command
+                and (subcommand != "ls-files" or "-v" in command)
+            ]
+            self.assertEqual(len(matching), 1)
+            self.assertEqual(matching[0].get("output_limit_bytes"), expected)
+        pathspec_calls = [
+            kwargs
+            for command, kwargs in calls
+            if "ls-files" in command
+            and any(item.startswith("--with-tree=") for item in command)
+        ]
+        self.assertEqual(len(pathspec_calls), 1)
+        self.assertEqual(pathspec_calls[0].get("output_limit_bytes"), expected)
+
     def test_successful_process_writes_private_bounded_outputs(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
         self.commit()
@@ -4218,6 +4639,832 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(stderr.read_bytes(), b"err")
         self.assertEqual(stat.S_IMODE(stdout.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(stderr.stat().st_mode), 0o600)
+        self.assertEqual(result["launch_binding"]["mode"], "verified-snapshot")
+        self.assertEqual(tuple(self.root.glob(".named-lane-*")), ())
+
+    def test_cli_run_claude_uses_the_preflight_bound_snapshot(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable(
+            "import sys\nsys.stdout.buffer.write(sys.stdin.buffer.read())\n"
+        )
+        stdout_path = self.root / "cli-bound.stdout"
+        stderr_path = self.root / "cli-bound.stderr"
+
+        completed = subprocess.run(
+            self.isolated_guard_command(
+                SCRIPTS / "named_lane_guard",
+                "run-claude",
+                "--worktree",
+                str(self.repo.resolve()),
+                "--preflight-result",
+                str(self.preflight_result_path(executable)),
+                "--stdout-path",
+                str(stdout_path),
+                "--stderr-path",
+                str(stderr_path),
+                "--timeout-seconds",
+                "5",
+                "--",
+                str(executable),
+            ),
+            check=True,
+            input=b"review",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+
+        receipt = json.loads(completed.stdout)
+        self.assertEqual(receipt["status"], "complete")
+        self.assertEqual(receipt["launch_binding"]["mode"], "verified-snapshot")
+        self.assertEqual(stdout_path.read_bytes(), b"review")
+        self.assertEqual(stderr_path.read_bytes(), b"")
+        self.assertEqual(tuple(self.root.glob(".named-lane-*")), ())
+
+    def test_process_rejects_a_command_that_differs_from_preflight(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        accepted = self.make_executable("pass\n")
+        different = self.make_executable("raise SystemExit(97)\n")
+        stdout = self.root / "different-command.out"
+        stderr = self.root / "different-command.err"
+
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "does not match the accepted preflight executable",
+        ):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=stdout,
+                stderr_path=stderr,
+                command=(str(different),),
+                preflight_result=self.preflight_result_path(accepted),
+                prompt=b"",
+                timeout_seconds=5.0,
+                stream_limit_bytes=64,
+            )
+
+        self.assertFalse(stdout.exists())
+        self.assertFalse(stderr.exists())
+
+    def test_process_rejects_executable_replacement_before_binding(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        accepted = self.make_executable("pass\n")
+        malicious_marker = self.root / "replacement-before.marker"
+        replacement = self.make_executable(
+            "import pathlib\n"
+            f"pathlib.Path({str(malicious_marker)!r}).write_text('ran')\n"
+        )
+        os.replace(replacement, accepted)
+
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "changed after accepted preflight",
+        ):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=self.root / "replacement-before.out",
+                stderr_path=self.root / "replacement-before.err",
+                command=(str(accepted),),
+                preflight_result=self.preflight_result_path(accepted),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=64,
+            )
+
+        self.assertFalse(malicious_marker.exists())
+
+    def test_process_executes_bound_snapshot_when_source_is_replaced_and_restored(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        accepted = self.make_executable(
+            "import sys\nsys.stdout.buffer.write(b'trusted')\n"
+        )
+        malicious_marker = self.root / "replacement-at-handoff.marker"
+        replacement = self.make_executable(
+            "import pathlib, sys\n"
+            f"pathlib.Path({str(malicious_marker)!r}).write_text('ran')\n"
+            "sys.stdout.buffer.write(b'malicious')\n"
+        )
+        preflight = self.preflight_result_path(accepted)
+        expected_preflight_digest = hashlib.sha256(preflight.read_bytes()).hexdigest()
+        stdout = self.root / "snapshot-binding.out"
+        stderr = self.root / "snapshot-binding.err"
+        original_backup = self.root / "snapshot-binding.original"
+        original_capture = named_lane_runtime.run_bounded_capture
+        replaced = False
+
+        def replace_at_handoff(argv: object, **kwargs: object) -> object:
+            nonlocal replaced
+            command = tuple(str(item) for item in argv)
+            if not replaced and pathlib.Path(command[0]).name.startswith(
+                ".named-lane-"
+            ):
+                accepted.rename(original_backup)
+                os.replace(replacement, accepted)
+                try:
+                    return original_capture(command, **kwargs)
+                finally:
+                    os.replace(original_backup, accepted)
+                    replaced = True
+            return original_capture(command, **kwargs)
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "run_bounded_capture",
+            side_effect=replace_at_handoff,
+        ):
+            result = run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=stdout,
+                stderr_path=stderr,
+                command=(str(accepted),),
+                preflight_result=preflight,
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=64,
+            )
+
+        self.assertTrue(replaced)
+        self.assertEqual(stdout.read_bytes(), b"trusted")
+        self.assertFalse(malicious_marker.exists())
+        self.assertEqual(
+            result["launch_binding"]["preflight_sha256"],
+            expected_preflight_digest,
+        )
+        self.assertEqual(result["launch_binding"]["resolved_path"], str(accepted))
+        self.assertEqual(tuple(self.root.glob(".named-lane-*")), ())
+
+    def test_process_ignores_nonsemantic_executable_timestamp_and_link_churn(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable(
+            "import sys\nsys.stdout.buffer.write(b'bound')\n"
+        )
+        metadata = executable.stat()
+        os.utime(
+            executable,
+            ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000),
+        )
+        extra_link = self.root / "benign-executable-hardlink"
+        os.link(executable, extra_link)
+        try:
+            result = run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=self.root / "benign-metadata.out",
+                stderr_path=self.root / "benign-metadata.err",
+                command=(str(executable),),
+                preflight_result=self.preflight_result_path(executable),
+                prompt=b"",
+                timeout_seconds=5.0,
+                stream_limit_bytes=64,
+            )
+        finally:
+            extra_link.unlink(missing_ok=True)
+
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual((self.root / "benign-metadata.out").read_bytes(), b"bound")
+
+    def test_process_rejects_a_forged_preflight_artifact_checksum(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("raise SystemExit(97)\n")
+        preflight = self.preflight_result_path(executable)
+        evidence = json.loads(preflight.read_text(encoding="utf-8"))
+        evidence["publisher_verification"]["checksum"] = "0" * 64
+        preflight.write_text(json.dumps(evidence, sort_keys=True), encoding="utf-8")
+        preflight.chmod(0o600)
+
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "changed during launch binding",
+        ):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=self.root / "forged-checksum.out",
+                stderr_path=self.root / "forged-checksum.err",
+                command=(str(executable),),
+                preflight_result=preflight,
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=64,
+            )
+
+        self.assertEqual(tuple(self.root.glob(".named-lane-*")), ())
+
+    def test_process_rejects_same_inode_executable_content_drift(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable(
+            "import sys\nsys.stdout.buffer.write(b'trusted')\n"
+        )
+        payload = bytearray(executable.read_bytes())
+        payload[-3] = ord("X")
+        executable.write_bytes(payload)
+        executable.chmod(0o755)
+
+        with self.assertRaisesRegex(
+            NamedLaneGuardError,
+            "changed during launch binding",
+        ):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=self.root / "same-inode-drift.out",
+                stderr_path=self.root / "same-inode-drift.err",
+                command=(str(executable),),
+                preflight_result=self.preflight_result_path(executable),
+                prompt=b"",
+                timeout_seconds=2.0,
+                stream_limit_bytes=64,
+            )
+
+        self.assertEqual(tuple(self.root.glob(".named-lane-*")), ())
+
+    def test_process_requires_parent_private_preflight_evidence(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("pass\n")
+        preflight = self.preflight_result_path(executable)
+        symlink = self.root / "preflight-symlink.json"
+        symlink.symlink_to(preflight)
+        hardlink = self.root / "preflight-hardlink.json"
+        os.link(preflight, hardlink)
+        try:
+            for label, candidate, expected in (
+                ("relative", pathlib.Path(preflight.name), "must be absolute"),
+                ("symlink", symlink, "single-link regular file"),
+                ("hardlink", hardlink, "single-link regular file"),
+            ):
+                with self.subTest(label=label):
+                    with self.assertRaisesRegex(NamedLaneGuardError, expected):
+                        run_claude(
+                            worktree=self.repo.resolve(),
+                            stdout_path=self.root / f"{label}-preflight.out",
+                            stderr_path=self.root / f"{label}-preflight.err",
+                            command=(str(executable),),
+                            preflight_result=candidate,
+                            prompt=b"",
+                            timeout_seconds=2.0,
+                            stream_limit_bytes=64,
+                        )
+        finally:
+            hardlink.unlink(missing_ok=True)
+
+        preflight.chmod(0o644)
+        try:
+            with self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "private single-link regular file",
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "permissive-preflight.out",
+                    stderr_path=self.root / "permissive-preflight.err",
+                    command=(str(executable),),
+                    preflight_result=preflight,
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=64,
+                )
+        finally:
+            preflight.chmod(0o600)
+
+    def test_initial_launch_snapshot_fstat_failure_removes_snapshot(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("pass\n")
+        real_fstat = os.fstat
+        failed_once = False
+
+        def fail_snapshot_fstat(descriptor: int) -> os.stat_result:
+            nonlocal failed_once
+            launch_snapshots = tuple(self.root.glob(".named-lane-launch-*"))
+            if not failed_once and launch_snapshots:
+                failed_once = True
+                raise OSError("synthetic launch snapshot fstat failure")
+            return real_fstat(descriptor)
+
+        with (
+            mock.patch.object(
+                named_lane_runtime.os,
+                "fstat",
+                side_effect=fail_snapshot_fstat,
+            ),
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "launch snapshot cannot be inspected safely",
+            ),
+        ):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=self.root / "snapshot-fstat.out",
+                stderr_path=self.root / "snapshot-fstat.err",
+                command=(str(executable),),
+                preflight_result=self.preflight_result_path(executable),
+                prompt=b"",
+                timeout_seconds=5.0,
+                stream_limit_bytes=64,
+            )
+
+        self.assertTrue(failed_once)
+        self.assertEqual(tuple(self.root.glob(".named-lane-*")), ())
+
+    def test_persistent_launch_snapshot_fstat_failure_reports_retained_path(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("pass\n")
+        real_fstat = os.fstat
+
+        def fail_snapshot_fstat(descriptor: int) -> os.stat_result:
+            if tuple(self.root.glob(".named-lane-launch-*")):
+                raise OSError("synthetic persistent launch snapshot fstat failure")
+            return real_fstat(descriptor)
+
+        retained: pathlib.Path | None = None
+        try:
+            with (
+                mock.patch.object(
+                    named_lane_runtime.os,
+                    "fstat",
+                    side_effect=fail_snapshot_fstat,
+                ),
+                self.assertRaisesRegex(
+                    NamedLaneGuardError,
+                    "cleanup cannot bind the retained path",
+                ) as context,
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "persistent-snapshot-fstat.out",
+                    stderr_path=self.root / "persistent-snapshot-fstat.err",
+                    command=(str(executable),),
+                    preflight_result=self.preflight_result_path(executable),
+                    prompt=b"",
+                    timeout_seconds=5.0,
+                    stream_limit_bytes=64,
+                )
+            retained_paths = tuple(self.root.glob(".named-lane-launch-*"))
+            self.assertEqual(len(retained_paths), 1)
+            retained = retained_paths[0]
+            self.assertIn(str(retained), str(context.exception))
+        finally:
+            if retained is not None:
+                retained.unlink(missing_ok=True)
+
+    def test_launch_snapshot_rehash_obeys_the_shared_deadline(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("pass\n")
+        real_remaining = named_lane_runtime._remaining_deadline_seconds
+        snapshot_checks = 0
+
+        def expire_during_rehash(deadline: float, label: str) -> float:
+            nonlocal snapshot_checks
+            if label == "Claude executable snapshot":
+                snapshot_checks += 1
+                if snapshot_checks == 3:
+                    raise ReviewTimeoutError("synthetic rehash deadline")
+            return real_remaining(deadline, label)
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_remaining_deadline_seconds",
+                side_effect=expire_during_rehash,
+            ),
+            self.assertRaisesRegex(ReviewTimeoutError, "rehash deadline"),
+        ):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=self.root / "rehash-deadline.out",
+                stderr_path=self.root / "rehash-deadline.err",
+                command=(str(executable),),
+                preflight_result=self.preflight_result_path(executable),
+                prompt=b"",
+                timeout_seconds=5.0,
+                stream_limit_bytes=64,
+            )
+
+        self.assertEqual(snapshot_checks, 3)
+        self.assertEqual(tuple(self.root.glob(".named-lane-*")), ())
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "launch snapshot signal transaction requires POSIX pthread_sigmask",
+    )
+    def test_launch_snapshot_handoff_signal_removes_snapshot(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("pass\n")
+        real_restore = named_lane_runtime.restore_signal_mask
+        restore_calls = 0
+
+        def interrupt_first_restore(previous: object) -> None:
+            nonlocal restore_calls
+            restore_calls += 1
+            real_restore(previous)
+            if restore_calls == 1:
+                raise ForwardedSignal(signal.SIGTERM)
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "restore_signal_mask",
+                side_effect=interrupt_first_restore,
+            ),
+            self.assertRaises(ForwardedSignal),
+        ):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=self.root / "snapshot-handoff.out",
+                stderr_path=self.root / "snapshot-handoff.err",
+                command=(str(executable),),
+                preflight_result=self.preflight_result_path(executable),
+                prompt=b"",
+                timeout_seconds=5.0,
+                stream_limit_bytes=64,
+            )
+
+        self.assertGreaterEqual(restore_calls, 2)
+        self.assertEqual(tuple(self.root.glob(".named-lane-*")), ())
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "launch snapshot signal transaction requires POSIX pthread_sigmask",
+    )
+    def test_launch_snapshot_cleanup_defers_pending_signal_after_removal(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("print('captured')\n")
+        real_restore = named_lane_runtime.restore_signal_mask
+        restore_calls = 0
+
+        def interrupt_cleanup_restore(previous: object) -> None:
+            nonlocal restore_calls
+            restore_calls += 1
+            real_restore(previous)
+            if restore_calls == 2:
+                raise ForwardedSignal(signal.SIGINT)
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "restore_signal_mask",
+                side_effect=interrupt_cleanup_restore,
+            ),
+            self.assertRaises(ForwardedSignal) as context,
+        ):
+            run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=self.root / "cleanup-signal.out",
+                stderr_path=self.root / "cleanup-signal.err",
+                command=(str(executable),),
+                preflight_result=self.preflight_result_path(executable),
+                prompt=b"",
+                timeout_seconds=5.0,
+                stream_limit_bytes=64,
+            )
+
+        self.assertEqual(context.exception.signum, signal.SIGINT)
+        self.assertEqual(restore_calls, 2)
+        self.assertEqual(tuple(self.root.glob(".named-lane-*")), ())
+        self.assertFalse((self.root / "cleanup-signal.out").exists())
+        self.assertFalse((self.root / "cleanup-signal.err").exists())
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "launch snapshot signal transaction requires POSIX pthread_sigmask",
+    )
+    def test_launch_snapshot_cleanup_failure_records_pending_signal_reason(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("pass\n")
+        real_restore = named_lane_runtime.restore_signal_mask
+        restore_calls = 0
+        retained: pathlib.Path | None = None
+
+        def interrupt_cleanup_restore(previous: object) -> None:
+            nonlocal restore_calls
+            restore_calls += 1
+            real_restore(previous)
+            if restore_calls == 2:
+                raise ForwardedSignal(signal.SIGTERM)
+
+        def fail_cleanup(snapshot: object, _target: object) -> None:
+            nonlocal retained
+            retained = snapshot.path
+            raise OSError("synthetic snapshot cleanup failure")
+
+        try:
+            with (
+                mock.patch.object(
+                    named_lane_runtime,
+                    "restore_signal_mask",
+                    side_effect=interrupt_cleanup_restore,
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_cleanup_claude_launch_snapshot",
+                    side_effect=fail_cleanup,
+                ),
+                self.assertRaises(
+                    named_lane_runtime._ClaudeLaunchSnapshotCleanupError
+                ) as context,
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "cleanup-signal-failure.out",
+                    stderr_path=self.root / "cleanup-signal-failure.err",
+                    command=(str(executable),),
+                    preflight_result=self.preflight_result_path(executable),
+                    prompt=b"",
+                    timeout_seconds=5.0,
+                    stream_limit_bytes=64,
+                )
+            self.assertEqual(context.exception.process_reason, "forwarded-signal")
+            self.assertEqual(context.exception.retained_path, retained)
+            self.assertIsNotNone(retained)
+            self.assertTrue(retained.exists())
+        finally:
+            if retained is not None:
+                retained.unlink(missing_ok=True)
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "launch snapshot signal transaction requires POSIX pthread_sigmask",
+    )
+    def test_launch_snapshot_cleanup_mask_restore_retries_and_clears_capture(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("print('captured')\n")
+        real_restore = named_lane_runtime.restore_signal_mask
+        real_capture = named_lane_runtime.run_bounded_capture
+        restore_calls = 0
+        process_capture: object | None = None
+        initial_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+        def fail_cleanup_restores(previous: object) -> None:
+            nonlocal restore_calls
+            restore_calls += 1
+            if restore_calls == 1:
+                real_restore(previous)
+            else:
+                raise OSError("synthetic persistent mask restore failure")
+
+        def retain_process_capture(argv: object, **kwargs: object) -> object:
+            nonlocal process_capture
+            result = real_capture(argv, **kwargs)
+            if str(tuple(argv)[0]).startswith(str(self.root / ".named-lane-launch-")):
+                process_capture = result
+            return result
+
+        mask_after_failure: set[signal.Signals] | None = None
+        try:
+            with (
+                mock.patch.object(
+                    named_lane_runtime,
+                    "restore_signal_mask",
+                    side_effect=fail_cleanup_restores,
+                ),
+                mock.patch.object(
+                    named_lane_runtime,
+                    "run_bounded_capture",
+                    side_effect=retain_process_capture,
+                ),
+                self.assertRaisesRegex(
+                    NamedLaneGuardError,
+                    "signal mask could not be restored",
+                ),
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "cleanup-mask.out",
+                    stderr_path=self.root / "cleanup-mask.err",
+                    command=(str(executable),),
+                    preflight_result=self.preflight_result_path(executable),
+                    prompt=b"",
+                    timeout_seconds=5.0,
+                    stream_limit_bytes=64,
+                )
+        finally:
+            mask_after_failure = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            real_restore(initial_mask)
+
+        self.assertEqual(restore_calls, 3)
+        self.assertTrue(
+            set(named_lane_runtime.forwarded_signals()).issubset(mask_after_failure)
+        )
+        self.assertEqual(
+            signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+            initial_mask,
+        )
+        self.assertIsNotNone(process_capture)
+        self.assertGreater(len(process_capture.stdout), 0)
+        self.assertFalse(any(process_capture.stdout))
+        self.assertFalse(any(process_capture.stderr))
+        self.assertEqual(tuple(self.root.glob(".named-lane-*")), ())
+        self.assertFalse((self.root / "cleanup-mask.out").exists())
+        self.assertFalse((self.root / "cleanup-mask.err").exists())
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "launch snapshot signal transaction requires POSIX pthread_sigmask",
+    )
+    def test_launch_snapshot_cleanup_mask_restore_retries_true_oserror(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("print('captured')\n")
+        real_restore = named_lane_runtime.restore_signal_mask
+        restore_calls = 0
+
+        def fail_first_cleanup_restore(previous: object) -> None:
+            nonlocal restore_calls
+            restore_calls += 1
+            if restore_calls == 2:
+                raise OSError("synthetic first mask restore failure")
+            real_restore(previous)
+
+        with mock.patch.object(
+            named_lane_runtime,
+            "restore_signal_mask",
+            side_effect=fail_first_cleanup_restore,
+        ):
+            result = run_claude(
+                worktree=self.repo.resolve(),
+                stdout_path=self.root / "cleanup-mask-retry.out",
+                stderr_path=self.root / "cleanup-mask-retry.err",
+                command=(str(executable),),
+                preflight_result=self.preflight_result_path(executable),
+                prompt=b"",
+                timeout_seconds=5.0,
+                stream_limit_bytes=64,
+            )
+
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(restore_calls, 5)
+        self.assertEqual(
+            (self.root / "cleanup-mask-retry.out").read_text(encoding="utf-8"),
+            "captured\n",
+        )
+        self.assertEqual(tuple(self.root.glob(".named-lane-*")), ())
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(signal, "pthread_sigmask"),
+        "launch snapshot signal transaction requires POSIX pthread_sigmask",
+    )
+    def test_launch_snapshot_cleanup_mask_restore_preserves_control_flow(self) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("print('captured')\n")
+        real_restore = named_lane_runtime.restore_signal_mask
+
+        for label, control_error in (
+            ("keyboard", KeyboardInterrupt()),
+            ("system-exit", SystemExit(23)),
+        ):
+            with self.subTest(label=label):
+                restore_calls = 0
+
+                def interrupt_cleanup_restore(previous: object) -> None:
+                    nonlocal restore_calls
+                    restore_calls += 1
+                    real_restore(previous)
+                    if restore_calls == 2:
+                        raise control_error
+
+                with (
+                    mock.patch.object(
+                        named_lane_runtime,
+                        "restore_signal_mask",
+                        side_effect=interrupt_cleanup_restore,
+                    ),
+                    self.assertRaises(type(control_error)) as context,
+                ):
+                    run_claude(
+                        worktree=self.repo.resolve(),
+                        stdout_path=self.root / f"cleanup-{label}.out",
+                        stderr_path=self.root / f"cleanup-{label}.err",
+                        command=(str(executable),),
+                        preflight_result=self.preflight_result_path(executable),
+                        prompt=b"",
+                        timeout_seconds=5.0,
+                        stream_limit_bytes=64,
+                    )
+
+                self.assertIs(context.exception, control_error)
+                self.assertEqual(restore_calls, 3)
+                self.assertEqual(tuple(self.root.glob(".named-lane-*")), ())
+                self.assertFalse((self.root / f"cleanup-{label}.out").exists())
+                self.assertFalse((self.root / f"cleanup-{label}.err").exists())
+
+    def test_post_run_snapshot_cleanup_failure_reports_complete_and_path(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable("pass\n")
+        retained: pathlib.Path | None = None
+
+        def fail_cleanup(
+            snapshot: object,
+            _target: object,
+        ) -> None:
+            nonlocal retained
+            retained = snapshot.path
+            raise OSError("synthetic snapshot cleanup failure")
+
+        try:
+            with (
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_cleanup_claude_launch_snapshot",
+                    side_effect=fail_cleanup,
+                ),
+                self.assertRaises(
+                    named_lane_runtime._ClaudeLaunchSnapshotCleanupError
+                ) as context,
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "cleanup-complete.out",
+                    stderr_path=self.root / "cleanup-complete.err",
+                    command=(str(executable),),
+                    preflight_result=self.preflight_result_path(executable),
+                    prompt=b"",
+                    timeout_seconds=5.0,
+                    stream_limit_bytes=64,
+                )
+            self.assertEqual(context.exception.process_reason, "complete")
+            self.assertEqual(context.exception.retained_path, retained)
+            self.assertIsNotNone(retained)
+            self.assertTrue(retained.exists())
+            self.assertIn(str(retained), str(context.exception))
+            self.assertFalse((self.root / "cleanup-complete.out").exists())
+            self.assertFalse((self.root / "cleanup-complete.err").exists())
+        finally:
+            if retained is not None:
+                retained.unlink(missing_ok=True)
+
+    def test_post_run_snapshot_cleanup_failure_preserves_deadline_reason(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        executable = self.make_executable(
+            "import time\nwhile True:\n    time.sleep(0.05)\n"
+        )
+        retained: pathlib.Path | None = None
+
+        def fail_cleanup(
+            snapshot: object,
+            _target: object,
+        ) -> None:
+            nonlocal retained
+            retained = snapshot.path
+            raise OSError("synthetic snapshot cleanup failure")
+
+        try:
+            with (
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_cleanup_claude_launch_snapshot",
+                    side_effect=fail_cleanup,
+                ),
+                self.assertRaises(
+                    named_lane_runtime._ClaudeLaunchSnapshotCleanupError
+                ) as context,
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=self.root / "cleanup-deadline.out",
+                    stderr_path=self.root / "cleanup-deadline.err",
+                    command=(str(executable),),
+                    preflight_result=self.preflight_result_path(executable),
+                    prompt=b"",
+                    timeout_seconds=0.1,
+                    stream_limit_bytes=64,
+                )
+            self.assertEqual(context.exception.process_reason, "deadline")
+            self.assertEqual(context.exception.retained_path, retained)
+            self.assertIsNotNone(retained)
+            self.assertTrue(retained.exists())
+        finally:
+            if retained is not None:
+                retained.unlink(missing_ok=True)
 
     @unittest.skipUnless(os.name == "posix", "account environment requires POSIX")
     def test_process_receives_only_the_named_lane_environment_allowlist(
@@ -4404,6 +5651,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             )
 
         self.assertLess(time.monotonic() - started, 3.0)
+        self.assertEqual(tuple(self.root.glob(".named-lane-*")), ())
 
     @unittest.skipUnless(os.name == "posix", "detached-process test requires POSIX")
     def test_process_supervisor_does_not_claim_detached_tree_containment(
@@ -4595,6 +5843,7 @@ class NamedLaneGuardTest(unittest.TestCase):
 
         self.assertFalse((output_parent / "stdout").exists())
         self.assertFalse((output_parent / "stderr").exists())
+        self.assertEqual(tuple(output_parent.glob(".named-lane-launch-*")), ())
 
     def test_process_anchors_outputs_if_parent_is_replaced_after_launch(
         self,
@@ -4637,6 +5886,85 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertFalse((self.repo / "stderr.bin").exists())
         self.assertFalse((displaced_parent / "stdout.bin").exists())
         self.assertFalse((displaced_parent / "stderr.bin").exists())
+        self.assertEqual(
+            tuple(displaced_parent.glob(".named-lane-launch-*")),
+            (),
+        )
+
+    def test_snapshot_cleanup_reports_descriptor_locator_after_parent_move(
+        self,
+    ) -> None:
+        (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
+        self.commit()
+        output_parent = self.root / "locator-outputs"
+        displaced_parent = self.root / "locator-outputs-displaced"
+        output_parent.mkdir(mode=0o700)
+        output_parent.chmod(0o700)
+        executable = self.make_executable(
+            "import os, pathlib, sys\n"
+            "parent = pathlib.Path(sys.argv[1])\n"
+            "displaced = pathlib.Path(sys.argv[2])\n"
+            "redirect = pathlib.Path(sys.argv[3])\n"
+            "os.rename(parent, displaced)\n"
+            "os.symlink(redirect, parent, target_is_directory=True)\n"
+        )
+        real_unlink = named_lane_runtime._unlink_output_if_observed_same
+
+        def fail_snapshot_cleanup(
+            target: object,
+            name: str,
+            identity: tuple[int, int],
+            *,
+            label: str,
+        ) -> None:
+            if label == "Claude launch snapshot":
+                raise NamedLaneGuardError("synthetic snapshot cleanup failure")
+            real_unlink(target, name, identity, label=label)
+
+        retained: pathlib.Path | None = None
+        try:
+            with (
+                mock.patch.object(
+                    named_lane_runtime,
+                    "_unlink_output_if_observed_same",
+                    side_effect=fail_snapshot_cleanup,
+                ),
+                self.assertRaises(
+                    named_lane_runtime._ClaudeLaunchSnapshotCleanupError
+                ) as context,
+            ):
+                run_claude(
+                    worktree=self.repo.resolve(),
+                    stdout_path=output_parent / "stdout.bin",
+                    stderr_path=output_parent / "stderr.bin",
+                    command=(
+                        str(executable),
+                        str(output_parent),
+                        str(displaced_parent),
+                        str(self.repo),
+                    ),
+                    prompt=b"",
+                    timeout_seconds=2.0,
+                    stream_limit_bytes=64,
+                )
+
+            error = context.exception
+            displaced_metadata = displaced_parent.stat()
+            self.assertIsNone(error.retained_path)
+            self.assertEqual(error.process_reason, "complete")
+            self.assertEqual(
+                error.retained_parent_identity,
+                (displaced_metadata.st_dev, displaced_metadata.st_ino),
+            )
+            self.assertIsNotNone(error.retained_leaf)
+            retained = displaced_parent / error.retained_leaf
+            self.assertTrue(retained.exists())
+        finally:
+            if retained is not None:
+                retained.unlink(missing_ok=True)
+
+        self.assertFalse((self.repo / "stdout.bin").exists())
+        self.assertFalse((self.repo / "stderr.bin").exists())
 
     def test_output_temp_cleanup_failure_rolls_back_published_leaf(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
@@ -4657,6 +5985,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 not failed_once
                 and isinstance(path, str)
                 and path.startswith(".named-lane-")
+                and not path.startswith(".named-lane-launch-")
             ):
                 failed_once = True
                 raise OSError("synthetic temporary cleanup failure")
@@ -4675,7 +6004,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     stderr_path=stderr,
                     command=(str(executable),),
                     prompt=b"",
-                    timeout_seconds=2.0,
+                    timeout_seconds=5.0,
                     stream_limit_bytes=64,
                 )
 
@@ -4695,7 +6024,12 @@ class NamedLaneGuardTest(unittest.TestCase):
 
         def fail_temporary_fstat(descriptor: int) -> os.stat_result:
             nonlocal failed_once
-            if not failed_once and list(self.root.glob(".named-lane-*")):
+            output_temporaries = tuple(
+                path
+                for path in self.root.glob(".named-lane-*")
+                if not path.name.startswith(".named-lane-launch-")
+            )
+            if not failed_once and output_temporaries:
                 failed_once = True
                 raise OSError("synthetic temporary fstat failure")
             return real_fstat(descriptor)
@@ -4715,7 +6049,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     stderr_path=stderr,
                     command=(str(executable),),
                     prompt=b"",
-                    timeout_seconds=2.0,
+                    timeout_seconds=5.0,
                     stream_limit_bytes=64,
                 )
 
@@ -4858,7 +6192,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(raised.exception.signum, signal.SIGINT)
         self.assertFalse(stdout.exists())
         self.assertFalse(stderr.exists())
-        restore.assert_called_once_with(set())
+        self.assertEqual(restore.call_args_list, [mock.call(set())] * 3)
 
     def test_keyboard_interrupt_rolls_back_first_published_output(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")
@@ -4927,11 +6261,11 @@ class NamedLaneGuardTest(unittest.TestCase):
                 self.assertEqual(stderr.read_bytes(), b"captured stderr")
             return None
 
-        def interrupt_first_restore(mask: set[signal.Signals]) -> None:
+        def interrupt_publication_restore(mask: set[signal.Signals]) -> None:
             nonlocal restore_calls
             restore_calls += 1
             real_restore(mask)
-            if restore_calls == 1:
+            if restore_calls == 3:
                 temporary_handler = signal.getsignal(signal.SIGINT)
                 self.assertIsNot(temporary_handler, previous_handler)
                 self.assertTrue(callable(temporary_handler))
@@ -4946,7 +6280,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             mock.patch.object(
                 named_lane_runtime,
                 "restore_signal_mask",
-                side_effect=interrupt_first_restore,
+                side_effect=interrupt_publication_restore,
             ),
         ):
             with self.assertRaises(ForwardedSignal) as raised:
@@ -4962,7 +6296,7 @@ class NamedLaneGuardTest(unittest.TestCase):
 
         self.assertEqual(raised.exception.signum, signal.SIGINT)
         self.assertGreaterEqual(consume_calls, 2)
-        self.assertEqual(restore_calls, 2)
+        self.assertEqual(restore_calls, 4)
         self.assertFalse(stdout.exists())
         self.assertFalse(stderr.exists())
         self.assertEqual(signal.getsignal(signal.SIGINT), previous_handler)
@@ -5041,6 +6375,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 not failed_once
                 and isinstance(path, str)
                 and path.startswith(".named-lane-")
+                and not path.startswith(".named-lane-launch-")
             ):
                 failed_once = True
                 os.replace(replacement, stdout)
@@ -5085,6 +6420,8 @@ class NamedLaneGuardTest(unittest.TestCase):
                 "run-claude",
                 "--worktree",
                 str(self.repo.resolve()),
+                "--preflight-result",
+                str(self.preflight_result_path(executable)),
                 "--stdout-path",
                 str(stdout_path),
                 "--stderr-path",
@@ -5140,6 +6477,8 @@ class NamedLaneGuardTest(unittest.TestCase):
             "run-claude",
             "--worktree",
             str(self.repo.resolve()),
+            "--preflight-result",
+            str(self.root / "unused-prompt-signal-preflight.json"),
             "--stdout-path",
             str(self.root / "prompt-signal.stdout"),
             "--stderr-path",
@@ -5219,6 +6558,8 @@ class NamedLaneGuardTest(unittest.TestCase):
                     "run-claude",
                     "--worktree",
                     str(self.repo.resolve()),
+                    "--preflight-result",
+                    str(self.root / "unused-prompt-budget-preflight.json"),
                     "--stdout-path",
                     str(self.root / "prompt-budget.stdout"),
                     "--stderr-path",
@@ -5234,6 +6575,10 @@ class NamedLaneGuardTest(unittest.TestCase):
         emit.assert_called_once_with(result)
         self.assertEqual(prompt_read.call_args.args[1:], (256 * 1024, 105.0))
         self.assertEqual(run.call_args.kwargs["prompt"], b"review")
+        self.assertEqual(
+            run.call_args.kwargs["preflight_result"],
+            self.root / "unused-prompt-budget-preflight.json",
+        )
         self.assertEqual(run.call_args.kwargs["timeout_seconds"], 3.5)
         self.assertEqual(run.call_args.kwargs["deadline_monotonic"], 105.0)
 
@@ -5319,6 +6664,8 @@ class NamedLaneGuardTest(unittest.TestCase):
                     "run-claude",
                     "--worktree",
                     str(self.repo.resolve()),
+                    "--preflight-result",
+                    str(self.root / f"unused-{label}-cap-preflight.json"),
                     "--stdout-path",
                     str(self.root / f"{label}-cap.stdout"),
                     "--stderr-path",
@@ -5422,6 +6769,105 @@ class NamedLaneGuardTest(unittest.TestCase):
             named_lane_runtime.DEFAULT_PROMPT_LIMIT_BYTES,
         )
 
+    def test_cli_reports_snapshot_cleanup_path_and_process_reason(self) -> None:
+        retained = self.root / ".named-lane-launch-retained"
+        stderr = io.StringIO()
+        error = named_lane_runtime._ClaudeLaunchSnapshotCleanupError(
+            retained,
+            "deadline",
+        )
+        argv = (
+            "run-claude",
+            "--worktree",
+            str(self.repo.resolve()),
+            "--preflight-result",
+            str(self.root / "unused-cleanup-preflight.json"),
+            "--stdout-path",
+            str(self.root / "unused-cleanup.stdout"),
+            "--stderr-path",
+            str(self.root / "unused-cleanup.stderr"),
+            "--",
+            "/usr/bin/false",
+        )
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_read_control_prompt",
+                return_value=b"",
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "run_claude",
+                side_effect=error,
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(argv)
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(
+            json.loads(stderr.getvalue()),
+            {
+                "status": "inconclusive",
+                "reason": "snapshot-cleanup",
+                "process_reason": "deadline",
+                "retained_path": str(retained),
+            },
+        )
+
+    def test_cli_reports_descriptor_bound_snapshot_cleanup_locator(self) -> None:
+        stderr = io.StringIO()
+        error = named_lane_runtime._ClaudeLaunchSnapshotCleanupError(
+            None,
+            "complete",
+            retained_parent_identity=(23, 47),
+            retained_leaf=".named-lane-launch-retained",
+        )
+        argv = (
+            "run-claude",
+            "--worktree",
+            str(self.repo.resolve()),
+            "--preflight-result",
+            str(self.root / "unused-locator-preflight.json"),
+            "--stdout-path",
+            str(self.root / "unused-locator.stdout"),
+            "--stderr-path",
+            str(self.root / "unused-locator.stderr"),
+            "--",
+            "/usr/bin/false",
+        )
+
+        with (
+            mock.patch.object(
+                named_lane_runtime,
+                "_read_control_prompt",
+                return_value=b"",
+            ),
+            mock.patch.object(
+                named_lane_runtime,
+                "run_claude",
+                side_effect=error,
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = named_lane_main(argv)
+
+        self.assertEqual(returncode, 2)
+        self.assertEqual(
+            json.loads(stderr.getvalue()),
+            {
+                "status": "inconclusive",
+                "reason": "snapshot-cleanup",
+                "process_reason": "complete",
+                "retained_locator": {
+                    "parent_device": 23,
+                    "parent_inode": 47,
+                    "leaf": ".named-lane-launch-retained",
+                },
+            },
+        )
+
     def test_cli_classifies_bounded_failures_by_subcommand(self) -> None:
         cases = (
             ("deadline", lambda: ReviewTimeoutError("deadline"), 2),
@@ -5470,6 +6916,8 @@ class NamedLaneGuardTest(unittest.TestCase):
                     "run-claude",
                     "--worktree",
                     str(self.repo.resolve()),
+                    "--preflight-result",
+                    str(self.root / "unused-classification-preflight.json"),
                     "--stdout-path",
                     str(self.root / "stdout"),
                     "--stderr-path",
@@ -5540,6 +6988,8 @@ class NamedLaneGuardTest(unittest.TestCase):
                     "run-claude",
                     "--worktree",
                     str(self.repo.resolve()),
+                    "--preflight-result",
+                    str(self.preflight_result_path(executable)),
                     "--stdout-path",
                     str(self.root / "thread-start.stdout"),
                     "--stderr-path",

@@ -4,7 +4,8 @@ This document primarily defines the trust and compatibility contract enforced
 by the low-level Claude Code runtime used by `isolated_review`. A documented
 platform or version is supported only when every applicable gate below passes.
 The canonical named-double lane has the trusted `named_lane_guard run-claude`
-supervisor launch actual Claude Code as its direct child under
+supervisor bind accepted publisher evidence to a private verified snapshot of
+the actual Claude Code bytes and launch that snapshot as its direct child under
 [canonical-claude-lane.md](canonical-claude-lane.md); it reuses applicable
 publisher-verification primitives, native-sandbox boundary, and failure
 vocabulary here, but never the helper's
@@ -32,13 +33,35 @@ guarded writeback, recovery, or prompt contract.
 The direct canonical lane and the low-level helper are separate launch paths.
 For named double/triple review, follow `canonical-claude-lane.md`: use a clean
 Git worktree, no prepared diff, explicit tracked guidance reads, and a fresh
-`claude` process launched as the trusted supervisor's direct child. Its **Canonical Executable Provenance** section owns the
-direct lane's complete executable contract: verify the installed file against
-the signed release manifest, revalidate that exact resolved path immediately
-before and after launch, and do not create a helper snapshot. Sections below
+`claude` process launched from the trusted supervisor's guard-created snapshot.
+Its **Canonical Executable Provenance** section owns the direct lane's complete
+executable contract: verify the installed source against the signed release
+manifest, persist the accepted parent-private preflight result, pass it through
+mandatory `--preflight-result`, and let
+`run-claude` copy the matching source from an opened no-follow descriptor into a
+private mode-`0500` snapshot after the relevant identity/policy plus signed
+size/SHA-256 checks. Launch identity intentionally excludes `mtime`, `ctime`,
+and `nlink`, so benign churn in those fields is accepted. The snapshot bytes,
+not the mutable raw source path, are executed; replacement of that raw path
+after binding cannot change the launched bytes, and no parent before/after
+raw-path check is required. The process receipt records this as
+`launch_binding.mode: verified-snapshot`. Snapshot copy and full rehash share
+the lane's monotonic deadline. Snapshot creation/handoff and later cleanup are
+separate forwarded-signal-masked critical sections; between them the bounded
+supervisor owns structured signal forwarding and process cleanup. An incomplete
+cleanup is structured `inconclusive` / `snapshot-cleanup` evidence with exact
+`process_reason` plus either exact `retained_path` while the lexical output-parent
+binding is revalidated or descriptor-bound `retained_locator` device/inode/leaf
+evidence after lexical drift; no output is published. Cleanup uses the retained
+output-parent descriptor and recorded leaf identity, while lexical parent
+revalidation remains an output-publication gate. Before stream validation, the parent
+compares that receipt's preflight SHA-256, source identity/path, and signed
+artifact size/SHA-256 with the accepted launch binding. The validator separately
+rereads the preflight result and does not consume `launch_binding`. Sections below
 that describe executable snapshots or dependency closures, `.git`-free
 materialization, supplied-diff prompts, helper-private credential carriers, or
-helper-owned outer sandboxes remain helper-only and cannot make an
+helper-owned outer sandboxes remain helper-only: the canonical launch snapshot
+does not confer those guarantees and cannot make an
 `isolated_review` artifact count as the canonical lane.
 
 The canonical lane's machine control path is also separate from the env-shebang

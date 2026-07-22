@@ -1575,7 +1575,7 @@ class RepositoryContractTest(unittest.TestCase):
             "exact `.git` marker",
             "bounded full object-validity `git fsck`",
             "no `commondir`, `config.worktree`, per-worktree config",
-            "alternate, HTTP-alternate, shallow, sparse, promisor, or bitmap state",
+            "alternate, HTTP-alternate, shallow, sparse, promisor, or pack `.bitmap` state",
             "executable clean/smudge/process filter",
             "The guard's forced ordinary/staged status is the first status query",
             "recorded device, inode, and owner",
@@ -1592,6 +1592,93 @@ class RepositoryContractTest(unittest.TestCase):
             "Before launch, require `git status --porcelain`",
             contracts,
         )
+
+    def test_named_lane_source_marker_bitmap_and_path_envelope_contracts(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("device, inode, file type, and owner", skill)
+        self.assertIn("(st_dev, st_ino, file type, st_uid)", contracts)
+        self.assertIn("device/inode/type/owner", canonical)
+        for content in (skill, contracts, canonical):
+            for anchor in (
+                "forward `gitdir:` target",
+                "back-pointer",
+                "`mtime`",
+                "`ctime`",
+                "`nlink`",
+                "benign churn",
+                "source pack `.bitmap`",
+                "--no-use-bitmap-index",
+                "100,000",
+                "64 MiB",
+                "SHA-1",
+                "SHA-256",
+                "`ls-tree`",
+                "`ls-files`",
+                "`status`",
+            ):
+                with self.subTest(anchor=anchor):
+                    self.assertIn(anchor, content)
+        self.assertIn("producer-output bound", contracts)
+        self.assertIn("not a claim", contracts)
+        self.assertIn("producer-output bound", canonical)
+
+        marker_binding = runtime.split(
+            "class _MaterializerSourceMarkerBinding:", 1
+        )[1].split("@dataclass", 1)[0]
+        for field in ("device", "inode", "file_type", "owner", "is_gitfile"):
+            self.assertIn(f"{field}:", marker_binding)
+        for excluded in ("mtime", "ctime", "nlink", "digest"):
+            self.assertNotIn(excluded, marker_binding)
+        self.assertIn("_read_materializer_gitfile_admin(binding.path, source)", runtime)
+        self.assertIn('label="Git admin back-pointer"', runtime)
+        self.assertIn("if back_pointer != marker:", runtime)
+        self.assertIn('| getattr(os, "O_NONBLOCK", 0)', runtime)
+        self.assertIn(
+            "_verify_materializer_source_back_pointer(storage.marker, storage.admin)",
+            runtime,
+        )
+        self.assertIn('folded_name.endswith(".bitmap")', runtime)
+        self.assertIn('"--no-use-bitmap-index"', runtime)
+        self.assertIn(
+            "return MATERIALIZER_CHECKOUT_PATH_BYTES_LIMIT + (",
+            runtime,
+        )
+        self.assertIn(
+            "MATERIALIZER_CHECKOUT_ENTRY_COUNT_LIMIT * (oid_length + 16)",
+            runtime,
+        )
+        self.assertEqual(
+            runtime.count("_checkout_tree_output_limit(len(frozen_head))"),
+            4,
+        )
+        self.assertIn("output_limit = _checkout_tree_output_limit(oid_length)", runtime)
+
+        if CI_PROFILE == "canonical":
+            journal = (
+                REPO_ROOT
+                / "docs/project_journal/2026/07/"
+                / "2026-07-21-named-lane-review-guards-rpf001.md"
+            ).read_text(encoding="utf-8")
+            for anchor in (
+                "forward `gitdir:` target",
+                "`nlink`",
+                "--no-use-bitmap-index",
+                "100,000-entry",
+                "SHA-1 or SHA-256",
+            ):
+                self.assertIn(anchor, journal)
 
     def test_review_scope_and_github_provider_identity_are_fail_closed(
         self,
@@ -3463,8 +3550,8 @@ class RepositoryContractTest(unittest.TestCase):
             "trusted bundle digest binds",
             "selects and publisher-verifies",
             "final clean/safety launch gate",
-            "launches the exact preflight-selected",
-            "runs only after successful supervision cleanup",
+            "launches that snapshot as its direct child",
+            "runs only after that parent receipt comparison",
         )
         positions = [boundaries.index(anchor) for anchor in ordered_controls]
         self.assertEqual(positions, sorted(positions))
@@ -4168,31 +4255,116 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("user-writable npm/NVM directory", canonical)
         self.assertIn("does not establish publisher provenance", canonical)
 
-    def test_canonical_claude_provenance_is_direct_not_helper_snapshot(self) -> None:
+    def test_canonical_claude_launch_uses_preflight_bound_verified_snapshot(
+        self,
+    ) -> None:
         canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
             encoding="utf-8"
         )
-        runtime = (SKILL_ROOT / "references/claude-runtime-trust.md").read_text(
+        runtime_trust = (SKILL_ROOT / "references/claude-runtime-trust.md").read_text(
             encoding="utf-8"
         )
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        implementation = (SCRIPTS / "review_runtime/named_lane.py").read_text(
+            encoding="utf-8"
+        )
 
+        for content in (skill, contracts, canonical, runtime_trust):
+            for anchor in (
+                "--preflight-result",
+                "verified-snapshot",
+                "`mtime`",
+                "`ctime`",
+                "`nlink`",
+                "benign churn",
+                "raw source path",
+                "forwarded-signal-masked",
+                "snapshot-cleanup",
+                "`process_reason`",
+                "`retained_path`",
+                "`retained_locator`",
+            ):
+                with self.subTest(anchor=anchor):
+                    self.assertIn(anchor, content)
         for anchor in (
             "## Canonical Executable Provenance",
-            "one resolved path accepted by the selection preflight",
-            "fixed credential-free environment",
-            "`>=2.1.211,<3.0.0`",
             "fixed Anthropic release-signing key",
-            "signed per-version manifest",
-            "`verify_claude_release` or equivalent checks",
-            "immediately before launch",
-            "revalidate it again after process completion",
-            "does not call `snapshot_verified_claude_executable`",
-            "do not claim the stronger immutability of the helper snapshot",
+            "signed manifest",
+            "guard-created verified snapshot",
+            "opened source descriptor",
+            "single-link mode-`0500` snapshot",
+            "cannot alter the executed bytes",
+            "without claiming the raw host path itself ran or requiring parent before/after raw-path checks",
+            "`launch_binding`",
+            "preflight SHA-256",
+            "signed artifact size/SHA-256",
         ):
             self.assertIn(anchor, canonical)
-        self.assertIn("do not create a helper snapshot", runtime)
-        self.assertIn("For the low-level helper, after the signed manifest", runtime)
+        self.assertIn("Before invoking `validate-claude-stream`", skill)
+        self.assertIn("Before stream validation", contracts)
+        self.assertIn("Before invoking the stream validator", canonical)
+        self.assertIn("Before stream validation", runtime_trust)
+        for content in (skill, contracts, canonical, runtime_trust):
+            self.assertIn("does not consume", content)
+            self.assertNotIn("source descriptor open through process spawn", content)
+            self.assertNotIn("snapshot descriptor open through process spawn", content)
+        for content in (skill, contracts, canonical):
+            for field in (
+                "preflight_sha256",
+                "resolved_path",
+                "identity",
+                "artifact_sha256",
+                "artifact_size",
+            ):
+                with self.subTest(field=field):
+                    self.assertIn(field, content)
+        self.assertNotIn(
+            "revalidate that exact resolved path immediately before and after launch",
+            runtime_trust,
+        )
+        self.assertNotIn(
+            "uses the revalidated host-installed executable path for the actual",
+            canonical,
+        )
+
+        self.assertIn(
+            'claude.add_argument("--preflight-result", required=True)',
+            implementation,
+        )
+        self.assertIn("_read_claude_preflight_evidence", implementation)
+        self.assertIn("_create_claude_launch_snapshot", implementation)
+        self.assertIn("snapshot_command = (str(snapshot.path)", implementation)
+        self.assertIn("snapshot_mask = block_forwarded_signals()", implementation)
+        self.assertIn("class _ClaudeLaunchSnapshotCleanupError", implementation)
+        self.assertIn('"reason": "snapshot-cleanup"', implementation)
+        self.assertIn("_output_parent_path_names_bound_directory", implementation)
+        self.assertIn('payload["retained_locator"]', implementation)
+        snapshot_creation = implementation.split(
+            "def _create_claude_launch_snapshot(", 1
+        )[1].split("def _cleanup_claude_launch_snapshot(", 1)[0]
+        self.assertEqual(
+            snapshot_creation.count("_remaining_deadline_seconds("),
+            2,
+        )
+        self.assertIn('"mode": "verified-snapshot"', implementation)
+        self.assertIn('"preflight_sha256": binding.preflight_checksum', implementation)
+        self.assertIn('"resolved_path": str(binding.source_path)', implementation)
+        self.assertIn(
+            '"identity": dict(_expected_executable_identity(binding))',
+            implementation,
+        )
+        self.assertIn('"artifact_sha256": binding.artifact_checksum', implementation)
+        self.assertIn('"artifact_size": binding.artifact_size', implementation)
+        expected_identity = implementation.split(
+            "def _expected_executable_identity(", 1
+        )[1].split("def _write_all(", 1)[0]
+        for field in ("device", "inode", "file_type", "mode", "uid", "gid", "size"):
+            self.assertIn(f'"{field}"', expected_identity)
+        for excluded in ("nlink", "mtime", "ctime"):
+            self.assertNotIn(excluded, expected_identity)
         self.assertIn(
             "Follow **Compatible-Version Selection**, **Canonical Executable Provenance**",
             skill,
