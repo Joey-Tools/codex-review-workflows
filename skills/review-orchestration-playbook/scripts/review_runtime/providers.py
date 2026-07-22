@@ -35,8 +35,6 @@ import urllib.request
 from dataclasses import dataclass, field, replace
 from typing import Any, BinaryIO, Callable, Iterable, Iterator, Mapping, TypeVar
 
-import validate_claude_stream as claude_stream_validator
-
 from .claude_capabilities import (
     CLAUDE_REQUIRED_OPTIONS,
     ClaudeCapabilities,
@@ -140,8 +138,24 @@ from .workspace import (
     write_bound_runner_error,
 )
 
-
 _CaptureResult = TypeVar("_CaptureResult")
+
+
+def _load_claude_stream_validator() -> Any:
+    """Load and cache the sibling validator only when a Claude stream needs it."""
+    try:
+        return globals()["claude_stream_validator"]
+    except KeyError:
+        pass
+    validator = importlib.import_module("validate_claude_stream")
+    globals()["claude_stream_validator"] = validator
+    return validator
+
+
+def __getattr__(name: str) -> Any:
+    if name == "claude_stream_validator":
+        return _load_claude_stream_validator()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 _CLAUDE_THREAD_LOCK_FACTORY = threading.Lock
@@ -20552,7 +20566,7 @@ def _validate_claude_stream_handle(
                 "reasons": ["stream.capture-not-regular-file"],
             }
         handle.seek(0)
-        result = claude_stream_validator.validate_claude_stream(
+        result = _load_claude_stream_validator().validate_claude_stream(
             handle,
             host_workspace_cwd=review.workspace_root,
             expected_runtime_cwd=expected_runtime_cwd,
@@ -21867,7 +21881,7 @@ def _resolve_validated_claude_executable(
             if capabilities is not None:
                 try:
                     runtime_bindings[str(candidate.absolute())] = (
-                        claude_stream_validator.runtime_binding_from_verified_executable(
+                        _load_claude_stream_validator().runtime_binding_from_verified_executable(
                             verified,
                             capabilities=capabilities,
                             authentication_source=_claude_authentication_source(

@@ -3,7 +3,9 @@
 This document primarily defines the trust and compatibility contract enforced
 by the low-level Claude Code runtime used by `isolated_review`. A documented
 platform or version is supported only when every applicable gate below passes.
-The canonical named-double lane launches actual Claude Code directly under
+The canonical named-double lane has the trusted `named_lane_guard run-claude`
+supervisor bind accepted publisher evidence to a private verified snapshot of
+the actual Claude Code bytes and launch that snapshot as its direct child under
 [canonical-claude-lane.md](canonical-claude-lane.md); it reuses applicable
 publisher-verification primitives, native-sandbox boundary, and failure
 vocabulary here, but never the helper's
@@ -21,7 +23,7 @@ guarded writeback, recovery, or prompt contract.
 - [Supported Platforms And Outer Sandbox](#supported-platforms-and-outer-sandbox)
 - [Credentials](#credentials)
 - [Runtime Report](#runtime-report)
-- [Failure Classification And Fallback](#failure-classification-and-fallback)
+- [Failure Classification And Low-Level Fallback](#failure-classification-and-low-level-fallback)
 - [Official Sources](#official-sources)
 
 ## Policy Summary
@@ -30,15 +32,87 @@ guarded writeback, recovery, or prompt contract.
 
 The direct canonical lane and the low-level helper are separate launch paths.
 For named double/triple review, follow `canonical-claude-lane.md`: use a clean
-Git worktree, no prepared diff, explicit tracked guidance reads, and a direct
-fresh `claude` process. Its **Canonical Executable Provenance** section owns the
-direct lane's complete executable contract: verify the installed file against
-the signed release manifest, revalidate that exact resolved path immediately
-before and after launch, and do not create a helper snapshot. Sections below
-that describe executable snapshots or dependency closures, supplied-diff/private-
-minimal-Git materialization, helper-private credential carriers, or
-helper-owned outer sandboxes remain helper-only and cannot make an
+detached Git worktree, no prepared diff, explicit tracked guidance reads, and a fresh
+`claude` process launched from the trusted supervisor's guard-created snapshot.
+Its **Canonical Executable Provenance** section owns the direct lane's complete
+executable contract: verify the installed source against the signed release
+manifest, persist the accepted parent-private preflight result, pass it through
+mandatory `--preflight-result`, and let
+`run-claude` copy the matching source from an opened no-follow descriptor into a
+private mode-`0500` snapshot after the relevant identity/policy plus signed
+size/SHA-256 checks. Launch identity intentionally excludes `mtime`, `ctime`,
+and `nlink`, so benign churn in those fields is accepted. The snapshot bytes,
+not the mutable raw source path, are executed; replacement of that raw path
+after binding cannot change the launched bytes, and no parent before/after
+raw-path check is required. The process receipt records this as
+`launch_binding.mode: verified-snapshot`. Snapshot copy and full rehash share
+the lane's monotonic deadline. Snapshot creation/handoff and later cleanup are
+separate forwarded-signal-masked critical sections; between them the bounded
+supervisor owns structured signal forwarding and process cleanup. An incomplete
+cleanup is structured `inconclusive` / `snapshot-cleanup` evidence with exact
+`process_reason` plus either exact `retained_path` while the lexical output-parent
+binding is revalidated or descriptor-bound `retained_locator` device/inode/leaf
+evidence after lexical drift; no output is published. Cleanup uses the retained
+output-parent descriptor and recorded leaf identity, while lexical parent
+revalidation remains an output-publication gate. Output publication, rollback,
+and the complete flushed `launch_binding` receipt share one signal-masked CLI
+commit transaction: a pre-receipt signal or receipt write/flush failure removes
+the output pair, while a post-receipt signal cannot create a false failure.
+Before stream validation, the parent
+compares that receipt's preflight SHA-256, source identity/path, and signed
+artifact size/SHA-256 with the accepted launch binding. The validator separately
+rereads the preflight result and does not consume `launch_binding`. Sections below
+that describe executable snapshots or dependency closures, `.git`-free
+materialization, supplied-diff prompts, helper-private credential carriers, or
+helper-owned outer sandboxes remain helper-only: the canonical launch snapshot
+does not confer those guarantees and cannot make an
 `isolated_review` artifact count as the canonical lane.
+
+The canonical lane's machine control path is also separate from the env-shebang
+compatibility wrappers. Invoke the trusted absolute Python interpreter with
+`-I -B -S` and `named_lane_guard preflight-claude` for compatible-version and provenance selection,
+then `named_lane_guard run-claude` for launch/process supervision, only after
+successful cleanup invoke `named_lane_guard validate-claude-stream` for terminal
+artifact classification, and only after validator acceptance invoke the
+manifest-bound `named_lane_guard classify-review-result` profile for semantic
+disposition. The default guard profile retains its exact three-module raw closure;
+the three additional subcommands select only their declared manifest-bound
+raw-source and companion profiles, including the version-policy, capability,
+stream-compatibility, audited-baseline, closed-profile-schema, and result-classifier
+dependencies. None uses ordinary package import resolution, and launch
+supervision, output validation, and post-acceptance disposition cannot replace one
+another.
+
+The formal preflight does not inherit or trust ambient `HOME`. The guard derives
+the current POSIX account with `pwd.getpwuid(os.getuid())`, requires its nonempty
+absolute home to resolve to an accessible directory, and binds that canonical
+path directly into the preflight consumer. The compatibility wrapper may still
+use its process `HOME` for low-level callers, but that behavior cannot satisfy a
+named lane or self-policy-migration review.
+
+Concretely, `preflight-claude` raw-loads the exact provenance closure plus
+`review_runtime.claude_version_policy`, `review_runtime.claude_capabilities`,
+`review_runtime.claude_stream_contract`, and
+`review_runtime.named_claude_preflight`. `validate-claude-stream` raw-loads the
+standalone validator plus its exact required runtime-source closure.
+`classify-review-result` binds and revalidates the exact
+`review_runtime.review_result` source before executing its already loaded
+classifier. The guard
+binds and revalidates `review_runtime/claude_code_release.asc`,
+`references/claude-stream-compatibility.json`,
+`references/claude-2.1.212-stream-schema.json`,
+`references/claude-stream-schema.json`, and the manifest-bound
+capability-contract source bytes. Companion revalidation repeats
+no-follow descriptor/type safety checks and compares the complete bounded bytes;
+a safe ordinary-file replacement with identical content is harmless, and no
+persistent `dev`/`ino` identity is required across the two reads. The provenance
+consumer verifies with the immutable release-key bytes captured by the guard's
+initial validated read and never reopens that path after final validation.
+The stream-contract and validator consumers parse the immutable compatibility,
+baseline, profile-schema, and capability bytes from the guard's initial validated reads without
+reopening those paths after final validation. Neither profile reads or executes its env-shebang
+compatibility wrapper or needs an extra `--` separator before its downstream
+arguments.
 
 The canonical lane and low-level helper share the stable publisher-verified
 compatibility range `>=2.1.211,<3.0.0`, defined once in
@@ -47,23 +121,27 @@ facts in signed per-version artifact manifests, schema baselines, and helper
 credential-lock catalog entries; they are not the global eligibility policy.
 Claude Code `2.1.212` is the audited per-version stream-schema baseline, not a
 global eligibility pin. The canonical lane additionally requires its
-publisher-first preflight, advertised-capability probe, preflight-bound strict
-stream profile, and installed-path identity/digest revalidation. The canonical
-lane selects ordinary Claude CLI authentication in trusted real `HOME` with
-precedence `ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` > local login. The
-publisher-verified CLI may
+publisher-first preflight, mandatory credential-free `--help` advertised-capability probe,
+accepted parent-private preflight evidence, preflight-bound strict stream profile,
+and installed-path identity/digest revalidation. Its only authentication interface
+is ordinary local Claude CLI login in trusted real `HOME`; it accepts no API key,
+OAuth-token environment interface, or helper carrier. The publisher-verified CLI may
 update ordinary CLI-owned authentication and runtime state in that control
 plane, including credential refresh and possible cache or tool-result
 artifacts. Those accepted CLI side effects are not model-authorized review
 mutations and do not authorize model/tool writes or deliberate host mutations.
 The canonical lane does not enumerate or attest every CLI-owned `HOME` write,
-take a complete real-`HOME` diff, or use or claim the helper's credential-lock
-catalog, broker, staged carrier, guarded writeback, or recovery guarantees.
+and it does not take a complete real-`HOME` diff. The canonical lane does not use or
+claim the helper's credential-lock catalog, broker, staged carrier, guarded
+writeback, or recovery guarantees.
 `--no-session-persistence` does not make the CLI process or real `HOME`
 immutable, and cache or tool-result artifacts may retain review-derived data
 according to upstream CLI behavior. Authentication rejection is still
-`blocked-authentication`, ambiguous credential persistence is inconclusive, and
-neither condition authorizes another provider.
+`blocked-authentication`; when ordinary refresh is forbidden or only API-key or
+OAuth-token credentials are available, the lane also reports
+`blocked-authentication` instead of widening the launcher environment. Ambiguous
+credential persistence is inconclusive, and neither condition authorizes another
+provider.
 
 ### Native Selected-Deny Read Boundary
 

@@ -27,6 +27,7 @@ import sys
 import tempfile
 import termios
 import threading
+import textwrap
 import time
 import types
 import traceback
@@ -331,6 +332,56 @@ def _blocked_keychain_handler_worker(connection: object, mode: str) -> None:
     finally:
         identity_root.cleanup()
         close()
+
+
+class ProviderImportTest(unittest.TestCase):
+    def test_provider_import_defers_the_sibling_stream_validator(self) -> None:
+        probe = textwrap.dedent(
+            """
+            import importlib
+            import importlib.util
+            import pathlib
+            import sys
+            import types
+
+            runtime_root = pathlib.Path(sys.argv[1]) / "review_runtime"
+            package_name = "private_overlay_review_runtime_probe"
+            package_spec = importlib.util.spec_from_file_location(
+                package_name,
+                runtime_root / "__init__.py",
+                submodule_search_locations=[str(runtime_root)],
+            )
+            assert package_spec is not None
+            assert package_spec.loader is not None
+            package = importlib.util.module_from_spec(package_spec)
+            sys.modules[package_name] = package
+            package_spec.loader.exec_module(package)
+            providers = importlib.import_module(f"{package_name}.providers")
+            synthetic_tokens = importlib.import_module(
+                f"{package_name}.synthetic_tokens"
+            )
+            assert pathlib.Path(sys.argv[1]) not in map(pathlib.Path, sys.path)
+            assert providers.__file__ == str(runtime_root / "providers.py")
+            assert synthetic_tokens.MAX_CATALOG_BYTES == 64 * 1024
+            assert "validate_claude_stream" not in sys.modules
+            validator = types.ModuleType("validate_claude_stream")
+            sys.modules[validator.__name__] = validator
+            assert providers.claude_stream_validator is validator
+            del sys.modules[validator.__name__]
+            assert providers.claude_stream_validator is validator
+            assert providers._load_claude_stream_validator() is validator
+            """
+        )
+        completed = subprocess.run(
+            (sys.executable, "-I", "-B", "-S", "-c", probe, str(SCRIPTS)),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
 
 class ProviderPolicyTest(unittest.TestCase):

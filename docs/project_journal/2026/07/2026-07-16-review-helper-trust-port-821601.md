@@ -905,3 +905,28 @@ metadata behavior.
   162-test validator/contract set, Ruff lint and formatting, compileall, JSON
   parsing, project-journal validation, the official skill validator, and
   `git diff --check` also pass. No local Python 3.10 run was performed.
+- The final default-branch synchronization advanced through
+  `bea5e7ad1312be1c15a0af7785eda74a8fb5282d` and resolved eight textual
+  conflicts without discarding either policy line. The trusted, manifest-bound
+  `named_lane_guard` remains the self-migration control-plane skeleton, while
+  the branch's terminal-local-lanes-before-GitHub-request rule, structural
+  stream profiles, and exact-version overlays remain explicit. The integrated
+  runtime additionally routes regular-file monitor creation through the common
+  thread-start wrapper, binds `version_adaptations` into the stream-validator
+  compatibility profile, and forces
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` in the formal Claude child
+  environment. A repository contract now rejects retained merge markers in
+  every manifest-bound guard source.
+- Post-integration validation used only Python 3.13. Ten exact runtime/provider
+  regressions, the 190-test validator/contract set, the 163-test named-lane
+  module, the 198-test common-runtime module with one expected platform skip,
+  and the 341-test deterministic supervisor gate all passed. Full discovery ran
+  2,787 tests in 1,767.498 seconds with 6 expected skips; its sole in-app failure
+  was the known nested `sandbox-exec` denial in the one-shot Claude keychain
+  broker test, and that exact test passed outside the Desktop sandbox in 3.056
+  seconds. Ruff lint, Python 3.13 compilation, strict launcher C syntax, both
+  official skill validations, project-journal validation, `git diff --check`,
+  and the Xcode 26.6 developer broker byte-reproducibility check passed. Ruff's
+  format check reports only five pre-existing default-branch formatting
+  deviations outside this workstream's added lines; they remain unchanged to
+  avoid unrelated churn. No local Python 3.10 run was performed.

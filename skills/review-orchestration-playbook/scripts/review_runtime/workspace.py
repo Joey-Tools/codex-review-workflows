@@ -33,6 +33,7 @@ from .common import (
     is_relative_to,
     resolve_git,
     restore_signal_mask,
+    symlink_target_stays_within_workspace,
     write_text_atomic,
 )
 from .prompt import build_review_prompt
@@ -398,26 +399,6 @@ LONG_NUMERIC_SECRET = re.compile(rb"[0-9]{16,512}")
 UNIFIED_DIFF_HUNK_PATTERN = re.compile(
     rb"^@@ -[0-9]+(?:,[0-9]+)? \+(?P<head_line>[0-9]+)(?:,[0-9]+)? @@"
 )
-
-
-def symlink_target_stays_within_workspace(
-    link_relative_path: pathlib.PurePosixPath,
-    target_text: str,
-) -> bool:
-    """Return whether a relative symlink target stays inside the frozen root."""
-
-    target = pathlib.PurePosixPath(target_text)
-    if target.is_absolute():
-        return False
-    depth = len(link_relative_path.parent.parts)
-    for component in target.parts:
-        if component == "..":
-            if depth == 0:
-                return False
-            depth -= 1
-        elif component not in {"", "."}:
-            depth += 1
-    return True
 
 
 @dataclass(frozen=True)
