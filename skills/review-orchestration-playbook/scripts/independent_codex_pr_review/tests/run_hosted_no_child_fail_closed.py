@@ -31,18 +31,25 @@ PROBE_ACTIONS = (
 CREATION_ACTIONS = ("fork", "posix_spawn", "popen", "double_fork")
 
 
-def _expected_hosted_fail_closed_blockers() -> set[str]:
+def _expected_hosted_fail_closed_blockers(
+    evidence: profile.CompatibilityEvidence,
+) -> set[str]:
     blockers: set[str] = set()
     for action in PROBE_ACTIONS:
         prefix = f"rlimit-{action}"
-        blockers.update(
-            {
-                f"{prefix}-post-exec-leader-binding-invalid",
-                f"{prefix}-start-identity-is-missing",
-                f"{prefix}-post-exec-rlimit-is-invalid",
-                f"ambiguous-rlimit-{action}",
-            }
-        )
+        blockers.add(f"ambiguous-rlimit-{action}")
+        item = evidence.observation("rlimit", action)
+        if (
+            item is not None
+            and item.detail == profile.PROBE_DETAIL_LEADER_EXITED_BEFORE_BINDING
+        ):
+            blockers.update(
+                {
+                    f"{prefix}-post-exec-leader-binding-invalid",
+                    f"{prefix}-start-identity-is-missing",
+                    f"{prefix}-post-exec-rlimit-is-invalid",
+                }
+            )
     for layer in ("seatbelt", "combined"):
         for action in PROBE_ACTIONS:
             blockers.add(f"ambiguous-{layer}-{action}")
@@ -77,14 +84,8 @@ def _matches_hosted_fail_closed_observations(
         expected_profile = (
             None if layer == "rlimit" else evidence.seatbelt_profile_sha256
         )
-        expected_detail = (
-            profile.PROBE_DETAIL_LEADER_EXITED_BEFORE_BINDING
-            if layer == "rlimit"
-            else profile.PROBE_DETAIL_KILLED_BEFORE_EVIDENCE
-        )
         if (
             item.outcome != "ambiguous"
-            or item.detail != expected_detail
             or item.error_number is not None
             or item.pre_exec_setsid_succeeded is not True
             or type(item.pre_exec_pid) is not int
@@ -97,16 +98,27 @@ def _matches_hosted_fail_closed_observations(
         ):
             return False
         if layer == "rlimit":
-            if (
-                item.child_process_group is not None
-                or item.child_session is not None
-                or item.child_start_identity is not None
-                or item.nproc_soft is not None
-                or item.nproc_hard is not None
-            ):
+            unbound = (
+                item.detail == profile.PROBE_DETAIL_LEADER_EXITED_BEFORE_BINDING
+                and item.child_process_group is None
+                and item.child_session is None
+                and item.child_start_identity is None
+                and item.nproc_soft is None
+                and item.nproc_hard is None
+            )
+            bound_then_killed = (
+                item.detail == profile.PROBE_DETAIL_KILLED_BEFORE_EVIDENCE
+                and item.child_process_group == item.pre_exec_pid
+                and item.child_session == item.pre_exec_pid
+                and isinstance(item.child_start_identity, str)
+                and item.child_start_identity.startswith("darwin-proc-start:")
+                and (item.nproc_soft, item.nproc_hard) == expected_limit
+            )
+            if not (unbound or bound_then_killed):
                 return False
         elif (
-            item.child_process_group != item.pre_exec_pid
+            item.detail != profile.PROBE_DETAIL_KILLED_BEFORE_EVIDENCE
+            or item.child_process_group != item.pre_exec_pid
             or item.child_session != item.pre_exec_pid
             or not isinstance(item.child_start_identity, str)
             or not item.child_start_identity.startswith("darwin-proc-start:")
@@ -194,7 +206,7 @@ def main() -> int:
             alternate_executable_path=synthetic_alternate,
             python_home=sys.base_prefix,
         )
-    expected_blockers = _expected_hosted_fail_closed_blockers()
+    expected_blockers = _expected_hosted_fail_closed_blockers(evidence)
     blockers = set(evidence.blockers)
     runtime = evidence.runtime
     runtime_matches = (

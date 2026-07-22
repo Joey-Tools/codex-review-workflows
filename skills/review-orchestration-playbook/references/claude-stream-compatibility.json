@@ -10,6 +10,87 @@
       "runtime_rule": "exact_preflight_selected_version"
     }
   },
+  "version_adaptations": {
+    "2.1.216": {
+      "scope": "exact-selected-version",
+      "init_event": {
+        "optional_field_contracts": {
+          "agents": {
+            "rule": "duplicate_free_exact_set",
+            "values": ["claude", "Explore", "general-purpose", "Plan"],
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "blocked"
+          },
+          "analytics_disabled": {
+            "rule": "boolean",
+            "failure": "inconclusive"
+          },
+          "capabilities": {
+            "rule": "duplicate_free_exact_set",
+            "values": ["interrupt_receipt_v1", "msg_lifecycle_v1"],
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "blocked"
+          },
+          "estimated_tokens": {
+            "rule": "null",
+            "failure": "inconclusive"
+          },
+          "estimated_tokens_delta": {
+            "rule": "null",
+            "failure": "inconclusive"
+          },
+          "fast_mode_state": {
+            "rule": "constant",
+            "value": "off",
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "blocked"
+          },
+          "output_style": {
+            "rule": "constant",
+            "value": "default",
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "blocked"
+          },
+          "product_feedback_disabled": {
+            "rule": "boolean",
+            "failure": "inconclusive"
+          },
+          "uuid": {
+            "rule": "nonempty_string",
+            "failure": "inconclusive"
+          }
+        }
+      },
+      "terminal_result": {
+        "optional_field_contracts": {
+          "fast_mode_state": {
+            "rule": "constant",
+            "value": "off",
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "blocked"
+          },
+          "terminal_reason": {
+            "rule": "constant",
+            "value": "completed",
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "blocked"
+          },
+          "time_to_request_ms": {
+            "rule": "nonnegative_finite_number",
+            "failure": "inconclusive"
+          },
+          "ttft_ms": {
+            "rule": "nonnegative_finite_number",
+            "failure": "inconclusive"
+          },
+          "ttft_stream_ms": {
+            "rule": "nonnegative_finite_number",
+            "failure": "inconclusive"
+          }
+        }
+      }
+    }
+  },
   "fail_closed_surfaces": [
     "stream_envelope",
     "init_field_set",

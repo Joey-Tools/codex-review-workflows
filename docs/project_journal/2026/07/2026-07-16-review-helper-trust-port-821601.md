@@ -820,3 +820,31 @@ metadata behavior.
   strict launcher C syntax, project-journal validation, the official skill
   validator, `git diff --check`, and the local broker developer reproducibility
   check also pass. No local Python 3.10 run was performed.
+- The first current-head GitHub macOS 26.4 hosted no-child gate exposed a
+  timing-dependent signature assumption: the rlimit baseline process bound its
+  post-exec identity before receiving `SIGKILL`, producing 69 blockers instead
+  of the previously calibrated 72, while a same-head rerun produced the earlier
+  all-unbound shape and passed. Both runs remained ambiguous, incompatible, and
+  non-production-capable on the same pinned runtime. The hosted matcher now
+  accepts only two strict rlimit evidence shapes: unbound leader exit, or a
+  completely bound `(0, 0)`-rlimit leader killed before evidence. It derives the
+  exact blocker set from that shape while retaining all 24 observations,
+  runtime identity, parent-limit stability, and exact-set equality. Seatbelt and
+  combined observations remain restricted to the bound-then-killed shape.
+  Python 3.13 passes the focused 72/69/48-blocker regression and all 331
+  deterministic supervisor tests.
+- A direct certified Claude Code 2.1.216 lane then completed clean process
+  supervision but correctly failed the 2.1.212 strict stream baseline because
+  its init and terminal events contained newly added metadata fields. The
+  baseline schema and global compatible range remain unchanged. The
+  compatibility profile now carries an exact-selected-version 2.1.216 additive
+  contract for those fields; the profile digest binds it into preflight
+  evidence, it cannot override baseline fields, later versions do not inherit
+  it, malformed metadata is inconclusive, and unreviewed semantic constants are
+  blocked. The 53-test Python 3.13 validator module and focused compatibility
+  contract tests pass. The complete host-level Python 3.13 suite passes all
+  2,329 tests in 282.459 seconds with 6 expected skips, and the independent
+  331-test deterministic supervisor gate passes in 86.958 seconds. Ruff lint,
+  changed-file formatting, compileall, JSON parsing, project-journal validation,
+  the official skill validator, and `git diff --check` also pass. No local
+  Python 3.10 run was performed.

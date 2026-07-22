@@ -173,6 +173,33 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             copy.deepcopy(self.result_event),
         ]
 
+    def _v216_events(self) -> list[dict[str, object]]:
+        events = self._full_events()
+        events[0].update(
+            {
+                "claude_code_version": "2.1.216",
+                "agents": ["claude", "Explore", "general-purpose", "Plan"],
+                "analytics_disabled": False,
+                "capabilities": ["interrupt_receipt_v1", "msg_lifecycle_v1"],
+                "estimated_tokens": None,
+                "estimated_tokens_delta": None,
+                "fast_mode_state": "off",
+                "output_style": "default",
+                "product_feedback_disabled": False,
+                "uuid": "init-uuid",
+            }
+        )
+        events[-1].update(
+            {
+                "fast_mode_state": "off",
+                "terminal_reason": "completed",
+                "time_to_request_ms": 2,
+                "ttft_ms": 3,
+                "ttft_stream_ms": 4,
+            }
+        )
+        return events
+
     def _validate(
         self,
         events: list[object] | None = None,
@@ -357,6 +384,61 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         self.assertEqual(binding.schema_id, "claude-code-stream-compatible-v1")
         self.assertEqual(len(binding.capability_digest), 64)
         self.assertNotIn("required_version", profile)
+        self.assertEqual(
+            profile["version_adaptations"],
+            claude_stream_contract.VERSION_ADAPTATIONS,
+        )
+        adaptation = claude_stream_contract.version_adaptation("2.1.216")
+        self.assertIsNotNone(adaptation)
+        assert adaptation is not None
+        adaptation["scope"] = "mutated"
+        self.assertEqual(
+            claude_stream_contract.version_adaptation("2.1.216")["scope"],
+            "exact-selected-version",
+        )
+        self.assertIsNone(claude_stream_contract.version_adaptation("2.1.217"))
+
+    def test_compatibility_profile_rejects_wildcards_and_baseline_overrides(
+        self,
+    ) -> None:
+        profile = json.loads(
+            claude_stream_contract.COMPATIBILITY_PATH.read_text(encoding="utf-8")
+        )
+        wildcard_profile = copy.deepcopy(profile)
+        wildcard_profile["version_adaptations"]["2.1.*"] = wildcard_profile[
+            "version_adaptations"
+        ].pop("2.1.216")
+        wildcard_path = self.parent_state / "wildcard-compatibility.json"
+        wildcard_path.write_text(json.dumps(wildcard_profile), encoding="utf-8")
+        with self.assertRaises(claude_stream_contract.ClaudeStreamContractError):
+            claude_stream_contract.load_stream_contract(
+                compatibility_path=wildcard_path,
+            )
+
+        overlapping_adaptations = copy.deepcopy(
+            claude_stream_contract.VERSION_ADAPTATIONS
+        )
+        overlapping_adaptations["2.1.216"]["init_event"]["optional_field_contracts"][
+            "tools"
+        ] = {
+            "rule": "boolean",
+            "failure": "inconclusive",
+        }
+        overlap_profile = copy.deepcopy(profile)
+        overlap_profile["version_adaptations"] = overlapping_adaptations
+        overlap_path = self.parent_state / "overlap-compatibility.json"
+        overlap_path.write_text(json.dumps(overlap_profile), encoding="utf-8")
+        with (
+            mock.patch.object(
+                claude_stream_contract,
+                "VERSION_ADAPTATIONS",
+                overlapping_adaptations,
+            ),
+            self.assertRaises(claude_stream_contract.ClaudeStreamContractError),
+        ):
+            claude_stream_contract.load_stream_contract(
+                compatibility_path=overlap_path,
+            )
 
     def test_loader_rejects_process_returncode_contract_drift(self) -> None:
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
@@ -452,14 +534,143 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         for surface in ("init", "terminal"):
             with self.subTest(surface=surface):
                 events = self._full_events()
-                events[0]["claude_code_version"] = "2.1.216"
+                events[0]["claude_code_version"] = "2.1.217"
                 target = events[0] if surface == "init" else events[-1]
                 target["future_field"] = True
 
-                outcome = self._validate(events, selected_version="2.1.216")
+                outcome = self._validate(events, selected_version="2.1.217")
 
                 self.assertEqual(outcome["classification"], "inconclusive")
                 self.assertNotIn("findings", outcome)
+
+    def test_accepts_exact_v216_additive_stream_contract(self) -> None:
+        events = self._v216_events()
+        events[-1]["ttft_stream_ms"] = 4.5
+
+        self.assertEqual(
+            self._validate(events, selected_version="2.1.216"),
+            {"classification": "accepted", "findings": "\nNo findings.\n"},
+        )
+
+    def test_v216_additive_fields_are_exact_version_scoped(self) -> None:
+        for version in ("2.1.212", "2.1.217"):
+            with self.subTest(version=version):
+                events = self._v216_events()
+                events[0]["claude_code_version"] = version
+
+                outcome = self._validate(events, selected_version=version)
+
+                self.assertEqual(outcome["classification"], "inconclusive")
+                self.assertIn("init.unknown-field", outcome["reasons"])
+                self.assertIn("terminal.unknown-field", outcome["reasons"])
+
+    def test_v216_additive_fields_fail_closed_on_malformed_values(self) -> None:
+        cases = {
+            "agents-type": ("init", "agents", {}, "inconclusive"),
+            "agents-duplicate": (
+                "init",
+                "agents",
+                ["claude", "claude", "general-purpose", "Plan"],
+                "inconclusive",
+            ),
+            "analytics-bool": ("init", "analytics_disabled", 0, "inconclusive"),
+            "capabilities-type": ("init", "capabilities", "none", "inconclusive"),
+            "estimated-tokens-null": (
+                "init",
+                "estimated_tokens",
+                1,
+                "inconclusive",
+            ),
+            "estimated-delta-null": (
+                "init",
+                "estimated_tokens_delta",
+                0,
+                "inconclusive",
+            ),
+            "fast-mode-type": ("init", "fast_mode_state", True, "inconclusive"),
+            "feedback-bool": (
+                "init",
+                "product_feedback_disabled",
+                1,
+                "inconclusive",
+            ),
+            "uuid-empty": ("init", "uuid", " ", "inconclusive"),
+            "request-time-negative": (
+                "terminal",
+                "time_to_request_ms",
+                -1,
+                "inconclusive",
+            ),
+            "ttft-bool": ("terminal", "ttft_ms", False, "inconclusive"),
+            "ttft-stream-string": (
+                "terminal",
+                "ttft_stream_ms",
+                "4",
+                "inconclusive",
+            ),
+        }
+        for name, (surface, field_name, value, classification) in cases.items():
+            with self.subTest(name=name):
+                events = self._v216_events()
+                target = events[0] if surface == "init" else events[-1]
+                target[field_name] = value
+
+                outcome = self._validate(events, selected_version="2.1.216")
+
+                self.assertEqual(outcome["classification"], classification)
+                self.assertNotIn("findings", outcome)
+
+    def test_v216_additive_fields_block_semantic_mismatches(self) -> None:
+        cases = {
+            "agents": ["claude", "Explore", "general-purpose", "Other"],
+            "capabilities": ["interrupt_receipt_v1", "unknown"],
+            "fast_mode_state": "on",
+            "output_style": "custom",
+        }
+        for field_name, value in cases.items():
+            with self.subTest(surface="init", field=field_name):
+                events = self._v216_events()
+                events[0][field_name] = value
+                self.assert_fail_closed(
+                    self._validate(events, selected_version="2.1.216"),
+                    "blocked",
+                )
+        for field_name, value in {
+            "fast_mode_state": "on",
+            "terminal_reason": "cancelled",
+        }.items():
+            with self.subTest(surface="terminal", field=field_name):
+                events = self._v216_events()
+                events[-1][field_name] = value
+                self.assert_fail_closed(
+                    self._validate(events, selected_version="2.1.216"),
+                    "blocked",
+                )
+
+    def test_v216_additive_fields_do_not_weaken_core_launch_checks(self) -> None:
+        for name, mutate in {
+            "task-tool": lambda events: events[0]["tools"].append("Task"),
+            "mcp-server": lambda events: events[0]["mcp_servers"].append("server"),
+        }.items():
+            with self.subTest(name=name):
+                events = self._v216_events()
+                mutate(events)
+                self.assert_fail_closed(
+                    self._validate(events, selected_version="2.1.216"),
+                    "blocked",
+                )
+
+    def test_v216_still_rejects_unreviewed_fields(self) -> None:
+        for surface in ("init", "terminal"):
+            with self.subTest(surface=surface):
+                events = self._v216_events()
+                target = events[0] if surface == "init" else events[-1]
+                target["future_field"] = True
+
+                self.assert_fail_closed(
+                    self._validate(events, selected_version="2.1.216"),
+                    "inconclusive",
+                )
 
     def test_tampered_preflight_evidence_never_releases_findings(self) -> None:
         def update_nested(

@@ -2510,7 +2510,8 @@ class RepositoryContractTest(unittest.TestCase):
             "defined once in",
             "claude_version_policy.py",
             "Claude Code `2.1.212` is the audited per-version stream-schema baseline, not a global eligibility pin.",
-            "adapts only the baseline `claude_code_version` constant to the exact accepted preflight-selected version",
+            "adapts the baseline `claude_code_version` constant to the exact accepted preflight-selected version",
+            "exact-version additive metadata contracts",
             "does not prove the final merged native sandbox",
             "merged admin-managed permission arrays",
             "path-rule evaluation",
@@ -2620,6 +2621,7 @@ class RepositoryContractTest(unittest.TestCase):
                         "runtime_rule": "exact_preflight_selected_version",
                     }
                 },
+                "version_adaptations": (claude_stream_contract.VERSION_ADAPTATIONS),
                 "fail_closed_surfaces": [
                     "stream_envelope",
                     "init_field_set",

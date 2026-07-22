@@ -918,6 +918,79 @@ def _validate_exact_string(
         evidence.blocked.add(f"init.{field_name}.mismatch")
 
 
+def _version_optional_contracts(
+    version: str,
+    surface: str,
+) -> Mapping[str, Mapping[str, Any]]:
+    adaptation = claude_stream_contract.version_adaptation(version)
+    if adaptation is None:
+        return {}
+    return adaptation[surface]["optional_field_contracts"]
+
+
+def _record_adaptation_failure(
+    evidence: _Evidence,
+    classification: str,
+    reason: str,
+) -> None:
+    if classification == "blocked":
+        evidence.blocked.add(reason)
+    else:
+        evidence.inconclusive.add(reason)
+
+
+def _validate_adapted_fields(
+    event: Mapping[str, Any],
+    *,
+    prefix: str,
+    contracts: Mapping[str, Mapping[str, Any]],
+    evidence: _Evidence,
+) -> None:
+    for field_name, field_contract in contracts.items():
+        if field_name not in event:
+            continue
+        value = event[field_name]
+        rule = field_contract["rule"]
+        malformed = False
+        mismatch = False
+        if rule == "duplicate_free_exact_set":
+            malformed = (
+                type(value) is not list
+                or any(type(item) is not str or not item.strip() for item in value)
+                or len(value) != len(set(value))
+            )
+            if not malformed:
+                mismatch = frozenset(value) != frozenset(field_contract["values"])
+        elif rule == "boolean":
+            malformed = type(value) is not bool
+        elif rule == "null":
+            malformed = value is not None
+        elif rule == "constant":
+            expected = field_contract["value"]
+            malformed = type(value) is not type(expected)
+            mismatch = not malformed and value != expected
+        elif rule == "nonempty_string":
+            malformed = type(value) is not str or not value.strip()
+        elif rule == "nonnegative_finite_number":
+            malformed = not _is_nonnegative_finite_number(value)
+        else:  # The bound compatibility profile should make this unreachable.
+            evidence.inconclusive.add("validator.version-adaptation-invalid")
+            continue
+
+        if malformed:
+            _record_adaptation_failure(
+                evidence,
+                field_contract.get("malformed_failure", field_contract.get("failure")),
+                f"{prefix}.{field_name}.malformed",
+            )
+        elif mismatch:
+            _record_adaptation_failure(
+                evidence,
+                field_contract["mismatch_failure"],
+                f"{prefix}.{field_name}.mismatch",
+            )
+
+
 def _validate_init(
     event: Mapping[str, Any],
     *,
@@ -927,7 +1000,13 @@ def _validate_init(
     api_key_source: str,
     evidence: _Evidence,
 ) -> None:
-    allowed_fields = INIT_REQUIRED_FIELDS | INIT_OPTIONAL_FIELDS
+    adaptation_contracts = _version_optional_contracts(
+        expected_claude_code_version,
+        "init_event",
+    )
+    allowed_fields = (
+        INIT_REQUIRED_FIELDS | INIT_OPTIONAL_FIELDS | frozenset(adaptation_contracts)
+    )
     if frozenset(event) - allowed_fields:
         evidence.inconclusive.add("init.unknown-field")
     missing = INIT_REQUIRED_FIELDS - frozenset(event)
@@ -967,6 +1046,12 @@ def _validate_init(
         value = event["session_id"]
         if type(value) is not str or not value.strip():
             evidence.inconclusive.add("init.session_id.malformed")
+    _validate_adapted_fields(
+        event,
+        prefix="init",
+        contracts=adaptation_contracts,
+        evidence=evidence,
+    )
 
 
 def _validate_model_usage(
@@ -1238,11 +1323,19 @@ def _validate_terminal(
     event: Mapping[str, Any],
     *,
     requested_model: str,
+    expected_claude_code_version: str,
     contract: Mapping[str, Any],
     evidence: _Evidence,
 ) -> str | None:
+    adaptation_contracts = _version_optional_contracts(
+        expected_claude_code_version,
+        "terminal_result",
+    )
     allowed_fields = (
-        TERMINAL_REQUIRED_FIELDS | TERMINAL_VARIANT_FIELDS | TERMINAL_OPTIONAL_FIELDS
+        TERMINAL_REQUIRED_FIELDS
+        | TERMINAL_VARIANT_FIELDS
+        | TERMINAL_OPTIONAL_FIELDS
+        | frozenset(adaptation_contracts)
     )
     if frozenset(event) - allowed_fields:
         evidence.inconclusive.add("terminal.unknown-field")
@@ -1287,6 +1380,12 @@ def _validate_terminal(
             evidence.inconclusive.add("terminal.result.malformed")
 
     _validate_optional_terminal_fields(event, evidence)
+    _validate_adapted_fields(
+        event,
+        prefix="terminal",
+        contracts=adaptation_contracts,
+        evidence=evidence,
+    )
     messages = _collect_error_messages(event, evidence)
     if success_claim and messages:
         evidence.inconclusive.add("terminal.success-with-error")
@@ -1448,6 +1547,7 @@ def validate_claude_stream(
     findings = _validate_terminal(
         envelope.last,
         requested_model=requested_model,
+        expected_claude_code_version=selected_claude_code_version,
         contract=contract,
         evidence=evidence,
     )

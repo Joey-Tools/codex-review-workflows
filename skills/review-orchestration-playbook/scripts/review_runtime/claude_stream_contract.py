@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import stat
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,6 +17,87 @@ VERSION_POLICY_REFERENCE = (
 )
 BASELINE_SCHEMA_NAME = "claude-2.1.212-stream-schema.json"
 BASELINE_VERSION = "2.1.212"
+VERSION_ADAPTATIONS = {
+    "2.1.216": {
+        "scope": "exact-selected-version",
+        "init_event": {
+            "optional_field_contracts": {
+                "agents": {
+                    "rule": "duplicate_free_exact_set",
+                    "values": ["claude", "Explore", "general-purpose", "Plan"],
+                    "malformed_failure": "inconclusive",
+                    "mismatch_failure": "blocked",
+                },
+                "analytics_disabled": {
+                    "rule": "boolean",
+                    "failure": "inconclusive",
+                },
+                "capabilities": {
+                    "rule": "duplicate_free_exact_set",
+                    "values": ["interrupt_receipt_v1", "msg_lifecycle_v1"],
+                    "malformed_failure": "inconclusive",
+                    "mismatch_failure": "blocked",
+                },
+                "estimated_tokens": {
+                    "rule": "null",
+                    "failure": "inconclusive",
+                },
+                "estimated_tokens_delta": {
+                    "rule": "null",
+                    "failure": "inconclusive",
+                },
+                "fast_mode_state": {
+                    "rule": "constant",
+                    "value": "off",
+                    "malformed_failure": "inconclusive",
+                    "mismatch_failure": "blocked",
+                },
+                "output_style": {
+                    "rule": "constant",
+                    "value": "default",
+                    "malformed_failure": "inconclusive",
+                    "mismatch_failure": "blocked",
+                },
+                "product_feedback_disabled": {
+                    "rule": "boolean",
+                    "failure": "inconclusive",
+                },
+                "uuid": {
+                    "rule": "nonempty_string",
+                    "failure": "inconclusive",
+                },
+            }
+        },
+        "terminal_result": {
+            "optional_field_contracts": {
+                "fast_mode_state": {
+                    "rule": "constant",
+                    "value": "off",
+                    "malformed_failure": "inconclusive",
+                    "mismatch_failure": "blocked",
+                },
+                "terminal_reason": {
+                    "rule": "constant",
+                    "value": "completed",
+                    "malformed_failure": "inconclusive",
+                    "mismatch_failure": "blocked",
+                },
+                "time_to_request_ms": {
+                    "rule": "nonnegative_finite_number",
+                    "failure": "inconclusive",
+                },
+                "ttft_ms": {
+                    "rule": "nonnegative_finite_number",
+                    "failure": "inconclusive",
+                },
+                "ttft_stream_ms": {
+                    "rule": "nonnegative_finite_number",
+                    "failure": "inconclusive",
+                },
+            }
+        },
+    }
+}
 REFERENCE_ROOT = pathlib.Path(__file__).resolve().parents[2] / "references"
 COMPATIBILITY_PATH = REFERENCE_ROOT / "claude-stream-compatibility.json"
 BASELINE_PATH = REFERENCE_ROOT / BASELINE_SCHEMA_NAME
@@ -34,6 +116,13 @@ class ClaudeStreamContractBinding:
     compatibility_digest: str
     baseline_digest: str
     capability_digest: str
+
+
+def version_adaptation(version: str) -> dict[str, Any] | None:
+    """Return an isolated exact-version additive contract, when reviewed."""
+
+    adaptation = VERSION_ADAPTATIONS.get(version)
+    return deepcopy(adaptation) if adaptation is not None else None
 
 
 def _identity(metadata: os.stat_result) -> tuple[int, ...]:
@@ -168,6 +257,7 @@ def load_stream_contract(
                 "runtime_rule": "exact_preflight_selected_version",
             }
         },
+        "version_adaptations": VERSION_ADAPTATIONS,
         "fail_closed_surfaces": [
             "stream_envelope",
             "init_field_set",
@@ -181,6 +271,26 @@ def load_stream_contract(
         raise ClaudeStreamContractError("stream compatibility profile does not match")
     if baseline.get("claude_code_version") != BASELINE_VERSION:
         raise ClaudeStreamContractError("stream baseline version does not match")
+    baseline_init = baseline.get("init_event")
+    baseline_terminal = baseline.get("terminal_result")
+    if type(baseline_init) is not dict or type(baseline_terminal) is not dict:
+        raise ClaudeStreamContractError("stream baseline field sets are invalid")
+    baseline_init_fields = set(baseline_init.get("required_fields", ())) | set(
+        baseline_init.get("optional_fields", ())
+    )
+    baseline_terminal_fields = set(baseline_terminal.get("required_fields", ())) | set(
+        baseline_terminal.get("optional_fields", ())
+    )
+    for adaptation in VERSION_ADAPTATIONS.values():
+        init_fields = set(adaptation["init_event"]["optional_field_contracts"])
+        terminal_fields = set(adaptation["terminal_result"]["optional_field_contracts"])
+        if (
+            init_fields & baseline_init_fields
+            or terminal_fields & baseline_terminal_fields
+        ):
+            raise ClaudeStreamContractError(
+                "version adaptation overrides a baseline field"
+            )
     compatibility_digest = hashlib.sha256(compatibility_raw).hexdigest()
     baseline_digest = hashlib.sha256(baseline_raw).hexdigest()
     capability_digest = hashlib.sha256(capability_raw).hexdigest()

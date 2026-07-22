@@ -352,117 +352,140 @@ class NoChildProfileUnitTests(unittest.TestCase):
 
         parent_limit = (256, 512)
         profile_sha256 = "a" * 64
-        observations: list[profile.ProbeObservation] = []
-        for layer_index, layer in enumerate(("rlimit", "seatbelt", "combined")):
-            expected_limit = parent_limit if layer == "seatbelt" else (0, 0)
-            expected_profile = None if layer == "rlimit" else profile_sha256
-            expected_detail = (
-                profile.PROBE_DETAIL_LEADER_EXITED_BEFORE_BINDING
-                if layer == "rlimit"
-                else profile.PROBE_DETAIL_KILLED_BEFORE_EVIDENCE
-            )
-            for action_index, action in enumerate(PROBE_ACTIONS):
-                pid = 4000 + layer_index * 100 + action_index
-                child_process_group = None if layer == "rlimit" else pid
-                child_session = None if layer == "rlimit" else pid
-                child_start_identity = (
-                    None if layer == "rlimit" else f"darwin-proc-start:{pid}:1"
-                )
-                post_exec_limit = (None, None) if layer == "rlimit" else expected_limit
-                observations.append(
-                    profile.ProbeObservation(
-                        layer=layer,
-                        action=action,
-                        outcome="ambiguous",
-                        detail=expected_detail,
-                        child_pid=pid,
-                        child_process_group=child_process_group,
-                        child_session=child_session,
-                        child_start_identity=child_start_identity,
-                        profile_sha256=expected_profile,
-                        pre_exec_setsid_succeeded=True,
-                        pre_exec_pid=pid,
-                        pre_exec_process_group=pid,
-                        pre_exec_session=pid,
-                        pre_exec_nproc_soft=expected_limit[0],
-                        pre_exec_nproc_hard=expected_limit[1],
-                        nproc_soft=post_exec_limit[0],
-                        nproc_hard=post_exec_limit[1],
-                    )
-                )
-        blockers = profile._probe_blockers(
-            observations,
-            parent_nproc=parent_limit,
-            profile_sha256=profile_sha256,
-        )
-        evidence = profile.CompatibilityEvidence(
-            schema_version=profile.EVIDENCE_SCHEMA_VERSION,
-            runtime_pin=GITHUB_HOSTED_RUNTIME_PIN,
-            runtime=profile.RuntimeFingerprint(
-                platform="darwin",
-                system="Darwin",
-                macos_product_version="26.4",
-                macos_build_version="25E246",
-                darwin_release="25.4.0",
-                python_version=(3, 13, 0),
-                python_executable="/synthetic/python3.13",
-                effective_uid=501,
-            ),
-            sandbox_exec=None,
-            probe_executable=None,
-            alternate_executable=None,
-            seatbelt_profile_sha256=profile_sha256,
-            parent_nproc_before=parent_limit,
-            parent_nproc_after=parent_limit,
-            observations=tuple(observations),
-            blockers=tuple(blockers),
-        )
 
-        self.assertEqual(set(blockers), _expected_hosted_fail_closed_blockers())
-        self.assertEqual(len(blockers), 72)
-        self.assertEqual(len(blockers), len(set(blockers)))
-        self.assertTrue(_matches_hosted_fail_closed_observations(evidence))
-        diagnostics = _signature_diagnostics(
+        def build_evidence(
+            bound_rlimit_actions: set[str],
+        ) -> profile.CompatibilityEvidence:
+            observations: list[profile.ProbeObservation] = []
+            for layer_index, layer in enumerate(("rlimit", "seatbelt", "combined")):
+                expected_limit = parent_limit if layer == "seatbelt" else (0, 0)
+                expected_profile = None if layer == "rlimit" else profile_sha256
+                for action_index, action in enumerate(PROBE_ACTIONS):
+                    pid = 4000 + layer_index * 100 + action_index
+                    bound = layer != "rlimit" or action in bound_rlimit_actions
+                    post_exec_limit = expected_limit if bound else (None, None)
+                    observations.append(
+                        profile.ProbeObservation(
+                            layer=layer,
+                            action=action,
+                            outcome="ambiguous",
+                            detail=(
+                                profile.PROBE_DETAIL_KILLED_BEFORE_EVIDENCE
+                                if bound
+                                else profile.PROBE_DETAIL_LEADER_EXITED_BEFORE_BINDING
+                            ),
+                            child_pid=pid,
+                            child_process_group=pid if bound else None,
+                            child_session=pid if bound else None,
+                            child_start_identity=(
+                                f"darwin-proc-start:{pid}:1" if bound else None
+                            ),
+                            profile_sha256=expected_profile,
+                            pre_exec_setsid_succeeded=True,
+                            pre_exec_pid=pid,
+                            pre_exec_process_group=pid,
+                            pre_exec_session=pid,
+                            pre_exec_nproc_soft=expected_limit[0],
+                            pre_exec_nproc_hard=expected_limit[1],
+                            nproc_soft=post_exec_limit[0],
+                            nproc_hard=post_exec_limit[1],
+                        )
+                    )
+            blockers = profile._probe_blockers(
+                observations,
+                parent_nproc=parent_limit,
+                profile_sha256=profile_sha256,
+            )
+            return profile.CompatibilityEvidence(
+                schema_version=profile.EVIDENCE_SCHEMA_VERSION,
+                runtime_pin=GITHUB_HOSTED_RUNTIME_PIN,
+                runtime=profile.RuntimeFingerprint(
+                    platform="darwin",
+                    system="Darwin",
+                    macos_product_version="26.4",
+                    macos_build_version="25E246",
+                    darwin_release="25.4.0",
+                    python_version=(3, 13, 0),
+                    python_executable="/synthetic/python3.13",
+                    effective_uid=501,
+                ),
+                sandbox_exec=None,
+                probe_executable=None,
+                alternate_executable=None,
+                seatbelt_profile_sha256=profile_sha256,
+                parent_nproc_before=parent_limit,
+                parent_nproc_after=parent_limit,
+                observations=tuple(observations),
+                blockers=tuple(blockers),
+            )
+
+        cases = (
+            ("all-unbound", set(), 72),
+            ("baseline-bound", {"baseline"}, 69),
+            ("all-bound", set(PROBE_ACTIONS), 48),
+        )
+        evidence_by_case: dict[str, profile.CompatibilityEvidence] = {}
+        for name, bound_rlimit_actions, expected_blocker_count in cases:
+            with self.subTest(name=name):
+                evidence = build_evidence(bound_rlimit_actions)
+                evidence_by_case[name] = evidence
+                expected_blockers = _expected_hosted_fail_closed_blockers(evidence)
+
+                self.assertEqual(len(evidence.observations), 24)
+                self.assertEqual(set(evidence.blockers), expected_blockers)
+                self.assertEqual(len(evidence.blockers), expected_blocker_count)
+                self.assertEqual(len(evidence.blockers), len(set(evidence.blockers)))
+                self.assertTrue(_matches_hosted_fail_closed_observations(evidence))
+                self.assertFalse(evidence.compatible)
+                self.assertFalse(evidence.production_capable)
+                diagnostics = _signature_diagnostics(
+                    evidence,
+                    expected_blockers=expected_blockers,
+                    runtime_matches=True,
+                    observation_signature_matches=True,
+                )
+                self.assertTrue(diagnostics["blockers_match"])
+                self.assertTrue(diagnostics["observation_signature_matches"])
+                self.assertTrue(diagnostics["parent_nproc_stable"])
+                self.assertEqual(
+                    diagnostics["missing_evidence"],
+                    ["sandbox_exec", "probe_executable", "alternate_executable"],
+                )
+                self.assertEqual(len(diagnostics["observations"]), 24)
+
+        evidence = evidence_by_case["baseline-bound"]
+        rlimit_index = next(
+            index
+            for index, item in enumerate(evidence.observations)
+            if (item.layer, item.action) == ("rlimit", "baseline")
+        )
+        malformed_observations = list(evidence.observations)
+        malformed_observations[rlimit_index] = replace(
+            malformed_observations[rlimit_index],
+            detail=profile.PROBE_DETAIL_LEADER_EXITED_BEFORE_BINDING,
+        )
+        malformed_evidence = replace(
             evidence,
-            expected_blockers=_expected_hosted_fail_closed_blockers(),
-            runtime_matches=True,
-            observation_signature_matches=True,
+            observations=tuple(malformed_observations),
         )
-        self.assertTrue(diagnostics["blockers_match"])
-        self.assertTrue(diagnostics["observation_signature_matches"])
-        self.assertTrue(diagnostics["parent_nproc_stable"])
-        self.assertEqual(
-            diagnostics["missing_evidence"],
-            ["sandbox_exec", "probe_executable", "alternate_executable"],
-        )
-        self.assertEqual(len(diagnostics["observations"]), len(observations))
+        with self.subTest(name="malformed-mixed-shape"):
+            self.assertFalse(
+                _matches_hosted_fail_closed_observations(malformed_evidence)
+            )
+            self.assertNotEqual(
+                set(malformed_evidence.blockers),
+                _expected_hosted_fail_closed_blockers(malformed_evidence),
+            )
 
         seatbelt_index = next(
             index
-            for index, item in enumerate(observations)
+            for index, item in enumerate(evidence.observations)
             if (item.layer, item.action) == ("seatbelt", "baseline")
         )
-        drifted_observations = list(observations)
+        drifted_observations = list(evidence.observations)
         drifted_observations[seatbelt_index] = replace(
             drifted_observations[seatbelt_index],
             detail=profile.PROBE_DETAIL_OUTER_SEATBELT_DENIED,
-        )
-        self.assertFalse(
-            _matches_hosted_fail_closed_observations(
-                replace(evidence, observations=tuple(drifted_observations))
-            )
-        )
-
-        rlimit_index = next(
-            index
-            for index, item in enumerate(observations)
-            if (item.layer, item.action) == ("rlimit", "baseline")
-        )
-        drifted_observations = list(observations)
-        drifted_observations[rlimit_index] = replace(
-            drifted_observations[rlimit_index],
-            nproc_soft=0,
-            nproc_hard=0,
         )
         self.assertFalse(
             _matches_hosted_fail_closed_observations(
