@@ -238,7 +238,10 @@ class NamedLaneGuardTest(unittest.TestCase):
         # Guard subprocesses use -I, so they ignore an ambient PYTHONPYCACHEPREFIX.
         with mock.patch.object(sys, "pycache_prefix", None):
             cache_path = pathlib.Path(
-                importlib.util.cache_from_source(str(source_path))
+                importlib.util.cache_from_source(
+                    str(source_path),
+                    optimization="",
+                )
             )
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         py_compile.compile(
@@ -246,6 +249,7 @@ class NamedLaneGuardTest(unittest.TestCase):
             cfile=str(cache_path),
             doraise=True,
             invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+            optimize=0,
         )
         return cache_path
 
@@ -331,6 +335,30 @@ class NamedLaneGuardTest(unittest.TestCase):
         )
 
         self.assertEqual(list(scripts.rglob("__pycache__")), [])
+
+    def test_unchecked_pyc_fixture_matches_unoptimized_guard_subprocess(self) -> None:
+        source_path = self.root / "guard-source.py"
+        source_path.write_text("value = 1\n", encoding="utf-8")
+        marker = self.root / "unchecked-pyc.marker"
+        optimized_flags = mock.Mock(wraps=sys.flags)
+        optimized_flags.optimize = 1
+
+        with mock.patch.object(sys, "flags", optimized_flags):
+            cache_path = self.install_unchecked_pyc(
+                source_path,
+                marker,
+                label="optimized-parent",
+            )
+        with mock.patch.object(sys, "pycache_prefix", None):
+            expected_path = pathlib.Path(
+                importlib.util.cache_from_source(
+                    str(source_path),
+                    optimization="",
+                )
+            )
+
+        self.assertEqual(cache_path, expected_path)
+        self.assertNotIn(".opt-", cache_path.name)
 
     def test_entrypoint_ignores_ambient_python_launch_controls(self) -> None:
         _, guard = self.copy_guard_bundle()
