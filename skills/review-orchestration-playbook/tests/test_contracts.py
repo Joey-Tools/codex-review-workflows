@@ -3382,8 +3382,7 @@ class RepositoryContractTest(unittest.TestCase):
                     "failure": "inconclusive",
                 },
                 "analytics_disabled": {
-                    "rule": "constant",
-                    "value": True,
+                    "rule": "boolean",
                     "failure": "inconclusive",
                 },
                 "product_feedback_disabled": {
@@ -3482,6 +3481,23 @@ class RepositoryContractTest(unittest.TestCase):
                 "accepted_values": ["ANTHROPIC_API_KEY", "none"],
                 "malformed_failure": "inconclusive",
                 "mismatch_failure": "blocked",
+            },
+        )
+        intermediate_profiles = schema["intermediate_events"]["profiles"]
+        self.assertEqual(
+            intermediate_profiles["legacy-base"]["assistant_message_profile"],
+            {
+                "additional_required_fields": [],
+                "field_contracts": {},
+            },
+        )
+        self.assertEqual(
+            intermediate_profiles["extended-2x"]["assistant_message_profile"],
+            {
+                "additional_required_fields": ["diagnostics"],
+                "field_contracts": {
+                    "diagnostics": {"rule": "null"},
+                },
             },
         )
         identities = schema["model_identity"]
@@ -4870,6 +4886,9 @@ class RepositoryContractTest(unittest.TestCase):
             '"path_field": "file_path"',
             '"path_field": "path"',
             '"path_if_present": "absolute"',
+            '"path_if_present": "absolute_or_cwd_relative"',
+            '"relative_path_base": "host_workspace_cwd"',
+            '"home_shorthand": "scope_unverified"',
             '"pattern_field": "pattern"',
             '"pattern_contract": "bounded_safe_relative_glob"',
             '"leading_prefix_normalization": "./"',

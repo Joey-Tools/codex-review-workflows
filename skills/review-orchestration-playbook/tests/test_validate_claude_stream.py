@@ -76,7 +76,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "output_style": "default",
             "agents": ["claude", "Explore", "general-purpose", "Plan"],
             "capabilities": ["interrupt_receipt_v1", "msg_lifecycle_v1"],
-            "analytics_disabled": True,
+            "analytics_disabled": False,
             "product_feedback_disabled": False,
             "uuid": "22222222-2222-4222-8222-222222222222",
             "fast_mode_state": "off",
@@ -86,6 +86,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "message": {
                 "content": [{"type": "text", "text": "working"}],
                 "context_management": None,
+                "diagnostics": None,
                 "id": "msg-synthetic",
                 "model": "claude-opus-4-8",
                 "role": "assistant",
@@ -318,6 +319,12 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             del events[0][field_name]
         for field_name in validator.EXTENDED_TERMINAL_FIELDS:
             del events[-1][field_name]
+        for event in events[1:-1]:
+            if event.get("type") != "assistant":
+                continue
+            message = event.get("message")
+            assert isinstance(message, dict)
+            del message["diagnostics"]
         return events
 
     def _valid_runtime_binding_fields(
@@ -684,7 +691,9 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                     "Grep": {
                         "path_field": "path",
                         "path_required": False,
-                        "path_if_present": "absolute",
+                        "path_if_present": "absolute_or_cwd_relative",
+                        "relative_path_base": "host_workspace_cwd",
+                        "home_shorthand": "scope_unverified",
                     },
                     "Glob": {
                         "path_field": "path",
@@ -1259,9 +1268,19 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                     init = copy.deepcopy(self.init_event)
                     init["claude_code_version"] = version
                     result = copy.deepcopy(self.result_event)
+                intermediate_events = copy.deepcopy(
+                    self._reviewed_intermediate_events()
+                )
+                if version < "2.1.216":
+                    for intermediate in intermediate_events:
+                        if intermediate.get("type") != "assistant":
+                            continue
+                        message = intermediate.get("message")
+                        assert isinstance(message, dict)
+                        del message["diagnostics"]
                 events = [
                     init,
-                    *copy.deepcopy(self._reviewed_intermediate_events()),
+                    *intermediate_events,
                     result,
                 ]
                 self.assertEqual(
@@ -1273,6 +1292,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         cases = {
             "absolute-read": ("Read", {"file_path": str(self.review_file)}),
             "absolute-grep": ("Grep", {"path": str(self.src_dir)}),
+            "relative-grep": ("Grep", {"path": "src"}),
             "absolute-glob": (
                 "Glob",
                 {"path": str(self.cwd), "pattern": "src/*.py"},
@@ -1292,11 +1312,16 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                     {"classification": "accepted", "findings": "\nNo findings.\n"},
                 )
 
-    def test_relative_or_home_shorthand_tool_paths_are_scope_unverified(self) -> None:
+    def test_unproved_relative_or_home_shorthand_paths_are_scope_unverified(
+        self,
+    ) -> None:
         cases = {
             "relative-read": ("Read", {"file_path": "review.py"}),
             "home-read": ("Read", {"file_path": "~/.claude/spill.txt"}),
-            "relative-grep": ("Grep", {"path": "src"}),
+            "home-grep": ("Grep", {"path": "~/.claude"}),
+            "named-home-grep": ("Grep", {"path": "~alice/.ssh"}),
+            "current-home-grep": ("Grep", {"path": "~+/src"}),
+            "previous-home-grep": ("Grep", {"path": "~-/src"}),
             "relative-glob-path": (
                 "Glob",
                 {"path": "src", "pattern": "*.py"},
@@ -1315,6 +1340,31 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                     {
                         "classification": "inconclusive",
                         "reasons": [validator.TOOL_PATH_SCOPE_UNVERIFIED_REASON],
+                    },
+                )
+
+    def test_blocks_relative_grep_escape_and_symlink_escape(self) -> None:
+        outside_dir = self.temporary_root / "outside"
+        outside_dir.mkdir()
+        inside_link = self.cwd / "outside-link"
+        inside_link.symlink_to(outside_dir, target_is_directory=True)
+
+        for name, path_value in (
+            ("parent", "../outside"),
+            ("symlink", "outside-link"),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    self._validate(
+                        self._tool_events(
+                            "Grep",
+                            {"path": path_value},
+                            tool_id=f"toolu-relative-{name}",
+                        )
+                    ),
+                    {
+                        "classification": "blocked",
+                        "reasons": [validator.TOOL_PATH_OUTSIDE_WORKSPACE_REASON],
                     },
                 )
 
@@ -1915,6 +1965,45 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             },
         )
 
+    def test_extended_assistant_message_requires_null_diagnostics(self) -> None:
+        missing = self._full_events()
+        missing_message = missing[1]["message"]
+        assert isinstance(missing_message, dict)
+        del missing_message["diagnostics"]
+        self.assertEqual(
+            self._validate(missing),
+            {
+                "classification": "inconclusive",
+                "reasons": ["intermediate.assistant.message.diagnostics.missing"],
+            },
+        )
+
+        nonnull = self._full_events()
+        nonnull_message = nonnull[1]["message"]
+        assert isinstance(nonnull_message, dict)
+        nonnull_message["diagnostics"] = []
+        self.assertEqual(
+            self._validate(nonnull),
+            {
+                "classification": "inconclusive",
+                "reasons": ["intermediate.assistant.message.diagnostics.nonnull"],
+            },
+        )
+
+    def test_legacy_assistant_message_rejects_extended_diagnostics(self) -> None:
+        events = self._legacy_events("2.1.215")
+        message = events[1]["message"]
+        assert isinstance(message, dict)
+        message["diagnostics"] = None
+
+        self.assertEqual(
+            self._validate(events, claude_code_version="2.1.215"),
+            {
+                "classification": "inconclusive",
+                "reasons": ["intermediate.assistant.message.unknown-field"],
+            },
+        )
+
     def test_rejects_malformed_intermediate_nested_shapes(self) -> None:
         cases: dict[str, dict[str, object]] = {}
         assistant_usage = copy.deepcopy(self.progress_event)
@@ -2455,7 +2544,6 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "output_style": "compact",
             "agents": ["Explore", "claude", "general-purpose", "Plan"],
             "capabilities": ["msg_lifecycle_v1", "interrupt_receipt_v1"],
-            "analytics_disabled": False,
             "fast_mode_state": "on",
         }
 
@@ -2469,11 +2557,13 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 self.assertIn(f"init.{field_name}.mismatch", outcome["reasons"])
                 self.assertNotIn("findings", outcome)
 
-    def test_extended_profile_accepts_either_feedback_boolean(self) -> None:
-        events = self._full_events()
-        events[0]["product_feedback_disabled"] = True
+    def test_extended_profile_accepts_either_policy_boolean(self) -> None:
+        for field_name in ("analytics_disabled", "product_feedback_disabled"):
+            with self.subTest(field=field_name):
+                events = self._full_events()
+                events[0][field_name] = True
 
-        self.assertEqual(self._validate(events)["classification"], "accepted")
+                self.assertEqual(self._validate(events)["classification"], "accepted")
 
     def test_legacy_profile_rejects_extended_shape(self) -> None:
         events = self._full_events()
@@ -2483,7 +2573,11 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             self._validate(events, claude_code_version="2.1.215"),
             {
                 "classification": "inconclusive",
-                "reasons": ["init.unknown-field", "terminal.unknown-field"],
+                "reasons": [
+                    "init.unknown-field",
+                    "intermediate.assistant.message.unknown-field",
+                    "terminal.unknown-field",
+                ],
             },
         )
 

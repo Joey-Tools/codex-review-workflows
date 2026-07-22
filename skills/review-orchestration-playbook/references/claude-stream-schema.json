@@ -228,8 +228,7 @@
               "failure": "inconclusive"
             },
             "analytics_disabled": {
-              "rule": "constant",
-              "value": true,
+              "rule": "boolean",
               "failure": "inconclusive"
             },
             "product_feedback_disabled": {
@@ -549,14 +548,28 @@
           "minimum_inclusive": "2.1.211",
           "maximum_exclusive": "2.1.216"
         },
-        "event_contract": "reviewed-2x"
+        "event_contract": "reviewed-2x",
+        "assistant_message_profile": {
+          "additional_required_fields": [],
+          "field_contracts": {}
+        }
       },
       "extended-2x": {
         "version_range": {
           "minimum_inclusive": "2.1.216",
           "maximum_exclusive": "3.0.0"
         },
-        "event_contract": "reviewed-2x"
+        "event_contract": "reviewed-2x",
+        "assistant_message_profile": {
+          "additional_required_fields": [
+            "diagnostics"
+          ],
+          "field_contracts": {
+            "diagnostics": {
+              "rule": "null"
+            }
+          }
+        }
       }
     }
   },
