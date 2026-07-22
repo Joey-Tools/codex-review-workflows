@@ -2100,6 +2100,7 @@ class RepositoryContractTest(unittest.TestCase):
         )
 
     def test_named_lanes_materialize_before_the_first_status_query(self) -> None:
+        policy_scope_root = _repository_policy_scope_root(REPO_ROOT, CI_PROFILE)
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
             encoding="utf-8"
@@ -2113,14 +2114,17 @@ class RepositoryContractTest(unittest.TestCase):
         readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
             encoding="utf-8"
         )
-        reviewer = (REPO_ROOT / "agents/reviewer.toml").read_text(encoding="utf-8")
-        repository_policy = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
-        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-        delivery = (REPO_ROOT / "skills/change-delivery-workflow/SKILL.md").read_text(
+        reviewer = (policy_scope_root / "agents/reviewer.toml").read_text(
             encoding="utf-8"
         )
+        repository_policy = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
+            encoding="utf-8"
+        )
+        delivery = (
+            policy_scope_root / "skills/change-delivery-workflow/SKILL.md"
+        ).read_text(encoding="utf-8")
 
-        for name, content in {
+        documents = {
             "skill": skill,
             "lane contracts": contracts,
             "Claude lane": claude,
@@ -2128,9 +2132,14 @@ class RepositoryContractTest(unittest.TestCase):
             "PR readiness": readiness,
             "reviewer profile": reviewer,
             "repository policy": repository_policy,
-            "README": readme,
             "delivery entrypoint": delivery,
-        }.items():
+        }
+        if CI_PROFILE == "canonical":
+            documents["README"] = (REPO_ROOT / "README.md").read_text(
+                encoding="utf-8"
+            )
+
+        for name, content in documents.items():
             with self.subTest(document=name):
                 self.assertIn("materialize-worktree", content)
                 self.assertIn("validate-worktree", content)
