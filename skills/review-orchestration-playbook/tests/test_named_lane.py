@@ -1461,6 +1461,72 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("cannot read common.py", completed.stdout)
 
+    @unittest.skipUnless(
+        hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"),
+        "requires POSIX FIFO support",
+    )
+    def test_entrypoint_bound_source_fifo_swap_fails_without_blocking(self) -> None:
+        scripts, guard = self.copy_guard_bundle()
+        common = scripts / "review_runtime/common.py"
+        probe = self.root / "guard-fifo-swap-probe.py"
+        probe.write_text(
+            "import os\n"
+            "import pathlib\n"
+            f"guard = pathlib.Path({str(guard)!r})\n"
+            f"common = pathlib.Path({str(common)!r})\n"
+            f"blocked = {common.name!r}\n"
+            "real_open = os.open\n"
+            "requested_flags = []\n"
+            "swapped = False\n"
+            "def guarded_open(path, flags, *args, **kwargs):\n"
+            "    global swapped\n"
+            "    if os.fspath(path) == blocked and not swapped:\n"
+            "        swapped = True\n"
+            "        common.unlink()\n"
+            "        os.mkfifo(common, mode=0o600)\n"
+            "        requested_flags.append(flags)\n"
+            "        flags |= os.O_NONBLOCK\n"
+            "    return real_open(path, flags, *args, **kwargs)\n"
+            "os.open = guarded_open\n"
+            "namespace = {\n"
+            "    '__name__': '_named_lane_guard_probe',\n"
+            "    '__file__': str(guard),\n"
+            "}\n"
+            "try:\n"
+            "    exec(compile(guard.read_bytes(), str(guard), 'exec'), namespace)\n"
+            "except SystemExit as error:\n"
+            "    failure = str(error)\n"
+            "else:\n"
+            "    raise RuntimeError('guard unexpectedly accepted a FIFO source')\n"
+            "finally:\n"
+            "    os.open = real_open\n"
+            "if not swapped or len(requested_flags) != 1:\n"
+            "    raise RuntimeError('fixture did not swap the bound source')\n"
+            "if not requested_flags[0] & os.O_NONBLOCK:\n"
+            "    raise RuntimeError('bound source open omitted O_NONBLOCK')\n"
+            "if 'common.py changed to a non-regular file' not in failure:\n"
+            "    raise RuntimeError(f'unexpected guard failure: {failure}')\n"
+            "print(failure)\n",
+            encoding="utf-8",
+        )
+        completed = subprocess.run(
+            (
+                str(pathlib.Path(sys.executable).resolve()),
+                "-I",
+                "-B",
+                "-S",
+                str(probe),
+            ),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("common.py changed to a non-regular file", completed.stdout)
+
     def test_entrypoint_rolls_back_partial_bound_runtime_modules(self) -> None:
         scripts, guard = self.copy_guard_bundle()
         named_lane = scripts / "review_runtime/named_lane.py"
@@ -5801,6 +5867,49 @@ class NamedLaneGuardTest(unittest.TestCase):
                             stream_limit_bytes=64,
                             inherit_node_extra_ca_certs=True,
                         )
+
+    @unittest.skipUnless(
+        hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"),
+        "requires POSIX FIFO support",
+    )
+    def test_opted_in_node_extra_ca_fifo_swap_fails_without_blocking(self) -> None:
+        node_extra_ca = self.root / "node-extra-ca-swap.pem"
+        node_extra_ca.write_text("certificate fixture\n", encoding="ascii")
+        real_open = os.open
+        requested_flags: list[int] = []
+        swapped = False
+
+        def swap_to_fifo(
+            path: os.PathLike[str] | str,
+            flags: int,
+            *args: object,
+            **kwargs: object,
+        ) -> int:
+            nonlocal swapped
+            if pathlib.Path(path) == node_extra_ca and not swapped:
+                swapped = True
+                node_extra_ca.unlink()
+                os.mkfifo(node_extra_ca, mode=0o600)
+                requested_flags.append(flags)
+                flags |= os.O_NONBLOCK
+            return real_open(path, flags, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                named_lane_runtime.os,
+                "open",
+                side_effect=swap_to_fifo,
+            ),
+            self.assertRaisesRegex(
+                NamedLaneGuardError,
+                "changed during validation",
+            ),
+        ):
+            named_lane_runtime._validate_node_extra_ca_certs(node_extra_ca)
+
+        self.assertTrue(swapped)
+        self.assertEqual(len(requested_flags), 1)
+        self.assertNotEqual(requested_flags[0] & os.O_NONBLOCK, 0)
 
     def test_stream_limit_accepts_exact_limit_and_rejects_one_more_byte(self) -> None:
         (self.repo / "AGENTS.md").write_text("guidance\n", encoding="utf-8")

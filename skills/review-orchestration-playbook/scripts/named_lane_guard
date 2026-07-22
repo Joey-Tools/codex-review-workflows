@@ -186,7 +186,12 @@ def _read_bound_source(
     no_follow = getattr(os, "O_NOFOLLOW", None)
     if no_follow is None:
         raise _fail("this platform cannot open bound sources without following links")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | no_follow
+    nonblocking = getattr(os, "O_NONBLOCK", None)
+    if nonblocking is None:
+        raise _fail("this platform cannot open bound sources without blocking")
+    flags = (
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | no_follow | nonblocking
+    )
     descriptor: int | None = None
     try:
         descriptor = os.open(path.name, flags, dir_fd=directory_descriptor)

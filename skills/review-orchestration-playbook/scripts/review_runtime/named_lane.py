@@ -3467,10 +3467,16 @@ def _validate_node_extra_ca_certs(path: pathlib.Path) -> str:
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
         raise NamedLaneGuardError("Node extra CA validation requires O_NOFOLLOW")
+    nonblocking = getattr(os, "O_NONBLOCK", None)
+    if nonblocking is None:
+        raise NamedLaneGuardError("Node extra CA validation requires O_NONBLOCK")
     try:
         descriptor = os.open(
             path,
-            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | nofollow
+            | nonblocking,
         )
     except OSError as error:
         raise NamedLaneGuardError(
