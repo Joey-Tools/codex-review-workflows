@@ -8274,6 +8274,11 @@ class SyntheticWorkspaceTest(unittest.TestCase):
     def test_source_wip_without_legacy_exemptions_skips_full_head_count_scan(
         self,
     ) -> None:
+        payload = catalog_payload()
+        payload["legacy_exemptions"] = []
+        catalog = synthetic_tokens.parse_catalog_bytes(
+            json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        )
         repo, base = self.new_repo({"README.md": "base\n"})
         (repo / "README.md").write_text("head\n", encoding="utf-8")
         head = self.commit(repo)
@@ -8282,6 +8287,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             repo=repo,
             base=base,
             head=head,
+            catalog=catalog,
             include_source_wip=True,
         )
 
@@ -8290,7 +8296,7 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             "_scan_frozen_tree_values",
             side_effect=AssertionError("unexpected full source HEAD count scan"),
         ):
-            evidence = self.validate(review)
+            evidence = self.validate(review, catalog=catalog)
         self.assertEqual(evidence["synthetic_tokens"]["legacy_counts"], [])
 
     def test_source_wip_only_unregistered_secret_path_is_violation_evidence(
