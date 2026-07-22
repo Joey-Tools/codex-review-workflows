@@ -2038,6 +2038,20 @@ class ExecutableVerificationTest(unittest.TestCase):
                 fetcher=fetcher,
             )
 
+    @staticmethod
+    def _metadata_with(
+        metadata: os.stat_result,
+        *,
+        mode: int | None = None,
+        uid: int | None = None,
+    ) -> os.stat_result:
+        fields = list(metadata)
+        if mode is not None:
+            fields[0] = stat.S_IFMT(metadata.st_mode) | mode
+        if uid is not None:
+            fields[4] = uid
+        return os.stat_result(fields)
+
     def test_accepts_stable_digest_and_returns_resolved_executable(self) -> None:
         link = self.root / "claude"
         link.symlink_to(self.executable)
@@ -2048,6 +2062,197 @@ class ExecutableVerificationTest(unittest.TestCase):
         )
 
         self.assertEqual(verified, self.executable.resolve())
+
+    def test_rejects_group_or_world_writable_executable(self) -> None:
+        for mode in (0o720, 0o702, 0o777):
+            with self.subTest(mode=oct(mode)):
+                self.executable.chmod(mode)
+                with self.assertRaisesRegex(
+                    claude_provenance.ClaudeProvenanceInvalid,
+                    "unsafe mode bits",
+                ):
+                    claude_provenance.verify_release_executable(
+                        self.executable,
+                        self.artifact,
+                    )
+
+    def test_rejects_set_id_executable(self) -> None:
+        resolved = self.executable.resolve(strict=True)
+        original_stat = pathlib.Path.stat
+        for mode in (0o4700, 0o2700):
+            with self.subTest(mode=oct(mode)):
+
+                def stat_with_set_id(
+                    path: pathlib.Path,
+                    *args: object,
+                    **kwargs: object,
+                ) -> os.stat_result:
+                    metadata = original_stat(  # type: ignore[arg-type]
+                        path,
+                        *args,
+                        **kwargs,
+                    )
+                    if path == resolved:
+                        return self._metadata_with(metadata, mode=mode)
+                    return metadata
+
+                with (
+                    mock.patch.object(
+                        pathlib.Path,
+                        "stat",
+                        autospec=True,
+                        side_effect=stat_with_set_id,
+                    ),
+                    self.assertRaisesRegex(
+                        claude_provenance.ClaudeProvenanceInvalid,
+                        "unsafe mode bits",
+                    ),
+                ):
+                    claude_provenance.verify_release_executable(
+                        self.executable,
+                        self.artifact,
+                    )
+
+    def test_rejects_executable_with_untrusted_owner(self) -> None:
+        resolved = self.executable.resolve(strict=True)
+        original_stat = pathlib.Path.stat
+        foreign_uid = max(1, os.geteuid() + 1)
+
+        def stat_with_foreign_owner(
+            path: pathlib.Path,
+            *args: object,
+            **kwargs: object,
+        ) -> os.stat_result:
+            metadata = original_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+            if path == resolved:
+                return self._metadata_with(metadata, uid=foreign_uid)
+            return metadata
+
+        with (
+            mock.patch.object(
+                pathlib.Path,
+                "stat",
+                autospec=True,
+                side_effect=stat_with_foreign_owner,
+            ),
+            self.assertRaisesRegex(
+                claude_provenance.ClaudeProvenanceInvalid,
+                "untrusted owner",
+            ),
+        ):
+            claude_provenance.verify_release_executable(
+                self.executable,
+                self.artifact,
+            )
+
+    def test_rejects_group_or_world_writable_executable_parent(self) -> None:
+        for mode in (0o770, 0o707):
+            with self.subTest(mode=oct(mode)):
+                parent = self.root / f"unsafe-parent-{mode:o}"
+                parent.mkdir(mode=0o700)
+                executable = parent / "claude"
+                executable.write_bytes(self.payload)
+                executable.chmod(0o700)
+                parent.chmod(mode)
+                with self.assertRaisesRegex(
+                    claude_provenance.ClaudeProvenanceInvalid,
+                    "unsafe parent directory",
+                ):
+                    claude_provenance.verify_release_executable(
+                        executable,
+                        self.artifact,
+                    )
+
+    def test_rejects_executable_parent_with_untrusted_owner(self) -> None:
+        resolved_parent = self.executable.resolve(strict=True).parent
+        original_stat = pathlib.Path.stat
+        foreign_uid = max(1, os.geteuid() + 1)
+
+        def stat_with_foreign_owner(
+            path: pathlib.Path,
+            *args: object,
+            **kwargs: object,
+        ) -> os.stat_result:
+            metadata = original_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+            if path == resolved_parent:
+                return self._metadata_with(metadata, uid=foreign_uid)
+            return metadata
+
+        with (
+            mock.patch.object(
+                pathlib.Path,
+                "stat",
+                autospec=True,
+                side_effect=stat_with_foreign_owner,
+            ),
+            self.assertRaisesRegex(
+                claude_provenance.ClaudeProvenanceInvalid,
+                "unsafe parent directory",
+            ),
+        ):
+            claude_provenance.verify_release_executable(
+                self.executable,
+                self.artifact,
+            )
+
+    def test_allows_root_owned_sticky_temp_ancestor(self) -> None:
+        resolved_parent = self.executable.resolve(strict=True).parent
+        original_stat = pathlib.Path.stat
+
+        def stat_with_root_sticky_temp(
+            path: pathlib.Path,
+            *args: object,
+            **kwargs: object,
+        ) -> os.stat_result:
+            metadata = original_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+            if path == resolved_parent:
+                return self._metadata_with(metadata, mode=0o1777, uid=0)
+            return metadata
+
+        with mock.patch.object(
+            pathlib.Path,
+            "stat",
+            autospec=True,
+            side_effect=stat_with_root_sticky_temp,
+        ):
+            verified = claude_provenance.verify_release_executable(
+                self.executable,
+                self.artifact,
+            )
+
+        self.assertEqual(verified, self.executable.resolve())
+
+    def test_parent_identity_change_during_hash_is_inconclusive(self) -> None:
+        parent = self.root / "changing-parent"
+        parent.mkdir(mode=0o700)
+        executable = parent / "claude"
+        executable.write_bytes(self.payload)
+        executable.chmod(0o700)
+        original_hash = claude_provenance._sha256_file_descriptor
+
+        def hash_then_change_parent(handle):  # type: ignore[no-untyped-def]
+            result = original_hash(handle)
+            parent.chmod(0o500)
+            return result
+
+        try:
+            with (
+                mock.patch.object(
+                    claude_provenance,
+                    "_sha256_file_descriptor",
+                    side_effect=hash_then_change_parent,
+                ),
+                self.assertRaisesRegex(
+                    claude_provenance.ClaudeProvenanceInconclusive,
+                    "parent chain changed",
+                ),
+            ):
+                claude_provenance.verify_release_executable(
+                    executable,
+                    self.artifact,
+                )
+        finally:
+            parent.chmod(0o700)
 
     def test_missing_executable_is_inconclusive(self) -> None:
         missing = self.root / "missing-claude"

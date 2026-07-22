@@ -24,6 +24,444 @@ from review_runtime import common  # noqa: E402
 from review_runtime.common import ReviewError  # noqa: E402
 
 
+class StreamingBytesRedactorTest(unittest.TestCase):
+    @staticmethod
+    def redact_in_chunks(
+        redact_values: tuple[str | bytes, ...],
+        chunks: tuple[bytes, ...],
+    ) -> bytes:
+        redactor = common._StreamingBytesRedactor(redact_values)
+        output = bytearray()
+        for chunk in chunks:
+            output.extend(redactor.feed(chunk))
+        output.extend(redactor.finish())
+        return bytes(output)
+
+    def test_normalization_ignores_empty_values_and_sorts_unique_values_by_length(
+        self,
+    ) -> None:
+        unicode_value = "凭据🔒"
+
+        normalized = common._normalize_redact_values(
+            (
+                b"",
+                "",
+                b"prefix",
+                b"prefix-long",
+                b"prefix",
+                unicode_value,
+                os.fsencode(unicode_value),
+            )
+        )
+
+        self.assertEqual(
+            set(normalized),
+            {b"prefix", b"prefix-long", os.fsencode(unicode_value)},
+        )
+        self.assertEqual(
+            [len(value) for value in normalized],
+            sorted((len(value) for value in normalized), reverse=True),
+        )
+        self.assertLess(normalized.index(b"prefix-long"), normalized.index(b"prefix"))
+
+    def test_redacts_prefix_overlaps_across_every_split_position(self) -> None:
+        values = (b"prefix", b"prefix-long", b"prefix")
+        payload = b"<prefix-long>|<prefix>|prefix-longprefix"
+        expected = (
+            b"<"
+            + b"*" * len(b"prefix-long")
+            + b">|<"
+            + b"*" * len(b"prefix")
+            + b">|"
+            + b"*" * len(b"prefix-long")
+            + b"*" * len(b"prefix")
+        )
+
+        for split in range(len(payload) + 1):
+            with self.subTest(split=split):
+                redacted = self.redact_in_chunks(
+                    values,
+                    (payload[:split], payload[split:]),
+                )
+                self.assertEqual(redacted, expected)
+                self.assertEqual(len(redacted), len(payload))
+
+        self.assertEqual(
+            self.redact_in_chunks(values, tuple(bytes((byte,)) for byte in payload)),
+            expected,
+        )
+
+    def test_redacts_unicode_value_across_utf8_byte_splits(self) -> None:
+        value = "凭据🔒"
+        encoded = os.fsencode(value)
+        prefix = "前文:".encode()
+        suffix = ":后文".encode()
+        payload = prefix + encoded + suffix
+        expected = prefix + b"*" * len(encoded) + suffix
+
+        for split in range(len(payload) + 1):
+            with self.subTest(split=split):
+                self.assertEqual(
+                    self.redact_in_chunks((value,), (payload[:split], payload[split:])),
+                    expected,
+                )
+
+    def test_redacts_union_of_offset_overlaps_across_every_split(self) -> None:
+        values = (b"abc", b"bcde")
+        payload = b"abcde"
+        expected = b"*****"
+
+        for split in range(len(payload) + 1):
+            with self.subTest(split=split):
+                self.assertEqual(
+                    self.redact_in_chunks(
+                        values,
+                        (payload[:split], payload[split:]),
+                    ),
+                    expected,
+                )
+
+        self.assertEqual(
+            self.redact_in_chunks(values, tuple(bytes((byte,)) for byte in payload)),
+            expected,
+        )
+
+    def test_redacts_union_of_three_offset_overlaps_across_chunks(self) -> None:
+        self.assertEqual(
+            self.redact_in_chunks(
+                (b"abcde", b"bcdef", b"cdefg"),
+                (b"a", b"bc", b"d", b"ef", b"g"),
+            ),
+            b"*******",
+        )
+
+    def test_fill_byte_cannot_reproduce_the_sensitive_value(self) -> None:
+        self.assertEqual(
+            self.redact_in_chunks((b"***",), (b"before *", b"** after")),
+            b"before ### after",
+        )
+
+    def test_printable_byte_mask_survives_fixed_candidate_exhaustion(self) -> None:
+        occupied = b"*#~^!"
+        redacted = self.redact_in_chunks((occupied,), (occupied,))
+
+        self.assertNotIn(occupied, redacted)
+        self.assertNotIn(b"\x00", redacted)
+        self.assertTrue(redacted.decode("utf-8").isprintable())
+
+    def test_printable_byte_mask_fails_closed_when_all_candidates_exhausted(
+        self,
+    ) -> None:
+        occupied = b"".join(common._PRINTABLE_MASK_BYTES)
+
+        with self.assertRaisesRegex(ReviewError, "printable byte mask alphabet"):
+            common._StreamingBytesRedactor((occupied,))
+
+    def test_rejects_nul_containing_byte_redaction_values(self) -> None:
+        with self.assertRaisesRegex(ReviewError, "must not contain NUL bytes"):
+            common._normalize_redact_values((b"secret\x00value",))
+
+    def test_normal_eof_flushes_nonsecret_tail_but_discard_does_not(self) -> None:
+        redactor = common._StreamingBytesRedactor((b"secret",))
+        emitted = redactor.feed(b"safe-secr")
+
+        self.assertEqual(emitted + redactor.finish(), b"safe-secr")
+
+        redactor = common._StreamingBytesRedactor((b"secret",))
+        emitted = redactor.feed(b"safe-secr")
+        redactor.discard()
+
+        self.assertEqual(emitted, b"safe")
+
+
+class TextRedactionTest(unittest.TestCase):
+    def test_output_values_include_raw_and_json_escaped_forms(self) -> None:
+        value = 'opaque\n"unicode-凭据'
+
+        variants = common.output_redact_values((value,))
+
+        self.assertIn(value, variants)
+        self.assertIn(json.dumps(value, ensure_ascii=True)[1:-1], variants)
+        self.assertIn(json.dumps(value, ensure_ascii=False)[1:-1], variants)
+
+    def test_redacts_raw_repr_and_json_escaped_values(self) -> None:
+        value = 'opaque\n"unicode-凭据'
+        json_escaped = json.dumps(value, ensure_ascii=True)[1:-1]
+        payload = f"raw={value}; json={json_escaped}; repr={value!r}"
+
+        redacted = common.redact_text(payload, (value,))
+
+        self.assertNotIn(value, redacted)
+        self.assertNotIn(json_escaped, redacted)
+        self.assertIn("*", redacted)
+
+    def test_ignores_empty_and_deduplicates_overlapping_values(self) -> None:
+        redacted = common.redact_text(
+            "prefix-long prefix",
+            ("", "prefix", "prefix-long", "prefix"),
+        )
+
+        self.assertNotIn("prefix", redacted)
+        self.assertEqual(len(redacted), len("prefix-long prefix"))
+
+    def test_fill_character_cannot_reproduce_the_sensitive_value(self) -> None:
+        redacted = common.redact_text("before *** after", ("***",))
+
+        self.assertNotIn("***", redacted)
+        self.assertEqual(redacted, "before ### after")
+
+    def test_printable_text_mask_fails_closed_when_all_candidates_exhausted(
+        self,
+    ) -> None:
+        occupied = "".join(common._PRINTABLE_MASK_CHARACTERS)
+
+        with self.assertRaisesRegex(ReviewError, "printable text mask alphabet"):
+            common.redact_text(occupied, (occupied,))
+
+    def test_rejects_scalar_and_non_string_redaction_values(self) -> None:
+        with self.assertRaisesRegex(ReviewError, "iterable of str values"):
+            common.redact_text("payload", "scalar")
+        with self.assertRaisesRegex(ReviewError, "entries must be str values"):
+            common.redact_text("payload", (object(),))  # type: ignore[arg-type]
+        with self.assertRaisesRegex(ReviewError, "must not contain NUL"):
+            common.redact_text("payload", ("secret\x00value",))
+
+
+class AtomicWriteRedactionTest(unittest.TestCase):
+    def test_writer_redacts_before_the_first_storage_sink_call(self) -> None:
+        value = 'opaque\n"writer-secret'
+        escaped = json.dumps(value, ensure_ascii=True)[1:-1]
+        stored: list[str] = []
+
+        def store(_path: pathlib.Path, text: str) -> None:
+            stored.append(text)
+
+        with (
+            mock.patch.object(
+                common,
+                "_write_text_atomic_unredacted",
+                side_effect=store,
+            ) as sink,
+            common.atomic_write_redactions((value,)),
+        ):
+            common.write_json(pathlib.Path("state.json"), {"detail": value})
+
+        sink.assert_called_once()
+        self.assertEqual(len(stored), 1)
+        self.assertNotIn(value, stored[0])
+        self.assertNotIn(escaped, stored[0])
+        self.assertNotIn("\x00", stored[0])
+        self.assertIsInstance(json.loads(stored[0]), dict)
+
+    def test_json_writer_redacts_only_string_values_before_serialization(
+        self,
+    ) -> None:
+        credentials = ("null", "true", "false", "1")
+        stored: list[str] = []
+        value = {
+            "null": None,
+            "true": True,
+            "false": False,
+            "1": 1,
+            "attempt": None,
+            "nested": [*credentials, {"detail": "null true false 1"}],
+        }
+
+        with (
+            mock.patch.object(
+                common,
+                "_write_text_atomic_unredacted",
+                side_effect=lambda _path, text: stored.append(text),
+            ) as sink,
+            common.atomic_write_redactions(credentials),
+        ):
+            common.write_json(pathlib.Path("state.json"), value)
+
+        sink.assert_called_once()
+        self.assertEqual(len(stored), 1)
+        parsed = json.loads(stored[0])
+        self.assertIsNone(parsed["null"])
+        self.assertIs(parsed["true"], True)
+        self.assertIs(parsed["false"], False)
+        self.assertEqual(parsed["1"], 1)
+        self.assertIsNone(parsed["attempt"])
+        for index, credential in enumerate(credentials):
+            self.assertNotEqual(parsed["nested"][index], credential)
+            self.assertNotIn(credential, parsed["nested"][-1]["detail"])
+
+    def test_writer_scope_applies_to_worker_threads(self) -> None:
+        value = "thread-writer-secret"
+        stored: list[str] = []
+
+        with (
+            mock.patch.object(
+                common,
+                "_write_text_atomic_unredacted",
+                side_effect=lambda _path, text: stored.append(text),
+            ),
+            common.atomic_write_redactions((value,)),
+        ):
+            worker = threading.Thread(
+                target=common.write_text_atomic,
+                args=(pathlib.Path("thread.txt"), f"before {value} after"),
+            )
+            worker.start()
+            worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(stored), 1)
+        self.assertNotIn(value, stored[0])
+
+    def test_nested_writer_scopes_restore_only_the_exited_scope(self) -> None:
+        outer_value = "outer-writer-secret"
+        inner_value = "inner-writer-secret"
+        stored: list[str] = []
+        with mock.patch.object(
+            common,
+            "_write_text_atomic_unredacted",
+            side_effect=lambda _path, text: stored.append(text),
+        ):
+            with common.atomic_write_redactions((outer_value,)):
+                with common.atomic_write_redactions((inner_value,)):
+                    common.write_text_atomic(
+                        pathlib.Path("nested.txt"),
+                        f"both {outer_value} {inner_value}",
+                    )
+                common.write_text_atomic(
+                    pathlib.Path("outer.txt"),
+                    f"outer-only {outer_value} {inner_value}",
+                )
+
+        self.assertNotIn(outer_value, stored[0])
+        self.assertNotIn(inner_value, stored[0])
+        self.assertNotIn(outer_value, stored[1])
+        self.assertIn(inner_value, stored[1])
+
+    def test_concurrent_writer_scope_exit_keeps_other_scope_active(self) -> None:
+        first_value = "first-writer-secret"
+        second_value = "second-writer-secret"
+        second_entered = threading.Event()
+        release_second = threading.Event()
+        stored: list[str] = []
+
+        def second_scope() -> None:
+            with common.atomic_write_redactions((second_value,)):
+                second_entered.set()
+                if not release_second.wait(timeout=2):
+                    raise AssertionError("concurrent writer test timed out")
+                common.write_text_atomic(
+                    pathlib.Path("second.txt"),
+                    f"second {second_value}",
+                )
+
+        with mock.patch.object(
+            common,
+            "_write_text_atomic_unredacted",
+            side_effect=lambda _path, text: stored.append(text),
+        ):
+            with common.atomic_write_redactions((first_value,)):
+                worker = threading.Thread(target=second_scope)
+                worker.start()
+                self.assertTrue(second_entered.wait(timeout=2))
+                common.write_text_atomic(
+                    pathlib.Path("both.txt"),
+                    f"both {first_value} {second_value}",
+                )
+            release_second.set()
+            worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(stored), 2)
+        self.assertNotIn(first_value, stored[0])
+        self.assertNotIn(second_value, stored[0])
+        self.assertNotIn(second_value, stored[1])
+
+    def test_enter_signal_after_registration_does_not_leak_scope(self) -> None:
+        interrupted_value = "interrupted-writer-secret"
+        outer_value = "outer-after-interrupt-secret"
+        inner_value = "inner-after-interrupt-secret"
+        stored: list[str] = []
+
+        class AppendThenSignal(list):
+            interrupted = False
+
+            def append(self, value) -> None:
+                super().append(value)
+                if not self.interrupted:
+                    self.interrupted = True
+                    raise common.ForwardedSignal(signal.SIGTERM)
+
+        scopes = AppendThenSignal()
+        with (
+            mock.patch.object(common, "_ATOMIC_WRITE_REDACTION_SCOPES", scopes),
+            mock.patch.object(
+                common,
+                "_write_text_atomic_unredacted",
+                side_effect=lambda _path, text: stored.append(text),
+            ),
+        ):
+            with self.assertRaises(common.ForwardedSignal):
+                with common.atomic_write_redactions((interrupted_value,)):
+                    self.fail("interrupted scope body must not run")
+
+            self.assertEqual(scopes, [])
+            with common.atomic_write_redactions((outer_value,)):
+                with common.atomic_write_redactions((inner_value,)):
+                    worker = threading.Thread(
+                        target=common.write_text_atomic,
+                        args=(
+                            pathlib.Path("after-interrupt.txt"),
+                            f"{interrupted_value} {outer_value} {inner_value}",
+                        ),
+                    )
+                    worker.start()
+                    worker.join(timeout=2)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(scopes, [])
+
+        self.assertEqual(len(stored), 1)
+        self.assertIn(interrupted_value, stored[0])
+        self.assertNotIn(outer_value, stored[0])
+        self.assertNotIn(inner_value, stored[0])
+
+    def test_writer_scope_path_filter_preserves_review_inputs(self) -> None:
+        value = "review-content-coincidence"
+        stored: dict[str, str] = {}
+        with (
+            mock.patch.object(
+                common,
+                "_write_text_atomic_unredacted",
+                side_effect=lambda path, text: stored.__setitem__(path.name, text),
+            ),
+            common.atomic_write_redactions(
+                (value,),
+                path_filter=lambda path: path.name == "state.txt",
+            ),
+        ):
+            common.write_text_atomic(pathlib.Path("state.txt"), value)
+            common.write_text_atomic(pathlib.Path("review.diff"), value)
+
+        self.assertNotIn(value, stored["state.txt"])
+        self.assertEqual(stored["review.diff"], value)
+
+    def test_writer_scope_fails_before_sink_when_mask_alphabet_is_exhausted(
+        self,
+    ) -> None:
+        occupied = "".join(common._PRINTABLE_MASK_CHARACTERS)
+        with (
+            mock.patch.object(
+                common,
+                "_write_text_atomic_unredacted",
+            ) as sink,
+            self.assertRaisesRegex(ReviewError, "printable text mask alphabet"),
+        ):
+            with common.atomic_write_redactions((occupied,)):
+                common.write_text_atomic(pathlib.Path("state.txt"), occupied)
+
+        sink.assert_not_called()
+
+
 def _visible_exception_messages(error: BaseException) -> tuple[str, ...]:
     messages: list[str] = []
     current: BaseException | None = error
@@ -126,11 +564,7 @@ class ForwardedSignalMaskTest(unittest.TestCase):
             nonlocal armed
             if frame.f_code is call_with_owner.__code__:
                 frame.f_trace_opcodes = True
-                if (
-                    event == "opcode"
-                    and armed
-                    and frame.f_lasti in call_result_offsets
-                ):
+                if event == "opcode" and armed and frame.f_lasti in call_result_offsets:
                     armed = False
                     raise interruption
             return trace
@@ -196,7 +630,9 @@ class ChildEnvironmentTest(unittest.TestCase):
             self.assertIsNone(owner.descriptor)
             raise close_error
 
-        with mock.patch.object(common.os, "close", side_effect=fail_after_observing_owner):
+        with mock.patch.object(
+            common.os, "close", side_effect=fail_after_observing_owner
+        ):
             with self.assertRaises(OSError) as raised:
                 owner.close()
             owner.close()
@@ -1447,8 +1883,7 @@ class ChildEnvironmentTest(unittest.TestCase):
             root = pathlib.Path(temporary)
             marker = root / "sitecustomize-executed"
             (root / "sitecustomize.py").write_text(
-                "import pathlib\n"
-                f"pathlib.Path({str(marker)!r}).touch()\n",
+                f"import pathlib\npathlib.Path({str(marker)!r}).touch()\n",
                 encoding="utf-8",
             )
             environment = dict(os.environ)
@@ -1555,9 +1990,7 @@ class ChildEnvironmentTest(unittest.TestCase):
                 compiled.stderr.decode("utf-8", errors="replace"),
             )
             loader_variable = (
-                "DYLD_INSERT_LIBRARIES"
-                if sys.platform == "darwin"
-                else "LD_PRELOAD"
+                "DYLD_INSERT_LIBRARIES" if sys.platform == "darwin" else "LD_PRELOAD"
             )
             target_environment = {
                 loader_variable: str(library),
@@ -1914,9 +2347,7 @@ class ChildEnvironmentTest(unittest.TestCase):
                 mock.patch.object(common, "_process_group_exists", return_value=False),
                 mock.patch.object(common, "signal_process_group") as terminate,
                 mock.patch.object(common.os, "set_blocking"),
-                mock.patch.object(
-                    common, "_wait_descriptor_ready", return_value=True
-                ),
+                mock.patch.object(common, "_wait_descriptor_ready", return_value=True),
                 mock.patch.object(
                     common.os, "read", side_effect=OSError("read failed")
                 ),
@@ -3087,6 +3518,463 @@ class ChildEnvironmentTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ReviewError, "validation failed"):
                     common.resolve_reviewer_executable("codex")
+
+    @mock.patch.object(common.subprocess, "Popen")
+    def test_exhausted_mask_alphabet_fails_before_launch_or_log_creation(
+        self,
+        popen: mock.Mock,
+    ) -> None:
+        occupied = b"".join(common._PRINTABLE_MASK_BYTES)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            stdout_path = root / "stdout.log"
+            stderr_path = root / "stderr.log"
+
+            with self.assertRaisesRegex(ReviewError, "printable byte mask alphabet"):
+                common.run(
+                    (sys.executable, "-c", "pass"),
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    timeout_seconds=5,
+                    output_file_limit_bytes=4096,
+                    redact_values=(occupied,),
+                )
+
+        popen.assert_not_called()
+        self.assertFalse(stdout_path.exists())
+        self.assertFalse(stderr_path.exists())
+
+    @mock.patch.object(common.subprocess, "Popen")
+    def test_invalid_redaction_arguments_fail_before_launch_or_log_creation(
+        self, popen: mock.Mock
+    ) -> None:
+        cases = (
+            (
+                {
+                    "redact_values": "single-value",
+                    "timeout_seconds": 5,
+                    "output_file_limit_bytes": 4096,
+                },
+                "iterable",
+            ),
+            (
+                {
+                    "redact_values": (object(),),
+                    "timeout_seconds": 5,
+                    "output_file_limit_bytes": 4096,
+                },
+                "entries",
+            ),
+            (
+                {
+                    "redact_values": (b"redact-me",),
+                    "timeout_seconds": 5,
+                },
+                "requires output_file_limit_bytes",
+            ),
+            (
+                {
+                    "redact_values": (b"redact-me",),
+                    "output_file_limit_bytes": 4096,
+                },
+                "positive finite timeout_seconds",
+            ),
+        ) + tuple(
+            (
+                {
+                    "redact_values": (b"redact-me",),
+                    "timeout_seconds": timeout,
+                    "output_file_limit_bytes": 4096,
+                },
+                "positive finite timeout_seconds",
+            )
+            for timeout in (0, -1, float("inf"), float("-inf"), float("nan"))
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for index, (arguments, message) in enumerate(cases):
+                with self.subTest(message=message):
+                    stdout_path = root / f"stdout-{index}.log"
+                    stderr_path = root / f"stderr-{index}.log"
+                    stdout_path.write_bytes(b"existing stdout")
+                    stderr_path.write_bytes(b"existing stderr")
+
+                    with self.assertRaisesRegex(ReviewError, message):
+                        common.run(
+                            (sys.executable, "-c", "pass"),
+                            stdout_path=stdout_path,
+                            stderr_path=stderr_path,
+                            **arguments,
+                        )
+
+                    self.assertEqual(stdout_path.read_bytes(), b"existing stdout")
+                    self.assertEqual(stderr_path.read_bytes(), b"existing stderr")
+
+        popen.assert_not_called()
+
+    @mock.patch.object(common.subprocess, "Popen")
+    @mock.patch.object(common.subprocess, "run")
+    def test_nonempty_redaction_requires_logged_paths_before_launch(
+        self, subprocess_run: mock.Mock, popen: mock.Mock
+    ) -> None:
+        with self.assertRaisesRegex(ReviewError, "requires logged output paths"):
+            common.run(
+                (sys.executable, "-c", "pass"),
+                redact_values=(b"redact-me",),
+            )
+
+        subprocess_run.assert_not_called()
+        popen.assert_not_called()
+
+    def test_empty_redaction_values_do_not_require_logged_output(self) -> None:
+        completed = common.run(
+            (sys.executable, "-c", "print('visible')"),
+            redact_values=("", b""),
+        )
+
+        self.assertEqual(completed.stdout, b"visible\n")
+
+    def test_drain_failure_discards_pending_redaction_tail(self) -> None:
+        process = mock.Mock(pid=12345, returncode=0)
+        process.stdout.fileno.return_value = 101
+        process.stderr.fileno.return_value = 102
+        stdout_reads = iter((b"redact-me-prefix", OSError("read failed")))
+
+        def read_output(descriptor: int, _size: int) -> bytes:
+            if descriptor == 101:
+                value = next(stdout_reads)
+                if isinstance(value, Exception):
+                    raise value
+                return value
+            return b""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            stdout_path = root / "stdout.log"
+            with (
+                mock.patch.object(common.subprocess, "Popen", return_value=process),
+                mock.patch.object(common, "_process_group_exists", return_value=False),
+                mock.patch.object(common, "signal_process_group"),
+                mock.patch.object(common, "_release_exec_gate"),
+                mock.patch.object(common, "_await_descriptor_exec_handoff"),
+                mock.patch.object(common.os, "set_blocking"),
+                mock.patch.object(
+                    common,
+                    "_wait_descriptor_ready",
+                    return_value=True,
+                ),
+                mock.patch.object(common.os, "read", side_effect=read_output),
+            ):
+                with self.assertRaises(common.ReviewOutputDrainError):
+                    common.run(
+                        ("reviewer",),
+                        stdout_path=stdout_path,
+                        stderr_path=root / "stderr.log",
+                        timeout_seconds=5,
+                        output_file_limit_bytes=4096,
+                        redact_values=(b"redact-me-prefix-complete",),
+                    )
+
+            self.assertEqual(stdout_path.read_bytes(), b"")
+
+    def test_forwarded_signal_discards_pending_redaction_tail(self) -> None:
+        process = mock.Mock(pid=12345, returncode=None)
+        process.stdout.fileno.return_value = 101
+        process.stderr.fileno.return_value = 102
+        installed: dict[signal.Signals, object] = {}
+        prefix_read = threading.Event()
+        stdout_read = False
+        cleanup_events: list[str] = []
+        original_discard = common._StreamingBytesRedactor.discard
+
+        def install_handler(signum, handler):
+            previous = installed.get(signum, signal.SIG_DFL)
+            installed[signum] = handler
+            return previous
+
+        def wait_output(
+            descriptor: int,
+            *,
+            writable: bool,
+            timeout_seconds: float,
+        ) -> bool:
+            nonlocal stdout_read
+            if descriptor == 101 and not stdout_read:
+                stdout_read = True
+                return True
+            if descriptor == 102:
+                return True
+            time.sleep(0.001)
+            return False
+
+        def read_output(descriptor: int, _size: int) -> bytes:
+            if descriptor == 101:
+                prefix_read.set()
+                return b"redact-me-prefix"
+            return b""
+
+        def wait_for_signal(*, timeout=None):
+            self.assertTrue(prefix_read.wait(timeout=1))
+            handler = installed[signal.SIGTERM]
+            assert callable(handler)
+            handler(signal.SIGTERM, None)
+
+        def block_signals(*, signal_mask_owner=None):
+            cleanup_events.append("block")
+            return None
+
+        def discard_redactor(redactor):
+            cleanup_events.append("discard")
+            return original_discard(redactor)
+
+        process.wait.side_effect = wait_for_signal
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            stdout_path = root / "stdout.log"
+            with (
+                mock.patch.object(common.subprocess, "Popen", return_value=process),
+                mock.patch.object(common.signal, "signal", side_effect=install_handler),
+                mock.patch.object(common, "signal_process_group"),
+                mock.patch.object(common, "terminate_process_group"),
+                mock.patch.object(common, "_release_exec_gate"),
+                mock.patch.object(common, "_await_descriptor_exec_handoff"),
+                mock.patch.object(
+                    common,
+                    "block_forwarded_signals",
+                    side_effect=block_signals,
+                ),
+                mock.patch.object(
+                    common._StreamingBytesRedactor,
+                    "discard",
+                    autospec=True,
+                    side_effect=discard_redactor,
+                ),
+                mock.patch.object(common.os, "set_blocking"),
+                mock.patch.object(
+                    common,
+                    "_wait_descriptor_ready",
+                    side_effect=wait_output,
+                ),
+                mock.patch.object(common.os, "read", side_effect=read_output),
+            ):
+                with self.assertRaises(common.ForwardedSignal):
+                    common.run(
+                        ("reviewer",),
+                        stdout_path=stdout_path,
+                        stderr_path=root / "stderr.log",
+                        timeout_seconds=5,
+                        output_file_limit_bytes=4096,
+                        redact_values=(b"redact-me-prefix-complete",),
+                    )
+
+            self.assertEqual(stdout_path.read_bytes(), b"")
+            self.assertEqual(
+                cleanup_events[-3:],
+                ["block", "discard", "discard"],
+            )
+
+    def test_logged_redaction_covers_stdout_stderr_unicode_and_normal_eof(
+        self,
+    ) -> None:
+        short_value = b"prefix"
+        long_value = b"prefix-long"
+        unicode_value = "凭据🔒"
+        unicode_bytes = os.fsencode(unicode_value)
+        stdout_payload = (
+            b"stdout:" + long_value + b":" + unicode_bytes + b":trailing-pref"
+        )
+        stderr_payload = b"ix:stderr:" + short_value + b":" + long_value
+        normalized = common._normalize_redact_values(
+            (short_value, long_value, unicode_value)
+        )
+
+        def redact(payload: bytes) -> bytes:
+            for value in normalized:
+                payload = payload.replace(value, b"*" * len(value))
+            return payload
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            stdout_path = root / "stdout.log"
+            stderr_path = root / "stderr.log"
+            completed = common.run(
+                (
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os,sys; "
+                        "os.write(1, bytes.fromhex(sys.argv[1])); "
+                        "os.write(2, bytes.fromhex(sys.argv[2]))"
+                    ),
+                    stdout_payload.hex(),
+                    stderr_payload.hex(),
+                ),
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                timeout_seconds=5,
+                output_file_limit_bytes=4096,
+                redact_values=(
+                    b"",
+                    "",
+                    short_value,
+                    long_value,
+                    long_value,
+                    unicode_value,
+                    unicode_bytes,
+                ),
+            )
+
+            expected_stdout = redact(stdout_payload)
+            expected_stderr = redact(stderr_payload)
+            self.assertEqual(stdout_path.read_bytes(), expected_stdout)
+            self.assertEqual(stderr_path.read_bytes(), expected_stderr)
+            self.assertEqual(completed.stdout, expected_stdout)
+            self.assertEqual(completed.stderr, expected_stderr)
+            self.assertEqual(len(completed.stdout), len(stdout_payload))
+            self.assertEqual(len(completed.stderr), len(stderr_payload))
+
+    def test_logged_redaction_masks_json_escaped_values_before_disk_write(
+        self,
+    ) -> None:
+        value = 'opaque\n"unicode-凭据'
+        escaped = json.dumps(value, ensure_ascii=True)[1:-1].encode()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            stdout_path = root / "stdout.log"
+            stderr_path = root / "stderr.log"
+            completed = common.run(
+                (
+                    sys.executable,
+                    "-c",
+                    "import os,sys; data=sys.stdin.buffer.read(); "
+                    "os.write(1, data); os.write(2, data)",
+                ),
+                stdin=escaped,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                timeout_seconds=5,
+                output_file_limit_bytes=4096,
+                redact_values=common.output_redact_values((value,)),
+            )
+
+            expected = b"*" * len(escaped)
+            self.assertEqual(stdout_path.read_bytes(), expected)
+            self.assertEqual(stderr_path.read_bytes(), expected)
+            self.assertEqual(completed.stdout, expected)
+            self.assertEqual(completed.stderr, expected)
+
+    def test_logged_redaction_masks_union_of_offset_overlaps(self) -> None:
+        stdout_payload = b"abcde"
+        stderr_payload = b"--abcde--"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            stdout_path = root / "stdout.log"
+            stderr_path = root / "stderr.log"
+            completed = common.run(
+                (
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os,sys; "
+                        "os.write(1, bytes.fromhex(sys.argv[1])); "
+                        "os.write(2, bytes.fromhex(sys.argv[2]))"
+                    ),
+                    stdout_payload.hex(),
+                    stderr_payload.hex(),
+                ),
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                timeout_seconds=5,
+                output_file_limit_bytes=4096,
+                redact_values=(b"abc", b"bcde"),
+            )
+
+            self.assertEqual(stdout_path.read_bytes(), b"*****")
+            self.assertEqual(stderr_path.read_bytes(), b"--*****--")
+            self.assertEqual(completed.stdout, b"*****")
+            self.assertEqual(completed.stderr, b"--*****--")
+
+    def test_timeout_discards_pending_redaction_tail(self) -> None:
+        value = b"timeout-secret"
+        emitted_prefix = value[:-1]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            stdout_path = root / "stdout.log"
+            with self.assertRaises(common.ReviewTimeoutError):
+                common.run(
+                    (
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os,sys,time; "
+                            "os.write(1, b'safe-' * 16 + bytes.fromhex(sys.argv[1])); "
+                            "time.sleep(5)"
+                        ),
+                        emitted_prefix.hex(),
+                    ),
+                    stdout_path=stdout_path,
+                    stderr_path=root / "stderr.log",
+                    timeout_seconds=0.5,
+                    output_file_limit_bytes=4096,
+                    redact_values=(value,),
+                )
+
+            logged = stdout_path.read_bytes()
+            self.assertIn(b"safe-", logged)
+            self.assertNotIn(emitted_prefix, logged)
+
+    def test_output_limit_counts_raw_bytes_and_keeps_redaction(self) -> None:
+        value = b"limit-secret"
+        payload = b"safe:" + value + b":" + b"x" * 4096
+        limit = 64
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            stdout_path = root / "stdout.log"
+            with self.assertRaises(common.ReviewOutputLimitError):
+                common.run(
+                    (
+                        sys.executable,
+                        "-c",
+                        "import os,sys; os.write(1, bytes.fromhex(sys.argv[1]))",
+                        payload.hex(),
+                    ),
+                    stdout_path=stdout_path,
+                    stderr_path=root / "stderr.log",
+                    timeout_seconds=5,
+                    output_file_limit_bytes=limit,
+                    redact_values=(value,),
+                )
+
+            logged = stdout_path.read_bytes()
+            self.assertNotIn(value, logged)
+            self.assertIn(b"*" * len(value), logged)
+            self.assertLessEqual(len(logged), limit)
+
+    def test_exact_output_limit_preserves_equal_length_redacted_output(self) -> None:
+        value = b"exact-secret"
+        limit = 64
+        payload = value + b"x" * (limit - len(value))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            stdout_path = root / "stdout.log"
+            completed = common.run(
+                (
+                    sys.executable,
+                    "-c",
+                    "import os,sys; os.write(1, bytes.fromhex(sys.argv[1]))",
+                    payload.hex(),
+                ),
+                stdout_path=stdout_path,
+                stderr_path=root / "stderr.log",
+                timeout_seconds=5,
+                output_file_limit_bytes=limit,
+                redact_values=(value,),
+            )
+
+            expected = b"*" * len(value) + b"x" * (limit - len(value))
+            self.assertEqual(completed.stdout, expected)
+            self.assertEqual(stdout_path.read_bytes(), expected)
+            self.assertEqual(len(completed.stdout), limit)
 
 
 if __name__ == "__main__":

@@ -25,13 +25,17 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field, replace
-from typing import Any, BinaryIO, Callable, Iterable, Iterator
+from typing import Any, BinaryIO, Callable, Iterable, Iterator, Mapping
+
+import validate_claude_stream as claude_stream_validator
 
 from .claude_capabilities import (
     CLAUDE_REQUIRED_OPTIONS,
+    ClaudeCapabilities,
     ClaudeCapabilityError,
     ClaudeSafetyContractInvalid,
     ClaudeVersion,
@@ -99,9 +103,11 @@ from .common import (
     ReviewOutputLimitError,
     ReviewProcessLeakError,
     ReviewTimeoutError,
+    atomic_write_redactions,
     child_environment,
     forwarded_signals,
     is_relative_to,
+    output_redact_values,
     read_json,
     reviewer_executable_path,
     resolve_reviewer_executable,
@@ -117,6 +123,7 @@ from .workspace import (
     BoundReviewLock,
     MAX_REVIEW_PROMPT_BYTES,
     ReviewWorkspace,
+    _review_root_for_source,
     build_preflight_evidence,
     encode_preflight_json,
     open_bound_review_lock,
@@ -225,6 +232,9 @@ CLAUDE_MACOS_DURABLE_STAGE_MAX_BYTES = (
 )
 CLAUDE_AUTH_LOGIN_ACTION = "Run `claude auth login`, then retry the review."
 CLAUDE_API_KEY_ACTION = "Unset or replace `ANTHROPIC_API_KEY`, then retry the review."
+CLAUDE_OAUTH_TOKEN_ACTION = (
+    "Unset or replace `CLAUDE_CODE_OAUTH_TOKEN`, then retry the review."
+)
 CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC = (
     "Claude credential refresh persistence also failed; the selected host "
     "credential source changed or could not be safely updated."
@@ -306,7 +316,7 @@ COPILOT_PROBE_OUTPUT_LIMIT_BYTES = 64 * 1024
 REVIEW_ATTEMPT_TIMEOUT_SECONDS = 30 * 60.0
 REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024
 COPILOT_JSONL_RECORD_LIMIT_BYTES = 4 * 1024 * 1024
-LOW_LEVEL_HELPER_REVIEW_CONTRACT = "supplied-diff-no-git"
+LOW_LEVEL_HELPER_REVIEW_CONTRACT = "supplied-diff-private-git"
 NAMED_LANE_ELIGIBLE = False
 CLAUDE_EGRESS_CONSENTS = (
     "explicit-claude-review",
@@ -314,7 +324,28 @@ CLAUDE_EGRESS_CONSENTS = (
 )
 COPILOT_EGRESS_CONSENTS = ("explicit-claude-with-copilot-fallback",)
 CODEX_ENV_KEYS = ("CODEX_HOME", "OPENAI_API_KEY")
-CLAUDE_ENV_KEYS = ("ANTHROPIC_API_KEY", "NODE_EXTRA_CA_CERTS")
+CLAUDE_EXPLICIT_AUTH_ENV_KEYS = (
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+)
+CLAUDE_PROXY_URL_ENV_KEYS = (
+    "ALL_PROXY",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "all_proxy",
+    "https_proxy",
+    "http_proxy",
+)
+CLAUDE_PROXY_USERINFO_SAFE_CHARACTERS = "!$%&'()*+,-._~"
+CLAUDE_PROXY_IGNORED_URL_CONTROLS = str.maketrans("", "", "\t\n\r")
+CLAUDE_PROXY_MINIMUM_STANDALONE_REDACTION_BYTES = 8
+CLAUDE_ENV_KEYS = (*CLAUDE_EXPLICIT_AUTH_ENV_KEYS, "NODE_EXTRA_CA_CERTS")
+CLAUDE_STREAM_ENTITLEMENT_REASONS = frozenset(
+    (
+        "terminal.model-entitlement-denial",
+        "terminal.organization-policy-denial",
+    )
+)
 COPILOT_ENV_KEYS = (
     "COPILOT_GITHUB_TOKEN",
     "GH_TOKEN",
@@ -2230,7 +2261,7 @@ def _prepare_claude_keychain_broker(
     env: dict[str, str],
 ) -> dict[str, str]:
     result = dict(env)
-    if result.get("ANTHROPIC_API_KEY"):
+    if _claude_uses_explicit_auth(result):
         return result
     if not CLAUDE_KEYCHAIN_CLIENT.is_file() or not os.access(
         CLAUDE_KEYCHAIN_CLIENT, os.X_OK
@@ -3685,7 +3716,18 @@ def _claude_review_workspace_roots(
         raise ClaudeCredentialInspectionInconclusive(
             "the Claude review workspace paths are not canonical absolute paths"
         )
-    review_root = source_root / ".codex-tmp"
+    try:
+        canonical_source = source_root.resolve(strict=True)
+        canonical_container = container_root.resolve(strict=True)
+        review_root = _review_root_for_source(canonical_source)
+    except (OSError, RuntimeError, ValueError, ReviewError) as error:
+        raise ClaudeCredentialInspectionInconclusive(
+            "cannot validate the external Claude review workspace roots"
+        ) from error
+    if source_root != canonical_source or container_root != canonical_container:
+        raise ClaudeCredentialInspectionInconclusive(
+            "the Claude review workspace paths are not canonical absolute paths"
+        )
     if container_root.parent != review_root or not container_root.name.startswith(
         "isolated-review-"
     ):
@@ -3731,13 +3773,12 @@ def _retain_claude_macos_refreshed_credential(
         )
     credential_digest = _claude_credential_digest(credential)
     if durable_directories:
-        source_root, review_root, container_root = _claude_review_workspace_roots(
+        _source_root, review_root, container_root = _claude_review_workspace_roots(
             review
         )
         _fsync_claude_runtime_directory(
-            source_root,
-            label="Claude source repository root",
-            require_current_user=False,
+            review_root.parent,
+            label="Claude review namespace root",
         )
         _fsync_claude_runtime_directory(
             review_root,
@@ -6253,10 +6294,7 @@ def _acquire_claude_forwarded_signal_mask(
     main_thread_only: bool,
     signal_mask_owner: _ClaudeSignalMaskOwner | None = None,
 ) -> _ClaudeSignalMaskAcquisition:
-    if (
-        main_thread_only
-        and threading.current_thread() is not threading.main_thread()
-    ):
+    if main_thread_only and threading.current_thread() is not threading.main_thread():
         return _ClaudeSignalMaskAcquisition(
             previous_mask=None,
             error=ClaudeCredentialInspectionInconclusive(
@@ -6264,10 +6302,7 @@ def _acquire_claude_forwarded_signal_mask(
                 "the main thread"
             ),
         )
-    if (
-        os.name != "posix"
-        or not hasattr(signal, "pthread_sigmask")
-    ):
+    if os.name != "posix" or not hasattr(signal, "pthread_sigmask"):
         return _ClaudeSignalMaskAcquisition(previous_mask=None, error=None)
 
     try:
@@ -8390,7 +8425,7 @@ def _claude_keychain_runtime(
     process_quiescent: Callable[[], bool] | None = None,
 ) -> Iterator[dict[str, str]]:
     result = dict(env)
-    if result.get("ANTHROPIC_API_KEY"):
+    if _claude_uses_explicit_auth(result):
         yield result
         return
     if refresh_lock_protocol is None:
@@ -9548,6 +9583,7 @@ def _claude_keychain_runtime_coordinated(
             nonlocal quiescence_recovery_proven
             nonlocal quiescence_recovery_replaces_existing
             nonlocal quiescence_recovery_expectation
+
             def publish_latest() -> bool:
                 nonlocal durable_stage_inflight, staged_credential
                 nonlocal staged_credential_generation
@@ -13088,6 +13124,259 @@ def _review_environment(
     )
 
 
+def _claude_authentication_source(env: Mapping[str, str]) -> str:
+    if env.get("ANTHROPIC_API_KEY"):
+        return "api-key"
+    if env.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        return "oauth-token"
+    return "local-login"
+
+
+def _claude_uses_explicit_auth(env: Mapping[str, str]) -> bool:
+    return _claude_authentication_source(env) != "local-login"
+
+
+def _strict_proxy_component_unquote(value: str) -> str:
+    if re.search(r"%(?![0-9A-Fa-f]{2})", value):
+        raise ReviewError(
+            "credential-bearing proxy URL cannot be safely normalized for output "
+            "redaction"
+        )
+    try:
+        decoded = urllib.parse.unquote_to_bytes(value).decode("utf-8")
+    except (UnicodeDecodeError, UnicodeEncodeError) as error:
+        raise ReviewError(
+            "credential-bearing proxy URL cannot be safely normalized for output "
+            "redaction"
+        ) from error
+    if "\x00" in decoded:
+        raise ReviewError(
+            "credential-bearing proxy URL cannot be safely normalized for output "
+            "redaction"
+        )
+    return decoded
+
+
+def _proxy_percent_escape_case(value: str, *, upper: bool) -> str:
+    def replace_escape(match: re.Match[str]) -> str:
+        escape = match.group(0)
+        return escape.upper() if upper else escape.lower()
+
+    return re.sub(r"%[0-9A-Fa-f]{2}", replace_escape, value)
+
+
+def _proxy_quote_preserving_escapes(value: str) -> str:
+    output: list[str] = []
+    start = 0
+    for escape in re.finditer(r"%[0-9A-Fa-f]{2}", value):
+        if escape.start() > start:
+            output.append(
+                urllib.parse.quote(
+                    value[start : escape.start()],
+                    safe=CLAUDE_PROXY_USERINFO_SAFE_CHARACTERS,
+                )
+            )
+        output.append(escape.group(0))
+        start = escape.end()
+    if start < len(value):
+        output.append(
+            urllib.parse.quote(
+                value[start:],
+                safe=CLAUDE_PROXY_USERINFO_SAFE_CHARACTERS,
+            )
+        )
+    return "".join(output)
+
+
+def _proxy_component_redact_values(value: str) -> tuple[str, ...]:
+    without_controls = value.translate(CLAUDE_PROXY_IGNORED_URL_CONTROLS)
+    decoded = _strict_proxy_component_unquote(without_controls)
+    without_diagnostic_controls = "".join(
+        character
+        for character in without_controls
+        if unicodedata.category(character) != "Cc"
+    )
+    decoded_without_diagnostic_controls = "".join(
+        character for character in decoded if unicodedata.category(character) != "Cc"
+    )
+    encoded = urllib.parse.quote(
+        decoded,
+        safe=CLAUDE_PROXY_USERINFO_SAFE_CHARACTERS,
+    )
+    diagnostic_encoded = urllib.parse.quote(
+        decoded_without_diagnostic_controls,
+        safe=CLAUDE_PROXY_USERINFO_SAFE_CHARACTERS,
+    )
+    preserving_encoded = _proxy_quote_preserving_escapes(without_controls)
+    diagnostic_preserving_encoded = _proxy_quote_preserving_escapes(
+        without_diagnostic_controls
+    )
+    variants = tuple(
+        dict.fromkeys(
+            item
+            for item in (
+                value,
+                without_controls,
+                _proxy_percent_escape_case(without_controls, upper=True),
+                _proxy_percent_escape_case(without_controls, upper=False),
+                without_diagnostic_controls,
+                decoded,
+                decoded_without_diagnostic_controls,
+                encoded,
+                _proxy_percent_escape_case(encoded, upper=False),
+                preserving_encoded,
+                _proxy_percent_escape_case(preserving_encoded, upper=True),
+                _proxy_percent_escape_case(preserving_encoded, upper=False),
+                diagnostic_encoded,
+                _proxy_percent_escape_case(diagnostic_encoded, upper=False),
+                diagnostic_preserving_encoded,
+                _proxy_percent_escape_case(
+                    diagnostic_preserving_encoded,
+                    upper=True,
+                ),
+                _proxy_percent_escape_case(
+                    diagnostic_preserving_encoded,
+                    upper=False,
+                ),
+            )
+            if item
+        )
+    )
+    try:
+        minimum_size = min(len(os.fsencode(item)) for item in variants)
+    except UnicodeEncodeError as error:
+        raise ReviewError(
+            "credential-bearing proxy URL cannot be safely normalized for output "
+            "redaction"
+        ) from error
+    if minimum_size < CLAUDE_PROXY_MINIMUM_STANDALONE_REDACTION_BYTES:
+        raise ReviewError(
+            "credential-bearing proxy URL contains a credential component too "
+            "short for safe output redaction"
+        )
+    return variants
+
+
+def _proxy_url_userinfo(value: str) -> tuple[str | None, bool]:
+    special_match = re.match(r"(?is)^https?:(.*)$", value)
+    if special_match is not None:
+        authority = special_match.group(1).lstrip("/\\")
+    else:
+        _scheme, separator, remainder = value.partition("://")
+        authority = remainder if separator else value
+    for delimiter in ("/", "\\", "?", "#"):
+        authority = authority.partition(delimiter)[0]
+    userinfo, separator, _host = authority.rpartition("@")
+    if not separator:
+        return None, False
+    if not userinfo:
+        return None, True
+    normalized_userinfo = userinfo.translate(CLAUDE_PROXY_IGNORED_URL_CONTROLS)
+    username, password_separator, password = normalized_userinfo.partition(":")
+    if password_separator:
+        return (userinfo if username or password else None), True
+    return (userinfo if normalized_userinfo else None), True
+
+
+def _proxy_url_redact_values(value: str) -> tuple[str, ...]:
+    candidate = value.strip()
+    if not candidate:
+        return ()
+    normalized_candidate = candidate.translate(CLAUDE_PROXY_IGNORED_URL_CONTROLS)
+    diagnostic_candidate = "".join(
+        character
+        for character in normalized_candidate
+        if unicodedata.category(character) != "Cc"
+    )
+    candidates = tuple(
+        dict.fromkeys((candidate, normalized_candidate, diagnostic_candidate))
+    )
+    parsed_userinfos = tuple(_proxy_url_userinfo(current) for current in candidates)
+    userinfos = tuple(
+        dict.fromkeys(
+            userinfo
+            for userinfo, _authority_at_seen in parsed_userinfos
+            if userinfo is not None
+        )
+    )
+    if not userinfos:
+        authority_at_seen = any(observed for _userinfo, observed in parsed_userinfos)
+        if "@" in diagnostic_candidate and (
+            not authority_at_seen or diagnostic_candidate.count("@") != 1
+        ):
+            raise ReviewError(
+                "proxy URL contains an ambiguous credential delimiter and cannot "
+                "be safely redacted"
+            )
+        return ()
+    values = [value, *candidates]
+    for userinfo in userinfos:
+        values.extend(_proxy_component_redact_values(userinfo))
+        username, password_separator, password = userinfo.partition(":")
+        if not password_separator:
+            continue
+        if password:
+            values.extend(_proxy_component_redact_values(password))
+            normalized_username = username.translate(CLAUDE_PROXY_IGNORED_URL_CONTROLS)
+            normalized_password = password.translate(CLAUDE_PROXY_IGNORED_URL_CONTROLS)
+            canonical_userinfo = (
+                urllib.parse.quote(
+                    _strict_proxy_component_unquote(normalized_username),
+                    safe=CLAUDE_PROXY_USERINFO_SAFE_CHARACTERS,
+                )
+                + ":"
+                + urllib.parse.quote(
+                    _strict_proxy_component_unquote(normalized_password),
+                    safe=CLAUDE_PROXY_USERINFO_SAFE_CHARACTERS,
+                )
+            )
+            values.extend(
+                (
+                    canonical_userinfo,
+                    _proxy_percent_escape_case(canonical_userinfo, upper=False),
+                )
+            )
+        elif username:
+            values.extend(_proxy_component_redact_values(username))
+    return tuple(dict.fromkeys(item for item in values if item))
+
+
+def claude_output_redact_values(environment: Mapping[str, str]) -> tuple[str, ...]:
+    """Return the winning Claude credential and proxy transports for redaction."""
+
+    values: list[str] = []
+    if value := environment.get("ANTHROPIC_API_KEY"):
+        values.append(value)
+    elif value := environment.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        values.append(value)
+    for key in CLAUDE_PROXY_URL_ENV_KEYS:
+        if value := environment.get(key):
+            values.extend(_proxy_url_redact_values(value))
+    return tuple(dict.fromkeys(values))
+
+
+def _select_claude_authentication(env: Mapping[str, str]) -> dict[str, str]:
+    """Select one explicit source without retaining the losing credential."""
+
+    selected = dict(env)
+    if selected.get("ANTHROPIC_API_KEY"):
+        selected.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    elif selected.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        selected.pop("ANTHROPIC_API_KEY", None)
+    else:
+        for key in CLAUDE_EXPLICIT_AUTH_ENV_KEYS:
+            selected.pop(key, None)
+    return selected
+
+
+def _claude_authentication_action(source: str) -> str:
+    if source == "api-key":
+        return CLAUDE_API_KEY_ACTION
+    if source == "oauth-token":
+        return CLAUDE_OAUTH_TOKEN_ACTION
+    return CLAUDE_AUTH_LOGIN_ACTION
+
+
 def _with_executable_path(
     env: dict[str, str],
     executable: pathlib.Path,
@@ -13136,7 +13425,7 @@ def _with_claude_review_tool_path(
         except InvalidReviewerExecutable as error:
             raise ClaudeReviewToolUnavailable(str(error)) from error
     entries: list[pathlib.Path] = []
-    if not _is_claude_linux_host() and not env.get("ANTHROPIC_API_KEY"):
+    if not _is_claude_linux_host() and not _claude_uses_explicit_auth(env):
         broker_dir = (
             review.container_dir.resolve() / "claude-runtime" / "keychain-broker"
         )
@@ -13555,7 +13844,7 @@ def _claude_review_sandbox_profile(
             tls_dirs.update((path.absolute(), resolved))
     auth_executables: tuple[pathlib.Path, ...] = ()
     keychain_broker_port: int | None = None
-    if not env.get("ANTHROPIC_API_KEY"):
+    if not _claude_uses_explicit_auth(env):
         broker_dir = container / "claude-runtime" / "keychain-broker"
         security_candidate = next(
             (
@@ -13755,7 +14044,9 @@ def _require_claude_identity(
 def _require_claude_safe_mode(
     executable: pathlib.Path,
     env: dict[str, str],
-) -> None:
+    *,
+    version: ClaudeVersion | None = None,
+) -> ClaudeCapabilities | None:
     completed = _run_claude_probe(executable, env, "--help")
     help_text = (completed.stdout + b"\n" + completed.stderr).decode(
         "utf-8", errors="replace"
@@ -13765,11 +14056,14 @@ def _require_claude_safe_mode(
             "Claude Code help probe failed before capability validation"
         )
     try:
-        validate_claude_help(help_text)
+        required_options, safe_mode_summary = validate_claude_help(help_text)
     except ClaudeSafetyContractInvalid as error:
         raise ClaudeSafeModeContractInvalid(str(error)) from error
     except ClaudeCapabilityError as error:
         raise InvalidReviewerExecutable(str(error)) from error
+    if version is None:
+        return None
+    return ClaudeCapabilities(version, required_options, safe_mode_summary)
 
 
 def classify_failure(stdout: bytes | str, stderr: bytes | str) -> str:
@@ -14017,6 +14311,181 @@ def _parse_claude_output(
     if _structured_error_text(stdout).strip():
         return None, effective_model
     return final_text, effective_model
+
+
+def _validate_claude_stream_handle(
+    handle: BinaryIO,
+    *,
+    review: ReviewWorkspace,
+    expected_runtime_cwd: str,
+    requested_model: str,
+    runtime_binding: Any | None = None,
+    process_returncode: int,
+) -> dict[str, Any]:
+    if runtime_binding is None:
+        return {
+            "classification": "inconclusive",
+            "reasons": ["runtime.binding-missing"],
+        }
+    try:
+        handle.flush()
+        before = os.fstat(handle.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            return {
+                "classification": "inconclusive",
+                "reasons": ["stream.capture-not-regular-file"],
+            }
+        handle.seek(0)
+        result = claude_stream_validator.validate_claude_stream(
+            handle,
+            host_workspace_cwd=review.workspace_root,
+            expected_runtime_cwd=expected_runtime_cwd,
+            requested_model=requested_model,
+            runtime_binding=runtime_binding,
+            process_returncode=process_returncode,
+        )
+        after = os.fstat(handle.fileno())
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return {
+            "classification": "inconclusive",
+            "reasons": ["stream.capture-read-failed"],
+        }
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if before_identity != after_identity:
+        return {
+            "classification": "inconclusive",
+            "reasons": ["stream.capture-changed-during-validation"],
+        }
+    if not isinstance(result, dict):
+        return {
+            "classification": "inconclusive",
+            "reasons": ["stream.validator-result-invalid"],
+        }
+    return result
+
+
+def _validate_claude_stream_output_file(
+    path: pathlib.Path,
+    *,
+    review: ReviewWorkspace,
+    expected_runtime_cwd: str,
+    requested_model: str,
+    runtime_binding: Any | None,
+    process_returncode: int,
+) -> dict[str, Any]:
+    no_follow_flag = getattr(os, "O_NOFOLLOW", None)
+    if no_follow_flag is None:
+        return {
+            "classification": "inconclusive",
+            "reasons": ["stream.capture-no-follow-unavailable"],
+        }
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | no_follow_flag
+    )
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            descriptor = None
+            return _validate_claude_stream_handle(
+                handle,
+                review=review,
+                expected_runtime_cwd=expected_runtime_cwd,
+                requested_model=requested_model,
+                runtime_binding=runtime_binding,
+                process_returncode=process_returncode,
+            )
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return {
+            "classification": "inconclusive",
+            "reasons": ["stream.capture-open-failed"],
+        }
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _validate_claude_attempt_stream(
+    *,
+    completed: Completed,
+    output: AttemptOutput,
+    review: ReviewWorkspace,
+    expected_runtime_cwd: str,
+    requested_model: str,
+    runtime_binding: Any | None,
+) -> dict[str, Any]:
+    try:
+        output.ensure_captured(completed)
+        if output.stdout_file is None:
+            return _validate_claude_stream_output_file(
+                output.stdout_path,
+                review=review,
+                expected_runtime_cwd=expected_runtime_cwd,
+                requested_model=requested_model,
+                runtime_binding=runtime_binding,
+                process_returncode=completed.returncode,
+            )
+        return _validate_claude_stream_handle(
+            output.stdout_file,
+            review=review,
+            expected_runtime_cwd=expected_runtime_cwd,
+            requested_model=requested_model,
+            runtime_binding=runtime_binding,
+            process_returncode=completed.returncode,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return {
+            "classification": "inconclusive",
+            "reasons": ["stream.validation-failed"],
+        }
+
+
+def _claude_stream_attempt_category(result: Mapping[str, Any]) -> str:
+    classification = result.get("classification")
+    if classification == "accepted":
+        findings = result.get("findings")
+        return (
+            "success"
+            if isinstance(findings, str) and findings.strip()
+            else "runtime-unverified"
+        )
+    if classification == "blocked-authentication":
+        return "auth"
+    reasons = result.get("reasons")
+    reason_set = (
+        frozenset(reasons)
+        if isinstance(reasons, list)
+        and reasons
+        and all(isinstance(reason, str) for reason in reasons)
+        else frozenset()
+    )
+    if (
+        classification == "blocked"
+        and reason_set
+        and reason_set <= CLAUDE_STREAM_ENTITLEMENT_REASONS
+    ):
+        return "entitlement"
+    if classification == "blocked":
+        return "permission-mismatch"
+    return "runtime-unverified"
 
 
 def _copilot_item_model_evidence(
@@ -14593,7 +15062,15 @@ def _claude_persistence_failed_attempt(
     completed: Completed,
     output: AttemptOutput,
     category: str = "blocked-authentication",
+    stream_validation: Mapping[str, Any] | None = None,
 ) -> Attempt:
+    stream_category = (
+        _claude_stream_attempt_category(stream_validation)
+        if stream_validation is not None
+        else None
+    )
+    if stream_category is not None:
+        category = "auth" if stream_category == "auth" else "inconclusive"
     try:
         output.ensure_captured(completed)
     except (OSError, ReviewError):
@@ -14601,7 +15078,13 @@ def _claude_persistence_failed_attempt(
     try:
         output.append_stderr(
             "Claude credential refresh persistence was not safely completed after "
-            "the runtime attempt.",
+            "the runtime attempt."
+            + (
+                " The canonical stream classification was preserved as "
+                f"{stream_validation.get('classification')!r}."
+                if stream_validation is not None
+                else ""
+            ),
         )
     except (OSError, ReviewError):
         pass
@@ -14627,8 +15110,12 @@ def _claude_auth_rejection_after_credential_inspection(
     completed: Completed,
     output: AttemptOutput,
     inspection_error: BaseException,
+    stream_validation: Mapping[str, Any] | None = None,
 ) -> BaseException | None:
-    if classify_failure(completed.stdout, completed.stderr) != "auth":
+    if (
+        stream_validation is None
+        or _claude_stream_attempt_category(stream_validation) != "auth"
+    ):
         return None
     failure = ClaudeKeychainCredentialUnavailable(
         "the restricted Claude runtime rejected the configured credential; "
@@ -14644,6 +15131,7 @@ def _claude_auth_rejection_after_credential_inspection(
             completed=completed,
             output=output,
             category="auth",
+            stream_validation=stream_validation,
         ),
     )
     effective_failure = _propagate_claude_persistence_state(
@@ -14657,6 +15145,56 @@ def _claude_auth_rejection_after_credential_inspection(
         failure,
         inspection_error,
     )
+
+
+def _claude_post_attempt_credential_failure(
+    *,
+    review: ReviewWorkspace,
+    index: int,
+    model: str,
+    completed: Completed,
+    output: AttemptOutput,
+    inspection_error: BaseException,
+    stream_validation: Mapping[str, Any],
+    platform: str,
+) -> BaseException:
+    authentication_error = _claude_auth_rejection_after_credential_inspection(
+        review=review,
+        index=index,
+        model=model,
+        completed=completed,
+        output=output,
+        inspection_error=inspection_error,
+        stream_validation=stream_validation,
+    )
+    if authentication_error is not None:
+        return authentication_error
+    failure = ClaudeCredentialInspectionInconclusive(
+        f"Claude {platform} post-attempt credential persistence was "
+        f"inconclusive: {inspection_error}"
+    )
+    setattr(failure, "_codex_claude_refresh_persistence_failed", True)
+    effective_failure = _propagate_claude_persistence_state(
+        review,
+        inspection_error,
+        failure,
+    )
+    if effective_failure is not failure:
+        return effective_failure
+    setattr(
+        failure,
+        "_codex_claude_persistence_attempt",
+        _claude_persistence_failed_attempt(
+            review=review,
+            index=index,
+            model=model,
+            completed=completed,
+            output=output,
+            category="inconclusive",
+            stream_validation=stream_validation,
+        ),
+    )
+    return failure
 
 
 def _record_attempt(
@@ -14903,6 +15441,7 @@ def _resolve_validated_claude_executable(
     *,
     review: ReviewWorkspace,
     env: dict[str, str],
+    runtime_binding_sink: list[Any] | None = None,
 ) -> tuple[pathlib.Path | None, dict[str, str]]:
     linux_host = _claude_linux_host() if _is_claude_linux_host() else None
     if linux_host is not None:
@@ -14940,6 +15479,7 @@ def _resolve_validated_claude_executable(
     probe_home.chmod(0o700)
     runtime_reports: dict[str, dict[str, object]] = {}
     runtime_executables: dict[str, pathlib.Path] = {}
+    runtime_bindings: dict[str, Any] = {}
 
     def validate_candidate(candidate: pathlib.Path) -> None:
         if linux_host is not None:
@@ -14990,9 +15530,33 @@ def _resolve_validated_claude_executable(
             home=probe_home,
             tmp=claude_tmp,
         )
-        _require_claude_safe_mode(verified_executable, candidate_env)
+        capabilities = _require_claude_safe_mode(
+            verified_executable,
+            candidate_env,
+            version=version,
+        )
         runtime_executables[str(candidate.absolute())] = verified_executable
-        if isinstance(verified, VerifiedClaudeExecutable):
+        if isinstance(verified, VerifiedClaudeExecutable) and capabilities is not None:
+            try:
+                runtime_bindings[str(candidate.absolute())] = (
+                    claude_stream_validator.runtime_binding_from_verified_executable(
+                        verified,
+                        capabilities=capabilities,
+                        authentication_source=_claude_authentication_source(
+                            prepared_env
+                        ),
+                        launch_profile=(
+                            "helper-linux"
+                            if linux_host is not None
+                            else "helper-darwin"
+                        ),
+                    )
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "cannot bind the verified Claude runtime to its canonical "
+                    "stream contract"
+                ) from error
             lock_protocol = certified_claude_refresh_lock_protocol(
                 version=verified.artifact.version,
                 platform_key=verified.artifact.platform_key,
@@ -15028,21 +15592,17 @@ def _resolve_validated_claude_executable(
                     "status": "pending-runtime-launch",
                 },
                 "authentication": {
-                    "source": (
-                        "api-key"
-                        if prepared_env.get("ANTHROPIC_API_KEY")
-                        else "pending"
-                    ),
+                    "source": _claude_authentication_source(prepared_env),
                     "carrier": (
                         "environment"
-                        if prepared_env.get("ANTHROPIC_API_KEY")
+                        if _claude_uses_explicit_auth(prepared_env)
                         else (
                             "writable-private-config-guarded-writeback"
                             if _is_claude_linux_host()
                             else "one-shot-security-broker"
                         )
                     ),
-                    "status": "pending",
+                    "status": "configured",
                 },
             }
 
@@ -15053,6 +15613,8 @@ def _resolve_validated_claude_executable(
     except RejectedReviewerCandidates as error:
         raise ClaudeExecutableUnavailable(str(error)) from error
     if executable is None:
+        if runtime_binding_sink is not None:
+            runtime_binding_sink.clear()
         return None, prepared_env
     report = runtime_reports.get(str(executable.absolute()))
     if report is not None:
@@ -15061,6 +15623,11 @@ def _resolve_validated_claude_executable(
         str(executable.absolute()),
         executable,
     )
+    if runtime_binding_sink is not None:
+        runtime_binding_sink.clear()
+        runtime_binding = runtime_bindings.get(str(executable.absolute()))
+        if runtime_binding is not None:
+            runtime_binding_sink.append(runtime_binding)
     return runtime_executable, _with_executable_path(
         prepared_env,
         runtime_executable,
@@ -15115,8 +15682,8 @@ def _claude_linux_review_runtime(
     ca_bundle = _claude_linux_ca_bundle(review, env)
     with contextlib.ExitStack() as stack:
         auth_env: dict[str, str] = {}
-        api_key = env.get("ANTHROPIC_API_KEY")
-        if api_key:
+        authentication_source = _claude_authentication_source(env)
+        if authentication_source != "local-login":
             api_carrier = _create_or_validate_claude_runtime_directory(
                 _claude_linux_private_directory(review, "api-carrier"),
                 private=True,
@@ -15125,7 +15692,12 @@ def _claude_linux_review_runtime(
                 api_carrier / "config",
                 private=True,
             )
-            auth_env["ANTHROPIC_API_KEY"] = api_key
+            explicit_key = (
+                "ANTHROPIC_API_KEY"
+                if authentication_source == "api-key"
+                else "CLAUDE_CODE_OAUTH_TOKEN"
+            )
+            auth_env[explicit_key] = env[explicit_key]
         else:
             if refresh_lock_protocol is None:
                 raise ClaudeExecutableInspectionInconclusive(
@@ -15181,10 +15753,10 @@ def _claude_linux_review_runtime(
                 "phase": "runtime-ready",
                 "outer_sandbox": {"status": "isolation-probe-verified"},
                 "authentication": {
-                    "source": "api-key" if api_key else "credential-file",
+                    "source": authentication_source,
                     "carrier": (
                         "environment"
-                        if api_key
+                        if authentication_source != "local-login"
                         else "writable-private-config-guarded-writeback"
                     ),
                     "status": "sandbox-auth-staged",
@@ -15227,7 +15799,8 @@ def _claude_review_arguments(
         "--permission-mode",
         permission_mode,
         "--output-format",
-        "json",
+        "stream-json",
+        "--verbose",
         "--no-session-persistence",
         "--safe-mode",
         "--no-chrome",
@@ -15296,6 +15869,7 @@ def _replace_claude_prompt_host_path(
         right_ok = end == len(prompt) or prompt[end] in (
             CLAUDE_PROMPT_PATH_RIGHT_BOUNDARIES
         )
+        trailing_sentence_period = False
         if not right_ok and allow_descendants and prompt[end : end + 1] == b"/":
             preceding = prompt[occurrence - 1] if occurrence else None
             quote = (
@@ -15333,11 +15907,17 @@ def _replace_claude_prompt_host_path(
             right_ok = end + 1 == len(prompt) or prompt[end + 1] in (
                 CLAUDE_PROMPT_PATH_RIGHT_BOUNDARIES
             )
+            trailing_sentence_period = right_ok
         if not left_ok or not right_ok:
             raise ReviewError(
                 f"Claude review prompt contains an ambiguous host {label} path"
             )
-        chunks.extend((prompt[cursor:occurrence], target))
+        replacement = target
+        if trailing_sentence_period and target == b".":
+            # Preserve the sentence period without forming the parent-path
+            # token; "./." still resolves to the descriptor-bound workspace.
+            replacement = b"./"
+        chunks.extend((prompt[cursor:occurrence], replacement))
         cursor = end
 
 
@@ -15396,6 +15976,7 @@ def _claude_attempt(
     index: int,
     env: dict[str, str],
     executable: pathlib.Path | None = None,
+    runtime_binding: Any | None = None,
     launch: ReviewLaunchBinding | None = None,
     refresh_lock_protocol: ClaudeRefreshLockProtocol | None | object = (
         _UNRESOLVED_CLAUDE_REFRESH_LOCK_PROTOCOL
@@ -15408,6 +15989,7 @@ def _claude_attempt(
             index=index,
             env=env,
             executable=executable,
+            runtime_binding=runtime_binding,
             launch=launch,
             refresh_lock_protocol=refresh_lock_protocol,
             output=output,
@@ -15421,14 +16003,20 @@ def _claude_attempt_with_output(
     index: int,
     env: dict[str, str],
     executable: pathlib.Path | None,
+    runtime_binding: Any | None = None,
     launch: ReviewLaunchBinding | None,
     refresh_lock_protocol: ClaudeRefreshLockProtocol | None | object,
     output: AttemptOutput,
 ) -> Attempt:
     if executable is None:
+        runtime_binding_sink: list[Any] = []
         executable, env = _resolve_validated_claude_executable(
             review=review,
             env=env,
+            runtime_binding_sink=runtime_binding_sink,
+        )
+        runtime_binding = (
+            runtime_binding_sink[0] if len(runtime_binding_sink) == 1 else None
         )
     if executable is None:
         raise FileNotFoundError(
@@ -15445,7 +16033,8 @@ def _claude_attempt_with_output(
         _require_claude_linux_prompt_without_file_mentions(prompt)
     env = _with_claude_review_tool_path(review, env)
     env = _prepare_claude_tls_environment(review, env)
-    if env.get("ANTHROPIC_API_KEY"):
+    authentication_source = _claude_authentication_source(env)
+    if authentication_source != "local-login":
         selected_refresh_lock_protocol = None
     elif refresh_lock_protocol is _UNRESOLVED_CLAUDE_REFRESH_LOCK_PROTOCOL:
         selected_refresh_lock_protocol = _certified_claude_refresh_lock_protocol(
@@ -15465,15 +16054,15 @@ def _claude_attempt_with_output(
                 "phase": "authentication-source-pending",
                 "outer_sandbox": {"status": "pending-runtime-launch"},
                 "authentication": {
-                    "source": "api-key" if env.get("ANTHROPIC_API_KEY") else "pending",
+                    "source": authentication_source,
                     "carrier": (
                         "environment"
-                        if env.get("ANTHROPIC_API_KEY")
+                        if authentication_source != "local-login"
                         else "one-shot-security-broker"
                     ),
                     "status": (
                         "configured"
-                        if env.get("ANTHROPIC_API_KEY")
+                        if authentication_source != "local-login"
                         else "pending-source-selection"
                     ),
                     "model": model,
@@ -15488,6 +16077,10 @@ def _claude_attempt_with_output(
         linux=linux_host,
     )
     completed: Completed | None = None
+    stream_validation: dict[str, Any] = {
+        "classification": "inconclusive",
+        "reasons": ["stream.runtime-not-complete"],
+    }
     if linux_host:
         writer_start = ProcessStartOwner()
         writer_quiescent = threading.Event()
@@ -15510,6 +16103,9 @@ def _claude_attempt_with_output(
                     stdin=prompt,
                     timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
                     output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+                    redact_values=output_redact_values(
+                        claude_output_redact_values(env)
+                    ),
                     on_process_starting=writer_start.publish_starting,
                     on_process_started=writer_start.publish_started,
                     on_process_quiescent=writer_quiescent.set,
@@ -15544,6 +16140,14 @@ def _claude_attempt_with_output(
                         )
                         assert selected_error is not None
                         raise selected_error
+                stream_validation = _validate_claude_attempt_stream(
+                    completed=completed,
+                    output=output,
+                    review=review,
+                    expected_runtime_cwd=str(sandbox_command.workspace_path),
+                    requested_model=model,
+                    runtime_binding=runtime_binding,
+                )
         except LinuxCredentialInspectionInconclusive as error:
             _update_claude_runtime_report_preserving_persistence(
                 review,
@@ -15602,6 +16206,7 @@ def _claude_attempt_with_output(
                         completed=completed,
                         output=output,
                         inspection_error=error,
+                        stream_validation=stream_validation,
                     )
                 )
                 if authentication_error is not None:
@@ -15638,47 +16243,95 @@ def _claude_attempt_with_output(
                         completed=completed,
                         output=output,
                         category="inconclusive",
+                        stream_validation=stream_validation,
                     ),
                 )
             raise translated_error from error
         except (LinuxCredentialUnavailable, LinuxCredentialUnsafe) as error:
             persistence_failed = completed is not None
+            if completed is not None:
+                authentication_rejected = (
+                    _claude_stream_attempt_category(stream_validation) == "auth"
+                )
+                status = (
+                    "blocked-authentication"
+                    if authentication_rejected
+                    else "inconclusive"
+                )
+                _update_claude_runtime_report_preserving_persistence(
+                    review,
+                    {
+                        "phase": (
+                            "blocked-authentication"
+                            if authentication_rejected
+                            else "authentication-inspection-inconclusive"
+                        ),
+                        "status": status,
+                        **(
+                            {"category": "blocked-authentication"}
+                            if authentication_rejected
+                            else {}
+                        ),
+                        "outer_sandbox": {
+                            "status": "isolation-probe-verified",
+                        },
+                        "authentication": {
+                            "status": (
+                                "blocked-authentication"
+                                if authentication_rejected
+                                else "inspection-inconclusive"
+                            ),
+                            **(
+                                {"category": "blocked-authentication"}
+                                if authentication_rejected
+                                else {}
+                            ),
+                            "model": model,
+                            "failure_class": "refresh-persistence",
+                        },
+                        "attempt": {
+                            "requested_model": model,
+                            "effective_model": None,
+                            "requested_effort": CLAUDE_REASONING_EFFORT,
+                            "effective_effort": None,
+                            "category": (
+                                "blocked-authentication"
+                                if authentication_rejected
+                                else "inconclusive"
+                            ),
+                            "returncode": completed.returncode,
+                            "failure_class": "refresh-persistence",
+                        },
+                    },
+                    error,
+                )
+                translated_post_attempt_error = _claude_post_attempt_credential_failure(
+                    review=review,
+                    index=index,
+                    model=model,
+                    completed=completed,
+                    output=output,
+                    inspection_error=error,
+                    stream_validation=stream_validation,
+                    platform="Linux",
+                )
+                if translated_post_attempt_error is error:
+                    raise
+                raise translated_post_attempt_error from error
             _update_claude_runtime_report(
                 review,
                 {
                     "phase": "blocked-authentication",
                     "status": "blocked-authentication",
                     "category": "blocked-authentication",
-                    "outer_sandbox": {
-                        "status": (
-                            "isolation-probe-verified"
-                            if persistence_failed
-                            else "pending-isolation-probe"
-                        )
-                    },
+                    "outer_sandbox": {"status": "pending-isolation-probe"},
                     "authentication": {
                         "status": "blocked-authentication",
                         "category": "blocked-authentication",
                         "model": model,
-                        "failure_class": (
-                            "refresh-persistence"
-                            if persistence_failed
-                            else "credential-source"
-                        ),
+                        "failure_class": "credential-source",
                     },
-                    "attempt": (
-                        {
-                            "requested_model": model,
-                            "effective_model": None,
-                            "requested_effort": CLAUDE_REASONING_EFFORT,
-                            "effective_effort": None,
-                            "category": "blocked-authentication",
-                            "returncode": completed.returncode,
-                            "failure_class": "refresh-persistence",
-                        }
-                        if completed is not None
-                        else None
-                    ),
+                    "attempt": None,
                 },
             )
             translated_error: ClaudeKeychainCredentialUnavailable
@@ -15688,18 +16341,6 @@ def _claude_attempt_with_output(
                 )
             else:
                 translated_error = ClaudeKeychainCredentialUnavailable(str(error))
-            if completed is not None:
-                setattr(
-                    translated_error,
-                    "_codex_claude_persistence_attempt",
-                    _claude_persistence_failed_attempt(
-                        review=review,
-                        index=index,
-                        model=model,
-                        completed=completed,
-                        output=output,
-                    ),
-                )
             raise translated_error from error
         except BaseException as error:
             _record_claude_secondary_persistence_failure(
@@ -15769,6 +16410,9 @@ def _claude_attempt_with_output(
                     stdin=prompt,
                     timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
                     output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+                    redact_values=output_redact_values(
+                        claude_output_redact_values(env)
+                    ),
                     on_process_starting=process_start.publish_starting,
                     on_process_started=verify_started_workspace,
                     on_process_quiescent=process_quiescent.set,
@@ -15803,6 +16447,14 @@ def _claude_attempt_with_output(
                         )
                         assert selected_error is not None
                         raise selected_error
+                stream_validation = _validate_claude_attempt_stream(
+                    completed=completed,
+                    output=output,
+                    review=review,
+                    expected_runtime_cwd=str(review.workspace_root),
+                    requested_model=model,
+                    runtime_binding=runtime_binding,
+                )
         except ClaudeCredentialInspectionInconclusive as error:
             persistence_failed = completed is not None
             _update_claude_runtime_report_preserving_persistence(
@@ -15862,6 +16514,7 @@ def _claude_attempt_with_output(
                         completed=completed,
                         output=output,
                         inspection_error=error,
+                        stream_validation=stream_validation,
                     )
                 )
                 if authentication_error is not None:
@@ -15879,11 +16532,79 @@ def _claude_attempt_with_output(
                             completed=completed,
                             output=output,
                             category="inconclusive",
+                            stream_validation=stream_validation,
                         ),
                     )
             raise
         except ClaudeKeychainCredentialUnavailable as error:
             persistence_failed = completed is not None
+            if completed is not None:
+                authentication_rejected = (
+                    _claude_stream_attempt_category(stream_validation) == "auth"
+                )
+                status = (
+                    "blocked-authentication"
+                    if authentication_rejected
+                    else "inconclusive"
+                )
+                _update_claude_runtime_report_preserving_persistence(
+                    review,
+                    {
+                        "phase": (
+                            "blocked-authentication"
+                            if authentication_rejected
+                            else "authentication-inspection-inconclusive"
+                        ),
+                        "status": status,
+                        **(
+                            {"category": "blocked-authentication"}
+                            if authentication_rejected
+                            else {}
+                        ),
+                        "outer_sandbox": {"status": "enforced-at-launch"},
+                        "authentication": {
+                            "status": (
+                                "blocked-authentication"
+                                if authentication_rejected
+                                else "inspection-inconclusive"
+                            ),
+                            **(
+                                {"category": "blocked-authentication"}
+                                if authentication_rejected
+                                else {}
+                            ),
+                            "model": model,
+                            "failure_class": "refresh-persistence",
+                        },
+                        "attempt": {
+                            "requested_model": model,
+                            "effective_model": None,
+                            "requested_effort": CLAUDE_REASONING_EFFORT,
+                            "effective_effort": None,
+                            "category": (
+                                "blocked-authentication"
+                                if authentication_rejected
+                                else "inconclusive"
+                            ),
+                            "returncode": completed.returncode,
+                            "failure_class": "refresh-persistence",
+                        },
+                    },
+                    error,
+                )
+                translated_post_attempt_error = _claude_post_attempt_credential_failure(
+                    review=review,
+                    index=index,
+                    model=model,
+                    completed=completed,
+                    output=output,
+                    inspection_error=error,
+                    stream_validation=stream_validation,
+                    platform="macOS",
+                )
+                if translated_post_attempt_error is error:
+                    raise
+                raise translated_post_attempt_error from error
             _update_claude_runtime_report(
                 review,
                 {
@@ -15922,18 +16643,6 @@ def _claude_attempt_with_output(
                     ),
                 },
             )
-            if completed is not None:
-                setattr(
-                    error,
-                    "_codex_claude_persistence_attempt",
-                    _claude_persistence_failed_attempt(
-                        review=review,
-                        index=index,
-                        model=model,
-                        completed=completed,
-                        output=output,
-                    ),
-                )
             raise
         except (
             ClaudeKeychainBrokerUnavailable,
@@ -15953,14 +16662,16 @@ def _claude_attempt_with_output(
             )
             raise
     assert completed is not None
-    complete_stdout = output.complete_stdout(
-        completed,
-        limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
-    )
-    final_text, effective_model = (
-        _parse_claude_output(complete_stdout, requested_model=model)
-        if complete_stdout is not None
-        else (None, None)
+    stream_category = _claude_stream_attempt_category(stream_validation)
+    final_text = None
+    if stream_category == "success":
+        candidate_findings = stream_validation.get("findings")
+        if isinstance(candidate_findings, str) and candidate_findings.strip():
+            final_text = candidate_findings
+        else:
+            stream_category = "runtime-unverified"
+    effective_model = (
+        model if stream_category in {"success", "auth", "entitlement"} else None
     )
     attempt = _record_attempt(
         review=review,
@@ -15975,6 +16686,23 @@ def _claude_attempt_with_output(
         require_verified_model=True,
         output=output,
     )
+    attempt = replace(
+        attempt,
+        category=stream_category,
+        final_text=final_text if stream_category == "success" else None,
+    )
+    if stream_category in {"permission-mismatch", "runtime-unverified"}:
+        output.append_stderr(
+            "canonical Claude stream validation did not accept the complete "
+            "versioned init, intermediate-event, terminal, model, permission, "
+            "authentication, and child-return-code contract; refusing partial "
+            "findings and model fallback",
+        )
+        attempt = replace(
+            attempt,
+            returncode=(65 if completed.returncode == 0 else completed.returncode),
+            final_text=None,
+        )
     _update_claude_runtime_report(
         review,
         {
@@ -15986,6 +16714,20 @@ def _claude_attempt_with_output(
                     else "enforced-at-launch"
                 )
             },
+            "capabilities": {
+                "effective_init_contract": (
+                    "verified" if stream_category == "success" else "rejected"
+                ),
+                "stream_validation": {
+                    "classification": stream_validation.get("classification"),
+                    "reasons": stream_validation.get("reasons", []),
+                },
+            },
+            "authentication": {
+                "source": authentication_source,
+                "status": ("used" if stream_category == "success" else "configured"),
+                "model": model,
+            },
             "attempt": {
                 "requested_model": model,
                 "effective_model": attempt.effective_model,
@@ -15993,6 +16735,9 @@ def _claude_attempt_with_output(
                 "effective_effort": attempt.effective_effort,
                 "category": attempt.category,
                 "returncode": attempt.returncode,
+                "stream_validation_classification": stream_validation.get(
+                    "classification"
+                ),
             },
         },
     )
@@ -16439,6 +17184,64 @@ def run_review(
         )
 
 
+def _build_low_level_helper_egress_record(
+    review: ReviewWorkspace,
+    *,
+    egress_consent: str | None,
+) -> dict[str, Any]:
+    if review.content_variant == "head":
+        include_source_wip = False
+        included = [
+            "tracked blobs materialized from the frozen head commit",
+            "the complete generated frozen diff without secret redaction",
+            "the review prompt and result",
+        ]
+        excluded = [
+            "untracked files",
+            "unrelated repositories",
+            "broad workspace or home-directory content",
+        ]
+    elif review.content_variant == "source-wip":
+        include_source_wip = True
+        included = [
+            (
+                "tracked blobs plus staged, unstaged, and nonignored untracked "
+                "contents materialized from the digest-bound source WIP snapshot"
+            ),
+            (
+                "the complete generated frozen diff through the source WIP "
+                "snapshot without secret redaction"
+            ),
+            "the review prompt and result",
+        ]
+        excluded = [
+            "ignored untracked files and source content not captured by the WIP snapshot",
+            "unrelated repositories",
+            "broad workspace or home-directory content",
+        ]
+    else:
+        raise ReviewError("review egress record has an invalid content variant")
+    if include_source_wip != (review.content_variant == "source-wip"):
+        raise ReviewError("review egress WIP marker contradicts its content variant")
+
+    return {
+        "consent": egress_consent,
+        "reviewer": "low-level-helper",
+        "requested_helper_reviewer": "claude",
+        "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+        "named_lane_eligible": NAMED_LANE_ELIGIBLE,
+        "review_range": f"{review.base_ref}..{review.head_ref}",
+        "content_variant": review.content_variant,
+        "include_source_wip": include_source_wip,
+        "snapshot_tree_sha": review.snapshot_tree_sha,
+        "scope_identity": review.scope_identity,
+        "included": included,
+        "excluded": excluded,
+        "merge_gate": "secret-delta status is evaluated separately",
+        "preflight": "review workspace containment and integrity checks passed",
+    }
+
+
 def _run_review_with_binding(
     *,
     review: ReviewWorkspace,
@@ -16451,6 +17254,14 @@ def _run_review_with_binding(
         synthetic_evidence = validate_external_workspace(review) or {}
         preflight_evidence = build_preflight_evidence(review, synthetic_evidence)
         preflight_json = encode_preflight_json(preflight_evidence)
+        egress_record = (
+            _build_low_level_helper_egress_record(
+                review,
+                egress_consent=egress_consent,
+            )
+            if reviewer == "claude"
+            else None
+        )
         launch.freeze_prompt(review.prompt_file)
     except ReviewError as error:
         private_cleanup_error = remove_private_review_artifacts(
@@ -16486,32 +17297,11 @@ def _run_review_with_binding(
             preflight_json,
         )
 
-        if reviewer == "claude":
+        if egress_record is not None:
             write_json_atomic_at(
                 launch.container_descriptor,
                 "egress.json",
-                {
-                    "consent": egress_consent,
-                    "reviewer": "low-level-helper",
-                    "requested_helper_reviewer": "claude",
-                    "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
-                    "named_lane_eligible": NAMED_LANE_ELIGIBLE,
-                    "review_range": f"{review.base_ref}..{review.head_ref}",
-                    "included": [
-                        "tracked blobs materialized from the frozen head commit",
-                        "the complete generated frozen diff without secret redaction",
-                        "the review prompt and result",
-                    ],
-                    "excluded": [
-                        "untracked files",
-                        "unrelated repositories",
-                        "broad workspace or home-directory content",
-                    ],
-                    "merge_gate": "secret-delta status is evaluated separately",
-                    "preflight": (
-                        "review workspace containment and integrity checks passed"
-                    ),
-                },
+                egress_record,
             )
         review = launch.runtime_review(review)
     except ReviewError as error:
@@ -16577,7 +17367,9 @@ def _run_review_with_binding(
         },
         descriptor_bound_workspace=True,
     )
+    claude_env = _select_claude_authentication(claude_env)
     explicit_claude_override = bool(os.environ.get("CODEX_REVIEW_CLAUDE_PATH"))
+    claude_runtime_binding_sink: list[Any] = []
     try:
         linux_host = _is_claude_linux_host()
         prompt = _claude_review_prompt(
@@ -16590,6 +17382,7 @@ def _run_review_with_binding(
         claude_executable, claude_env = _resolve_validated_claude_executable(
             review=review,
             env=claude_env,
+            runtime_binding_sink=claude_runtime_binding_sink,
         )
         claude_available = claude_executable is not None
         if claude_available:
@@ -16668,14 +17461,20 @@ def _run_review_with_binding(
             env: dict[str, str],
             launch: ReviewLaunchBinding | None = None,
         ) -> Attempt:
-            return _claude_attempt(
-                review=review,
-                model=model,
-                index=index,
-                env=env,
-                executable=claude_executable,
-                launch=launch,
-            )
+            with atomic_write_redactions(claude_output_redact_values(env)):
+                return _claude_attempt(
+                    review=review,
+                    model=model,
+                    index=index,
+                    env=env,
+                    executable=claude_executable,
+                    runtime_binding=(
+                        claude_runtime_binding_sink[0]
+                        if len(claude_runtime_binding_sink) == 1
+                        else None
+                    ),
+                    launch=launch,
+                )
 
         try:
             category, final_text = _run_model_chain(
@@ -16812,10 +17611,8 @@ def _run_review_with_binding(
                 review,
                 attempts,
                 "the restricted Claude runtime rejected the configured credential",
-                action=(
-                    CLAUDE_API_KEY_ACTION
-                    if claude_env.get("ANTHROPIC_API_KEY")
-                    else CLAUDE_AUTH_LOGIN_ACTION
+                action=_claude_authentication_action(
+                    _claude_authentication_source(claude_env)
                 ),
             )
         if category not in {"entitlement", "unavailable"}:

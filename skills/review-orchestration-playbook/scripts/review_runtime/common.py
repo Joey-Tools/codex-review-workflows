@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import enum
 import errno
 import json
+import math
 import os
 import pathlib
 import re
@@ -16,7 +18,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, BinaryIO, Callable, Iterable
+from typing import Any, BinaryIO, Callable, Iterable, Iterator
 
 
 class ReviewError(RuntimeError):
@@ -133,6 +135,181 @@ class _BytearrayWriter:
         return None
 
 
+def _normalize_redact_values(
+    redact_values: Iterable[str | bytes],
+) -> tuple[bytes, ...]:
+    if isinstance(redact_values, (str, bytes)):
+        raise ReviewError("redact_values must be an iterable of str or bytes values")
+    try:
+        values = iter(redact_values)
+    except Exception:
+        raise ReviewError(
+            "redact_values must be an iterable of str or bytes values"
+        ) from None
+    normalized: set[bytes] = set()
+    try:
+        for value in values:
+            if isinstance(value, str):
+                encoded = os.fsencode(value)
+            elif isinstance(value, bytes):
+                encoded = value
+            else:
+                raise ReviewError("redact_values entries must be str or bytes values")
+            if b"\x00" in encoded:
+                raise ReviewError("redact_values entries must not contain NUL bytes")
+            if encoded:
+                normalized.add(encoded)
+    except ReviewError:
+        raise
+    except Exception:
+        raise ReviewError(
+            "redact_values entries must be encodable str or bytes values"
+        ) from None
+    return tuple(sorted(normalized, key=lambda value: (-len(value), value)))
+
+
+def output_redact_values(redact_values: Iterable[str]) -> tuple[str, ...]:
+    """Expand sensitive text into raw and escaped output variants."""
+
+    if isinstance(redact_values, str):
+        raise ReviewError("redact_values must be an iterable of str values")
+    try:
+        values = iter(redact_values)
+    except Exception:
+        raise ReviewError("redact_values must be an iterable of str values") from None
+    variants: set[str] = set()
+    try:
+        for value in values:
+            if not isinstance(value, str):
+                raise ReviewError("redact_values entries must be str values")
+            if "\x00" in value:
+                raise ReviewError(
+                    "redact_values entries must not contain NUL characters"
+                )
+            if not value:
+                continue
+            variants.add(value)
+            variants.add(json.dumps(value, ensure_ascii=True)[1:-1])
+            variants.add(json.dumps(value, ensure_ascii=False)[1:-1])
+            variants.add(repr(value)[1:-1])
+            variants.add(ascii(value)[1:-1])
+    except ReviewError:
+        raise
+    except Exception:
+        raise ReviewError("redact_values entries must be str values") from None
+    variants.discard("")
+    return tuple(sorted(variants, key=lambda item: (-len(item), item)))
+
+
+_PRINTABLE_MASK_CHARACTERS = tuple(
+    dict.fromkeys(
+        ("*", "#", "~", "^", "!")
+        + tuple(
+            chr(codepoint)
+            for codepoint in range(0x21, 0x7F)
+            if codepoint not in (ord('"'), ord("\\"))
+        )
+    )
+)
+_PRINTABLE_MASK_BYTES = tuple(
+    character.encode("ascii") for character in _PRINTABLE_MASK_CHARACTERS
+)
+
+
+def _printable_text_mask(redact_values: tuple[str, ...]) -> str:
+    for candidate in _PRINTABLE_MASK_CHARACTERS:
+        if all(candidate not in value for value in redact_values):
+            return candidate
+    raise ReviewError("redact_values exhaust the printable text mask alphabet")
+
+
+def _printable_byte_mask(redact_values: tuple[bytes, ...]) -> bytes:
+    for candidate in _PRINTABLE_MASK_BYTES:
+        if all(candidate not in value for value in redact_values):
+            return candidate
+    raise ReviewError("redact_values exhaust the printable byte mask alphabet")
+
+
+def redact_text(text: str, redact_values: Iterable[str]) -> str:
+    """Redact raw and escaped sensitive values from in-memory text."""
+
+    variants = output_redact_values(redact_values)
+    if not variants:
+        return text
+    fill = _printable_text_mask(variants)
+    for value in variants:
+        text = text.replace(value, fill * len(value))
+    return text
+
+
+class _StreamingBytesRedactor:
+    def __init__(self, redact_values: Iterable[str | bytes]) -> None:
+        self._redact_values = _normalize_redact_values(redact_values)
+        self._maximum_value_length = max(
+            (len(value) for value in self._redact_values), default=0
+        )
+        self._fill_byte = _printable_byte_mask(self._redact_values)
+        self._pending = bytearray()
+        self._pending_mask = bytearray()
+        self._closed = False
+        self._lock = threading.RLock()
+
+    def feed(self, payload: bytes) -> bytes:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("cannot feed a closed output redactor")
+            if not self._redact_values:
+                return payload
+            self._pending.extend(payload)
+            self._pending_mask.extend(b"\x00" * len(payload))
+            return self._drain(final=False)
+
+    def finish(self) -> bytes:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("cannot finish a closed output redactor")
+            self._closed = True
+            return self._drain(final=True)
+
+    def discard(self) -> None:
+        with self._lock:
+            if self._pending:
+                self._pending[:] = b"\x00" * len(self._pending)
+                self._pending.clear()
+            if self._pending_mask:
+                self._pending_mask[:] = b"\x00" * len(self._pending_mask)
+                self._pending_mask.clear()
+            self._closed = True
+
+    def _drain(self, *, final: bool) -> bytes:
+        for value in self._redact_values:
+            offset = 0
+            while True:
+                offset = self._pending.find(value, offset)
+                if offset < 0:
+                    break
+                end = offset + len(value)
+                self._pending_mask[offset:end] = b"\x01" * len(value)
+                offset += 1
+        if final:
+            finalizable = len(self._pending)
+        else:
+            finalizable = max(
+                0,
+                len(self._pending) - self._maximum_value_length + 1,
+            )
+        output = bytearray(self._pending[:finalizable])
+        for offset, masked in enumerate(self._pending_mask[:finalizable]):
+            if masked:
+                output[offset] = self._fill_byte[0]
+        if finalizable:
+            self._pending[:finalizable] = b"\x00" * finalizable
+            self._pending_mask[:finalizable] = b"\x00" * finalizable
+            del self._pending[:finalizable]
+            del self._pending_mask[:finalizable]
+        return bytes(output)
+
+
 TRUSTED_PATH = os.pathsep.join(
     (
         "/opt/homebrew/bin",
@@ -179,9 +356,60 @@ GATED_ENVIRONMENT_MAGIC = b"CGR1"
 MAX_GATED_ENVIRONMENT_BYTES = 8 * 1024 * 1024
 FD_EXEC_ERROR_PREFIX = b"fd_exec.py: launch-error:"
 _PROCESS_SPAWN_THREAD = threading.Thread
+_ATOMIC_WRITE_REDACTION_LOCK = threading.RLock()
+_ATOMIC_WRITE_REDACTION_SCOPES: list[
+    tuple[object, tuple[str, ...], Callable[[pathlib.Path], bool] | None]
+] = []
+
+
+@contextlib.contextmanager
+def atomic_write_redactions(
+    redact_values: Iterable[str],
+    *,
+    path_filter: Callable[[pathlib.Path], bool] | None = None,
+) -> Iterator[None]:
+    """Redact active secrets before any atomic text writer reaches its sink."""
+
+    frozen = tuple(dict.fromkeys(value for value in redact_values if value))
+    variants = output_redact_values(frozen)
+    if variants:
+        _printable_text_mask(variants)
+    token = object()
+    try:
+        with _ATOMIC_WRITE_REDACTION_LOCK:
+            _ATOMIC_WRITE_REDACTION_SCOPES.append((token, frozen, path_filter))
+        yield
+    finally:
+        with _ATOMIC_WRITE_REDACTION_LOCK:
+            for index, (candidate, _values, _path_filter) in enumerate(
+                _ATOMIC_WRITE_REDACTION_SCOPES
+            ):
+                if candidate is token:
+                    del _ATOMIC_WRITE_REDACTION_SCOPES[index]
+                    break
+
+
+def _active_atomic_write_redactions(path: pathlib.Path) -> tuple[str, ...]:
+    with _ATOMIC_WRITE_REDACTION_LOCK:
+        scopes = tuple(_ATOMIC_WRITE_REDACTION_SCOPES)
+    return tuple(
+        dict.fromkeys(
+            value
+            for _token, values, path_filter in scopes
+            if path_filter is None or path_filter(path)
+            for value in values
+        )
+    )
 
 
 def write_text_atomic(path: pathlib.Path, text: str) -> None:
+    redact_values = _active_atomic_write_redactions(path)
+    if redact_values:
+        text = redact_text(text, redact_values)
+    _write_text_atomic_unredacted(path, text)
+
+
+def _write_text_atomic_unredacted(path: pathlib.Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary_path = pathlib.Path(temporary)
@@ -249,7 +477,28 @@ def write_bytes_atomic_at(directory_fd: int, name: str, payload: bytes) -> None:
             pass
 
 
+def redact_json_string_values(value: Any, redact_values: tuple[str, ...]) -> Any:
+    if isinstance(value, str):
+        return redact_text(value, redact_values)
+    if isinstance(value, dict):
+        return {
+            key: redact_json_string_values(item, redact_values)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_json_string_values(item, redact_values) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_json_string_values(item, redact_values) for item in value)
+    return value
+
+
 def write_text_atomic_at(directory_fd: int, name: str, text: str) -> None:
+    # Descriptor-bound writers cannot trust a pathname for their destination.
+    # Unfiltered redaction scopes (used by the Claude provider) still apply;
+    # path-filtered outer scopes remain responsible for their pathname writers.
+    redact_values = _active_atomic_write_redactions(pathlib.Path(name))
+    if redact_values:
+        text = redact_text(text, redact_values)
     try:
         payload = text.encode("utf-8")
     except UnicodeEncodeError as error:
@@ -270,7 +519,11 @@ def write_json_atomic_at(directory_fd: int, name: str, value: Any) -> None:
 
 
 def write_json(path: pathlib.Path, value: Any) -> None:
-    write_text_atomic(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
+    redact_values = _active_atomic_write_redactions(path)
+    if redact_values:
+        value = redact_json_string_values(value, redact_values)
+    text = json.dumps(value, indent=2, sort_keys=True) + "\n"
+    _write_text_atomic_unredacted(path, text)
 
 
 def read_json(path: pathlib.Path) -> dict[str, Any]:
@@ -325,10 +578,14 @@ def run(
     on_process_starting: Callable[[], None] | None = None,
     on_process_started: Callable[[], None] | None = None,
     on_process_quiescent: Callable[[], None] | None = None,
+    redact_values: Iterable[str | bytes] = (),
 ) -> Completed:
     command = tuple(str(item) for item in argv)
     if not command:
         raise ReviewError("command must not be empty")
+    normalized_redact_values = _normalize_redact_values(redact_values)
+    if normalized_redact_values:
+        _printable_byte_mask(normalized_redact_values)
     inherited_fds = _validate_pass_fds(pass_fds)
     if cwd is not None and cwd_fd is not None:
         raise ReviewError("cwd and cwd_fd are mutually exclusive")
@@ -341,6 +598,25 @@ def run(
     if path_logging and handle_logging:
         raise ReviewError("logged output paths and files are mutually exclusive")
     logged_output = path_logging or handle_logging
+    if normalized_redact_values and not logged_output:
+        raise ReviewError(
+            "redact_values requires logged output paths or bound file handles"
+        )
+    if normalized_redact_values:
+        try:
+            valid_redaction_timeout = (
+                timeout_seconds is not None
+                and timeout_seconds > 0
+                and math.isfinite(timeout_seconds)
+            )
+        except Exception:
+            valid_redaction_timeout = False
+        if not valid_redaction_timeout:
+            raise ReviewError(
+                "redact_values requires a positive finite timeout_seconds"
+            )
+    if normalized_redact_values and output_file_limit_bytes is None:
+        raise ReviewError("redact_values requires output_file_limit_bytes")
     if output_file_limit_bytes is not None and (not logged_output):
         raise ReviewError("output_file_limit_bytes requires logged output paths")
     if output_file_limit_bytes is not None and timeout_seconds is None:
@@ -355,6 +631,10 @@ def run(
         raise ReviewError("on_process_quiescent requires logged output paths")
     if output_file_limit_bytes is not None and output_file_limit_bytes <= 0:
         raise ReviewError("output_file_limit_bytes must be positive")
+    if stdout_path is not None and capture_limit_bytes <= 0:
+        raise ReviewError("capture_limit_bytes must be positive")
+    if on_process_started is not None and not callable(on_process_started):
+        raise ReviewError("on_process_started must be callable")
     try:
         if not logged_output:
             spawn_command, cwd_pass_fds = _descriptor_cwd_command(
@@ -399,6 +679,7 @@ def run(
                     on_process_starting=on_process_starting,
                     on_process_started=on_process_started,
                     on_process_quiescent=on_process_quiescent,
+                    redact_values=normalized_redact_values,
                 )
                 result = Completed(
                     command,
@@ -426,6 +707,7 @@ def run(
                 on_process_starting=on_process_starting,
                 on_process_started=on_process_started,
                 on_process_quiescent=on_process_quiescent,
+                redact_values=normalized_redact_values,
             )
             result = Completed(
                 command,
@@ -546,7 +828,9 @@ def _encode_gated_environment(env: dict[str, str] | None) -> bytearray:
     try:
         items = tuple(source.items())
     except (AttributeError, RuntimeError) as error:
-        raise ReviewError("cannot snapshot the supervised command environment") from error
+        raise ReviewError(
+            "cannot snapshot the supervised command environment"
+        ) from error
     frame = bytearray(GATED_ENVIRONMENT_MAGIC + b"\x00\x00\x00\x00")
     encoded_keys: set[bytes] = set()
     payload_size = 0
@@ -558,7 +842,9 @@ def _encode_gated_environment(env: dict[str, str] | None) -> bytearray:
         if not encoded_key or b"=" in encoded_key or b"\x00" in encoded_key:
             raise ReviewError("supervised command environment contains an invalid name")
         if b"\x00" in encoded_value:
-            raise ReviewError("supervised command environment contains an invalid value")
+            raise ReviewError(
+                "supervised command environment contains an invalid value"
+            )
         if encoded_key in encoded_keys:
             raise ReviewError(
                 "supervised command environment contains duplicate encoded names"
@@ -790,10 +1076,7 @@ def block_forwarded_signals(
         if signal_mask_owner is not None:
             signal_mask_owner.publish(previous_mask)
     except BaseException as block_error:
-        if (
-            signal_mask_owner is None
-            or not signal_mask_owner.owns(previous_mask)
-        ):
+        if signal_mask_owner is None or not signal_mask_owner.owns(previous_mask):
             try:
                 signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
             except BaseException as restore_error:
@@ -836,9 +1119,7 @@ def _propagate_signal_mask_restore_failures(
 ) -> None:
     if not failures:
         return
-    candidates = (
-        ((primary_error,) if primary_error is not None else ()) + failures
-    )
+    candidates = ((primary_error,) if primary_error is not None else ()) + failures
     selected = next(
         (error for error in candidates if _is_process_control_flow_error(error)),
         primary_error if primary_error is not None else failures[0],
@@ -1179,7 +1460,9 @@ def _write_exec_control(
             except BlockingIOError:
                 continue
             except BrokenPipeError as error:
-                raise ReviewError("reviewer launch gate closed before commit") from error
+                raise ReviewError(
+                    "reviewer launch gate closed before commit"
+                ) from error
             if written <= 0:
                 raise ReviewError("reviewer launch control write made no progress")
             offset += written
@@ -1215,6 +1498,7 @@ def _run_logged_process(
     on_process_starting: Callable[[], None] | None = None,
     on_process_started: Callable[[], None] | None = None,
     on_process_quiescent: Callable[[], None] | None = None,
+    redact_values: tuple[bytes, ...] = (),
 ) -> int:
     if not command:
         raise ReviewError("command must not be empty")
@@ -1234,6 +1518,7 @@ def _run_logged_process(
     signal_deferral_active = False
     io_threads: list[threading.Thread] = []
     stop_io = threading.Event()
+    output_redactors: list[tuple[_StreamingBytesRedactor, BinaryIO]] = []
     drain_errors: list[Exception] = []
     process_cleanup_inconclusive = False
     primary_error: BaseException | None = None
@@ -1487,9 +1772,10 @@ def _run_logged_process(
             stream: BinaryIO,
             destination: BinaryIO,
             limit_bytes: int,
+            redactor: _StreamingBytesRedactor,
         ) -> None:
             try:
-                written = 0
+                accepted = 0
                 descriptor = stream.fileno()
                 os.set_blocking(descriptor, False)
                 while not stop_io.is_set():
@@ -1506,11 +1792,14 @@ def _run_logged_process(
                         continue
                     if not chunk:
                         return
-                    remaining = limit_bytes - written
+                    remaining = limit_bytes - accepted
                     if remaining > 0:
-                        destination.write(chunk[:remaining])
-                        destination.flush()
-                        written += min(len(chunk), remaining)
+                        allowed = chunk[:remaining]
+                        accepted += len(allowed)
+                        redacted = redactor.feed(allowed)
+                        if redacted:
+                            destination.write(redacted)
+                            destination.flush()
                     if len(chunk) > remaining and not output_overflow.is_set():
                         output_overflow.set()
                         signal_process_group(process, signal.SIGTERM)
@@ -1557,18 +1846,17 @@ def _run_logged_process(
                 thread_start_mask = block_forwarded_signals(
                     signal_mask_owner=thread_start_mask_owner,
                 )
-                if (
-                    not thread_start_mask_owner.active
-                    and thread_start_mask is not None
-                ):
+                if not thread_start_mask_owner.active and thread_start_mask is not None:
                     thread_start_mask_owner.publish(thread_start_mask)
                 for stream, destination, limit_bytes in (
                     (process.stdout, stdout_handle, stdout_file_limit_bytes),
                     (process.stderr, stderr_handle, stderr_file_limit_bytes),
                 ):
+                    redactor = _StreamingBytesRedactor(redact_values)
+                    output_redactors.append((redactor, destination))
                     thread = threading.Thread(
                         target=drain_bounded,
-                        args=(stream, destination, limit_bytes),
+                        args=(stream, destination, limit_bytes, redactor),
                         daemon=True,
                     )
                     try:
@@ -1662,6 +1950,20 @@ def _run_logged_process(
             raise ReviewProcessLeakError(
                 f"command left descendant processes after exit: {' '.join(command)}"
             )
+        try:
+            final_output = [
+                (redactor.finish(), destination)
+                for redactor, destination in output_redactors
+            ]
+            for payload, destination in final_output:
+                if payload:
+                    destination.write(payload)
+                    destination.flush()
+        except Exception as error:
+            process_cleanup_inconclusive = True
+            raise ReviewOutputDrainError(
+                f"command output drain failed: {' '.join(command)}"
+            ) from error
         return int(process.returncode)
     except BaseException as error:
         primary_error = error
@@ -1678,10 +1980,7 @@ def _run_logged_process(
                 previous_mask = block_forwarded_signals(
                     signal_mask_owner=cleanup_signal_mask_owner,
                 )
-                if (
-                    not cleanup_signal_mask_owner.active
-                    and previous_mask is not None
-                ):
+                if not cleanup_signal_mask_owner.active and previous_mask is not None:
                     cleanup_signal_mask_owner.publish(previous_mask)
             except BaseException as error:
                 cleanup_failures.append(
@@ -1720,9 +2019,7 @@ def _run_logged_process(
                 if isinstance(started_event, threading.Event):
                     if not worker_started and not started_event.is_set():
                         try:
-                            started_event.wait(
-                                timeout=PROCESS_GROUP_TERM_GRACE_SECONDS
-                            )
+                            started_event.wait(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
                         except BaseException as error:
                             cleanup_failures.append(
                                 ("observing reviewer spawn-worker startup", error)
@@ -1730,7 +2027,9 @@ def _run_logged_process(
                     worker_started = worker_started or started_event.is_set()
                 else:
                     try:
-                        worker_started = worker_started or spawn_thread.ident is not None
+                        worker_started = (
+                            worker_started or spawn_thread.ident is not None
+                        )
                     except BaseException as error:
                         cleanup_failures.append(
                             ("observing reviewer spawn-worker identity", error)
@@ -1766,10 +2065,7 @@ def _run_logged_process(
                 and spawn_owner is not None
                 and (
                     spawn_owner._claimed_event.is_set()
-                    or (
-                        spawn_owner.cleanup_completed.is_set()
-                        and not worker_alive
-                    )
+                    or (spawn_owner.cleanup_completed.is_set() and not worker_alive)
                 )
             ):
                 process = spawn_owner.process
@@ -1841,6 +2137,14 @@ def _run_logged_process(
                                 f"cleanup: {' '.join(command)}"
                             ),
                         )
+                    )
+            for redactor, _destination in output_redactors:
+                try:
+                    redactor.discard()
+                except BaseException as error:
+                    process_cleanup_inconclusive = True
+                    cleanup_failures.append(
+                        ("discarding pending redacted command output", error)
                     )
             if drain_errors:
                 process_cleanup_inconclusive = True
@@ -1930,9 +2234,7 @@ def _run_logged_process(
             for error in _restore_forwarded_signal_mask_owner_bounded(
                 cleanup_signal_mask_owner,
             ):
-                cleanup_failures.append(
-                    ("restoring the forwarded-signal mask", error)
-                )
+                cleanup_failures.append(("restoring the forwarded-signal mask", error))
 
         effective_pending_signal = pending_cleanup_signal or pending_signal
         signal_error: ForwardedSignal | None = None

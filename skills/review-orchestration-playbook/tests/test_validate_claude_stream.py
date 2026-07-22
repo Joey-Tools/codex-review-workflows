@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import io
 import json
 import os
@@ -8,9 +9,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-import threading
 import unittest
-from collections.abc import Callable
 from pathlib import Path
 from unittest import mock
 
@@ -18,7 +17,7 @@ from unittest import mock
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = SKILL_ROOT / "scripts"
 VALIDATOR = SCRIPTS / "validate_claude_stream.py"
-SCHEMA = SKILL_ROOT / "references/claude-2.1.212-stream-schema.json"
+SCHEMA = SKILL_ROOT / "references/claude-stream-schema.json"
 sys.path.insert(0, str(SCRIPTS))
 
 import validate_claude_stream as validator  # noqa: E402
@@ -37,10 +36,24 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         self.temporary_root = Path(temporary_directory.name).resolve()
         self.cwd = self.temporary_root / "review-workspace"
         self.cwd.mkdir(mode=0o700)
+        self.review_file = self.cwd / "review.py"
+        self.review_file.write_text("# synthetic review target\n", encoding="utf-8")
+        self.src_dir = self.cwd / "src"
+        self.src_dir.mkdir()
+        (self.src_dir / "module.py").write_text(
+            "# synthetic source\n", encoding="utf-8"
+        )
         self.parent_state = self.temporary_root / "parent-state"
         self.parent_state.mkdir(mode=0o700)
+        self.claude_code_version = "2.1.216"
         self.preflight_path = self.parent_state / "named-claude-preflight.json"
-        self._write_preflight_evidence(self.preflight_path)
+        self._write_preflight_evidence(
+            self.preflight_path,
+            version=self.claude_code_version,
+        )
+        _contract, self.stream_contract_binding = (
+            validator._load_contract_with_binding()
+        )
         self.init_event = {
             "type": "system",
             "subtype": "init",
@@ -52,13 +65,36 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "skills": [],
             "plugins": [],
             "model": "claude-opus-4-8",
-            "claude_code_version": "2.1.212",
+            "claude_code_version": self.claude_code_version,
             "apiKeySource": "none",
             "session_id": "init-session",
+            "output_style": "default",
+            "agents": ["claude", "Explore", "general-purpose", "Plan"],
+            "capabilities": ["interrupt_receipt_v1", "msg_lifecycle_v1"],
+            "analytics_disabled": True,
+            "product_feedback_disabled": False,
+            "uuid": "22222222-2222-4222-8222-222222222222",
+            "fast_mode_state": "off",
         }
         self.progress_event = {
             "type": "assistant",
-            "message": {"content": [{"type": "text", "text": "working"}]},
+            "message": {
+                "content": [{"type": "text", "text": "working"}],
+                "context_management": None,
+                "id": "msg-synthetic",
+                "model": "claude-opus-4-8",
+                "role": "assistant",
+                "stop_details": None,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "type": "message",
+                "usage": {},
+            },
+            "parent_tool_use_id": None,
+            "request_id": "req-synthetic",
+            "session_id": "init-session",
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "uuid": "33333333-3333-4333-8333-333333333333",
         }
         self.result_event = {
             "type": "result",
@@ -79,11 +115,16 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "errors": [],
             "api_error_status": None,
             "permission_denials": [],
+            "fast_mode_state": "off",
+            "terminal_reason": "completed",
+            "time_to_request_ms": 1,
+            "ttft_ms": 2,
+            "ttft_stream_ms": 3,
         }
 
     @staticmethod
-    def _preflight_evidence(version: str = "2.1.212") -> dict[str, object]:
-        binding, _compatibility_raw, _baseline_raw = (
+    def _preflight_evidence(version: str) -> dict[str, object]:
+        binding, _compatibility_raw, _profile_raw = (
             claude_stream_contract.load_stream_contract()
         )
         manifest_url, signature_url = claude_provenance.release_artifact_urls(version)
@@ -140,7 +181,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         self,
         path: Path,
         *,
-        version: str = "2.1.212",
+        version: str,
         evidence: dict[str, object] | None = None,
     ) -> None:
         path.write_text(
@@ -173,37 +214,192 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             copy.deepcopy(self.result_event),
         ]
 
+    def _assistant_event(self, block: dict[str, object]) -> dict[str, object]:
+        event = copy.deepcopy(self.progress_event)
+        message = event["message"]
+        assert isinstance(message, dict)
+        message["content"] = [block]
+        return event
+
+    def _tool_events(
+        self,
+        tool_name: str,
+        tool_input: dict[str, object],
+        *,
+        tool_id: str = "toolu-scope",
+        **extra_block: object,
+    ) -> list[dict[str, object]]:
+        return [
+            copy.deepcopy(self.init_event),
+            self._assistant_event(
+                {
+                    "type": "tool_use",
+                    "caller": {"type": "direct"},
+                    "id": tool_id,
+                    "input": tool_input,
+                    "name": tool_name,
+                    **extra_block,
+                }
+            ),
+            copy.deepcopy(self.result_event),
+        ]
+
+    def _reviewed_intermediate_events(self) -> list[dict[str, object]]:
+        return [
+            {
+                "type": "system",
+                "subtype": "thinking_tokens",
+                "estimated_tokens": 7,
+                "estimated_tokens_delta": 2,
+                "session_id": "init-session",
+                "uuid": "44444444-4444-4444-8444-444444444444",
+            },
+            self._assistant_event(
+                {
+                    "type": "thinking",
+                    "signature": "synthetic-signature",
+                    "thinking": "synthetic thought",
+                }
+            ),
+            self._assistant_event({"type": "text", "text": "working"}),
+            self._assistant_event(
+                {
+                    "type": "tool_use",
+                    "caller": {"type": "direct"},
+                    "id": "toolu-synthetic",
+                    "input": {"file_path": str(self.review_file)},
+                    "name": "Read",
+                }
+            ),
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "content": "synthetic tool output",
+                            "tool_use_id": "toolu-synthetic",
+                            "is_error": False,
+                        }
+                    ],
+                    "role": "user",
+                },
+                "parent_tool_use_id": None,
+                "session_id": "init-session",
+                "timestamp": "2026-01-01T00:00:01.000Z",
+                "tool_use_result": {"status": "synthetic"},
+                "uuid": "55555555-5555-4555-8555-555555555555",
+            },
+            {
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "allowed",
+                    "resetsAt": 10,
+                    "rateLimitType": "synthetic-window",
+                    "overageStatus": "allowed",
+                    "overageResetsAt": 20,
+                    "isUsingOverage": False,
+                    "overageInUse": False,
+                },
+                "session_id": "init-session",
+                "uuid": "66666666-6666-4666-8666-666666666666",
+            },
+        ]
+
+    def _legacy_events(self, version: str = "2.1.211") -> list[dict[str, object]]:
+        events = self._full_events()
+        events[0]["claude_code_version"] = version
+        for field_name in validator.EXTENDED_INIT_REQUIRED_FIELDS:
+            del events[0][field_name]
+        for field_name in validator.EXTENDED_TERMINAL_FIELDS:
+            del events[-1][field_name]
+        return events
+
+    def _valid_runtime_binding_fields(
+        self,
+        *,
+        selected_version: str | None = None,
+        api_key_source: str = "none",
+        launch_profile: str = "named-direct",
+        trust_source: str | None = None,
+    ) -> dict[str, object]:
+        if trust_source is None:
+            trust_source = (
+                "named-parent-private-preflight"
+                if launch_profile == "named-direct"
+                else "low-level-helper"
+            )
+        return {
+            "selected_version": selected_version or self.claude_code_version,
+            "api_key_source": api_key_source,
+            "launch_profile": launch_profile,
+            "trust_source": trust_source,
+            "publisher_checksum": "a" * 64,
+            "artifact_size": 128,
+            "runtime_identity": (
+                1,
+                2,
+                stat.S_IFREG,
+                stat.S_IFREG | 0o500,
+                1,
+                os.geteuid(),
+                os.getegid(),
+                128,
+                3,
+                4,
+            ),
+            "required_options": claude_capabilities.CLAUDE_REQUIRED_OPTIONS,
+            "stream_contract": self.stream_contract_binding,
+        }
+
     def _validate(
         self,
         events: list[object] | None = None,
         *,
         raw: bytes | None = None,
         requested_model: str = "claude-opus-4-8",
-        api_key_source: str = "none",
-        selected_version: str = "2.1.212",
-        preflight_result: Path | None = None,
+        claude_code_version: str | None = None,
+        authentication_source: str = "local-login",
+        launch_profile: str = "named-direct",
+        trust_source: str | None = None,
+        expected_runtime_cwd: str | None = None,
         process_returncode: object = 0,
         limits: validator.StreamLimits | None = None,
     ) -> dict[str, object]:
         if raw is None:
             raw = self._raw(events if events is not None else self._full_events())
-        if preflight_result is None:
-            if selected_version == "2.1.212":
-                preflight_result = self.preflight_path
-            else:
-                preflight_result = self.parent_state / (
-                    f"named-claude-preflight-{selected_version}.json"
-                )
-                self._write_preflight_evidence(
-                    preflight_result,
-                    version=selected_version,
-                )
+        selected_version = (
+            self.claude_code_version
+            if claude_code_version is None
+            else claude_code_version
+        )
+        api_key_source = validator.AUTHENTICATION_SOURCE_TO_API_KEY_SOURCE.get(
+            authentication_source,
+            "__invalid__",
+        )
+        runtime_binding = validator.ClaudeRuntimeBinding(
+            **self._valid_runtime_binding_fields(
+                selected_version=selected_version,
+                api_key_source=api_key_source,
+                launch_profile=launch_profile,
+                trust_source=trust_source,
+            )
+        )
+        if expected_runtime_cwd is None:
+            runtime_cwd_contract = validator.LAUNCH_PROFILES[launch_profile][
+                "runtime_cwd"
+            ]
+            expected_runtime_cwd = (
+                str(self.cwd)
+                if runtime_cwd_contract == validator.HOST_WORKSPACE_RUNTIME_CWD
+                else runtime_cwd_contract
+            )
         return validator.validate_claude_stream_bytes(
             raw,
-            expected_cwd=self.cwd,
+            host_workspace_cwd=self.cwd,
+            expected_runtime_cwd=expected_runtime_cwd,
             requested_model=requested_model,
-            api_key_source=api_key_source,
-            preflight_result=preflight_result,
+            runtime_binding=runtime_binding,
             process_returncode=process_returncode,
             limits=limits,
         )
@@ -217,47 +413,13 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         self.assertNotIn("findings", outcome)
         self.assertTrue(outcome["reasons"])
 
-    def assert_raises_without_blocking_on_fifo(
-        self,
-        *,
-        fifo: Path,
-        action: Callable[[], object],
-        expected_error: type[BaseException],
-    ) -> None:
-        returned: list[object] = []
-        errors: list[BaseException] = []
-        finished = threading.Event()
-
-        def invoke() -> None:
-            try:
-                returned.append(action())
-            except BaseException as error:  # pragma: no cover - diagnostic only
-                errors.append(error)
-            finally:
-                finished.set()
-
-        thread = threading.Thread(target=invoke, daemon=True)
-        thread.start()
-        blocked = not finished.wait(1.0)
-        if blocked:
-            descriptor = os.open(fifo, os.O_RDWR | getattr(os, "O_NONBLOCK", 0))
-            try:
-                os.write(descriptor, b"{}\n")
-            finally:
-                os.close(descriptor)
-            finished.wait(1.0)
-        thread.join(timeout=0.1)
-
-        self.assertFalse(blocked, f"{action!r} blocked while opening FIFO evidence")
-        self.assertFalse(thread.is_alive(), "FIFO reader thread remained alive")
-        self.assertEqual(returned, [])
-        self.assertEqual(len(errors), 1)
-        self.assertIsInstance(errors[0], expected_error)
-
     def test_machine_schema_defines_complete_init_and_stream_bounds(self) -> None:
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
 
-        self.assertEqual(schema["claude_code_version"], "2.1.212")
+        self.assertEqual(
+            schema["claude_code_version"],
+            validator.CLAUDE_CODE_VERSION_CONTRACT,
+        )
         self.assertEqual(
             schema["process_returncode"], validator.PROCESS_RETURNCODE_CONTRACT
         )
@@ -306,6 +468,11 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 }
             },
         )
+        self.assertEqual(init_contract["profiles"], validator.INIT_PROFILE_CONTRACT)
+        self.assertEqual(
+            schema["intermediate_events"],
+            validator.INTERMEDIATE_EVENT_CONTRACT,
+        )
         terminal_contract = schema["terminal_result"]
         self.assertFalse(terminal_contract["additional_fields"])
         self.assertEqual(
@@ -323,7 +490,10 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         self.assertEqual(
             terminal_contract["variants"]["failure"]["match"],
             {
-                "subtype": {"rule": "string_not_equal", "value": "success"},
+                "subtype": {
+                    "rule": "profile_enum",
+                    "profile_field": "failure_subtypes",
+                },
                 "is_error": True,
             },
         )
@@ -334,29 +504,299 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             set(terminal_contract["variants"]["failure"]["optional_fields"]),
             {"result", "modelUsage"},
         )
+        self.assertEqual(
+            terminal_contract["profiles"], validator.TERMINAL_PROFILE_CONTRACT
+        )
+        for profile_name, failure_subtypes in terminal_contract["profiles"][
+            "variants"
+        ].items():
+            with self.subTest(profile=profile_name):
+                self.assertEqual(failure_subtypes["failure_subtypes"], ["error"])
 
-    def test_compatibility_profile_keeps_exact_baseline_separate_from_range(
+    def test_structured_tool_path_scope_contract_is_closed_and_path_free(self) -> None:
+        self.assertEqual(
+            validator.STRUCTURED_TOOL_PATH_SCOPE_CONTRACT,
+            {
+                "source": "assistant.tool_use.input",
+                "launch_profiles": ("named-direct",),
+                "workspace_root": "exact_resolved_host_workspace_cwd",
+                "tools": {
+                    "Read": {
+                        "path_field": "file_path",
+                        "path_required": True,
+                        "path_if_present": "absolute",
+                    },
+                    "Grep": {
+                        "path_field": "path",
+                        "path_required": False,
+                        "path_if_present": "absolute",
+                    },
+                    "Glob": {
+                        "path_field": "path",
+                        "path_required": False,
+                        "path_if_present": "absolute",
+                        "missing_path_base": "host_workspace_cwd",
+                        "pattern_field": "pattern",
+                        "pattern_required": True,
+                        "pattern_contract": "bounded_safe_relative_glob",
+                        "leading_prefix_normalization": "./",
+                        "extglob": "scope_unverified",
+                        "dynamic_directory_containment": "bounded_overapprox_scan",
+                    },
+                },
+                "glob_scan_limits": {
+                    "entries": 32_768,
+                    "states": 32_768,
+                    "depth": 64,
+                },
+                "containment": ("lexical", "resolved_with_symlinks"),
+                "outside": {
+                    "classification": "blocked",
+                    "reason": "intermediate.tool-path.outside-workspace",
+                },
+                "unverified": {
+                    "classification": "inconclusive",
+                    "reason": "intermediate.tool-path.scope-unverified",
+                },
+                "excluded_surfaces": (
+                    "user.tool_use_result.persistedOutputPath",
+                    "Bash.command",
+                ),
+            },
+        )
+        self.assertNotIn("/", validator.TOOL_PATH_OUTSIDE_WORKSPACE_REASON)
+        self.assertNotIn("/", validator.TOOL_PATH_SCOPE_UNVERIFIED_REASON)
+        self.assertEqual(validator.MAX_STRUCTURED_GLOB_PATTERN_CHARACTERS, 4096)
+        self.assertEqual(validator.MAX_STRUCTURED_GLOB_ALTERNATIVES, 64)
+        self.assertEqual(validator.MAX_STRUCTURED_GLOB_SCAN_ENTRIES, 32_768)
+        self.assertEqual(validator.MAX_STRUCTURED_GLOB_SCAN_STATES, 32_768)
+        self.assertEqual(validator.MAX_STRUCTURED_GLOB_SCAN_DEPTH, 64)
+        self.assertEqual(
+            validator.STRUCTURED_GLOB_EXTGLOB_TOKENS,
+            ("@(", "!(", "+(", "?(", "*("),
+        )
+
+    def test_runtime_trust_sources_bind_only_their_exact_launch_profiles(self) -> None:
+        self.assertEqual(
+            validator.TRUST_SOURCE_LAUNCH_PROFILES,
+            {
+                "named-parent-private-preflight": frozenset(("named-direct",)),
+                "low-level-helper": frozenset(("helper-linux", "helper-darwin")),
+            },
+        )
+        cases = (
+            ("named-parent-private-preflight", "named-direct", True),
+            ("low-level-helper", "helper-linux", True),
+            ("low-level-helper", "helper-darwin", True),
+            ("named-parent-private-preflight", "helper-linux", False),
+            ("named-parent-private-preflight", "helper-darwin", False),
+            ("low-level-helper", "named-direct", False),
+            ("future-trust-source", "named-direct", False),
+        )
+        for trust_source, launch_profile, expected_valid in cases:
+            with self.subTest(
+                trust_source=trust_source,
+                launch_profile=launch_profile,
+            ):
+                runtime_binding = validator.ClaudeRuntimeBinding(
+                    **self._valid_runtime_binding_fields(
+                        launch_profile=launch_profile,
+                        trust_source=trust_source,
+                    )
+                )
+                self.assertEqual(
+                    validator._runtime_binding_is_valid(
+                        runtime_binding,
+                        contract_binding=self.stream_contract_binding,
+                    ),
+                    expected_valid,
+                )
+
+    def test_runtime_trust_source_cross_pairings_fail_closed(self) -> None:
+        cases = (
+            ("named-parent-private-preflight", "helper-linux"),
+            ("named-parent-private-preflight", "helper-darwin"),
+            ("low-level-helper", "named-direct"),
+        )
+        for trust_source, launch_profile in cases:
+            with self.subTest(
+                trust_source=trust_source,
+                launch_profile=launch_profile,
+            ):
+                events = self._full_events()
+                profile = validator.LAUNCH_PROFILES[launch_profile]
+                events[0]["permissionMode"] = profile["permission_mode"]
+                events[0]["tools"] = sorted(profile["tools"])
+
+                self.assertEqual(
+                    self._validate(
+                        events,
+                        launch_profile=launch_profile,
+                        trust_source=trust_source,
+                    ),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": ["validator.runtime-binding-invalid"],
+                    },
+                )
+
+    def test_version_range_matches_provenance_preflight_and_schema(self) -> None:
+        schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            schema["claude_code_version"]["minimum_inclusive"],
+            ".".join(map(str, claude_version_policy.CLAUDE_MINIMUM_VERSION)),
+        )
+        self.assertEqual(
+            schema["claude_code_version"]["maximum_exclusive"],
+            ".".join(map(str, claude_version_policy.CLAUDE_MAXIMUM_VERSION)),
+        )
+        self.assertEqual(
+            schema["claude_code_version"],
+            validator.CLAUDE_CODE_VERSION_CONTRACT,
+        )
+
+    def test_named_preflight_factory_binds_private_evidence_and_rejects_tamper(
         self,
     ) -> None:
-        profile = json.loads(
-            claude_stream_contract.COMPATIBILITY_PATH.read_text(encoding="utf-8")
+        runtime_binding = validator.runtime_binding_from_preflight_result(
+            self.preflight_path,
+            reviewer_cwd=self.cwd,
+            api_key_source="none",
         )
-        binding, _compatibility_raw, _baseline_raw = (
-            claude_stream_contract.load_stream_contract()
+        self.assertEqual(runtime_binding.selected_version, "2.1.216")
+        self.assertEqual(runtime_binding.launch_profile, "named-direct")
+        self.assertEqual(
+            runtime_binding.trust_source,
+            "named-parent-private-preflight",
         )
 
-        self.assertEqual(profile["baseline_version"], "2.1.212")
-        self.assertEqual(
-            profile["version_policy"],
-            "review_runtime.claude_version_policy.CLAUDE_COMPATIBILITY_SPEC",
+        tampered = self._preflight_evidence(self.claude_code_version)
+        stream_contract = tampered["stream_contract"]
+        assert isinstance(stream_contract, dict)
+        stream_contract["digest"] = "0" * 64
+        tampered_path = self.parent_state / "tampered-preflight.json"
+        self._write_preflight_evidence(
+            tampered_path,
+            version=self.claude_code_version,
+            evidence=tampered,
         )
-        self.assertEqual(
-            claude_version_policy.CLAUDE_COMPATIBILITY_SPEC,
-            ">=2.1.211,<3.0.0",
+        with self.assertRaises(validator._ContractError):
+            validator.runtime_binding_from_preflight_result(
+                tampered_path,
+                reviewer_cwd=self.cwd,
+                api_key_source="none",
+            )
+
+        symlink_path = self.parent_state / "preflight-link.json"
+        symlink_path.symlink_to(self.preflight_path)
+        with self.assertRaises(validator._ContractError):
+            validator.runtime_binding_from_preflight_result(
+                symlink_path,
+                reviewer_cwd=self.cwd,
+                api_key_source="none",
+            )
+
+    def test_helper_factory_binds_verified_snapshot_capabilities_and_auth(self) -> None:
+        executable = self.parent_state / "claude-verified"
+        executable.write_bytes(b"synthetic verified Claude executable")
+        executable.chmod(0o700)
+        raw = executable.read_bytes()
+        version = "2.1.216"
+        manifest_url, signature_url = claude_provenance.release_artifact_urls(version)
+        artifact = claude_provenance.ClaudeReleaseArtifact(
+            version=version,
+            platform_key="darwin-arm64",
+            binary="claude",
+            checksum=hashlib.sha256(raw).hexdigest(),
+            size=len(raw),
         )
-        self.assertEqual(binding.schema_id, "claude-code-stream-compatible-v1")
-        self.assertEqual(len(binding.capability_digest), 64)
-        self.assertNotIn("required_version", profile)
+        verified = claude_provenance.VerifiedClaudeExecutable(
+            executable=executable,
+            artifact=artifact,
+            manifest_url=manifest_url,
+            signature_url=signature_url,
+            gpg_path=Path("/usr/bin/gpg"),
+        )
+        capabilities = claude_capabilities.ClaudeCapabilities(
+            version=claude_capabilities.ClaudeVersion(version, (2, 1, 216)),
+            required_options=claude_capabilities.CLAUDE_REQUIRED_OPTIONS,
+            safe_mode_summary="synthetic accepted safe-mode contract",
+        )
+        runtime_binding = validator.runtime_binding_from_verified_executable(
+            verified,
+            capabilities=capabilities,
+            authentication_source="oauth-token",
+            launch_profile="helper-darwin",
+        )
+        self.assertEqual(runtime_binding.api_key_source, "none")
+        self.assertEqual(runtime_binding.launch_profile, "helper-darwin")
+        self.assertEqual(runtime_binding.trust_source, "low-level-helper")
+
+        invalid_artifact = claude_provenance.ClaudeReleaseArtifact(
+            **{**artifact.__dict__, "checksum": "0" * 64}
+        )
+        with self.assertRaises(validator._ContractError):
+            validator.runtime_binding_from_verified_executable(
+                claude_provenance.VerifiedClaudeExecutable(
+                    **{**verified.__dict__, "artifact": invalid_artifact}
+                ),
+                capabilities=capabilities,
+                authentication_source="oauth-token",
+                launch_profile="helper-darwin",
+            )
+
+    def test_loader_accepts_current_contract_and_rejects_profile_drift(self) -> None:
+        self.assertEqual(
+            validator._load_contract()["init_event"]["profiles"],
+            validator.INIT_PROFILE_CONTRACT,
+        )
+
+        schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
+        schema["init_event"]["profiles"]["variants"]["extended-2x"]["field_contracts"][
+            "fast_mode_state"
+        ]["value"] = "on"
+        schema_path = self.cwd / "invalid-profile-schema.json"
+        schema_path.write_text(json.dumps(schema), encoding="utf-8")
+
+        with (
+            mock.patch.object(validator, "SCHEMA_PATH", schema_path),
+            self.assertRaises(validator._ContractError),
+        ):
+            validator._load_contract()
+
+        schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
+        schema["terminal_result"]["profiles"]["variants"]["legacy-base"][
+            "failure_subtypes"
+        ].append("future_error")
+        schema_path.write_text(json.dumps(schema), encoding="utf-8")
+        with (
+            mock.patch.object(validator, "SCHEMA_PATH", schema_path),
+            self.assertRaises(validator._ContractError),
+        ):
+            validator._load_contract()
+
+        schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
+        schema["intermediate_events"]["profiles"]["legacy-base"]["event_contract"] = (
+            "unknown"
+        )
+        schema_path.write_text(json.dumps(schema), encoding="utf-8")
+        with (
+            mock.patch.object(validator, "SCHEMA_PATH", schema_path),
+            self.assertRaises(validator._ContractError),
+        ):
+            validator._load_contract()
+
+        schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
+        schema["terminal_result"]["profiles"]["variants"]["extended-2x"]["success"][
+            "field_contracts"
+        ]["terminal_reason"]["value"] = "future"
+        schema_path.write_text(json.dumps(schema), encoding="utf-8")
+        with (
+            mock.patch.object(validator, "SCHEMA_PATH", schema_path),
+            self.assertRaises(validator._ContractError),
+        ):
+            validator._load_contract()
 
     def test_loader_rejects_process_returncode_contract_drift(self) -> None:
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
@@ -369,44 +809,6 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             self.assertRaises(validator._ContractError),
         ):
             validator._load_contract()
-
-    def test_validator_rejects_unknown_root_and_ignored_field_rule_drift(
-        self,
-    ) -> None:
-        baseline = json.loads(SCHEMA.read_text(encoding="utf-8"))
-
-        def add_unknown_root(schema: dict[str, object]) -> None:
-            schema["unknown_root_contract"] = {"rule": "accept"}
-
-        def weaken_init_rule(schema: dict[str, object]) -> None:
-            schema["init_event"]["field_contracts"]["tools"]["mismatch_failure"] = (
-                "inconclusive"
-            )
-
-        def weaken_terminal_rule(schema: dict[str, object]) -> None:
-            schema["terminal_result"]["optional_field_contracts"]["duration_ms"][
-                "rule"
-            ] = "positive_integer"
-
-        cases: dict[str, Callable[[dict[str, object]], None]] = {
-            "unknown-root": add_unknown_root,
-            "ignored-init-field-rule": weaken_init_rule,
-            "ignored-terminal-field-rule": weaken_terminal_rule,
-        }
-        for name, mutate in cases.items():
-            with self.subTest(name=name):
-                schema = copy.deepcopy(baseline)
-                mutate(schema)
-                schema_path = self.parent_state / f"{name}.json"
-                schema_path.write_text(json.dumps(schema), encoding="utf-8")
-                with mock.patch.object(validator, "SCHEMA_PATH", schema_path):
-                    self.assertEqual(
-                        self._validate(),
-                        {
-                            "classification": "inconclusive",
-                            "reasons": ["validator.contract-invalid"],
-                        },
-                    )
 
     def test_accepts_complete_stream_and_preserves_findings_verbatim(self) -> None:
         outcome = self._validate(raw=self._raw(self._full_events(), blank_edges=True))
@@ -428,174 +830,694 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             {"classification": "accepted", "findings": raw_result},
         )
 
-    def test_accepts_compatible_selected_versions_and_binds_init_exactly(self) -> None:
-        for version in ("2.1.211", "2.1.216", "2.99.999"):
-            with self.subTest(version=version):
-                events = self._full_events()
-                events[0]["claude_code_version"] = version
-                self.assertEqual(
-                    self._validate(events, selected_version=version),
-                    {
-                        "classification": "accepted",
-                        "findings": "\nNo findings.\n",
-                    },
-                )
-
-        mismatched = self._full_events()
-        mismatched[0]["claude_code_version"] = "2.1.211"
-        outcome = self._validate(mismatched, selected_version="2.1.216")
-        self.assertEqual(outcome["classification"], "blocked")
-        self.assertIn("init.claude_code_version.mismatch", outcome["reasons"])
-        self.assertNotIn("findings", outcome)
-
-    def test_future_compatible_version_unknown_shapes_fail_closed(self) -> None:
-        for surface in ("init", "terminal"):
-            with self.subTest(surface=surface):
-                events = self._full_events()
-                events[0]["claude_code_version"] = "2.1.216"
-                target = events[0] if surface == "init" else events[-1]
-                target["future_field"] = True
-
-                outcome = self._validate(events, selected_version="2.1.216")
-
-                self.assertEqual(outcome["classification"], "inconclusive")
-                self.assertNotIn("findings", outcome)
-
-    def test_tampered_preflight_evidence_never_releases_findings(self) -> None:
-        def update_nested(
-            key: str,
-            values: dict[str, object],
-        ) -> Callable[[dict[str, object]], None]:
-            def mutate(evidence: dict[str, object]) -> None:
-                nested = evidence[key]
-                assert isinstance(nested, dict)
-                nested.update(values)
-
-            return mutate
-
-        cases: dict[str, Callable[[dict[str, object]], None]] = {
-            "extra-field": lambda evidence: evidence.update({"unexpected": True}),
-            "range": lambda evidence: evidence.update(
-                {"compatible_version_range": "==2.1.212"}
-            ),
-            "selected-version": lambda evidence: evidence.update(
-                {"selected_version": "2.1.217"}
-            ),
-            "retired-source": lambda evidence: evidence.update(
-                {"source": "side-by-side-exact"}
-            ),
-            "identity-size": update_nested("identity", {"size": 129}),
-            "publisher-version": update_nested(
-                "publisher_verification",
-                {"release_version": "2.1.211"},
-            ),
-            "capability": update_nested(
-                "capability_contract",
-                {"status": "unaccepted"},
-            ),
-            "stream-digest": update_nested(
-                "stream_contract",
-                {"digest": "0" * 64},
-            ),
-            "capability-digest": update_nested(
-                "stream_contract",
-                {"capability_digest": "0" * 64},
-            ),
-        }
-        for name, mutate in cases.items():
-            with self.subTest(name=name):
-                evidence = self._preflight_evidence("2.1.216")
-                mutate(evidence)
-                preflight_result = self.parent_state / f"tampered-{name}.json"
-                self._write_preflight_evidence(
-                    preflight_result,
-                    evidence=evidence,
-                )
-                events = self._full_events()
-                events[0]["claude_code_version"] = "2.1.216"
-
-                self.assertEqual(
-                    self._validate(events, preflight_result=preflight_result),
-                    {
-                        "classification": "inconclusive",
-                        "reasons": ["validator.preflight-evidence-invalid"],
-                    },
-                )
-
-    def test_preflight_evidence_file_must_be_parent_private_and_not_a_symlink(
+    def test_runtime_launch_profiles_bind_exact_permission_and_tool_surfaces(
         self,
     ) -> None:
-        public_path = self.parent_state / "public-preflight.json"
-        self._write_preflight_evidence(public_path)
-        public_path.chmod(0o644)
-        self.assertEqual(
-            self._validate(preflight_result=public_path),
-            {
-                "classification": "inconclusive",
-                "reasons": ["validator.preflight-evidence-invalid"],
-            },
-        )
+        cases = {
+            "named-direct": ("dontAsk", ["Read", "Grep", "Glob", "Bash"]),
+            "helper-linux": ("dontAsk", ["Read"]),
+            "helper-darwin": ("default", ["Read", "Grep", "Glob"]),
+        }
+        for launch_profile, (permission_mode, tools) in cases.items():
+            with self.subTest(launch_profile=launch_profile):
+                events = self._full_events()
+                if launch_profile == "helper-linux":
+                    events[0]["cwd"] = "/workspace"
+                events[0]["permissionMode"] = permission_mode
+                events[0]["tools"] = tools
+                self.assertEqual(
+                    self._validate(events, launch_profile=launch_profile)[
+                        "classification"
+                    ],
+                    "accepted",
+                )
 
-        alias = self.parent_state / "preflight-alias.json"
-        alias.symlink_to(self.preflight_path)
-        self.assertEqual(
-            self._validate(preflight_result=alias),
-            {
-                "classification": "inconclusive",
-                "reasons": ["validator.preflight-evidence-invalid"],
-            },
-        )
-
-    def test_preflight_evidence_inside_review_workspace_fails_closed(self) -> None:
-        workspace_local = self.cwd / "workspace-local-preflight.json"
-        self._write_preflight_evidence(workspace_local)
-
-        self.assertEqual(
-            self._validate(preflight_result=workspace_local),
-            {
-                "classification": "inconclusive",
-                "reasons": ["validator.preflight-evidence-invalid"],
-            },
-        )
-
-    def test_hardlinked_preflight_evidence_fails_closed(self) -> None:
-        hardlink = self.parent_state / "hardlinked-preflight.json"
-        os.link(self.preflight_path, hardlink)
-
-        self.assertEqual(
-            self._validate(preflight_result=hardlink),
-            {
-                "classification": "inconclusive",
-                "reasons": ["validator.preflight-evidence-invalid"],
-            },
-        )
-
-    def test_fifo_contract_inputs_fail_closed_without_blocking(self) -> None:
-        preflight_fifo = self.parent_state / "preflight.fifo"
-        os.mkfifo(preflight_fifo, mode=0o600)
-        self.assert_raises_without_blocking_on_fifo(
-            fifo=preflight_fifo,
-            action=lambda: validator._read_preflight_evidence(
-                preflight_fifo,
-                reviewer_cwd=self.cwd,
+        events = self._full_events()
+        events[0]["cwd"] = "/workspace"
+        events[0]["tools"] = ["Read"]
+        events.insert(
+            -1,
+            self._assistant_event(
+                {
+                    "type": "tool_use",
+                    "caller": {"type": "direct"},
+                    "id": "toolu-forbidden",
+                    "input": {},
+                    "name": "Bash",
+                }
             ),
-            expected_error=validator._ContractError,
+        )
+        self.assert_fail_closed(
+            self._validate(events, launch_profile="helper-linux"),
+            "inconclusive",
         )
 
-        compatibility_fifo = self.parent_state / "compatibility.fifo"
-        os.mkfifo(compatibility_fifo, mode=0o600)
-        self.assert_raises_without_blocking_on_fifo(
-            fifo=compatibility_fifo,
-            action=lambda: claude_stream_contract.load_stream_contract(
-                compatibility_path=compatibility_fifo,
-                baseline_path=claude_stream_contract.BASELINE_PATH,
-            ),
-            expected_error=claude_stream_contract.ClaudeStreamContractError,
+    def test_runtime_cwd_binding_separates_linux_sandbox_from_host_workspace(
+        self,
+    ) -> None:
+        self.assertEqual(
+            {
+                name: profile["runtime_cwd"]
+                for name, profile in validator.LAUNCH_PROFILES.items()
+            },
+            {
+                "named-direct": validator.HOST_WORKSPACE_RUNTIME_CWD,
+                "helper-linux": "/workspace",
+                "helper-darwin": validator.HOST_WORKSPACE_RUNTIME_CWD,
+            },
         )
+        events = self._full_events()
+        events[0]["cwd"] = "/workspace"
+        events[0]["tools"] = ["Read"]
+
+        self.assertEqual(
+            self._validate(events, launch_profile="helper-linux"),
+            {"classification": "accepted", "findings": "\nNo findings.\n"},
+        )
+
+        host_cwd_event = copy.deepcopy(events)
+        host_cwd_event[0]["cwd"] = str(self.cwd)
+        self.assertEqual(
+            self._validate(host_cwd_event, launch_profile="helper-linux"),
+            {"classification": "blocked", "reasons": ["init.cwd.mismatch"]},
+        )
+
+        for launch_profile, expected_runtime_cwd in (
+            ("helper-linux", str(self.cwd)),
+            ("helper-darwin", "/workspace"),
+            ("named-direct", "/workspace"),
+        ):
+            with self.subTest(launch_profile=launch_profile):
+                self.assertEqual(
+                    self._validate(
+                        events,
+                        launch_profile=launch_profile,
+                        expected_runtime_cwd=expected_runtime_cwd,
+                    ),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": ["validator.expected-runtime-cwd-invalid"],
+                    },
+                )
+
+    def test_helper_linux_does_not_apply_named_direct_host_path_gate(self) -> None:
+        events = self._full_events()
+        events[0]["cwd"] = "/workspace"
+        events[0]["tools"] = ["Read"]
+        events.insert(
+            -1,
+            self._assistant_event(
+                {
+                    "type": "tool_use",
+                    "caller": {"type": "direct"},
+                    "id": "toolu-helper-linux",
+                    "input": {"file_path": "/workspace/review.py"},
+                    "name": "Read",
+                }
+            ),
+        )
+
+        with mock.patch.object(validator, "_open_bound_workspace") as open_binding:
+            outcome = self._validate(events, launch_profile="helper-linux")
+
+        self.assertEqual(
+            outcome,
+            {"classification": "accepted", "findings": "\nNo findings.\n"},
+        )
+        open_binding.assert_not_called()
+
+    def test_accepts_all_reviewed_intermediate_shapes_for_supported_2x(self) -> None:
+        for version in ("2.1.211", "2.1.216", "2.9.999"):
+            with self.subTest(version=version):
+                if version < "2.1.216":
+                    init, _, result = self._legacy_events(version)
+                else:
+                    init = copy.deepcopy(self.init_event)
+                    init["claude_code_version"] = version
+                    result = copy.deepcopy(self.result_event)
+                events = [
+                    init,
+                    *copy.deepcopy(self._reviewed_intermediate_events()),
+                    result,
+                ]
+                self.assertEqual(
+                    self._validate(events, claude_code_version=version),
+                    {"classification": "accepted", "findings": "\nNo findings.\n"},
+                )
+
+    def test_accepts_structured_tool_paths_inside_exact_cwd(self) -> None:
+        cases = {
+            "absolute-read": ("Read", {"file_path": str(self.review_file)}),
+            "absolute-grep": ("Grep", {"path": str(self.src_dir)}),
+            "absolute-glob": (
+                "Glob",
+                {"path": str(self.cwd), "pattern": "src/*.py"},
+            ),
+            "cwd-default-glob": ("Glob", {"pattern": "src/*.py"}),
+        }
+        for name, (tool_name, tool_input) in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    self._validate(
+                        self._tool_events(
+                            tool_name,
+                            tool_input,
+                            tool_id=f"toolu-{name}",
+                        )
+                    ),
+                    {"classification": "accepted", "findings": "\nNo findings.\n"},
+                )
+
+    def test_relative_or_home_shorthand_tool_paths_are_scope_unverified(self) -> None:
+        cases = {
+            "relative-read": ("Read", {"file_path": "review.py"}),
+            "home-read": ("Read", {"file_path": "~/.claude/spill.txt"}),
+            "relative-grep": ("Grep", {"path": "src"}),
+            "relative-glob-path": (
+                "Glob",
+                {"path": "src", "pattern": "*.py"},
+            ),
+        }
+        for name, (tool_name, tool_input) in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    self._validate(
+                        self._tool_events(
+                            tool_name,
+                            tool_input,
+                            tool_id=f"toolu-{name}",
+                        )
+                    ),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": [validator.TOOL_PATH_SCOPE_UNVERIFIED_REASON],
+                    },
+                )
+
+    def test_blocks_structured_read_of_real_home_like_outside_path(self) -> None:
+        outside_path = self.temporary_root / "real-home" / ".claude" / "spill.txt"
+        outside_path.parent.mkdir(parents=True)
+        outside_path.write_text("synthetic spill\n", encoding="utf-8")
+        cases = {
+            "Read": {"file_path": str(outside_path)},
+            "Grep": {"path": str(outside_path.parent)},
+            "Glob": {"path": str(outside_path.parent), "pattern": "*.txt"},
+        }
+        for tool_name, tool_input in cases.items():
+            with self.subTest(tool_name=tool_name):
+                outcome = self._validate(
+                    self._tool_events(
+                        tool_name,
+                        tool_input,
+                        tool_id=f"toolu-outside-{tool_name.lower()}",
+                    )
+                )
+
+                self.assertEqual(
+                    outcome,
+                    {
+                        "classification": "blocked",
+                        "reasons": [validator.TOOL_PATH_OUTSIDE_WORKSPACE_REASON],
+                    },
+                )
+                self.assertNotIn(str(outside_path.parent), json.dumps(outcome))
+
+    def test_blocks_inside_symlink_that_resolves_outside_workspace(self) -> None:
+        outside_path = self.temporary_root / "outside-review.py"
+        outside_path.write_text("# outside target\n", encoding="utf-8")
+        inside_link = self.cwd / "linked-review.py"
+        inside_link.symlink_to(outside_path)
+
+        self.assertEqual(
+            self._validate(
+                self._tool_events(
+                    "Read",
+                    {"file_path": str(inside_link)},
+                    tool_id="toolu-symlink-escape",
+                )
+            ),
+            {
+                "classification": "blocked",
+                "reasons": [validator.TOOL_PATH_OUTSIDE_WORKSPACE_REASON],
+            },
+        )
+
+    def test_blocks_symlink_escape_before_parent_traversal(self) -> None:
+        outside_root = self.temporary_root / "outside-root"
+        outside_nested = outside_root / "nested"
+        outside_nested.mkdir(parents=True)
+        (outside_root / "secret.py").write_text("# outside secret\n", encoding="utf-8")
+        inside_link = self.cwd / "linked-directory"
+        inside_link.symlink_to(outside_nested, target_is_directory=True)
+
+        self.assertEqual(
+            self._validate(
+                self._tool_events(
+                    "Read",
+                    {"file_path": str(inside_link / ".." / "secret.py")},
+                    tool_id="toolu-symlink-parent-escape",
+                )
+            ),
+            {
+                "classification": "blocked",
+                "reasons": [validator.TOOL_PATH_OUTSIDE_WORKSPACE_REASON],
+            },
+        )
+
+    def test_read_path_missing_or_blank_is_inconclusive(self) -> None:
+        for tool_input in ({}, {"file_path": " \t"}):
+            with self.subTest(tool_input=tool_input):
+                self.assertEqual(
+                    self._validate(
+                        self._tool_events(
+                            "Read",
+                            tool_input,
+                            tool_id="toolu-unverified-read",
+                        )
+                    ),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": [validator.TOOL_PATH_SCOPE_UNVERIFIED_REASON],
+                    },
+                )
+
+    def test_glob_pattern_safe_subset_and_escape_classification(self) -> None:
+        outside_root = self.temporary_root / "real-home"
+        outside_root.mkdir()
+        inside_absolute_pattern = str(self.src_dir / "*.py")
+        cases = {
+            "safe-relative": ("src/*.py", "accepted", []),
+            "parent-traversal": (
+                "../real-home/**",
+                "blocked",
+                [validator.TOOL_PATH_OUTSIDE_WORKSPACE_REASON],
+            ),
+            "absolute-outside": (
+                str(outside_root / "**"),
+                "blocked",
+                [validator.TOOL_PATH_OUTSIDE_WORKSPACE_REASON],
+            ),
+            "absolute-inside": (
+                inside_absolute_pattern,
+                "inconclusive",
+                [validator.TOOL_PATH_SCOPE_UNVERIFIED_REASON],
+            ),
+            "home-shorthand": (
+                "~/.claude/**",
+                "inconclusive",
+                [validator.TOOL_PATH_SCOPE_UNVERIFIED_REASON],
+            ),
+            "recursive-glob": (
+                "**/*.py",
+                "accepted",
+                [],
+            ),
+            "leading-dot-recursive": (
+                "./**/*.py",
+                "accepted",
+                [],
+            ),
+            "leading-dot-src-recursive": (
+                "./src/**/*.ts",
+                "accepted",
+                [],
+            ),
+            "wildcard-directory": (
+                "*/module.py",
+                "accepted",
+                [],
+            ),
+            "common-recursive-brace": (
+                "src/**/*.{py,md}",
+                "accepted",
+                [],
+            ),
+            "character-class": (
+                "src/**/[Tt]est*.py",
+                "accepted",
+                [],
+            ),
+            "intermediate-dot": (
+                "src/./*.py",
+                "inconclusive",
+                [validator.TOOL_PATH_SCOPE_UNVERIFIED_REASON],
+            ),
+            "escaping-brace-alternative": (
+                "{src/**,../real-home/**}",
+                "blocked",
+                [validator.TOOL_PATH_OUTSIDE_WORKSPACE_REASON],
+            ),
+        }
+        for name, (pattern, classification, reasons) in cases.items():
+            with self.subTest(name=name):
+                outcome = self._validate(
+                    self._tool_events(
+                        "Glob",
+                        {"pattern": pattern},
+                        tool_id=f"toolu-glob-{name}",
+                    )
+                )
+
+                self.assertEqual(outcome["classification"], classification)
+                if classification == "accepted":
+                    self.assertEqual(outcome["findings"], "\nNo findings.\n")
+                else:
+                    self.assertEqual(outcome["reasons"], sorted(reasons))
+
+    def test_glob_pattern_requires_bounded_nonblank_string(self) -> None:
+        cases = (
+            {},
+            {"pattern": ""},
+            {"pattern": 7},
+            {"pattern": "a" * 4097},
+            {"pattern": "src\\*.py"},
+            {"pattern": "src/{nested,{brace,syntax}}/*.py"},
+            {"pattern": "{" + ",".join(f"branch-{i}" for i in range(65)) + "}"},
+            *(
+                {"pattern": f"src/{token}module.py"}
+                for token in validator.STRUCTURED_GLOB_EXTGLOB_TOKENS
+            ),
+        )
+        for tool_input in cases:
+            with self.subTest(tool_input=tool_input):
+                self.assertEqual(
+                    self._validate(
+                        self._tool_events(
+                            "Glob",
+                            tool_input,
+                            tool_id="toolu-glob-unverified",
+                        )
+                    ),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": [validator.TOOL_PATH_SCOPE_UNVERIFIED_REASON],
+                    },
+                )
+
+    def test_dynamic_glob_directory_components_block_external_symlinks(
+        self,
+    ) -> None:
+        outside_root = self.temporary_root / "outside-glob-directory"
+        outside_root.mkdir()
+        (outside_root / "module.py").write_text("# outside module\n", encoding="utf-8")
+        (self.cwd / "linked-external").symlink_to(
+            outside_root,
+            target_is_directory=True,
+        )
+        (self.src_dir / "linked-external").symlink_to(
+            outside_root,
+            target_is_directory=True,
+        )
+
+        for pattern in ("*/module.py", "**/*.py", "src/**/*.py"):
+            with self.subTest(pattern=pattern):
+                self.assertEqual(
+                    self._validate(self._tool_events("Glob", {"pattern": pattern})),
+                    {
+                        "classification": "blocked",
+                        "reasons": [validator.TOOL_PATH_OUTSIDE_WORKSPACE_REASON],
+                    },
+                )
+
+    def test_dynamic_glob_directory_components_accept_internal_symlinks(
+        self,
+    ) -> None:
+        internal_root = self.src_dir / "internal"
+        internal_root.mkdir()
+        (internal_root / "module.py").write_text(
+            "# internal module\n", encoding="utf-8"
+        )
+        (self.cwd / "linked-src").symlink_to(
+            self.src_dir,
+            target_is_directory=True,
+        )
+        (self.src_dir / "linked-internal").symlink_to(
+            internal_root,
+            target_is_directory=True,
+        )
+
+        for pattern in ("*/module.py", "**/*.py", "src/**/*.py"):
+            with self.subTest(pattern=pattern):
+                self.assertEqual(
+                    self._validate(self._tool_events("Glob", {"pattern": pattern})),
+                    {"classification": "accepted", "findings": "\nNo findings.\n"},
+                )
+
+    def test_recursive_glob_skips_dangling_symlink_proved_inside_workspace(
+        self,
+    ) -> None:
+        (self.src_dir / "broken-internal").symlink_to(
+            self.src_dir / "missing-directory",
+            target_is_directory=True,
+        )
+
+        self.assertEqual(
+            self._validate(self._tool_events("Glob", {"pattern": "**/*.py"})),
+            {"classification": "accepted", "findings": "\nNo findings.\n"},
+        )
+
+    def test_dynamic_glob_scan_budget_exhaustion_is_scope_unverified(self) -> None:
+        for limit_name in (
+            "MAX_STRUCTURED_GLOB_SCAN_ENTRIES",
+            "MAX_STRUCTURED_GLOB_SCAN_STATES",
+            "MAX_STRUCTURED_GLOB_SCAN_DEPTH",
+        ):
+            with (
+                self.subTest(limit_name=limit_name),
+                mock.patch.object(validator, limit_name, 0),
+            ):
+                outcome = self._validate(
+                    self._tool_events("Glob", {"pattern": "**/*.py"})
+                )
+
+                self.assertEqual(
+                    outcome,
+                    {
+                        "classification": "inconclusive",
+                        "reasons": [validator.TOOL_PATH_SCOPE_UNVERIFIED_REASON],
+                    },
+                )
+
+    def test_glob_literal_directory_prefix_cannot_follow_outside_symlink(self) -> None:
+        outside_root = self.temporary_root / "outside-source"
+        outside_root.mkdir()
+        (outside_root / "module.py").write_text("# outside source\n", encoding="utf-8")
+        (self.cwd / "linked-source").symlink_to(
+            outside_root,
+            target_is_directory=True,
+        )
+
+        self.assertEqual(
+            self._validate(
+                self._tool_events(
+                    "Glob",
+                    {"pattern": "linked-source/*.py"},
+                    tool_id="toolu-glob-symlink-prefix",
+                )
+            ),
+            {
+                "classification": "blocked",
+                "reasons": [validator.TOOL_PATH_OUTSIDE_WORKSPACE_REASON],
+            },
+        )
+
+    def test_outside_tool_path_and_malformed_block_follow_global_precedence(
+        self,
+    ) -> None:
+        outside_path = self.temporary_root / "outside.py"
+        outside_path.write_text("# outside\n", encoding="utf-8")
+        outcome = self._validate(
+            self._tool_events(
+                "Read",
+                {"file_path": str(outside_path)},
+                tool_id="toolu-outside-malformed",
+                future_field="unsupported",
+            )
+        )
+
+        self.assertEqual(
+            outcome,
+            {
+                "classification": "inconclusive",
+                "reasons": [
+                    "intermediate.assistant.message.content.tool_use.unknown-field",
+                    validator.TOOL_PATH_OUTSIDE_WORKSPACE_REASON,
+                ],
+            },
+        )
+        self.assertNotIn(str(outside_path), json.dumps(outcome))
+
+    def test_named_direct_opens_and_closes_one_workspace_binding_per_stream(
+        self,
+    ) -> None:
+        events = [
+            copy.deepcopy(self.init_event),
+            self._assistant_event(
+                {
+                    "type": "tool_use",
+                    "caller": {"type": "direct"},
+                    "id": "toolu-read-once",
+                    "input": {"file_path": str(self.review_file)},
+                    "name": "Read",
+                }
+            ),
+            self._assistant_event(
+                {
+                    "type": "tool_use",
+                    "caller": {"type": "direct"},
+                    "id": "toolu-glob-once",
+                    "input": {"pattern": "src/*.py"},
+                    "name": "Glob",
+                }
+            ),
+            copy.deepcopy(self.result_event),
+        ]
+
+        with (
+            mock.patch.object(
+                validator,
+                "_open_bound_workspace",
+                wraps=validator._open_bound_workspace,
+            ) as open_binding,
+            mock.patch.object(
+                validator,
+                "_close_bound_workspace",
+                wraps=validator._close_bound_workspace,
+            ) as close_binding,
+        ):
+            outcome = self._validate(events)
+
+        self.assertEqual(
+            outcome,
+            {"classification": "accepted", "findings": "\nNo findings.\n"},
+        )
+        open_binding.assert_called_once_with(self.cwd)
+        close_binding.assert_called_once()
+
+    def test_workspace_identity_uncertainty_is_path_free_and_inconclusive(self) -> None:
+        with mock.patch.object(
+            validator,
+            "_workspace_binding_matches",
+            return_value=False,
+        ):
+            outcome = self._validate(
+                self._tool_events(
+                    "Read",
+                    {"file_path": str(self.review_file)},
+                    tool_id="toolu-workspace-identity-drift",
+                )
+            )
+
+        self.assertEqual(
+            outcome,
+            {
+                "classification": "inconclusive",
+                "reasons": [validator.TOOL_PATH_SCOPE_UNVERIFIED_REASON],
+            },
+        )
+        self.assertNotIn(str(self.review_file), json.dumps(outcome))
+
+    def test_persisted_output_path_without_model_read_is_not_blocked(self) -> None:
+        outside_path = self.temporary_root / "real-home" / ".claude" / "spill.txt"
+        user_event = copy.deepcopy(self._reviewed_intermediate_events()[-2])
+        user_event["tool_use_result"] = {
+            "persistedOutputPath": str(outside_path),
+        }
+        message = user_event["message"]
+        assert isinstance(message, dict)
+        content = message["content"]
+        assert isinstance(content, list)
+        content[0]["content"] = f"Output persisted to {outside_path}"
+
+        self.assertEqual(
+            self._validate(
+                [
+                    copy.deepcopy(self.init_event),
+                    self._reviewed_intermediate_events()[3],
+                    user_event,
+                    copy.deepcopy(self.result_event),
+                ]
+            ),
+            {"classification": "accepted", "findings": "\nNo findings.\n"},
+        )
+
+    def test_accepts_each_reviewed_tool_and_tool_result_representation(self) -> None:
+        for tool_name in validator.LAUNCH_PROFILES["named-direct"]["tools"]:
+            with self.subTest(tool_name=tool_name):
+                if tool_name == "Read":
+                    tool_input = {"file_path": str(self.review_file)}
+                elif tool_name == "Glob":
+                    tool_input = {"pattern": "src/*.py"}
+                else:
+                    tool_input = {}
+                tool_event = self._assistant_event(
+                    {
+                        "type": "tool_use",
+                        "caller": {"type": "direct"},
+                        "id": "toolu-synthetic",
+                        "input": tool_input,
+                        "name": tool_name,
+                    }
+                )
+                events = [
+                    copy.deepcopy(self.init_event),
+                    tool_event,
+                    copy.deepcopy(self.result_event),
+                ]
+                self.assertEqual(self._validate(events)["classification"], "accepted")
+
+        user_event = copy.deepcopy(self._reviewed_intermediate_events()[-2])
+        user_event["tool_use_result"] = "synthetic tool output"
+        message = user_event["message"]
+        assert isinstance(message, dict)
+        content = message["content"]
+        assert isinstance(content, list)
+        del content[0]["is_error"]
+        self.assertEqual(
+            self._validate(
+                [
+                    copy.deepcopy(self.init_event),
+                    user_event,
+                    copy.deepcopy(self.result_event),
+                ]
+            )["classification"],
+            "accepted",
+        )
+
+    def test_accepts_legacy_and_floating_extended_release_profiles(self) -> None:
+        cases = {
+            "legacy-minimum": ("2.1.211", self._legacy_events()),
+            "legacy-2.1.212": ("2.1.212", self._legacy_events()),
+            "legacy-upper-bound": ("2.1.215", self._legacy_events()),
+            "extended-current": ("2.1.216", self._full_events()),
+            "extended-future-2x": ("2.9.999", self._full_events()),
+        }
+
+        for name, (version, events) in cases.items():
+            with self.subTest(name=name):
+                events[0]["claude_code_version"] = version
+                self.assertEqual(
+                    self._validate(events, claude_code_version=version)[
+                        "classification"
+                    ],
+                    "accepted",
+                )
+
+    def test_rejects_out_of_range_and_nonrelease_version_arguments(self) -> None:
+        for version in ("2.1.210", "3.0.0", "2.1.216-beta.1", "v2.1.216"):
+            with self.subTest(version=version):
+                self.assertEqual(
+                    self._validate(claude_code_version=version),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": ["validator.runtime-binding-invalid"],
+                    },
+                )
 
     def test_accepts_init_without_optional_session_id(self) -> None:
         events = self._full_events()
         del events[0]["session_id"]
+        del events[1]
 
         self.assertEqual(self._validate(events)["classification"], "accepted")
 
@@ -610,6 +1532,200 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "reasons": ["stream.session_id.mismatch"],
             },
         )
+
+    def test_rejects_unknown_policy_and_error_intermediate_events(self) -> None:
+        unknown_events = {
+            "policy-subtype": {
+                "type": "system",
+                "subtype": "policy",
+                "session_id": "init-session",
+            },
+            "error-type": {
+                "type": "error",
+                "error": "synthetic error",
+                "session_id": "init-session",
+            },
+        }
+        for name, intermediate in unknown_events.items():
+            with self.subTest(name=name):
+                events = [
+                    copy.deepcopy(self.init_event),
+                    intermediate,
+                    copy.deepcopy(self.result_event),
+                ]
+                self.assert_fail_closed(self._validate(events), "inconclusive")
+
+    def test_rejects_unknown_intermediate_fields_sessions_and_tools(self) -> None:
+        extra_top_level = copy.deepcopy(self.progress_event)
+        extra_top_level["permissionMode"] = "dontAsk"
+        extra_nested = copy.deepcopy(self.progress_event)
+        message = extra_nested["message"]
+        assert isinstance(message, dict)
+        message["future_security_context"] = {"allow": True}
+        unknown_tool = self._assistant_event(
+            {
+                "type": "tool_use",
+                "caller": {"type": "direct"},
+                "id": "toolu-synthetic",
+                "input": {},
+                "name": "Write",
+            }
+        )
+        cases = {
+            "extra-top-level": extra_top_level,
+            "extra-nested": extra_nested,
+            "unknown-tool": unknown_tool,
+        }
+        for name, intermediate in cases.items():
+            with self.subTest(name=name):
+                events = [
+                    copy.deepcopy(self.init_event),
+                    intermediate,
+                    copy.deepcopy(self.result_event),
+                ]
+                self.assert_fail_closed(self._validate(events), "inconclusive")
+
+        for intermediate in self._reviewed_intermediate_events():
+            with self.subTest(session_event_type=intermediate["type"]):
+                intermediate["session_id"] = "different-session"
+                events = [
+                    copy.deepcopy(self.init_event),
+                    intermediate,
+                    copy.deepcopy(self.result_event),
+                ]
+                self.assertEqual(
+                    self._validate(events),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": ["stream.session_id.mismatch"],
+                    },
+                )
+
+        unbound = self._full_events()
+        del unbound[0]["session_id"]
+        self.assertEqual(
+            self._validate(unbound),
+            {
+                "classification": "inconclusive",
+                "reasons": ["stream.session_id.unbound"],
+            },
+        )
+
+    def test_rejects_malformed_intermediate_nested_shapes(self) -> None:
+        cases: dict[str, dict[str, object]] = {}
+        assistant_usage = copy.deepcopy(self.progress_event)
+        message = assistant_usage["message"]
+        assert isinstance(message, dict)
+        message["usage"] = []
+        cases["assistant-usage"] = assistant_usage
+
+        user_content = copy.deepcopy(self._reviewed_intermediate_events()[-2])
+        user_message = user_content["message"]
+        assert isinstance(user_message, dict)
+        user_message["content"] = []
+        cases["user-content"] = user_content
+
+        rate_info = copy.deepcopy(self._reviewed_intermediate_events()[-1])
+        info = rate_info["rate_limit_info"]
+        assert isinstance(info, dict)
+        info["resetsAt"] = True
+        cases["rate-limit-timestamp"] = rate_info
+
+        thinking_tokens = copy.deepcopy(self._reviewed_intermediate_events()[0])
+        thinking_tokens["estimated_tokens_delta"] = -1
+        cases["thinking-token-count"] = thinking_tokens
+
+        for name, intermediate in cases.items():
+            with self.subTest(name=name):
+                self.assert_fail_closed(
+                    self._validate(
+                        [
+                            copy.deepcopy(self.init_event),
+                            intermediate,
+                            copy.deepcopy(self.result_event),
+                        ]
+                    ),
+                    "inconclusive",
+                )
+
+    def test_accepts_closed_allowed_warning_rate_limit_variant(self) -> None:
+        warning = copy.deepcopy(self._reviewed_intermediate_events()[-1])
+        info = warning["rate_limit_info"]
+        assert isinstance(info, dict)
+        info.update(
+            {
+                "status": "allowed_warning",
+                "utilization": 0.75,
+                "surpassedThreshold": 0.75,
+            }
+        )
+        del info["overageStatus"]
+        del info["overageResetsAt"]
+
+        outcome = self._validate(
+            [
+                copy.deepcopy(self.init_event),
+                warning,
+                copy.deepcopy(self.result_event),
+            ]
+        )
+
+        self.assertEqual(
+            outcome,
+            {"classification": "accepted", "findings": "\nNo findings.\n"},
+        )
+
+    def test_rejects_nonclosed_rate_limit_variants(self) -> None:
+        allowed = copy.deepcopy(self._reviewed_intermediate_events()[-1])
+        allowed_info = allowed["rate_limit_info"]
+        assert isinstance(allowed_info, dict)
+        del allowed_info["overageStatus"]
+
+        warning = copy.deepcopy(self._reviewed_intermediate_events()[-1])
+        warning_info = warning["rate_limit_info"]
+        assert isinstance(warning_info, dict)
+        warning_info.update(
+            {
+                "status": "allowed_warning",
+                "utilization": 1.1,
+                "surpassedThreshold": 0.75,
+            }
+        )
+        del warning_info["overageStatus"]
+        del warning_info["overageResetsAt"]
+
+        unknown = copy.deepcopy(self._reviewed_intermediate_events()[-1])
+        unknown_info = unknown["rate_limit_info"]
+        assert isinstance(unknown_info, dict)
+        unknown_info["status"] = "future_status"
+
+        for label, event, reason in (
+            (
+                "allowed missing field",
+                allowed,
+                "intermediate.rate-limit-event.rate_limit_info.overageStatus.missing",
+            ),
+            (
+                "warning invalid ratio",
+                warning,
+                "intermediate.rate-limit-event.rate_limit_info.utilization.malformed",
+            ),
+            (
+                "unknown status",
+                unknown,
+                "intermediate.rate-limit-event.rate_limit_info.status.unrecognized",
+            ),
+        ):
+            with self.subTest(label=label):
+                outcome = self._validate(
+                    [
+                        copy.deepcopy(self.init_event),
+                        event,
+                        copy.deepcopy(self.result_event),
+                    ]
+                )
+                self.assert_fail_closed(outcome, "inconclusive")
+                self.assertIn(reason, outcome["reasons"])
 
     def test_nonzero_success_is_inconclusive_and_returncode_must_be_exact_int(
         self,
@@ -637,10 +1753,14 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         self.assertEqual(
             validator.validate_claude_stream_bytes(
                 self._raw(self._full_events()),
-                expected_cwd=self.cwd,
+                host_workspace_cwd=self.cwd,
+                expected_runtime_cwd=str(self.cwd),
                 requested_model="claude-opus-4-8",
-                api_key_source="none",
-                preflight_result=self.preflight_path,
+                runtime_binding=validator.ClaudeRuntimeBinding(
+                    **{
+                        **self._valid_runtime_binding_fields(),
+                    }
+                ),
             ),
             {
                 "classification": "inconclusive",
@@ -704,13 +1824,53 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
 
         self.assertEqual(outcome["classification"], "accepted")
 
-    def test_accepts_explicit_api_key_source_when_init_matches(self) -> None:
-        events = self._full_events()
-        events[0]["apiKeySource"] = "ANTHROPIC_API_KEY"
+    def test_authentication_source_maps_to_exact_init_api_key_source(self) -> None:
+        self.assertEqual(validator.CLAUDE_AUTH_ENV_NAME, "ANTHROPIC_API_KEY")
+        cases = {
+            "api-key": validator.CLAUDE_AUTH_ENV_NAME,
+            "oauth-token": "none",
+            "local-login": "none",
+        }
 
-        outcome = self._validate(events, api_key_source="ANTHROPIC_API_KEY")
+        for authentication_source, init_api_key_source in cases.items():
+            with self.subTest(authentication_source=authentication_source):
+                events = self._full_events()
+                events[0]["apiKeySource"] = init_api_key_source
+                self.assertEqual(
+                    self._validate(
+                        events,
+                        authentication_source=authentication_source,
+                    )["classification"],
+                    "accepted",
+                )
 
-        self.assertEqual(outcome["classification"], "accepted")
+    def test_authentication_source_rejects_init_mapping_mismatch(self) -> None:
+        cases = {
+            "api-key": "none",
+            "oauth-token": validator.CLAUDE_AUTH_ENV_NAME,
+            "local-login": validator.CLAUDE_AUTH_ENV_NAME,
+        }
+
+        for authentication_source, init_api_key_source in cases.items():
+            with self.subTest(authentication_source=authentication_source):
+                events = self._full_events()
+                events[0]["apiKeySource"] = init_api_key_source
+                outcome = self._validate(
+                    events,
+                    authentication_source=authentication_source,
+                )
+
+                self.assertEqual(outcome["classification"], "blocked")
+                self.assertEqual(outcome["reasons"], ["init.apiKeySource.mismatch"])
+
+    def test_rejects_unknown_authentication_source_argument(self) -> None:
+        self.assertEqual(
+            self._validate(authentication_source="none"),
+            {
+                "classification": "inconclusive",
+                "reasons": ["validator.runtime-binding-invalid"],
+            },
+        )
 
     def test_rejects_malformed_raw_streams(self) -> None:
         valid = self._full_events()
@@ -737,16 +1897,18 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
 
         outcome = validator.validate_claude_stream(
             io.StringIO("not binary"),
-            expected_cwd=self.cwd,
+            host_workspace_cwd=self.cwd,
+            expected_runtime_cwd=str(self.cwd),
             requested_model="claude-opus-4-8",
-            api_key_source="none",
-            preflight_result=self.preflight_path,
+            runtime_binding=validator.ClaudeRuntimeBinding(
+                **self._valid_runtime_binding_fields()
+            ),
             process_returncode=0,
         )
         self.assert_fail_closed(outcome, "inconclusive")
 
     def test_json_parser_exceptions_fail_closed(self) -> None:
-        contract_with_binding = validator._load_contract_with_binding()
+        contract = validator._load_contract()
         parser_errors = (
             ValueError("integer conversion limit"),
             RecursionError("maximum recursion depth exceeded"),
@@ -759,12 +1921,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                     mock.patch.object(
                         validator,
                         "_load_contract_with_binding",
-                        return_value=contract_with_binding,
-                    ),
-                    mock.patch.object(
-                        validator,
-                        "_read_preflight_evidence",
-                        return_value=self._preflight_evidence(),
+                        return_value=(contract, self.stream_contract_binding),
                     ),
                     mock.patch.object(
                         validator, "_strict_json_loads", side_effect=error
@@ -794,15 +1951,16 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 )
 
     def test_json_integer_digit_bound_is_explicit(self) -> None:
-        accepted_progress = (
-            b'{"type":"assistant","value":'
-            + b"1" * validator.MAX_JSON_INTEGER_DIGITS
-            + b"}\n"
+        progress = self._raw([self.progress_event])
+        accepted_progress = progress.replace(
+            b'"usage":{}',
+            b'"usage":{"synthetic":' + b"1" * validator.MAX_JSON_INTEGER_DIGITS + b"}",
         )
-        rejected_progress = (
-            b'{"type":"assistant","value":'
+        rejected_progress = progress.replace(
+            b'"usage":{}',
+            b'"usage":{"synthetic":'
             + b"1" * (validator.MAX_JSON_INTEGER_DIGITS + 1)
-            + b"}\n"
+            + b"}",
         )
         valid = self._full_events()
         init = self._raw([valid[0]])
@@ -939,6 +2097,13 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "claude_code_version": 212,
             "apiKeySource": None,
             "session_id": " ",
+            "output_style": 1,
+            "agents": {"claude": True},
+            "capabilities": ["interrupt_receipt_v1", 2],
+            "analytics_disabled": 1,
+            "product_feedback_disabled": "false",
+            "uuid": " ",
+            "fast_mode_state": ["off"],
         }
 
         for field_name, value in malformed_values.items():
@@ -947,10 +2112,9 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 events[0][field_name] = value
                 self.assert_fail_closed(self._validate(events), "inconclusive")
 
-    def test_rejects_hooks_agents_and_arbitrary_unknown_init_fields(self) -> None:
+    def test_rejects_hooks_and_arbitrary_unknown_init_fields(self) -> None:
         unknown_fields = {
             "hooks": [{"matcher": "Bash"}],
-            "agents": [{"name": "reviewer"}],
             "future_field": True,
         }
 
@@ -966,11 +2130,186 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                     },
                 )
 
+    def test_extended_profile_requires_every_field(self) -> None:
+        for field_name in validator.EXTENDED_INIT_REQUIRED_FIELDS:
+            with self.subTest(field=field_name):
+                events = self._full_events()
+                del events[0][field_name]
+
+                self.assertEqual(
+                    self._validate(events),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": [f"init.{field_name}.missing"],
+                    },
+                )
+
+    def test_extended_profile_rejects_value_and_order_drift_as_inconclusive(
+        self,
+    ) -> None:
+        mismatch_values = {
+            "output_style": "compact",
+            "agents": ["Explore", "claude", "general-purpose", "Plan"],
+            "capabilities": ["msg_lifecycle_v1", "interrupt_receipt_v1"],
+            "analytics_disabled": False,
+            "fast_mode_state": "on",
+        }
+
+        for field_name, value in mismatch_values.items():
+            with self.subTest(field=field_name):
+                events = self._full_events()
+                events[0][field_name] = value
+                outcome = self._validate(events)
+
+                self.assertEqual(outcome["classification"], "inconclusive")
+                self.assertIn(f"init.{field_name}.mismatch", outcome["reasons"])
+                self.assertNotIn("findings", outcome)
+
+    def test_extended_profile_accepts_either_feedback_boolean(self) -> None:
+        events = self._full_events()
+        events[0]["product_feedback_disabled"] = True
+
+        self.assertEqual(self._validate(events)["classification"], "accepted")
+
+    def test_legacy_profile_rejects_extended_shape(self) -> None:
+        events = self._full_events()
+        events[0]["claude_code_version"] = "2.1.215"
+
+        self.assertEqual(
+            self._validate(events, claude_code_version="2.1.215"),
+            {
+                "classification": "inconclusive",
+                "reasons": ["init.unknown-field", "terminal.unknown-field"],
+            },
+        )
+
+    def test_extended_success_requires_every_terminal_profile_field(self) -> None:
+        for field_name in validator.EXTENDED_TERMINAL_FIELDS:
+            with self.subTest(field=field_name):
+                events = self._full_events()
+                del events[-1][field_name]
+                self.assertEqual(
+                    self._validate(events),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": [f"terminal.{field_name}.missing"],
+                    },
+                )
+
+    def test_extended_terminal_profile_rejects_malformed_and_value_drift(
+        self,
+    ) -> None:
+        malformed_values = {
+            "fast_mode_state": None,
+            "terminal_reason": [],
+            "time_to_request_ms": True,
+            "ttft_ms": -1,
+            "ttft_stream_ms": "3",
+        }
+        drift_values = {
+            "fast_mode_state": "on",
+            "terminal_reason": "api_error",
+        }
+        for field_name, value in {**malformed_values, **drift_values}.items():
+            with self.subTest(field=field_name, value=value):
+                events = self._full_events()
+                events[-1][field_name] = value
+                self.assert_fail_closed(self._validate(events), "inconclusive")
+
+    def test_extended_failure_strictly_validates_optional_terminal_profile_fields(
+        self,
+    ) -> None:
+        terminal = {
+            "type": "result",
+            "subtype": "error",
+            "is_error": True,
+            "error": "HTTP 401 Unauthorized",
+            "fast_mode_state": "off",
+            "terminal_reason": "api_error",
+            "time_to_request_ms": 0,
+            "ttft_ms": 1,
+            "ttft_stream_ms": 2,
+        }
+        events = [copy.deepcopy(self.init_event), terminal]
+        self.assertEqual(
+            self._validate(events),
+            {
+                "classification": "blocked-authentication",
+                "reasons": ["terminal.authentication-error"],
+            },
+        )
+
+        malformed = copy.deepcopy(events)
+        malformed[-1]["terminal_reason"] = "unknown"
+        self.assert_fail_closed(self._validate(malformed), "inconclusive")
+
+    def test_failure_subtype_is_closed_for_every_version_profile(self) -> None:
+        cases = (
+            ("legacy-base", "2.1.215", self._legacy_events("2.1.215")),
+            ("extended-2x", "2.1.216", self._full_events()),
+        )
+        for profile_name, version, events in cases:
+            with self.subTest(profile=profile_name, subtype="error"):
+                known_failure = copy.deepcopy(events)
+                known_failure[-1].update(
+                    {
+                        "subtype": "error",
+                        "is_error": True,
+                        "error": "HTTP 401 Unauthorized",
+                    }
+                )
+                self.assertEqual(
+                    self._validate(
+                        known_failure,
+                        claude_code_version=version,
+                    ),
+                    {
+                        "classification": "blocked-authentication",
+                        "reasons": ["terminal.authentication-error"],
+                    },
+                )
+
+            with self.subTest(profile=profile_name, subtype="future_error"):
+                unknown_failure = copy.deepcopy(events)
+                unknown_failure[-1].update(
+                    {
+                        "subtype": "future_error",
+                        "is_error": True,
+                        "error": "HTTP 401 Unauthorized",
+                    }
+                )
+                outcome = self._validate(
+                    unknown_failure,
+                    claude_code_version=version,
+                )
+                self.assert_fail_closed(outcome, "inconclusive")
+                self.assertIn("terminal.subtype.unrecognized", outcome["reasons"])
+                self.assertNotIn("terminal.authentication-error", outcome["reasons"])
+
+    def test_legacy_terminal_forbids_extended_profile_fields(self) -> None:
+        for field_name, value in {
+            "fast_mode_state": "off",
+            "terminal_reason": "completed",
+            "time_to_request_ms": 0,
+            "ttft_ms": 0,
+            "ttft_stream_ms": 0,
+        }.items():
+            with self.subTest(field=field_name):
+                events = self._legacy_events("2.1.215")
+                events[-1][field_name] = value
+                self.assertEqual(
+                    self._validate(events, claude_code_version="2.1.215"),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": ["terminal.unknown-field"],
+                    },
+                )
+
     def test_rejects_well_formed_init_mismatches_as_blocked(self) -> None:
         mismatch_values = {
             "cwd": str(self.cwd / "other"),
             "permissionMode": "default",
-            "tools": ["Read", "Grep", "Glob"],
+            "tools": ["Read", "Grep", "Glob", "Bash", "Task"],
             "mcp_servers": ["server"],
             "slash_commands": ["review"],
             "skills": ["skill"],
@@ -1349,8 +2688,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                         "claude-opus-4-8",
                         "--preflight-result",
                         str(self.preflight_path),
-                        "--api-key-source",
-                        "none",
+                        "--authentication-source",
+                        "local-login",
                         "--process-returncode",
                         "0",
                         "--input",
@@ -1386,8 +2725,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "claude-opus-4-8",
                 "--preflight-result",
                 str(self.preflight_path),
-                "--api-key-source",
-                "none",
+                "--authentication-source",
+                "local-login",
                 "--process-returncode",
                 "0",
                 "--input",
@@ -1408,6 +2747,48 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         )
         self.assertEqual(completed.stderr, b"")
 
+    def test_cli_maps_each_authentication_source_to_api_key_source(self) -> None:
+        for authentication_source, api_key_source in (
+            ("api-key", "ANTHROPIC_API_KEY"),
+            ("oauth-token", "none"),
+            ("local-login", "none"),
+        ):
+            with self.subTest(authentication_source=authentication_source):
+                events = self._full_events()
+                events[0]["apiKeySource"] = api_key_source
+                input_path = self.cwd / f"{authentication_source}-stream.jsonl"
+                input_path.write_bytes(self._raw(events))
+
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(VALIDATOR),
+                        "--cwd",
+                        str(self.cwd),
+                        "--model",
+                        "claude-opus-4-8",
+                        "--preflight-result",
+                        str(self.preflight_path),
+                        "--authentication-source",
+                        authentication_source,
+                        "--process-returncode",
+                        "0",
+                        "--input",
+                        str(input_path),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=5,
+                )
+
+                self.assertEqual(completed.returncode, 0)
+                self.assertEqual(completed.stderr, b"")
+                self.assertEqual(
+                    json.loads(completed.stdout),
+                    {"classification": "accepted", "findings": "\nNo findings.\n"},
+                )
+
     def test_cli_rejects_success_stdout_when_process_returncode_is_nonzero(
         self,
     ) -> None:
@@ -1424,8 +2805,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "claude-opus-4-8",
                 "--preflight-result",
                 str(self.preflight_path),
-                "--api-key-source",
-                "none",
+                "--authentication-source",
+                "local-login",
                 "--process-returncode",
                 "401",
                 "--input",
@@ -1481,8 +2862,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                         "claude-opus-4-8",
                         "--preflight-result",
                         str(self.preflight_path),
-                        "--api-key-source",
-                        "none",
+                        "--authentication-source",
+                        "local-login",
                         "--process-returncode",
                         "0",
                         "--input",
@@ -1513,8 +2894,18 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "claude-opus-4-8",
                 "--preflight-result",
                 str(self.preflight_path),
-                "--api-key-source",
-                "none",
+                "--authentication-source",
+                "local-login",
+                "--process-returncode",
+                "0",
+            ],
+            "missing-preflight-result": [
+                "--cwd",
+                str(self.cwd),
+                "--model",
+                "claude-opus-4-8",
+                "--authentication-source",
+                "local-login",
                 "--process-returncode",
                 "0",
             ],
@@ -1525,8 +2916,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "claude-opus-4-8",
                 "--preflight-result",
                 str(self.preflight_path),
-                "--api-key-source",
-                "none",
+                "--authentication-source",
+                "local-login",
             ],
             "invalid-process-returncode": [
                 "--cwd",
@@ -1535,8 +2926,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "claude-opus-4-8",
                 "--preflight-result",
                 str(self.preflight_path),
-                "--api-key-source",
-                "none",
+                "--authentication-source",
+                "local-login",
                 "--process-returncode",
                 "not-an-integer",
             ],
@@ -1545,8 +2936,22 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 str(self.cwd),
                 "--model",
                 "claude-future",
-                "--api-key-source",
-                "none",
+                "--preflight-result",
+                str(self.preflight_path),
+                "--authentication-source",
+                "local-login",
+                "--process-returncode",
+                "0",
+            ],
+            "invalid-authentication-source": [
+                "--cwd",
+                str(self.cwd),
+                "--model",
+                "claude-opus-4-8",
+                "--preflight-result",
+                str(self.preflight_path),
+                "--authentication-source",
+                "future-auth-source",
                 "--process-returncode",
                 "0",
             ],
@@ -1557,8 +2962,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "claude-opus-4-8",
                 "--preflight-result",
                 str(self.preflight_path),
-                "--api-key-source",
-                "none",
+                "--authentication-source",
+                "local-login",
                 "--process-returncode",
                 "0",
                 "--future-option",
@@ -1605,8 +3010,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "claude-opus-4-8",
                 "--preflight-result",
                 str(self.preflight_path),
-                "--api-key-source",
-                "none",
+                "--authentication-source",
+                "local-login",
                 "--process-returncode",
                 "0",
                 "--input",
@@ -1649,8 +3054,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "claude-opus-4-8",
                 "--preflight-result",
                 str(self.preflight_path),
-                "--api-key-source",
-                "none",
+                "--authentication-source",
+                "local-login",
                 "--process-returncode",
                 "0",
                 "--input",

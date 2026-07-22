@@ -3,7 +3,7 @@ id: 20260719-crt001
 title: Claude Refresh Transaction Lock
 status: completed
 created: 2026-07-19
-updated: 2026-07-21
+updated: 2026-07-22
 branch: codex/claude-refresh-transaction-lock
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/67
 supersedes: []
@@ -16,10 +16,12 @@ superseded_by:
 
 - Serialize each catalogued Claude local-login attempt before the first host credential read and through runtime refresh, quiescence, final drain, and verified host persistence on macOS, Linux, and WSL2.
 - Retain shared lock directories as a fail-closed stale fence when rotation persistence or writer quiescence remains uncertain.
-- Keep API-key mode independent of local-login carrier coordination.
+- Keep explicit API-key and OAuth-token modes independent of local-login carrier coordination.
 
 ## Current State
 
+- This remains the current low-level `isolated_review` helper contract. It does not apply to the named direct Claude lane, which uses the ordinary publisher-verified CLI in real `HOME` and never claims helper broker/carrier/catalog/writeback guarantees.
+- Helper authentication precedence is `ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` > local login. Either explicit winner bypasses carrier reads, the exact credential-lock catalog gate, and the refresh transaction; only helper local login enters the transaction below.
 - The process supervisor exposes a post-cleanup quiescence callback only after the child is reaped and its supervised process group is absent.
 - macOS carrier selection, broker execution, snapshot validation, and host persistence reuse one outer refresh-lock lease.
 - Linux/WSL2 credential staging, watcher writeback, final drain, and cleanup reuse one borrowed-descriptor host lease while private staged-carrier locks remain separate.

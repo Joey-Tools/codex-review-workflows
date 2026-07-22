@@ -8,17 +8,21 @@ import stat
 from dataclasses import dataclass
 from typing import Any
 
+from .claude_version_policy import CLAUDE_COMPATIBILITY_SPEC
+
 
 COMPATIBILITY_SCHEMA_ID = "claude-code-stream-compatible-v1"
-COMPATIBILITY_MODE = "strict-structural-baseline"
+COMPATIBILITY_MODE = "strict-version-and-launch-profiles"
 VERSION_POLICY_REFERENCE = (
     "review_runtime.claude_version_policy.CLAUDE_COMPATIBILITY_SPEC"
 )
 BASELINE_SCHEMA_NAME = "claude-2.1.212-stream-schema.json"
 BASELINE_VERSION = "2.1.212"
+PROFILE_SCHEMA_NAME = "claude-stream-schema.json"
 REFERENCE_ROOT = pathlib.Path(__file__).resolve().parents[2] / "references"
 COMPATIBILITY_PATH = REFERENCE_ROOT / "claude-stream-compatibility.json"
 BASELINE_PATH = REFERENCE_ROOT / BASELINE_SCHEMA_NAME
+PROFILE_PATH = REFERENCE_ROOT / PROFILE_SCHEMA_NAME
 CAPABILITY_PATH = pathlib.Path(__file__).with_name("claude_capabilities.py")
 MAX_CONTRACT_BYTES = 256 * 1024
 
@@ -146,6 +150,7 @@ def load_stream_contract(
     *,
     compatibility_path: pathlib.Path = COMPATIBILITY_PATH,
     baseline_path: pathlib.Path = BASELINE_PATH,
+    profile_path: pathlib.Path = PROFILE_PATH,
 ) -> tuple[
     ClaudeStreamContractBinding,
     bytes,
@@ -153,25 +158,30 @@ def load_stream_contract(
 ]:
     compatibility_raw = _read_stable(compatibility_path)
     baseline_raw = _read_stable(baseline_path)
+    profile_raw = _read_stable(profile_path)
     capability_raw = _read_stable(CAPABILITY_PATH)
     compatibility = _parse_json(compatibility_raw, label=compatibility_path.name)
     baseline = _parse_json(baseline_raw, label=baseline_path.name)
+    profile = _parse_json(profile_raw, label=profile_path.name)
     expected_compatibility = {
         "schema_id": COMPATIBILITY_SCHEMA_ID,
         "version_policy": VERSION_POLICY_REFERENCE,
         "compatibility_mode": COMPATIBILITY_MODE,
         "baseline_schema": BASELINE_SCHEMA_NAME,
         "baseline_version": BASELINE_VERSION,
-        "adaptations": {
-            "init_event.field_contracts.claude_code_version": {
-                "baseline_rule": "constant",
-                "runtime_rule": "exact_preflight_selected_version",
-            }
+        "profile_schema": PROFILE_SCHEMA_NAME,
+        "profile_version_policy": CLAUDE_COMPATIBILITY_SPEC,
+        "version_profiles": {
+            "legacy-base": ">=2.1.211,<2.1.216",
+            "extended-2x": ">=2.1.216,<3.0.0",
         },
+        "launch_profiles": ["helper-darwin", "helper-linux", "named-direct"],
         "fail_closed_surfaces": [
             "stream_envelope",
             "init_field_set",
             "init_field_values",
+            "intermediate_event_field_sets",
+            "intermediate_session_binding",
             "terminal_field_set",
             "terminal_variants",
             "model_identity",
@@ -181,11 +191,24 @@ def load_stream_contract(
         raise ClaudeStreamContractError("stream compatibility profile does not match")
     if baseline.get("claude_code_version") != BASELINE_VERSION:
         raise ClaudeStreamContractError("stream baseline version does not match")
+    version_contract = profile.get("claude_code_version")
+    if version_contract != {
+        "rule": "strict_release_semver_range",
+        "minimum_inclusive": "2.1.211",
+        "maximum_exclusive": "3.0.0",
+    }:
+        raise ClaudeStreamContractError("stream profile version policy does not match")
     compatibility_digest = hashlib.sha256(compatibility_raw).hexdigest()
     baseline_digest = hashlib.sha256(baseline_raw).hexdigest()
     capability_digest = hashlib.sha256(capability_raw).hexdigest()
     digest = hashlib.sha256(
-        compatibility_raw + b"\0" + baseline_raw + b"\0" + capability_raw
+        compatibility_raw
+        + b"\0"
+        + baseline_raw
+        + b"\0"
+        + profile_raw
+        + b"\0"
+        + capability_raw
     ).hexdigest()
     return (
         ClaudeStreamContractBinding(
@@ -196,5 +219,5 @@ def load_stream_contract(
             capability_digest=capability_digest,
         ),
         compatibility_raw,
-        baseline_raw,
+        profile_raw,
     )

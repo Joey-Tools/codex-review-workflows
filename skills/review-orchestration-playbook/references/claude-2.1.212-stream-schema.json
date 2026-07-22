@@ -135,11 +135,11 @@
         "mismatch_failure": "blocked"
       },
       "apiKeySource": {
-        "rule": "exact_cli_argument",
-        "argument": "api_key_source",
-        "accepted_arguments": [
-          "none",
-          "ANTHROPIC_API_KEY"
+        "rule": "exact_runtime_binding",
+        "binding_field": "api_key_source",
+        "accepted_values": [
+          "ANTHROPIC_API_KEY",
+          "none"
         ],
         "malformed_failure": "inconclusive",
         "mismatch_failure": "blocked"

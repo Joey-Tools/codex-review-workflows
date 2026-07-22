@@ -3,7 +3,7 @@ id: 20260717-7f1703
 title: Trust Reviewers and Gate Exact-Secret Growth
 status: completed
 created: 2026-07-17
-updated: 2026-07-21
+updated: 2026-07-22
 branch: codex/secret-reduction-review
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/60
 supersedes: []
@@ -93,11 +93,13 @@ A large catalog-only manifest may use the existing public and helper-private fil
 
 Canonical named lanes use separate clean Git worktrees, clear reviewer context, and no injected full diff:
 
-- single review: fresh local Codex;
-- double review: fresh local Codex plus one Claude-family lane;
+- single review: one zero-inherited-turn Codex reviewer;
+- double review: single review plus one directly launched actual Claude Code process in a separate read-only worktree;
 - triple review: double review plus current-head GitHub Codex.
 
-The stateful supplied-diff/no-Git helper remains a low-level compatibility, security-maintenance, and optional admission-audit tool. Its reviewer artifact is trusted but never satisfies or replaces a named lane. PR readiness does not add the former `offline-frozen-diff-review` or `independent-codex-pr-review` lanes, and does not require the helper final/admission pair; required admission uses the no-reviewer direct scan.
+The stateful helper remains a low-level compatibility, security-maintenance, and optional admission-audit tool. It materializes a helper-owned detached workspace backed by private minimal Git under `review_contract: supplied-diff-private-git`; its reviewer artifact is trusted but never satisfies or replaces a named lane. PR readiness does not add the former `offline-frozen-diff-review` or `independent-codex-pr-review` lanes, and does not require the helper final/admission pair; required admission uses the no-reviewer direct scan.
+
+Current named-direct and low-level-helper policy accepts publisher-verified strict stable Claude Code `>=2.1.211,<3.0.0`. Each selected release is bound to its exact signed per-version manifest, platform artifact size, and SHA-256, then must pass credential-free `--version` and `--help` capability probes against the same private digest-verified executable snapshot before credential or review input.
 
 ### Direct Admission And Optional Stateful Evidence
 
@@ -111,7 +113,7 @@ The receipt and argv bindings close helper-controlled path-replacement and coope
 
 ### Workspace Scope
 
-Targeted launch-boundary hardening is part of this delivery: frozen workspace and control artifacts use safe owner-only modes, a newly created bound `attempts` directory is forced to `0700` before reopening, newly created runtime/control/attempt/credential-update files are descriptor-forced to `0600` even under an owner-masking umask, runner stdout/stderr descriptors are forced to exact `0600` before child spawn, existing lock and artifact files are never chmod-repaired, cleanup is bound to the prepared runner-lock identity, reviewer/egress policy is child-argv-bound, and reviewer workspace, prompt, sandbox mount, attempt output, preflight receipt, and verdict/control I/O remain attached to validated descriptors or exact digests. Canonical named lanes now use the review-policy migration's separate clean Git worktree contract. This delivery does not redesign the low-level helper's `.git`-free frozen snapshot into a detached worktree or reflinked snapshot; that separate architecture decision remains deferred.
+Targeted launch-boundary hardening is part of this delivery: frozen workspace and control artifacts use safe owner-only modes, a newly created bound `attempts` directory is forced to `0700` before reopening, newly created runtime/control/attempt/credential-update files are descriptor-forced to `0600` even under an owner-masking umask, runner stdout/stderr descriptors are forced to exact `0600` before child spawn, existing lock and artifact files are never chmod-repaired, cleanup is bound to the prepared runner-lock identity, reviewer/egress policy is child-argv-bound, and reviewer workspace, prompt, sandbox mount, attempt output, preflight receipt, and verdict/control I/O remain attached to validated descriptors or exact digests. Canonical named lanes use separate clean Git worktrees; the low-level helper uses its own detached workspace backed by a helper-private minimal Git database and never satisfies a named lane.
 
 ## Current State
 
@@ -134,8 +136,8 @@ Implementation and final combined code validation now preserve both layers: the 
 - Base-only unextractable shapes may be deleted, while head-side or otherwise genuinely incomplete scans report `inconclusive`.
 - Violation diagnostics include only newly added `path:line` locations.
 - Ambiguous move-plus-copy or cross-surface endpoint mappings never overstate addition locations; they retain the proved global violation while reporting location evidence as `inconclusive`.
-- Single/double/triple review counting remains Codex / Codex+Claude / Codex+Claude+GitHub Codex, each local named lane using its own clean Git worktree without an injected full diff.
-- The low-level supplied-diff helper is never counted as a named lane, and PR readiness has no additional offline/independent Codex double gate.
+- Single/double/triple review counting remains Codex / Codex+actual Claude Code / Codex+actual Claude Code+GitHub Codex, each local named lane using its own clean Git worktree without an injected full diff.
+- The low-level `supplied-diff-private-git` helper uses a detached workspace, is never counted as a named lane, and does not add an offline/independent Codex double gate to PR readiness.
 - PR/master/merge-ready requires direct current-head `secret-admission`; it starts no reviewer, and only exit `0` is permitting.
 - Direct admission exits `1` and `75` remain distinct violation and inconclusive outcomes. Optional helper-state admission additionally retains exit `3` pending, runner-lock precedence, receipt binding, and reviewer-final independence; a head change invalidates every result.
 - A schema-v5 runner-sealed receipt binds admission to the exact bounded `preflight.json` bytes; replacement, mutation, terminal non-sealing, malformed receipt, and schema-v4 admission all fail closed, while schema-v4 `status` / `wait` / `final` / cleanup remain compatible.

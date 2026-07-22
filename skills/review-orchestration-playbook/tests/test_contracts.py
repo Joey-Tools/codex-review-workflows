@@ -18,6 +18,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by Python 3.10 CI
 SKILL_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SKILL_SCOPE_ROOT = SKILL_ROOT.parents[1]
 SCRIPTS = SKILL_ROOT / "scripts"
+RUNTIME = SCRIPTS / "review_runtime"
 sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime import (  # noqa: E402
@@ -136,6 +137,20 @@ def _claude_auth_repository_policy_files(
     return {
         name: path.read_text(encoding="utf-8") for name, path in policy_paths.items()
     }
+
+
+def _current_claude_contract_files() -> dict[str, str]:
+    candidates = {
+        "SKILL.md": SKILL_ROOT / "SKILL.md",
+        "helper-contract.md": SKILL_ROOT / "references/helper-contract.md",
+        "claude-runtime-trust.md": SKILL_ROOT / "references/claude-runtime-trust.md",
+        "egress-consent.md": SKILL_ROOT / "references/egress-consent.md",
+        "pr-readiness.md": SKILL_ROOT / "references/pr-readiness.md",
+        "AGENTS.md": _repository_agents_path(REPO_ROOT, CI_PROFILE),
+    }
+    if CI_PROFILE == "canonical":
+        candidates["README.md"] = REPO_ROOT / "README.md"
+    return {name: path.read_text(encoding="utf-8") for name, path in candidates.items()}
 
 
 def _secret_admission_repository_policy_files(
@@ -519,7 +534,7 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertEqual(
             providers.LOW_LEVEL_HELPER_REVIEW_CONTRACT,
-            "supplied-diff-no-git",
+            "supplied-diff-private-git",
         )
         self.assertFalse(providers.NAMED_LANE_ELIGIBLE)
         for candidate in (
@@ -555,13 +570,21 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertIn(anchor, reviewer_instructions)
 
-    def test_claude_policy_defaults_to_local_login_in_safe_mode(self) -> None:
+    def test_low_level_helper_local_login_runs_in_outer_safe_mode(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
             encoding="utf-8"
         )
 
-        self.assertIn("ordinary local Claude login by default", skill)
+        self.assertIn(
+            "helper authentication, apply precedence `ANTHROPIC_API_KEY` > "
+            "`CLAUDE_CODE_OAUTH_TOKEN` > local login",
+            skill,
+        )
+        self.assertIn(
+            "An explicit API key or OAuth token bypasses helper local-login carrier access",
+            skill,
+        )
         self.assertIn("runs in safe mode", helper_contract)
         self.assertIn(
             "hardening-compatible `default` permission mode",
@@ -581,6 +604,34 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn(">=2.1.211,<3.0.0", helper_contract)
         self.assertIn("Linux and WSL2", helper_contract)
         self.assertNotIn("requires `ANTHROPIC_API_KEY`", skill)
+
+    def test_helper_runtime_cwd_is_separate_from_host_workspace_binding(
+        self,
+    ) -> None:
+        helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
+            encoding="utf-8"
+        )
+        provider_source = (RUNTIME / "providers.py").read_text(encoding="utf-8")
+        validator_source = (SCRIPTS / "validate_claude_stream.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual(str(claude_linux.SANDBOX_WORKSPACE), "/workspace")
+        self.assertIn(
+            "expected_runtime_cwd=str(sandbox_command.workspace_path)",
+            provider_source,
+        )
+        self.assertIn("host_workspace_cwd=review.workspace_root", provider_source)
+        self.assertIn("expected_cwd=expected_runtime_cwd", validator_source)
+        self.assertIn("stream-reported runtime cwd as distinct inputs", helper_contract)
+        self.assertIn(
+            "Linux and WSL2 bind the reported runtime cwd to `/workspace`",
+            helper_contract,
+        )
+        self.assertIn(
+            "named-direct structured-tool path scope remains bound to the host clean worktree",
+            helper_contract,
+        )
 
     def test_claude_auth_carriers_refresh_without_a_freshness_gate(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
@@ -611,9 +662,7 @@ class RepositoryContractTest(unittest.TestCase):
         ) + inspect.getsource(providers._claude_attempt_with_output)
         pwd_home_source = inspect.getsource(providers._claude_pwd_home)
         select_source = inspect.getsource(providers._select_claude_macos_credential)
-        validate_source = inspect.getsource(
-            providers._validate_claude_local_credential
-        )
+        validate_source = inspect.getsource(providers._validate_claude_local_credential)
         macos_runtime_source = inspect.getsource(
             providers._claude_keychain_runtime
         ) + inspect.getsource(providers._claude_keychain_runtime_coordinated)
@@ -820,7 +869,11 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("refresh_lock.assert_held()", linux_write_source)
         self.assertIn("refresh_lock_protocol", linux_write_source)
         self.assertIn("_certified_claude_refresh_lock_protocol", attempt_source)
-        self.assertIn('env.get("ANTHROPIC_API_KEY")', attempt_source)
+        self.assertIn(
+            "authentication_source = _claude_authentication_source(env)",
+            attempt_source,
+        )
+        self.assertIn('authentication_source != "local-login"', attempt_source)
 
         self.assertIn('"phase": "blocked-authentication"', auth_outcome_source)
         self.assertIn("CLAUDE_AUTH_LOGIN_ACTION", auth_outcome_source)
@@ -894,6 +947,298 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn(
             "Read(/auth/**)",
             claude_linux.CLAUDE_LINUX_FILE_TOOL_DENY_RULES,
+        )
+
+    def test_direct_and_helper_claude_modes_keep_distinct_home_contracts(
+        self,
+    ) -> None:
+        policies = _current_claude_contract_files()
+        skill = policies["SKILL.md"]
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        helper = policies["helper-contract.md"]
+
+        for phrase in (
+            "real `HOME`",
+            "ordinary Claude CLI authentication",
+            "trusted control plane",
+            "does not use the low-level helper's credential broker",
+        ):
+            self.assertIn(phrase, canonical)
+        for phrase in (
+            "helper-owned detached worktree",
+            "private minimal Git",
+            "review_contract: supplied-diff-private-git",
+            "named_lane_eligible: false",
+        ):
+            self.assertIn(phrase, skill)
+        for phrase in (
+            "helper-owned outer sandbox",
+            "credential-lock protocol catalog",
+            "recovery carrier",
+            "guarded writeback",
+        ):
+            self.assertIn(phrase, helper)
+        self.assertEqual(
+            providers.LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+            "supplied-diff-private-git",
+        )
+        self.assertFalse(providers.NAMED_LANE_ELIGIBLE)
+
+        self.assertIn('"autoAllowBashIfSandboxed": false', canonical)
+        self.assertIn('"allowUnsandboxedCommands": false', canonical)
+        helper_arguments = providers._claude_review_arguments(
+            model="claude-opus-4-8",
+            settings="{}",
+            linux=False,
+        )
+        self.assertEqual(
+            helper_arguments[helper_arguments.index("--permission-mode") + 1],
+            "default",
+        )
+        self.assertEqual(
+            helper_arguments[helper_arguments.index("--tools") + 1],
+            "Read,Grep,Glob",
+        )
+        self.assertIn(
+            "Bash",
+            helper_arguments[helper_arguments.index("--disallowedTools") + 1].split(
+                ","
+            ),
+        )
+        self.assertIn("`Read`, `Grep`, `Glob`, and sandboxed `Bash`", skill)
+        self.assertIn("native sandbox", skill)
+
+    def test_claude_auth_precedence_delegates_to_verified_cli(self) -> None:
+        policies = _current_claude_contract_files()
+        combined = "\n".join(policies.values())
+        provider_source = (RUNTIME / "providers.py").read_text(encoding="utf-8")
+
+        direct_precedence = (
+            "`ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` > ordinary local login"
+        )
+        helper_precedence = (
+            "`ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` > local login"
+        )
+        self.assertIn(direct_precedence, policies["SKILL.md"])
+        self.assertIn(helper_precedence, policies["SKILL.md"])
+        if "README.md" in policies:
+            self.assertIn(direct_precedence, policies["README.md"])
+            self.assertIn(helper_precedence, policies["README.md"])
+        self.assertIn("ANTHROPIC_API_KEY", provider_source)
+        self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", provider_source)
+        self.assertIn("blocked-authentication", combined)
+        self.assertIn("claude auth login", combined)
+        self.assertIn("unset or replace `ANTHROPIC_API_KEY`", combined)
+        self.assertIn("unset or replace `CLAUDE_CODE_OAUTH_TOKEN`", combined)
+        self.assertIn("opaque", combined)
+        self.assertIn("auth status --json", combined)
+
+    def test_direct_claude_does_not_inherit_helper_credential_transactions(
+        self,
+    ) -> None:
+        direct_policy = {
+            "SKILL.md": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"),
+            "canonical-claude-lane.md": (
+                SKILL_ROOT / "references/canonical-claude-lane.md"
+            ).read_text(encoding="utf-8"),
+            "review-lane-contracts.md": (
+                SKILL_ROOT / "references/review-lane-contracts.md"
+            ).read_text(encoding="utf-8"),
+        }
+        for name, content in direct_policy.items():
+            with self.subTest(direct_policy=name):
+                self.assertIn("real `HOME`", content)
+                self.assertIn("direct", content)
+        self.assertIn(
+            "does not use the low-level helper's credential broker",
+            direct_policy["canonical-claude-lane.md"],
+        )
+        self.assertIn(
+            "do not apply to this direct lane",
+            direct_policy["review-lane-contracts.md"],
+        )
+
+        runtime_source = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (RUNTIME / "providers.py", RUNTIME / "claude_linux.py")
+        )
+        for symbol in (
+            "_prepare_claude_keychain_broker",
+            "_claude_keychain_runtime",
+            "_persist_claude_macos_refreshed_credential",
+            "_write_claude_keychain_credential",
+            "stage_claude_credentials",
+            "acquire_claude_refresh_lock",
+        ):
+            with self.subTest(symbol=symbol):
+                self.assertIn(symbol, runtime_source)
+
+        helper_policy = (SKILL_ROOT / "references/helper-contract.md").read_text(
+            encoding="utf-8"
+        )
+        for helper_term in (
+            "credential-lock protocol catalog",
+            "recovery carrier",
+            "/auth/config",
+            "guarded writeback",
+            "broker `W` generation",
+        ):
+            with self.subTest(helper_term=helper_term):
+                self.assertIn(helper_term, helper_policy)
+
+    def test_workspace_defaults_clean_and_wip_is_explicit_diagnostic_only(
+        self,
+    ) -> None:
+        cli_source = (RUNTIME / "cli.py").read_text(encoding="utf-8")
+        workspace_source = (RUNTIME / "workspace.py").read_text(encoding="utf-8")
+        policies = _current_claude_contract_files()
+
+        self.assertIn("--include-source-wip", cli_source)
+        self.assertIn("include_source_wip", cli_source + workspace_source)
+        for name in ("SKILL.md", "helper-contract.md"):
+            policy = policies[name]
+            with self.subTest(policy=name):
+                self.assertIn("--include-source-wip", policy)
+                self.assertIn("staged", policy)
+                self.assertIn("unstaged", policy)
+                self.assertIn("untracked", policy)
+
+        helper = policies["helper-contract.md"]
+        self.assertIn("private-minimal-Git", helper)
+        self.assertIn("WIP digest", helper)
+        self.assertIn("source checkout", helper)
+        self.assertIn("original source `HEAD`", helper)
+        self.assertIn("WIP deletion or reversion", helper)
+        self.assertIn(
+            "match exactly between the source `HEAD` tree and active index",
+            helper,
+        )
+        self.assertIn(
+            "Top-level source queries ignore initialized submodule worktree state",
+            helper,
+        )
+        self.assertIn(
+            "never read nested content or local Git configuration",
+            helper,
+        )
+
+        readiness = policies["pr-readiness.md"]
+        self.assertIn("clean Git worktree", readiness)
+        self.assertIn("<merge_base>..HEAD", readiness)
+        self.assertNotIn("--include-source-wip", readiness)
+
+        consent = policies["egress-consent.md"]
+        self.assertIn("--include-source-wip", consent)
+        self.assertIn("Clean-head helper approval", consent)
+        self.assertIn("Source-WIP helper approval", consent)
+        self.assertIn("content_variant=head", consent)
+        self.assertIn("content_variant=source-wip", consent)
+        self.assertIn("untracked private files", consent)
+        self.assertIn("home-directory content", consent)
+
+    def test_review_workspace_and_state_use_external_system_temp_root(self) -> None:
+        workspace_source = (RUNTIME / "workspace.py").read_text(encoding="utf-8")
+        provider_source = (RUNTIME / "providers.py").read_text(encoding="utf-8")
+        combined = "\n".join(_current_claude_contract_files().values())
+
+        self.assertIn('REVIEW_ROOT_BASE = pathlib.Path("/tmp")', workspace_source)
+        self.assertIn(
+            'REVIEW_USER_ROOT_PREFIX = "codex-isolated-review-uid-"',
+            workspace_source,
+        )
+        self.assertIn(
+            "hashlib.sha256(os.fsencode(str(canonical_source))).hexdigest()",
+            workspace_source,
+        )
+        self.assertIn(
+            "helper review root must be outside the source repository",
+            workspace_source,
+        )
+        helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "/tmp/codex-isolated-review-uid-<effective-uid>/"
+            "<sha256(canonical-source-path)>/isolated-review-*",
+            helper_contract,
+        )
+        self.assertIn(
+            "Source-local `.codex-tmp` remains only a schema-v1-to-v4 "
+            "legacy compatibility layout",
+            helper_contract,
+        )
+        self.assertNotIn(
+            "source_root/.codex-tmp/isolated-review-*",
+            helper_contract,
+        )
+        self.assertIn("_review_root_for_source(canonical_source)", provider_source)
+        self.assertIn("container_root.parent != review_root", provider_source)
+        for phrase in (
+            "system temporary root `/tmp`",
+            "outside the source checkout",
+            "effective UID",
+            "canonical source path",
+        ):
+            self.assertIn(phrase, combined)
+
+    def test_helper_wip_requires_separate_consent_while_named_egress_excludes_it(
+        self,
+    ) -> None:
+        helper = (SKILL_ROOT / "references/helper-contract.md").read_text(
+            encoding="utf-8"
+        )
+        consent = (SKILL_ROOT / "references/egress-consent.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("separate explicit consent", helper)
+        self.assertIn("--include-source-wip", helper)
+        self.assertIn("nonignored untracked", helper)
+        self.assertIn("WIP evidence is diagnostic only", helper)
+        self.assertIn("untracked private files", consent)
+        self.assertIn("home-directory content", consent)
+        self.assertIn("hidden local-only artifacts", consent)
+        self.assertIn("--include-source-wip", consent)
+
+        provider_source = (RUNTIME / "providers.py").read_text(encoding="utf-8")
+        for field in (
+            "content_variant",
+            "include_source_wip",
+            "snapshot_tree_sha",
+            "scope_identity",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(f'"{field}"', provider_source)
+                self.assertIn(field, helper)
+                self.assertIn(field, consent)
+
+        self.assertIn("Clean-head approval:", helper)
+        self.assertIn("Source-WIP approval:", helper)
+        for document in (helper, consent):
+            with self.subTest(document=document[:32]):
+                self.assertIn("staged, unstaged, and nonignored untracked", document)
+                self.assertIn(
+                    "ignored untracked files and source content not captured by the "
+                    "WIP snapshot",
+                    document,
+                )
+                self.assertIn("content_variant=head", document)
+                self.assertIn("content_variant=source-wip", document)
+                self.assertIn("`false` for `content_variant: head`", document)
+                self.assertIn(
+                    "`true` only for `content_variant: source-wip`",
+                    document,
+                )
+
+        source_wip_approval = consent.split(
+            "### Source-WIP helper approval",
+            maxsplit=1,
+        )[1].split("Do not shorten this", maxsplit=1)[0]
+        self.assertNotIn(
+            "This excludes automatic discovery of reviewer/runtime authentication "
+            "credentials, untracked files",
+            source_wip_approval,
         )
 
     def test_ci_targets_only_the_canonical_runtime_and_tests(self) -> None:
@@ -1150,7 +1495,7 @@ class RepositoryContractTest(unittest.TestCase):
             "path-scoped `AGENTS.md`, repo-local domain skills, tracked project guidance, then hunks",
             "Codex must load exactly that named source",
             "Do not prepare, paste, attach, or point it to a full diff",
-            "existing frozen-diff Codex helper is not this lane and does not satisfy single review",
+            "existing supplied-diff/private-Git Codex helper is not this lane and does not satisfy single review",
             "actual Claude Code process in a second clean Git worktree",
             "A Copilot, Cursor, OpenCode, or other model-family result does not satisfy the Claude Code lane",
         ):
@@ -1172,6 +1517,25 @@ class RepositoryContractTest(unittest.TestCase):
             "A different provider cannot satisfy this lane",
         ):
             self.assertIn(anchor, contracts)
+
+    def test_skill_interface_distinguishes_direct_and_helper_authentication(
+        self,
+    ) -> None:
+        interface = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
+
+        for anchor in (
+            "Both select authentication with precedence ANTHROPIC_API_KEY > "
+            "CLAUDE_CODE_OAUTH_TOKEN > local login",
+            "The named-direct lane uses the ordinary CLI in real HOME",
+            "low-level helper local login instead uses its private credential "
+            "carrier/broker and guarded writeback",
+            "helper API-key/OAuth modes bypass that transaction",
+        ):
+            self.assertIn(anchor, interface)
+        self.assertNotIn(
+            "Use real HOME ordinary CLI authentication with precedence",
+            interface,
+        )
 
     def test_report_only_review_never_implicitly_authorizes_an_anchor_commit(
         self,
@@ -2011,6 +2375,7 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertIn(anchor, content)
         for anchor in (
             "explicit absolute `--claude-path` override",
+            "`--claude-version`",
             "An explicit override is authoritative",
             "Candidate presence is tri-state",
             "highest compatible stable side-by-side install",
@@ -2056,6 +2421,8 @@ class RepositoryContractTest(unittest.TestCase):
             '"signed-version-identity-mismatch"',
             '"publisher-verification-failed"',
             "verify_claude_release(",
+            "version=release_version",
+            "parse_compatible_release_version(declared_version)",
             "materialize_verified_executable(",
             "def _verified_source_matches_signed_artifact(",
             "version_probe(snapshot.executable)",
@@ -2078,6 +2445,10 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertLess(
             module.index("verified = verifier("),
             module.index("completed = verified.version_probe_result"),
+        )
+        self.assertLess(
+            module.index("version_completed = version_probe(snapshot.executable)"),
+            module.index("help_completed = help_probe(snapshot.executable)"),
         )
         self.assertLess(
             module.index(
@@ -2115,6 +2486,7 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertTrue(claude_stream_contract.COMPATIBILITY_PATH.is_file())
         self.assertTrue(claude_stream_contract.BASELINE_PATH.is_file())
+        self.assertTrue(claude_stream_contract.PROFILE_PATH.is_file())
         production_python = sorted((SCRIPTS / "review_runtime").glob("*.py"))
         production_python.append(SCRIPTS / "validate_claude_stream.py")
         range_literal_sources = {
@@ -2190,7 +2562,7 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, preflight)
 
-        binding, compatibility_raw, baseline_raw = (
+        binding, compatibility_raw, profile_raw = (
             claude_stream_contract.load_stream_contract()
         )
         self.assertEqual(
@@ -2202,18 +2574,53 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(len(binding.baseline_digest), 64)
         self.assertEqual(len(binding.capability_digest), 64)
         compatibility = json.loads(compatibility_raw)
-        baseline = json.loads(baseline_raw)
+        profile = json.loads(profile_raw)
+        baseline = json.loads(
+            claude_stream_contract.BASELINE_PATH.read_text(encoding="utf-8")
+        )
         self.assertEqual(compatibility["baseline_version"], "2.1.212")
         self.assertEqual(baseline["claude_code_version"], "2.1.212")
+        self.assertEqual(
+            baseline["init_event"]["field_contracts"]["apiKeySource"],
+            {
+                "rule": "exact_runtime_binding",
+                "binding_field": "api_key_source",
+                "accepted_values": ["ANTHROPIC_API_KEY", "none"],
+                "malformed_failure": "inconclusive",
+                "mismatch_failure": "blocked",
+            },
+        )
         self.assertEqual(
             compatibility["version_policy"],
             "review_runtime.claude_version_policy.CLAUDE_COMPATIBILITY_SPEC",
         )
         self.assertEqual(
-            compatibility["adaptations"][
-                "init_event.field_contracts.claude_code_version"
-            ]["runtime_rule"],
-            "exact_preflight_selected_version",
+            compatibility["compatibility_mode"],
+            "strict-version-and-launch-profiles",
+        )
+        self.assertEqual(compatibility["profile_schema"], "claude-stream-schema.json")
+        self.assertEqual(
+            compatibility["profile_version_policy"],
+            claude_version_policy.CLAUDE_COMPATIBILITY_SPEC,
+        )
+        self.assertEqual(
+            compatibility["version_profiles"],
+            {
+                "legacy-base": ">=2.1.211,<2.1.216",
+                "extended-2x": ">=2.1.216,<3.0.0",
+            },
+        )
+        self.assertEqual(
+            set(compatibility["launch_profiles"]),
+            {"helper-darwin", "helper-linux", "named-direct"},
+        )
+        self.assertEqual(
+            profile["claude_code_version"],
+            {
+                "rule": "strict_release_semver_range",
+                "minimum_inclusive": "2.1.211",
+                "maximum_exclusive": "3.0.0",
+            },
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             incompatible_path = pathlib.Path(temp_dir) / "compatibility.json"
@@ -2245,7 +2652,7 @@ class RepositoryContractTest(unittest.TestCase):
         validator_path = SCRIPTS / "validate_claude_stream.py"
         validator = validator_path.read_text(encoding="utf-8")
         stream_schema = json.loads(
-            (SKILL_ROOT / "references/claude-2.1.212-stream-schema.json").read_text(
+            (SKILL_ROOT / "references/claude-stream-schema.json").read_text(
                 encoding="utf-8"
             )
         )
@@ -2268,8 +2675,9 @@ class RepositoryContractTest(unittest.TestCase):
             "duplicate-free set exactly equal to `Read`, `Grep`, `Glob`, and `Bash`",
             "`mcp_servers`, `slash_commands`, `skills`, and `plugins`",
             "`claude_code_version` equals the publisher-verified preflight version",
-            "`apiKeySource` is a string that exactly matches the parent-selected and preflight-verified authentication source",
-            "`ANTHROPIC_API_KEY` for explicit API-key mode and `none` for ordinary local login",
+            "`apiKeySource` is a string that exactly matches the runtime-bound authentication class",
+            "`ANTHROPIC_API_KEY` for explicit API-key mode and `none` for explicit OAuth-token or ordinary local-login mode",
+            "distinguishes API-key from non-API-key operation only",
             "`result` is a required string whose `strip()` value is nonempty",
             "`modelUsage` is a required nonempty object",
             "every key is a nonempty model-ID string",
@@ -2283,7 +2691,9 @@ class RepositoryContractTest(unittest.TestCase):
             "defined once in",
             "claude_version_policy.py",
             "Claude Code `2.1.212` is the audited per-version stream-schema baseline, not a global eligibility pin.",
-            "adapts only the baseline `claude_code_version` constant to the exact accepted preflight-selected version",
+            "selects a reviewed closed profile by the exact preflight version",
+            "`legacy-base` for `>=2.1.211,<2.1.216`",
+            "`extended-2x` for `>=2.1.216,<3.0.0`",
             "does not prove the final merged native sandbox",
             "merged admin-managed permission arrays",
             "path-rule evaluation",
@@ -2345,8 +2755,22 @@ class RepositoryContractTest(unittest.TestCase):
             '"process.returncode.nonzero"',
             '"init.unknown-field"',
             "INIT_OPTIONAL_FIELDS",
+            "CLAUDE_CODE_VERSION_CONTRACT",
+            "AUTHENTICATION_SOURCE_TO_API_KEY_SOURCE",
+            "INIT_PROFILE_CONTRACT",
+            "EXTENDED_INIT_REQUIRED_FIELDS",
+            "runtime_binding_from_preflight_result",
+            '"--authentication-source"',
         ):
             self.assertIn(anchor, validator)
+        self.assertEqual(
+            stream_schema["claude_code_version"],
+            {
+                "rule": "strict_release_semver_range",
+                "minimum_inclusive": "2.1.211",
+                "maximum_exclusive": "3.0.0",
+            },
+        )
         init_contract = stream_schema["init_event"]
         self.assertEqual(
             stream_schema["process_returncode"],
@@ -2384,19 +2808,26 @@ class RepositoryContractTest(unittest.TestCase):
                 "version_policy": (
                     "review_runtime.claude_version_policy.CLAUDE_COMPATIBILITY_SPEC"
                 ),
-                "compatibility_mode": "strict-structural-baseline",
+                "compatibility_mode": "strict-version-and-launch-profiles",
                 "baseline_schema": "claude-2.1.212-stream-schema.json",
                 "baseline_version": "2.1.212",
-                "adaptations": {
-                    "init_event.field_contracts.claude_code_version": {
-                        "baseline_rule": "constant",
-                        "runtime_rule": "exact_preflight_selected_version",
-                    }
+                "profile_schema": "claude-stream-schema.json",
+                "profile_version_policy": ">=2.1.211,<3.0.0",
+                "version_profiles": {
+                    "legacy-base": ">=2.1.211,<2.1.216",
+                    "extended-2x": ">=2.1.216,<3.0.0",
                 },
+                "launch_profiles": [
+                    "helper-darwin",
+                    "helper-linux",
+                    "named-direct",
+                ],
                 "fail_closed_surfaces": [
                     "stream_envelope",
                     "init_field_set",
                     "init_field_values",
+                    "intermediate_event_field_sets",
+                    "intermediate_session_binding",
                     "terminal_field_set",
                     "terminal_variants",
                     "model_identity",
@@ -2480,14 +2911,23 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn(anchor, templates)
         self.assertNotIn("{review_skill_path_or_version}", templates)
 
-    def test_claude_2_1_212_schema_closes_models_and_terminal_fields(self) -> None:
-        schema_path = SKILL_ROOT / "references/claude-2.1.212-stream-schema.json"
+    def test_floating_claude_schema_closes_versioned_init_and_terminal_fields(
+        self,
+    ) -> None:
+        schema_path = SKILL_ROOT / "references/claude-stream-schema.json"
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
         canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
             encoding="utf-8"
         )
 
-        self.assertEqual(schema["claude_code_version"], "2.1.212")
+        self.assertEqual(
+            schema["claude_code_version"],
+            {
+                "rule": "strict_release_semver_range",
+                "minimum_inclusive": "2.1.211",
+                "maximum_exclusive": "3.0.0",
+            },
+        )
         self.assertEqual(
             schema["stream_contract"]["first_nonblank_event"],
             {"type": "system", "subtype": "init"},
@@ -2517,6 +2957,85 @@ class RepositoryContractTest(unittest.TestCase):
             init_contract["optional_field_contracts"]["session_id"],
             {"rule": "nonempty_string", "failure": "inconclusive"},
         )
+        profiles = init_contract["profiles"]
+        self.assertEqual(profiles["selector"], "claude_code_version")
+        self.assertEqual(
+            set(profiles["variants"]),
+            {"legacy-base", "extended-2x"},
+        )
+        legacy_profile = profiles["variants"]["legacy-base"]
+        self.assertEqual(
+            legacy_profile["version_range"],
+            {
+                "minimum_inclusive": "2.1.211",
+                "maximum_exclusive": "2.1.216",
+            },
+        )
+        self.assertEqual(legacy_profile["additional_required_fields"], [])
+        self.assertEqual(legacy_profile["field_contracts"], {})
+        extended_profile = profiles["variants"]["extended-2x"]
+        self.assertEqual(
+            extended_profile["version_range"],
+            {
+                "minimum_inclusive": "2.1.216",
+                "maximum_exclusive": "3.0.0",
+            },
+        )
+        extended_fields = {
+            "agents",
+            "analytics_disabled",
+            "capabilities",
+            "fast_mode_state",
+            "output_style",
+            "product_feedback_disabled",
+            "uuid",
+        }
+        self.assertEqual(
+            set(extended_profile["additional_required_fields"]),
+            extended_fields,
+        )
+        self.assertEqual(
+            set(extended_profile["field_contracts"]),
+            extended_fields,
+        )
+        self.assertEqual(
+            extended_profile["field_contracts"],
+            {
+                "output_style": {
+                    "rule": "constant",
+                    "value": "default",
+                    "failure": "inconclusive",
+                },
+                "agents": {
+                    "rule": "exact_ordered_array",
+                    "values": ["claude", "Explore", "general-purpose", "Plan"],
+                    "failure": "inconclusive",
+                },
+                "capabilities": {
+                    "rule": "exact_ordered_array",
+                    "values": ["interrupt_receipt_v1", "msg_lifecycle_v1"],
+                    "failure": "inconclusive",
+                },
+                "analytics_disabled": {
+                    "rule": "constant",
+                    "value": True,
+                    "failure": "inconclusive",
+                },
+                "product_feedback_disabled": {
+                    "rule": "boolean",
+                    "failure": "inconclusive",
+                },
+                "uuid": {
+                    "rule": "nonempty_string",
+                    "failure": "inconclusive",
+                },
+                "fast_mode_state": {
+                    "rule": "constant",
+                    "value": "off",
+                    "failure": "inconclusive",
+                },
+            },
+        )
         self.assertEqual(
             set(init_contract["required_fields"]),
             {
@@ -2535,12 +3054,70 @@ class RepositoryContractTest(unittest.TestCase):
             },
         )
         self.assertEqual(
-            set(init_contract["field_contracts"]["tools"]["values"]),
-            {"Read", "Grep", "Glob", "Bash"},
+            schema["launch_profiles"],
+            {
+                "named-direct": {
+                    "permission_mode": "dontAsk",
+                    "runtime_cwd": "host-workspace",
+                    "tools": ["Bash", "Glob", "Grep", "Read"],
+                },
+                "helper-linux": {
+                    "permission_mode": "dontAsk",
+                    "runtime_cwd": "/workspace",
+                    "tools": ["Read"],
+                },
+                "helper-darwin": {
+                    "permission_mode": "default",
+                    "runtime_cwd": "host-workspace",
+                    "tools": ["Glob", "Grep", "Read"],
+                },
+            },
         )
         self.assertEqual(
-            init_contract["field_contracts"]["permissionMode"]["value"],
-            "dontAsk",
+            init_contract["field_contracts"]["cwd"],
+            {
+                "rule": "exact_expected_runtime_cwd",
+                "binding_field": "expected_runtime_cwd",
+                "malformed_failure": "inconclusive",
+                "mismatch_failure": "blocked",
+            },
+        )
+        self.assertEqual(
+            init_contract["field_contracts"]["tools"],
+            {
+                "rule": "duplicate_free_exact_runtime_binding_launch_profile_set",
+                "profile_field": "tools",
+                "malformed_failure": "inconclusive",
+                "mismatch_failure": "blocked",
+            },
+        )
+        self.assertEqual(
+            init_contract["field_contracts"]["permissionMode"],
+            {
+                "rule": "exact_runtime_binding_launch_profile",
+                "profile_field": "permission_mode",
+                "malformed_failure": "inconclusive",
+                "mismatch_failure": "blocked",
+            },
+        )
+        self.assertEqual(
+            init_contract["field_contracts"]["claude_code_version"],
+            {
+                "rule": "exact_cli_argument",
+                "argument": "claude_code_version",
+                "malformed_failure": "inconclusive",
+                "mismatch_failure": "blocked",
+            },
+        )
+        self.assertEqual(
+            init_contract["field_contracts"]["apiKeySource"],
+            {
+                "rule": "exact_runtime_binding",
+                "binding_field": "api_key_source",
+                "accepted_values": ["ANTHROPIC_API_KEY", "none"],
+                "malformed_failure": "inconclusive",
+                "mismatch_failure": "blocked",
+            },
         )
         identities = schema["model_identity"]
         self.assertEqual(
@@ -2675,29 +3252,34 @@ class RepositoryContractTest(unittest.TestCase):
             "`stop_reason`, when present, is exactly `null` or `end_turn`",
             "Any other value—including `max_tokens`",
             "`structured_output`, when present, is exactly `null`",
-            "closed top-level allowlists",
-            "Any other init or terminal field",
+            "closed allowlists for init, every intermediate event family, and every terminal variant",
+            "Any other field, including an unknown error-bearing field",
         ):
             self.assertIn(anchor, canonical)
 
-        self.assertIn(
-            "Claude Code `2.1.212` is the audited per-version stream-schema baseline, not a global eligibility pin.",
-            canonical,
-        )
-        self.assertIn("`strict-structural-baseline`", canonical)
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn(
-            "Claude Code `2.1.212` is the audited per-version stream-schema baseline, not a global eligibility pin.",
-            skill,
-        )
-        self.assertIn("claude-stream-compatibility.json", skill)
         contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
             encoding="utf-8"
         )
-        self.assertIn(
-            "Claude Code `2.1.212` is the audited per-version stream-schema baseline, not a global eligibility pin.",
-            contracts,
+        for content in (skill, contracts, canonical):
+            self.assertIn(">=2.1.211,<3.0.0", content)
+            self.assertIn("signed per-version manifest", content)
+            self.assertNotIn("exact Claude Code `2.1.212`", content)
+            self.assertNotIn("exactly `2.1.212`", content)
+        self.assertIn("claude-stream-schema.json", canonical)
+        self.assertIn("binds the selected version", canonical)
+        self.assertIn("--authentication-source", canonical)
+        self.assertNotIn("--api-key-source", canonical)
+        self.assertIn("legacy", canonical.lower())
+        self.assertIn("extended", canonical.lower())
+        baseline_sentence = (
+            "Claude Code `2.1.212` is the audited per-version stream-schema "
+            "baseline, not a global eligibility pin."
         )
+        for content in (skill, contracts, canonical):
+            self.assertIn(baseline_sentence, content)
+        self.assertIn("`strict-version-and-launch-profiles`", canonical)
+        self.assertIn("claude-stream-compatibility.json", skill)
         self.assertIn("stream-profile digest evidence", contracts)
         self.assertNotIn("require exactly Claude Code `2.1.212`", canonical)
 
@@ -2902,12 +3484,104 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertNotIn("selected-deny policy re-opens only", runtime)
         self.assertNotIn("re-open only the current workspace", skill)
-        for content in (skill, contracts, runtime):
+        for content in (skill, contracts):
             self.assertIn("requested configuration", content)
             self.assertNotIn(
                 "native sandbox enforces global write denial",
                 content.lower(),
             )
+        self.assertIn("Persist sandbox controls as requested configuration", runtime)
+        self.assertNotIn(
+            "native sandbox enforces global write denial",
+            runtime.lower(),
+        )
+
+    def test_claude_spill_scope_rule_and_observable_validator_gate_are_explicit(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
+            encoding="utf-8"
+        )
+        validator_source = (SCRIPTS / "validate_claude_stream.py").read_text(
+            encoding="utf-8"
+        )
+
+        for content in (skill, contracts, canonical, templates):
+            self.assertIn("persisted or spilled", content)
+            self.assertIn("narrower bounded", content)
+        for content in (skill, contracts, canonical):
+            self.assertIn("`Read.file_path`", content)
+            self.assertIn("`Grep.path`", content)
+            self.assertIn("`Glob.path`", content)
+            self.assertIn("`Glob.pattern`", content)
+        for content in (contracts, canonical):
+            self.assertIn("`persistedOutputPath`", content)
+            self.assertIn("`Bash` command strings", content)
+            self.assertIn("not complete host-read enforcement", content)
+
+        self.assertIn(
+            "A direct structured tool read of the spilled path adds deterministic blocked evidence",
+            canonical,
+        )
+        self.assertIn(
+            "if an outside-workspace tool read already occurred, the lane is blocked",
+            templates,
+        )
+        self.assertIn(
+            "intermediate.tool-path.outside-workspace",
+            canonical,
+        )
+        self.assertIn(
+            "intermediate.tool-path.scope-unverified",
+            canonical,
+        )
+        for content in (skill, contracts, canonical, templates):
+            self.assertIn("absolute", content)
+            self.assertIn("`**/*.py`", content)
+            self.assertIn("`./**/*.py`", content)
+            self.assertIn("extglob", content)
+            self.assertIn("ABA", content)
+        for content in (skill, contracts, canonical):
+            self.assertIn("validation start", content)
+            self.assertIn("global", content)
+            self.assertIn("inconclusive", content)
+        for content in (skill, contracts, canonical):
+            self.assertIn("`named-parent-private-preflight`", content)
+            self.assertIn("`low-level-helper`", content)
+        for anchor in (
+            "STRUCTURED_TOOL_PATH_SCOPE_CONTRACT",
+            "TRUST_SOURCE_LAUNCH_PROFILES",
+            '"launch_profiles": ("named-direct",)',
+            '"source": "assistant.tool_use.input"',
+            '"path_field": "file_path"',
+            '"path_field": "path"',
+            '"path_if_present": "absolute"',
+            '"pattern_field": "pattern"',
+            '"pattern_contract": "bounded_safe_relative_glob"',
+            '"leading_prefix_normalization": "./"',
+            '"extglob": "scope_unverified"',
+            '"dynamic_directory_containment": "bounded_overapprox_scan"',
+            '"glob_scan_limits"',
+            "MAX_STRUCTURED_GLOB_ALTERNATIVES = 64",
+            "MAX_STRUCTURED_GLOB_SCAN_ENTRIES = 32_768",
+            "MAX_STRUCTURED_GLOB_SCAN_STATES = 32_768",
+            "MAX_STRUCTURED_GLOB_SCAN_DEPTH = 64",
+            "STRUCTURED_GLOB_EXTGLOB_TOKENS",
+            "_bounded_glob_directory_scope",
+            "with os.scandir(resolved_current) as entries",
+            "_open_bound_workspace(resolved_cwd)",
+            '"user.tool_use_result.persistedOutputPath"',
+            '"Bash.command"',
+        ):
+            self.assertIn(anchor, validator_source)
+        self.assertNotIn("persistedOutputPath", validator_source.split("def ", 1)[1])
 
     def test_canonical_claude_auth_control_plane_is_not_helper_broker(self) -> None:
         agents = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
@@ -2967,6 +3641,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("recovery rules do not apply to this direct lane", lane_contracts)
         self.assertNotIn("authentication, credential-recovery", lane_contracts)
         if CI_PROFILE == "canonical":
+            self.assertIn("real `HOME`", agents)
             self.assertIn("Those guarantees do not apply", agents)
         else:
             self.assertIn(
@@ -2979,6 +3654,7 @@ class RepositoryContractTest(unittest.TestCase):
             "broker `W` generation",
             "primary `.oauth_refresh.lock`",
             "last generation and 1 MiB",
+            "helper's credential-lock",
         ):
             self.assertNotIn(retired_global_detail, agents)
 
@@ -3041,6 +3717,100 @@ class RepositoryContractTest(unittest.TestCase):
                 self.assertIn("## Historical Helper State", journal)
                 self.assertNotIn("## Current State", journal)
 
+    def test_current_policy_journals_use_the_current_claude_contract(self) -> None:
+        if CI_PROFILE != "canonical":
+            self.skipTest("public project journals are not packaged in private overlay")
+
+        journal_root = REPO_ROOT / "docs/project_journal/2026/07"
+        historical_marker = "\n## Historical Superseded Implementation Evidence\n"
+        required_by_journal = {
+            "2026-07-17-secret-reduction-gate-7f1703.md": (
+                "actual Claude Code",
+                "review_contract: supplied-diff-private-git",
+                "helper-owned detached workspace backed by private minimal Git",
+                "publisher-verified strict stable Claude Code `>=2.1.211,<3.0.0`",
+                "signed per-version manifest",
+                "`--version` and `--help`",
+                "same private digest-verified executable snapshot",
+            ),
+            "2026-07-19-real-home-read-only-claude-c63d11.md": (
+                "named direct Claude lane",
+                "real `HOME`",
+                "review_contract: supplied-diff-private-git",
+                "`--include-source-wip`",
+                "`ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` > local login",
+                "broker/carrier/catalog/full refresh transaction",
+                "publisher-verified strict stable Claude Code `>=2.1.211,<3.0.0`",
+                "claude_version_policy.py",
+                "`legacy-base`",
+                "`extended-2x`",
+            ),
+            "2026-07-20-review-policy-migration-7f2001.md": (
+                "directly launched actual Claude Code",
+                "review_contract: supplied-diff-private-git",
+                "helper-owned detached workspace backed by private minimal Git",
+                "broker, staged carrier",
+                "full refresh transaction",
+                "named direct real-`HOME` lane does not inherit",
+                "publisher-verified strict stable Claude Code `>=2.1.211,<3.0.0`",
+                "same private digest-verified executable snapshot",
+            ),
+            "2026-07-19-claude-refresh-transaction-crt001.md": (
+                "explicit API-key and OAuth-token modes independent of local-login carrier coordination",
+                "one outer refresh-lock lease",
+                "broker execution",
+                "Linux/WSL2 credential staging",
+                "final drain",
+                "private carrier",
+                "descriptor-bound",
+            ),
+            "2026-07-22-claude-compatible-version-range-7f2201.md": (
+                "`>=2.1.211,<3.0.0`",
+                "one production source of truth",
+                "claude_version_policy.py",
+                "audited per-version stream-schema baseline",
+                "not a global eligibility pin",
+                "`legacy-base`",
+                "`extended-2x`",
+                "strict-version-and-launch-profiles",
+            ),
+        }
+        forbidden_by_journal = {
+            "2026-07-17-secret-reduction-gate-7f1703.md": (
+                "supplied-diff-no-git",
+                "supplied-diff/no-git",
+                "`.git`-free",
+                ".git-free",
+            ),
+            "2026-07-19-real-home-read-only-claude-c63d11.md": (
+                "no separate mandatory help",
+                "no separate mandatory `--help`",
+            ),
+            "2026-07-20-review-policy-migration-7f2001.md": (
+                "no separate mandatory help",
+                "no separate mandatory `--help`",
+            ),
+            "2026-07-22-claude-compatible-version-range-7f2201.md": (
+                "requires exactly Claude Code `2.1.212`",
+                "require exactly Claude Code `2.1.212`",
+                "exact-version-mismatch",
+                "exact-version-unavailable",
+                "adapts only the init version constant",
+            ),
+        }
+
+        for journal_name, required_anchors in required_by_journal.items():
+            journal = (journal_root / journal_name).read_text(encoding="utf-8")
+            active, marker, historical = journal.partition(historical_marker)
+            with self.subTest(journal=journal_name):
+                for anchor in required_anchors:
+                    self.assertIn(anchor, active)
+                for forbidden in forbidden_by_journal.get(journal_name, ()):
+                    self.assertNotIn(forbidden, active)
+                    if forbidden in journal:
+                        self.assertEqual(marker, historical_marker)
+                        self.assertIn(forbidden, historical)
+
     def test_migration_journal_requires_zero_inherited_turns_for_single(self) -> None:
         if CI_PROFILE != "canonical":
             self.skipTest("public project journals are not packaged in private overlay")
@@ -3063,7 +3833,13 @@ class RepositoryContractTest(unittest.TestCase):
         boundary = readme.index("## Low-Level `isolated_review` Helper Only")
 
         self.assertLess(readme.index("accepted real-`HOME`"), boundary)
+        self.assertLess(readme.index("`>=2.1.211,<3.0.0`"), boundary)
+        self.assertLess(readme.index("signed per-version manifest"), boundary)
         for helper_detail in (
+            "review_contract: supplied-diff-private-git",
+            "helper-owned detached worktree backed by private minimal Git",
+            "`ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` > local login",
+            "explicit source is opaque-forwarded",
             "private, checksum-keyed executable snapshot",
             "dedicated writable `/auth` carrier root",
             "Low-level helper Claude authentication",

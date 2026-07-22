@@ -340,7 +340,7 @@ def _decode_strict_json(payload: bytes, *, label: str) -> object:
 
 
 def require_supported_release_version(version: str) -> tuple[int, int, int]:
-    """Validate and parse a strict, supported Claude Code release version."""
+    """Validate one stable Claude Code release in the compatible range."""
 
     try:
         return parse_compatible_release_version(version)
@@ -1949,6 +1949,64 @@ def _stat_identity(value: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _require_trusted_release_source_metadata(
+    path: pathlib.Path,
+    metadata: os.stat_result,
+) -> None:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ClaudeProvenanceInvalid(
+            f"Claude Code executable is not a regular file: {path}"
+        )
+    if metadata.st_uid not in {0, os.geteuid()}:
+        raise ClaudeProvenanceInvalid(
+            f"Claude Code executable has an untrusted owner: {path}"
+        )
+    if metadata.st_mode & (
+        stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX
+    ):
+        raise ClaudeProvenanceInvalid(
+            f"Claude Code executable has unsafe mode bits: {path}"
+        )
+
+
+def _trusted_release_source_parent_chain(
+    path: pathlib.Path,
+) -> tuple[tuple[pathlib.Path, tuple[int, ...]], ...]:
+    identities: list[tuple[pathlib.Path, tuple[int, ...]]] = []
+    current = path.parent
+    while True:
+        try:
+            metadata = current.stat(follow_symlinks=False)
+        except OSError as error:
+            raise ClaudeProvenanceInconclusive(
+                f"cannot inspect the Claude Code executable parent chain: {error}"
+            ) from error
+        mode = stat.S_IMODE(metadata.st_mode)
+        root_owned_sticky_temp = metadata.st_uid == 0 and mode == 0o1777
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid not in {0, os.geteuid()}
+            or (
+                metadata.st_mode
+                & (
+                    stat.S_IWGRP
+                    | stat.S_IWOTH
+                    | stat.S_ISUID
+                    | stat.S_ISGID
+                    | stat.S_ISVTX
+                )
+                and not root_owned_sticky_temp
+            )
+        ):
+            raise ClaudeProvenanceInvalid(
+                f"Claude Code executable has an unsafe parent directory: {current}"
+            )
+        identities.append((current, _directory_anchor_identity(metadata)))
+        if current.parent == current:
+            return tuple(identities)
+        current = current.parent
+
+
 def _ensure_private_cache_directory(path: pathlib.Path) -> pathlib.Path:
     try:
         path.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -2153,16 +2211,14 @@ def _verify_release_executable_with_identity(
         raise ClaudeProvenanceInconclusive(
             f"cannot resolve Claude Code executable {executable}: {error}"
         ) from error
+    parent_chain_before = _trusted_release_source_parent_chain(resolved)
     try:
         before = resolved.stat(follow_symlinks=False)
     except OSError as error:
         raise ClaudeProvenanceInconclusive(
             f"cannot stat Claude Code executable {resolved}: {error}"
         ) from error
-    if not stat.S_ISREG(before.st_mode):
-        raise ClaudeProvenanceInvalid(
-            f"Claude Code executable is not a regular file: {resolved}"
-        )
+    _require_trusted_release_source_metadata(resolved, before)
     if not os.access(resolved, os.X_OK):
         raise ClaudeProvenanceInvalid(
             f"Claude Code executable is not executable: {resolved}"
@@ -2182,6 +2238,12 @@ def _verify_release_executable_with_identity(
     try:
         with os.fdopen(descriptor, "rb", closefd=True) as handle:
             opened_before = os.fstat(handle.fileno())
+            try:
+                _require_trusted_release_source_metadata(resolved, opened_before)
+            except ClaudeProvenanceInvalid as error:
+                raise ClaudeProvenanceInconclusive(
+                    "Claude Code executable changed while it was opened"
+                ) from error
             source_identity = _stat_identity(opened_before)
             if not stat.S_ISREG(
                 opened_before.st_mode
@@ -2194,6 +2256,12 @@ def _verify_release_executable_with_identity(
             else:
                 checksum, bytes_read = "", 0
             opened_after = os.fstat(handle.fileno())
+            try:
+                _require_trusted_release_source_metadata(resolved, opened_after)
+            except ClaudeProvenanceInvalid as error:
+                raise ClaudeProvenanceInconclusive(
+                    "Claude Code executable changed while it was hashed"
+                ) from error
     except OSError as error:
         raise ClaudeProvenanceInconclusive(
             f"cannot hash a stable Claude Code executable: {error}"
@@ -2204,6 +2272,13 @@ def _verify_release_executable_with_identity(
         raise ClaudeProvenanceInconclusive(
             f"Claude Code executable changed after hashing: {error}"
         ) from error
+    try:
+        _require_trusted_release_source_metadata(resolved, after)
+    except ClaudeProvenanceInvalid as error:
+        raise ClaudeProvenanceInconclusive(
+            "Claude Code executable changed after hashing"
+        ) from error
+    parent_chain_after = _trusted_release_source_parent_chain(resolved)
     identities = {
         _stat_identity(before),
         source_identity,
@@ -2213,6 +2288,11 @@ def _verify_release_executable_with_identity(
     if len(identities) != 1:
         raise ClaudeProvenanceInconclusive(
             "Claude Code executable changed while its provenance was verified"
+        )
+    if parent_chain_before != parent_chain_after:
+        raise ClaudeProvenanceInconclusive(
+            "Claude Code executable parent chain changed while its provenance "
+            "was verified"
         )
     if source_identity[7] != artifact.size:
         raise ClaudeProvenanceInvalid(
@@ -2712,7 +2792,7 @@ def verify_claude_release(
     fetch_timeout_seconds: float = CLAUDE_FETCH_TIMEOUT_SECONDS,
     gpg_timeout_seconds: float = CLAUDE_GPG_TIMEOUT_SECONDS,
 ) -> VerifiedClaudeExecutable:
-    """Verify publisher provenance for one floating Claude Code 2.x release."""
+    """Verify publisher provenance for one selected compatible Claude release."""
 
     require_supported_release_version(version)
     bundle = (

@@ -54,6 +54,33 @@ def private_cleanup_evidence(container: pathlib.Path) -> PrivateCleanupEvidence:
 
 
 class ForegroundCleanupTest(unittest.TestCase):
+    def test_help_distinguishes_clean_range_from_review_only_wip(self) -> None:
+        help_text = " ".join(cli._build_parser().format_help().split())
+
+        self.assertIn("one clean frozen Git range", help_text)
+        self.assertIn("digest-bound WIP snapshot", help_text)
+        self.assertIn("Review-only", help_text)
+        self.assertIn("not formal PR-readiness", help_text)
+
+    def test_stateful_start_passes_include_source_wip(self) -> None:
+        with mock.patch.object(
+            cli, "start", return_value=pathlib.Path("/tmp/state")
+        ) as start:
+            returncode = cli.main(
+                [
+                    "stateful",
+                    "start",
+                    "--base-ref",
+                    "a" * 40,
+                    "--head-ref",
+                    "b" * 40,
+                    "--include-source-wip",
+                ]
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertTrue(start.call_args.kwargs["include_source_wip"])
+
     def test_secret_admission_dispatches_without_starting_a_reviewer(self) -> None:
         summary = {
             "base_sha": "a" * 40,

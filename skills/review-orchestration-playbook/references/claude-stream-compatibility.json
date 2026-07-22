@@ -1,19 +1,26 @@
 {
   "schema_id": "claude-code-stream-compatible-v1",
   "version_policy": "review_runtime.claude_version_policy.CLAUDE_COMPATIBILITY_SPEC",
-  "compatibility_mode": "strict-structural-baseline",
+  "compatibility_mode": "strict-version-and-launch-profiles",
   "baseline_schema": "claude-2.1.212-stream-schema.json",
   "baseline_version": "2.1.212",
-  "adaptations": {
-    "init_event.field_contracts.claude_code_version": {
-      "baseline_rule": "constant",
-      "runtime_rule": "exact_preflight_selected_version"
-    }
+  "profile_schema": "claude-stream-schema.json",
+  "profile_version_policy": ">=2.1.211,<3.0.0",
+  "version_profiles": {
+    "legacy-base": ">=2.1.211,<2.1.216",
+    "extended-2x": ">=2.1.216,<3.0.0"
   },
+  "launch_profiles": [
+    "helper-darwin",
+    "helper-linux",
+    "named-direct"
+  ],
   "fail_closed_surfaces": [
     "stream_envelope",
     "init_field_set",
     "init_field_values",
+    "intermediate_event_field_sets",
+    "intermediate_session_binding",
     "terminal_field_set",
     "terminal_variants",
     "model_identity"
