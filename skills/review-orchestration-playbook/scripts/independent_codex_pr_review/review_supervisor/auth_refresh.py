@@ -306,11 +306,12 @@ class ManagedAuthRefreshLaunchCapability(Protocol):
 
 
 class _ManagedAuthRefreshProtocol:
-    """Require initialize, remote-disabled, account-updated, then account response."""
+    """Require initialize, remote-disabled, and a valid managed account response."""
 
     def __init__(self, *, expected_codex_home: pathlib.Path) -> None:
         self._expected_codex_home = str(expected_codex_home)
         self._state = "new"
+        self._account_update_seen = False
         self._requires_openai_auth: bool | None = None
 
     @property
@@ -338,6 +339,9 @@ class _ManagedAuthRefreshProtocol:
 
     def accept(self, message: dict[str, Any]) -> tuple[dict[str, Any], ...]:
         if self.complete:
+            if message.get("method") == "account/updated":
+                self._accept_notification(message)
+                return ()
             raise _protocol_error("trailing-record")
         if "id" in message and "method" in message:
             raise _protocol_error("server-request")
@@ -384,9 +388,7 @@ class _ManagedAuthRefreshProtocol:
             )
         if self._state == "remote-control-status":
             raise _protocol_error("remote-control-status-missing")
-        if self._state == "account-update":
-            raise _protocol_error("account-update-missing")
-        if self._state == "account-response":
+        if self._state in {"account-update", "account-response"}:
             self._requires_openai_auth = self._validate_account(result)
             self._state = "complete"
             return ()
@@ -425,14 +427,18 @@ class _ManagedAuthRefreshProtocol:
             raise _protocol_error("notification-schema")
         params = _object(message.get("params"))
         if method == "account/updated":
-            if self._state != "account-update":
+            if self._state not in {"account-update", "complete"}:
+                raise _protocol_error("protocol-order")
+            if self._account_update_seen:
                 raise _protocol_error("protocol-order")
             _exact_keys(params, {"authMode"}, optional={"planType"})
             if params.get("authMode") != "chatgpt":
                 raise _protocol_error("managed-auth-required")
             if params.get("planType") is not None:
                 _validate_plan_type(params["planType"])
-            self._state = "account-response"
+            self._account_update_seen = True
+            if self._state == "account-update":
+                self._state = "account-response"
             return
         if method == "remoteControl/status/changed":
             if self._state != "remote-control-status":

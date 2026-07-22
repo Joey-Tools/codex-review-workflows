@@ -178,7 +178,11 @@ _FAKE_APP_SERVER_TEMPLATE = textwrap.dedent(
     notification_plan_type = "plus"
     if mode == "notification-plan-object":
         notification_plan_type = {{"unexpected": "value"}}
-    if mode not in {{"missing-account-update", "missing-remote-status"}}:
+    if mode not in {{
+        "missing-account-update",
+        "missing-remote-status",
+        "response-before-account-update",
+    }}:
         write_message(
             {{
                 "method": "account/updated",
@@ -204,6 +208,16 @@ _FAKE_APP_SERVER_TEMPLATE = textwrap.dedent(
             }},
         }}
     )
+    if mode == "response-before-account-update":
+        write_message(
+            {{
+                "method": "account/updated",
+                "params": {{
+                    "authMode": "chatgpt",
+                    "planType": notification_plan_type,
+                }},
+            }}
+        )
     stdin_tail = sys.stdin.buffer.read()
     observed_path.write_text(
         json.dumps(
@@ -859,12 +873,41 @@ class ManagedAuthRefreshTests(unittest.TestCase):
                     self.assertNotIn("sensitive-runtime-marker", str(raised.exception))
                     self._assert_process_gone(pid_path)
 
-    def test_requires_remote_disabled_then_account_update_before_response(
-        self,
-    ) -> None:
+    def test_accepts_account_response_without_account_update(self) -> None:
+        with owned_temporary_directory("auth-refresh-no-update-") as root:
+            snapshot, neutral, environment, pid_path, _ = self._fixture(
+                root / "case",
+                mode="missing-account-update",
+            )
+            result = self._refresh(
+                snapshot=snapshot,
+                neutral_cwd=neutral,
+                environment=environment,
+                limits=self._limits(),
+            )
+            self.assertTrue(result.refresh_completed)
+            self.assertTrue(result.managed_auth_verified)
+            self._assert_process_gone(pid_path)
+
+    def test_accepts_account_update_after_account_response(self) -> None:
+        with owned_temporary_directory("auth-refresh-late-update-") as root:
+            snapshot, neutral, environment, pid_path, _ = self._fixture(
+                root / "case",
+                mode="response-before-account-update",
+            )
+            result = self._refresh(
+                snapshot=snapshot,
+                neutral_cwd=neutral,
+                environment=environment,
+                limits=self._limits(),
+            )
+            self.assertTrue(result.refresh_completed)
+            self.assertTrue(result.managed_auth_verified)
+            self._assert_process_gone(pid_path)
+
+    def test_requires_remote_disabled_before_account_response(self) -> None:
         cases = {
             "missing-remote-status": "remote-control-status-missing",
-            "missing-account-update": "account-update-missing",
             "remote-control-enabled": "remote-control-enabled",
         }
         with owned_temporary_directory("auth-refresh-evidence-") as root:
