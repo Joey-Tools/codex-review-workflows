@@ -27,6 +27,7 @@
   "launch_profiles": {
     "named-direct": {
       "permission_mode": "dontAsk",
+      "runtime_cwd": "host-workspace",
       "tools": [
         "Bash",
         "Glob",
@@ -36,12 +37,14 @@
     },
     "helper-linux": {
       "permission_mode": "dontAsk",
+      "runtime_cwd": "/workspace",
       "tools": [
         "Read"
       ]
     },
     "helper-darwin": {
       "permission_mode": "default",
+      "runtime_cwd": "host-workspace",
       "tools": [
         "Glob",
         "Grep",
@@ -109,8 +112,8 @@
         "mismatch_failure": "inconclusive"
       },
       "cwd": {
-        "rule": "exact_resolved_cli_argument",
-        "argument": "cwd",
+        "rule": "exact_expected_runtime_cwd",
+        "binding_field": "expected_runtime_cwd",
         "malformed_failure": "inconclusive",
         "mismatch_failure": "blocked"
       },

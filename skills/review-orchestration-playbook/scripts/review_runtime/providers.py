@@ -14317,6 +14317,7 @@ def _validate_claude_stream_handle(
     handle: BinaryIO,
     *,
     review: ReviewWorkspace,
+    expected_runtime_cwd: str,
     requested_model: str,
     runtime_binding: Any | None = None,
     process_returncode: int,
@@ -14337,7 +14338,8 @@ def _validate_claude_stream_handle(
         handle.seek(0)
         result = claude_stream_validator.validate_claude_stream(
             handle,
-            expected_cwd=review.workspace_root,
+            host_workspace_cwd=review.workspace_root,
+            expected_runtime_cwd=expected_runtime_cwd,
             requested_model=requested_model,
             runtime_binding=runtime_binding,
             process_returncode=process_returncode,
@@ -14381,6 +14383,7 @@ def _validate_claude_stream_output_file(
     path: pathlib.Path,
     *,
     review: ReviewWorkspace,
+    expected_runtime_cwd: str,
     requested_model: str,
     runtime_binding: Any | None,
     process_returncode: int,
@@ -14405,6 +14408,7 @@ def _validate_claude_stream_output_file(
             return _validate_claude_stream_handle(
                 handle,
                 review=review,
+                expected_runtime_cwd=expected_runtime_cwd,
                 requested_model=requested_model,
                 runtime_binding=runtime_binding,
                 process_returncode=process_returncode,
@@ -14424,6 +14428,7 @@ def _validate_claude_attempt_stream(
     completed: Completed,
     output: AttemptOutput,
     review: ReviewWorkspace,
+    expected_runtime_cwd: str,
     requested_model: str,
     runtime_binding: Any | None,
 ) -> dict[str, Any]:
@@ -14433,6 +14438,7 @@ def _validate_claude_attempt_stream(
             return _validate_claude_stream_output_file(
                 output.stdout_path,
                 review=review,
+                expected_runtime_cwd=expected_runtime_cwd,
                 requested_model=requested_model,
                 runtime_binding=runtime_binding,
                 process_returncode=completed.returncode,
@@ -14440,6 +14446,7 @@ def _validate_claude_attempt_stream(
         return _validate_claude_stream_handle(
             output.stdout_file,
             review=review,
+            expected_runtime_cwd=expected_runtime_cwd,
             requested_model=requested_model,
             runtime_binding=runtime_binding,
             process_returncode=completed.returncode,
@@ -16137,6 +16144,7 @@ def _claude_attempt_with_output(
                     completed=completed,
                     output=output,
                     review=review,
+                    expected_runtime_cwd=str(sandbox_command.workspace_path),
                     requested_model=model,
                     runtime_binding=runtime_binding,
                 )
@@ -16443,6 +16451,7 @@ def _claude_attempt_with_output(
                     completed=completed,
                     output=output,
                     review=review,
+                    expected_runtime_cwd=str(review.workspace_root),
                     requested_model=model,
                     runtime_binding=runtime_binding,
                 )

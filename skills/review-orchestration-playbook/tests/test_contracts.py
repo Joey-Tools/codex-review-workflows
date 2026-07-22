@@ -605,6 +605,34 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("Linux and WSL2", helper_contract)
         self.assertNotIn("requires `ANTHROPIC_API_KEY`", skill)
 
+    def test_helper_runtime_cwd_is_separate_from_host_workspace_binding(
+        self,
+    ) -> None:
+        helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
+            encoding="utf-8"
+        )
+        provider_source = (RUNTIME / "providers.py").read_text(encoding="utf-8")
+        validator_source = (SCRIPTS / "validate_claude_stream.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual(str(claude_linux.SANDBOX_WORKSPACE), "/workspace")
+        self.assertIn(
+            "expected_runtime_cwd=str(sandbox_command.workspace_path)",
+            provider_source,
+        )
+        self.assertIn("host_workspace_cwd=review.workspace_root", provider_source)
+        self.assertIn("expected_cwd=expected_runtime_cwd", validator_source)
+        self.assertIn("stream-reported runtime cwd as distinct inputs", helper_contract)
+        self.assertIn(
+            "Linux and WSL2 bind the reported runtime cwd to `/workspace`",
+            helper_contract,
+        )
+        self.assertIn(
+            "named-direct structured-tool path scope remains bound to the host clean worktree",
+            helper_contract,
+        )
+
     def test_claude_auth_carriers_refresh_without_a_freshness_gate(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
@@ -2982,16 +3010,28 @@ class RepositoryContractTest(unittest.TestCase):
             {
                 "named-direct": {
                     "permission_mode": "dontAsk",
+                    "runtime_cwd": "host-workspace",
                     "tools": ["Bash", "Glob", "Grep", "Read"],
                 },
                 "helper-linux": {
                     "permission_mode": "dontAsk",
+                    "runtime_cwd": "/workspace",
                     "tools": ["Read"],
                 },
                 "helper-darwin": {
                     "permission_mode": "default",
+                    "runtime_cwd": "host-workspace",
                     "tools": ["Glob", "Grep", "Read"],
                 },
+            },
+        )
+        self.assertEqual(
+            init_contract["field_contracts"]["cwd"],
+            {
+                "rule": "exact_expected_runtime_cwd",
+                "binding_field": "expected_runtime_cwd",
+                "malformed_failure": "inconclusive",
+                "mismatch_failure": "blocked",
             },
         )
         self.assertEqual(

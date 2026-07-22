@@ -20,6 +20,9 @@ from review_runtime.claude_capabilities import (
     CLAUDE_REQUIRED_OPTIONS,
     ClaudeCapabilities,
 )
+from review_runtime.claude_linux import (
+    SANDBOX_WORKSPACE as CLAUDE_LINUX_SANDBOX_WORKSPACE,
+)
 from review_runtime.claude_provenance import (
     CLAUDE_RELEASE_KEY_FINGERPRINT,
     CLAUDE_SUPPORTED_PLATFORM_BINARIES,
@@ -38,18 +41,22 @@ CLAUDE_CODE_VERSION_CONTRACT = {
     "minimum_inclusive": "2.1.211",
     "maximum_exclusive": "3.0.0",
 }
+HOST_WORKSPACE_RUNTIME_CWD = "host-workspace"
 LAUNCH_PROFILES = {
     "named-direct": {
         "permission_mode": "dontAsk",
         "tools": frozenset(("Read", "Grep", "Glob", "Bash")),
+        "runtime_cwd": HOST_WORKSPACE_RUNTIME_CWD,
     },
     "helper-linux": {
         "permission_mode": "dontAsk",
         "tools": frozenset(("Read",)),
+        "runtime_cwd": str(CLAUDE_LINUX_SANDBOX_WORKSPACE),
     },
     "helper-darwin": {
         "permission_mode": "default",
         "tools": frozenset(("Read", "Grep", "Glob")),
+        "runtime_cwd": HOST_WORKSPACE_RUNTIME_CWD,
     },
 }
 TRUST_SOURCE_LAUNCH_PROFILES = {
@@ -292,7 +299,7 @@ STRUCTURED_GLOB_EXTGLOB_TOKENS = ("@(", "!(", "+(", "?(", "*(")
 STRUCTURED_TOOL_PATH_SCOPE_CONTRACT = {
     "source": "assistant.tool_use.input",
     "launch_profiles": ("named-direct",),
-    "workspace_root": "exact_resolved_expected_cwd",
+    "workspace_root": "exact_resolved_host_workspace_cwd",
     "tools": {
         "Read": {
             "path_field": "file_path",
@@ -308,7 +315,7 @@ STRUCTURED_TOOL_PATH_SCOPE_CONTRACT = {
             "path_field": "path",
             "path_required": False,
             "path_if_present": "absolute",
-            "missing_path_base": "expected_cwd",
+            "missing_path_base": "host_workspace_cwd",
             "pattern_field": "pattern",
             "pattern_required": True,
             "pattern_contract": "bounded_safe_relative_glob",
@@ -810,6 +817,7 @@ def _load_contract_with_binding() -> tuple[
     expected_launch_profiles = {
         name: {
             "permission_mode": profile["permission_mode"],
+            "runtime_cwd": profile["runtime_cwd"],
             "tools": sorted(profile["tools"]),
         }
         for name, profile in LAUNCH_PROFILES.items()
@@ -879,6 +887,13 @@ def _load_contract_with_binding() -> tuple[
         "mismatch_failure": "blocked",
     }:
         raise _ContractError("permission mode contract does not match")
+    if field_contracts.get("cwd") != {
+        "rule": "exact_expected_runtime_cwd",
+        "binding_field": "expected_runtime_cwd",
+        "malformed_failure": "inconclusive",
+        "mismatch_failure": "blocked",
+    }:
+        raise _ContractError("runtime cwd contract does not match")
     if field_contracts.get("tools") != {
         "rule": "duplicate_free_exact_runtime_binding_launch_profile_set",
         "profile_field": "tools",
@@ -1284,6 +1299,23 @@ def _runtime_binding_is_valid(
         and runtime_binding.required_options == CLAUDE_REQUIRED_OPTIONS
         and runtime_binding.stream_contract == contract_binding
     )
+
+
+def _runtime_cwd_is_valid(
+    expected_runtime_cwd: object,
+    *,
+    resolved_host_workspace_cwd: Path,
+    launch_profile: str,
+) -> bool:
+    if type(expected_runtime_cwd) is not str:
+        return False
+    profile = LAUNCH_PROFILES.get(launch_profile)
+    if profile is None:
+        return False
+    cwd_contract = profile["runtime_cwd"]
+    if cwd_contract == HOST_WORKSPACE_RUNTIME_CWD:
+        return expected_runtime_cwd == str(resolved_host_workspace_cwd)
+    return cwd_contract is not None and expected_runtime_cwd == cwd_contract
 
 
 def runtime_binding_from_preflight_result(
@@ -3010,7 +3042,8 @@ def _finalize_workspace_bound_outcome(
 def validate_claude_stream(
     stream: BinaryIO,
     *,
-    expected_cwd: str | Path,
+    host_workspace_cwd: str | Path,
+    expected_runtime_cwd: str,
     requested_model: str,
     runtime_binding: ClaudeRuntimeBinding,
     process_returncode: object = None,
@@ -3028,7 +3061,7 @@ def validate_claude_stream(
             process_returncode,
         )
     try:
-        resolved_cwd = Path(expected_cwd).resolve(strict=True)
+        resolved_cwd = Path(host_workspace_cwd).resolve(strict=True)
         if not resolved_cwd.is_dir():
             raise OSError("cwd is not a directory")
     except (OSError, RuntimeError, TypeError, ValueError):
@@ -3042,6 +3075,15 @@ def validate_claude_stream(
     ):
         return _apply_process_returncode_precedence(
             _failure("inconclusive", {"validator.runtime-binding-invalid"}),
+            process_returncode,
+        )
+    if not _runtime_cwd_is_valid(
+        expected_runtime_cwd,
+        resolved_host_workspace_cwd=resolved_cwd,
+        launch_profile=runtime_binding.launch_profile,
+    ):
+        return _apply_process_returncode_precedence(
+            _failure("inconclusive", {"validator.expected-runtime-cwd-invalid"}),
             process_returncode,
         )
     if (
@@ -3123,7 +3165,7 @@ def validate_claude_stream(
             )
         _validate_init(
             envelope.first,
-            expected_cwd=str(resolved_cwd),
+            expected_cwd=expected_runtime_cwd,
             requested_model=requested_model,
             claude_code_version=claude_code_version,
             api_key_source=runtime_binding.api_key_source,
@@ -3173,7 +3215,8 @@ def validate_claude_stream(
 def validate_claude_stream_bytes(
     raw_stream: bytes,
     *,
-    expected_cwd: str | Path,
+    host_workspace_cwd: str | Path,
+    expected_runtime_cwd: str,
     requested_model: str,
     runtime_binding: ClaudeRuntimeBinding,
     process_returncode: object = None,
@@ -3185,7 +3228,8 @@ def validate_claude_stream_bytes(
         return _failure("inconclusive", {"stream.non-binary-input"})
     return validate_claude_stream(
         io.BytesIO(raw_stream),
-        expected_cwd=expected_cwd,
+        host_workspace_cwd=host_workspace_cwd,
+        expected_runtime_cwd=expected_runtime_cwd,
         requested_model=requested_model,
         runtime_binding=runtime_binding,
         process_returncode=process_returncode,
@@ -3273,7 +3317,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = validate_claude_stream(
             stream,
-            expected_cwd=args.cwd,
+            host_workspace_cwd=args.cwd,
+            expected_runtime_cwd=args.cwd,
             requested_model=args.model,
             runtime_binding=runtime_binding,
             process_returncode=args.process_returncode,

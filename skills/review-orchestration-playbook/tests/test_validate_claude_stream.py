@@ -362,6 +362,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         authentication_source: str = "local-login",
         launch_profile: str = "named-direct",
         trust_source: str | None = None,
+        expected_runtime_cwd: str | None = None,
         process_returncode: object = 0,
         limits: validator.StreamLimits | None = None,
     ) -> dict[str, object]:
@@ -384,9 +385,19 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 trust_source=trust_source,
             )
         )
+        if expected_runtime_cwd is None:
+            runtime_cwd_contract = validator.LAUNCH_PROFILES[launch_profile][
+                "runtime_cwd"
+            ]
+            expected_runtime_cwd = (
+                str(self.cwd)
+                if runtime_cwd_contract == validator.HOST_WORKSPACE_RUNTIME_CWD
+                else runtime_cwd_contract
+            )
         return validator.validate_claude_stream_bytes(
             raw,
-            expected_cwd=self.cwd,
+            host_workspace_cwd=self.cwd,
+            expected_runtime_cwd=expected_runtime_cwd,
             requested_model=requested_model,
             runtime_binding=runtime_binding,
             process_returncode=process_returncode,
@@ -508,7 +519,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             {
                 "source": "assistant.tool_use.input",
                 "launch_profiles": ("named-direct",),
-                "workspace_root": "exact_resolved_expected_cwd",
+                "workspace_root": "exact_resolved_host_workspace_cwd",
                 "tools": {
                     "Read": {
                         "path_field": "file_path",
@@ -524,7 +535,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                         "path_field": "path",
                         "path_required": False,
                         "path_if_present": "absolute",
-                        "missing_path_base": "expected_cwd",
+                        "missing_path_base": "host_workspace_cwd",
                         "pattern_field": "pattern",
                         "pattern_required": True,
                         "pattern_contract": "bounded_safe_relative_glob",
@@ -818,6 +829,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         for launch_profile, (permission_mode, tools) in cases.items():
             with self.subTest(launch_profile=launch_profile):
                 events = self._full_events()
+                if launch_profile == "helper-linux":
+                    events[0]["cwd"] = "/workspace"
                 events[0]["permissionMode"] = permission_mode
                 events[0]["tools"] = tools
                 self.assertEqual(
@@ -828,6 +841,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 )
 
         events = self._full_events()
+        events[0]["cwd"] = "/workspace"
         events[0]["tools"] = ["Read"]
         events.insert(
             -1,
@@ -846,8 +860,57 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "inconclusive",
         )
 
+    def test_runtime_cwd_binding_separates_linux_sandbox_from_host_workspace(
+        self,
+    ) -> None:
+        self.assertEqual(
+            {
+                name: profile["runtime_cwd"]
+                for name, profile in validator.LAUNCH_PROFILES.items()
+            },
+            {
+                "named-direct": validator.HOST_WORKSPACE_RUNTIME_CWD,
+                "helper-linux": "/workspace",
+                "helper-darwin": validator.HOST_WORKSPACE_RUNTIME_CWD,
+            },
+        )
+        events = self._full_events()
+        events[0]["cwd"] = "/workspace"
+        events[0]["tools"] = ["Read"]
+
+        self.assertEqual(
+            self._validate(events, launch_profile="helper-linux"),
+            {"classification": "accepted", "findings": "\nNo findings.\n"},
+        )
+
+        host_cwd_event = copy.deepcopy(events)
+        host_cwd_event[0]["cwd"] = str(self.cwd)
+        self.assertEqual(
+            self._validate(host_cwd_event, launch_profile="helper-linux"),
+            {"classification": "blocked", "reasons": ["init.cwd.mismatch"]},
+        )
+
+        for launch_profile, expected_runtime_cwd in (
+            ("helper-linux", str(self.cwd)),
+            ("helper-darwin", "/workspace"),
+            ("named-direct", "/workspace"),
+        ):
+            with self.subTest(launch_profile=launch_profile):
+                self.assertEqual(
+                    self._validate(
+                        events,
+                        launch_profile=launch_profile,
+                        expected_runtime_cwd=expected_runtime_cwd,
+                    ),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": ["validator.expected-runtime-cwd-invalid"],
+                    },
+                )
+
     def test_helper_linux_does_not_apply_named_direct_host_path_gate(self) -> None:
         events = self._full_events()
+        events[0]["cwd"] = "/workspace"
         events[0]["tools"] = ["Read"]
         events.insert(
             -1,
@@ -1678,7 +1741,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         self.assertEqual(
             validator.validate_claude_stream_bytes(
                 self._raw(self._full_events()),
-                expected_cwd=self.cwd,
+                host_workspace_cwd=self.cwd,
+                expected_runtime_cwd=str(self.cwd),
                 requested_model="claude-opus-4-8",
                 runtime_binding=validator.ClaudeRuntimeBinding(
                     **{
@@ -1821,7 +1885,8 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
 
         outcome = validator.validate_claude_stream(
             io.StringIO("not binary"),
-            expected_cwd=self.cwd,
+            host_workspace_cwd=self.cwd,
+            expected_runtime_cwd=str(self.cwd),
             requested_model="claude-opus-4-8",
             runtime_binding=validator.ClaudeRuntimeBinding(
                 **self._valid_runtime_binding_fields()

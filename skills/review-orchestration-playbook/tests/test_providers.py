@@ -37983,6 +37983,7 @@ class ProviderPolicyTest(unittest.TestCase):
             completed=completed,
             output=mock.ANY,
             review=self.review,
+            expected_runtime_cwd=str(self.review.workspace_root),
             requested_model=providers.CLAUDE_MODELS[0],
             runtime_binding=runtime_binding,
         )
@@ -40521,6 +40522,7 @@ class ProviderPolicyTest(unittest.TestCase):
         result = providers._validate_claude_stream_output_file(
             capture,
             review=self.review,
+            expected_runtime_cwd=str(self.review.workspace_root),
             requested_model="claude-opus-4-8",
             runtime_binding=object(),
             process_returncode=0,
@@ -40530,7 +40532,7 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(result["reasons"], ["stream.capture-open-failed"])
 
     def test_claude_stream_handle_uses_canonical_runtime_binding(self) -> None:
-        runtime_binding = object()
+        runtime_binding = mock.Mock(launch_profile="helper-darwin")
         expected = {"classification": "accepted", "findings": "No findings."}
         with tempfile.TemporaryFile() as handle:
             handle.write(b"{}\n")
@@ -40543,6 +40545,7 @@ class ProviderPolicyTest(unittest.TestCase):
                 result = providers._validate_claude_stream_handle(
                     handle,
                     review=self.review,
+                    expected_runtime_cwd=str(self.review.workspace_root),
                     requested_model="claude-opus-4-8",
                     runtime_binding=runtime_binding,
                     process_returncode=0,
@@ -40551,10 +40554,98 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(result, expected)
         validate.assert_called_once_with(
             mock.ANY,
-            expected_cwd=self.review.workspace_root,
+            host_workspace_cwd=self.review.workspace_root,
+            expected_runtime_cwd=str(self.review.workspace_root),
             requested_model="claude-opus-4-8",
             runtime_binding=runtime_binding,
             process_returncode=0,
+        )
+
+    def test_claude_linux_stream_adapter_binds_sandbox_and_host_cwds(self) -> None:
+        _contract, stream_contract = (
+            providers.claude_stream_validator._load_contract_with_binding()
+        )
+        runtime_binding = providers.claude_stream_validator.ClaudeRuntimeBinding(
+            selected_version="2.1.216",
+            api_key_source="none",
+            launch_profile="helper-linux",
+            trust_source="low-level-helper",
+            publisher_checksum="a" * 64,
+            artifact_size=128,
+            runtime_identity=(
+                1,
+                2,
+                stat.S_IFREG,
+                stat.S_IFREG | 0o500,
+                1,
+                os.geteuid(),
+                os.getegid(),
+                128,
+                3,
+                4,
+            ),
+            required_options=claude_capabilities.CLAUDE_REQUIRED_OPTIONS,
+            stream_contract=stream_contract,
+        )
+        events = (
+            {
+                "type": "system",
+                "subtype": "init",
+                "cwd": str(claude_linux.SANDBOX_WORKSPACE),
+                "permissionMode": "dontAsk",
+                "tools": ["Read"],
+                "mcp_servers": [],
+                "slash_commands": [],
+                "skills": [],
+                "plugins": [],
+                "model": "claude-opus-4-8",
+                "claude_code_version": "2.1.216",
+                "apiKeySource": "none",
+                "output_style": "default",
+                "agents": ["claude", "Explore", "general-purpose", "Plan"],
+                "capabilities": ["interrupt_receipt_v1", "msg_lifecycle_v1"],
+                "analytics_disabled": True,
+                "product_feedback_disabled": False,
+                "uuid": "22222222-2222-4222-8222-222222222222",
+                "fast_mode_state": "off",
+            },
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": "No findings.",
+                "modelUsage": {"claude-opus-4-8": {"inputTokens": 1}},
+                "fast_mode_state": "off",
+                "terminal_reason": "completed",
+                "time_to_request_ms": 1,
+                "ttft_ms": 2,
+                "ttft_stream_ms": 3,
+            },
+        )
+        raw_stream = b"".join(
+            json.dumps(event, separators=(",", ":")).encode("utf-8") + b"\n"
+            for event in events
+        )
+
+        with tempfile.TemporaryFile() as handle:
+            handle.write(raw_stream)
+            handle.flush()
+            result = providers._validate_claude_stream_handle(
+                handle,
+                review=self.review,
+                expected_runtime_cwd=str(claude_linux.SANDBOX_WORKSPACE),
+                requested_model="claude-opus-4-8",
+                runtime_binding=runtime_binding,
+                process_returncode=0,
+            )
+
+        self.assertNotEqual(
+            str(self.review.workspace_root),
+            str(claude_linux.SANDBOX_WORKSPACE),
+        )
+        self.assertEqual(
+            result,
+            {"classification": "accepted", "findings": "No findings."},
         )
 
     def test_claude_stream_validation_precedes_local_login_transaction_exit(
