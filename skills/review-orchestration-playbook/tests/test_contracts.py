@@ -1518,6 +1518,25 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertIn(anchor, contracts)
 
+    def test_skill_interface_distinguishes_direct_and_helper_authentication(
+        self,
+    ) -> None:
+        interface = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
+
+        for anchor in (
+            "Both select authentication with precedence ANTHROPIC_API_KEY > "
+            "CLAUDE_CODE_OAUTH_TOKEN > local login",
+            "The named-direct lane uses the ordinary CLI in real HOME",
+            "low-level helper local login instead uses its private credential "
+            "carrier/broker and guarded writeback",
+            "helper API-key/OAuth modes bypass that transaction",
+        ):
+            self.assertIn(anchor, interface)
+        self.assertNotIn(
+            "Use real HOME ordinary CLI authentication with precedence",
+            interface,
+        )
+
     def test_report_only_review_never_implicitly_authorizes_an_anchor_commit(
         self,
     ) -> None:
