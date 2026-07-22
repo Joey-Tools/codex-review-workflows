@@ -26,7 +26,7 @@ superseded_by:
 
 ## Next Steps
 
-- None after the compatibility PR is squash-merged and the private overlay sync consumes it.
+- None in the target-branch post-merge state recorded here. PR, private-overlay sync, and release transition state remain in their delivery workflow rather than this completed journal.
 
 ## Evidence
 

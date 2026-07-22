@@ -342,8 +342,13 @@ class NamedLaneGuardTest(unittest.TestCase):
         marker = self.root / "unchecked-pyc.marker"
         optimized_flags = mock.Mock(wraps=sys.flags)
         optimized_flags.optimize = 1
+        ambient_cache = self.root / "absent-ambient-cache" / "deep"
+        self.assertFalse(ambient_cache.parent.exists())
 
-        with mock.patch.object(sys, "flags", optimized_flags):
+        with (
+            mock.patch.object(sys, "flags", optimized_flags),
+            mock.patch.object(sys, "pycache_prefix", str(ambient_cache)),
+        ):
             cache_path = self.install_unchecked_pyc(
                 source_path,
                 marker,
@@ -359,6 +364,8 @@ class NamedLaneGuardTest(unittest.TestCase):
 
         self.assertEqual(cache_path, expected_path)
         self.assertNotIn(".opt-", cache_path.name)
+        self.assertFalse(cache_path.is_relative_to(ambient_cache))
+        self.assertFalse(ambient_cache.parent.exists())
 
     def test_entrypoint_ignores_ambient_python_launch_controls(self) -> None:
         _, guard = self.copy_guard_bundle()
