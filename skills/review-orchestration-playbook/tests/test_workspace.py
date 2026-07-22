@@ -1042,6 +1042,14 @@ class WorkspaceTest(unittest.TestCase):
             (review.workspace_root / "example.txt").read_text(encoding="utf-8"),
             "staged\nunstaged\n",
         )
+        self.assertEqual(
+            git(
+                review.workspace_root,
+                "show",
+                f"{review.snapshot_tree_sha}:example.txt",
+            ),
+            "staged\nunstaged",
+        )
         self.assertFalse((review.workspace_root / ".gitattributes").exists())
         self.assertEqual(
             (review.workspace_root / "new.txt").read_text(encoding="utf-8"),
@@ -1077,6 +1085,64 @@ class WorkspaceTest(unittest.TestCase):
             "+staged-only",
             review.diff_file.read_text(encoding="utf-8"),
         )
+
+    def test_wip_snapshot_preserves_staged_content_when_worktree_reverts_to_head(
+        self,
+    ) -> None:
+        source_path = self.repo / "example.txt"
+        head_content = source_path.read_text(encoding="utf-8")
+        staged_content = "staged index content\n"
+        source_path.write_text(staged_content, encoding="utf-8")
+        git(self.repo, "add", "example.txt")
+        staged_object = git(self.repo, "rev-parse", ":example.txt")
+        source_path.write_text(head_content, encoding="utf-8")
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+            include_source_wip=True,
+        )
+        self.reviews.append(review)
+
+        self.assertNotEqual(
+            staged_object, git(self.repo, "rev-parse", "HEAD:example.txt")
+        )
+        self.assertEqual(
+            git(
+                review.workspace_root,
+                "rev-parse",
+                f"{review.snapshot_tree_sha}:example.txt",
+            ),
+            staged_object,
+        )
+        self.assertEqual(
+            (review.workspace_root / "example.txt").read_text(encoding="utf-8"),
+            staged_content,
+        )
+        self.assertIn(
+            "+staged index content",
+            review.diff_file.read_text(encoding="utf-8"),
+        )
+
+    def test_wip_staged_symlink_rejects_escape_when_worktree_reverts_to_head(
+        self,
+    ) -> None:
+        staged_link = self.repo / "staged-link"
+        staged_link.symlink_to("../outside.txt")
+        git(self.repo, "add", "staged-link")
+        staged_link.unlink()
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "source WIP symlink escapes review workspace",
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                include_source_wip=True,
+            )
 
     def test_wip_rejects_external_regular_file_hardlink(self) -> None:
         outside = pathlib.Path(self.temporary.name) / "outside-wip.txt"
@@ -1228,6 +1294,8 @@ class WorkspaceTest(unittest.TestCase):
                 wraps=original_popen,
             ) as launched,
         ):
+            workspace_runtime._source_index_snapshot(source_inspection)
+            workspace_runtime._reject_source_head_gitlinks(source_inspection)
             status_bytes = workspace_runtime._source_status(source_inspection)
             workspace_runtime._source_wip_paths(source_inspection, status_bytes)
 
@@ -1238,7 +1306,7 @@ class WorkspaceTest(unittest.TestCase):
                 str(argument).startswith("--work-tree=") for argument in call.args[0]
             )
         ]
-        self.assertGreaterEqual(len(source_commands), 5)
+        self.assertEqual(len(source_commands), 4)
         for command in source_commands:
             self.assertIn("core.commitGraph=false", command)
 
@@ -1324,6 +1392,48 @@ class WorkspaceTest(unittest.TestCase):
         self.assertNotIn(ignored_name, diff)
         self.assertNotIn(oauth_refresh_credential(), diff)
         validate_external_workspace(wip_review)
+
+    def test_clean_and_wip_accept_disabled_core_excludes_file(self) -> None:
+        for label, configured_value in (("empty", ""), ("null-device", os.devnull)):
+            visible_name = f"disabled-excludes-{label}.txt"
+            visible_path = self.repo / visible_name
+            try:
+                with self.subTest(configured_value=label):
+                    git(
+                        self.repo,
+                        "config",
+                        "core.excludesFile",
+                        configured_value,
+                    )
+                    self.assertIsNone(
+                        workspace_runtime._source_excludes_file(self.repo)
+                    )
+                    clean_review = prepare_workspace(
+                        repo=self.repo,
+                        base_ref=self.base,
+                        head_ref=self.head,
+                    )
+                    self.reviews.append(clean_review)
+
+                    visible_path.write_text(
+                        "capture disabled excludes WIP\n",
+                        encoding="utf-8",
+                    )
+                    wip_review = prepare_workspace(
+                        repo=self.repo,
+                        base_ref=self.base,
+                        head_ref=self.head,
+                        include_source_wip=True,
+                    )
+                    self.reviews.append(wip_review)
+                    self.assertEqual(
+                        (wip_review.workspace_root / visible_name).read_text(
+                            encoding="utf-8"
+                        ),
+                        "capture disabled excludes WIP\n",
+                    )
+            finally:
+                visible_path.unlink(missing_ok=True)
 
     def test_wip_source_inspection_uses_linked_worktree_index(self) -> None:
         linked = pathlib.Path(self.temporary.name) / "linked"
@@ -1495,6 +1605,7 @@ class WorkspaceTest(unittest.TestCase):
         validate_external_workspace(wip_review)
 
     def test_source_inspection_projects_only_safe_path_config(self) -> None:
+        git(self.repo, "config", "core.fileMode", "false")
         git(self.repo, "config", "core.ignoreCase", "true")
         git(self.repo, "config", "core.precomposeUnicode", "true")
         git(self.repo, "config", "filter.evil.clean", "/usr/bin/false")
@@ -1505,6 +1616,7 @@ class WorkspaceTest(unittest.TestCase):
         ) as source_inspection:
             config = (source_inspection.git_dir / "config").read_text(encoding="utf-8")
 
+        self.assertIn("\tfileMode = false\n", config)
         self.assertIn("\tignoreCase = true\n", config)
         self.assertIn("\tprecomposeUnicode = true\n", config)
         self.assertNotIn("filter", config.casefold())
@@ -1877,6 +1989,88 @@ class WorkspaceTest(unittest.TestCase):
         )
         self.assertFalse(any(command[:1] == ("hash-object",) for command in commands))
         validate_external_workspace(review)
+
+    def test_wip_tracked_raw_path_round_trips_name_status_pair(self) -> None:
+        raw_name = (
+            b"tracked-\xc3\xbf-\n-\t.txt"
+            if sys.platform == "darwin"
+            else b"tracked-\xff-\n-\t.txt"
+        )
+        relative = pathlib.PurePosixPath(os.fsdecode(raw_name))
+        source_path = self.repo.joinpath(*relative.parts)
+        source_path.write_bytes(b"tracked raw base\n")
+        git(self.repo, "add", "--", relative.as_posix())
+        git(self.repo, "commit", "-m", "Add tracked raw path")
+        raw_head = git(self.repo, "rev-parse", "HEAD")
+        payload = b"tracked raw WIP\n"
+        source_path.write_bytes(payload)
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.head,
+            head_ref=raw_head,
+            include_source_wip=True,
+        )
+        self.reviews.append(review)
+
+        tree_records = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(review.workspace_root),
+                "ls-tree",
+                "-rz",
+                "--full-tree",
+                review.snapshot_tree_sha,
+            ),
+            check=True,
+            env=test_git_environment(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout.split(b"\0")
+        raw_record = next(
+            record for record in tree_records if record.endswith(b"\t" + raw_name)
+        )
+        metadata, _separator, actual_name = raw_record.partition(b"\t")
+        _mode, _object_type, object_id = metadata.split(b" ")
+
+        self.assertEqual(actual_name, raw_name)
+        self.assertEqual(
+            review.workspace_root.joinpath(*relative.parts).read_bytes(),
+            payload,
+        )
+        blob = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(review.workspace_root),
+                "cat-file",
+                "blob",
+                object_id.decode("ascii"),
+            ),
+            check=True,
+            env=test_git_environment(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout
+        self.assertEqual(blob, payload)
+
+        invalid_raw_name = b"tracked-\xff-\n-\t.txt"
+        with mock.patch.object(
+            workspace_runtime,
+            "_bounded_source_git_output",
+            return_value=b"M\0" + invalid_raw_name + b"\0",
+        ):
+            parsed_paths, deleted_paths = (
+                workspace_runtime._source_final_worktree_paths(
+                    mock.Mock(head_sha=raw_head)
+                )
+            )
+        self.assertEqual(
+            {os.fsencode(path.as_posix()) for path in parsed_paths},
+            {invalid_raw_name},
+        )
+        self.assertEqual(deleted_paths, set())
 
     def test_wip_blob_import_batches_duplicate_payloads_to_same_object(self) -> None:
         payload = b"shared WIP content\n"
@@ -3060,6 +3254,153 @@ class WorkspaceTest(unittest.TestCase):
                 include_source_wip=True,
             )
 
+    def test_wip_rejects_a_planned_worktree_path_missing_from_capture(self) -> None:
+        relative = pathlib.PurePosixPath("planned-wip.txt")
+        (self.repo / relative).write_text("planned WIP\n", encoding="utf-8")
+        original_read = workspace_runtime._read_wip_entry
+
+        def omit_planned_path(**kwargs):
+            if kwargs["relative"] == relative:
+                return None
+            return original_read(**kwargs)
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_read_wip_entry",
+                side_effect=omit_planned_path,
+            ),
+            self.assertRaisesRegex(ReviewError, "planned worktree path is missing"),
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                include_source_wip=True,
+            )
+
+    def test_wip_staged_delete_then_worktree_restore_is_captured(self) -> None:
+        source_path = self.repo / "example.txt"
+        head_content = source_path.read_text(encoding="utf-8")
+        git(self.repo, "rm", "example.txt")
+        source_path.write_text(head_content, encoding="utf-8")
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+            include_source_wip=True,
+        )
+        self.reviews.append(review)
+
+        self.assertEqual(
+            (review.workspace_root / "example.txt").read_text(encoding="utf-8"),
+            head_content,
+        )
+        self.assertEqual(
+            git(review.workspace_root, "write-tree"),
+            review.snapshot_tree_sha,
+        )
+
+    def test_source_wip_git_invocations_are_aggregate_bounded(self) -> None:
+        source_path = self.repo / "example.txt"
+        head_content = source_path.read_text(encoding="utf-8")
+        source_path.write_text("staged-only invocation fixture\n", encoding="utf-8")
+        git(self.repo, "add", "example.txt")
+        source_path.write_text(head_content, encoding="utf-8")
+        (self.repo / ".gitattributes").write_text(
+            "worktree capture invocation fixture\n",
+            encoding="utf-8",
+        )
+        budgets: list[workspace_runtime.SourceWipCaptureBudget] = []
+        original_factory = workspace_runtime._new_source_wip_capture_budget
+
+        def capture_budget():
+            budget = original_factory()
+            budgets.append(budget)
+            return budget
+
+        with mock.patch.object(
+            workspace_runtime,
+            "_new_source_wip_capture_budget",
+            side_effect=capture_budget,
+        ):
+            review = prepare_workspace(
+                repo=self.repo,
+                base_ref=self.base,
+                head_ref=self.head,
+                include_source_wip=True,
+            )
+        self.reviews.append(review)
+
+        self.assertEqual(len(budgets), 1)
+        self.assertEqual(
+            budgets[0].git_invocations,
+            workspace_runtime.MAX_SOURCE_WIP_GIT_INVOCATIONS,
+        )
+
+    def test_source_wip_shared_deadline_blocks_the_next_git_launch(self) -> None:
+        with workspace_runtime._temporary_source_inspection_git_context(
+            source_root=self.repo,
+            head_sha=self.head,
+        ) as source_inspection:
+            capture_budget = workspace_runtime.SourceWipCaptureBudget(deadline=10.0)
+            with (
+                mock.patch.object(
+                    workspace_runtime.time,
+                    "monotonic",
+                    return_value=10.0,
+                ),
+                mock.patch.object(workspace_runtime.subprocess, "Popen") as launched,
+                self.assertRaisesRegex(ReviewError, "shared time limit"),
+            ):
+                workspace_runtime._source_status(
+                    source_inspection,
+                    capture_budget=capture_budget,
+                )
+
+        launched.assert_not_called()
+
+    def test_source_wip_shared_deadline_covers_final_name_status_parse(self) -> None:
+        capture_budget = workspace_runtime.SourceWipCaptureBudget(
+            deadline=100.0,
+            git_invocations=(workspace_runtime.MAX_SOURCE_WIP_GIT_INVOCATIONS - 1),
+        )
+        oversized_path = b"x" * (
+            2 * workspace_runtime.SOURCE_WIP_PARSE_DEADLINE_CHECK_BYTES
+        )
+
+        def emit_final_name_status(*_args, **_kwargs):
+            capture_budget.claim_git_invocation()
+            return b"M\0" + oversized_path + b"\0"
+
+        shared_timeout = ReviewError(
+            "source WIP capture and revalidation exceeded the shared time limit"
+        )
+        with (
+            mock.patch.object(
+                capture_budget,
+                "remaining_seconds",
+                side_effect=(120.0, 120.0, 120.0, shared_timeout),
+            ) as remaining,
+            mock.patch.object(
+                workspace_runtime,
+                "_bounded_source_git_output",
+                side_effect=emit_final_name_status,
+            ),
+            self.assertRaisesRegex(ReviewError, "shared time limit"),
+        ):
+            workspace_runtime._source_final_worktree_paths(
+                mock.Mock(head_sha=self.head),
+                capture_budget=capture_budget,
+            )
+
+        self.assertEqual(
+            capture_budget.git_invocations,
+            workspace_runtime.MAX_SOURCE_WIP_GIT_INVOCATIONS,
+        )
+        self.assertEqual(remaining.call_count, 4)
+
     def test_source_status_output_is_byte_bounded(self) -> None:
         (self.repo / "example.txt").write_text("dirty\n", encoding="utf-8")
 
@@ -3340,16 +3681,42 @@ class WorkspaceTest(unittest.TestCase):
         git(self.repo, "add", "nested-submodule")
         assert_rejected_before_status()
 
-    def test_core_filemode_false_cannot_hide_mode_only_wip(self) -> None:
+    def test_core_filemode_false_ignores_mode_only_worktree_change(self) -> None:
         git(self.repo, "config", "core.filemode", "false")
         (self.repo / "example.txt").chmod(0o755)
 
-        with self.assertRaisesRegex(ReviewError, "source repository has"):
-            prepare_workspace(
-                repo=self.repo,
-                base_ref=self.base,
-                head_ref=self.head,
-            )
+        clean_review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+        )
+        self.reviews.append(clean_review)
+        wip_review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+            include_source_wip=True,
+        )
+        self.reviews.append(wip_review)
+
+        self.assertEqual(
+            stat.S_IMODE((self.repo / "example.txt").stat().st_mode), 0o755
+        )
+        for review in (clean_review, wip_review):
+            with self.subTest(content_variant=review.content_variant):
+                self.assertEqual(
+                    stat.S_IMODE(
+                        (review.workspace_root / "example.txt").stat().st_mode
+                    ),
+                    0o644,
+                )
+
+    def test_core_filemode_false_content_wip_uses_index_mode(self) -> None:
+        git(self.repo, "config", "core.filemode", "false")
+        source_path = self.repo / "example.txt"
+        source_path.write_text("content WIP with physical chmod\n", encoding="utf-8")
+        source_path.chmod(0o755)
+
         review = prepare_workspace(
             repo=self.repo,
             base_ref=self.base,
@@ -3357,8 +3724,90 @@ class WorkspaceTest(unittest.TestCase):
             include_source_wip=True,
         )
         self.reviews.append(review)
+
+        snapshot_entry = git(
+            review.workspace_root,
+            "ls-tree",
+            review.snapshot_tree_sha,
+            "example.txt",
+        )
+        self.assertEqual(snapshot_entry.split(maxsplit=1)[0], "100644")
+        self.assertEqual(stat.S_IMODE(source_path.stat().st_mode), 0o755)
         self.assertEqual(
             stat.S_IMODE((review.workspace_root / "example.txt").stat().st_mode),
+            0o644,
+        )
+
+    def test_core_filemode_false_preserves_explicit_staged_index_mode(self) -> None:
+        git(self.repo, "config", "core.filemode", "false")
+        git(self.repo, "update-index", "--chmod=+x", "example.txt")
+        source_path = self.repo / "example.txt"
+        source_path.chmod(0o644)
+        source_path.write_text(
+            "worktree content with staged executable mode\n",
+            encoding="utf-8",
+        )
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+            include_source_wip=True,
+        )
+        self.reviews.append(review)
+
+        snapshot_entry = git(
+            review.workspace_root,
+            "ls-tree",
+            review.snapshot_tree_sha,
+            "example.txt",
+        )
+        self.assertEqual(snapshot_entry.split(maxsplit=1)[0], "100755")
+        self.assertEqual(
+            (review.workspace_root / "example.txt").read_text(encoding="utf-8"),
+            "worktree content with staged executable mode\n",
+        )
+        self.assertEqual(
+            stat.S_IMODE((review.workspace_root / "example.txt").stat().st_mode),
+            0o755,
+        )
+
+    def test_core_filemode_false_keeps_type_change_and_untracked_mode(self) -> None:
+        git(self.repo, "config", "core.filemode", "false")
+        source_path = self.repo / "example.txt"
+        source_path.unlink()
+        source_path.symlink_to(".gitattributes")
+        untracked_path = self.repo / "untracked-executable"
+        untracked_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        untracked_path.chmod(0o755)
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=self.base,
+            head_ref=self.head,
+            include_source_wip=True,
+        )
+        self.reviews.append(review)
+
+        tracked_entry = git(
+            review.workspace_root,
+            "ls-tree",
+            review.snapshot_tree_sha,
+            "example.txt",
+        )
+        untracked_entry = git(
+            review.workspace_root,
+            "ls-tree",
+            review.snapshot_tree_sha,
+            "untracked-executable",
+        )
+        self.assertEqual(tracked_entry.split(maxsplit=1)[0], "120000")
+        self.assertEqual(untracked_entry.split(maxsplit=1)[0], "100755")
+        self.assertTrue((review.workspace_root / "example.txt").is_symlink())
+        self.assertEqual(
+            stat.S_IMODE(
+                (review.workspace_root / "untracked-executable").stat().st_mode
+            ),
             0o755,
         )
 

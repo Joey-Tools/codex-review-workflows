@@ -3374,6 +3374,93 @@ class RepositoryContractTest(unittest.TestCase):
             runtime.lower(),
         )
 
+    def test_claude_spill_scope_rule_and_observable_validator_gate_are_explicit(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
+            encoding="utf-8"
+        )
+        validator_source = (SCRIPTS / "validate_claude_stream.py").read_text(
+            encoding="utf-8"
+        )
+
+        for content in (skill, contracts, canonical, templates):
+            self.assertIn("persisted or spilled", content)
+            self.assertIn("narrower bounded", content)
+        for content in (skill, contracts, canonical):
+            self.assertIn("`Read.file_path`", content)
+            self.assertIn("`Grep.path`", content)
+            self.assertIn("`Glob.path`", content)
+            self.assertIn("`Glob.pattern`", content)
+        for content in (contracts, canonical):
+            self.assertIn("`persistedOutputPath`", content)
+            self.assertIn("`Bash` command strings", content)
+            self.assertIn("not complete host-read enforcement", content)
+
+        self.assertIn(
+            "A direct structured tool read of the spilled path adds deterministic blocked evidence",
+            canonical,
+        )
+        self.assertIn(
+            "if an outside-workspace tool read already occurred, the lane is blocked",
+            templates,
+        )
+        self.assertIn(
+            "intermediate.tool-path.outside-workspace",
+            canonical,
+        )
+        self.assertIn(
+            "intermediate.tool-path.scope-unverified",
+            canonical,
+        )
+        for content in (skill, contracts, canonical, templates):
+            self.assertIn("absolute", content)
+            self.assertIn("`**/*.py`", content)
+            self.assertIn("`./**/*.py`", content)
+            self.assertIn("extglob", content)
+            self.assertIn("ABA", content)
+        for content in (skill, contracts, canonical):
+            self.assertIn("validation start", content)
+            self.assertIn("global", content)
+            self.assertIn("inconclusive", content)
+        for content in (skill, contracts, canonical):
+            self.assertIn("`named-parent-private-preflight`", content)
+            self.assertIn("`low-level-helper`", content)
+        for anchor in (
+            "STRUCTURED_TOOL_PATH_SCOPE_CONTRACT",
+            "TRUST_SOURCE_LAUNCH_PROFILES",
+            '"launch_profiles": ("named-direct",)',
+            '"source": "assistant.tool_use.input"',
+            '"path_field": "file_path"',
+            '"path_field": "path"',
+            '"path_if_present": "absolute"',
+            '"pattern_field": "pattern"',
+            '"pattern_contract": "bounded_safe_relative_glob"',
+            '"leading_prefix_normalization": "./"',
+            '"extglob": "scope_unverified"',
+            '"dynamic_directory_containment": "bounded_overapprox_scan"',
+            '"glob_scan_limits"',
+            "MAX_STRUCTURED_GLOB_ALTERNATIVES = 64",
+            "MAX_STRUCTURED_GLOB_SCAN_ENTRIES = 32_768",
+            "MAX_STRUCTURED_GLOB_SCAN_STATES = 32_768",
+            "MAX_STRUCTURED_GLOB_SCAN_DEPTH = 64",
+            "STRUCTURED_GLOB_EXTGLOB_TOKENS",
+            "_bounded_glob_directory_scope",
+            "with os.scandir(resolved_current) as entries",
+            "_open_bound_workspace(resolved_cwd)",
+            '"user.tool_use_result.persistedOutputPath"',
+            '"Bash.command"',
+        ):
+            self.assertIn(anchor, validator_source)
+        self.assertNotIn("persistedOutputPath", validator_source.split("def ", 1)[1])
+
     def test_canonical_claude_auth_control_plane_is_not_helper_broker(self) -> None:
         agents = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
             encoding="utf-8"

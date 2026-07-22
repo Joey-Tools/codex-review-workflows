@@ -15862,6 +15862,7 @@ def _replace_claude_prompt_host_path(
         right_ok = end == len(prompt) or prompt[end] in (
             CLAUDE_PROMPT_PATH_RIGHT_BOUNDARIES
         )
+        trailing_sentence_period = False
         if not right_ok and allow_descendants and prompt[end : end + 1] == b"/":
             preceding = prompt[occurrence - 1] if occurrence else None
             quote = (
@@ -15899,11 +15900,17 @@ def _replace_claude_prompt_host_path(
             right_ok = end + 1 == len(prompt) or prompt[end + 1] in (
                 CLAUDE_PROMPT_PATH_RIGHT_BOUNDARIES
             )
+            trailing_sentence_period = right_ok
         if not left_ok or not right_ok:
             raise ReviewError(
                 f"Claude review prompt contains an ambiguous host {label} path"
             )
-        chunks.extend((prompt[cursor:occurrence], target))
+        replacement = target
+        if trailing_sentence_period and target == b".":
+            # Preserve the sentence period without forming the parent-path
+            # token; "./." still resolves to the descriptor-bound workspace.
+            replacement = b"./"
+        chunks.extend((prompt[cursor:occurrence], replacement))
         cursor = end
 
 

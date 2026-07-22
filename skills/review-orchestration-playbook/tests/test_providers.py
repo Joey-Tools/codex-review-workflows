@@ -29235,6 +29235,63 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertIn(b"Only Read is available", projected)
         self.assertIn(b"Every Read `file_path` must be absolute", projected)
 
+    def test_descriptor_bound_prompt_preserves_period_without_parent_path(
+        self,
+    ) -> None:
+        workspace = str(self.review.workspace_root).encode()
+
+        projected = providers._claude_review_prompt(
+            self.review,
+            b"Inspect " + workspace + b".\n",
+            linux=False,
+            descriptor_bound=True,
+        )
+
+        self.assertEqual(projected, b"Inspect ./.\n")
+        self.assertNotIn(b"Inspect ..", projected)
+
+    def test_descriptor_bound_prompt_projects_bare_and_descendant_workspace_paths(
+        self,
+    ) -> None:
+        workspace = str(self.review.workspace_root).encode()
+        cases = (
+            (b"Inspect " + workspace + b"\n", b"Inspect .\n"),
+            (
+                b"Nested=" + workspace + b"/src/source.py.\n",
+                b"Nested=./src/source.py.\n",
+            ),
+        )
+
+        for prompt, expected in cases:
+            with self.subTest(prompt=prompt):
+                projected = providers._claude_review_prompt(
+                    self.review,
+                    prompt,
+                    linux=False,
+                    descriptor_bound=True,
+                )
+                self.assertEqual(projected, expected)
+
+    def test_descriptor_bound_prompt_keeps_ambiguous_path_guards(self) -> None:
+        workspace = str(self.review.workspace_root)
+        for ambiguous in (
+            f"Workspace={workspace}-backup\n",
+            f"Workspace=copy{workspace}\n",
+            f"Workspace={workspace}.sig\n",
+            f"Workspace={workspace}/../outside.py\n",
+            f"Workspace={workspace}//source.py\n",
+        ):
+            with (
+                self.subTest(ambiguous=ambiguous),
+                self.assertRaisesRegex(ReviewError, "ambiguous host workspace path"),
+            ):
+                providers._claude_review_prompt(
+                    self.review,
+                    ambiguous.encode(),
+                    linux=False,
+                    descriptor_bound=True,
+                )
+
     def test_linux_prompt_rejects_ambiguous_host_path_prefixes(self) -> None:
         for ambiguous in (
             f"Workspace={self.review.workspace_root}-backup\n",

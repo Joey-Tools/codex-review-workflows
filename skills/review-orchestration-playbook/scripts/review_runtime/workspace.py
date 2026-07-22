@@ -333,6 +333,9 @@ MAX_SOURCE_INFO_EXCLUDE_BYTES = 1024 * 1024
 MAX_SOURCE_GIT_QUERY_BYTES = 64 * 1024
 MAX_SOURCE_GIT_STDERR_BYTES = 64 * 1024
 SOURCE_GIT_TIMEOUT_SECONDS = 120.0
+SOURCE_WIP_CAPTURE_TIMEOUT_SECONDS = 300.0
+MAX_SOURCE_WIP_GIT_INVOCATIONS = 16
+SOURCE_WIP_PARSE_DEADLINE_CHECK_BYTES = 64 * 1024
 MAX_PRIVATE_GIT_STDERR_BYTES = 64 * 1024
 MAX_PRIVATE_FSCK_OUTPUT_BYTES = 4 * 1024 * 1024
 PRIVATE_GIT_TIMEOUT_SECONDS = 300.0
@@ -1100,6 +1103,39 @@ class SourceInspectionGitContext:
     index_file: pathlib.Path
     head_sha: str
     excludes_file: str
+    file_mode: bool
+
+
+@dataclass
+class SourceWipCaptureBudget:
+    deadline: float
+    git_invocations: int = 0
+
+    def remaining_seconds(self) -> float:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReviewError(
+                "source WIP capture and revalidation exceeded the shared time limit"
+            )
+        return remaining
+
+    def claim_git_invocation(self) -> float:
+        if self.git_invocations >= MAX_SOURCE_WIP_GIT_INVOCATIONS:
+            raise ReviewError(
+                "source WIP capture and revalidation exceeded the Git invocation limit"
+            )
+        timeout_seconds = min(
+            SOURCE_GIT_TIMEOUT_SECONDS,
+            self.remaining_seconds(),
+        )
+        self.git_invocations += 1
+        return timeout_seconds
+
+
+def _new_source_wip_capture_budget() -> SourceWipCaptureBudget:
+    return SourceWipCaptureBudget(
+        deadline=time.monotonic() + SOURCE_WIP_CAPTURE_TIMEOUT_SECONDS
+    )
 
 
 def _temporary_review_file() -> BinaryIO:
@@ -1208,16 +1244,25 @@ def _source_git_config_value(
     return os.fsdecode(completed.stdout[:-1]), default_path
 
 
-def _source_excludes_file(source_root: pathlib.Path) -> pathlib.Path:
+def _source_excludes_file(source_root: pathlib.Path) -> pathlib.Path | None:
     value, default_path = _source_git_config_value(
         source_root,
         key="core.excludesFile",
         value_type="path",
     )
+    if value == "" or (
+        value is not None and os.path.normcase(value) == os.path.normcase(os.devnull)
+    ):
+        return None
     path = default_path if value is None else pathlib.Path(value)
     if not path.is_absolute():
         path = source_root / path
-    return pathlib.Path(os.path.abspath(path))
+    absolute_path = pathlib.Path(os.path.abspath(path))
+    if value is not None and os.path.normcase(os.fspath(absolute_path)) == (
+        os.path.normcase(os.path.abspath(os.devnull))
+    ):
+        return None
+    return absolute_path
 
 
 def _source_git_boolean_config(
@@ -1237,7 +1282,12 @@ def _source_git_boolean_config(
     return value == "true"
 
 
-def _git(repo: pathlib.Path, *args: str, check: bool = True):
+def _git(
+    repo: pathlib.Path,
+    *args: str,
+    check: bool = True,
+    capture_budget: SourceWipCaptureBudget | None = None,
+):
     command = (
         str(resolve_git()),
         "--no-pager",
@@ -1255,15 +1305,24 @@ def _git(repo: pathlib.Path, *args: str, check: bool = True):
         str(repo),
         *args,
     )
-    return _run_bounded_git_capture(
-        command,
-        input_bytes=None,
-        check=check,
-        label="source Git query",
-        byte_limit=MAX_SOURCE_GIT_QUERY_BYTES,
-        timeout_seconds=SOURCE_GIT_TIMEOUT_SECONDS,
-        timeout_label="source Git",
-    )
+    try:
+        return _run_bounded_git_capture(
+            command,
+            input_bytes=None,
+            check=check,
+            label="source Git query",
+            byte_limit=MAX_SOURCE_GIT_QUERY_BYTES,
+            timeout_seconds=(
+                SOURCE_GIT_TIMEOUT_SECONDS
+                if capture_budget is None
+                else capture_budget.claim_git_invocation()
+            ),
+            timeout_label="source Git",
+        )
+    except ReviewError:
+        if capture_budget is not None:
+            capture_budget.remaining_seconds()
+        raise
 
 
 def _stop_bounded_process(process: subprocess.Popen[bytes]) -> None:
@@ -1302,7 +1361,13 @@ def _bounded_source_git_output(
     record_limit: int,
     label: str,
     config_overrides: tuple[str, ...] = (),
+    capture_budget: SourceWipCaptureBudget | None = None,
 ) -> bytes:
+    timeout_seconds = (
+        SOURCE_GIT_TIMEOUT_SECONDS
+        if capture_budget is None
+        else capture_budget.claim_git_invocation()
+    )
     config_args = tuple(item for value in config_overrides for item in ("-c", value))
     command = (
         str(resolve_git()),
@@ -1311,8 +1376,6 @@ def _bounded_source_git_output(
         "core.commitGraph=false",
         "-c",
         "core.fsmonitor=false",
-        "-c",
-        "core.filemode=true",
         "-c",
         f"core.hooksPath={os.devnull}",
         "-c",
@@ -1336,7 +1399,7 @@ def _bounded_source_git_output(
     if process.stdout is None or process.stderr is None:
         _stop_source_git_process(process)
         raise ReviewError(f"failed to create {label} pipes")
-    deadline = time.monotonic() + SOURCE_GIT_TIMEOUT_SECONDS
+    command_deadline = time.monotonic() + timeout_seconds
     output_bytes = 0
     records = 0
     stderr_bytes = bytearray()
@@ -1346,8 +1409,10 @@ def _bounded_source_git_output(
         selector.register(process.stderr, selectors.EVENT_READ, "stderr")
         with _temporary_review_file() as output:
             while selector.get_map():
-                remaining = deadline - time.monotonic()
+                remaining = command_deadline - time.monotonic()
                 if remaining <= 0:
+                    if capture_budget is not None:
+                        capture_budget.remaining_seconds()
                     raise ReviewError(f"{label} exceeded the source Git time limit")
                 events = selector.select(timeout=min(remaining, 0.5))
                 if not events:
@@ -1377,12 +1442,16 @@ def _bounded_source_git_output(
                             MAX_SOURCE_GIT_STDERR_BYTES + 1 - len(stderr_bytes)
                         )
                         stderr_bytes.extend(chunk[:remaining_stderr])
-            remaining = deadline - time.monotonic()
+            remaining = command_deadline - time.monotonic()
             if remaining <= 0:
+                if capture_budget is not None:
+                    capture_budget.remaining_seconds()
                 raise ReviewError(f"{label} exceeded the source Git time limit")
             try:
                 returncode = process.wait(timeout=remaining)
             except subprocess.TimeoutExpired as error:
+                if capture_budget is not None:
+                    capture_budget.remaining_seconds()
                 raise ReviewError(
                     f"{label} exceeded the source Git time limit"
                 ) from error
@@ -1540,7 +1609,9 @@ def _read_source_info_exclude(path: pathlib.Path) -> bytes:
         return handle.read(MAX_SOURCE_INFO_EXCLUDE_BYTES + 1)
 
 
-def _read_source_excludes_file(path: pathlib.Path) -> bytes:
+def _read_source_excludes_file(path: pathlib.Path | None) -> bytes:
+    if path is None:
+        return b""
     try:
         os.lstat(path)
     except FileNotFoundError:
@@ -1592,7 +1663,7 @@ def _create_source_inspection_git_context(
     source_excludes = _read_source_excludes_file(_source_excludes_file(source_root))
     source_status_config = {
         key: _source_git_boolean_config(source_root, key=key)
-        for key in ("core.ignoreCase", "core.precomposeUnicode")
+        for key in ("core.fileMode", "core.ignoreCase", "core.precomposeUnicode")
     }
 
     git_dir = container / "source-inspection.git"
@@ -1626,6 +1697,7 @@ def _create_source_inspection_git_context(
         index_file=index_file,
         head_sha=head_sha,
         excludes_file=str(effective_excludes_destination),
+        file_mode=source_status_config["core.fileMode"] is not False,
     )
 
 
@@ -1745,6 +1817,7 @@ def _run_worktree_git(
     check: bool = True,
     byte_limit: int = MAX_PRIVATE_OBJECT_LIST_BYTES,
     record_limit: int | None = None,
+    capture_budget: SourceWipCaptureBudget | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     command = (
         str(resolve_git()),
@@ -1759,15 +1832,28 @@ def _run_worktree_git(
         str(workspace_root),
         *args,
     )
-    return _run_bounded_git_capture(
-        command,
-        input_bytes=input_bytes,
-        input_handle=input_handle,
-        check=check,
-        label="detached review worktree Git command",
-        byte_limit=byte_limit,
-        record_limit=record_limit,
-    )
+    try:
+        return _run_bounded_git_capture(
+            command,
+            input_bytes=input_bytes,
+            input_handle=input_handle,
+            check=check,
+            label="detached review worktree Git command",
+            byte_limit=byte_limit,
+            record_limit=record_limit,
+            timeout_seconds=(
+                PRIVATE_GIT_TIMEOUT_SECONDS
+                if capture_budget is None
+                else capture_budget.claim_git_invocation()
+            ),
+            timeout_label=(
+                "private Git" if capture_budget is None else "source WIP capture"
+            ),
+        )
+    except ReviewError:
+        if capture_budget is not None:
+            capture_budget.remaining_seconds()
+        raise
 
 
 def _run_bounded_git_capture(
@@ -2486,8 +2572,21 @@ def resolve_repo_root(repo: pathlib.Path) -> pathlib.Path:
     return root
 
 
-def resolve_commit(repo: pathlib.Path, ref: str, *, label: str) -> str:
-    result = _git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}", check=False)
+def resolve_commit(
+    repo: pathlib.Path,
+    ref: str,
+    *,
+    label: str,
+    capture_budget: SourceWipCaptureBudget | None = None,
+) -> str:
+    result = _git(
+        repo,
+        "rev-parse",
+        "--verify",
+        f"{ref}^{{commit}}",
+        check=False,
+        capture_budget=capture_budget,
+    )
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", errors="replace").strip()
         raise ReviewError(f"cannot resolve {label} {ref!r}: {detail}")
@@ -14354,24 +14453,32 @@ def _validate_prompt_size(prompt: str) -> None:
         )
 
 
-def _source_status(context: SourceInspectionGitContext) -> bytes:
-    _reject_hidden_index_entries(context)
-    _reject_source_head_gitlinks(context)
+def _source_status(
+    context: SourceInspectionGitContext,
+    *,
+    capture_budget: SourceWipCaptureBudget | None = None,
+) -> bytes:
     return _bounded_source_git_output(
         context,
         "status",
         "--porcelain=v2",
         "-z",
+        "--no-renames",
         "--untracked-files=all",
         "--ignore-submodules=all",
         byte_limit=MAX_SOURCE_STATUS_BYTES,
         record_limit=MAX_SOURCE_STATUS_RECORDS,
         label="source WIP status metadata",
         config_overrides=(f"core.excludesFile={context.excludes_file}",),
+        capture_budget=capture_budget,
     )
 
 
-def _reject_hidden_index_entries(context: SourceInspectionGitContext) -> None:
+def _source_index_snapshot(
+    context: SourceInspectionGitContext,
+    *,
+    capture_budget: SourceWipCaptureBudget | None = None,
+) -> dict[bytes, tuple[str, str]]:
     value = _bounded_source_git_output(
         context,
         "ls-files",
@@ -14383,9 +14490,13 @@ def _reject_hidden_index_entries(context: SourceInspectionGitContext) -> None:
         byte_limit=MAX_SOURCE_INDEX_METADATA_BYTES,
         record_limit=MAX_SOURCE_INDEX_RECORDS,
         label="source index-flag metadata",
+        capture_budget=capture_budget,
     )
     if value and not value.endswith(b"\0"):
         raise ReviewError("unterminated source index-flag metadata")
+    object_id_length = len(context.head_sha)
+    lowercase_hex = b"0123456789abcdef"
+    metadata_by_path: dict[bytes, tuple[str, str]] = {}
     for record in value.split(b"\0")[:-1]:
         if len(record) < 3 or record[1:2] != b" ":
             raise ReviewError("source index-flag metadata is malformed")
@@ -14395,18 +14506,38 @@ def _reject_hidden_index_entries(context: SourceInspectionGitContext) -> None:
                 "source index contains assume-unchanged or skip-worktree entries; "
                 "clear hidden index flags before preparing a review"
             )
-        metadata, separator, _raw_path = record[2:].partition(b"\t")
+        metadata, separator, raw_path = record[2:].partition(b"\t")
         fields = metadata.split(b" ")
         if not separator or len(fields) != 3:
             raise ReviewError("source index-flag metadata is malformed")
-        if fields[0] == b"160000":
+        raw_mode, raw_object_id, raw_stage = fields
+        if raw_mode == b"160000":
             raise ReviewError(
                 "source index contains a gitlink; submodule source inspection is "
                 "not supported"
             )
+        if raw_mode not in {b"100644", b"100755", b"120000"}:
+            raise ReviewError("source index contains an unsupported mode")
+        if raw_stage != b"0":
+            raise ReviewError("source index contains an unmerged entry")
+        if len(raw_object_id) != object_id_length or any(
+            byte not in lowercase_hex for byte in raw_object_id
+        ):
+            raise ReviewError("source index object id is malformed")
+        if not raw_path or raw_path in metadata_by_path:
+            raise ReviewError("source index path metadata is malformed")
+        metadata_by_path[raw_path] = (
+            raw_mode.decode("ascii"),
+            raw_object_id.decode("ascii"),
+        )
+    return metadata_by_path
 
 
-def _reject_source_head_gitlinks(context: SourceInspectionGitContext) -> None:
+def _reject_source_head_gitlinks(
+    context: SourceInspectionGitContext,
+    *,
+    capture_budget: SourceWipCaptureBudget | None = None,
+) -> None:
     value = _bounded_source_git_output(
         context,
         "ls-tree",
@@ -14418,6 +14549,7 @@ def _reject_source_head_gitlinks(context: SourceInspectionGitContext) -> None:
         byte_limit=MAX_SOURCE_INDEX_METADATA_BYTES,
         record_limit=MAX_SOURCE_INDEX_RECORDS,
         label="source HEAD tree metadata",
+        capture_budget=capture_budget,
     )
     if value and not value.endswith(b"\0"):
         raise ReviewError("unterminated source HEAD tree metadata")
@@ -14434,27 +14566,13 @@ def _reject_source_head_gitlinks(context: SourceInspectionGitContext) -> None:
 
 
 def _require_clean_source(context: SourceInspectionGitContext) -> None:
+    _source_index_snapshot(context)
+    _reject_source_head_gitlinks(context)
     if _source_status(context):
         raise ReviewError(
             "source repository has staged, unstaged, or nonignored untracked "
             "changes; commit or clean them, or explicitly use --include-source-wip"
         )
-
-
-def _parse_wip_status(status_bytes: bytes) -> None:
-    for record in status_bytes.split(b"\0"):
-        if not record:
-            continue
-        if record.startswith(b"u "):
-            raise ReviewError("source WIP contains unresolved merge conflicts")
-        if record.startswith((b"1 ", b"2 ")):
-            fields = record.split(b" ", 3)
-            if len(fields) < 3:
-                raise ReviewError("source WIP status metadata is malformed")
-            if fields[2].startswith(b"S"):
-                raise ReviewError(
-                    "source WIP contains a changed or dirty submodule, which is not supported"
-                )
 
 
 def _parse_wip_path(raw_path: bytes) -> pathlib.PurePosixPath:
@@ -14467,17 +14585,6 @@ def _parse_wip_path(raw_path: bytes) -> pathlib.PurePosixPath:
     if relative.parts[0].casefold() in {".codex-review", ".codex-tmp"}:
         raise ReviewError(f"reserved helper path in source WIP: {display}")
     return relative
-
-
-def _nul_path_set(value: bytes, *, label: str) -> set[pathlib.PurePosixPath]:
-    if len(value) > MAX_CHANGED_METADATA_BYTES:
-        raise ReviewError(f"{label} exceeds the review metadata limit")
-    records = value.split(b"\0")
-    if records[-1:] != [b""]:
-        raise ReviewError(f"unterminated record from {label}")
-    if len(records) - 1 > MAX_CHANGED_ENTRIES:
-        raise ReviewError(f"{label} exceeds the review entry-count limit")
-    return {_parse_wip_path(record) for record in records[:-1]}
 
 
 def _porcelain_v2_groups(value: bytes) -> list[tuple[bytes, ...]]:
@@ -14501,72 +14608,226 @@ def _porcelain_v2_groups(value: bytes) -> list[tuple[bytes, ...]]:
     return groups
 
 
-def _initial_untracked_wip_paths(
-    initial_status: bytes,
-) -> set[pathlib.PurePosixPath]:
-    paths: set[pathlib.PurePosixPath] = set()
-    for group in _porcelain_v2_groups(initial_status):
-        if group[0].startswith(b"? "):
-            raw_path = group[0][2:]
+def _source_wip_status_paths(
+    status_bytes: bytes,
+) -> tuple[
+    set[pathlib.PurePosixPath],
+    set[pathlib.PurePosixPath],
+    set[pathlib.PurePosixPath],
+    set[pathlib.PurePosixPath],
+    set[pathlib.PurePosixPath],
+]:
+    staged_paths: set[pathlib.PurePosixPath] = set()
+    staged_deleted_paths: set[pathlib.PurePosixPath] = set()
+    unstaged_paths: set[pathlib.PurePosixPath] = set()
+    unstaged_deleted_paths: set[pathlib.PurePosixPath] = set()
+    untracked_paths: set[pathlib.PurePosixPath] = set()
+
+    def add_status_path(
+        status: int,
+        *,
+        current: pathlib.PurePosixPath,
+        original: pathlib.PurePosixPath | None,
+        changed: set[pathlib.PurePosixPath],
+        deleted: set[pathlib.PurePosixPath],
+    ) -> None:
+        if status == ord("."):
+            return
+        if status not in b"MTADRC":
+            raise ReviewError("source WIP status metadata is malformed")
+        changed.add(current)
+        if status in b"RC":
+            if original is None:
+                raise ReviewError("source WIP rename status metadata is malformed")
+            changed.add(original)
+        elif status == ord("D"):
+            deleted.add(current)
+
+    for group in _porcelain_v2_groups(status_bytes):
+        record = group[0]
+        if record.startswith(b"u "):
+            raise ReviewError("source WIP contains unresolved merge conflicts")
+        if record.startswith(b"? "):
+            if len(group) != 1:
+                raise ReviewError("source WIP status metadata is malformed")
+            raw_path = record[2:]
             if raw_path.endswith(b"/"):
                 raise ReviewError(
                     "source WIP contains an unexpanded untracked directory; "
                     "nested repositories are not supported"
                 )
-            paths.add(_parse_wip_path(raw_path))
-    return paths
+            untracked_paths.add(_parse_wip_path(raw_path))
+            continue
+        if record.startswith(b"1 "):
+            if len(group) != 1:
+                raise ReviewError("source WIP status metadata is malformed")
+            fields = record.split(b" ", 8)
+            if len(fields) != 9:
+                raise ReviewError("source WIP status metadata is malformed")
+            raw_path = fields[8]
+            raw_original = None
+        elif record.startswith(b"2 "):
+            if len(group) != 2:
+                raise ReviewError("source WIP rename status metadata is malformed")
+            fields = record.split(b" ", 9)
+            if len(fields) != 10:
+                raise ReviewError("source WIP rename status metadata is malformed")
+            raw_path = fields[9]
+            raw_original = group[1]
+        else:
+            raise ReviewError("source WIP status metadata is malformed")
+        xy = fields[1]
+        if len(xy) != 2 or fields[2].startswith(b"S"):
+            if fields[2].startswith(b"S"):
+                raise ReviewError(
+                    "source WIP contains a changed or dirty submodule, which is not supported"
+                )
+            raise ReviewError("source WIP status metadata is malformed")
+        current = _parse_wip_path(raw_path)
+        original = None if raw_original is None else _parse_wip_path(raw_original)
+        add_status_path(
+            xy[0],
+            current=current,
+            original=original,
+            changed=staged_paths,
+            deleted=staged_deleted_paths,
+        )
+        add_status_path(
+            xy[1],
+            current=current,
+            original=original,
+            changed=unstaged_paths,
+            deleted=unstaged_deleted_paths,
+        )
+    return (
+        staged_paths,
+        staged_deleted_paths,
+        unstaged_paths,
+        unstaged_deleted_paths,
+        untracked_paths,
+    )
+
+
+def _source_final_worktree_paths(
+    context: SourceInspectionGitContext,
+    *,
+    capture_budget: SourceWipCaptureBudget | None = None,
+) -> tuple[set[pathlib.PurePosixPath], set[pathlib.PurePosixPath]]:
+    label = "source WIP tracked paths"
+    value = _bounded_source_git_output(
+        context,
+        "diff",
+        "--name-status",
+        "-z",
+        "--no-renames",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--ignore-submodules=none",
+        context.head_sha,
+        "--",
+        byte_limit=MAX_SOURCE_TRACKED_PATH_BYTES,
+        record_limit=2 * MAX_SOURCE_TRACKED_PATH_RECORDS,
+        label=label,
+        capture_budget=capture_budget,
+    )
+
+    def next_record(cursor: int) -> tuple[bytes, int]:
+        search_start = cursor
+        while search_start < len(value):
+            if capture_budget is not None:
+                capture_budget.remaining_seconds()
+            search_end = min(
+                len(value),
+                search_start + SOURCE_WIP_PARSE_DEADLINE_CHECK_BYTES,
+            )
+            separator = value.find(b"\0", search_start, search_end)
+            if separator >= 0:
+                return value[cursor:separator], separator + 1
+            search_start = search_end
+        raise ReviewError("source WIP tracked path metadata is malformed")
+
+    paths: set[pathlib.PurePosixPath] = set()
+    deleted_paths: set[pathlib.PurePosixPath] = set()
+    cursor = 0
+    while cursor < len(value):
+        raw_status, cursor = next_record(cursor)
+        raw_path, cursor = next_record(cursor)
+        if raw_status not in {b"A", b"D", b"M", b"T", b"U", b"X", b"B"}:
+            raise ReviewError("source WIP tracked path metadata is malformed")
+        relative = _parse_wip_path(raw_path)
+        paths.add(relative)
+        if len(paths) > MAX_CHANGED_ENTRIES:
+            raise ReviewError(
+                "source WIP tracked paths exceeds the review entry-count limit"
+            )
+        if raw_status == b"D":
+            deleted_paths.add(relative)
+    if capture_budget is not None:
+        capture_budget.remaining_seconds()
+    return paths, deleted_paths
 
 
 def _source_wip_paths(
     context: SourceInspectionGitContext,
     initial_status: bytes,
-) -> tuple[set[pathlib.PurePosixPath], set[pathlib.PurePosixPath]]:
-    _reject_hidden_index_entries(context)
-    _reject_source_head_gitlinks(context)
-    tracked = _bounded_source_git_output(
+    *,
+    capture_budget: SourceWipCaptureBudget | None = None,
+) -> tuple[
+    set[pathlib.PurePosixPath],
+    set[pathlib.PurePosixPath],
+    set[pathlib.PurePosixPath],
+]:
+    (
+        staged_paths,
+        staged_deleted_paths,
+        unstaged_paths,
+        unstaged_deleted_paths,
+        untracked_paths,
+    ) = _source_wip_status_paths(initial_status)
+    (
+        final_worktree_paths,
+        final_worktree_deleted_paths,
+    ) = _source_final_worktree_paths(
         context,
-        "diff",
-        "--name-only",
-        "-z",
-        "--no-renames",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--ignore-submodules=none",
-        context.head_sha,
-        "--",
-        byte_limit=MAX_SOURCE_TRACKED_PATH_BYTES,
-        record_limit=MAX_SOURCE_TRACKED_PATH_RECORDS,
-        label="source WIP tracked paths",
+        capture_budget=capture_budget,
     )
-    tracked_paths = _nul_path_set(tracked, label="source WIP tracked paths")
-    deleted = _bounded_source_git_output(
-        context,
-        "diff",
-        "--name-only",
-        "-z",
-        "--no-renames",
-        "--diff-filter=D",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--ignore-submodules=none",
-        context.head_sha,
-        "--",
-        byte_limit=MAX_SOURCE_TRACKED_PATH_BYTES,
-        record_limit=MAX_SOURCE_TRACKED_PATH_RECORDS,
-        label="source WIP deleted tracked paths",
-    )
-    deleted_paths = _nul_path_set(
-        deleted,
-        label="source WIP deleted tracked paths",
-    )
-    if not deleted_paths.issubset(tracked_paths):
+    if capture_budget is not None:
+        capture_budget.remaining_seconds()
+    if not final_worktree_deleted_paths.issubset(final_worktree_paths):
         raise ReviewError("source WIP tracked path metadata is inconsistent")
-    untracked_paths = _initial_untracked_wip_paths(initial_status)
-    paths = tracked_paths | untracked_paths
+    if not staged_deleted_paths.issubset(staged_paths):
+        raise ReviewError("source WIP staged path metadata is inconsistent")
+    if not unstaged_deleted_paths.issubset(unstaged_paths):
+        raise ReviewError("source WIP unstaged path metadata is inconsistent")
+    deleted_status_paths = staged_deleted_paths | unstaged_deleted_paths
+    if capture_budget is not None:
+        capture_budget.remaining_seconds()
+    if not final_worktree_deleted_paths.issubset(deleted_status_paths):
+        raise ReviewError("source WIP deleted path metadata is inconsistent")
+    status_changed_paths = staged_paths | unstaged_paths
+    if capture_budget is not None:
+        capture_budget.remaining_seconds()
+    final_changed_paths = staged_paths | final_worktree_paths
+    if capture_budget is not None:
+        capture_budget.remaining_seconds()
+    if status_changed_paths != final_changed_paths:
+        raise ReviewError(
+            "source WIP staged and unstaged path metadata is inconsistent"
+        )
+    paths = status_changed_paths | untracked_paths
+    if capture_budget is not None:
+        capture_budget.remaining_seconds()
     if len(paths) > MAX_CHANGED_ENTRIES:
         raise ReviewError("source WIP exceeds the review entry-count limit")
-    capture_paths = (tracked_paths - deleted_paths) | untracked_paths
-    return paths, capture_paths
+    worktree_capture_paths = (
+        final_worktree_paths - final_worktree_deleted_paths
+    ) | untracked_paths
+    if capture_budget is not None:
+        capture_budget.remaining_seconds()
+    index_capture_paths = staged_paths - staged_deleted_paths - final_worktree_paths
+    if capture_budget is not None:
+        capture_budget.remaining_seconds()
+    return paths, worktree_capture_paths, index_capture_paths
 
 
 def _read_wip_entry(
@@ -14575,7 +14836,10 @@ def _read_wip_entry(
     relative: pathlib.PurePosixPath,
     remaining_bytes: int,
     expected_materialized_mode: str | None = None,
+    regular_mode_override: str | None = None,
 ) -> tuple[str, bytes] | None:
+    if regular_mode_override not in {None, "100644", "100755"}:
+        raise ValueError("source WIP regular mode override is invalid")
     display = _redact_secret_path(relative.as_posix(), "source WIP path")
     directory_flags = (
         os.O_RDONLY
@@ -14702,7 +14966,10 @@ def _read_wip_entry(
         or _wip_stat_identity(initial) != _wip_stat_identity(final_path)
     ):
         raise ReviewError(f"source WIP file changed while copied: {display}")
-    return ("100755" if initial.st_mode & stat.S_IXUSR else "100644"), data
+    mode = regular_mode_override or (
+        "100755" if initial.st_mode & stat.S_IXUSR else "100644"
+    )
+    return mode, data
 
 
 def _wip_stat_identity(
@@ -14722,18 +14989,155 @@ def _capture_source_wip_entries(
     *,
     source_root: pathlib.Path,
     paths: set[pathlib.PurePosixPath],
+    regular_mode_overrides: Mapping[pathlib.PurePosixPath, str] | None = None,
+    capture_budget: SourceWipCaptureBudget | None = None,
 ) -> dict[pathlib.PurePosixPath, tuple[str, bytes]]:
+    selected_mode_overrides = (
+        {} if regular_mode_overrides is None else regular_mode_overrides
+    )
+    if not set(selected_mode_overrides).issubset(paths):
+        raise ValueError("source WIP regular mode override paths are inconsistent")
     entries: dict[pathlib.PurePosixPath, tuple[str, bytes]] = {}
     remaining_bytes = MAX_SNAPSHOT_BYTES
     for relative in sorted(paths, key=lambda item: item.as_posix()):
+        if capture_budget is not None:
+            capture_budget.remaining_seconds()
         entry = _read_wip_entry(
             source_root=source_root,
             relative=relative,
             remaining_bytes=remaining_bytes,
+            regular_mode_override=selected_mode_overrides.get(relative),
         )
-        if entry is not None:
-            entries[relative] = entry
-            remaining_bytes -= len(entry[1])
+        if entry is None:
+            raise ReviewError(
+                "source WIP planned worktree path is missing during capture"
+            )
+        entries[relative] = entry
+        remaining_bytes -= len(entry[1])
+    if entries.keys() != paths:
+        raise ReviewError("source WIP worktree capture is incomplete")
+    return entries
+
+
+def _source_index_wip_metadata(
+    *,
+    index_snapshot: Mapping[bytes, tuple[str, str]],
+    paths: set[pathlib.PurePosixPath],
+    required_paths: set[pathlib.PurePosixPath],
+) -> dict[pathlib.PurePosixPath, tuple[str, str]]:
+    if not required_paths.issubset(paths):
+        raise ValueError("source WIP required index paths are inconsistent")
+    selected_raw_paths = {
+        os.fsencode(relative.as_posix()): relative for relative in paths
+    }
+    if len(selected_raw_paths) != len(paths):
+        raise ReviewError("source WIP staged index path encoding is ambiguous")
+    metadata_by_path = {
+        relative: index_snapshot[raw_path]
+        for raw_path, relative in selected_raw_paths.items()
+        if raw_path in index_snapshot
+    }
+    if not required_paths.issubset(metadata_by_path):
+        raise ReviewError("source WIP staged index metadata is incomplete")
+    return metadata_by_path
+
+
+def _source_wip_regular_mode_overrides(
+    *,
+    context: SourceInspectionGitContext,
+    metadata_by_path: Mapping[pathlib.PurePosixPath, tuple[str, str]],
+) -> dict[pathlib.PurePosixPath, str]:
+    if context.file_mode:
+        return {}
+    return {
+        relative: mode
+        for relative, (mode, _object_id) in metadata_by_path.items()
+        if mode in {"100644", "100755"}
+    }
+
+
+def _capture_source_index_wip_entries(
+    *,
+    context: SourceInspectionGitContext,
+    metadata_by_path: Mapping[pathlib.PurePosixPath, tuple[str, str]],
+    remaining_bytes: int,
+    capture_budget: SourceWipCaptureBudget,
+) -> dict[pathlib.PurePosixPath, tuple[str, bytes]]:
+    if not 0 <= remaining_bytes <= MAX_SNAPSHOT_BYTES:
+        raise ValueError("source WIP staged blob budget is invalid")
+    if not metadata_by_path:
+        return {}
+    sorted_metadata = sorted(
+        metadata_by_path.items(),
+        key=lambda item: item[0].as_posix(),
+    )
+    with (
+        _temporary_review_file() as batch_input,
+        _temporary_review_file() as batch_output,
+    ):
+        for _relative, (_mode, object_id) in sorted_metadata:
+            batch_input.write(object_id.encode("ascii") + b"\n")
+        batch_input.seek(0)
+        _run_bounded_process_to_file(
+            _frozen_command(
+                git_view=context.git_dir,
+                args=("cat-file", "--batch"),
+            ),
+            environment=_git_environment(
+                object_directory=context.object_directory,
+            ),
+            input_handle=batch_input,
+            destination=batch_output,
+            label="source WIP staged blobs",
+            byte_limit=remaining_bytes + MAX_SOURCE_INDEX_METADATA_BYTES,
+            timeout_seconds=capture_budget.claim_git_invocation(),
+            timeout_label="source Git",
+        )
+        batch_output.seek(0)
+        entries: dict[pathlib.PurePosixPath, tuple[str, bytes]] = {}
+        for relative, (mode, object_id) in sorted_metadata:
+            header = batch_output.readline()
+            fields = header.rstrip(b"\n").split(b" ")
+            if len(fields) != 3:
+                raise ReviewError("source WIP staged blob header is malformed")
+            raw_actual_object, object_type, raw_size = fields
+            if raw_actual_object != object_id.encode("ascii") or object_type != b"blob":
+                raise ReviewError("source WIP staged blob metadata is inconsistent")
+            try:
+                size = int(raw_size)
+            except ValueError as error:
+                raise ReviewError("source WIP staged blob size is malformed") from error
+            display = _redact_secret_path(relative.as_posix(), "source WIP path")
+            if size < 0 or size > remaining_bytes:
+                raise ReviewError(
+                    f"source WIP staged blob exceeds the review snapshot limit: {display}"
+                )
+            if mode == "120000":
+                if size > 16 * 1024:
+                    raise ReviewError(
+                        f"oversized symlink target in source WIP: {display}"
+                    )
+            elif size > MAX_SNAPSHOT_BLOB_BYTES:
+                raise ReviewError(
+                    f"source WIP file exceeds the review snapshot limit: {display}"
+                )
+            data = _read_exact(batch_output, size)
+            if batch_output.read(1) != b"\n":
+                raise ReviewError("missing delimiter after source WIP staged blob")
+            if mode == "120000":
+                if b"\0" in data:
+                    raise ReviewError(f"NUL in source WIP symlink target: {display}")
+                target = os.fsdecode(data)
+                if not symlink_target_stays_within_workspace(relative, target):
+                    raise ReviewError(
+                        f"source WIP symlink escapes review workspace: {display}"
+                    )
+            entries[relative] = (mode, data)
+            remaining_bytes -= size
+        if batch_output.read(1):
+            raise ReviewError(
+                "source WIP staged blobs contain unexpected trailing data"
+            )
     return entries
 
 
@@ -14741,11 +15145,17 @@ def _import_source_wip_blobs(
     *,
     workspace_root: pathlib.Path,
     entries: dict[pathlib.PurePosixPath, tuple[str, bytes]],
+    capture_budget: SourceWipCaptureBudget | None = None,
 ) -> tuple[str, dict[pathlib.PurePosixPath, str]]:
     """Import captured WIP blobs with one bounded Git process."""
 
     object_format = (
-        _run_worktree_git(workspace_root, "rev-parse", "--show-object-format")
+        _run_worktree_git(
+            workspace_root,
+            "rev-parse",
+            "--show-object-format",
+            capture_budget=capture_budget,
+        )
         .stdout.decode("ascii")
         .strip()
     )
@@ -14782,6 +15192,7 @@ def _import_source_wip_blobs(
             input_handle=stream,
             byte_limit=len(sorted_entries) * (object_id_length + 1),
             record_limit=len(sorted_entries),
+            capture_budget=capture_budget,
         )
     output = completed.stdout
     if not output.endswith(b"\n"):
@@ -14816,6 +15227,7 @@ def _apply_source_wip_index_overlay(
     entries: dict[pathlib.PurePosixPath, tuple[str, bytes]],
     object_format: str,
     object_ids: dict[pathlib.PurePosixPath, str],
+    capture_budget: SourceWipCaptureBudget,
 ) -> None:
     """Apply all WIP removals and additions with one NUL-delimited index update."""
 
@@ -14851,6 +15263,7 @@ def _apply_source_wip_index_overlay(
             "-z",
             "--index-info",
             input_handle=index_info,
+            capture_budget=capture_budget,
         )
 
 
@@ -14862,12 +15275,17 @@ def _overlay_source_wip(
     head_sha: str,
     initial_status: bytes,
     paths: set[pathlib.PurePosixPath],
-    capture_paths: set[pathlib.PurePosixPath],
+    worktree_capture_paths: set[pathlib.PurePosixPath],
+    index_capture_paths: set[pathlib.PurePosixPath],
     entries: dict[pathlib.PurePosixPath, tuple[str, bytes]],
+    initial_index_snapshot: Mapping[bytes, tuple[str, str]],
+    capture_budget: SourceWipCaptureBudget,
 ) -> str:
+    capture_budget.remaining_seconds()
     object_format, object_ids = _import_source_wip_blobs(
         workspace_root=workspace_root,
         entries=entries,
+        capture_budget=capture_budget,
     )
     _apply_source_wip_index_overlay(
         workspace_root=workspace_root,
@@ -14875,33 +15293,102 @@ def _overlay_source_wip(
         entries=entries,
         object_format=object_format,
         object_ids=object_ids,
+        capture_budget=capture_budget,
     )
     snapshot_tree_sha = (
         _run_worktree_git(
             workspace_root,
             "write-tree",
+            capture_budget=capture_budget,
         )
         .stdout.decode("ascii")
         .strip()
     )
-    if resolve_commit(source_root, "HEAD", label="source WIP HEAD") != head_sha:
-        raise ReviewError("source HEAD changed while the WIP snapshot was prepared")
-    recheck_remaining_bytes = MAX_SNAPSHOT_BYTES
-    for relative in sorted(capture_paths, key=lambda item: item.as_posix()):
-        rechecked = _read_wip_entry(
-            source_root=source_root,
-            relative=relative,
-            remaining_bytes=recheck_remaining_bytes,
+    if (
+        resolve_commit(
+            source_root,
+            "HEAD",
+            label="source WIP HEAD",
+            capture_budget=capture_budget,
         )
-        if rechecked != entries.get(relative):
-            raise ReviewError(
-                "source WIP content changed while the private snapshot was prepared"
-            )
-        if rechecked is not None:
-            recheck_remaining_bytes -= len(rechecked[1])
-    final_status = _source_status(source_inspection)
+        != head_sha
+    ):
+        raise ReviewError("source HEAD changed while the WIP snapshot was prepared")
+    rechecked_index_snapshot = _source_index_snapshot(
+        source_inspection,
+        capture_budget=capture_budget,
+    )
+    if rechecked_index_snapshot != initial_index_snapshot:
+        raise ReviewError(
+            "source WIP index changed while the private snapshot was prepared"
+        )
+    rechecked_index_metadata = _source_index_wip_metadata(
+        index_snapshot=rechecked_index_snapshot,
+        paths=worktree_capture_paths | index_capture_paths,
+        required_paths=index_capture_paths,
+    )
+    rechecked_worktree_metadata = {
+        relative: rechecked_index_metadata[relative]
+        for relative in worktree_capture_paths
+        if relative in rechecked_index_metadata
+    }
+    rechecked_worktree_entries = _capture_source_wip_entries(
+        source_root=source_root,
+        paths=worktree_capture_paths,
+        regular_mode_overrides=_source_wip_regular_mode_overrides(
+            context=source_inspection,
+            metadata_by_path=rechecked_worktree_metadata,
+        ),
+        capture_budget=capture_budget,
+    )
+    if not worktree_capture_paths.issubset(entries):
+        raise ReviewError("source WIP initial worktree capture is incomplete")
+    expected_worktree_entries = {
+        relative: entries[relative] for relative in worktree_capture_paths
+    }
+    if rechecked_worktree_entries != expected_worktree_entries:
+        raise ReviewError(
+            "source WIP content changed while the private snapshot was prepared"
+        )
+    rechecked_index_entries = _capture_source_index_wip_entries(
+        context=source_inspection,
+        metadata_by_path={
+            relative: rechecked_index_metadata[relative]
+            for relative in index_capture_paths
+        },
+        remaining_bytes=MAX_SNAPSHOT_BYTES
+        - sum(len(entry[1]) for entry in rechecked_worktree_entries.values()),
+        capture_budget=capture_budget,
+    )
+    if not index_capture_paths.issubset(entries):
+        raise ReviewError("source WIP initial staged capture is incomplete")
+    expected_index_entries = {
+        relative: entries[relative] for relative in index_capture_paths
+    }
+    if rechecked_index_entries != expected_index_entries:
+        raise ReviewError(
+            "source WIP staged content changed while the private snapshot was prepared"
+        )
+    final_status = _source_status(
+        source_inspection,
+        capture_budget=capture_budget,
+    )
     if final_status != initial_status:
         raise ReviewError("source WIP changed while the review snapshot was prepared")
+    final_path_plan = _source_wip_paths(
+        source_inspection,
+        final_status,
+        capture_budget=capture_budget,
+    )
+    if final_path_plan != (
+        paths,
+        worktree_capture_paths,
+        index_capture_paths,
+    ):
+        raise ReviewError(
+            "source WIP path selection changed while the review snapshot was prepared"
+        )
+    capture_budget.remaining_seconds()
     return snapshot_tree_sha
 
 
@@ -15275,28 +15762,103 @@ def prepare_workspace(
                 raise ReviewError(
                     "--include-source-wip requires --head-ref to resolve to source HEAD"
                 )
-            source_status = _source_status(source_inspection)
-            _parse_wip_status(source_status)
-            source_wip_paths, source_wip_capture_paths = _source_wip_paths(
+            source_wip_capture_budget = _new_source_wip_capture_budget()
+            source_wip_index_snapshot = _source_index_snapshot(
+                source_inspection,
+                capture_budget=source_wip_capture_budget,
+            )
+            _reject_source_head_gitlinks(
+                source_inspection,
+                capture_budget=source_wip_capture_budget,
+            )
+            source_status = _source_status(
+                source_inspection,
+                capture_budget=source_wip_capture_budget,
+            )
+            (
+                source_wip_paths,
+                source_wip_worktree_capture_paths,
+                source_wip_index_capture_paths,
+            ) = _source_wip_paths(
                 source_inspection,
                 source_status,
+                capture_budget=source_wip_capture_budget,
             )
-            source_wip_entries = _capture_source_wip_entries(
+            if source_wip_worktree_capture_paths & source_wip_index_capture_paths:
+                raise ReviewError("source WIP capture path metadata is inconsistent")
+            source_wip_index_metadata = _source_index_wip_metadata(
+                index_snapshot=source_wip_index_snapshot,
+                paths=(
+                    source_wip_worktree_capture_paths | source_wip_index_capture_paths
+                ),
+                required_paths=source_wip_index_capture_paths,
+            )
+            source_wip_worktree_metadata = {
+                relative: source_wip_index_metadata[relative]
+                for relative in source_wip_worktree_capture_paths
+                if relative in source_wip_index_metadata
+            }
+            source_wip_worktree_entries = _capture_source_wip_entries(
                 source_root=source_root,
-                paths=source_wip_capture_paths,
+                paths=source_wip_worktree_capture_paths,
+                regular_mode_overrides=_source_wip_regular_mode_overrides(
+                    context=source_inspection,
+                    metadata_by_path=source_wip_worktree_metadata,
+                ),
+                capture_budget=source_wip_capture_budget,
             )
-            if resolve_commit(source_root, "HEAD", label="source WIP HEAD") != head_sha:
+            source_wip_index_entries = _capture_source_index_wip_entries(
+                context=source_inspection,
+                metadata_by_path={
+                    relative: source_wip_index_metadata[relative]
+                    for relative in source_wip_index_capture_paths
+                },
+                remaining_bytes=MAX_SNAPSHOT_BYTES
+                - sum(len(entry[1]) for entry in source_wip_worktree_entries.values()),
+                capture_budget=source_wip_capture_budget,
+            )
+            source_wip_entries = {
+                **source_wip_index_entries,
+                **source_wip_worktree_entries,
+            }
+            if (
+                sum(len(entry[1]) for entry in source_wip_entries.values())
+                > MAX_SNAPSHOT_BYTES
+            ):
+                raise ReviewError("source WIP exceeds the total review snapshot limit")
+            if source_wip_entries.keys() != (
+                source_wip_worktree_capture_paths | source_wip_index_capture_paths
+            ):
+                raise ReviewError("source WIP initial capture is incomplete")
+            if (
+                resolve_commit(
+                    source_root,
+                    "HEAD",
+                    label="source WIP HEAD",
+                    capture_budget=source_wip_capture_budget,
+                )
+                != head_sha
+            ):
                 raise ReviewError(
                     "source HEAD changed while the WIP snapshot was captured"
                 )
-            if _source_status(source_inspection) != source_status:
+            if (
+                _source_status(
+                    source_inspection,
+                    capture_budget=source_wip_capture_budget,
+                )
+                != source_status
+            ):
                 raise ReviewError("source WIP changed while its content was captured")
         else:
             _require_clean_source(source_inspection)
             source_status = b""
             source_wip_paths = set()
-            source_wip_capture_paths = set()
+            source_wip_worktree_capture_paths = set()
+            source_wip_index_capture_paths = set()
             source_wip_entries = {}
+            source_wip_index_snapshot = {}
+            source_wip_capture_budget = None
         catalog = load_catalog()
         validate_authoring_catalog_scanner_contract(catalog)
         # Keep validating the deprecated option for typo detection, but every
@@ -15439,8 +16001,11 @@ def prepare_workspace(
                 head_sha=head_sha,
                 initial_status=source_status,
                 paths=source_wip_paths,
-                capture_paths=source_wip_capture_paths,
+                worktree_capture_paths=source_wip_worktree_capture_paths,
+                index_capture_paths=source_wip_index_capture_paths,
                 entries=source_wip_entries,
+                initial_index_snapshot=source_wip_index_snapshot,
+                capture_budget=source_wip_capture_budget,
             )
             content_variant = "source-wip"
         else:

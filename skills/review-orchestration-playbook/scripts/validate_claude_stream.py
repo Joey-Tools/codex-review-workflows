@@ -52,6 +52,10 @@ LAUNCH_PROFILES = {
         "tools": frozenset(("Read", "Grep", "Glob")),
     },
 }
+TRUST_SOURCE_LAUNCH_PROFILES = {
+    "named-parent-private-preflight": frozenset(("named-direct",)),
+    "low-level-helper": frozenset(("helper-linux", "helper-darwin")),
+}
 EMPTY_INIT_SURFACES = ("mcp_servers", "slash_commands", "skills", "plugins")
 CLAUDE_AUTH_ENV_NAME = "ANTHROPIC_API_KEY"
 AUTHENTICATION_SOURCE_TO_API_KEY_SOURCE = {
@@ -276,6 +280,61 @@ ASSISTANT_CONTENT_BLOCK_FIELDS = {
     "thinking": frozenset(("type", "signature", "thinking")),
     "text": frozenset(("type", "text")),
     "tool_use": frozenset(("type", "caller", "id", "input", "name")),
+}
+TOOL_PATH_OUTSIDE_WORKSPACE_REASON = "intermediate.tool-path.outside-workspace"
+TOOL_PATH_SCOPE_UNVERIFIED_REASON = "intermediate.tool-path.scope-unverified"
+MAX_STRUCTURED_GLOB_PATTERN_CHARACTERS = 4096
+MAX_STRUCTURED_GLOB_ALTERNATIVES = 64
+MAX_STRUCTURED_GLOB_SCAN_ENTRIES = 32_768
+MAX_STRUCTURED_GLOB_SCAN_STATES = 32_768
+MAX_STRUCTURED_GLOB_SCAN_DEPTH = 64
+STRUCTURED_GLOB_EXTGLOB_TOKENS = ("@(", "!(", "+(", "?(", "*(")
+STRUCTURED_TOOL_PATH_SCOPE_CONTRACT = {
+    "source": "assistant.tool_use.input",
+    "launch_profiles": ("named-direct",),
+    "workspace_root": "exact_resolved_expected_cwd",
+    "tools": {
+        "Read": {
+            "path_field": "file_path",
+            "path_required": True,
+            "path_if_present": "absolute",
+        },
+        "Grep": {
+            "path_field": "path",
+            "path_required": False,
+            "path_if_present": "absolute",
+        },
+        "Glob": {
+            "path_field": "path",
+            "path_required": False,
+            "path_if_present": "absolute",
+            "missing_path_base": "expected_cwd",
+            "pattern_field": "pattern",
+            "pattern_required": True,
+            "pattern_contract": "bounded_safe_relative_glob",
+            "leading_prefix_normalization": "./",
+            "extglob": "scope_unverified",
+            "dynamic_directory_containment": "bounded_overapprox_scan",
+        },
+    },
+    "glob_scan_limits": {
+        "entries": MAX_STRUCTURED_GLOB_SCAN_ENTRIES,
+        "states": MAX_STRUCTURED_GLOB_SCAN_STATES,
+        "depth": MAX_STRUCTURED_GLOB_SCAN_DEPTH,
+    },
+    "containment": ("lexical", "resolved_with_symlinks"),
+    "outside": {
+        "classification": "blocked",
+        "reason": TOOL_PATH_OUTSIDE_WORKSPACE_REASON,
+    },
+    "unverified": {
+        "classification": "inconclusive",
+        "reason": TOOL_PATH_SCOPE_UNVERIFIED_REASON,
+    },
+    "excluded_surfaces": (
+        "user.tool_use_result.persistedOutputPath",
+        "Bash.command",
+    ),
 }
 USER_EVENT_FIELDS = frozenset(
     (
@@ -1207,8 +1266,8 @@ def _runtime_binding_is_valid(
     return (
         runtime_binding.api_key_source in {"none", "ANTHROPIC_API_KEY"}
         and runtime_binding.launch_profile in LAUNCH_PROFILES
-        and runtime_binding.trust_source
-        in {"low-level-helper", "named-parent-private-preflight"}
+        and runtime_binding.launch_profile
+        in TRUST_SOURCE_LAUNCH_PROFILES.get(runtime_binding.trust_source, frozenset())
         and type(runtime_binding.publisher_checksum) is str
         and _SHA256.fullmatch(runtime_binding.publisher_checksum) is not None
         and type(runtime_binding.artifact_size) is int
@@ -1809,10 +1868,358 @@ def _validate_thinking_tokens_event(
     )
 
 
+def _filesystem_identity(value: os.stat_result) -> tuple[int, int, int]:
+    return (value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode))
+
+
+@dataclass
+class _WorkspaceScopeBinding:
+    expected_cwd: Path
+    descriptor: int
+    identity: tuple[int, int, int]
+    closed: bool = False
+    glob_scan_entries: int = 0
+    glob_scan_states: int = 0
+
+
+def _open_bound_workspace(expected_cwd: Path) -> _WorkspaceScopeBinding:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(expected_cwd, flags)
+        opened = os.fstat(descriptor)
+        named = os.stat(expected_cwd, follow_symlinks=False)
+        identity = _filesystem_identity(opened)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(named.st_mode)
+            or identity != _filesystem_identity(named)
+        ):
+            raise OSError("review workspace identity does not match")
+        return _WorkspaceScopeBinding(expected_cwd, descriptor, identity)
+    except Exception:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+
+
+def _workspace_binding_matches(binding: _WorkspaceScopeBinding) -> bool:
+    if binding.closed:
+        return False
+    try:
+        opened = os.fstat(binding.descriptor)
+        named = os.stat(binding.expected_cwd, follow_symlinks=False)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(opened.st_mode)
+        and stat.S_ISDIR(named.st_mode)
+        and _filesystem_identity(opened) == binding.identity
+        and _filesystem_identity(named) == binding.identity
+    )
+
+
+def _close_bound_workspace(binding: _WorkspaceScopeBinding) -> bool:
+    if binding.closed:
+        return True
+    try:
+        os.close(binding.descriptor)
+    except OSError:
+        return False
+    finally:
+        binding.closed = True
+    return True
+
+
+def _path_is_within_workspace(path: Path, expected_cwd: Path) -> bool:
+    return path == expected_cwd or path.is_relative_to(expected_cwd)
+
+
+def _candidate_path_scope(
+    candidate: Path,
+    binding: _WorkspaceScopeBinding,
+) -> tuple[str, Path | None]:
+    try:
+        lexical_path = Path(os.path.abspath(os.fspath(candidate)))
+        if not _path_is_within_workspace(lexical_path, binding.expected_cwd):
+            return "outside", None
+        resolved_path = candidate.resolve(strict=False)
+        if not _path_is_within_workspace(resolved_path, binding.expected_cwd):
+            return "outside", None
+        return "inside", resolved_path
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return "unverified", None
+
+
+def _record_structured_scope(scope: str, evidence: _Evidence) -> None:
+    if scope == "outside":
+        evidence.blocked.add(TOOL_PATH_OUTSIDE_WORKSPACE_REASON)
+    elif scope != "inside":
+        evidence.inconclusive.add(TOOL_PATH_SCOPE_UNVERIFIED_REASON)
+
+
+def _expand_bounded_glob_alternatives(pattern: str) -> list[str] | None:
+    alternatives = [pattern]
+    while True:
+        expanded: list[str] = []
+        changed = False
+        for alternative in alternatives:
+            opening = alternative.find("{")
+            closing = alternative.find("}")
+            if opening < 0 and closing < 0:
+                expanded.append(alternative)
+                continue
+            if opening < 0 or closing < 0 or closing < opening:
+                return None
+            body = alternative[opening + 1 : closing]
+            if "{" in body or "}" in body:
+                return None
+            branches = body.split(",")
+            if len(branches) < 2 or any(not branch for branch in branches):
+                return None
+            prefix = alternative[:opening]
+            suffix = alternative[closing + 1 :]
+            expanded.extend(prefix + branch + suffix for branch in branches)
+            changed = True
+            if len(expanded) > MAX_STRUCTURED_GLOB_ALTERNATIVES:
+                return None
+        alternatives = expanded
+        if len(alternatives) > MAX_STRUCTURED_GLOB_ALTERNATIVES:
+            return None
+        if not changed:
+            return alternatives
+
+
+def _glob_component_is_dynamic(component: str) -> bool:
+    return any(character in component for character in "*?[")
+
+
+def _bounded_glob_directory_scope(
+    components: tuple[str, ...],
+    *,
+    base: Path,
+    binding: _WorkspaceScopeBinding,
+) -> str:
+    pending = [(base, 0, 0)]
+    seen: set[tuple[Path, int]] = set()
+    while pending:
+        if binding.glob_scan_states >= MAX_STRUCTURED_GLOB_SCAN_STATES:
+            return "unverified"
+        binding.glob_scan_states += 1
+        current, component_index, depth = pending.pop()
+        scope, resolved_current = _candidate_path_scope(current, binding)
+        if scope != "inside" or resolved_current is None:
+            return scope
+        state = (resolved_current, component_index)
+        if state in seen:
+            continue
+        seen.add(state)
+        if component_index >= len(components):
+            continue
+
+        component = components[component_index]
+        if component != "**" and not _glob_component_is_dynamic(component):
+            candidate = resolved_current / component
+            candidate_scope, resolved_candidate = _candidate_path_scope(
+                candidate, binding
+            )
+            if candidate_scope != "inside" or resolved_candidate is None:
+                return candidate_scope
+            try:
+                candidate_stat = os.stat(candidate)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return "unverified"
+            if not stat.S_ISDIR(candidate_stat.st_mode):
+                continue
+            if depth >= MAX_STRUCTURED_GLOB_SCAN_DEPTH:
+                return "unverified"
+            pending.append((resolved_candidate, component_index + 1, depth + 1))
+            continue
+
+        if component == "**":
+            pending.append((resolved_current, component_index + 1, depth))
+            next_component_index = component_index
+        else:
+            next_component_index = component_index + 1
+        try:
+            with os.scandir(resolved_current) as entries:
+                for entry in entries:
+                    if binding.glob_scan_entries >= MAX_STRUCTURED_GLOB_SCAN_ENTRIES:
+                        return "unverified"
+                    binding.glob_scan_entries += 1
+                    entry_path = Path(entry.path)
+                    try:
+                        is_symlink = entry.is_symlink()
+                        if is_symlink:
+                            entry_scope, resolved_entry = _candidate_path_scope(
+                                entry_path, binding
+                            )
+                            if entry_scope != "inside" or resolved_entry is None:
+                                return entry_scope
+                            try:
+                                is_directory = stat.S_ISDIR(
+                                    os.stat(resolved_entry).st_mode
+                                )
+                            except FileNotFoundError:
+                                continue
+                        else:
+                            is_directory = entry.is_dir(follow_symlinks=False)
+                            resolved_entry = entry_path
+                    except OSError:
+                        return "unverified"
+                    if not is_directory:
+                        continue
+                    entry_scope, resolved_entry = _candidate_path_scope(
+                        resolved_entry, binding
+                    )
+                    if entry_scope != "inside" or resolved_entry is None:
+                        return entry_scope
+                    if depth >= MAX_STRUCTURED_GLOB_SCAN_DEPTH:
+                        return "unverified"
+                    pending.append((resolved_entry, next_component_index, depth + 1))
+        except OSError:
+            return "unverified"
+    return "inside"
+
+
+def _glob_pattern_branch_scope(
+    pattern: str,
+    *,
+    base: Path,
+    binding: _WorkspaceScopeBinding,
+) -> str:
+    while pattern.startswith("./"):
+        pattern = pattern[2:]
+    if not pattern:
+        return "unverified"
+    if pattern == "~" or pattern.startswith(("~/", "~\\")):
+        return "unverified"
+    first_component = pattern.split("/", 1)[0]
+    if first_component.startswith("~"):
+        return "unverified"
+
+    if (
+        "\\" in pattern
+        or any(character in pattern for character in "{}")
+        or any(token in pattern for token in STRUCTURED_GLOB_EXTGLOB_TOKENS)
+    ):
+        return "unverified"
+    raw_pattern = Path(pattern)
+    components = raw_pattern.parts
+    if raw_pattern.is_absolute() or ".." in components:
+        prefix_components: list[str] = []
+        for component in components:
+            if component == raw_pattern.anchor:
+                continue
+            if any(character in component for character in "*?[]()!+@"):
+                break
+            prefix_components.append(component)
+        candidate = (
+            Path(raw_pattern.anchor).joinpath(*prefix_components)
+            if raw_pattern.is_absolute()
+            else base.joinpath(*prefix_components)
+        )
+        scope, _ = _candidate_path_scope(candidate, binding)
+        return "outside" if scope == "outside" else "unverified"
+
+    components = tuple(pattern.split("/"))
+    if any(component in {"", ".", ".."} for component in components):
+        return "unverified"
+    directory_components = components if components[-1] == "**" else components[:-1]
+    scope = _bounded_glob_directory_scope(
+        directory_components,
+        base=base,
+        binding=binding,
+    )
+    if scope != "inside":
+        return scope
+    if components[-1] != "**" and not _glob_component_is_dynamic(components[-1]):
+        scope, _ = _candidate_path_scope(base.joinpath(*components), binding)
+    return scope
+
+
+def _audit_structured_glob_pattern(
+    tool_input: Mapping[str, Any],
+    *,
+    base: Path,
+    binding: _WorkspaceScopeBinding,
+    evidence: _Evidence,
+) -> None:
+    pattern = tool_input.get("pattern")
+    if (
+        type(pattern) is not str
+        or not pattern.strip()
+        or len(pattern) > MAX_STRUCTURED_GLOB_PATTERN_CHARACTERS
+        or "\x00" in pattern
+    ):
+        evidence.inconclusive.add(TOOL_PATH_SCOPE_UNVERIFIED_REASON)
+        return
+    alternatives = _expand_bounded_glob_alternatives(pattern)
+    if alternatives is None:
+        evidence.inconclusive.add(TOOL_PATH_SCOPE_UNVERIFIED_REASON)
+        return
+    for alternative in alternatives:
+        _record_structured_scope(
+            _glob_pattern_branch_scope(
+                alternative,
+                base=base,
+                binding=binding,
+            ),
+            evidence,
+        )
+
+
+def _audit_structured_tool_path(
+    block: Mapping[str, Any],
+    *,
+    binding: _WorkspaceScopeBinding,
+    evidence: _Evidence,
+) -> None:
+    tool_name = block.get("name")
+    tool_contract = STRUCTURED_TOOL_PATH_SCOPE_CONTRACT["tools"].get(tool_name)
+    tool_input = block.get("input")
+    if tool_contract is None or type(tool_input) is not dict:
+        return
+    path_field = tool_contract["path_field"]
+    base = binding.expected_cwd
+    if path_field not in tool_input:
+        if tool_contract["path_required"]:
+            evidence.inconclusive.add(TOOL_PATH_SCOPE_UNVERIFIED_REASON)
+    else:
+        path_value = tool_input[path_field]
+        if type(path_value) is not str or not path_value.strip():
+            evidence.inconclusive.add(TOOL_PATH_SCOPE_UNVERIFIED_REASON)
+            base = binding.expected_cwd
+        else:
+            raw_path = Path(path_value)
+            if not raw_path.is_absolute():
+                scope, resolved_path = "unverified", None
+            else:
+                scope, resolved_path = _candidate_path_scope(raw_path, binding)
+            _record_structured_scope(scope, evidence)
+            if resolved_path is not None:
+                base = resolved_path
+    if tool_name == "Glob":
+        _audit_structured_glob_pattern(
+            tool_input,
+            base=base,
+            binding=binding,
+            evidence=evidence,
+        )
+
+
 def _validate_assistant_content_block(
     value: Any,
     *,
     allowed_tools: frozenset[str],
+    structured_path_binding: _WorkspaceScopeBinding | None,
     evidence: _Evidence,
 ) -> None:
     label = "intermediate.assistant.message.content"
@@ -1868,6 +2275,12 @@ def _validate_assistant_content_block(
                 evidence.inconclusive.add(f"{block_label}.name.malformed")
             elif name not in allowed_tools:
                 evidence.inconclusive.add(f"{block_label}.name.unknown-tool")
+            elif structured_path_binding is not None:
+                _audit_structured_tool_path(
+                    block,
+                    binding=structured_path_binding,
+                    evidence=evidence,
+                )
 
 
 def _validate_assistant_event(
@@ -1876,6 +2289,7 @@ def _validate_assistant_event(
     init_session_id: str | None,
     requested_model: str,
     allowed_tools: frozenset[str],
+    structured_path_binding: _WorkspaceScopeBinding | None,
     evidence: _Evidence,
 ) -> None:
     label = "intermediate.assistant"
@@ -1942,6 +2356,7 @@ def _validate_assistant_event(
         _validate_assistant_content_block(
             message["content"],
             allowed_tools=allowed_tools,
+            structured_path_binding=structured_path_binding,
             evidence=evidence,
         )
 
@@ -2102,6 +2517,7 @@ def _validate_intermediate_events(
     init_session_id: str | None,
     requested_model: str,
     launch_profile: str,
+    workspace_binding: _WorkspaceScopeBinding | None,
     evidence: _Evidence,
 ) -> None:
     profile_name = _init_profile_name(claude_code_version)
@@ -2113,6 +2529,11 @@ def _validate_intermediate_events(
         evidence.inconclusive.add("validator.launch-profile-invalid")
         return
     allowed_tools = profile["tools"]
+    structured_path_binding = (
+        workspace_binding
+        if launch_profile in STRUCTURED_TOOL_PATH_SCOPE_CONTRACT["launch_profiles"]
+        else None
+    )
     for event in events:
         event_type = event.get("type")
         if event_type == "system":
@@ -2130,6 +2551,7 @@ def _validate_intermediate_events(
                 init_session_id=init_session_id,
                 requested_model=requested_model,
                 allowed_tools=allowed_tools,
+                structured_path_binding=structured_path_binding,
                 evidence=evidence,
             )
         elif event_type == "user":
@@ -2569,6 +2991,22 @@ def _classify(evidence: _Evidence, findings: str | None) -> dict[str, Any]:
     return {"classification": "accepted", "findings": findings}
 
 
+def _finalize_workspace_bound_outcome(
+    outcome: dict[str, Any],
+    *,
+    workspace_binding: _WorkspaceScopeBinding | None,
+    process_returncode: int,
+) -> dict[str, Any]:
+    if workspace_binding is not None:
+        binding_matches = _workspace_binding_matches(workspace_binding)
+        binding_closed = _close_bound_workspace(workspace_binding)
+        if not binding_matches or not binding_closed:
+            reasons = set(outcome.get("reasons", ()))
+            reasons.add(TOOL_PATH_SCOPE_UNVERIFIED_REASON)
+            outcome = _failure("inconclusive", reasons)
+    return _apply_process_returncode_precedence(outcome, process_returncode)
+
+
 def validate_claude_stream(
     stream: BinaryIO,
     *,
@@ -2640,65 +3078,96 @@ def validate_claude_stream(
             process_returncode,
         )
 
-    envelope, read_failure = _read_envelope(stream, selected_limits)
-    if read_failure is not None:
-        return _apply_process_returncode_precedence(read_failure, process_returncode)
-    if envelope is None:
-        return _apply_process_returncode_precedence(
-            _failure("inconclusive", {"stream.envelope-unavailable"}),
-            process_returncode,
-        )
-    evidence = _Evidence()
-    if not _validate_envelope(envelope, evidence):
-        return _apply_process_returncode_precedence(
-            _classify(evidence, None), process_returncode
-        )
-    if envelope.first is None or envelope.last is None:
-        return _apply_process_returncode_precedence(
-            _failure("inconclusive", {"stream.envelope-unavailable"}),
-            process_returncode,
-        )
-    _validate_init(
-        envelope.first,
-        expected_cwd=str(resolved_cwd),
-        requested_model=requested_model,
-        claude_code_version=claude_code_version,
-        api_key_source=runtime_binding.api_key_source,
-        launch_profile=runtime_binding.launch_profile,
-        evidence=evidence,
-    )
-    raw_init_session_id = envelope.first.get("session_id")
-    init_session_id = (
-        raw_init_session_id
-        if type(raw_init_session_id) is str and raw_init_session_id.strip()
-        else None
-    )
-    _validate_intermediate_events(
-        envelope.events[1:-1],
-        claude_code_version=claude_code_version,
-        init_session_id=init_session_id,
-        requested_model=requested_model,
-        launch_profile=runtime_binding.launch_profile,
-        evidence=evidence,
-    )
-    terminal_session_id = envelope.last.get("session_id")
+    workspace_binding: _WorkspaceScopeBinding | None = None
     if (
-        init_session_id is not None
-        and type(terminal_session_id) is str
-        and terminal_session_id.strip()
-        and init_session_id != terminal_session_id
+        runtime_binding.launch_profile
+        in STRUCTURED_TOOL_PATH_SCOPE_CONTRACT["launch_profiles"]
     ):
-        evidence.inconclusive.add("stream.session_id.mismatch")
-    findings = _validate_terminal(
-        envelope.last,
-        requested_model=requested_model,
-        claude_code_version=claude_code_version,
-        contract=contract,
-        evidence=evidence,
-    )
-    return _apply_process_returncode_precedence(
-        _classify(evidence, findings), process_returncode
-    )
+        try:
+            workspace_binding = _open_bound_workspace(resolved_cwd)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return _apply_process_returncode_precedence(
+                _failure(
+                    "inconclusive",
+                    {TOOL_PATH_SCOPE_UNVERIFIED_REASON},
+                ),
+                process_returncode,
+            )
+
+    try:
+        envelope, read_failure = _read_envelope(stream, selected_limits)
+        if read_failure is not None:
+            return _finalize_workspace_bound_outcome(
+                read_failure,
+                workspace_binding=workspace_binding,
+                process_returncode=process_returncode,
+            )
+        if envelope is None:
+            return _finalize_workspace_bound_outcome(
+                _failure("inconclusive", {"stream.envelope-unavailable"}),
+                workspace_binding=workspace_binding,
+                process_returncode=process_returncode,
+            )
+        evidence = _Evidence()
+        if not _validate_envelope(envelope, evidence):
+            return _finalize_workspace_bound_outcome(
+                _classify(evidence, None),
+                workspace_binding=workspace_binding,
+                process_returncode=process_returncode,
+            )
+        if envelope.first is None or envelope.last is None:
+            return _finalize_workspace_bound_outcome(
+                _failure("inconclusive", {"stream.envelope-unavailable"}),
+                workspace_binding=workspace_binding,
+                process_returncode=process_returncode,
+            )
+        _validate_init(
+            envelope.first,
+            expected_cwd=str(resolved_cwd),
+            requested_model=requested_model,
+            claude_code_version=claude_code_version,
+            api_key_source=runtime_binding.api_key_source,
+            launch_profile=runtime_binding.launch_profile,
+            evidence=evidence,
+        )
+        raw_init_session_id = envelope.first.get("session_id")
+        init_session_id = (
+            raw_init_session_id
+            if type(raw_init_session_id) is str and raw_init_session_id.strip()
+            else None
+        )
+        _validate_intermediate_events(
+            envelope.events[1:-1],
+            claude_code_version=claude_code_version,
+            init_session_id=init_session_id,
+            requested_model=requested_model,
+            launch_profile=runtime_binding.launch_profile,
+            workspace_binding=workspace_binding,
+            evidence=evidence,
+        )
+        terminal_session_id = envelope.last.get("session_id")
+        if (
+            init_session_id is not None
+            and type(terminal_session_id) is str
+            and terminal_session_id.strip()
+            and init_session_id != terminal_session_id
+        ):
+            evidence.inconclusive.add("stream.session_id.mismatch")
+        findings = _validate_terminal(
+            envelope.last,
+            requested_model=requested_model,
+            claude_code_version=claude_code_version,
+            contract=contract,
+            evidence=evidence,
+        )
+        return _finalize_workspace_bound_outcome(
+            _classify(evidence, findings),
+            workspace_binding=workspace_binding,
+            process_returncode=process_returncode,
+        )
+    finally:
+        if workspace_binding is not None and not workspace_binding.closed:
+            _close_bound_workspace(workspace_binding)
 
 
 def validate_claude_stream_bytes(

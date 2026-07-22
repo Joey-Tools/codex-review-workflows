@@ -36,6 +36,13 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         self.temporary_root = Path(temporary_directory.name).resolve()
         self.cwd = self.temporary_root / "review-workspace"
         self.cwd.mkdir(mode=0o700)
+        self.review_file = self.cwd / "review.py"
+        self.review_file.write_text("# synthetic review target\n", encoding="utf-8")
+        self.src_dir = self.cwd / "src"
+        self.src_dir.mkdir()
+        (self.src_dir / "module.py").write_text(
+            "# synthetic source\n", encoding="utf-8"
+        )
         self.parent_state = self.temporary_root / "parent-state"
         self.parent_state.mkdir(mode=0o700)
         self.claude_code_version = "2.1.216"
@@ -214,6 +221,29 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         message["content"] = [block]
         return event
 
+    def _tool_events(
+        self,
+        tool_name: str,
+        tool_input: dict[str, object],
+        *,
+        tool_id: str = "toolu-scope",
+        **extra_block: object,
+    ) -> list[dict[str, object]]:
+        return [
+            copy.deepcopy(self.init_event),
+            self._assistant_event(
+                {
+                    "type": "tool_use",
+                    "caller": {"type": "direct"},
+                    "id": tool_id,
+                    "input": tool_input,
+                    "name": tool_name,
+                    **extra_block,
+                }
+            ),
+            copy.deepcopy(self.result_event),
+        ]
+
     def _reviewed_intermediate_events(self) -> list[dict[str, object]]:
         return [
             {
@@ -237,7 +267,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                     "type": "tool_use",
                     "caller": {"type": "direct"},
                     "id": "toolu-synthetic",
-                    "input": {"file_path": "/synthetic/review.py"},
+                    "input": {"file_path": str(self.review_file)},
                     "name": "Read",
                 }
             ),
@@ -291,12 +321,19 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         selected_version: str | None = None,
         api_key_source: str = "none",
         launch_profile: str = "named-direct",
+        trust_source: str | None = None,
     ) -> dict[str, object]:
+        if trust_source is None:
+            trust_source = (
+                "named-parent-private-preflight"
+                if launch_profile == "named-direct"
+                else "low-level-helper"
+            )
         return {
             "selected_version": selected_version or self.claude_code_version,
             "api_key_source": api_key_source,
             "launch_profile": launch_profile,
-            "trust_source": "named-parent-private-preflight",
+            "trust_source": trust_source,
             "publisher_checksum": "a" * 64,
             "artifact_size": 128,
             "runtime_identity": (
@@ -324,6 +361,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         claude_code_version: str | None = None,
         authentication_source: str = "local-login",
         launch_profile: str = "named-direct",
+        trust_source: str | None = None,
         process_returncode: object = 0,
         limits: validator.StreamLimits | None = None,
     ) -> dict[str, object]:
@@ -343,6 +381,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 selected_version=selected_version,
                 api_key_source=api_key_source,
                 launch_profile=launch_profile,
+                trust_source=trust_source,
             )
         )
         return validator.validate_claude_stream_bytes(
@@ -462,6 +501,133 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         ].items():
             with self.subTest(profile=profile_name):
                 self.assertEqual(failure_subtypes["failure_subtypes"], ["error"])
+
+    def test_structured_tool_path_scope_contract_is_closed_and_path_free(self) -> None:
+        self.assertEqual(
+            validator.STRUCTURED_TOOL_PATH_SCOPE_CONTRACT,
+            {
+                "source": "assistant.tool_use.input",
+                "launch_profiles": ("named-direct",),
+                "workspace_root": "exact_resolved_expected_cwd",
+                "tools": {
+                    "Read": {
+                        "path_field": "file_path",
+                        "path_required": True,
+                        "path_if_present": "absolute",
+                    },
+                    "Grep": {
+                        "path_field": "path",
+                        "path_required": False,
+                        "path_if_present": "absolute",
+                    },
+                    "Glob": {
+                        "path_field": "path",
+                        "path_required": False,
+                        "path_if_present": "absolute",
+                        "missing_path_base": "expected_cwd",
+                        "pattern_field": "pattern",
+                        "pattern_required": True,
+                        "pattern_contract": "bounded_safe_relative_glob",
+                        "leading_prefix_normalization": "./",
+                        "extglob": "scope_unverified",
+                        "dynamic_directory_containment": "bounded_overapprox_scan",
+                    },
+                },
+                "glob_scan_limits": {
+                    "entries": 32_768,
+                    "states": 32_768,
+                    "depth": 64,
+                },
+                "containment": ("lexical", "resolved_with_symlinks"),
+                "outside": {
+                    "classification": "blocked",
+                    "reason": "intermediate.tool-path.outside-workspace",
+                },
+                "unverified": {
+                    "classification": "inconclusive",
+                    "reason": "intermediate.tool-path.scope-unverified",
+                },
+                "excluded_surfaces": (
+                    "user.tool_use_result.persistedOutputPath",
+                    "Bash.command",
+                ),
+            },
+        )
+        self.assertNotIn("/", validator.TOOL_PATH_OUTSIDE_WORKSPACE_REASON)
+        self.assertNotIn("/", validator.TOOL_PATH_SCOPE_UNVERIFIED_REASON)
+        self.assertEqual(validator.MAX_STRUCTURED_GLOB_PATTERN_CHARACTERS, 4096)
+        self.assertEqual(validator.MAX_STRUCTURED_GLOB_ALTERNATIVES, 64)
+        self.assertEqual(validator.MAX_STRUCTURED_GLOB_SCAN_ENTRIES, 32_768)
+        self.assertEqual(validator.MAX_STRUCTURED_GLOB_SCAN_STATES, 32_768)
+        self.assertEqual(validator.MAX_STRUCTURED_GLOB_SCAN_DEPTH, 64)
+        self.assertEqual(
+            validator.STRUCTURED_GLOB_EXTGLOB_TOKENS,
+            ("@(", "!(", "+(", "?(", "*("),
+        )
+
+    def test_runtime_trust_sources_bind_only_their_exact_launch_profiles(self) -> None:
+        self.assertEqual(
+            validator.TRUST_SOURCE_LAUNCH_PROFILES,
+            {
+                "named-parent-private-preflight": frozenset(("named-direct",)),
+                "low-level-helper": frozenset(("helper-linux", "helper-darwin")),
+            },
+        )
+        cases = (
+            ("named-parent-private-preflight", "named-direct", True),
+            ("low-level-helper", "helper-linux", True),
+            ("low-level-helper", "helper-darwin", True),
+            ("named-parent-private-preflight", "helper-linux", False),
+            ("named-parent-private-preflight", "helper-darwin", False),
+            ("low-level-helper", "named-direct", False),
+            ("future-trust-source", "named-direct", False),
+        )
+        for trust_source, launch_profile, expected_valid in cases:
+            with self.subTest(
+                trust_source=trust_source,
+                launch_profile=launch_profile,
+            ):
+                runtime_binding = validator.ClaudeRuntimeBinding(
+                    **self._valid_runtime_binding_fields(
+                        launch_profile=launch_profile,
+                        trust_source=trust_source,
+                    )
+                )
+                self.assertEqual(
+                    validator._runtime_binding_is_valid(
+                        runtime_binding,
+                        contract_binding=self.stream_contract_binding,
+                    ),
+                    expected_valid,
+                )
+
+    def test_runtime_trust_source_cross_pairings_fail_closed(self) -> None:
+        cases = (
+            ("named-parent-private-preflight", "helper-linux"),
+            ("named-parent-private-preflight", "helper-darwin"),
+            ("low-level-helper", "named-direct"),
+        )
+        for trust_source, launch_profile in cases:
+            with self.subTest(
+                trust_source=trust_source,
+                launch_profile=launch_profile,
+            ):
+                events = self._full_events()
+                profile = validator.LAUNCH_PROFILES[launch_profile]
+                events[0]["permissionMode"] = profile["permission_mode"]
+                events[0]["tools"] = sorted(profile["tools"])
+
+                self.assertEqual(
+                    self._validate(
+                        events,
+                        launch_profile=launch_profile,
+                        trust_source=trust_source,
+                    ),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": ["validator.runtime-binding-invalid"],
+                    },
+                )
 
     def test_version_range_matches_provenance_preflight_and_schema(self) -> None:
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
@@ -680,6 +846,31 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
             "inconclusive",
         )
 
+    def test_helper_linux_does_not_apply_named_direct_host_path_gate(self) -> None:
+        events = self._full_events()
+        events[0]["tools"] = ["Read"]
+        events.insert(
+            -1,
+            self._assistant_event(
+                {
+                    "type": "tool_use",
+                    "caller": {"type": "direct"},
+                    "id": "toolu-helper-linux",
+                    "input": {"file_path": "/workspace/review.py"},
+                    "name": "Read",
+                }
+            ),
+        )
+
+        with mock.patch.object(validator, "_open_bound_workspace") as open_binding:
+            outcome = self._validate(events, launch_profile="helper-linux")
+
+        self.assertEqual(
+            outcome,
+            {"classification": "accepted", "findings": "\nNo findings.\n"},
+        )
+        open_binding.assert_not_called()
+
     def test_accepts_all_reviewed_intermediate_shapes_for_supported_2x(self) -> None:
         for version in ("2.1.211", "2.1.216", "2.9.999"):
             with self.subTest(version=version):
@@ -699,15 +890,497 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                     {"classification": "accepted", "findings": "\nNo findings.\n"},
                 )
 
+    def test_accepts_structured_tool_paths_inside_exact_cwd(self) -> None:
+        cases = {
+            "absolute-read": ("Read", {"file_path": str(self.review_file)}),
+            "absolute-grep": ("Grep", {"path": str(self.src_dir)}),
+            "absolute-glob": (
+                "Glob",
+                {"path": str(self.cwd), "pattern": "src/*.py"},
+            ),
+            "cwd-default-glob": ("Glob", {"pattern": "src/*.py"}),
+        }
+        for name, (tool_name, tool_input) in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    self._validate(
+                        self._tool_events(
+                            tool_name,
+                            tool_input,
+                            tool_id=f"toolu-{name}",
+                        )
+                    ),
+                    {"classification": "accepted", "findings": "\nNo findings.\n"},
+                )
+
+    def test_relative_or_home_shorthand_tool_paths_are_scope_unverified(self) -> None:
+        cases = {
+            "relative-read": ("Read", {"file_path": "review.py"}),
+            "home-read": ("Read", {"file_path": "~/.claude/spill.txt"}),
+            "relative-grep": ("Grep", {"path": "src"}),
+            "relative-glob-path": (
+                "Glob",
+                {"path": "src", "pattern": "*.py"},
+            ),
+        }
+        for name, (tool_name, tool_input) in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    self._validate(
+                        self._tool_events(
+                            tool_name,
+                            tool_input,
+                            tool_id=f"toolu-{name}",
+                        )
+                    ),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": [validator.TOOL_PATH_SCOPE_UNVERIFIED_REASON],
+                    },
+                )
+
+    def test_blocks_structured_read_of_real_home_like_outside_path(self) -> None:
+        outside_path = self.temporary_root / "real-home" / ".claude" / "spill.txt"
+        outside_path.parent.mkdir(parents=True)
+        outside_path.write_text("synthetic spill\n", encoding="utf-8")
+        cases = {
+            "Read": {"file_path": str(outside_path)},
+            "Grep": {"path": str(outside_path.parent)},
+            "Glob": {"path": str(outside_path.parent), "pattern": "*.txt"},
+        }
+        for tool_name, tool_input in cases.items():
+            with self.subTest(tool_name=tool_name):
+                outcome = self._validate(
+                    self._tool_events(
+                        tool_name,
+                        tool_input,
+                        tool_id=f"toolu-outside-{tool_name.lower()}",
+                    )
+                )
+
+                self.assertEqual(
+                    outcome,
+                    {
+                        "classification": "blocked",
+                        "reasons": [validator.TOOL_PATH_OUTSIDE_WORKSPACE_REASON],
+                    },
+                )
+                self.assertNotIn(str(outside_path.parent), json.dumps(outcome))
+
+    def test_blocks_inside_symlink_that_resolves_outside_workspace(self) -> None:
+        outside_path = self.temporary_root / "outside-review.py"
+        outside_path.write_text("# outside target\n", encoding="utf-8")
+        inside_link = self.cwd / "linked-review.py"
+        inside_link.symlink_to(outside_path)
+
+        self.assertEqual(
+            self._validate(
+                self._tool_events(
+                    "Read",
+                    {"file_path": str(inside_link)},
+                    tool_id="toolu-symlink-escape",
+                )
+            ),
+            {
+                "classification": "blocked",
+                "reasons": [validator.TOOL_PATH_OUTSIDE_WORKSPACE_REASON],
+            },
+        )
+
+    def test_blocks_symlink_escape_before_parent_traversal(self) -> None:
+        outside_root = self.temporary_root / "outside-root"
+        outside_nested = outside_root / "nested"
+        outside_nested.mkdir(parents=True)
+        (outside_root / "secret.py").write_text("# outside secret\n", encoding="utf-8")
+        inside_link = self.cwd / "linked-directory"
+        inside_link.symlink_to(outside_nested, target_is_directory=True)
+
+        self.assertEqual(
+            self._validate(
+                self._tool_events(
+                    "Read",
+                    {"file_path": str(inside_link / ".." / "secret.py")},
+                    tool_id="toolu-symlink-parent-escape",
+                )
+            ),
+            {
+                "classification": "blocked",
+                "reasons": [validator.TOOL_PATH_OUTSIDE_WORKSPACE_REASON],
+            },
+        )
+
+    def test_read_path_missing_or_blank_is_inconclusive(self) -> None:
+        for tool_input in ({}, {"file_path": " \t"}):
+            with self.subTest(tool_input=tool_input):
+                self.assertEqual(
+                    self._validate(
+                        self._tool_events(
+                            "Read",
+                            tool_input,
+                            tool_id="toolu-unverified-read",
+                        )
+                    ),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": [validator.TOOL_PATH_SCOPE_UNVERIFIED_REASON],
+                    },
+                )
+
+    def test_glob_pattern_safe_subset_and_escape_classification(self) -> None:
+        outside_root = self.temporary_root / "real-home"
+        outside_root.mkdir()
+        inside_absolute_pattern = str(self.src_dir / "*.py")
+        cases = {
+            "safe-relative": ("src/*.py", "accepted", []),
+            "parent-traversal": (
+                "../real-home/**",
+                "blocked",
+                [validator.TOOL_PATH_OUTSIDE_WORKSPACE_REASON],
+            ),
+            "absolute-outside": (
+                str(outside_root / "**"),
+                "blocked",
+                [validator.TOOL_PATH_OUTSIDE_WORKSPACE_REASON],
+            ),
+            "absolute-inside": (
+                inside_absolute_pattern,
+                "inconclusive",
+                [validator.TOOL_PATH_SCOPE_UNVERIFIED_REASON],
+            ),
+            "home-shorthand": (
+                "~/.claude/**",
+                "inconclusive",
+                [validator.TOOL_PATH_SCOPE_UNVERIFIED_REASON],
+            ),
+            "recursive-glob": (
+                "**/*.py",
+                "accepted",
+                [],
+            ),
+            "leading-dot-recursive": (
+                "./**/*.py",
+                "accepted",
+                [],
+            ),
+            "leading-dot-src-recursive": (
+                "./src/**/*.ts",
+                "accepted",
+                [],
+            ),
+            "wildcard-directory": (
+                "*/module.py",
+                "accepted",
+                [],
+            ),
+            "common-recursive-brace": (
+                "src/**/*.{py,md}",
+                "accepted",
+                [],
+            ),
+            "character-class": (
+                "src/**/[Tt]est*.py",
+                "accepted",
+                [],
+            ),
+            "intermediate-dot": (
+                "src/./*.py",
+                "inconclusive",
+                [validator.TOOL_PATH_SCOPE_UNVERIFIED_REASON],
+            ),
+            "escaping-brace-alternative": (
+                "{src/**,../real-home/**}",
+                "blocked",
+                [validator.TOOL_PATH_OUTSIDE_WORKSPACE_REASON],
+            ),
+        }
+        for name, (pattern, classification, reasons) in cases.items():
+            with self.subTest(name=name):
+                outcome = self._validate(
+                    self._tool_events(
+                        "Glob",
+                        {"pattern": pattern},
+                        tool_id=f"toolu-glob-{name}",
+                    )
+                )
+
+                self.assertEqual(outcome["classification"], classification)
+                if classification == "accepted":
+                    self.assertEqual(outcome["findings"], "\nNo findings.\n")
+                else:
+                    self.assertEqual(outcome["reasons"], sorted(reasons))
+
+    def test_glob_pattern_requires_bounded_nonblank_string(self) -> None:
+        cases = (
+            {},
+            {"pattern": ""},
+            {"pattern": 7},
+            {"pattern": "a" * 4097},
+            {"pattern": "src\\*.py"},
+            {"pattern": "src/{nested,{brace,syntax}}/*.py"},
+            {"pattern": "{" + ",".join(f"branch-{i}" for i in range(65)) + "}"},
+            *(
+                {"pattern": f"src/{token}module.py"}
+                for token in validator.STRUCTURED_GLOB_EXTGLOB_TOKENS
+            ),
+        )
+        for tool_input in cases:
+            with self.subTest(tool_input=tool_input):
+                self.assertEqual(
+                    self._validate(
+                        self._tool_events(
+                            "Glob",
+                            tool_input,
+                            tool_id="toolu-glob-unverified",
+                        )
+                    ),
+                    {
+                        "classification": "inconclusive",
+                        "reasons": [validator.TOOL_PATH_SCOPE_UNVERIFIED_REASON],
+                    },
+                )
+
+    def test_dynamic_glob_directory_components_block_external_symlinks(
+        self,
+    ) -> None:
+        outside_root = self.temporary_root / "outside-glob-directory"
+        outside_root.mkdir()
+        (outside_root / "module.py").write_text("# outside module\n", encoding="utf-8")
+        (self.cwd / "linked-external").symlink_to(
+            outside_root,
+            target_is_directory=True,
+        )
+        (self.src_dir / "linked-external").symlink_to(
+            outside_root,
+            target_is_directory=True,
+        )
+
+        for pattern in ("*/module.py", "**/*.py", "src/**/*.py"):
+            with self.subTest(pattern=pattern):
+                self.assertEqual(
+                    self._validate(self._tool_events("Glob", {"pattern": pattern})),
+                    {
+                        "classification": "blocked",
+                        "reasons": [validator.TOOL_PATH_OUTSIDE_WORKSPACE_REASON],
+                    },
+                )
+
+    def test_dynamic_glob_directory_components_accept_internal_symlinks(
+        self,
+    ) -> None:
+        internal_root = self.src_dir / "internal"
+        internal_root.mkdir()
+        (internal_root / "module.py").write_text(
+            "# internal module\n", encoding="utf-8"
+        )
+        (self.cwd / "linked-src").symlink_to(
+            self.src_dir,
+            target_is_directory=True,
+        )
+        (self.src_dir / "linked-internal").symlink_to(
+            internal_root,
+            target_is_directory=True,
+        )
+
+        for pattern in ("*/module.py", "**/*.py", "src/**/*.py"):
+            with self.subTest(pattern=pattern):
+                self.assertEqual(
+                    self._validate(self._tool_events("Glob", {"pattern": pattern})),
+                    {"classification": "accepted", "findings": "\nNo findings.\n"},
+                )
+
+    def test_recursive_glob_skips_dangling_symlink_proved_inside_workspace(
+        self,
+    ) -> None:
+        (self.src_dir / "broken-internal").symlink_to(
+            self.src_dir / "missing-directory",
+            target_is_directory=True,
+        )
+
+        self.assertEqual(
+            self._validate(self._tool_events("Glob", {"pattern": "**/*.py"})),
+            {"classification": "accepted", "findings": "\nNo findings.\n"},
+        )
+
+    def test_dynamic_glob_scan_budget_exhaustion_is_scope_unverified(self) -> None:
+        for limit_name in (
+            "MAX_STRUCTURED_GLOB_SCAN_ENTRIES",
+            "MAX_STRUCTURED_GLOB_SCAN_STATES",
+            "MAX_STRUCTURED_GLOB_SCAN_DEPTH",
+        ):
+            with (
+                self.subTest(limit_name=limit_name),
+                mock.patch.object(validator, limit_name, 0),
+            ):
+                outcome = self._validate(
+                    self._tool_events("Glob", {"pattern": "**/*.py"})
+                )
+
+                self.assertEqual(
+                    outcome,
+                    {
+                        "classification": "inconclusive",
+                        "reasons": [validator.TOOL_PATH_SCOPE_UNVERIFIED_REASON],
+                    },
+                )
+
+    def test_glob_literal_directory_prefix_cannot_follow_outside_symlink(self) -> None:
+        outside_root = self.temporary_root / "outside-source"
+        outside_root.mkdir()
+        (outside_root / "module.py").write_text("# outside source\n", encoding="utf-8")
+        (self.cwd / "linked-source").symlink_to(
+            outside_root,
+            target_is_directory=True,
+        )
+
+        self.assertEqual(
+            self._validate(
+                self._tool_events(
+                    "Glob",
+                    {"pattern": "linked-source/*.py"},
+                    tool_id="toolu-glob-symlink-prefix",
+                )
+            ),
+            {
+                "classification": "blocked",
+                "reasons": [validator.TOOL_PATH_OUTSIDE_WORKSPACE_REASON],
+            },
+        )
+
+    def test_outside_tool_path_and_malformed_block_follow_global_precedence(
+        self,
+    ) -> None:
+        outside_path = self.temporary_root / "outside.py"
+        outside_path.write_text("# outside\n", encoding="utf-8")
+        outcome = self._validate(
+            self._tool_events(
+                "Read",
+                {"file_path": str(outside_path)},
+                tool_id="toolu-outside-malformed",
+                future_field="unsupported",
+            )
+        )
+
+        self.assertEqual(
+            outcome,
+            {
+                "classification": "inconclusive",
+                "reasons": [
+                    "intermediate.assistant.message.content.tool_use.unknown-field",
+                    validator.TOOL_PATH_OUTSIDE_WORKSPACE_REASON,
+                ],
+            },
+        )
+        self.assertNotIn(str(outside_path), json.dumps(outcome))
+
+    def test_named_direct_opens_and_closes_one_workspace_binding_per_stream(
+        self,
+    ) -> None:
+        events = [
+            copy.deepcopy(self.init_event),
+            self._assistant_event(
+                {
+                    "type": "tool_use",
+                    "caller": {"type": "direct"},
+                    "id": "toolu-read-once",
+                    "input": {"file_path": str(self.review_file)},
+                    "name": "Read",
+                }
+            ),
+            self._assistant_event(
+                {
+                    "type": "tool_use",
+                    "caller": {"type": "direct"},
+                    "id": "toolu-glob-once",
+                    "input": {"pattern": "src/*.py"},
+                    "name": "Glob",
+                }
+            ),
+            copy.deepcopy(self.result_event),
+        ]
+
+        with (
+            mock.patch.object(
+                validator,
+                "_open_bound_workspace",
+                wraps=validator._open_bound_workspace,
+            ) as open_binding,
+            mock.patch.object(
+                validator,
+                "_close_bound_workspace",
+                wraps=validator._close_bound_workspace,
+            ) as close_binding,
+        ):
+            outcome = self._validate(events)
+
+        self.assertEqual(
+            outcome,
+            {"classification": "accepted", "findings": "\nNo findings.\n"},
+        )
+        open_binding.assert_called_once_with(self.cwd)
+        close_binding.assert_called_once()
+
+    def test_workspace_identity_uncertainty_is_path_free_and_inconclusive(self) -> None:
+        with mock.patch.object(
+            validator,
+            "_workspace_binding_matches",
+            return_value=False,
+        ):
+            outcome = self._validate(
+                self._tool_events(
+                    "Read",
+                    {"file_path": str(self.review_file)},
+                    tool_id="toolu-workspace-identity-drift",
+                )
+            )
+
+        self.assertEqual(
+            outcome,
+            {
+                "classification": "inconclusive",
+                "reasons": [validator.TOOL_PATH_SCOPE_UNVERIFIED_REASON],
+            },
+        )
+        self.assertNotIn(str(self.review_file), json.dumps(outcome))
+
+    def test_persisted_output_path_without_model_read_is_not_blocked(self) -> None:
+        outside_path = self.temporary_root / "real-home" / ".claude" / "spill.txt"
+        user_event = copy.deepcopy(self._reviewed_intermediate_events()[-2])
+        user_event["tool_use_result"] = {
+            "persistedOutputPath": str(outside_path),
+        }
+        message = user_event["message"]
+        assert isinstance(message, dict)
+        content = message["content"]
+        assert isinstance(content, list)
+        content[0]["content"] = f"Output persisted to {outside_path}"
+
+        self.assertEqual(
+            self._validate(
+                [
+                    copy.deepcopy(self.init_event),
+                    self._reviewed_intermediate_events()[3],
+                    user_event,
+                    copy.deepcopy(self.result_event),
+                ]
+            ),
+            {"classification": "accepted", "findings": "\nNo findings.\n"},
+        )
+
     def test_accepts_each_reviewed_tool_and_tool_result_representation(self) -> None:
         for tool_name in validator.LAUNCH_PROFILES["named-direct"]["tools"]:
             with self.subTest(tool_name=tool_name):
+                if tool_name == "Read":
+                    tool_input = {"file_path": str(self.review_file)}
+                elif tool_name == "Glob":
+                    tool_input = {"pattern": "src/*.py"}
+                else:
+                    tool_input = {}
                 tool_event = self._assistant_event(
                     {
                         "type": "tool_use",
                         "caller": {"type": "direct"},
                         "id": "toolu-synthetic",
-                        "input": {},
+                        "input": tool_input,
                         "name": tool_name,
                     }
                 )
