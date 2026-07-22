@@ -960,3 +960,9 @@ metadata behavior.
   sentinel. The focused 22-test prompt/app-server regression set, Ruff lint
   and formatting, `git diff --check`, and all 345 deterministic supervisor
   tests pass under Python 3.13.
+- Before refreezing the final review range, the branch incorporated
+  default-branch commit `35271bec152f1ccaf484ffa738948d17107f42f9`
+  through signed merge commit `a246f1c1ff37fbfb47b69f62913ae274295e49df`.
+  The incoming private-layout test compatibility change merged without
+  conflicts. All 255 affected contract and named-lane tests and all 345
+  deterministic supervisor tests pass under Python 3.13 after integration.
