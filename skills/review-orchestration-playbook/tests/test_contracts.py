@@ -1090,7 +1090,11 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("--include-source-wip", readiness)
 
         consent = policies["egress-consent.md"]
-        self.assertNotIn("--include-source-wip", consent)
+        self.assertIn("--include-source-wip", consent)
+        self.assertIn("Clean-head helper approval", consent)
+        self.assertIn("Source-WIP helper approval", consent)
+        self.assertIn("content_variant=head", consent)
+        self.assertIn("content_variant=source-wip", consent)
         self.assertIn("untracked private files", consent)
         self.assertIn("home-directory content", consent)
 
@@ -1133,12 +1137,52 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertIn("separate explicit consent", helper)
         self.assertIn("--include-source-wip", helper)
-        self.assertIn("non-ignored untracked", helper)
+        self.assertIn("nonignored untracked", helper)
         self.assertIn("WIP evidence is diagnostic only", helper)
         self.assertIn("untracked private files", consent)
         self.assertIn("home-directory content", consent)
         self.assertIn("hidden local-only artifacts", consent)
-        self.assertNotIn("--include-source-wip", consent)
+        self.assertIn("--include-source-wip", consent)
+
+        provider_source = (RUNTIME / "providers.py").read_text(encoding="utf-8")
+        for field in (
+            "content_variant",
+            "include_source_wip",
+            "snapshot_tree_sha",
+            "scope_identity",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(f'"{field}"', provider_source)
+                self.assertIn(field, helper)
+                self.assertIn(field, consent)
+
+        self.assertIn("Clean-head approval:", helper)
+        self.assertIn("Source-WIP approval:", helper)
+        for document in (helper, consent):
+            with self.subTest(document=document[:32]):
+                self.assertIn("staged, unstaged, and nonignored untracked", document)
+                self.assertIn(
+                    "ignored untracked files and source content not captured by the "
+                    "WIP snapshot",
+                    document,
+                )
+                self.assertIn("content_variant=head", document)
+                self.assertIn("content_variant=source-wip", document)
+                self.assertIn("`false` for `content_variant: head`", document)
+                self.assertIn(
+                    "`true` only for `content_variant: source-wip`",
+                    document,
+                )
+
+        source_wip_approval = consent.split(
+            "### Source-WIP helper approval",
+            maxsplit=1,
+        )[1].split("Do not shorten this", maxsplit=1)[0]
+        self.assertNotIn(
+            "This excludes automatic discovery of reviewer/runtime authentication "
+            "credentials, untracked files",
+            source_wip_approval,
+        )
 
     def test_ci_targets_only_the_canonical_runtime_and_tests(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")

@@ -646,6 +646,51 @@ class ReviewWorkspace:
 class SourceLocalReviewWorkspace(ReviewWorkspace):
     """Modern v2-v4 state whose container remains under source `.codex-tmp`."""
 
+    @classmethod
+    def from_json(cls, value: dict[str, Any]) -> "SourceLocalReviewWorkspace":
+        required_fields = {
+            "base_ref",
+            "container_dir",
+            "diff_file",
+            "head_ref",
+            "private_cleanup",
+            "prompt_file",
+            "source_root",
+            "workspace_root",
+        }
+        optional_fields = {"git_dir"}
+        if not required_fields <= set(value) or not set(value) <= (
+            required_fields | optional_fields
+        ):
+            raise ValueError("legacy workspace fields are invalid")
+        text_fields = (required_fields - {"private_cleanup"}) | (
+            set(value) & optional_fields
+        )
+        if any(not isinstance(value[field], str) for field in text_fields):
+            raise ValueError("legacy workspace text fields are invalid")
+        container_dir = pathlib.Path(value["container_dir"])
+        return cls(
+            source_root=pathlib.Path(value["source_root"]),
+            container_dir=container_dir,
+            workspace_root=pathlib.Path(value["workspace_root"]),
+            base_ref=value["base_ref"],
+            head_ref=value["head_ref"],
+            diff_file=pathlib.Path(value["diff_file"]),
+            prompt_file=pathlib.Path(value["prompt_file"]),
+            private_cleanup=_parse_private_cleanup_evidence(
+                value["private_cleanup"],
+                require_all=True,
+            ),
+            git_dir=(
+                pathlib.Path(value["git_dir"])
+                if value.get("git_dir")
+                else container_dir / "review.git"
+            ),
+            content_variant="head",
+            snapshot_tree_sha="",
+            scope_identity="",
+        )
+
 
 @dataclass(frozen=True)
 class LegacyReviewWorkspace:
@@ -14609,15 +14654,19 @@ def _read_wip_entry(
             return "120000", raw_target
         if not stat.S_ISREG(initial.st_mode):
             raise ReviewError(f"unsupported special file in source WIP: {display}")
+        if initial.st_nlink != 1:
+            raise ReviewError(
+                f"source WIP regular file must have exactly one hard link: {display}"
+            )
+        if initial.st_uid != os.geteuid():
+            raise ReviewError(
+                f"source WIP regular file must be owned by the current user: {display}"
+            )
         if expected_materialized_mode in {"100644", "100755"}:
             expected_permissions = (
                 0o755 if expected_materialized_mode == "100755" else 0o644
             )
-            if (
-                stat.S_IMODE(initial.st_mode) != expected_permissions
-                or initial.st_nlink != 1
-                or initial.st_uid != os.geteuid()
-            ):
+            if stat.S_IMODE(initial.st_mode) != expected_permissions:
                 raise ReviewError(
                     "materialized review workspace metadata does not match snapshot tree"
                 )
@@ -15536,33 +15585,21 @@ def prepare_workspace(
             ),
         )
         prompt_file = control_dir / "review.prompt"
-        if prompt_override is None:
-            prompt = build_review_prompt(
-                workspace=workspace_root,
-                diff_file=diff_file,
-                base_ref=base_sha,
-                head_ref=head_sha,
-                content_variant=content_variant,
-                snapshot_tree_sha=snapshot_tree_sha,
-                scope_identity=scope_identity,
+        supplemental_template = None
+        if prompt_override is not None:
+            supplemental_template = _read_prompt_template(
+                prompt_override.expanduser().absolute()
             )
-        else:
-            template = _read_prompt_template(prompt_override.expanduser().absolute())
-            replacements = {
-                "workspace": str(workspace_root),
-                "diff_file": str(diff_file),
-                "base_ref": base_sha,
-                "head_ref": head_sha,
-                "review_range": f"{base_sha}..{head_sha}",
-                "content_variant": content_variant,
-                "snapshot_tree_sha": snapshot_tree_sha,
-                "scope_identity": scope_identity,
-            }
-            prompt = re.sub(
-                r"\{(workspace|diff_file|base_ref|head_ref|review_range|content_variant|snapshot_tree_sha|scope_identity)\}",
-                lambda match: replacements[match.group(1)],
-                template,
-            )
+        prompt = build_review_prompt(
+            workspace=workspace_root,
+            diff_file=diff_file,
+            base_ref=base_sha,
+            head_ref=head_sha,
+            content_variant=content_variant,
+            snapshot_tree_sha=snapshot_tree_sha,
+            scope_identity=scope_identity,
+            supplemental_template=supplemental_template,
+        )
         _validate_prompt_size(prompt)
         write_text_atomic(prompt_file, prompt)
         if set(private_artifact_identities) != set(PRIVATE_HELPER_ARTIFACT_NAMES):

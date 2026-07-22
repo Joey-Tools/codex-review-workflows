@@ -654,34 +654,38 @@ class StatefulLifecycleTest(unittest.TestCase):
                 action()
 
     def test_v4_terminal_state_remains_compatible_with_status_and_final(self) -> None:
-        review = self.write_source_local_completed_state()
-        marker_path = review.container_dir / state.STATE_MARKER
-        marker = state._state_marker_payload(
-            review,
-            runner_lock_identity(review),
+        review = self.write_historical_v4_completed_state()
+
+        loaded_state, loaded_review = state.load_review_state(review.container_dir)
+        self.assertEqual(
+            set(loaded_state["workspace"]),
+            {
+                "base_ref",
+                "container_dir",
+                "diff_file",
+                "head_ref",
+                "private_cleanup",
+                "prompt_file",
+                "source_root",
+                "workspace_root",
+            },
         )
-        marker.pop("preflight_receipt")
-        marker["version"] = state.BOUND_STATE_MARKER_SCHEMA_VERSION
-        write_json(marker_path, marker)
+        self.assertEqual(loaded_review.git_dir, review.container_dir / "review.git")
+        self.assertEqual(loaded_review.content_variant, "head")
+        self.assertEqual(loaded_review.snapshot_tree_sha, "")
+        self.assertEqual(loaded_review.scope_identity, "")
 
         summary = state.status(review.container_dir)
         self.assertFalse(summary["running"])
         self.assertEqual(summary["exit_code"], 0)
         self.assertEqual(summary["admission"]["status"], "inconclusive")
 
-        with mock.patch.object(state, "wait", return_value=0):
-            exit_code, text = state.final(review.container_dir)
+        self.assertEqual(state.wait(review.container_dir, timeout_seconds=5), 0)
+        exit_code, text = state.final(review.container_dir)
         self.assertEqual((exit_code, text), (0, "No findings."))
 
     def test_v4_source_local_cleanup_removes_runtime_and_is_idempotent(self) -> None:
-        review = self.write_source_local_completed_state()
-        marker = state._state_marker_payload(
-            review,
-            runner_lock_identity(review),
-        )
-        marker.pop("preflight_receipt")
-        marker["version"] = state.BOUND_STATE_MARKER_SCHEMA_VERSION
-        write_json(review.container_dir / state.STATE_MARKER, marker)
+        review = self.write_historical_v4_completed_state()
 
         self.assertEqual(
             state.cleanup(review.container_dir, timeout_seconds=None),
@@ -694,6 +698,56 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertIsNone(cleanup_workspace(review, keep_container=False))
         self.assertFalse(review.container_dir.exists())
         self.assertIsNone(cleanup_workspace(review, keep_container=False))
+
+    def test_v4_historical_workspace_fields_remain_strict(self) -> None:
+        review = self.write_historical_v4_completed_state()
+        current = state.load_state(review.container_dir)
+        historical_workspace = dict(current["workspace"])
+
+        current["workspace"] = {
+            **historical_workspace,
+            "git_dir": str(review.container_dir / "review.git"),
+        }
+        write_json(review.container_dir / state.STATE_FILE, current)
+        _loaded, loaded_review = state.load_review_state(review.container_dir)
+        self.assertEqual(loaded_review.git_dir, review.container_dir / "review.git")
+
+        invalid_workspaces = (
+            {**historical_workspace, "content_variant": "head"},
+            {**historical_workspace, "git_dir": True},
+            {**historical_workspace, "base_ref": True},
+            {
+                key: value
+                for key, value in historical_workspace.items()
+                if key != "base_ref"
+            },
+        )
+        for workspace_value in invalid_workspaces:
+            with self.subTest(fields=workspace_value):
+                current["workspace"] = workspace_value
+                write_json(review.container_dir / state.STATE_FILE, current)
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "invalid workspace",
+                ):
+                    state.load_review_state(review.container_dir)
+
+    def test_v5_workspace_rejects_missing_scope_fields(self) -> None:
+        self.write_completed_state()
+        current = state.load_state(self.review.container_dir)
+        workspace_value = dict(current["workspace"])
+
+        for field in ("content_variant", "snapshot_tree_sha", "scope_identity"):
+            with self.subTest(field=field):
+                current["workspace"] = {
+                    key: value for key, value in workspace_value.items() if key != field
+                }
+                write_json(self.review.container_dir / state.STATE_FILE, current)
+                with self.assertRaisesRegex(
+                    ReviewError,
+                    "invalid workspace",
+                ):
+                    state.load_review_state(self.review.container_dir)
 
     def test_preparing_marker_recovers_partial_container_without_state(self) -> None:
         retained_name = PRIVATE_CHANGED_PATHS_NAME
@@ -1278,9 +1332,6 @@ class StatefulLifecycleTest(unittest.TestCase):
             prompt_file=workspace_root / ".codex-review/review.prompt",
             private_cleanup=private_cleanup,
             git_dir=git_dir,
-            content_variant=self.review.content_variant,
-            snapshot_tree_sha=self.review.snapshot_tree_sha,
-            scope_identity=self.review.scope_identity,
         )
         write_json(
             container_dir / CONTROL_ARTIFACT_STATE_NAME,
@@ -1290,8 +1341,28 @@ class StatefulLifecycleTest(unittest.TestCase):
             ),
         )
         current = read_json(container_dir / state.STATE_FILE)
-        current["workspace"] = review.to_json()
+        current["workspace"] = {
+            "base_ref": review.base_ref,
+            "container_dir": str(review.container_dir),
+            "diff_file": str(review.diff_file),
+            "head_ref": review.head_ref,
+            "private_cleanup": review.private_cleanup.to_json(),
+            "prompt_file": str(review.prompt_file),
+            "source_root": str(review.source_root),
+            "workspace_root": str(review.workspace_root),
+        }
         write_json(container_dir / state.STATE_FILE, current)
+        return review
+
+    def write_historical_v4_completed_state(self) -> SourceLocalReviewWorkspace:
+        review = self.write_source_local_completed_state()
+        marker = state._state_marker_payload(
+            review,
+            runner_lock_identity(review),
+        )
+        marker.pop("preflight_receipt")
+        marker["version"] = state.BOUND_STATE_MARKER_SCHEMA_VERSION
+        write_json(review.container_dir / state.STATE_MARKER, marker)
         return review
 
     def test_claude_redactions_include_auth_and_credential_proxy_transport(
@@ -2366,15 +2437,7 @@ class StatefulLifecycleTest(unittest.TestCase):
     def test_v4_admission_is_pending_while_held_and_inconclusive_when_terminal(
         self,
     ) -> None:
-        review = self.write_source_local_completed_state()
-        marker_path = review.container_dir / state.STATE_MARKER
-        marker = state._state_marker_payload(
-            review,
-            runner_lock_identity(review),
-        )
-        marker.pop("preflight_receipt")
-        marker["version"] = state.BOUND_STATE_MARKER_SCHEMA_VERSION
-        write_json(marker_path, marker)
+        review = self.write_historical_v4_completed_state()
 
         terminal = state.admission_status(review.container_dir)
         self.assertEqual(terminal["status"], "inconclusive")

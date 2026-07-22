@@ -37,7 +37,14 @@ isolated_review stateful admission --state-dir <state_dir>
 isolated_review stateful cleanup --state-dir <state_dir>
 ```
 
-Add `--include-source-wip` only with separate explicit consent to include staged, unstaged, and non-ignored untracked source state. Clean committed-head content is the default.
+Add `--include-source-wip` only with separate explicit consent to include staged, unstaged, and nonignored untracked source state. Clean committed-head content is the default.
+
+For an approval-gated external helper launch, use the wording that matches the verified variant and substitute the exact values:
+
+- Clean-head approval: `Approve this low-level Claude helper run for <owner/repo> at <base_sha>..<head_sha>. It sends tracked blobs materialized from the frozen head, the complete generated diff, and the prompt/result to Anthropic Claude Code for read-only review. Scope is bound by content_variant=head, snapshot_tree_sha=<snapshot_tree_sha>, and scope_identity=<scope_identity>. It excludes untracked files, unrelated repositories, and broad workspace/home-directory content.`
+- Source-WIP approval: `I separately authorize --include-source-wip for this low-level Claude helper run for <owner/repo> at <base_sha>..<head_sha>. It sends tracked blobs plus staged, unstaged, and nonignored untracked contents captured in the digest-bound source WIP snapshot, the complete generated diff through that snapshot, and the prompt/result to Anthropic Claude Code for read-only review. Scope is bound by content_variant=source-wip, snapshot_tree_sha=<snapshot_tree_sha>, and scope_identity=<scope_identity>. It excludes ignored untracked files and source content not captured by the WIP snapshot, unrelated repositories, and broad workspace/home-directory content.`
+
+Do not use the clean-head wording for a WIP snapshot. See [egress-consent.md](egress-consent.md) for the full provider and trusted-processor disclosure.
 
 Synthetic-token catalog inspection is read-only:
 
@@ -79,7 +86,7 @@ Claude Code CLI releases are not pinned to one current patch. The Claude runtime
 
 The Copilot IDs follow GitHub's authoritative [supported models matrix](https://docs.github.com/en/copilot/reference/ai-models/supported-models), which lists Opus 4.8 and Opus 4.7 for Copilot CLI. The shorter command-reference example table can lag product availability and is not treated as a runtime allowlist; exact model verification still fails closed if the installed CLI rejects or substitutes any ID.
 
-The low-level Claude helper requires either `--egress-consent explicit-claude-review` or `--egress-consent explicit-claude-with-copilot-fallback`. The helper saves this value in state and writes `egress.json`; it refuses to start the external lane without it. `explicit-claude-review` authorizes Anthropic only. `explicit-claude-with-copilot-fallback` is valid only after the user separately requests and authorizes both the Anthropic review and this helper's compatibility GitHub Copilot fallback. Named single/double/triple phrases are not helper consent markers. No Copilot artifact satisfies the required Claude Code lane, and no consent mode turns an authentication problem into fallback eligibility.
+The low-level Claude helper requires either `--egress-consent explicit-claude-review` or `--egress-consent explicit-claude-with-copilot-fallback`. The helper saves this value in state and writes `egress.json`; it refuses to start the external lane without it. `explicit-claude-review` authorizes Anthropic only. `explicit-claude-with-copilot-fallback` is valid only after the user separately requests and authorizes both the Anthropic review and this helper's compatibility GitHub Copilot fallback. Named single/double/triple phrases are not helper consent markers. No Copilot artifact satisfies the required Claude Code lane, and no consent mode turns an authentication problem into fallback eligibility. Each egress record also binds the verified `content_variant`, `snapshot_tree_sha`, and `scope_identity`. Its `include_source_wip` machine marker must be `false` for `content_variant: head` and `true` only for `content_variant: source-wip`, corresponding to explicit `--include-source-wip`; unknown or inconsistent variants fail closed before reviewer launch. The variant-specific `included` and `excluded` lists must match the same verified scope.
 
 Every new state and `egress.json` record is machine-labeled `review_contract: supplied-diff-private-git` and `named_lane_eligible: false`. `stateful status` exposes those fields, while `attempts[].runtime` remains the authoritative actual backend. Consumers must not infer a named lane from the top-level requested helper reviewer, exit `0`, or the findings-only output of `stateful final`; that command intentionally returns the saved low-level artifact, not a named-lane envelope.
 

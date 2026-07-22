@@ -577,6 +577,48 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertEqual(handed_off, [review])
         return review
 
+    def _prepare_source_wip_review(self) -> ReviewWorkspace:
+        source_root = self.review.source_root
+        tracked_paths = ("staged.txt", "unstaged.txt")
+        for relative_path in tracked_paths:
+            (source_root / relative_path).write_text(
+                f"committed {relative_path}\n",
+                encoding="utf-8",
+            )
+        (source_root / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+        self._git(source_root, "add", "--", ".gitignore", *tracked_paths)
+        self._git(source_root, "commit", "-m", "Add WIP fixtures")
+        head_ref = self._git(source_root, "rev-parse", "HEAD")
+
+        (source_root / "staged.txt").write_text(
+            "staged source WIP\n",
+            encoding="utf-8",
+        )
+        self._git(source_root, "add", "--", "staged.txt")
+        (source_root / "unstaged.txt").write_text(
+            "unstaged source WIP\n",
+            encoding="utf-8",
+        )
+        (source_root / "untracked.txt").write_text(
+            "untracked source WIP\n",
+            encoding="utf-8",
+        )
+        (source_root / "ignored.txt").write_text(
+            "ignored source content\n",
+            encoding="utf-8",
+        )
+
+        handed_off: list[ReviewWorkspace] = []
+        review = workspace_runtime.prepare_workspace(
+            repo=source_root,
+            base_ref=head_ref,
+            head_ref=head_ref,
+            ownership_handoff=handed_off.append,
+            include_source_wip=True,
+        )
+        self.assertEqual(handed_off, [review])
+        return review
+
     def _refresh_control_artifact_state(self) -> None:
         control_dir = self.review.workspace_root / ".codex-review"
         state = workspace_runtime._build_control_artifact_state(
@@ -31602,6 +31644,21 @@ class ProviderPolicyTest(unittest.TestCase):
                 ):
                     workspace_runtime.validate_external_workspace(self.review)
 
+    def test_low_level_helper_egress_rejects_unknown_content_variant(self) -> None:
+        invalid_review = dataclasses.replace(
+            self.review,
+            content_variant="future-snapshot",
+        )
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "egress record has an invalid content variant",
+        ):
+            providers._build_low_level_helper_egress_record(
+                invalid_review,
+                egress_consent="explicit-claude-review",
+            )
+
     @mock.patch.object(
         providers,
         "_review_environment",
@@ -31670,9 +31727,27 @@ class ProviderPolicyTest(unittest.TestCase):
             egress["merge_gate"],
             "secret-delta status is evaluated separately",
         )
-        self.assertIn(
-            "the complete generated frozen diff without secret redaction",
+        self.assertEqual(egress["content_variant"], "head")
+        self.assertFalse(egress["include_source_wip"])
+        for field in ("content_variant", "snapshot_tree_sha", "scope_identity"):
+            with self.subTest(field=field):
+                self.assertEqual(egress[field], preflight[field])
+                self.assertEqual(egress[field], getattr(review, field))
+        self.assertEqual(
             egress["included"],
+            [
+                "tracked blobs materialized from the frozen head commit",
+                "the complete generated frozen diff without secret redaction",
+                "the review prompt and result",
+            ],
+        )
+        self.assertEqual(
+            egress["excluded"],
+            [
+                "untracked files",
+                "unrelated repositories",
+                "broad workspace or home-directory content",
+            ],
         )
         self.assertFalse(
             any(
@@ -31680,6 +31755,97 @@ class ProviderPolicyTest(unittest.TestCase):
                 for name in workspace_runtime.PRIVATE_HELPER_ARTIFACT_NAMES
             )
         )
+
+    @mock.patch.object(
+        providers,
+        "_review_environment",
+        return_value={"ANTHROPIC_API_KEY": SYNTHETIC_API_KEY_A},
+    )
+    @mock.patch.object(
+        providers,
+        "_resolve_validated_claude_executable",
+        return_value=(pathlib.Path("/bin/claude"), {}),
+    )
+    @mock.patch.object(providers, "_run_model_chain")
+    def test_source_wip_egress_binds_scope_and_discloses_snapshot_contents(
+        self,
+        run_model_chain: mock.Mock,
+        _resolve_claude: mock.Mock,
+        environment: mock.Mock,
+    ) -> None:
+        review = self._prepare_source_wip_review()
+        _resolve_claude.side_effect = lambda **kwargs: (
+            pathlib.Path("/bin/claude"),
+            kwargs["env"],
+        )
+        run_model_chain.return_value = ("success", "No findings.")
+
+        outcome = providers.run_review(
+            review=review,
+            reviewer="claude",
+            egress_consent="explicit-claude-review",
+        )
+
+        runner_error = review.container_dir / "runner-error.txt"
+        self.assertEqual(
+            outcome.returncode,
+            0,
+            runner_error.read_text(encoding="utf-8") if runner_error.exists() else "",
+        )
+        self.assertEqual(outcome.final_text, "No findings.")
+        run_model_chain.assert_called_once()
+        environment.assert_called_once()
+        self.assertEqual(
+            (review.workspace_root / "staged.txt").read_text(encoding="utf-8"),
+            "staged source WIP\n",
+        )
+        self.assertEqual(
+            (review.workspace_root / "unstaged.txt").read_text(encoding="utf-8"),
+            "unstaged source WIP\n",
+        )
+        self.assertEqual(
+            (review.workspace_root / "untracked.txt").read_text(encoding="utf-8"),
+            "untracked source WIP\n",
+        )
+        self.assertFalse((review.workspace_root / "ignored.txt").exists())
+        preflight = json.loads(
+            (review.container_dir / "preflight.json").read_text(encoding="utf-8")
+        )
+        egress = json.loads(
+            (review.container_dir / "egress.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(egress["content_variant"], "source-wip")
+        self.assertTrue(egress["include_source_wip"])
+        for field in ("content_variant", "snapshot_tree_sha", "scope_identity"):
+            with self.subTest(field=field):
+                self.assertEqual(egress[field], preflight[field])
+                self.assertEqual(egress[field], getattr(review, field))
+        self.assertEqual(
+            egress["included"],
+            [
+                (
+                    "tracked blobs plus staged, unstaged, and nonignored untracked "
+                    "contents materialized from the digest-bound source WIP snapshot"
+                ),
+                (
+                    "the complete generated frozen diff through the source WIP "
+                    "snapshot without secret redaction"
+                ),
+                "the review prompt and result",
+            ],
+        )
+        self.assertEqual(
+            egress["excluded"],
+            [
+                (
+                    "ignored untracked files and source content not captured by the "
+                    "WIP snapshot"
+                ),
+                "unrelated repositories",
+                "broad workspace or home-directory content",
+            ],
+        )
+        self.assertNotIn("untracked files", egress["excluded"])
 
     @mock.patch.object(
         providers,

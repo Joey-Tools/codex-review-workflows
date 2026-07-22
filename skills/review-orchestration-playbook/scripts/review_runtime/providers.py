@@ -17168,6 +17168,64 @@ def run_review(
         )
 
 
+def _build_low_level_helper_egress_record(
+    review: ReviewWorkspace,
+    *,
+    egress_consent: str | None,
+) -> dict[str, Any]:
+    if review.content_variant == "head":
+        include_source_wip = False
+        included = [
+            "tracked blobs materialized from the frozen head commit",
+            "the complete generated frozen diff without secret redaction",
+            "the review prompt and result",
+        ]
+        excluded = [
+            "untracked files",
+            "unrelated repositories",
+            "broad workspace or home-directory content",
+        ]
+    elif review.content_variant == "source-wip":
+        include_source_wip = True
+        included = [
+            (
+                "tracked blobs plus staged, unstaged, and nonignored untracked "
+                "contents materialized from the digest-bound source WIP snapshot"
+            ),
+            (
+                "the complete generated frozen diff through the source WIP "
+                "snapshot without secret redaction"
+            ),
+            "the review prompt and result",
+        ]
+        excluded = [
+            "ignored untracked files and source content not captured by the WIP snapshot",
+            "unrelated repositories",
+            "broad workspace or home-directory content",
+        ]
+    else:
+        raise ReviewError("review egress record has an invalid content variant")
+    if include_source_wip != (review.content_variant == "source-wip"):
+        raise ReviewError("review egress WIP marker contradicts its content variant")
+
+    return {
+        "consent": egress_consent,
+        "reviewer": "low-level-helper",
+        "requested_helper_reviewer": "claude",
+        "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+        "named_lane_eligible": NAMED_LANE_ELIGIBLE,
+        "review_range": f"{review.base_ref}..{review.head_ref}",
+        "content_variant": review.content_variant,
+        "include_source_wip": include_source_wip,
+        "snapshot_tree_sha": review.snapshot_tree_sha,
+        "scope_identity": review.scope_identity,
+        "included": included,
+        "excluded": excluded,
+        "merge_gate": "secret-delta status is evaluated separately",
+        "preflight": "review workspace containment and integrity checks passed",
+    }
+
+
 def _run_review_with_binding(
     *,
     review: ReviewWorkspace,
@@ -17180,6 +17238,14 @@ def _run_review_with_binding(
         synthetic_evidence = validate_external_workspace(review) or {}
         preflight_evidence = build_preflight_evidence(review, synthetic_evidence)
         preflight_json = encode_preflight_json(preflight_evidence)
+        egress_record = (
+            _build_low_level_helper_egress_record(
+                review,
+                egress_consent=egress_consent,
+            )
+            if reviewer == "claude"
+            else None
+        )
         launch.freeze_prompt(review.prompt_file)
     except ReviewError as error:
         private_cleanup_error = remove_private_review_artifacts(
@@ -17215,32 +17281,11 @@ def _run_review_with_binding(
             preflight_json,
         )
 
-        if reviewer == "claude":
+        if egress_record is not None:
             write_json_atomic_at(
                 launch.container_descriptor,
                 "egress.json",
-                {
-                    "consent": egress_consent,
-                    "reviewer": "low-level-helper",
-                    "requested_helper_reviewer": "claude",
-                    "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
-                    "named_lane_eligible": NAMED_LANE_ELIGIBLE,
-                    "review_range": f"{review.base_ref}..{review.head_ref}",
-                    "included": [
-                        "tracked blobs materialized from the frozen head commit",
-                        "the complete generated frozen diff without secret redaction",
-                        "the review prompt and result",
-                    ],
-                    "excluded": [
-                        "untracked files",
-                        "unrelated repositories",
-                        "broad workspace or home-directory content",
-                    ],
-                    "merge_gate": "secret-delta status is evaluated separately",
-                    "preflight": (
-                        "review workspace containment and integrity checks passed"
-                    ),
-                },
+                egress_record,
             )
         review = launch.runtime_review(review)
     except ReviewError as error:
