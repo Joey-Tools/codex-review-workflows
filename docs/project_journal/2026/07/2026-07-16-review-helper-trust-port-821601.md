@@ -930,3 +930,24 @@ metadata behavior.
   format check reports only five pre-existing default-branch formatting
   deviations outside this workstream's added lines; they remain unchanged to
   avoid unrelated churn. No local Python 3.10 run was performed.
+- The first formal fresh-context Codex review of
+  `bea5e7ad1312be1c15a0af7785eda74a8fb5282d..863e72c9df881812a25d035c5e29c16a10a6b0f5`
+  found that preflight admitted the raw 4-MiB primary-diff limit without
+  charging canonical JSON escaping against the final 5-MiB evidence-bundle
+  limit. The repaired path briefly acquires the existing authenticated source
+  custody before attempt creation, reads and verifies the held diff, and uses
+  the same primary-only bundle constructor as the runtime. CJK, backslash,
+  exact serialized-boundary, invalid-content, and no-attempt CLI regressions
+  are now part of the fixed 345-test deterministic supervisor identity. That
+  gate passes all 345 tests in 149.728 seconds. A full Python 3.13 discovery ran
+  2,787 tests in 2,100.850 seconds with 6 expected skips; the only implementation
+  failure was the known nested Desktop `sandbox-exec` denial in the one-shot
+  keychain broker test, while the other failure was the stale repository
+  contract count updated in this same change. The exact repository-contract
+  regression then passed, and the exact broker test passed outside the Desktop
+  sandbox in 3.067 seconds. Python 3.13 compilation, Ruff lint, focused
+  formatting, both skill validators, project-journal validation, strict Linux
+  launcher C syntax, and `git diff --check` also pass. The whole-file Ruff
+  format check still reports the pre-existing `test_contracts.py` deviation;
+  this change does not reformat that unrelated file. No local Python 3.10 run
+  was performed.

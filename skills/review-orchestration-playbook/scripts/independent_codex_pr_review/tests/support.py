@@ -198,6 +198,7 @@ def build_helper_fixture(
     source_repo: pathlib.Path | None = None,
     base_sha: str | None = None,
     head_sha: str | None = None,
+    primary_diff: bytes | None = None,
 ) -> dict[str, object]:
     repo = source_repo or root / "repo"
     state_dir = root / "helper-state"
@@ -219,7 +220,11 @@ def build_helper_fixture(
         "changed-blob-findings.z": b"findings",
         "synthetic-secret-manifest.json": b"{}\n",
         "synthetic-changed-evidence.json": b"{}\n",
-        "review.diff": b"diff --git a/a.txt b/a.txt\n+new\n",
+        "review.diff": (
+            primary_diff
+            if primary_diff is not None
+            else b"diff --git a/a.txt b/a.txt\n+new\n"
+        ),
         "review.prompt": b"review\n",
     }
     artifact_records: list[dict[str, object]] = []

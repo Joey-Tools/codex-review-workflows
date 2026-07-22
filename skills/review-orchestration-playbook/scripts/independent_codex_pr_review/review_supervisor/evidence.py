@@ -28,6 +28,10 @@ class EvidenceError(ValueError):
     """The pre-launch evidence could not be authenticated or safely bundled."""
 
 
+class EvidenceBundleSizeError(EvidenceError):
+    """The canonical evidence bundle exceeds its serialized byte budget."""
+
+
 @dataclass(frozen=True)
 class ManifestEntry:
     path: str
@@ -193,7 +197,9 @@ class EvidenceBundle:
     def to_bytes(self) -> bytes:
         encoded = canonical_json(self.to_json())
         if len(encoded) > MAX_EVIDENCE_BUNDLE_BYTES:
-            raise EvidenceError("serialized evidence bundle exceeds its byte limit")
+            raise EvidenceBundleSizeError(
+                "serialized evidence bundle exceeds its byte limit"
+            )
         return encoded
 
 
@@ -271,6 +277,48 @@ def build_evidence_bundle(
         artifacts=tuple(artifacts),
         manifest_sha256=manifest.sha256,
         total_content_bytes=total,
+    )
+    bundle.to_bytes()
+    return bundle
+
+
+def build_primary_evidence_bundle(
+    content: bytes,
+    *,
+    expected_sha256: str,
+) -> EvidenceBundle:
+    if not isinstance(content, bytes):
+        raise EvidenceError("primary evidence content is not bytes")
+    if not 1 <= len(content) <= MAX_EVIDENCE_PRIMARY_BYTES:
+        raise EvidenceError("primary evidence exceeds its byte limit")
+    actual_sha256 = sha256_bytes(content)
+    if not _is_sha256(expected_sha256) or not hmac.compare_digest(
+        actual_sha256,
+        expected_sha256,
+    ):
+        raise EvidenceError("primary evidence digest is inconsistent")
+
+    entry = ManifestEntry(
+        path=PRIMARY_DIFF_RELATIVE_PATH,
+        kind="regular",
+        size=len(content),
+        sha256=actual_sha256,
+    )
+    manifest = AuthenticatedManifest.authenticate(
+        (entry,),
+        expected_sha256=manifest_sha256((entry,)),
+    )
+    artifact = EvidenceArtifact(
+        label="artifact-0000",
+        role="primary_diff",
+        content=_decode_text(content, "artifact-0000"),
+        length=len(content),
+        sha256=actual_sha256,
+    )
+    bundle = EvidenceBundle(
+        artifacts=(artifact,),
+        manifest_sha256=manifest.sha256,
+        total_content_bytes=len(content),
     )
     bundle.to_bytes()
     return bundle

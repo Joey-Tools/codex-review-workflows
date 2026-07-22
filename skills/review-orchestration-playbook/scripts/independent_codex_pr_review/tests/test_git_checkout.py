@@ -23,6 +23,7 @@ from review_supervisor.checkout import (
 )
 from review_supervisor.constants import (
     LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+    MAX_EVIDENCE_PRIMARY_BYTES,
     MAX_SYMLINK_BYTES,
     NAMED_LANE_ELIGIBLE,
     SCHEMA_VERSION,
@@ -1276,6 +1277,68 @@ class RawGitCheckoutTests(unittest.TestCase):
             self.assertEqual(payload["review_status"], "not-run")
             self.assertFalse(payload["created_attempt"])
             self.assertEqual(payload["review_range"], f"{base_sha}..{head_sha}")
+            self.assertEqual(tuple(checkouts.iterdir()), ())
+            self.assertEqual(
+                tuple(path.name for path in retention.iterdir()),
+                ("retention.lock",),
+            )
+
+    def test_cli_preflight_rejects_serialized_evidence_overflow_without_attempt(
+        self,
+    ) -> None:
+        with owned_temporary_directory("preflight-escaped-evidence-") as root:
+            repo, base_sha, head_sha = _build_repository(root)
+            fixture = build_helper_fixture(
+                root,
+                source_repo=repo,
+                base_sha=base_sha,
+                head_sha=head_sha,
+                primary_diff="界".encode() * (MAX_EVIDENCE_PRIMARY_BYTES // 3),
+            )
+            retention = root / "retention"
+            checkouts = root / "checkouts"
+            entrypoint = (
+                pathlib.Path(__file__).resolve().parent.parent
+                / "independent-codex-pr-review"
+            )
+            completed = subprocess.run(
+                (
+                    sys.executable,
+                    str(entrypoint),
+                    "preflight",
+                    "--helper-state",
+                    str(fixture["state_dir"]),
+                    "--repo",
+                    str(repo),
+                    "--base",
+                    base_sha,
+                    "--head",
+                    head_sha,
+                    "--pr-url",
+                    "https://github.example/owner/repo/pull/1",
+                    "--retention-root",
+                    str(retention),
+                    "--checkout-parent",
+                    str(checkouts),
+                    "--codex",
+                    "/usr/bin/true",
+                ),
+                cwd=pathlib.Path(__file__).resolve().parent.parent,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=30,
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertEqual(payload["overall_status"], "blocked")
+            self.assertEqual(payload["failure_stage"], "evidence-admission")
+            self.assertEqual(
+                payload["failure_code"],
+                "primary-evidence-size-invalid",
+            )
             self.assertEqual(tuple(checkouts.iterdir()), ())
             self.assertEqual(
                 tuple(path.name for path in retention.iterdir()),

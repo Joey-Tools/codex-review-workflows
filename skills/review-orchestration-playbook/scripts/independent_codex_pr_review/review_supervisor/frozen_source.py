@@ -23,11 +23,9 @@ from .custody import (
     _validate_runner_complete,
 )
 from .evidence import (
-    AuthenticatedManifest,
-    EvidenceArtifact,
+    EvidenceError,
     EvidenceBundle,
-    ManifestEntry,
-    manifest_sha256,
+    build_primary_evidence_bundle,
 )
 from .models import Identity
 from .secureio import (
@@ -63,17 +61,6 @@ class FrozenSourceCustody:
     def build_bundle(self) -> EvidenceBundle:
         if self._closed:
             raise FrozenSourceError("frozen source custody is closed")
-        entry = ManifestEntry(
-            path=PRIMARY_DIFF_RELATIVE_PATH,
-            kind="regular",
-            size=self.diff_size,
-            sha256=self.diff_sha256,
-        )
-        expected_manifest = manifest_sha256((entry,))
-        manifest = AuthenticatedManifest.authenticate(
-            (entry,),
-            expected_sha256=expected_manifest,
-        )
         content = read_fd_exact(
             self.diff_fd,
             max_bytes=MAX_EVIDENCE_PRIMARY_BYTES,
@@ -82,21 +69,14 @@ class FrozenSourceCustody:
         if sha256_bytes(content) != self.diff_sha256:
             raise FrozenSourceError("held retained diff changed after authentication")
         try:
-            text = content.decode("utf-8", "strict")
-        except UnicodeDecodeError as error:
-            raise FrozenSourceError("held retained diff is not UTF-8") from error
-        artifact = EvidenceArtifact(
-            label="artifact-0000",
-            role="primary_diff",
-            content=text,
-            length=self.diff_size,
-            sha256=self.diff_sha256,
-        )
-        return EvidenceBundle(
-            artifacts=(artifact,),
-            manifest_sha256=manifest.sha256,
-            total_content_bytes=self.diff_size,
-        )
+            return build_primary_evidence_bundle(
+                content,
+                expected_sha256=self.diff_sha256,
+            )
+        except EvidenceError as error:
+            raise FrozenSourceError(
+                "held retained diff cannot be serialized as reviewer evidence"
+            ) from error
 
     def close(self) -> None:
         if self._closed:

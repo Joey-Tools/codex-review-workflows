@@ -28,12 +28,21 @@ from .constants import (
     REVIEWER_RUNTIME_SECONDS,
     UNSUPPORTED_CLAUSES,
 )
-from .custody import CustodyHandles, authenticate_helper_state
+from .custody import (
+    CustodyHandles,
+    acquire_source_custody,
+    authenticate_helper_state,
+)
 from .errors import (
     SupervisorError,
     UnprovenDirectHelperClosure,
     blocked,
     inconclusive,
+)
+from .evidence import (
+    EvidenceBundleSizeError,
+    EvidenceError,
+    build_primary_evidence_bundle,
 )
 from .gitraw import (
     GitProcessClosureUnproven,
@@ -49,7 +58,7 @@ from .ledger import (
     read_attempt_state,
     reconcile_ledger,
 )
-from .models import Identity
+from .models import HelperCustody, Identity
 from .process import (
     ForkedProcessClosureUnproven,
     SpawnedProcess,
@@ -205,6 +214,66 @@ def _require_primary_evidence_budget(diff_length: int) -> None:
         )
 
 
+def _read_authenticated_primary_evidence(
+    helper: HelperCustody,
+    *,
+    repo: pathlib.Path,
+) -> bytes:
+    _require_primary_evidence_budget(helper.diff_length)
+    handles: CustodyHandles | None = None
+    try:
+        handles = acquire_source_custody(
+            expected=helper,
+            repo=repo,
+            deadline=time.monotonic() + HANDOFF_SECONDS,
+        )
+        content = read_fd_exact(
+            handles.source_fd,
+            max_bytes=MAX_EVIDENCE_PRIMARY_BYTES,
+            expected_size=helper.diff_length,
+        )
+        if identity_from_stat(os.fstat(handles.source_fd)) != helper.source_identity:
+            raise ValueError("primary diff identity changed while it was read")
+        if sha256_bytes(content) != helper.diff_sha256:
+            raise ValueError("primary diff digest changed after authentication")
+        return content
+    except SupervisorError:
+        raise
+    except (OSError, ValueError) as error:
+        raise blocked(
+            "Primary diff cannot be reauthenticated for evidence admission",
+            stage="evidence-admission",
+            code="primary-evidence-invalid",
+        ) from error
+    finally:
+        if handles is not None:
+            handles.close()
+
+
+def _require_primary_serialized_evidence_budget(
+    content: bytes,
+    *,
+    expected_sha256: str,
+) -> None:
+    try:
+        build_primary_evidence_bundle(
+            content,
+            expected_sha256=expected_sha256,
+        )
+    except EvidenceBundleSizeError as error:
+        raise blocked(
+            "Primary diff does not fit the serialized reviewer evidence budget",
+            stage="evidence-admission",
+            code="primary-evidence-size-invalid",
+        ) from error
+    except EvidenceError as error:
+        raise blocked(
+            "Primary diff is not valid serialized reviewer evidence",
+            stage="evidence-admission",
+            code="primary-evidence-invalid",
+        ) from error
+
+
 def prepare_run(
     *,
     helper_state: pathlib.Path,
@@ -225,7 +294,11 @@ def prepare_run(
         base_sha=base_sha,
         head_sha=head_sha,
     )
-    _require_primary_evidence_budget(helper.diff_length)
+    primary_evidence = _read_authenticated_primary_evidence(helper, repo=repo)
+    _require_primary_serialized_evidence_budget(
+        primary_evidence,
+        expected_sha256=helper.diff_sha256,
+    )
     repository = inspect_repository(
         repo=repo,
         base_sha=base_sha,

@@ -18,6 +18,7 @@ from review_supervisor.constants import (
     RELEASED_TTL_SECONDS,
     SCHEMA_VERSION,
 )
+from review_supervisor.evidence import build_primary_evidence_bundle
 from review_supervisor.errors import SupervisorError, blocked
 from review_supervisor.gitraw import GitProcessClosureUnproven
 from review_supervisor.ledger import (
@@ -47,6 +48,7 @@ from review_supervisor.supervisor import (
     _publish_final_authorization,
     _reclaim_released_attempts,
     _require_primary_evidence_budget,
+    _require_primary_serialized_evidence_budget,
     _resolve_codex,
     _settle_rewritten_process_charge,
     _terminate_incomplete_handoff,
@@ -108,6 +110,68 @@ class PreflightAdmissionTests(unittest.TestCase):
 
     def test_accepts_primary_diff_at_final_evidence_limit(self) -> None:
         _require_primary_evidence_budget(MAX_EVIDENCE_PRIMARY_BYTES)
+
+    def test_rejects_primary_diff_after_json_escaping_expands_the_bundle(self) -> None:
+        cases = (
+            ("cjk", "界".encode() * (MAX_EVIDENCE_PRIMARY_BYTES // 3)),
+            ("backslash", b"\\" * (3 * 1024 * 1024)),
+        )
+        for label, content in cases:
+            with (
+                self.subTest(label=label),
+                self.assertRaises(SupervisorError) as caught,
+            ):
+                _require_primary_serialized_evidence_budget(
+                    content,
+                    expected_sha256=sha256_bytes(content),
+                )
+
+            self.assertEqual(caught.exception.failure.stage, "evidence-admission")
+            self.assertEqual(
+                caught.exception.failure.code,
+                "primary-evidence-size-invalid",
+            )
+
+    def test_accepts_primary_diff_at_exact_serialized_bundle_limit(self) -> None:
+        content = ("界\\" * 40).encode()
+        bundle = build_primary_evidence_bundle(
+            content,
+            expected_sha256=sha256_bytes(content),
+        )
+        serialized_size = len(canonical_json(bundle.to_json()))
+
+        with mock.patch(
+            "review_supervisor.evidence.MAX_EVIDENCE_BUNDLE_BYTES",
+            serialized_size,
+        ):
+            _require_primary_serialized_evidence_budget(
+                content,
+                expected_sha256=sha256_bytes(content),
+            )
+        with (
+            mock.patch(
+                "review_supervisor.evidence.MAX_EVIDENCE_BUNDLE_BYTES",
+                serialized_size - 1,
+            ),
+            self.assertRaises(SupervisorError),
+        ):
+            _require_primary_serialized_evidence_budget(
+                content,
+                expected_sha256=sha256_bytes(content),
+            )
+
+    def test_rejects_invalid_primary_content_separately_from_bundle_size(self) -> None:
+        with self.assertRaises(SupervisorError) as caught:
+            _require_primary_serialized_evidence_budget(
+                b"\xff",
+                expected_sha256=sha256_bytes(b"\xff"),
+            )
+
+        self.assertEqual(caught.exception.failure.stage, "evidence-admission")
+        self.assertEqual(
+            caught.exception.failure.code,
+            "primary-evidence-invalid",
+        )
 
     def test_rejects_missing_and_nonexecutable_codex_paths(self) -> None:
         with owned_temporary_directory("codex-preflight-") as root:
