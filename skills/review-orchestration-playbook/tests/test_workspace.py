@@ -1294,8 +1294,11 @@ class WorkspaceTest(unittest.TestCase):
                 wraps=original_popen,
             ) as launched,
         ):
-            workspace_runtime._source_index_snapshot(source_inspection)
-            workspace_runtime._reject_source_head_gitlinks(source_inspection)
+            index_snapshot = workspace_runtime._source_index_snapshot(source_inspection)
+            workspace_runtime._require_unchanged_source_gitlinks(
+                source_inspection,
+                index_snapshot,
+            )
             status_bytes = workspace_runtime._source_status(source_inspection)
             workspace_runtime._source_wip_paths(source_inspection, status_bytes)
 
@@ -1309,6 +1312,13 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(len(source_commands), 4)
         for command in source_commands:
             self.assertIn("core.commitGraph=false", command)
+        for subcommand in ("status", "diff"):
+            matching = [command for command in source_commands if subcommand in command]
+            self.assertEqual(len(matching), 1)
+            self.assertIn("--ignore-submodules=all", matching[0])
+        self.assertFalse(
+            any("--ignore-submodules=none" in command for command in source_commands)
+        )
 
     def test_clean_and_wip_respect_source_info_exclude(self) -> None:
         raw_info_exclude = pathlib.Path(
@@ -3596,7 +3606,7 @@ class WorkspaceTest(unittest.TestCase):
                     include_source_wip=include_source_wip,
                 )
 
-    def test_clean_and_wip_reject_committed_gitlink_before_status(
+    def test_clean_and_wip_allow_unchanged_uninitialized_gitlink(
         self,
     ) -> None:
         git(
@@ -3609,6 +3619,49 @@ class WorkspaceTest(unittest.TestCase):
         git(self.repo, "commit", "-m", "Add gitlink")
         gitlink_head = git(self.repo, "rev-parse", "HEAD")
 
+        for include_source_wip in (False, True):
+            with self.subTest(include_source_wip=include_source_wip):
+                if include_source_wip:
+                    (self.repo / "wip-note.txt").write_text(
+                        "ordinary source WIP beside an unchanged gitlink\n",
+                        encoding="utf-8",
+                    )
+                review = prepare_workspace(
+                    repo=self.repo,
+                    base_ref=self.head,
+                    head_ref=gitlink_head,
+                    include_source_wip=include_source_wip,
+                )
+                self.reviews.append(review)
+                materialized = review.workspace_root / "nested-submodule"
+                self.assertTrue(materialized.is_dir())
+                self.assertEqual(list(materialized.iterdir()), [])
+                self.assertIn(
+                    f"Subproject commit {self.head}".encode(),
+                    review.diff_file.read_bytes(),
+                )
+                if include_source_wip:
+                    self.assertEqual(
+                        (review.workspace_root / "wip-note.txt").read_text(
+                            encoding="utf-8"
+                        ),
+                        "ordinary source WIP beside an unchanged gitlink\n",
+                    )
+                else:
+                    self.assertFalse((review.workspace_root / "wip-note.txt").exists())
+                validate_external_workspace(review)
+
+    def test_clean_and_wip_reject_staged_gitlink_addition_before_status(
+        self,
+    ) -> None:
+        git(
+            self.repo,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{self.head},nested-submodule",
+        )
+
         source_git_output = workspace_runtime._bounded_source_git_output
         for include_source_wip in (False, True):
             with (
@@ -3620,19 +3673,132 @@ class WorkspaceTest(unittest.TestCase):
                 ) as inspected,
                 self.assertRaisesRegex(
                     ReviewError,
-                    "source index contains a gitlink",
+                    "source index gitlinks do not match source HEAD",
+                ),
+            ):
+                prepare_workspace(
+                    repo=self.repo,
+                    base_ref=self.base,
+                    head_ref=self.head,
+                    include_source_wip=include_source_wip,
+                )
+            self.assertEqual(
+                [call.args[1] for call in inspected.call_args_list],
+                ["ls-files", "ls-tree"],
+            )
+
+    def test_clean_and_wip_reject_regular_to_gitlink_replacement_before_status(
+        self,
+    ) -> None:
+        git(
+            self.repo,
+            "update-index",
+            "--cacheinfo",
+            f"160000,{self.head},example.txt",
+        )
+
+        source_git_output = workspace_runtime._bounded_source_git_output
+        for include_source_wip in (False, True):
+            with (
+                self.subTest(include_source_wip=include_source_wip),
+                mock.patch.object(
+                    workspace_runtime,
+                    "_bounded_source_git_output",
+                    wraps=source_git_output,
+                ) as inspected,
+                self.assertRaisesRegex(
+                    ReviewError,
+                    "source index gitlinks do not match source HEAD",
+                ),
+            ):
+                prepare_workspace(
+                    repo=self.repo,
+                    base_ref=self.base,
+                    head_ref=self.head,
+                    include_source_wip=include_source_wip,
+                )
+            self.assertEqual(
+                [call.args[1] for call in inspected.call_args_list],
+                ["ls-files", "ls-tree"],
+            )
+
+    def test_clean_and_wip_reject_symlink_to_gitlink_replacement_before_status(
+        self,
+    ) -> None:
+        os.symlink("example.txt", self.repo / "example-link")
+        git(self.repo, "add", "example-link")
+        git(self.repo, "commit", "-m", "Add symlink")
+        symlink_head = git(self.repo, "rev-parse", "HEAD")
+        git(
+            self.repo,
+            "update-index",
+            "--cacheinfo",
+            f"160000,{self.head},example-link",
+        )
+
+        source_git_output = workspace_runtime._bounded_source_git_output
+        for include_source_wip in (False, True):
+            with (
+                self.subTest(include_source_wip=include_source_wip),
+                mock.patch.object(
+                    workspace_runtime,
+                    "_bounded_source_git_output",
+                    wraps=source_git_output,
+                ) as inspected,
+                self.assertRaisesRegex(
+                    ReviewError,
+                    "source index gitlinks do not match source HEAD",
                 ),
             ):
                 prepare_workspace(
                     repo=self.repo,
                     base_ref=self.head,
-                    head_ref=gitlink_head,
+                    head_ref=symlink_head,
                     include_source_wip=include_source_wip,
                 )
-            self.assertEqual(inspected.call_count, 1)
-            self.assertEqual(inspected.call_args.args[1], "ls-files")
+            self.assertEqual(
+                [call.args[1] for call in inspected.call_args_list],
+                ["ls-files", "ls-tree"],
+            )
 
-    def test_clean_and_wip_reject_head_gitlink_after_staged_replacement(
+    def test_clean_source_rechecks_index_after_status(self) -> None:
+        git(
+            self.repo,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{self.head},nested-submodule",
+        )
+        git(self.repo, "commit", "-m", "Add gitlink")
+        gitlink_head = git(self.repo, "rev-parse", "HEAD")
+        source_status = workspace_runtime._source_status
+
+        def mutate_index_after_status(*args, **kwargs):
+            result = source_status(*args, **kwargs)
+            git(
+                self.repo,
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                f"160000,{self.base},nested-submodule",
+            )
+            return result
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "_source_status",
+                side_effect=mutate_index_after_status,
+            ),
+            self.assertRaisesRegex(ReviewError, "source index changed"),
+        ):
+            prepare_workspace(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=gitlink_head,
+            )
+
+    def test_clean_and_wip_reject_staged_gitlink_delete_update_and_replacement(
         self,
     ) -> None:
         git(
@@ -3657,7 +3823,7 @@ class WorkspaceTest(unittest.TestCase):
                     ) as inspected,
                     self.assertRaisesRegex(
                         ReviewError,
-                        "source HEAD tree contains a gitlink",
+                        "source index gitlinks do not match source HEAD",
                     ),
                 ):
                     prepare_workspace(
@@ -3674,6 +3840,16 @@ class WorkspaceTest(unittest.TestCase):
         git(self.repo, "update-index", "--force-remove", "nested-submodule")
         assert_rejected_before_status()
 
+        git(
+            self.repo,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{self.base},nested-submodule",
+        )
+        assert_rejected_before_status()
+
+        git(self.repo, "update-index", "--force-remove", "nested-submodule")
         (self.repo / "nested-submodule").write_text(
             "replace gitlink with a regular file\n",
             encoding="utf-8",
@@ -8414,27 +8590,31 @@ class WorkspaceTest(unittest.TestCase):
         git(self.repo, "add", gitlink_path)
         git(self.repo, "commit", "-m", "Update external gitlink")
         gitlink_head = git(self.repo, "rev-parse", "HEAD")
-        self.assertEqual(git(checkout, "rev-parse", "HEAD"), submodule_head)
-
-        previous_cwd = pathlib.Path.cwd()
-        source = self.clean_source_worktree()
-        try:
-            os.chdir(source)
+        local_marker = b"LOCAL_DIRTY_SUBMODULE_CONTENT_MARKER_123456\n"
+        for include_source_wip in (False, True):
+            if include_source_wip:
+                git(checkout, "checkout", "--detach", submodule_head)
+                (checkout / "foreign.txt").write_bytes(marker + local_marker)
+            else:
+                git(checkout, "checkout", "--detach", submodule_base)
             review = prepare_workspace(
-                repo=source,
+                repo=self.repo,
                 base_ref=gitlink_base,
                 head_ref=gitlink_head,
+                include_source_wip=include_source_wip,
             )
             self.reviews.append(review)
-        finally:
-            os.chdir(previous_cwd)
-        diff = review.diff_file.read_bytes()
+            diff = review.diff_file.read_bytes()
 
-        self.assertIn(f"Subproject commit {submodule_base}".encode(), diff)
-        self.assertIn(f"Subproject commit {submodule_head}".encode(), diff)
-        self.assertNotIn(marker.rstrip(), diff)
-        self.assertNotIn(b"diff --git a/vendor/external/foreign.txt", diff)
-        validate_external_workspace(review)
+            self.assertIn(f"Subproject commit {submodule_base}".encode(), diff)
+            self.assertIn(f"Subproject commit {submodule_head}".encode(), diff)
+            self.assertNotIn(marker.rstrip(), diff)
+            self.assertNotIn(local_marker.rstrip(), diff)
+            self.assertNotIn(b"diff --git a/vendor/external/foreign.txt", diff)
+            materialized = review.workspace_root / gitlink_path
+            self.assertTrue(materialized.is_dir())
+            self.assertEqual(list(materialized.iterdir()), [])
+            validate_external_workspace(review)
 
     def test_new_secret_shaped_gitlink_path_is_an_admission_violation(self) -> None:
         secret = "sk-" + "G" * 40

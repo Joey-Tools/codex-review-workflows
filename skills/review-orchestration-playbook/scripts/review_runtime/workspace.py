@@ -14511,12 +14511,7 @@ def _source_index_snapshot(
         if not separator or len(fields) != 3:
             raise ReviewError("source index-flag metadata is malformed")
         raw_mode, raw_object_id, raw_stage = fields
-        if raw_mode == b"160000":
-            raise ReviewError(
-                "source index contains a gitlink; submodule source inspection is "
-                "not supported"
-            )
-        if raw_mode not in {b"100644", b"100755", b"120000"}:
+        if raw_mode not in {b"100644", b"100755", b"120000", b"160000"}:
             raise ReviewError("source index contains an unsupported mode")
         if raw_stage != b"0":
             raise ReviewError("source index contains an unmerged entry")
@@ -14533,8 +14528,9 @@ def _source_index_snapshot(
     return metadata_by_path
 
 
-def _reject_source_head_gitlinks(
+def _require_unchanged_source_gitlinks(
     context: SourceInspectionGitContext,
+    index_snapshot: Mapping[bytes, tuple[str, str]],
     *,
     capture_budget: SourceWipCaptureBudget | None = None,
 ) -> None:
@@ -14553,26 +14549,53 @@ def _reject_source_head_gitlinks(
     )
     if value and not value.endswith(b"\0"):
         raise ReviewError("unterminated source HEAD tree metadata")
+    object_id_length = len(context.head_sha)
+    lowercase_hex = b"0123456789abcdef"
+    head_gitlinks: dict[bytes, str] = {}
     for record in value.split(b"\0")[:-1]:
-        metadata, separator, _raw_path = record.partition(b"\t")
+        metadata, separator, raw_path = record.partition(b"\t")
         fields = metadata.split(b" ")
         if not separator or len(fields) != 3:
             raise ReviewError("source HEAD tree metadata is malformed")
-        if fields[0] == b"160000":
-            raise ReviewError(
-                "source HEAD tree contains a gitlink; submodule source inspection "
-                "is not supported"
-            )
+        raw_mode, raw_object_type, raw_object_id = fields
+        if raw_mode not in {b"100644", b"100755", b"120000", b"160000"}:
+            raise ReviewError("source HEAD tree contains an unsupported mode")
+        expected_object_type = b"commit" if raw_mode == b"160000" else b"blob"
+        if raw_object_type != expected_object_type:
+            raise ReviewError("source HEAD tree metadata is malformed")
+        if len(raw_object_id) != object_id_length or any(
+            byte not in lowercase_hex for byte in raw_object_id
+        ):
+            raise ReviewError("source HEAD tree object id is malformed")
+        if not raw_path:
+            raise ReviewError("source HEAD tree path metadata is malformed")
+        if raw_mode == b"160000":
+            if raw_path in head_gitlinks:
+                raise ReviewError("source HEAD tree path metadata is malformed")
+            head_gitlinks[raw_path] = raw_object_id.decode("ascii")
+
+    index_gitlinks = {
+        raw_path: object_id
+        for raw_path, (mode, object_id) in index_snapshot.items()
+        if mode == "160000"
+    }
+    if index_gitlinks != head_gitlinks:
+        raise ReviewError(
+            "source index gitlinks do not match source HEAD; staged gitlink "
+            "changes are not supported"
+        )
 
 
 def _require_clean_source(context: SourceInspectionGitContext) -> None:
-    _source_index_snapshot(context)
-    _reject_source_head_gitlinks(context)
+    index_snapshot = _source_index_snapshot(context)
+    _require_unchanged_source_gitlinks(context, index_snapshot)
     if _source_status(context):
         raise ReviewError(
             "source repository has staged, unstaged, or nonignored untracked "
             "changes; commit or clean them, or explicitly use --include-source-wip"
         )
+    if _source_index_snapshot(context) != index_snapshot:
+        raise ReviewError("source index changed while clean source was verified")
 
 
 def _parse_wip_path(raw_path: bytes) -> pathlib.PurePosixPath:
@@ -14722,7 +14745,7 @@ def _source_final_worktree_paths(
         "--no-renames",
         "--no-ext-diff",
         "--no-textconv",
-        "--ignore-submodules=none",
+        "--ignore-submodules=all",
         context.head_sha,
         "--",
         byte_limit=MAX_SOURCE_TRACKED_PATH_BYTES,
@@ -15767,8 +15790,9 @@ def prepare_workspace(
                 source_inspection,
                 capture_budget=source_wip_capture_budget,
             )
-            _reject_source_head_gitlinks(
+            _require_unchanged_source_gitlinks(
                 source_inspection,
+                source_wip_index_snapshot,
                 capture_budget=source_wip_capture_budget,
             )
             source_status = _source_status(

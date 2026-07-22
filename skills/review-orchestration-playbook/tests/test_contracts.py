@@ -1111,6 +1111,18 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("source checkout", helper)
         self.assertIn("original source `HEAD`", helper)
         self.assertIn("WIP deletion or reversion", helper)
+        self.assertIn(
+            "match exactly between the source `HEAD` tree and active index",
+            helper,
+        )
+        self.assertIn(
+            "Top-level source queries ignore initialized submodule worktree state",
+            helper,
+        )
+        self.assertIn(
+            "never read nested content or local Git configuration",
+            helper,
+        )
 
         readiness = policies["pr-readiness.md"]
         self.assertIn("clean Git worktree", readiness)
