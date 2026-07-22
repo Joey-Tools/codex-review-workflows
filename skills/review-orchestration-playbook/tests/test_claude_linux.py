@@ -2782,6 +2782,7 @@ class CredentialStagingTest(unittest.TestCase):
         self.assertTrue(all(path.is_dir() for path in lease.paths))
         self._assert_refresh_lock_descriptors_closed(lease)
         self.assertIsNotNone(snapshot.diagnostic)
+
     def test_private_credential_update_forces_mode_under_restrictive_umask(
         self,
     ) -> None:
@@ -3639,9 +3640,7 @@ class CredentialStagingTest(unittest.TestCase):
             def settle_residue() -> None:
                 pausing_lock.settlement_thread_id = threading.get_ident()
                 try:
-                    results.append(
-                        anchor.settle_descriptor_bound_residue(requested)
-                    )
+                    results.append(anchor.settle_descriptor_bound_residue(requested))
                 except BaseException as error:
                     failures.append(error)
 
@@ -10425,9 +10424,7 @@ class CredentialStagingTest(unittest.TestCase):
             lease,
         ):
             assert lease is not None
-            handoff = claude_refresh_lock._OperationLockHandoff(
-                lease._operation_lock
-            )
+            handoff = claude_refresh_lock._OperationLockHandoff(lease._operation_lock)
             lease._publish_operation_handoff(handoff)
             handoff.acquire(
                 timeout=0.01,
@@ -10544,7 +10541,9 @@ class CredentialStagingTest(unittest.TestCase):
 
                     def retain_source_without_settling_lease() -> None:
                         coordinator._retaining = True
-                        coordinator._retention_reason = "injected terminal proof failure"
+                        coordinator._retention_reason = (
+                            "injected terminal proof failure"
+                        )
                         coordinator._retain_source_anchor()
 
                     def release() -> None:
@@ -10623,9 +10622,7 @@ class CredentialStagingTest(unittest.TestCase):
                 coordinator._terminal_errors = ()
                 coordinator._cleanup_terminal_proven = True
                 coordinator._cleanup_terminal_diagnostic = None
-                coordinator._phase = (
-                    claude_linux._HostRefreshLockCleanupPhase.TERMINAL
-                )
+                coordinator._phase = claude_linux._HostRefreshLockCleanupPhase.TERMINAL
 
             with (
                 mock.patch.object(
@@ -10962,8 +10959,7 @@ class CredentialStagingTest(unittest.TestCase):
                     side_effect=OSError("injected persistent source handoff"),
                 ),
                 self._interrupt_attribute_assignment(
-                    claude_linux._CredentialDirectoryAnchor
-                    ._descriptor_residue_diagnostic_locked,
+                    claude_linux._CredentialDirectoryAnchor._descriptor_residue_diagnostic_locked,
                     target=source_anchor,
                     attribute_name="_descriptor_residue_diagnostic",
                     error=control_flow,
@@ -11067,10 +11063,7 @@ class CredentialStagingTest(unittest.TestCase):
             control_flow = KeyboardInterrupt(
                 "injected source-anchor residue diagnostic read interruption"
             )
-            real_diagnostic_getter = (
-                claude_linux._CredentialDirectoryAnchor
-                .descriptor_residue_diagnostic.fget
-            )
+            real_diagnostic_getter = claude_linux._CredentialDirectoryAnchor.descriptor_residue_diagnostic.fget
             assert real_diagnostic_getter is not None
             diagnostic_reads = 0
 
@@ -11286,9 +11279,7 @@ class CredentialStagingTest(unittest.TestCase):
 
             def retain() -> None:
                 try:
-                    coordinator.retain(
-                        reason="injected ordinary-worker terminal proof"
-                    )
+                    coordinator.retain(reason="injected ordinary-worker terminal proof")
                 except BaseException as error:
                     retain_failures.append(error)
 

@@ -32,7 +32,7 @@ guarded writeback, recovery, or prompt contract.
 
 The direct canonical lane and the low-level helper are separate launch paths.
 For named double/triple review, follow `canonical-claude-lane.md`: use a clean
-Git worktree, no prepared diff, explicit tracked guidance reads, and a fresh
+detached Git worktree, no prepared diff, explicit tracked guidance reads, and a fresh
 `claude` process launched from the trusted supervisor's guard-created snapshot.
 Its **Canonical Executable Provenance** section owns the direct lane's complete
 executable contract: verify the installed source against the signed release
@@ -71,13 +71,16 @@ does not confer those guarantees and cannot make an
 The canonical lane's machine control path is also separate from the env-shebang
 compatibility wrappers. Invoke the trusted absolute Python interpreter with
 `-I -B -S` and `named_lane_guard preflight-claude` for compatible-version and provenance selection,
-then `named_lane_guard run-claude` for launch/process supervision, and only after
+then `named_lane_guard run-claude` for launch/process supervision, only after
 successful cleanup invoke `named_lane_guard validate-claude-stream` for terminal
-output classification. The default guard profile retains its exact three-module
-raw closure; the two additional subcommands select only their declared
-manifest-bound raw-source and companion profiles, including the version-policy,
-capability, stream-compatibility, and audited-baseline dependencies. None uses ordinary package import
-resolution, and launch supervision and output validation cannot replace one
+artifact classification, and only after validator acceptance invoke the
+manifest-bound `named_lane_guard classify-review-result` profile for semantic
+disposition. The default guard profile retains its exact three-module raw closure;
+the three additional subcommands select only their declared manifest-bound
+raw-source and companion profiles, including the version-policy, capability,
+stream-compatibility, audited-baseline, closed-profile-schema, and result-classifier
+dependencies. None uses ordinary package import resolution, and launch
+supervision, output validation, and post-acceptance disposition cannot replace one
 another.
 
 The formal preflight does not inherit or trust ambient `HOME`. The guard derives
@@ -91,10 +94,14 @@ Concretely, `preflight-claude` raw-loads the exact provenance closure plus
 `review_runtime.claude_version_policy`, `review_runtime.claude_capabilities`,
 `review_runtime.claude_stream_contract`, and
 `review_runtime.named_claude_preflight`. `validate-claude-stream` raw-loads the
-standalone validator plus its exact required runtime-source closure. The guard
+standalone validator plus its exact required runtime-source closure.
+`classify-review-result` binds and revalidates the exact
+`review_runtime.review_result` source before executing its already loaded
+classifier. The guard
 binds and revalidates `review_runtime/claude_code_release.asc`,
 `references/claude-stream-compatibility.json`,
-`references/claude-2.1.212-stream-schema.json`, and the manifest-bound
+`references/claude-2.1.212-stream-schema.json`,
+`references/claude-stream-schema.json`, and the manifest-bound
 capability-contract source bytes. Companion revalidation repeats
 no-follow descriptor/type safety checks and compares the complete bounded bytes;
 a safe ordinary-file replacement with identical content is harmless, and no
@@ -102,7 +109,7 @@ persistent `dev`/`ino` identity is required across the two reads. The provenance
 consumer verifies with the immutable release-key bytes captured by the guard's
 initial validated read and never reopens that path after final validation.
 The stream-contract and validator consumers parse the immutable compatibility,
-baseline, and capability bytes from the guard's initial validated reads without
+baseline, profile-schema, and capability bytes from the guard's initial validated reads without
 reopening those paths after final validation. Neither profile reads or executes its env-shebang
 compatibility wrapper or needs an extra `--` separator before its downstream
 arguments.
@@ -140,12 +147,13 @@ provider.
 
 For the accepted real-`HOME` native-sandbox review design, keep these layers distinct:
 
-- Real `HOME` is the trusted ordinary Claude CLI control plane. The canonical lane's clean detached Git worktree, or the low-level helper's explicitly labeled detached scope, is the authorized review scope for its respective launch path.
+- For the canonical direct lane, real `HOME` is the trusted ordinary Claude CLI control plane and its clean detached Git worktree is the review scope. The low-level helper instead uses its supplied-diff/private-Git workspace and, for local login, its broker/carrier/catalog transaction; those helper guarantees do not transfer to the direct lane.
 - The model may receive `Read`, `Grep`, `Glob`, and sandboxed `Bash`, with read-only behavior required by the prompt and permission contract.
 - Launch must request global `denyWrite` and critical-sensitive-root `denyRead` for credential/configuration roots, the original source checkout, other review-state roots, `/proc`, and `/dev`; those requested controls define the native-sandbox enforcement boundary. A canonical worktree's registered Git metadata/object paths remain part of its logical read-only scope even when their physical storage is outside the worktree directory.
 - Native-sandbox `allowRead` entries are exceptions within a selected-deny policy, not a global host-read whitelist. Sandboxed Bash can technically read a host path that is outside the detached worktree when that path is not covered by `denyRead`. The prompt/model scope therefore explicitly forbids all outside-workspace reads; do not describe the selected-deny policy as re-opening only the current workspace or private Git view.
 - Capability probes and the first `system/init` event report only their documented fields. They do not prove the final merged native-sandbox configuration, merged admin-managed permission arrays, or path-rule evaluation; that limitation applies even to Claude Code 2.1.212 baseline output. Persist sandbox controls as requested configuration and do not promote init/capability output into independent evidence of effective enforcement.
 - For the canonical direct lane, require exactly one leading `system/init` and one trailing terminal `result`, plus the preflight-bound compatibility fields defined in `canonical-claude-lane.md`. Missing, duplicate, malformed, misordered, or mismatched observable evidence must fail closed. This strict envelope proves only reported invocation fields and still does not attest the merged sandbox, managed permission arrays, or path evaluation.
+- Select the closed `legacy-base` stream profile for `>=2.1.211,<2.1.216` and the closed `extended-2x` profile for `>=2.1.216,<3.0.0`. Both profiles validate every admitted intermediate event against a closed, session-bound contract; unknown init, intermediate, terminal, or nested fields fail closed. Both the direct lane and low-level helper pass captured Claude output through this canonical validator after their distinct workspace, sandbox, and authentication preparation.
 - Post-attempt worktree validation can prove the inspected worktree and private Git state are unchanged at validation time. It cannot prove that no transient write or outside-workspace read/side effect occurred.
 
 This boundary is an accepted model-behavior tradeoff, not full host-read isolation. A stronger outer sandbox may add protection, but must not be inferred from selected `denyRead` / `allowRead` settings or init output.
@@ -156,7 +164,8 @@ This boundary is an accepted model-behavior tradeoff, not full host-read isolati
   checks pass. For the low-level helper only, local-login refresh writeback
   additionally requires an exact version/platform/SHA-256 entry from the signed
   artifact in the credential-lock protocol catalog. The canonical direct lane
-  uses the ordinary control-plane contract above instead.
+  uses the ordinary control-plane contract above instead, and helper explicit
+  API-key/OAuth-token modes bypass the local-login catalog and transaction.
 - Do not pin either production path to `latest`, `stable`, or one current patch
   release. Neither path upgrades Claude Code; each validates an installed release.
 - Treating one audited patch as the complete compatibility policy was a compact
@@ -275,16 +284,16 @@ explicitly configured Claude Code candidate:
    mentions, and deny every non-workspace synthetic-root mount with absolute
    double-slash rules. Command construction must fail closed when a mount lacks
    coverage or appears below `/workspace`.
-10. At every model-attempt boundary, prepare one platform-specific private
-    credential carrier. On macOS, securely read the current-account Keychain
+10. For local login at every model-attempt boundary, prepare one platform-
+    specific private credential carrier. On macOS, securely read the current-account Keychain
     item plus the empirically compatible file under the account's `pwd` home,
     validate their structure, UTF-8 token encodability, and refresh-token presence, select the candidate
     with the later access-token expiry, and load it into the restricted broker.
     On Linux and WSL2, validate the host credential file and stage a private
     copy. An expired access token is accepted when a usable refresh token remains;
     there is no warmup or attempt-duration freshness gate. An explicit API key
-    skips local credential selection, staging, and the internal lock-protocol
-    gate. Before local-login preparation, require the captured signed artifact
+    or OAuth token skips local credential selection, staging, and the internal
+    lock-protocol gate. Before local-login preparation, require the captured signed artifact
     to resolve to one exact certified lock protocol; an unknown artifact is
     inspection-inconclusive before credentials or review data are exposed.
 11. Launch only the one captured verified snapshot for every real model attempt
@@ -598,10 +607,11 @@ Neither path claims a credential-free fixed-input behavioral canary. Preflight
 capability evidence consists of the accepted release range, required public
 options, and parsed safe-mode semantics. It proves only the advertised surface,
 not actual launch semantics or the final merged sandbox. Behavioral acceptance
-comes from the final real review invocation plus strict structured-output,
-effective-model, error-state, and terminal-artifact validation; the canonical
-direct lane additionally binds that validation to its accepted preflight and
-stream-profile digests.
+comes from the final real review invocation plus the canonical preflight-bound
+strict stream validator, exact effective-model, error-state, and terminal-
+artifact validation. Both launch paths bind Claude output to the selected
+compatible version and closed stream profile; their workspace, executable-
+launch, sandbox, and authentication contracts remain separate.
 
 The outer sandbox remains authoritative for host filesystem, process, write,
 and network isolation after these probes pass. It deliberately makes the
@@ -804,9 +814,12 @@ filesystem boundary.
 ## Credentials
 
 Except for the canonical direct-lane authentication contract above, this
-section specifies the low-level helper's private credential staging and
-writeback implementation. Do not apply its catalog, broker, carrier, lock, or
-recovery requirements to the canonical real-`HOME` lane.
+section specifies the low-level helper's private local-login credential staging
+and writeback implementation. Do not apply its catalog, broker, carrier, lock,
+or recovery requirements to the canonical real-`HOME` lane. The helper first
+applies `ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` > local-login
+precedence; either winning explicit source bypasses this entire local-login
+section.
 
 For a catalogued local-login artifact, the credential boundary begins with one
 outer host refresh transaction before the first carrier read. The certified
@@ -825,13 +838,14 @@ lease: it stops the heartbeat, closes owned descriptors, intentionally leaves
 the shared lock directories as a stale fence, attaches only descriptor-bound
 recovery evidence without a lexical pathname, and pauses. It never automatically
 deletes that fence or treats it as authentication failure or Copilot fallback
-evidence. Explicit API-key mode performs no local-login carrier read and does
-not enter this transaction.
+evidence. Explicit API-key or OAuth-token mode performs no local-login carrier
+read and does not enter this transaction.
 
-An explicitly supplied `ANTHROPIC_API_KEY` remains an optional override and does
-not require local-login credential access or an internal credential-lock
-protocol entry. Never pass Claude and Copilot credentials into the same child
-environment.
+An explicitly supplied `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` remains
+an optional override and does not require local-login credential access or an
+internal credential-lock protocol entry. Opaque-forward only the precedence
+winner and remove the lower-priority explicit source. Never pass Claude and
+Copilot credentials into the same child environment.
 
 Before local-login credential access on any platform, bind the verified
 executable, release version, manifest platform key, and signed SHA-256 from
@@ -840,7 +854,10 @@ catalog contains the six supported Darwin and Linux artifacts for `2.1.211`;
 WSL2 uses its matching Linux artifact. Unknown versions, platforms, checksums,
 or mismatched executable evidence are inspection-inconclusive before credentials
 or review data are exposed. They are not authentication failures, runtime
-unavailability, or Copilot fallback reasons.
+unavailability, or Copilot fallback reasons. This extra gate applies only to
+helper local login: an uncatalogued but otherwise compatible signed release
+remains eligible for the named direct lane and for low-level-helper API-key or
+OAuth-token mode.
 
 On macOS, retain the capability-authenticated temporary Keychain broker but
 allow it to coordinate the current CLI's normal refresh behavior without giving
@@ -1146,9 +1163,9 @@ exception chain through a dedicated diagnostic cause because
 A private staged carrier prevents direct host-file mutation but does not hide a
 secret from the Claude process that must authenticate with it. The Linux/WSL2
 inner permission policy therefore denies `/auth` from model-visible `Read`.
-In API-key mode, it also
+In explicit API-key or OAuth-token mode, it also
 denies `/proc` and `/dev` so `Read(//proc/self/environ)` and file-descriptor
-aliases cannot expose `ANTHROPIC_API_KEY`. This boundary trusts the
+aliases cannot expose the winning authentication variable. This boundary trusts the
 publisher-verified Claude runtime to enforce its own tool permissions against
 prompt injection; `bubblewrap` cannot distinguish two reads made by the same
 process. Stronger isolation would require an external authentication proxy that
@@ -1183,9 +1200,10 @@ reached:
 3. Authentication failure is explicit. Missing, malformed, unsafe, or
    refresh-token-less local credentials, plus a final-runtime `Login expired`,
    HTTP 401, or refresh failure, write `blocked-authentication` and the operator
-   action `claude auth login`. A rejected explicit API key instead instructs the
-   operator to unset or replace `ANTHROPIC_API_KEY`; it is not evaluated for an
-   OAuth refresh token. The phase carries no Copilot fallback eligibility.
+   action `claude auth login`. A rejected explicit API key or OAuth token instead
+   instructs the operator to unset or replace its exact winning variable; an
+   explicit source is not evaluated as a helper local-login refresh token. The
+   phase carries no Copilot fallback eligibility.
    Credential-source/broker I/O races, lock contention, heartbeat failure,
    uncatalogued lock protocols, or bounded-supervision failures remain
    inconclusive. For every Keychain-broker, TCP-proxy, and Unix-proxy endpoint,
@@ -1225,7 +1243,7 @@ described as an enforced final launch.
 | No automatic candidate, supported platform unavailable, or a shared-range automatic candidate in the low-level helper path cleanly lacks a required non-security capability or secure runtime dependency | `runtime-unavailable` | Only after a separate explicit supplemental Copilot request; never satisfies named double |
 | A helper-owned Keychain-broker, TCP-proxy, or Unix-proxy bind fails with an explicit OS policy or socket-capability errno | `runtime-unavailable` | Only after a separate explicit supplemental Copilot request; never satisfies named double |
 | The Keychain-broker source and compiler exist, but the compiler cannot start or the broker build returns nonzero | `inconclusive`; report the build gate and pause | No |
-| Local/API authentication is missing, malformed, unsafe, refresh-token-less, or actually rejected as `Login expired`, HTTP 401, or refresh failure | `blocked-authentication`; request `claude auth login` for local login or unset/replace the explicit API key, then pause | No |
+| Local/API/OAuth authentication is missing, malformed, unsafe, refresh-token-less when applicable, or actually rejected as `Login expired`, HTTP 401, or refresh failure | `blocked-authentication`; request `claude auth login` for local login or unset/replace the exact explicit API/OAuth variable, then pause | No |
 | Signed artifact has no exact credential-lock protocol entry, either macOS carrier changed, lock contention/heartbeat failed, or credential inspection was unstable | `inconclusive`; report the exact coordination/inspection gate and pause without a login prompt | No |
 | The current macOS update would consume the reserved eighth generation or final 1 MiB | `inconclusive`; atomically close later `W` admission, durably stage that current update in the terminal recovery slot, invalidate any older staged host-writeback candidate, and NACK without publication or host writeback; NACK later requests before their callbacks or filesystem work | No |
 | The macOS broker cannot prove handler quiescence, bounded abandonment or detach is inconclusive, or its latest acknowledged durable rotation cannot be completely guarded-written to every required host carrier | `inconclusive`; irreversibly close pending publication/ACK before draining entered commit sections, use an event-only bounded abandonment latch and timed retryable detach, transfer no payload on timeout, converge a racing terminal stage through bounded recovery even for detached `None`, and use only a nonblocking timeout snapshot; any abandonment journal/quiescence stage keeps the recovery-root cleanup scope in the final error even beside an exact current carrier; after an actual recovery timeout, let only the handler/recovery state machine exact-clean a late stage/fallback or keep it within that root scope | No |
@@ -1239,8 +1257,9 @@ described as an enforced final launch.
 
 Authentication failure never becomes runtime unavailability. The helper reports
 `blocked-authentication`, tells the operator to run `claude auth login` for local
-login or unset/replace an explicit `ANTHROPIC_API_KEY`, and pauses for an explicit
-retry. Access-token expiry alone is not this state: the current CLI may refresh
+login or unset/replace the winning explicit `ANTHROPIC_API_KEY` /
+`CLAUDE_CODE_OAUTH_TOKEN`, and pauses for an explicit retry. Access-token expiry
+alone is not this state: the current CLI may refresh
 inside the temporary carrier, and the parent uses validated guarded writeback to
 retain a rotation when the observed host source still matches.
 Only stderr and structured primary error fields are failure-classification
@@ -1260,7 +1279,7 @@ An unsupported future patch inside the shared version range on the low-level hel
 be treated as automatic
 runtime unavailability only when it cleanly lacks a required public capability.
 An uncatalogued internal credential-lock protocol is instead inconclusive for
-local login and remains usable with an explicit API key. Evidence
+local login and remains usable with an explicit API key or OAuth token. Evidence
 of tampering, contradictory claims, or boundary failure is blocked, not converted
 into availability fallback. Capacity, rate limits, timeouts, and 5xx errors never
 authorize a model or backend switch. On WSL2, a path positively covered by a

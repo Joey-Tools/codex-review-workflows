@@ -187,6 +187,10 @@ class NamedLaneGuardTest(unittest.TestCase):
             SCRIPTS.parent / "references/claude-2.1.212-stream-schema.json",
             references,
         )
+        shutil.copy2(
+            SCRIPTS.parent / "references/claude-stream-schema.json",
+            references,
+        )
         return scripts, guard
 
     @staticmethod
@@ -194,6 +198,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         return (
             scripts.parent / "references/claude-stream-compatibility.json",
             scripts.parent / "references/claude-2.1.212-stream-schema.json",
+            scripts.parent / "references/claude-stream-schema.json",
             scripts / "review_runtime/claude_capabilities.py",
         )
 
@@ -766,6 +771,10 @@ class NamedLaneGuardTest(unittest.TestCase):
             "review_runtime.claude_capabilities": str(
                 runtime / "claude_capabilities.py"
             ),
+            "review_runtime.claude_refresh_lock": str(
+                runtime / "claude_refresh_lock.py"
+            ),
+            "review_runtime.claude_linux": str(runtime / "claude_linux.py"),
             "review_runtime.claude_provenance": str(runtime / "claude_provenance.py"),
             "review_runtime.claude_stream_contract": str(
                 runtime / "claude_stream_contract.py"
@@ -777,6 +786,9 @@ class NamedLaneGuardTest(unittest.TestCase):
             ),
             "BASELINE": str(
                 scripts.parent / "references/claude-2.1.212-stream-schema.json"
+            ),
+            "PROFILE": str(
+                scripts.parent / "references/claude-stream-schema.json"
             ),
             "CAPABILITY": str(runtime / "claude_capabilities.py"),
         }
@@ -805,8 +817,8 @@ class NamedLaneGuardTest(unittest.TestCase):
             "path_and_bytes = (\n"
             "    ('COMPATIBILITY_PATH', 'COMPATIBILITY_JSON_BYTES', "
             "expected_companions['COMPATIBILITY']),\n"
-            "    ('SCHEMA_PATH', 'BASELINE_SCHEMA_BYTES', "
-            "expected_companions['BASELINE']),\n"
+            "    ('SCHEMA_PATH', 'PROFILE_SCHEMA_BYTES', "
+            "expected_companions['PROFILE']),\n"
             "    ('CAPABILITY_PATH', 'CAPABILITY_SOURCE_BYTES', "
             "expected_companions['CAPABILITY']),\n"
             ")\n"
@@ -815,6 +827,9 @@ class NamedLaneGuardTest(unittest.TestCase):
             "        raise RuntimeError(f'unexpected companion path: {path_name}')\n"
             "    if getattr(module, bytes_name) != pathlib.Path(expected_path).read_bytes():\n"
             "        raise RuntimeError(f'companion bytes were not bound: {bytes_name}')\n"
+            "if module.BASELINE_SCHEMA_BYTES != pathlib.Path("
+            "expected_companions['BASELINE']).read_bytes():\n"
+            "    raise RuntimeError('baseline companion bytes were not bound')\n"
             "loaded = sorted(name for name in sys.modules "
             "if name == 'review_runtime' or name.startswith('review_runtime.') "
             "or name == 'validate_claude_stream' "
@@ -1030,6 +1045,10 @@ class NamedLaneGuardTest(unittest.TestCase):
                 lambda scripts: self.stream_companion_paths(scripts)[2],
             ),
             (
+                "validate-claude-stream",
+                lambda scripts: self.stream_companion_paths(scripts)[3],
+            ),
+            (
                 "preflight-claude",
                 lambda scripts: scripts / "review_runtime/fd_exec.py",
             ),
@@ -1070,7 +1089,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                     )
 
     def test_control_companion_same_content_replacement_is_allowed(self) -> None:
-        for companion_index in range(3):
+        for companion_index in range(4):
             with self.subTest(companion_index=companion_index):
                 scripts, guard = self.copy_guard_bundle()
                 companion = self.stream_companion_paths(scripts)[companion_index]
@@ -1107,7 +1126,7 @@ class NamedLaneGuardTest(unittest.TestCase):
                 )
 
     def test_control_companion_content_is_revalidated_before_main(self) -> None:
-        for companion_index in range(3):
+        for companion_index in range(4):
             with self.subTest(companion_index=companion_index):
                 scripts, guard = self.copy_guard_bundle()
                 companion = self.stream_companion_paths(scripts)[companion_index]
@@ -1250,7 +1269,11 @@ class NamedLaneGuardTest(unittest.TestCase):
             "    consume, initial_bindings\n"
             ")\n"
             "version, binding = guarded(())\n"
-            "if version != '2.1.212':\n"
+            "if version != {\n"
+            "    'rule': 'strict_release_semver_range',\n"
+            "    'minimum_inclusive': '2.1.211',\n"
+            "    'maximum_exclusive': '3.0.0',\n"
+            "}:\n"
             "    raise RuntimeError(f'unexpected bound schema version: {version}')\n"
             "if any(path.read_bytes() != b'not valid companion bytes' "
             "for path in companions):\n"
@@ -1267,7 +1290,14 @@ class NamedLaneGuardTest(unittest.TestCase):
             "    module.CAPABILITY_SOURCE_BYTES\n"
             ").hexdigest():\n"
             "    raise RuntimeError('validator did not consume bound capability bytes')\n"
-            "print(version)\n"
+            "if binding.digest != __import__('hashlib').sha256(\n"
+            "    module.COMPATIBILITY_JSON_BYTES + b'\\0'\n"
+            "    + module.BASELINE_SCHEMA_BYTES + b'\\0'\n"
+            "    + module.PROFILE_SCHEMA_BYTES + b'\\0'\n"
+            "    + module.CAPABILITY_SOURCE_BYTES\n"
+            ").hexdigest():\n"
+            "    raise RuntimeError('validator did not consume every bound companion byte')\n"
+            "print('bound stream profile')\n"
         )
         completed = subprocess.run(
             self.guard_probe_command(
@@ -1282,7 +1312,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stdout.strip(), "2.1.212")
+        self.assertEqual(completed.stdout.strip(), "bound stream profile")
 
     def test_optional_control_load_failures_roll_back_their_namespaces(self) -> None:
         cases = (
@@ -1335,8 +1365,8 @@ class NamedLaneGuardTest(unittest.TestCase):
                 "claude-opus-4-8",
                 "--preflight-result",
                 str(self.root / "missing-preflight.json"),
-                "--api-key-source",
-                "none",
+                "--authentication-source",
+                "local-login",
                 "--process-returncode",
                 "0",
                 "--input",
@@ -1351,7 +1381,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 3, completed.stderr)
         result = json.loads(completed.stdout)
         self.assertEqual(result["classification"], "inconclusive")
-        self.assertIn("stream.input-unreadable", result["reasons"])
+        self.assertIn("validator.preflight-evidence-invalid", result["reasons"])
 
     def test_entrypoint_rejects_unbound_runtime_file_types(self) -> None:
         for replacement_type in ("symlink", "directory"):

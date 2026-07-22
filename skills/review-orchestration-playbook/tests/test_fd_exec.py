@@ -17,7 +17,9 @@ LAUNCHER = (
     / "review_runtime"
     / "fd_exec.py"
 )
-_MODULE_SPEC = importlib.util.spec_from_file_location("review_runtime_fd_exec", LAUNCHER)
+_MODULE_SPEC = importlib.util.spec_from_file_location(
+    "review_runtime_fd_exec", LAUNCHER
+)
 if _MODULE_SPEC is None or _MODULE_SPEC.loader is None:
     raise RuntimeError(f"cannot load launcher module: {LAUNCHER}")
 FD_EXEC = importlib.util.module_from_spec(_MODULE_SPEC)

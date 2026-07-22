@@ -70,6 +70,12 @@ _CLAUDE_STREAM_RUNTIME_SOURCES = (
         False,
     ),
     ("review_runtime.claude_capabilities", "claude_capabilities.py", False),
+    (
+        "review_runtime.claude_refresh_lock",
+        "claude_refresh_lock.py",
+        False,
+    ),
+    ("review_runtime.claude_linux", "claude_linux.py", False),
     ("review_runtime.claude_provenance", "claude_provenance.py", False),
     (
         "review_runtime.claude_stream_contract",
@@ -425,6 +431,7 @@ def _stream_companion_bindings(
     paths = (
         scripts_root.parent / "references" / "claude-stream-compatibility.json",
         scripts_root.parent / "references" / "claude-2.1.212-stream-schema.json",
+        scripts_root.parent / "references" / "claude-stream-schema.json",
         runtime_root / "claude_capabilities.py",
     )
     return tuple((path, _validate_bound_companion(path)) for path in paths)
@@ -520,7 +527,8 @@ def _load_claude_preflight_entrypoint(scripts_root: pathlib.Path) -> object:
     stream_companions = _stream_companion_bindings(scripts_root)
     compatibility_path, _compatibility_bytes = stream_companions[0]
     baseline_path, _baseline_bytes = stream_companions[1]
-    capability_path, capability_bytes = stream_companions[2]
+    profile_path, _profile_bytes = stream_companions[2]
+    capability_path, capability_bytes = stream_companions[3]
     fd_exec_path = runtime_root / "fd_exec.py"
     fd_exec_bytes = _validate_bound_companion(fd_exec_path)
     try:
@@ -544,6 +552,11 @@ def _load_claude_preflight_entrypoint(scripts_root: pathlib.Path) -> object:
                     "review_runtime.claude_stream_contract",
                     "BASELINE_PATH",
                     baseline_path,
+                ),
+                (
+                    "review_runtime.claude_stream_contract",
+                    "PROFILE_PATH",
+                    profile_path,
                 ),
                 (
                     "review_runtime.claude_stream_contract",
@@ -589,7 +602,8 @@ def _load_claude_stream_validator_entrypoint(scripts_root: pathlib.Path) -> obje
     stream_companions = _stream_companion_bindings(scripts_root)
     compatibility_path, compatibility_bytes = stream_companions[0]
     baseline_path, baseline_bytes = stream_companions[1]
-    capability_path, capability_bytes = stream_companions[2]
+    profile_path, profile_bytes = stream_companions[2]
+    capability_path, capability_bytes = stream_companions[3]
     try:
         stream_contract_module = _load_bound_sources(
             runtime_root,
@@ -607,6 +621,11 @@ def _load_claude_stream_validator_entrypoint(scripts_root: pathlib.Path) -> obje
                     "review_runtime.claude_stream_contract",
                     "BASELINE_PATH",
                     baseline_path,
+                ),
+                (
+                    "review_runtime.claude_stream_contract",
+                    "PROFILE_PATH",
+                    profile_path,
                 ),
                 (
                     "review_runtime.claude_stream_contract",
@@ -630,7 +649,7 @@ def _load_claude_stream_validator_entrypoint(scripts_root: pathlib.Path) -> obje
                     "COMPATIBILITY_PATH",
                     compatibility_path,
                 ),
-                ("validate_claude_stream", "SCHEMA_PATH", baseline_path),
+                ("validate_claude_stream", "SCHEMA_PATH", profile_path),
                 (
                     "validate_claude_stream",
                     "CAPABILITY_PATH",
@@ -647,6 +666,11 @@ def _load_claude_stream_validator_entrypoint(scripts_root: pathlib.Path) -> obje
                     "validate_claude_stream",
                     "BASELINE_SCHEMA_BYTES",
                     baseline_bytes,
+                ),
+                (
+                    "validate_claude_stream",
+                    "PROFILE_SCHEMA_BYTES",
+                    profile_bytes,
                 ),
                 (
                     "validate_claude_stream",

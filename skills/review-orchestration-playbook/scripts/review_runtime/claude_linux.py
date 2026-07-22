@@ -305,8 +305,7 @@ class _CredentialDirectoryAnchor:
         ):
             return None
         diagnostic = (
-            self._descriptor_residue_diagnostic
-            or self._descriptor_residue_fallback
+            self._descriptor_residue_diagnostic or self._descriptor_residue_fallback
         )
         self._descriptor_residue_diagnostic = diagnostic
         self._disposition = _CredentialDirectoryAnchorDisposition.DESCRIPTOR_RESIDUE
@@ -5063,9 +5062,7 @@ class _HostRefreshLockCleanupCoordinator:
         while True:
             source_retention_required = self._source_retention_required_snapshot()
             if source_retention_required and not self._source_terminal:
-                if source_retention_attempts < (
-                    CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS
-                ):
+                if source_retention_attempts < (CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS):
                     source_retention_attempts += 1
                     try:
                         self._retain_source_anchor()
@@ -5143,8 +5140,7 @@ class _HostRefreshLockCleanupCoordinator:
                 stable_lease is not None
                 and not lease_terminal
                 and not lease_proof_exhausted
-                and lease_snapshot_attempts
-                < CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS
+                and lease_snapshot_attempts < CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS
             ):
                 lease_snapshot_attempts += 1
                 try:
@@ -5174,9 +5170,7 @@ class _HostRefreshLockCleanupCoordinator:
                 if not settlement_diagnostic_recorded:
                     self._record_worker_error_once(settlement_diagnostic)
                     settlement_diagnostic_recorded = True
-                if lease_settlement_attempts < (
-                    CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS
-                ):
+                if lease_settlement_attempts < (CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS):
                     lease_settlement_attempts += 1
                     try:
                         recovery = stable_lease._settle_descriptor_bound_retention(
@@ -5214,8 +5208,7 @@ class _HostRefreshLockCleanupCoordinator:
                         diagnostic=lease_diagnostic,
                     )
                 lease_proof_exhausted = (
-                    lease_snapshot_attempts
-                    >= CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS
+                    lease_snapshot_attempts >= CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS
                     and lease_settlement_attempts
                     >= CREDENTIAL_CLEANUP_STATE_MAX_ATTEMPTS
                 )
@@ -5864,9 +5857,7 @@ class _HostRefreshLockCleanupCoordinator:
             with self._state_lock:
                 self._terminal_errors = tuple(self._errors)
                 self._cleanup_terminal_proven = cleanup_terminal_proof.terminal
-                self._cleanup_terminal_diagnostic = (
-                    cleanup_terminal_proof.diagnostic
-                )
+                self._cleanup_terminal_diagnostic = cleanup_terminal_proof.diagnostic
                 self._phase = _HostRefreshLockCleanupPhase.TERMINAL
 
 
@@ -6690,8 +6681,7 @@ def _stage_claude_credentials_anchored(
                     )
                     _attach_host_refresh_lock_recovery(
                         writeback_error,
-                        host_refresh_lock_coordinator
-                        ._cleanup_terminal_diagnostic_snapshot(),
+                        host_refresh_lock_coordinator._cleanup_terminal_diagnostic_snapshot(),
                     )
                 elif retain_for_recovery or not carrier_cleanup_proven:
                     if retain_for_recovery:
@@ -6715,8 +6705,7 @@ def _stage_claude_credentials_anchored(
                     )
                     _attach_host_refresh_lock_recovery(
                         selected_coordinator_error,
-                        host_refresh_lock_coordinator
-                        ._cleanup_terminal_diagnostic_snapshot(),
+                        host_refresh_lock_coordinator._cleanup_terminal_diagnostic_snapshot(),
                     )
                     if retain_for_recovery:
                         writeback_error = selected_coordinator_error
@@ -6738,8 +6727,7 @@ def _stage_claude_credentials_anchored(
                     if host_refresh_lock_error is not None:
                         _attach_host_refresh_lock_recovery(
                             host_refresh_lock_error,
-                            host_refresh_lock_coordinator
-                            ._cleanup_terminal_diagnostic_snapshot(),
+                            host_refresh_lock_coordinator._cleanup_terminal_diagnostic_snapshot(),
                         )
                         writeback_error = _primary_cleanup_error(
                             [

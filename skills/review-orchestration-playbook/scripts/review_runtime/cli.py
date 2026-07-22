@@ -49,12 +49,24 @@ def _add_review_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--head-ref", required=True, help="Frozen head commit-ish.")
     parser.add_argument(
         "--prompt-file",
-        help="Optional prompt template supporting review placeholders.",
+        help=(
+            "Optional supplemental prompt template supporting review placeholders; "
+            "it cannot replace the helper's mandatory review boundary."
+        ),
     )
     parser.add_argument(
         "--keep-workspace",
         action="store_true",
         help="Keep the detached review workspace after completion.",
+    )
+    parser.add_argument(
+        "--include-source-wip",
+        action="store_true",
+        help=(
+            "Review a helper-private snapshot of source HEAD plus staged, "
+            "unstaged, and nonignored untracked content. Review-only; not "
+            "formal PR-readiness or merge-ready evidence."
+        ),
     )
     parser.add_argument(
         "--egress-consent",
@@ -89,8 +101,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="isolated_review",
         description=(
-            "Run a pinned Codex or low-level Claude helper against one frozen Git range "
-            "inside a detached read-only review workspace. Results are diagnostic and "
+            "Run a pinned Codex or low-level Claude helper against one clean frozen "
+            "Git range or explicitly authorized digest-bound WIP snapshot inside a "
+            "detached read-only review workspace. Results are diagnostic and "
             "ineligible for named review lanes; the foreground command prints only the "
             "raw helper artifact, so automation that needs machine metadata must use "
             "the stateful interface."
@@ -263,6 +276,7 @@ def _run_foreground(args: argparse.Namespace) -> int:
             prompt_override=(
                 pathlib.Path(args.prompt_file) if args.prompt_file else None
             ),
+            include_source_wip=bool(getattr(args, "include_source_wip", False)),
         )
         if review is None:
             raise ReviewError("workspace ownership handoff did not complete")
@@ -343,6 +357,7 @@ def _run_stateful(argv: list[str], *, script_path: pathlib.Path) -> int:
             synthetic_secret_exemptions=tuple(
                 getattr(args, "synthetic_secret_exemption", ())
             ),
+            include_source_wip=bool(getattr(args, "include_source_wip", False)),
             publisher=lambda created: print(created, flush=True),
         )
         return 0

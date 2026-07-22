@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, BinaryIO, Callable, Iterator
 
@@ -21,10 +22,13 @@ from .common import (
     PROCESS_GROUP_TERM_GRACE_SECONDS,
     ForwardedSignal,
     ReviewError,
+    atomic_write_redactions,
     block_forwarded_signals,
     consume_pending_forwarded_signal,
     forwarded_signals,
     read_json,
+    redact_json_string_values,
+    redact_text,
     restore_signal_mask,
     signal_process_group,
     tail_text,
@@ -35,13 +39,17 @@ from .common import (
 )
 from .providers import (
     CLAUDE_EGRESS_CONSENTS,
+    CLAUDE_EXPLICIT_AUTH_ENV_KEYS,
     LOW_LEVEL_HELPER_REVIEW_CONTRACT,
     NAMED_LANE_ELIGIBLE,
+    claude_output_redact_values,
     run_review,
 )
 from .workspace import (
     MAX_BOUNDED_JSON_DEPTH,
     MAX_PREFLIGHT_JSON_BYTES,
+    REVIEW_CONTAINER_PATTERN,
+    REVIEW_USER_ROOT_PREFIX,
     PRIVATE_HELPER_ARTIFACT_NAMES,
     REVIEW_CLEANUP_LOCK_NAME,
     REVIEW_RUNNER_LOCK_NAME,
@@ -51,6 +59,9 @@ from .workspace import (
     LegacyReviewWorkspace,
     PrivateCleanupEvidence,
     ReviewWorkspace,
+    SourceLocalReviewWorkspace,
+    _canonical_review_root_base,
+    _review_root_for_source,
     _inspect_control_directory,
     _load_control_artifact_state,
     _read_bounded_json,
@@ -58,6 +69,7 @@ from .workspace import (
     cleanup_legacy_workspace,
     cleanup_workspace,
     load_bound_private_cleanup_state,
+    open_bound_review_lock,
     parse_partial_private_cleanup_evidence,
     parse_private_cleanup_evidence,
     prepare_workspace,
@@ -66,8 +78,9 @@ from .workspace import (
     remove_partial_review_container,
     remove_private_review_artifacts,
     remove_ready_review_container,
-    open_bound_review_lock,
+    review_preflight_scope,
     validate_secret_delta_summary,
+    validate_retained_cleanup_postcondition,
     validate_workspace_layout,
     write_bound_review_json,
     write_bound_review_text,
@@ -91,7 +104,6 @@ PREFLIGHT_RECEIPT_ALGORITHM = "sha256"
 PREFLIGHT_FILE = "preflight.json"
 PREFLIGHT_STATUS = "review workspace containment and integrity checks passed"
 PREFLIGHT_PRIVATE_ARTIFACTS = "removed"
-PREFLIGHT_SCOPE = "frozen tracked workspace, diff, and review prompt"
 LEGACY_STATE_REQUIRED_FIELDS = frozenset(
     {
         "attempts_path",
@@ -116,6 +128,115 @@ PRIMARY_DIFF_RELATIVE_PATH = ".codex-review/review.diff"
 SAFE_LEGACY_LOCK_MODES = frozenset({0o600, 0o604, 0o640, 0o644})
 PRIVATE_STATE_LEGACY_LOCK_MODES = SAFE_LEGACY_LOCK_MODES | {0o664}
 _STARTED_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
+_STATE_OWNED_TEXT_ARTIFACTS = (
+    STATE_MARKER,
+    STATE_FILE,
+    EXIT_FILE,
+    "attempts.json",
+    "claude-runtime.json",
+    "claude-skip.txt",
+    "egress.json",
+    "final.txt",
+    "preflight.json",
+    "runner.stdout.log",
+    "runner.stderr.log",
+    "runner-error.txt",
+    "cleanup-error.txt",
+)
+_STATE_OWNED_TEXT_ARTIFACT_NAMES = frozenset(_STATE_OWNED_TEXT_ARTIFACTS)
+
+
+def _state_owned_write_filter(
+    state_dir: pathlib.Path,
+) -> Callable[[pathlib.Path], bool]:
+    try:
+        root = state_dir.expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ReviewError(
+            f"cannot resolve isolated-review state directory {state_dir}: {error}"
+        ) from error
+    if not root.is_dir():
+        raise ReviewError(f"isolated-review state path is not a directory: {root}")
+
+    def includes(path: pathlib.Path) -> bool:
+        candidate = path.expanduser()
+        try:
+            parent = candidate.parent.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise ReviewError(
+                f"cannot resolve atomic write parent {candidate.parent}: {error}"
+            ) from error
+        return parent == root and candidate.name in _STATE_OWNED_TEXT_ARTIFACT_NAMES
+
+    return includes
+
+
+def _freeze_claude_redactions(
+    environment: Mapping[str, str] | None = None,
+    *,
+    reviewer: str | None = "claude",
+) -> tuple[str, ...]:
+    source = os.environ if environment is None else environment
+    if reviewer != "claude":
+        source = {
+            key: value
+            for key, value in source.items()
+            if key not in CLAUDE_EXPLICIT_AUTH_ENV_KEYS
+        }
+    return claude_output_redact_values(source)
+
+
+def _redact_claude_text(text: str, redact_values: tuple[str, ...]) -> str:
+    return redact_text(text, redact_values)
+
+
+def _redacted_exception_detail(
+    error: BaseException,
+    redact_values: tuple[str, ...],
+) -> str:
+    details: list[str] = []
+    seen: set[int] = set()
+
+    def visit(current: BaseException, relation: str) -> None:
+        identity = id(current)
+        if identity in seen:
+            details.append(f"{relation}<exception cycle>")
+            return
+        if len(seen) >= 32:
+            details.append(f"{relation}<exception chain truncated>")
+            return
+        seen.add(identity)
+        try:
+            message = str(current)
+        except Exception:
+            message = "<unprintable exception>"
+        label = f"{type(current).__name__}: {message}"
+        details.append(relation + _redact_claude_text(label, redact_values))
+        cause = current.__cause__
+        context = current.__context__
+        if cause is not None:
+            visit(cause, "caused by ")
+        elif context is not None and not current.__suppress_context__:
+            visit(context, "context: ")
+
+    visit(error, "")
+    return "; ".join(details)
+
+
+def _redact_claude_value(value: Any, redact_values: tuple[str, ...]) -> Any:
+    return redact_json_string_values(value, redact_values)
+
+
+def _write_state_json_without_credentials(
+    path: pathlib.Path,
+    value: dict[str, Any],
+    redact_values: tuple[str, ...],
+) -> None:
+    if redact_json_string_values(value, redact_values) != value:
+        raise ReviewError(
+            "review state metadata contains an explicit Claude credential"
+        )
+    write_json(path, value)
 
 
 def _write_loaded_review_text(
@@ -363,7 +484,9 @@ def open_private_lock_file(
                 opened_metadata.st_ino,
             ):
                 raise ReviewError(f"{label} changed before it could be opened safely")
-        if created:
+        # A no-op chmod still changes ctime and can race another first opener's
+        # path/descriptor identity validation.
+        if created and stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600:
             os.fchmod(descriptor, 0o600)
         handle = os.fdopen(descriptor, "r+b", buffering=0)
         descriptor = None
@@ -413,6 +536,7 @@ def _validate_private_directory_path_identity(
     *,
     label: str,
     expected_mode: int | None = None,
+    expected_uid: int | None = None,
     dir_fd: int | None = None,
 ) -> None:
     try:
@@ -433,8 +557,9 @@ def _validate_private_directory_path_identity(
         raise ReviewError(f"{label} path does not match its open descriptor")
     if not stat.S_ISDIR(descriptor_after.st_mode):
         raise ReviewError(f"{label} is not a real directory")
-    if descriptor_after.st_uid != os.geteuid():
-        raise ReviewError(f"{label} is not owned by the current user")
+    owner_uid = os.geteuid() if expected_uid is None else expected_uid
+    if descriptor_after.st_uid != owner_uid:
+        raise ReviewError(f"{label} has an unexpected owner")
     mode = stat.S_IMODE(descriptor_after.st_mode)
     if expected_mode is not None:
         if mode != expected_mode:
@@ -444,35 +569,75 @@ def _validate_private_directory_path_identity(
 
 
 @contextmanager
-def _open_private_cleanup_state_directory(
+def _open_external_cleanup_state_directory(
     state_dir: pathlib.Path,
 ) -> Iterator[tuple[int, Callable[[], None]]]:
-    review_root = state_dir.parent
-    if review_root.name != ".codex-tmp" or not state_dir.name.startswith(
-        "isolated-review-"
+    source_review_root = state_dir.parent
+    user_review_root = source_review_root.parent
+    review_root_base = user_review_root.parent
+    canonical_base = _canonical_review_root_base()
+    if (
+        review_root_base != canonical_base
+        or user_review_root.name != f"{REVIEW_USER_ROOT_PREFIX}{os.geteuid()}"
+        or re.fullmatch(r"[0-9a-f]{64}", source_review_root.name) is None
+        or REVIEW_CONTAINER_PATTERN.fullmatch(state_dir.name) is None
     ):
         raise ReviewError("review state directory is outside a private review root")
     flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
-    review_root_fd: int | None = None
+    review_root_base_fd: int | None = None
+    user_review_root_fd: int | None = None
+    source_review_root_fd: int | None = None
     state_dir_fd: int | None = None
     try:
-        review_root_fd = os.open(review_root, flags)
-        state_dir_fd = os.open(state_dir.name, flags, dir_fd=review_root_fd)
+        review_root_base_fd = os.open(canonical_base, flags)
+        user_review_root_fd = os.open(
+            user_review_root.name,
+            flags,
+            dir_fd=review_root_base_fd,
+        )
+        source_review_root_fd = os.open(
+            source_review_root.name,
+            flags,
+            dir_fd=user_review_root_fd,
+        )
+        state_dir_fd = os.open(
+            state_dir.name,
+            flags,
+            dir_fd=source_review_root_fd,
+        )
 
         def revalidate() -> None:
-            assert review_root_fd is not None
+            assert review_root_base_fd is not None
+            assert user_review_root_fd is not None
+            assert source_review_root_fd is not None
             assert state_dir_fd is not None
             _validate_private_directory_path_identity(
-                review_root,
-                review_root_fd,
-                label="review state root",
+                canonical_base,
+                review_root_base_fd,
+                label="review state base root",
+                expected_mode=0o1777,
+                expected_uid=0,
+            )
+            _validate_private_directory_path_identity(
+                pathlib.Path(user_review_root.name),
+                user_review_root_fd,
+                label="review state user root",
+                expected_mode=0o700,
+                dir_fd=review_root_base_fd,
+            )
+            _validate_private_directory_path_identity(
+                pathlib.Path(source_review_root.name),
+                source_review_root_fd,
+                label="review state source root",
+                expected_mode=0o700,
+                dir_fd=user_review_root_fd,
             )
             _validate_private_directory_path_identity(
                 pathlib.Path(state_dir.name),
                 state_dir_fd,
                 label="review state directory",
                 expected_mode=0o700,
-                dir_fd=review_root_fd,
+                dir_fd=source_review_root_fd,
             )
 
         revalidate()
@@ -484,8 +649,74 @@ def _open_private_cleanup_state_directory(
     finally:
         if state_dir_fd is not None:
             os.close(state_dir_fd)
+        if source_review_root_fd is not None:
+            os.close(source_review_root_fd)
+        if user_review_root_fd is not None:
+            os.close(user_review_root_fd)
+        if review_root_base_fd is not None:
+            os.close(review_root_base_fd)
+
+
+@contextmanager
+def _open_legacy_cleanup_state_directory(
+    state_dir: pathlib.Path,
+) -> Iterator[tuple[int, Callable[[], None]]]:
+    review_root = state_dir.parent
+    if (
+        review_root.name != ".codex-tmp"
+        or REVIEW_CONTAINER_PATTERN.fullmatch(state_dir.name) is None
+    ):
+        raise ReviewError("legacy review state directory has an invalid layout")
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
+    review_root_fd: int | None = None
+    state_dir_fd: int | None = None
+    try:
+        review_root_fd = os.open(review_root, flags)
+        state_dir_fd = os.open(
+            state_dir.name,
+            flags,
+            dir_fd=review_root_fd,
+        )
+
+        def revalidate() -> None:
+            assert review_root_fd is not None
+            assert state_dir_fd is not None
+            _validate_private_directory_path_identity(
+                review_root,
+                review_root_fd,
+                label="legacy review state root",
+            )
+            _validate_private_directory_path_identity(
+                pathlib.Path(state_dir.name),
+                state_dir_fd,
+                label="legacy review state directory",
+                expected_mode=0o700,
+                dir_fd=review_root_fd,
+            )
+
+        revalidate()
+        yield state_dir_fd, revalidate
+    except OSError as error:
+        raise ReviewError(
+            f"cannot open legacy review state directory safely: {error}"
+        ) from error
+    finally:
+        if state_dir_fd is not None:
+            os.close(state_dir_fd)
         if review_root_fd is not None:
             os.close(review_root_fd)
+
+
+def _open_private_cleanup_state_directory(
+    state_dir: pathlib.Path,
+    *,
+    legacy: bool | None = None,
+):
+    if legacy is None:
+        legacy = state_dir.parent.name == ".codex-tmp"
+    if legacy:
+        return _open_legacy_cleanup_state_directory(state_dir)
+    return _open_external_cleanup_state_directory(state_dir)
 
 
 def _state_path(state_dir: pathlib.Path) -> pathlib.Path:
@@ -985,6 +1216,8 @@ def _validate_v3_marker_layout(
     raw_container: Any,
     *,
     resolved_state_dir: pathlib.Path,
+    marker_version: int,
+    phase: str,
 ) -> pathlib.Path:
     source_root = _canonical_v3_marker_path(
         raw_source_root,
@@ -994,11 +1227,26 @@ def _validate_v3_marker_layout(
         raw_container,
         label="container",
     )
+    if marker_version == STATE_MARKER_SCHEMA_VERSION and phase == "preparing":
+        canonical_base = _canonical_review_root_base()
+        expected_user_root = canonical_base / f"{REVIEW_USER_ROOT_PREFIX}{os.geteuid()}"
+        expected_parent = container.parent
+        if (
+            source_root != expected_user_root
+            or expected_parent.parent != expected_user_root
+            or re.fullmatch(r"[0-9a-f]{64}", expected_parent.name) is None
+        ):
+            raise ReviewError("isolated-review state marker layout is invalid")
+    else:
+        expected_parent = (
+            _review_root_for_source(source_root, require_source=False)
+            if marker_version == STATE_MARKER_SCHEMA_VERSION
+            else source_root / ".codex-tmp"
+        )
     if (
         container != resolved_state_dir
-        or container.parent != source_root / ".codex-tmp"
-        or not container.name.startswith("isolated-review-")
-        or container.name == "isolated-review-"
+        or container.parent != expected_parent
+        or REVIEW_CONTAINER_PATTERN.fullmatch(container.name) is None
     ):
         raise ReviewError("isolated-review state marker layout is invalid")
     return source_root
@@ -1236,14 +1484,16 @@ def _load_state_marker(state_dir: pathlib.Path) -> LoadedStateMarker:
     )
     if actual_fields != required_fields:
         raise ReviewError("isolated-review state marker fields are invalid")
+    phase = marker["phase"]
+    if not isinstance(phase, str) or phase not in {"preparing", "ready"}:
+        raise ReviewError("isolated-review state marker phase is invalid")
     source_root = _validate_v3_marker_layout(
         marker["source_root"],
         marker["container_dir"],
         resolved_state_dir=resolved_state_dir,
+        marker_version=version,
+        phase=phase,
     )
-    phase = marker["phase"]
-    if not isinstance(phase, str) or phase not in {"preparing", "ready"}:
-        raise ReviewError("isolated-review state marker phase is invalid")
     cleanup_parser = (
         parse_private_cleanup_evidence
         if phase == "ready"
@@ -1643,7 +1893,11 @@ def load_review_state(
             or marker.phase != "ready"
         ):
             raise ReviewError("review state and marker versions are inconsistent")
-        workspace_type = ReviewWorkspace
+        workspace_type = (
+            ReviewWorkspace
+            if marker.version == STATE_MARKER_SCHEMA_VERSION
+            else SourceLocalReviewWorkspace
+        )
     review_value = state.get("workspace")
     if not isinstance(review_value, dict):
         raise ReviewError("review state does not contain a workspace object")
@@ -1998,9 +2252,12 @@ def start(
     keep_workspace: bool,
     egress_consent: str | None,
     synthetic_secret_exemptions: tuple[str, ...] = (),
+    include_source_wip: bool = False,
     publisher: Callable[[pathlib.Path], None] | None = None,
 ) -> pathlib.Path:
     _validate_reviewer_policy(reviewer, egress_consent)
+    redact_values = _freeze_claude_redactions(reviewer=reviewer)
+    _redact_claude_text("", redact_values)
     process: subprocess.Popen[bytes] | None = None
     review: ReviewWorkspace | None = None
     preparation_guard = ReviewPreparationGuard()
@@ -2009,6 +2266,8 @@ def start(
     published = False
     cleaning = False
     handlers_restored = False
+    write_redaction_scope = None
+    write_redaction_entered = False
 
     def forward_signal(signum: int, _frame: object) -> None:
         nonlocal pending_signal
@@ -2043,9 +2302,16 @@ def start(
             preparation_cleanup_handoff=(preparation_guard.accept_preparation_cleanup),
             synthetic_secret_exemptions=synthetic_secret_exemptions,
             prompt_override=prompt_file,
+            include_source_wip=include_source_wip,
         )
         review = preparation_guard.require_review()
         state_dir = review.container_dir
+        write_redaction_scope = atomic_write_redactions(
+            redact_values,
+            path_filter=_state_owned_write_filter(state_dir),
+        )
+        write_redaction_scope.__enter__()
+        write_redaction_entered = True
         stdout_path = state_dir / "runner.stdout.log"
         stderr_path = state_dir / "runner.stderr.log"
         state: dict[str, Any] = {
@@ -2057,13 +2323,18 @@ def start(
             "keep_workspace": keep_workspace,
             "egress_consent": egress_consent,
             "synthetic_secret_exemptions": list(synthetic_secret_exemptions),
+            "include_source_wip": include_source_wip,
             "stdout_path": str(stdout_path),
             "stderr_path": str(stderr_path),
             "final_path": str(state_dir / "final.txt"),
             "attempts_path": str(state_dir / "attempts.json"),
             "started_at": time.time(),
         }
-        write_json(state_dir / STATE_FILE, state)
+        _write_state_json_without_credentials(
+            state_dir / STATE_FILE,
+            state,
+            redact_values,
+        )
         lock_fd = preparation_guard.lock_fd()
         with (
             stdout_path.open("wb") as stdout_handle,
@@ -2091,8 +2362,8 @@ def start(
                     tuple(runner_arguments),
                     cwd=review.workspace_root,
                     stdin=subprocess.DEVNULL,
-                    stdout=stdout_handle,
-                    stderr=stderr_handle,
+                    stdout=(subprocess.DEVNULL if redact_values else stdout_handle),
+                    stderr=(subprocess.DEVNULL if redact_values else stderr_handle),
                     start_new_session=True,
                     close_fds=True,
                     pass_fds=(lock_fd,),
@@ -2105,7 +2376,11 @@ def start(
             raise ForwardedSignal(pending_signal)
         state["pid"] = process.pid
         _STARTED_PROCESSES[process.pid] = process
-        write_json(state_dir / STATE_FILE, state)
+        _write_state_json_without_credentials(
+            state_dir / STATE_FILE,
+            state,
+            redact_values,
+        )
         publication_mask = block_forwarded_signals()
         publication_signal: signal.Signals | None = None
         try:
@@ -2149,30 +2424,50 @@ def start(
         if pending_signal is not None:
             details: list[str] = []
             if isinstance(error, ForwardedSignal) and error.detail:
-                details.append(error.detail)
+                details.append(_redact_claude_text(error.detail, redact_values))
             elif isinstance(error, ReviewError):
-                details.append(str(error))
+                details.append(
+                    _redacted_exception_detail(error, redact_values)
+                    if redact_values
+                    else str(error)
+                )
             if cleanup_error and review is not None:
                 details.append(
                     "review startup failed and cleanup failed; evidence may remain "
                     f"near {review.container_dir}; inspect cleanup state: "
-                    f"{cleanup_error}"
+                    f"{_redact_claude_text(cleanup_error, redact_values)}"
                 )
             raise ForwardedSignal(
                 pending_signal,
                 detail="; ".join(details) or None,
-            ) from error
+            ) from None
         if cleanup_error and review is not None:
+            primary_detail = (
+                f"; primary failure: {_redacted_exception_detail(error, redact_values)}"
+                if redact_values
+                else ""
+            )
             raise ReviewError(
                 "review startup failed and cleanup failed; evidence may remain near "
-                f"{review.container_dir}; inspect cleanup state: {cleanup_error}"
+                f"{review.container_dir}; inspect cleanup state: "
+                f"{_redact_claude_text(cleanup_error, redact_values)}"
+                f"{primary_detail}"
             ) from error
+        if redact_values:
+            raise ReviewError(
+                "review startup failed: "
+                f"{_redacted_exception_detail(error, redact_values)}"
+            ) from None
         raise
     finally:
-        preparation_guard.close()
-        if not handlers_restored:
-            for forwarded, previous in previous_handlers.items():
-                signal.signal(forwarded, previous)
+        try:
+            preparation_guard.close()
+            if not handlers_restored:
+                for forwarded, previous in previous_handlers.items():
+                    signal.signal(forwarded, previous)
+        finally:
+            if write_redaction_entered and write_redaction_scope is not None:
+                write_redaction_scope.__exit__(None, None, None)
 
 
 def run_state(
@@ -2183,10 +2478,16 @@ def run_state(
     expected_reviewer: str | None = None,
     expected_egress_consent: str | None = None,
 ) -> int:
+    redact_values = _freeze_claude_redactions(
+        reviewer=expected_reviewer if terminal_process else None,
+    )
+    _redact_claude_text("", redact_values)
     exit_code = 1
     pending_signal: signal.Signals | None = None
     suppress_signal_raise = False
     state_loaded = False
+    write_redaction_scope = None
+    write_redaction_entered = False
     review: ReviewWorkspace | LegacyReviewWorkspace | None = None
 
     def record_signal(signum: int, _frame: object) -> None:
@@ -2228,6 +2529,21 @@ def run_state(
             raise ReviewError(
                 "legacy v1 review state cannot be resumed; start a new review"
             )
+        state_reviewer = state.get("reviewer")
+        selected_reviewer = expected_reviewer if terminal_process else state_reviewer
+        redact_values = _freeze_claude_redactions(
+            reviewer=(
+                selected_reviewer if isinstance(selected_reviewer, str) else None
+            ),
+        )
+        _redact_claude_text("", redact_values)
+        state_dir = review.container_dir.expanduser().resolve(strict=True)
+        write_redaction_scope = atomic_write_redactions(
+            redact_values,
+            path_filter=_state_owned_write_filter(state_dir),
+        )
+        write_redaction_scope.__enter__()
+        write_redaction_entered = True
         marker = _load_state_marker(state_dir)
         if marker.version != STATE_MARKER_SCHEMA_VERSION:
             raise ReviewError(
@@ -2286,7 +2602,8 @@ def run_state(
         if state_loaded and review is not None and error.detail:
             diagnostic = (
                 "review orchestration interrupted by signal "
-                f"{int(error.signum)}: {error.detail}\n"
+                f"{int(error.signum)}: "
+                f"{_redact_claude_text(error.detail, redact_values)}\n"
             )
             diagnostic_error = _write_loaded_review_text(
                 state_dir,
@@ -2302,7 +2619,7 @@ def run_state(
                 )
     except Exception as error:
         if state_loaded and review is not None:
-            diagnostic = f"{type(error).__name__}: {error}\n"
+            diagnostic = _redacted_exception_detail(error, redact_values) + "\n"
             diagnostic_error = _write_loaded_review_text(
                 state_dir,
                 review,
@@ -2317,48 +2634,59 @@ def run_state(
                 )
         exit_code = 1
     finally:
-        suppress_signal_raise = True
-        previous_mask = block_forwarded_signals()
         try:
-            while True:
-                masked_signal = (
-                    consume_pending_forwarded_signal()
-                    if previous_mask is not None
-                    else None
-                )
-                if pending_signal is None:
-                    pending_signal = masked_signal
-                if pending_signal is not None:
-                    exit_code = 128 + int(pending_signal)
-                if state_loaded and review is not None:
-                    exit_error = _write_loaded_review_text(
-                        state_dir,
-                        review,
-                        name=EXIT_FILE,
-                        text=f"{exit_code}\n",
+            suppress_signal_raise = True
+            previous_mask = block_forwarded_signals()
+            try:
+                while True:
+                    masked_signal = (
+                        consume_pending_forwarded_signal()
+                        if previous_mask is not None
+                        else None
                     )
-                    if exit_error:
-                        print(
-                            f"review runner exit code was not persisted: {exit_error}",
-                            file=sys.stderr,
+                    if pending_signal is None:
+                        pending_signal = masked_signal
+                    if pending_signal is not None:
+                        exit_code = 128 + int(pending_signal)
+                    if state_loaded and review is not None:
+                        exit_error = _write_loaded_review_text(
+                            state_dir,
+                            review,
+                            name=EXIT_FILE,
+                            text=f"{exit_code}\n",
                         )
-                if previous_mask is None:
-                    break
-                pending_signal = consume_pending_forwarded_signal()
-                if pending_signal is None:
-                    break
-            if not terminal_process:
-                for forwarded, previous in previous_handlers.items():
-                    signal.signal(forwarded, previous)
+                        if exit_error:
+                            print(
+                                "review runner exit code was not persisted: "
+                                f"{exit_error}",
+                                file=sys.stderr,
+                            )
+                    if previous_mask is None:
+                        break
+                    pending_signal = consume_pending_forwarded_signal()
+                    if pending_signal is None:
+                        break
+                if not terminal_process:
+                    for forwarded, previous in previous_handlers.items():
+                        signal.signal(forwarded, previous)
+            finally:
+                if not terminal_process:
+                    restore_signal_mask(previous_mask)
         finally:
-            if not terminal_process:
-                restore_signal_mask(previous_mask)
+            if write_redaction_entered and write_redaction_scope is not None:
+                write_redaction_scope.__exit__(None, None, None)
     return exit_code
 
 
 def status(state_dir: pathlib.Path) -> dict[str, Any]:
+    redact_values = _freeze_claude_redactions(reviewer=None)
     state_dir = state_dir.expanduser().resolve()
     state, review = load_review_state(state_dir)
+    state_reviewer = state.get("reviewer")
+    redact_values = _freeze_claude_redactions(
+        reviewer=state_reviewer if isinstance(state_reviewer, str) else None,
+    )
+    _redact_claude_text("", redact_values)
     marker = _load_state_marker(state_dir)
     pid_value = state.get("pid")
     pid = pid_value if isinstance(pid_value, int) else 0
@@ -2417,12 +2745,15 @@ def status(state_dir: pathlib.Path) -> dict[str, Any]:
                 if legacy_final is not None:
                     summary["final_available"] = bool(legacy_final)
                 attempts.append(summary)
-    return {
+    summary = {
         "state_dir": str(state_dir),
         "reviewer": state.get("reviewer"),
         "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
         "named_lane_eligible": NAMED_LANE_ELIGIBLE,
         "egress_consent": state.get("egress_consent"),
+        "content_variant": review.content_variant,
+        "snapshot_tree_sha": review.snapshot_tree_sha,
+        "scope_identity": review.scope_identity,
         "pid": pid or None,
         "runner_lock_held": process_running,
         "running": running,
@@ -2437,6 +2768,9 @@ def status(state_dir: pathlib.Path) -> dict[str, Any]:
         "runner_error": tail_text(state_dir / "runner-error.txt"),
         "cleanup_error": tail_text(state_dir / "cleanup-error.txt"),
         "admission": admission_summary,
+    }
+    return {
+        key: _redact_claude_value(item, redact_values) for key, item in summary.items()
     }
 
 
@@ -2563,7 +2897,10 @@ def _admission_status_for_loaded_state(
     if (
         preflight.get("status") != PREFLIGHT_STATUS
         or preflight.get("private_artifacts") != PREFLIGHT_PRIVATE_ARTIFACTS
-        or preflight.get("scope") != PREFLIGHT_SCOPE
+        or preflight.get("content_variant") != review.content_variant
+        or preflight.get("snapshot_tree_sha") != review.snapshot_tree_sha
+        or preflight.get("scope_identity") != review.scope_identity
+        or preflight.get("scope") != review_preflight_scope(review.content_variant)
     ):
         return _admission_result(
             state_dir=state_dir,
@@ -2643,6 +2980,8 @@ def _should_retain_fallback_workspace(
         state.get("reviewer") != "codex"
         or exit_code != 127
         or not review.workspace_root.is_dir()
+        or not (review.git_dir or review.container_dir / "review.git").is_dir()
+        or not review.has_complete_scope_identity()
     ):
         return False
     try:
@@ -2659,7 +2998,11 @@ def _should_retain_fallback_workspace(
                 == "sensitive-content and escaping-symlink checks passed"
             )
         if (
-            preflight.get("private_artifacts") != "removed"
+            preflight.get("review_range") != f"{review.base_ref}..{review.head_ref}"
+            or preflight.get("content_variant") != review.content_variant
+            or preflight.get("snapshot_tree_sha") != review.snapshot_tree_sha
+            or preflight.get("scope_identity") != review.scope_identity
+            or preflight.get("private_artifacts") != "removed"
             or preflight.get("status")
             != "review workspace containment and integrity checks passed"
         ):
@@ -2964,7 +3307,6 @@ def _cleanup_terminal_workspace(
     ):
         if not _acquire_cleanup_lock(cleanup_lock, deadline=deadline):
             return 124
-        revalidate_state_directory()
         cleanup_lock_transferred = False
 
         def transfer_cleanup_lock() -> None:
@@ -3059,6 +3401,29 @@ def _cleanup_terminal_workspace(
                 raise
             keep_workspace = bool(state.get("keep_workspace"))
             exit_code = _read_exit_code(state_dir)
+            if exit_code is None:
+                exit_error = _write_loaded_review_text(
+                    state_dir,
+                    review,
+                    name=EXIT_FILE,
+                    text="1\n",
+                )
+                diagnostic_error = _write_loaded_review_text(
+                    state_dir,
+                    review,
+                    name="runner-error.txt",
+                    text=("review runner exited without recording a terminal result\n"),
+                )
+                if exit_error or diagnostic_error:
+                    raise ReviewError(
+                        "cannot persist missing runner terminal state: "
+                        + "; ".join(
+                            error for error in (exit_error, diagnostic_error) if error
+                        )
+                    )
+                exit_code = 1
+            pid_value = state.get("pid")
+            _reap_started_process(pid_value if isinstance(pid_value, int) else 0)
             retain_for_fallback = _should_retain_fallback_workspace(
                 state_dir=state_dir,
                 state=state,
@@ -3084,6 +3449,14 @@ def _cleanup_terminal_workspace(
                 )
             if not cleanup_completed:
                 return 124
+            if (
+                not should_keep
+                and not isinstance(review, LegacyReviewWorkspace)
+                and cleanup_error is None
+            ):
+                revalidate_state_directory()
+                cleanup_error = validate_retained_cleanup_postcondition(review)
+                revalidate_state_directory()
             if cleanup_error:
                 diagnostic_error = _write_loaded_review_text(
                     state_dir,
