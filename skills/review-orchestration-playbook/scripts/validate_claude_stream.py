@@ -234,8 +234,7 @@ INIT_PROFILE_CONTRACT = {
                     "failure": "inconclusive",
                 },
                 "analytics_disabled": {
-                    "rule": "constant",
-                    "value": True,
+                    "rule": "boolean",
                     "failure": "inconclusive",
                 },
                 "product_feedback_disabled": {
@@ -291,6 +290,7 @@ ASSISTANT_MESSAGE_FIELDS = frozenset(
         "usage",
     )
 )
+EXTENDED_ASSISTANT_MESSAGE_REQUIRED_FIELDS = frozenset(("diagnostics",))
 ASSISTANT_CONTENT_BLOCK_FIELDS = {
     "thinking": frozenset(("type", "signature", "thinking")),
     "text": frozenset(("type", "text")),
@@ -317,7 +317,9 @@ STRUCTURED_TOOL_PATH_SCOPE_CONTRACT = {
         "Grep": {
             "path_field": "path",
             "path_required": False,
-            "path_if_present": "absolute",
+            "path_if_present": "absolute_or_cwd_relative",
+            "relative_path_base": "host_workspace_cwd",
+            "home_shorthand": "scope_unverified",
         },
         "Glob": {
             "path_field": "path",
@@ -539,6 +541,10 @@ INTERMEDIATE_EVENT_CONTRACT = {
                 "maximum_exclusive": "2.1.216",
             },
             "event_contract": "reviewed-2x",
+            "assistant_message_profile": {
+                "additional_required_fields": [],
+                "field_contracts": {},
+            },
         },
         "extended-2x": {
             "version_range": {
@@ -546,6 +552,14 @@ INTERMEDIATE_EVENT_CONTRACT = {
                 "maximum_exclusive": "3.0.0",
             },
             "event_contract": "reviewed-2x",
+            "assistant_message_profile": {
+                "additional_required_fields": sorted(
+                    EXTENDED_ASSISTANT_MESSAGE_REQUIRED_FIELDS
+                ),
+                "field_contracts": {
+                    "diagnostics": {"rule": "null"},
+                },
+            },
         },
     },
 }
@@ -1822,8 +1836,6 @@ def _validate_extended_init(event: Mapping[str, Any], evidence: _Evidence) -> No
         value = event["analytics_disabled"]
         if type(value) is not bool:
             evidence.inconclusive.add("init.analytics_disabled.malformed")
-        elif value is not True:
-            evidence.inconclusive.add("init.analytics_disabled.mismatch")
 
     if "product_feedback_disabled" in event:
         value = event["product_feedback_disabled"]
@@ -2405,7 +2417,15 @@ def _audit_structured_tool_path(
         else:
             raw_path = Path(path_value)
             if not raw_path.is_absolute():
-                scope, resolved_path = "unverified", None
+                if tool_contract[
+                    "path_if_present"
+                ] != "absolute_or_cwd_relative" or path_value.startswith("~"):
+                    scope, resolved_path = "unverified", None
+                else:
+                    scope, resolved_path = _candidate_path_scope(
+                        binding.expected_cwd / raw_path,
+                        binding,
+                    )
             else:
                 scope, resolved_path = _candidate_path_scope(raw_path, binding)
             _record_structured_scope(scope, evidence)
@@ -2491,6 +2511,7 @@ def _validate_assistant_content_block(
 def _validate_assistant_event(
     event: Mapping[str, Any],
     *,
+    profile_name: str,
     init_session_id: str | None,
     requested_model: str,
     allowed_tools: frozenset[str],
@@ -2525,9 +2546,12 @@ def _validate_assistant_event(
     if "message" not in event:
         return
     message_label = f"{label}.message"
+    message_required_fields = ASSISTANT_MESSAGE_FIELDS
+    if profile_name == "extended-2x":
+        message_required_fields |= EXTENDED_ASSISTANT_MESSAGE_REQUIRED_FIELDS
     message = _validate_closed_object(
         event["message"],
-        required_fields=ASSISTANT_MESSAGE_FIELDS,
+        required_fields=message_required_fields,
         label=message_label,
         evidence=evidence,
     )
@@ -2541,6 +2565,10 @@ def _validate_assistant_event(
     ):
         _validate_intermediate_null(
             message, field_name, label=message_label, evidence=evidence
+        )
+    if profile_name == "extended-2x":
+        _validate_intermediate_null(
+            message, "diagnostics", label=message_label, evidence=evidence
         )
     _validate_intermediate_exact_value(
         message, "type", "message", label=message_label, evidence=evidence
@@ -2753,6 +2781,7 @@ def _validate_intermediate_events(
         elif event_type == "assistant":
             _validate_assistant_event(
                 event,
+                profile_name=profile_name,
                 init_session_id=init_session_id,
                 requested_model=requested_model,
                 allowed_tools=allowed_tools,
