@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import pathlib
+import subprocess
 import sys
 import unittest
 
@@ -126,6 +128,45 @@ class ReviewResultDispositionTest(unittest.TestCase):
                 "No findings.",
                 content_assessment="clean",  # type: ignore[arg-type]
             )
+
+    def test_cli_preserves_exact_utf8_result_and_emits_disposition(self) -> None:
+        raw_result = b"Reviewed the changed paths.\r\nNo findings.\r\n"
+        completed = subprocess.run(
+            (
+                sys.executable,
+                str(SCRIPTS / "review_runtime/review_result.py"),
+                "--content-assessment",
+                "summary-only",
+            ),
+            check=False,
+            input=raw_result,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+        disposition = json.loads(completed.stdout)
+        self.assertEqual(disposition["raw_result"], raw_result.decode("utf-8"))
+        self.assertEqual(disposition["review_outcome"], "clean")
+        self.assertEqual(disposition["presentation"], "extended-clean")
+
+    def test_cli_rejects_invalid_utf8(self) -> None:
+        completed = subprocess.run(
+            (
+                sys.executable,
+                str(SCRIPTS / "review_runtime/review_result.py"),
+                "--content-assessment",
+                "undetermined",
+            ),
+            check=False,
+            input=b"\xff",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stdout, b"")
+        self.assertIn(b"raw_result must be valid UTF-8", completed.stderr)
 
 
 if __name__ == "__main__":

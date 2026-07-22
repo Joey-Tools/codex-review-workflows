@@ -1,0 +1,730 @@
+"""Run narrow safety and process guards for canonical named review lanes."""
+
+from __future__ import annotations
+
+import sys
+
+
+if sys.version_info < (3, 10):
+    raise SystemExit("named_lane_guard requires Python 3.10 or later")
+
+if not (
+    sys.flags.isolated
+    and sys.flags.ignore_environment
+    and sys.flags.no_site
+    and sys.flags.no_user_site
+    and sys.flags.dont_write_bytecode
+):
+    raise SystemExit(
+        "named_lane_guard requires a prevalidated absolute Python interpreter "
+        "invoked with -I -B -S"
+    )
+
+import importlib.machinery
+import importlib.util
+import os
+import pathlib
+import stat
+import types
+
+
+_SOURCE_LIMIT_BYTES = 1024 * 1024
+_DEFAULT_RUNTIME_SOURCES = (
+    ("review_runtime", "__init__.py", True),
+    ("review_runtime.common", "common.py", False),
+    ("review_runtime.named_lane", "named_lane.py", False),
+)
+_CLAUDE_PREFLIGHT_SOURCES = (
+    ("review_runtime", "__init__.py", True),
+    ("review_runtime.common", "common.py", False),
+    (
+        "review_runtime.claude_version_policy",
+        "claude_version_policy.py",
+        False,
+    ),
+    ("review_runtime.claude_capabilities", "claude_capabilities.py", False),
+    (
+        "review_runtime.claude_refresh_lock",
+        "claude_refresh_lock.py",
+        False,
+    ),
+    ("review_runtime.claude_linux", "claude_linux.py", False),
+    ("review_runtime.claude_provenance", "claude_provenance.py", False),
+    (
+        "review_runtime.claude_stream_contract",
+        "claude_stream_contract.py",
+        False,
+    ),
+    (
+        "review_runtime.named_claude_preflight",
+        "named_claude_preflight.py",
+        False,
+    ),
+)
+_CLAUDE_STREAM_RUNTIME_SOURCES = (
+    ("review_runtime", "__init__.py", True),
+    ("review_runtime.common", "common.py", False),
+    (
+        "review_runtime.claude_version_policy",
+        "claude_version_policy.py",
+        False,
+    ),
+    ("review_runtime.claude_capabilities", "claude_capabilities.py", False),
+    (
+        "review_runtime.claude_refresh_lock",
+        "claude_refresh_lock.py",
+        False,
+    ),
+    ("review_runtime.claude_linux", "claude_linux.py", False),
+    ("review_runtime.claude_provenance", "claude_provenance.py", False),
+    (
+        "review_runtime.claude_stream_contract",
+        "claude_stream_contract.py",
+        False,
+    ),
+)
+_CLAUDE_STREAM_VALIDATOR_SOURCES = (
+    ("validate_claude_stream", "validate_claude_stream.py", False),
+)
+_REVIEW_RESULT_SOURCES = (
+    ("review_runtime", "__init__.py", True),
+    ("review_runtime.review_result", "review_result.py", False),
+)
+_SourceIdentity = tuple[int, int, int, int, int]
+_CompanionBinding = bytes
+
+
+class _BoundSourceLoader:
+    def __init__(
+        self,
+        module_name: str,
+        origin: str,
+        code: types.CodeType,
+    ) -> None:
+        self.module_name = module_name
+        self.origin = origin
+        self.code = code
+
+    def create_module(
+        self,
+        _spec: importlib.machinery.ModuleSpec,
+    ) -> types.ModuleType | None:
+        return None
+
+    def exec_module(self, module: types.ModuleType) -> None:
+        if module.__name__ != self.module_name:
+            raise ImportError("bound source loader module mismatch")
+        exec(self.code, module.__dict__)
+
+    def get_filename(self, fullname: str) -> str:
+        if fullname != self.module_name:
+            raise ImportError("bound source loader module mismatch")
+        return self.origin
+
+
+def _fail(message: str, error: BaseException | None = None) -> SystemExit:
+    failure = SystemExit(f"named_lane_guard cannot load bound runtime: {message}")
+    if error is not None:
+        failure.__cause__ = error
+    return failure
+
+
+def _source_identity(
+    metadata: os.stat_result,
+) -> _SourceIdentity:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_size,
+    )
+
+
+def _directory_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+    )
+
+
+def _read_descriptor_payload(descriptor: int, source_name: str) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    payload = bytearray()
+    while len(payload) <= _SOURCE_LIMIT_BYTES:
+        chunk = os.read(
+            descriptor,
+            min(64 * 1024, _SOURCE_LIMIT_BYTES + 1 - len(payload)),
+        )
+        if not chunk:
+            break
+        payload.extend(chunk)
+    if len(payload) > _SOURCE_LIMIT_BYTES:
+        raise _fail(f"{source_name} exceeds the bound source size limit")
+    return bytes(payload)
+
+
+def _read_bound_source(
+    path: pathlib.Path,
+    directory_descriptor: int,
+) -> tuple[bytes, _SourceIdentity]:
+    try:
+        lexical_metadata = os.stat(
+            path.name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except (NotImplementedError, OSError) as error:
+        raise _fail(f"cannot inspect {path.name}", error)
+    if not stat.S_ISREG(lexical_metadata.st_mode) or stat.S_ISLNK(
+        lexical_metadata.st_mode
+    ):
+        raise _fail(f"{path.name} must be an ordinary non-symlink regular file")
+
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise _fail("this platform cannot open bound sources without following links")
+    nonblocking = getattr(os, "O_NONBLOCK", None)
+    if nonblocking is None:
+        raise _fail("this platform cannot open bound sources without blocking")
+    flags = (
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | no_follow | nonblocking
+    )
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path.name, flags, dir_fd=directory_descriptor)
+        opened_metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_metadata.st_mode):
+            raise _fail(f"{path.name} changed to a non-regular file")
+        if _source_identity(opened_metadata) != _source_identity(lexical_metadata):
+            raise _fail(f"{path.name} identity changed before reading")
+
+        payload = _read_descriptor_payload(descriptor, path.name)
+        repeated_payload = _read_descriptor_payload(descriptor, path.name)
+        if repeated_payload != payload:
+            raise _fail(f"{path.name} content changed while reading")
+        final_metadata = os.fstat(descriptor)
+        if _source_identity(final_metadata) != _source_identity(opened_metadata):
+            raise _fail(f"{path.name} identity changed while reading")
+        if len(payload) != opened_metadata.st_size:
+            raise _fail(f"{path.name} content changed while reading")
+        return bytes(payload), _source_identity(opened_metadata)
+    except SystemExit:
+        raise
+    except OSError as error:
+        raise _fail(f"cannot read {path.name}", error)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _new_bound_module(
+    module_name: str,
+    origin: pathlib.Path,
+    code: types.CodeType,
+    *,
+    is_package: bool,
+) -> types.ModuleType:
+    origin_text = str(origin)
+    loader = _BoundSourceLoader(module_name, origin_text, code)
+    spec = importlib.machinery.ModuleSpec(
+        module_name,
+        loader,
+        origin=origin_text,
+        is_package=is_package,
+    )
+    spec.has_location = True
+    if is_package:
+        # Keep the package closed: every allowed relative import is preloaded below.
+        spec.submodule_search_locations = []
+    module = importlib.util.module_from_spec(spec)
+    module.__cached__ = None
+    return module
+
+
+def _read_bound_files(
+    source_root: pathlib.Path,
+    source_names: tuple[str, ...],
+    *,
+    label: str,
+) -> dict[str, tuple[pathlib.Path, bytes, _SourceIdentity]]:
+    try:
+        root_metadata = source_root.lstat()
+    except OSError as error:
+        raise _fail(f"cannot inspect {label} directory", error)
+    if not stat.S_ISDIR(root_metadata.st_mode) or stat.S_ISLNK(root_metadata.st_mode):
+        raise _fail(f"{label} must be an ordinary non-symlink directory")
+
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    directory_only = getattr(os, "O_DIRECTORY", None)
+    if no_follow is None or directory_only is None:
+        raise _fail(f"this platform cannot bind the {label} directory safely")
+    directory_descriptor: int | None = None
+    try:
+        directory_descriptor = os.open(
+            source_root,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | no_follow | directory_only,
+        )
+        opened_root_metadata = os.fstat(directory_descriptor)
+        if not stat.S_ISDIR(opened_root_metadata.st_mode) or (
+            _directory_identity(opened_root_metadata)
+            != _directory_identity(root_metadata)
+        ):
+            raise _fail(f"{label} directory identity changed before reading")
+
+        files: dict[str, tuple[pathlib.Path, bytes, _SourceIdentity]] = {}
+        for source_name in source_names:
+            source_path = source_root / source_name
+            payload, identity = _read_bound_source(source_path, directory_descriptor)
+            files[source_name] = (
+                source_path,
+                payload,
+                identity,
+            )
+        try:
+            final_root_metadata = source_root.lstat()
+        except OSError as error:
+            raise _fail(f"cannot revalidate {label} directory", error)
+        if not stat.S_ISDIR(final_root_metadata.st_mode) or stat.S_ISLNK(
+            final_root_metadata.st_mode
+        ):
+            raise _fail(f"{label} directory changed to an unsafe type")
+        if _directory_identity(final_root_metadata) != _directory_identity(
+            opened_root_metadata
+        ):
+            raise _fail(f"{label} directory identity changed while reading")
+        return files
+    except SystemExit:
+        raise
+    except OSError as error:
+        raise _fail(f"cannot bind {label} directory", error)
+    finally:
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+
+
+def _is_bound_namespace(name: str, namespace_root: str) -> bool:
+    return name == namespace_root or name.startswith(f"{namespace_root}.")
+
+
+def _remove_bound_namespace(namespace_root: str) -> None:
+    for module_name in tuple(sys.modules):
+        if _is_bound_namespace(module_name, namespace_root):
+            sys.modules.pop(module_name, None)
+
+
+def _load_bound_sources(
+    source_root: pathlib.Path,
+    source_specs: tuple[tuple[str, str, bool], ...],
+    *,
+    namespace_root: str,
+    entry_module_name: str,
+    entry_attribute: str | None = "main",
+    constant_bindings: tuple[tuple[str, str, pathlib.Path], ...] = (),
+    byte_bindings: tuple[tuple[str, str, bytes], ...] = (),
+    source_byte_bindings: tuple[tuple[str, bytes], ...] = (),
+) -> object:
+    bound_files = _read_bound_files(
+        source_root,
+        tuple(source_name for _module_name, source_name, _is_package in source_specs),
+        label=source_root.name,
+    )
+    sources = {
+        module_name: (
+            bound_files[source_name][0],
+            bound_files[source_name][1],
+            is_package,
+        )
+        for module_name, source_name, is_package in source_specs
+    }
+    for module_name, expected_payload in source_byte_bindings:
+        if module_name not in sources or sources[module_name][1] != expected_payload:
+            raise _fail(f"bound source bytes changed: {module_name}")
+    code_objects: dict[str, types.CodeType] = {}
+    for module_name, (source_path, payload, _is_package) in sources.items():
+        try:
+            code_objects[module_name] = compile(
+                payload,
+                str(source_path),
+                "exec",
+                dont_inherit=True,
+            )
+        except Exception as error:
+            raise _fail(f"cannot compile {source_path.name}", error)
+
+    module_names = tuple(
+        module_name for module_name, _source_name, _is_package in source_specs
+    )
+    preexisting = sorted(
+        name for name in sys.modules if _is_bound_namespace(name, namespace_root)
+    )
+    if preexisting:
+        raise _fail(f"a {namespace_root} module was already loaded")
+
+    modules = {
+        module_name: _new_bound_module(
+            module_name,
+            source_path,
+            code_objects[module_name],
+            is_package=is_package,
+        )
+        for module_name, (source_path, _payload, is_package) in sources.items()
+    }
+    sys.modules.update(modules)
+    try:
+        for module_name, _source_name, _is_package in source_specs:
+            loader = modules[module_name].__loader__
+            if not isinstance(loader, _BoundSourceLoader):
+                raise ImportError("bound source loader metadata changed")
+            loader.exec_module(modules[module_name])
+        loaded_module_names = {
+            name for name in sys.modules if _is_bound_namespace(name, namespace_root)
+        }
+        if loaded_module_names != set(module_names) or any(
+            sys.modules.get(name) is not modules[name] for name in module_names
+        ):
+            raise ImportError("bound source module closure changed during loading")
+        for module_name, attribute_name, expected_path in constant_bindings:
+            if getattr(modules[module_name], attribute_name, None) != expected_path:
+                raise ImportError(f"bound companion path changed: {attribute_name}")
+        for module_name, attribute_name, payload in byte_bindings:
+            module = modules[module_name]
+            if (
+                attribute_name not in module.__dict__
+                or module.__dict__[attribute_name] is not None
+            ):
+                raise ImportError(
+                    f"bound companion byte hook changed: {attribute_name}"
+                )
+            setattr(module, attribute_name, payload)
+            if getattr(module, attribute_name, None) is not payload:
+                raise ImportError(f"cannot bind companion bytes: {attribute_name}")
+        if entry_attribute is None:
+            entrypoint = modules[entry_module_name]
+        else:
+            entrypoint = getattr(modules[entry_module_name], entry_attribute, None)
+            if not callable(entrypoint):
+                raise ImportError("bound entrypoint is missing or not callable")
+    except BaseException as error:
+        for module_name in reversed(module_names):
+            sys.modules.pop(module_name, None)
+        _remove_bound_namespace(namespace_root)
+        raise _fail("runtime execution failed", error)
+    for module_name, module in modules.items():
+        parent_name, separator, child_name = module_name.rpartition(".")
+        if separator and parent_name in modules:
+            setattr(modules[parent_name], child_name, module)
+    return entrypoint
+
+
+def _validate_bound_companion(path: pathlib.Path) -> _CompanionBinding:
+    files = _read_bound_files(
+        path.parent,
+        (path.name,),
+        label=f"{path.name} companion",
+    )
+    _bound_path, payload, _identity = files[path.name]
+    return payload
+
+
+def _stream_companion_bindings(
+    scripts_root: pathlib.Path,
+) -> tuple[tuple[pathlib.Path, _CompanionBinding], ...]:
+    runtime_root = scripts_root / "review_runtime"
+    paths = (
+        scripts_root.parent / "references" / "claude-stream-compatibility.json",
+        scripts_root.parent / "references" / "claude-2.1.212-stream-schema.json",
+        scripts_root.parent / "references" / "claude-stream-schema.json",
+        runtime_root / "claude_capabilities.py",
+    )
+    return tuple((path, _validate_bound_companion(path)) for path in paths)
+
+
+def _bind_stream_contract_reader(
+    module: object,
+    companions: tuple[tuple[pathlib.Path, _CompanionBinding], ...],
+) -> None:
+    namespace = getattr(module, "__dict__", None)
+    if type(namespace) is not dict or not callable(namespace.get("_read_stable")):
+        raise _fail("stream-contract byte reader is unavailable")
+    error_type = namespace.get("ClaudeStreamContractError")
+    if not isinstance(error_type, type) or not issubclass(error_type, Exception):
+        raise _fail("stream-contract error type is unavailable")
+    bound_payloads = dict(companions)
+    if len(bound_payloads) != len(companions):
+        raise _fail("stream-contract companion paths are not unique")
+
+    def read_bound(path: pathlib.Path) -> bytes:
+        if not isinstance(path, pathlib.Path) or path not in bound_payloads:
+            raise error_type("stream contract path is not guard-bound")
+        return bound_payloads[path]
+
+    namespace["_read_stable"] = read_bound
+    if namespace.get("_read_stable") is not read_bound:
+        raise _fail("stream-contract byte reader could not be bound")
+
+
+def _guard_companions(
+    entrypoint: object,
+    companions: tuple[tuple[pathlib.Path, _CompanionBinding], ...],
+) -> object:
+    def guarded_main(argv: object = None) -> object:
+        for companion, expected_binding in companions:
+            actual_binding = _validate_bound_companion(companion)
+            if actual_binding != expected_binding:
+                raise _fail(f"{companion.name} companion content changed")
+        return entrypoint(argv)
+
+    return guarded_main
+
+
+def _current_posix_account_home() -> pathlib.Path:
+    if os.name != "posix":
+        raise _fail("current POSIX account home is unavailable")
+    try:
+        import pwd
+
+        uid = os.getuid()
+        account = pwd.getpwuid(uid)
+    except (ImportError, KeyError, OSError) as error:
+        raise _fail("current POSIX account home cannot be resolved", error)
+    if account.pw_uid != uid or not account.pw_dir:
+        raise _fail("current POSIX account home is invalid")
+    home = pathlib.Path(account.pw_dir)
+    if not home.is_absolute():
+        raise _fail("current POSIX account home is not absolute")
+    try:
+        resolved = home.resolve(strict=True)
+        metadata = resolved.stat(follow_symlinks=False)
+    except (OSError, RuntimeError) as error:
+        raise _fail("current POSIX account home is not accessible", error)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise _fail("current POSIX account home is not a directory")
+    return resolved
+
+
+def _bind_preflight_account_home(entrypoint: object) -> object:
+    def guarded_main(argv: object = None) -> object:
+        return entrypoint(argv, selection_home=_current_posix_account_home())
+
+    return guarded_main
+
+
+def _load_default_entrypoint(scripts_root: pathlib.Path) -> object:
+    fd_exec_path = scripts_root / "review_runtime" / "fd_exec.py"
+    fd_exec_bytes = _validate_bound_companion(fd_exec_path)
+    entrypoint = _load_bound_sources(
+        scripts_root / "review_runtime",
+        _DEFAULT_RUNTIME_SOURCES,
+        namespace_root="review_runtime",
+        entry_module_name="review_runtime.named_lane",
+        byte_bindings=(("review_runtime.common", "FD_EXEC_BYTES", fd_exec_bytes),),
+    )
+    return _guard_companions(entrypoint, ((fd_exec_path, fd_exec_bytes),))
+
+
+def _load_claude_preflight_entrypoint(scripts_root: pathlib.Path) -> object:
+    runtime_root = scripts_root / "review_runtime"
+    release_key_path = runtime_root / "claude_code_release.asc"
+    release_key_bytes = _validate_bound_companion(release_key_path)
+    stream_companions = _stream_companion_bindings(scripts_root)
+    compatibility_path, _compatibility_bytes = stream_companions[0]
+    baseline_path, _baseline_bytes = stream_companions[1]
+    profile_path, _profile_bytes = stream_companions[2]
+    capability_path, capability_bytes = stream_companions[3]
+    fd_exec_path = runtime_root / "fd_exec.py"
+    fd_exec_bytes = _validate_bound_companion(fd_exec_path)
+    try:
+        entrypoint = _load_bound_sources(
+            runtime_root,
+            _CLAUDE_PREFLIGHT_SOURCES,
+            namespace_root="review_runtime",
+            entry_module_name="review_runtime.named_claude_preflight",
+            constant_bindings=(
+                (
+                    "review_runtime.claude_provenance",
+                    "CLAUDE_RELEASE_KEY_PATH",
+                    release_key_path,
+                ),
+                (
+                    "review_runtime.claude_stream_contract",
+                    "COMPATIBILITY_PATH",
+                    compatibility_path,
+                ),
+                (
+                    "review_runtime.claude_stream_contract",
+                    "BASELINE_PATH",
+                    baseline_path,
+                ),
+                (
+                    "review_runtime.claude_stream_contract",
+                    "PROFILE_PATH",
+                    profile_path,
+                ),
+                (
+                    "review_runtime.claude_stream_contract",
+                    "CAPABILITY_PATH",
+                    capability_path,
+                ),
+            ),
+            byte_bindings=(
+                (
+                    "review_runtime.common",
+                    "FD_EXEC_BYTES",
+                    fd_exec_bytes,
+                ),
+                (
+                    "review_runtime.claude_provenance",
+                    "CLAUDE_RELEASE_KEY_BYTES",
+                    release_key_bytes,
+                ),
+            ),
+            source_byte_bindings=(
+                ("review_runtime.claude_capabilities", capability_bytes),
+            ),
+        )
+        _bind_stream_contract_reader(
+            sys.modules["review_runtime.claude_stream_contract"],
+            stream_companions,
+        )
+    except BaseException:
+        _remove_bound_namespace("review_runtime")
+        raise
+    return _guard_companions(
+        _bind_preflight_account_home(entrypoint),
+        (
+            (release_key_path, release_key_bytes),
+            *stream_companions,
+            (fd_exec_path, fd_exec_bytes),
+        ),
+    )
+
+
+def _load_claude_stream_validator_entrypoint(scripts_root: pathlib.Path) -> object:
+    runtime_root = scripts_root / "review_runtime"
+    stream_companions = _stream_companion_bindings(scripts_root)
+    compatibility_path, compatibility_bytes = stream_companions[0]
+    baseline_path, baseline_bytes = stream_companions[1]
+    profile_path, profile_bytes = stream_companions[2]
+    capability_path, capability_bytes = stream_companions[3]
+    try:
+        stream_contract_module = _load_bound_sources(
+            runtime_root,
+            _CLAUDE_STREAM_RUNTIME_SOURCES,
+            namespace_root="review_runtime",
+            entry_module_name="review_runtime.claude_stream_contract",
+            entry_attribute=None,
+            constant_bindings=(
+                (
+                    "review_runtime.claude_stream_contract",
+                    "COMPATIBILITY_PATH",
+                    compatibility_path,
+                ),
+                (
+                    "review_runtime.claude_stream_contract",
+                    "BASELINE_PATH",
+                    baseline_path,
+                ),
+                (
+                    "review_runtime.claude_stream_contract",
+                    "PROFILE_PATH",
+                    profile_path,
+                ),
+                (
+                    "review_runtime.claude_stream_contract",
+                    "CAPABILITY_PATH",
+                    capability_path,
+                ),
+            ),
+            source_byte_bindings=(
+                ("review_runtime.claude_capabilities", capability_bytes),
+            ),
+        )
+        _bind_stream_contract_reader(stream_contract_module, stream_companions)
+        entrypoint = _load_bound_sources(
+            scripts_root,
+            _CLAUDE_STREAM_VALIDATOR_SOURCES,
+            namespace_root="validate_claude_stream",
+            entry_module_name="validate_claude_stream",
+            constant_bindings=(
+                (
+                    "validate_claude_stream",
+                    "COMPATIBILITY_PATH",
+                    compatibility_path,
+                ),
+                ("validate_claude_stream", "SCHEMA_PATH", profile_path),
+                (
+                    "validate_claude_stream",
+                    "CAPABILITY_PATH",
+                    capability_path,
+                ),
+            ),
+            byte_bindings=(
+                (
+                    "validate_claude_stream",
+                    "COMPATIBILITY_JSON_BYTES",
+                    compatibility_bytes,
+                ),
+                (
+                    "validate_claude_stream",
+                    "BASELINE_SCHEMA_BYTES",
+                    baseline_bytes,
+                ),
+                (
+                    "validate_claude_stream",
+                    "PROFILE_SCHEMA_BYTES",
+                    profile_bytes,
+                ),
+                (
+                    "validate_claude_stream",
+                    "CAPABILITY_SOURCE_BYTES",
+                    capability_bytes,
+                ),
+            ),
+        )
+    except BaseException:
+        _remove_bound_namespace("validate_claude_stream")
+        _remove_bound_namespace("review_runtime")
+        raise
+    return _guard_companions(entrypoint, stream_companions)
+
+
+def _load_review_result_entrypoint(scripts_root: pathlib.Path) -> object:
+    runtime_root = scripts_root / "review_runtime"
+    review_result_path = runtime_root / "review_result.py"
+    review_result_bytes = _validate_bound_companion(review_result_path)
+    entrypoint = _load_bound_sources(
+        runtime_root,
+        _REVIEW_RESULT_SOURCES,
+        namespace_root="review_runtime",
+        entry_module_name="review_runtime.review_result",
+        source_byte_bindings=(("review_runtime.review_result", review_result_bytes),),
+    )
+    return _guard_companions(
+        entrypoint,
+        ((review_result_path, review_result_bytes),),
+    )
+
+
+def _select_entrypoint(
+    scripts_root: pathlib.Path,
+    argv: tuple[str, ...],
+) -> tuple[object, tuple[str, ...]]:
+    if argv and argv[0] == "preflight-claude":
+        return _load_claude_preflight_entrypoint(scripts_root), argv[1:]
+    if argv and argv[0] == "validate-claude-stream":
+        return _load_claude_stream_validator_entrypoint(scripts_root), argv[1:]
+    if argv and argv[0] == "classify-review-result":
+        return _load_review_result_entrypoint(scripts_root), argv[1:]
+    return _load_default_entrypoint(scripts_root), argv
+
+
+sys.dont_write_bytecode = True
+_SCRIPTS_ROOT = pathlib.Path(__file__).resolve().parent
+main, _MAIN_ARGV = _select_entrypoint(_SCRIPTS_ROOT, tuple(sys.argv[1:]))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(_MAIN_ARGV))

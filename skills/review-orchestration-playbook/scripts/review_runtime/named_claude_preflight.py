@@ -1685,13 +1685,18 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     stdout: TextIO | None = None,
+    selection_home: pathlib.Path | None = None,
 ) -> int:
     arguments = tuple(sys.argv[1:] if argv is None else argv)
     destination = sys.stdout if stdout is None else stdout
     try:
         explicit_path, explicit_version = _parse_args(arguments)
-        home_value = os.environ.get("HOME")
-        home = pathlib.Path(home_value) if home_value else None
+        home_value = os.environ.get("HOME") if selection_home is None else None
+        home = (
+            selection_home
+            if selection_home is not None
+            else (pathlib.Path(home_value) if home_value else None)
+        )
         value = preflight(
             explicit_path=explicit_path,
             explicit_version=explicit_version,

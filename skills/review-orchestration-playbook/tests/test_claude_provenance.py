@@ -894,6 +894,79 @@ class GpgVerificationTest(unittest.TestCase):
         self.assertEqual(len(set(execution_paths)), 1)
         self.assertTrue(all(not home.exists() for home in homes))
 
+    def test_injected_release_key_bytes_win_when_path_is_missing(self) -> None:
+        injected_key = b"injected release key"
+
+        def runner(argv, *, env, timeout_seconds):  # type: ignore[no-untyped-def]
+            if "--dearmor" in argv:
+                key_path = pathlib.Path(argv[-1])
+                self.assertEqual(key_path.read_bytes(), injected_key)
+            return self.fake_gpg(
+                argv,
+                env=env,
+                timeout_seconds=timeout_seconds,
+            )
+
+        with (
+            mock.patch.object(
+                claude_provenance,
+                "CLAUDE_RELEASE_KEY_BYTES",
+                injected_key,
+            ),
+            mock.patch.object(
+                claude_provenance,
+                "CLAUDE_RELEASE_KEY_PATH",
+                self.root / "missing-release-key.asc",
+            ),
+            mock.patch.object(
+                claude_provenance,
+                "_run_gpg",
+                side_effect=runner,
+            ),
+        ):
+            selected = claude_provenance.verify_manifest_signature(
+                self.bundle,
+                temp_root=self.root,
+                gpg_candidates=(self.gpg_path,),
+            )
+
+        self.assertEqual(selected, self.gpg_path.resolve())
+
+    def test_release_key_path_remains_the_compatibility_fallback(self) -> None:
+        replacement_key = self.root / "replacement-release-key.asc"
+        replacement_key.write_bytes(b"replacement release key")
+
+        def runner(argv, *, env, timeout_seconds):  # type: ignore[no-untyped-def]
+            if "--dearmor" in argv:
+                key_path = pathlib.Path(argv[-1])
+                self.assertEqual(key_path.read_bytes(), replacement_key.read_bytes())
+            return self.fake_gpg(
+                argv,
+                env=env,
+                timeout_seconds=timeout_seconds,
+            )
+
+        with (
+            mock.patch.object(claude_provenance, "CLAUDE_RELEASE_KEY_BYTES", None),
+            mock.patch.object(
+                claude_provenance,
+                "CLAUDE_RELEASE_KEY_PATH",
+                replacement_key,
+            ),
+            mock.patch.object(
+                claude_provenance,
+                "_run_gpg",
+                side_effect=runner,
+            ),
+        ):
+            selected = claude_provenance.verify_manifest_signature(
+                self.bundle,
+                temp_root=self.root,
+                gpg_candidates=(self.gpg_path,),
+            )
+
+        self.assertEqual(selected, self.gpg_path.resolve())
+
     def test_revalidates_dynamic_dependencies_before_every_gpg_call(self) -> None:
         with (
             mock.patch.object(

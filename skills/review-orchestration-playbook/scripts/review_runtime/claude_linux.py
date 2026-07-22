@@ -43,8 +43,8 @@ from .common import (
     forwarded_signals,
     restore_signal_mask,
     run_bounded_capture,
+    symlink_target_stays_within_workspace,
 )
-from .workspace import symlink_target_stays_within_workspace
 
 
 class LinuxRuntimeError(ReviewError):

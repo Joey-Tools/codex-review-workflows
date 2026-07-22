@@ -1964,6 +1964,39 @@ class NamedClaudePreflightTest(unittest.TestCase):
             },
         )
 
+    def test_public_main_prefers_explicit_selection_home_over_ambient_home(
+        self,
+    ) -> None:
+        selected_home = pathlib.Path("/trusted/account-home")
+        destination = types.SimpleNamespace(write=lambda _payload: None)
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"HOME": "/attacker/ambient-home"},
+                clear=True,
+            ),
+            mock.patch.object(
+                preflight_module,
+                "preflight",
+                return_value={
+                    "classification": "blocked",
+                    "reason": "compatible-version-unavailable",
+                },
+            ) as preflight,
+        ):
+            returncode = preflight_module.main(
+                argv=(),
+                stdout=destination,
+                selection_home=selected_home,
+            )
+
+        self.assertEqual(returncode, 1)
+        preflight.assert_called_once_with(
+            explicit_path=None,
+            explicit_version=None,
+            home=selected_home,
+        )
+
     def test_invalid_arguments_return_one_json_object_without_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)

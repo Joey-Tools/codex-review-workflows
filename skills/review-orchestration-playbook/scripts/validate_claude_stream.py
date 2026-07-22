@@ -36,6 +36,7 @@ from review_runtime.claude_version_policy import (
 )
 from review_runtime import claude_stream_contract
 
+
 CLAUDE_CODE_VERSION_CONTRACT = {
     "rule": "strict_release_semver_range",
     "minimum_inclusive": "2.1.211",
@@ -90,8 +91,15 @@ PROCESS_RETURNCODE_CONTRACT = {
         },
     },
 }
+BASELINE_PATH = claude_stream_contract.BASELINE_PATH
 SCHEMA_PATH = claude_stream_contract.PROFILE_PATH
 COMPATIBILITY_PATH = claude_stream_contract.COMPATIBILITY_PATH
+CAPABILITY_PATH = claude_stream_contract.CAPABILITY_PATH
+BASELINE_VERSION = claude_stream_contract.BASELINE_VERSION
+COMPATIBILITY_JSON_BYTES: bytes | None = None
+BASELINE_SCHEMA_BYTES: bytes | None = None
+PROFILE_SCHEMA_BYTES: bytes | None = None
+CAPABILITY_SOURCE_BYTES: bytes | None = None
 MAX_SCHEMA_BYTES = 256 * 1024
 MAX_PREFLIGHT_EVIDENCE_BYTES = 16 * 1024
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -771,17 +779,133 @@ def _unique_string_set(value: Any, *, label: str) -> frozenset[str]:
     return frozenset(value)
 
 
+def _load_bound_stream_contract(
+    compatibility_raw: bytes,
+    baseline_raw: bytes,
+    profile_raw: bytes,
+    capability_raw: bytes,
+) -> tuple[
+    claude_stream_contract.ClaudeStreamContractBinding,
+    bytes,
+    bytes,
+]:
+    payloads = (compatibility_raw, baseline_raw, profile_raw, capability_raw)
+    if any(type(payload) is not bytes for payload in payloads):
+        raise _ContractError("bound stream companions must be exact bytes")
+    if any(
+        len(payload) > claude_stream_contract.MAX_CONTRACT_BYTES for payload in payloads
+    ):
+        raise _ContractError("bound stream companion exceeds its size bound")
+    try:
+        compatibility = _strict_json_loads(
+            compatibility_raw.decode("utf-8", errors="strict")
+        )
+        baseline = _strict_json_loads(baseline_raw.decode("utf-8", errors="strict"))
+        profile = _strict_json_loads(profile_raw.decode("utf-8", errors="strict"))
+    except Exception as error:
+        raise _ContractError("bound stream companion is not strict JSON") from error
+    if (
+        _contains_unpaired_surrogate(compatibility)
+        or _contains_unpaired_surrogate(baseline)
+        or _contains_unpaired_surrogate(profile)
+        or type(compatibility) is not dict
+        or type(baseline) is not dict
+        or type(profile) is not dict
+    ):
+        raise _ContractError("bound stream companion structure is invalid")
+    expected_compatibility = {
+        "schema_id": claude_stream_contract.COMPATIBILITY_SCHEMA_ID,
+        "version_policy": claude_stream_contract.VERSION_POLICY_REFERENCE,
+        "compatibility_mode": claude_stream_contract.COMPATIBILITY_MODE,
+        "baseline_schema": claude_stream_contract.BASELINE_SCHEMA_NAME,
+        "baseline_version": BASELINE_VERSION,
+        "profile_schema": claude_stream_contract.PROFILE_SCHEMA_NAME,
+        "profile_version_policy": CLAUDE_COMPATIBILITY_SPEC,
+        "version_profiles": {
+            "legacy-base": ">=2.1.211,<2.1.216",
+            "extended-2x": ">=2.1.216,<3.0.0",
+        },
+        "launch_profiles": ["helper-darwin", "helper-linux", "named-direct"],
+        "fail_closed_surfaces": [
+            "stream_envelope",
+            "init_field_set",
+            "init_field_values",
+            "intermediate_event_field_sets",
+            "intermediate_session_binding",
+            "terminal_field_set",
+            "terminal_variants",
+            "model_identity",
+        ],
+    }
+    if compatibility != expected_compatibility:
+        raise _ContractError("stream compatibility profile does not match")
+    if baseline.get("claude_code_version") != BASELINE_VERSION:
+        raise _ContractError("stream baseline version does not match")
+    if profile.get("claude_code_version") != CLAUDE_CODE_VERSION_CONTRACT:
+        raise _ContractError("stream profile version policy does not match")
+    compatibility_digest = hashlib.sha256(compatibility_raw).hexdigest()
+    baseline_digest = hashlib.sha256(baseline_raw).hexdigest()
+    capability_digest = hashlib.sha256(capability_raw).hexdigest()
+    digest = hashlib.sha256(
+        compatibility_raw
+        + b"\0"
+        + baseline_raw
+        + b"\0"
+        + profile_raw
+        + b"\0"
+        + capability_raw
+    ).hexdigest()
+    return (
+        claude_stream_contract.ClaudeStreamContractBinding(
+            schema_id=claude_stream_contract.COMPATIBILITY_SCHEMA_ID,
+            digest=digest,
+            compatibility_digest=compatibility_digest,
+            baseline_digest=baseline_digest,
+            capability_digest=capability_digest,
+        ),
+        compatibility_raw,
+        profile_raw,
+    )
+
+
 def _load_contract_with_binding() -> tuple[
     dict[str, Any],
     claude_stream_contract.ClaudeStreamContractBinding,
 ]:
-    try:
-        binding, _compatibility_raw, raw = claude_stream_contract.load_stream_contract(
-            compatibility_path=COMPATIBILITY_PATH,
-            profile_path=SCHEMA_PATH,
+    bound_payloads = (
+        COMPATIBILITY_JSON_BYTES,
+        BASELINE_SCHEMA_BYTES,
+        PROFILE_SCHEMA_BYTES,
+        CAPABILITY_SOURCE_BYTES,
+    )
+    if all(payload is None for payload in bound_payloads):
+        try:
+            binding, _compatibility_raw, raw = (
+                claude_stream_contract.load_stream_contract(
+                    compatibility_path=COMPATIBILITY_PATH,
+                    baseline_path=BASELINE_PATH,
+                    profile_path=SCHEMA_PATH,
+                )
+            )
+        except claude_stream_contract.ClaudeStreamContractError as error:
+            raise _ContractError("schema is unreadable or incompatible") from error
+    elif any(payload is None for payload in bound_payloads):
+        raise _ContractError("bound stream companions are incomplete")
+    else:
+        compatibility_raw, baseline_raw, raw, capability_raw = bound_payloads
+        if (
+            type(compatibility_raw) is not bytes
+            or type(baseline_raw) is not bytes
+            or type(raw) is not bytes
+            or type(capability_raw) is not bytes
+        ):
+            raise _ContractError("bound stream companions must be exact bytes")
+        binding, _compatibility_raw, raw = _load_bound_stream_contract(
+            bytes(compatibility_raw),
+            bytes(baseline_raw),
+            bytes(raw),
+            bytes(capability_raw),
         )
-    except claude_stream_contract.ClaudeStreamContractError as error:
-        raise _ContractError("schema is unreadable") from error
     if len(raw) > MAX_SCHEMA_BYTES:
         raise _ContractError("schema exceeds its size bound")
     try:
@@ -875,47 +999,67 @@ def _load_contract_with_binding() -> tuple[
     ):
         raise _ContractError("init optional fields do not match the validator")
     field_contracts = init_contract.get("field_contracts")
-    if (
-        type(field_contracts) is not dict
-        or frozenset(field_contracts) != INIT_REQUIRED_FIELDS
-    ):
-        raise _ContractError("init field contracts are incomplete")
-    if field_contracts.get("permissionMode") != {
-        "rule": "exact_runtime_binding_launch_profile",
-        "profile_field": "permission_mode",
-        "malformed_failure": "inconclusive",
-        "mismatch_failure": "blocked",
-    }:
-        raise _ContractError("permission mode contract does not match")
-    if field_contracts.get("cwd") != {
-        "rule": "exact_expected_runtime_cwd",
-        "binding_field": "expected_runtime_cwd",
-        "malformed_failure": "inconclusive",
-        "mismatch_failure": "blocked",
-    }:
-        raise _ContractError("runtime cwd contract does not match")
-    if field_contracts.get("tools") != {
-        "rule": "duplicate_free_exact_runtime_binding_launch_profile_set",
-        "profile_field": "tools",
-        "malformed_failure": "inconclusive",
-        "mismatch_failure": "blocked",
-    }:
-        raise _ContractError("tool contract does not match")
-    if field_contracts.get("claude_code_version") != {
-        "rule": "exact_cli_argument",
-        "argument": "claude_code_version",
-        "malformed_failure": "inconclusive",
-        "mismatch_failure": "blocked",
-    }:
-        raise _ContractError("init version contract does not match")
-    if field_contracts.get("apiKeySource") != {
-        "rule": "exact_runtime_binding",
-        "binding_field": "api_key_source",
-        "accepted_values": ["ANTHROPIC_API_KEY", "none"],
-        "malformed_failure": "inconclusive",
-        "mismatch_failure": "blocked",
-    }:
-        raise _ContractError("authentication-source contract does not match")
+    expected_init_field_contracts = {
+        "type": {
+            "rule": "constant",
+            "value": "system",
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "inconclusive",
+        },
+        "subtype": {
+            "rule": "constant",
+            "value": "init",
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "inconclusive",
+        },
+        "cwd": {
+            "rule": "exact_expected_runtime_cwd",
+            "binding_field": "expected_runtime_cwd",
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "blocked",
+        },
+        "permissionMode": {
+            "rule": "exact_runtime_binding_launch_profile",
+            "profile_field": "permission_mode",
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "blocked",
+        },
+        "tools": {
+            "rule": "duplicate_free_exact_runtime_binding_launch_profile_set",
+            "profile_field": "tools",
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "blocked",
+        },
+        **{
+            field: {
+                "rule": "empty_array",
+                "malformed_failure": "inconclusive",
+                "mismatch_failure": "blocked",
+            }
+            for field in EMPTY_INIT_SURFACES
+        },
+        "model": {
+            "rule": "exact_cli_argument",
+            "argument": "model",
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "blocked",
+        },
+        "claude_code_version": {
+            "rule": "exact_cli_argument",
+            "argument": "claude_code_version",
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "blocked",
+        },
+        "apiKeySource": {
+            "rule": "exact_runtime_binding",
+            "binding_field": "api_key_source",
+            "accepted_values": ["ANTHROPIC_API_KEY", "none"],
+            "malformed_failure": "inconclusive",
+            "mismatch_failure": "blocked",
+        },
+    }
+    if field_contracts != expected_init_field_contracts:
+        raise _ContractError("init field contracts do not match the validator")
     expected_init_optional_contracts = {
         "session_id": {
             "rule": "nonempty_string",
@@ -953,12 +1097,41 @@ def _load_contract_with_binding() -> tuple[
     ):
         raise _ContractError("terminal optional fields do not match")
     optional_contracts = terminal_contract.get("optional_field_contracts")
-    if (
-        type(optional_contracts) is not dict
-        or frozenset(optional_contracts)
-        != TERMINAL_VARIANT_FIELDS | TERMINAL_OPTIONAL_FIELDS
-    ):
-        raise _ContractError("terminal optional contracts are incomplete")
+    expected_terminal_optional_contracts = {
+        "result": {"rule": "variant_specific", "failure": "inconclusive"},
+        "modelUsage": {"rule": "variant_specific", "failure": "classify"},
+        "duration_ms": {
+            "rule": "nonnegative_integer",
+            "failure": "inconclusive",
+        },
+        "duration_api_ms": {
+            "rule": "nonnegative_integer",
+            "failure": "inconclusive",
+        },
+        "num_turns": {"rule": "positive_integer", "failure": "inconclusive"},
+        "session_id": {"rule": "nonempty_string", "failure": "inconclusive"},
+        "total_cost_usd": {
+            "rule": "nonnegative_finite_number",
+            "failure": "inconclusive",
+        },
+        "usage": {"rule": "object", "failure": "inconclusive"},
+        "uuid": {"rule": "nonempty_string", "failure": "inconclusive"},
+        "stop_reason": {
+            "rule": "enum",
+            "accepted_values": [None, "end_turn"],
+            "failure": "blocked",
+        },
+        "structured_output": {"rule": "null", "failure": "inconclusive"},
+        "error": {"rule": "explicitly_empty", "failure": "classify"},
+        "errors": {"rule": "explicitly_empty", "failure": "classify"},
+        "api_error_status": {
+            "rule": "null_or_whitespace_string",
+            "failure": "classify",
+        },
+        "permission_denials": {"rule": "empty_array", "failure": "blocked"},
+    }
+    if optional_contracts != expected_terminal_optional_contracts:
+        raise _ContractError("terminal optional contracts do not match the validator")
     expected_variants = {
         "success": {
             "match": {"subtype": "success", "is_error": False},
@@ -1322,7 +1495,7 @@ def runtime_binding_from_preflight_result(
     preflight_result: str | Path,
     *,
     reviewer_cwd: str | Path,
-    api_key_source: str,
+    authentication_source: str,
 ) -> ClaudeRuntimeBinding:
     """Build the named-direct binding from parent-private preflight evidence."""
 
@@ -1330,8 +1503,8 @@ def runtime_binding_from_preflight_result(
     resolved_cwd = Path(reviewer_cwd).resolve(strict=True)
     if not resolved_cwd.is_dir():
         raise _ContractError("reviewer cwd is not a directory")
-    if api_key_source not in {"none", "ANTHROPIC_API_KEY"}:
-        raise _ContractError("api key source is invalid")
+    if authentication_source != "local-login":
+        raise _ContractError("named-direct authentication source is invalid")
     evidence = _read_preflight_evidence(
         Path(preflight_result),
         reviewer_cwd=resolved_cwd,
@@ -1341,7 +1514,7 @@ def runtime_binding_from_preflight_result(
     publisher = evidence["publisher_verification"]
     runtime_binding = ClaudeRuntimeBinding(
         selected_version=selected_version,
-        api_key_source=api_key_source,
+        api_key_source="none",
         launch_profile="named-direct",
         trust_source="named-parent-private-preflight",
         publisher_checksum=publisher["checksum"],
@@ -3264,8 +3437,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--authentication-source",
         required=True,
-        choices=tuple(AUTHENTICATION_SOURCE_TO_API_KEY_SOURCE),
-        help="Authentication source selected by the parent before launch",
+        choices=("local-login",),
+        help="Named-direct local-login source selected before launch",
     )
     parser.add_argument(
         "--process-returncode",
@@ -3294,9 +3467,7 @@ def main(argv: list[str] | None = None) -> int:
         runtime_binding = runtime_binding_from_preflight_result(
             args.preflight_result,
             reviewer_cwd=args.cwd,
-            api_key_source=AUTHENTICATION_SOURCE_TO_API_KEY_SOURCE[
-                args.authentication_source
-            ],
+            authentication_source=args.authentication_source,
         )
     except (_ContractError, OSError, RuntimeError, TypeError, ValueError):
         result = _failure("inconclusive", {"validator.preflight-evidence-invalid"})

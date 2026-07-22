@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import math
@@ -475,6 +476,41 @@ class RepositoryContractTest(unittest.TestCase):
                 repository_policy["AGENTS.md"],
             )
 
+    def test_stateful_secret_admission_is_a_separate_current_head_gate(self) -> None:
+        helper = (SKILL_ROOT / "references/helper-contract.md").read_text(
+            encoding="utf-8"
+        )
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("stateful final", helper)
+        self.assertIn("stateful admission", helper)
+        self.assertLess(
+            helper.index("stateful final"), helper.index("stateful admission")
+        )
+        for exit_code in ("0", "1", "3", "75"):
+            self.assertIn(f"exit `{exit_code}`", helper)
+        self.assertIn(
+            "successful optional helper-state check, not the required PR/master/merge-ready admission producer",
+            helper,
+        )
+        self.assertIn(
+            "schema-v5 `stateful final` / `stateful admission` compatibility contract",
+            readiness,
+        )
+        self.assertIn(
+            "compatible `stateful final` / `stateful admission` pair remains helper-only evidence",
+            contracts,
+        )
+        self.assertNotIn(
+            "the only result that permits PR/master/merge-ready",
+            helper,
+        )
+
     def test_admission_receipt_and_runner_policy_are_bound_to_the_launch(
         self,
     ) -> None:
@@ -555,14 +591,20 @@ class RepositoryContractTest(unittest.TestCase):
         for anchor in (
             "required local Codex reviewer lane",
             "sole lane that satisfies a named single review",
-            "separate clean Git worktree",
-            "Keep the workspace read-only",
-            "authoritative review-skill path/version",
-            "load that review skill",
+            "separate clean Git workspace supplied by the orchestrator",
+            "Keep it read-only",
+            "exact prompt-provided authoritative review skill",
+            "independently trusted control-plane bundle",
+            "absolute path, version, and SHA-256 digest",
+            "load that trusted review skill",
             "domain skill",
             "AGENTS.md",
             "project-guidance document",
             "exact base_sha and head_sha",
+            "exact sanitized Git argv prefix",
+            "/usr/bin/env -i",
+            "never run bare `git`",
+            "--no-ext-diff --no-textconv",
             "not a prebuilt or injected full diff",
             "obtain base_sha..head_sha metadata, changed paths, hunks",
             "state-changing MCP, Plugin, connector, GitHub",
@@ -576,6 +618,10 @@ class RepositoryContractTest(unittest.TestCase):
             encoding="utf-8"
         )
 
+        self.assertIn(
+            "ordinary local Claude login in trusted real `HOME` as the only authentication interface",
+            skill,
+        )
         self.assertIn(
             "helper authentication, apply precedence `ANTHROPIC_API_KEY` > "
             "`CLAUDE_CODE_OAUTH_TOKEN` > local login",
@@ -961,7 +1007,7 @@ class RepositoryContractTest(unittest.TestCase):
 
         for phrase in (
             "real `HOME`",
-            "ordinary Claude CLI authentication",
+            "ordinary local Claude CLI login",
             "trusted control plane",
             "does not use the low-level helper's credential broker",
         ):
@@ -1010,22 +1056,30 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("`Read`, `Grep`, `Glob`, and sandboxed `Bash`", skill)
         self.assertIn("native sandbox", skill)
 
-    def test_claude_auth_precedence_delegates_to_verified_cli(self) -> None:
+    def test_claude_auth_contracts_delegate_to_verified_cli(self) -> None:
         policies = _current_claude_contract_files()
         combined = "\n".join(policies.values())
         provider_source = (RUNTIME / "providers.py").read_text(encoding="utf-8")
 
-        direct_precedence = (
-            "`ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` > ordinary local login"
-        )
         helper_precedence = (
             "`ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` > local login"
         )
-        self.assertIn(direct_precedence, policies["SKILL.md"])
+        self.assertIn(
+            "ordinary local Claude login in trusted real `HOME` as the only "
+            "authentication interface",
+            policies["SKILL.md"],
+        )
         self.assertIn(helper_precedence, policies["SKILL.md"])
         if "README.md" in policies:
-            self.assertIn(direct_precedence, policies["README.md"])
+            self.assertIn(
+                "accepts only ordinary local login in trusted real `HOME`",
+                policies["README.md"],
+            )
             self.assertIn(helper_precedence, policies["README.md"])
+            self.assertIn(
+                "`ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`",
+                policies["README.md"],
+            )
         self.assertIn("ANTHROPIC_API_KEY", provider_source)
         self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", provider_source)
         self.assertIn("blocked-authentication", combined)
@@ -1033,7 +1087,6 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("unset or replace `ANTHROPIC_API_KEY`", combined)
         self.assertIn("unset or replace `CLAUDE_CODE_OAUTH_TOKEN`", combined)
         self.assertIn("opaque", combined)
-        self.assertIn("auth status --json", combined)
 
     def test_direct_claude_does_not_inherit_helper_credential_transactions(
         self,
@@ -1125,7 +1178,7 @@ class RepositoryContractTest(unittest.TestCase):
         )
 
         readiness = policies["pr-readiness.md"]
-        self.assertIn("clean Git worktree", readiness)
+        self.assertIn("detached clean lane worktrees", readiness)
         self.assertIn("<merge_base>..HEAD", readiness)
         self.assertNotIn("--include-source-wip", readiness)
 
@@ -1486,23 +1539,24 @@ class RepositoryContractTest(unittest.TestCase):
             "Triple / triple review | Double plus exact `@codex review` on an exact-host `github.com` PR",
             "Each logical lane receives its own workspace",
             "intentional review-anchor commit",
-            "separate clean Git worktree at `head_sha` for each lane",
+            "Materialize a separate lane-private Git workspace at `head_sha`",
             "Enforce read-only reviewer behavior",
             '`fork_turns="none"`',
             "review-control metadata",
+            "independently trusted bundle pinned outside",
             "exact authoritative playbook path/version in the prompt",
             "Both local lanes follow the same discovery order",
             "path-scoped `AGENTS.md`, repo-local domain skills, tracked project guidance, then hunks",
-            "Codex must load exactly that named source",
-            "Do not prepare, paste, attach, or point it to a full diff",
-            "existing supplied-diff/private-Git Codex helper is not this lane and does not satisfy single review",
-            "actual Claude Code process in a second clean Git worktree",
+            "Codex must load exactly the parent-named authoritative source",
+            "Do not prepare, paste, attach, or point either reviewer to a full diff",
+            "Do not use its Codex path to satisfy single review",
+            "actual Claude Code process in a second independently materialized clean Git workspace",
             "A Copilot, Cursor, OpenCode, or other model-family result does not satisfy the Claude Code lane",
         ):
             self.assertIn(anchor, skill)
 
         for anchor in (
-            "lane-unique clean Git worktree at `head_sha`",
+            "pre-status isolated reachable-object import",
             "Never derive a formal named-lane range from a dirty working tree",
             "Expose the workspace and Git metadata for read-only reviewer behavior",
             "free of generated prompts, diff files, manifests, state directories, and helper control artifacts",
@@ -1511,6 +1565,7 @@ class RepositoryContractTest(unittest.TestCase):
             "for both local lanes, the same discovery order",
             "path-scoped `AGENTS.md`, repo-local domain skills, tracked project guidance, then hunks",
             "exact authoritative playbook path/version selected by the parent",
+            "independently trusted external bundle pinned outside the candidate range",
             "compute or persist a reviewer-visible full diff",
             '`fork_turns="none"`',
             "Use an actual Claude Code process in a second lane-unique clean Git worktree",
@@ -1524,16 +1579,17 @@ class RepositoryContractTest(unittest.TestCase):
         interface = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
 
         for anchor in (
-            "Both select authentication with precedence ANTHROPIC_API_KEY > "
-            "CLAUDE_CODE_OAUTH_TOKEN > local login",
-            "The named-direct lane uses the ordinary CLI in real HOME",
-            "low-level helper local login instead uses its private credential "
-            "carrier/broker and guarded writeback",
+            "manifest-bound named_lane_guard validate-claude-stream profile",
+            "named-direct lane accepts only ordinary local login in real HOME",
+            "low-level helper selects authentication with precedence "
+            "ANTHROPIC_API_KEY > CLAUDE_CODE_OAUTH_TOKEN > local login",
+            "helper local login uses its private credential carrier/broker and "
+            "guarded writeback",
             "helper API-key/OAuth modes bypass that transaction",
         ):
             self.assertIn(anchor, interface)
         self.assertNotIn(
-            "Use real HOME ordinary CLI authentication with precedence",
+            "require validate_claude_stream.py classification accepted",
             interface,
         )
 
@@ -1625,8 +1681,8 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn(anchor, skill)
         for anchor in (
             "It never adds a hidden local Codex review",
-            "Each lane gets its own clean Git worktree, clear reviewer context, and read-only access",
-            "Never generate or inject a full diff for the reviewer",
+            "Each reviewer gets that lane-unique read-only worktree and clear control metadata",
+            "never prepare or inject a full diff",
             "Persist `requested: triple`, `effective: double`, and a concrete reason",
             "exact `@codex review` comment",
             "effective: triple-inconclusive",
@@ -1723,6 +1779,279 @@ class RepositoryContractTest(unittest.TestCase):
             interface,
         )
         self.assertIn("after service start means triple-inconclusive", interface)
+
+    def test_github_codex_issue_comments_require_request_correlation(self) -> None:
+        probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
+            encoding="utf-8"
+        )
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+
+        for anchor in (
+            "Keep a request ledger across the PR's issue-comment history",
+            "does **not** resolve the older request",
+            "the full exact current `headRefOid`",
+            "the current request is the sole still-unresolved `@codex review` request",
+            "A head marker does not relax either condition",
+            "no other `@codex review` request intervened",
+            "pair a response to the nearest request by timestamp alone",
+            "an older-head request remains unresolved",
+            "a full SHA proves only which head the response concerns, not which request caused it",
+            "exact request comment ID/URL",
+            "provider request/dispatch identity",
+            "SHA-only delayed result while any older request remains unresolved",
+            "even when the candidate names the full exact current `headRefOid`",
+            "`triple-inconclusive`",
+            "`commit_id == headRefOid`",
+        ):
+            self.assertIn(anchor, probes)
+
+        self.assertIn(
+            "the request-ledger and correlation rule",
+            readiness,
+        )
+        self.assertIn(
+            "An older request remains unresolved across a head change",
+            readiness,
+        )
+        self.assertIn(
+            "without the required correlation, that ambiguity is `triple-inconclusive`",
+            readiness,
+        )
+        self.assertIn(
+            "A terminal completion must bind through the exact request/run or the sole-unresolved/no-intervening fallback",
+            readiness,
+        )
+        self.assertIn(
+            "The full exact current SHA may corroborate artifact scope, but it does not identify which request caused the response",
+            readiness,
+        )
+        self.assertIn(
+            "Exact current-head SHA binding alone is not request binding for completion or no-start evidence",
+            readiness,
+        )
+        self.assertIn(
+            "A current-SHA marker cannot disambiguate which request caused a result",
+            readiness,
+        )
+        self.assertNotIn(
+            "the full exact current SHA, or the sole-unresolved-request fallback",
+            readiness,
+        )
+
+    def test_current_sha_does_not_resolve_an_older_request(self) -> None:
+        probes = (SKILL_ROOT / "references/github-pr-probes.md").read_text(
+            encoding="utf-8"
+        )
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "SHA-only delayed terminal completion or no-start rejection while any older request remains unresolved",
+            probes,
+        )
+        self.assertIn(
+            "even when the terminal response names the current SHA",
+            readiness,
+        )
+        self.assertIn(
+            "an older request may execute after the push and review that same current head",
+            readiness,
+        )
+        self.assertNotIn(
+            "the SHA disambiguates any unresolved different-head request",
+            probes,
+        )
+        self.assertNotIn(
+            "full-current-SHA binding that disambiguates the head epoch",
+            readiness,
+        )
+
+    def test_named_lanes_materialize_before_the_first_status_query(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        claude = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
+            encoding="utf-8"
+        )
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+        reviewer = (REPO_ROOT / "agents/reviewer.toml").read_text(encoding="utf-8")
+        repository_policy = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        delivery = (REPO_ROOT / "skills/change-delivery-workflow/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+
+        for name, content in {
+            "skill": skill,
+            "lane contracts": contracts,
+            "Claude lane": claude,
+            "prompt templates": templates,
+            "PR readiness": readiness,
+            "reviewer profile": reviewer,
+            "repository policy": repository_policy,
+            "README": readme,
+            "delivery entrypoint": delivery,
+        }.items():
+            with self.subTest(document=name):
+                self.assertIn("materialize-worktree", content)
+                self.assertIn("validate-worktree", content)
+
+        shared = contracts[
+            contracts.index("## Shared Frozen-Range Contract") : contracts.index(
+                "## Separate PR/Master Secret Admission"
+            )
+        ]
+        ordered_anchors = (
+            "pre-status isolated reachable-object import",
+            "Before checkout",
+            "Materialize `head_sha` only after that audit",
+            "As the first worktree-status operation",
+            "Codex spawn or Claude process launch",
+        )
+        positions = tuple(shared.index(anchor) for anchor in ordered_anchors)
+        self.assertEqual(positions, tuple(sorted(positions)))
+
+        for anchor in (
+            "version 2.45.0 or newer",
+            "`/usr/bin/env -i`",
+            "`GIT_CONFIG_NOSYSTEM=1`",
+            "`GIT_CONFIG_GLOBAL=/dev/null`",
+            "`GIT_CONFIG_SYSTEM=/dev/null`",
+            "`GIT_ATTR_NOSYSTEM=1`",
+            "`GIT_CEILING_DIRECTORIES=<destination-parent>`",
+            "`GIT_NO_LAZY_FETCH=1`",
+            "`GIT_NO_REPLACE_OBJECTS=1`",
+            "`GIT_TERMINAL_PROMPT=0`",
+            "-c core.hooksPath=<empty-private-hooks>",
+            "-c core.commitGraph=false",
+            "-c core.multiPackIndex=false",
+            "-c core.fsmonitor=false",
+            "-c core.attributesFile=/dev/null",
+            "-c submodule.recurse=false",
+            "250,000 reachable objects",
+            "2 GiB of reachable logical object bytes",
+            "256 MiB compressed pack",
+            "pack-objects --stdout --no-reuse-delta --no-reuse-object",
+            "index-pack --stdin --strict --max-input-size=<256 MiB>",
+            "destination's complete object inventory",
+            "promisor markers/configuration",
+            "sibling `.bundle` / `.git` suffix discovery",
+            "exact `.git` marker",
+            "bounded full object-validity `git fsck`",
+            "no `commondir`, `config.worktree`, per-worktree config",
+            "alternate, HTTP-alternate, shallow, sparse, promisor, or pack `.bitmap` state",
+            "executable clean/smudge/process filter",
+            "The guard's forced ordinary/staged status is the first status query",
+            "recorded device, inode, and owner",
+        ):
+            self.assertIn(anchor, shared)
+
+        self.assertIn("never use `git worktree add`", shared)
+        self.assertIn("never loaded by Git", shared)
+        self.assertIn("cleanup failure must report the exact retained path", skill)
+        self.assertIn("complete flushed success receipt", skill)
+        self.assertNotIn("parent-validated native Git", shared)
+        self.assertIn("prior-policy bootstrap", templates)
+        self.assertNotIn(
+            "Before launch, require `git status --porcelain`",
+            contracts,
+        )
+
+    def test_named_lane_source_marker_bitmap_and_path_envelope_contracts(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("device, inode, file type, and owner", skill)
+        self.assertIn("(st_dev, st_ino, file type, st_uid)", contracts)
+        self.assertIn("device/inode/type/owner", canonical)
+        for content in (skill, contracts, canonical):
+            for anchor in (
+                "forward `gitdir:` target",
+                "back-pointer",
+                "`mtime`",
+                "`ctime`",
+                "`nlink`",
+                "benign churn",
+                "source pack `.bitmap`",
+                "--no-use-bitmap-index",
+                "100,000",
+                "64 MiB",
+                "SHA-1",
+                "SHA-256",
+                "`ls-tree`",
+                "`ls-files`",
+                "`status`",
+            ):
+                with self.subTest(anchor=anchor):
+                    self.assertIn(anchor, content)
+        self.assertIn("producer-output bound", contracts)
+        self.assertIn("not a claim", contracts)
+        self.assertIn("producer-output bound", canonical)
+
+        marker_binding = runtime.split(
+            "class _MaterializerSourceMarkerBinding:", 1
+        )[1].split("@dataclass", 1)[0]
+        for field in ("device", "inode", "file_type", "owner", "is_gitfile"):
+            self.assertIn(f"{field}:", marker_binding)
+        for excluded in ("mtime", "ctime", "nlink", "digest"):
+            self.assertNotIn(excluded, marker_binding)
+        self.assertIn("_read_materializer_gitfile_admin(binding.path, source)", runtime)
+        self.assertIn('label="Git admin back-pointer"', runtime)
+        self.assertIn("if back_pointer != marker:", runtime)
+        self.assertIn('| getattr(os, "O_NONBLOCK", 0)', runtime)
+        self.assertIn(
+            "_verify_materializer_source_back_pointer(storage.marker, storage.admin)",
+            runtime,
+        )
+        self.assertIn('folded_name.endswith(".bitmap")', runtime)
+        self.assertIn('"--no-use-bitmap-index"', runtime)
+        self.assertIn(
+            "return MATERIALIZER_CHECKOUT_PATH_BYTES_LIMIT + (",
+            runtime,
+        )
+        self.assertIn(
+            "MATERIALIZER_CHECKOUT_ENTRY_COUNT_LIMIT * (oid_length + 16)",
+            runtime,
+        )
+        self.assertEqual(
+            runtime.count("_checkout_tree_output_limit(len(frozen_head))"),
+            4,
+        )
+        self.assertIn("output_limit = _checkout_tree_output_limit(oid_length)", runtime)
+
+        if CI_PROFILE == "canonical":
+            journal = (
+                REPO_ROOT
+                / "docs/project_journal/2026/07/"
+                / "2026-07-21-named-lane-review-guards-rpf001.md"
+            ).read_text(encoding="utf-8")
+            for anchor in (
+                "forward `gitdir:` target",
+                "`nlink`",
+                "--no-use-bitmap-index",
+                "100,000-entry",
+                "SHA-1 or SHA-256",
+            ):
+                self.assertIn(anchor, journal)
 
     def test_review_scope_and_github_provider_identity_are_fail_closed(
         self,
@@ -2191,6 +2520,10 @@ class RepositoryContractTest(unittest.TestCase):
             "Base SHA: {base_sha}",
             "Head SHA: {head_sha}",
             "Frozen review range: {base_sha}..{head_sha}",
+            "Trusted control-plane bundle absolute source: {trusted_bundle_absolute_path}",
+            "Trusted control-plane bundle version: {trusted_bundle_version}",
+            "Trusted control-plane bundle SHA-256: {trusted_bundle_sha256}",
+            "Sanitized Git argv prefix (exact token sequence): {sanitized_git_argv_prefix}",
             "Authoritative review skill path: {review_skill_path}",
             "Authoritative review skill version/digest: {review_skill_version_or_digest}",
             "clean, independent, read-only Git worktree",
@@ -2200,9 +2533,12 @@ class RepositoryContractTest(unittest.TestCase):
             "missing or mismatched",
             "never choose another installed copy",
             "Load exactly that review skill",
+            "load the trusted review skill",
             "domain skill",
             "AGENTS.md",
             "project-guidance document",
+            "Do not run bare `git`",
+            "--no-ext-diff --no-textconv",
             '`fork_turns="none"`',
         ):
             self.assertIn(anchor, single)
@@ -2302,8 +2638,9 @@ class RepositoryContractTest(unittest.TestCase):
             '"disableBundledSkills": true',
             "`--safe-mode` alone is not evidence that bundled skills are absent",
             '"denyWrite": ["/"]',
-            "lane-private local clone or private bare object store plus worktree",
-            "not a network clone or prepared-diff materialization",
+            "owner-private lane-local repository",
+            "private destination inventory is exact",
+            "remote transport",
             "GIT_NO_LAZY_FETCH=1",
             "locally complete",
             "never run `fetch`, `pull`",
@@ -2675,9 +3012,10 @@ class RepositoryContractTest(unittest.TestCase):
             "duplicate-free set exactly equal to `Read`, `Grep`, `Glob`, and `Bash`",
             "`mcp_servers`, `slash_commands`, `skills`, and `plugins`",
             "`claude_code_version` equals the publisher-verified preflight version",
-            "`apiKeySource` is a string that exactly matches the runtime-bound authentication class",
-            "`ANTHROPIC_API_KEY` for explicit API-key mode and `none` for explicit OAuth-token or ordinary local-login mode",
-            "distinguishes API-key from non-API-key operation only",
+            "`apiKeySource` is exactly the string `none`",
+            "validator/schema compatibility surface can represent `ANTHROPIC_API_KEY`",
+            "current `run-claude` launcher exposes no API-key input",
+            "`ANTHROPIC_API_KEY` therefore cannot satisfy this canonical lane",
             "`result` is a required string whose `strip()` value is nonempty",
             "`modelUsage` is a required nonempty object",
             "every key is a nonempty model-ID string",
@@ -2728,6 +3066,12 @@ class RepositoryContractTest(unittest.TestCase):
         for content in (skill, contracts, canonical):
             self.assertIn("validate_claude_stream.py", content)
             self.assertIn("classification: accepted", content)
+        self.assertIn("outside the reviewer-visible workspace", skill)
+        for content in (contracts, canonical):
+            self.assertIn(
+                "outside the model-visible worktree",
+                " ".join(content.split()),
+            )
         for content in (skill, canonical):
             self.assertIn("claude-stream-compatibility.json", content)
         self.assertTrue(validator_path.is_file())
@@ -2891,10 +3235,22 @@ class RepositoryContractTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         for content in (skill, contracts, reviewer, change_delivery):
-            self.assertIn("normally the active installed copy", content)
-            self.assertIn("frozen repo-local copy", content)
-            self.assertIn("missing or mismatched", content)
-        self.assertIn("repo-local playbook from the frozen review head", agents_policy)
+            normalized = content.lower()
+            self.assertRegex(
+                normalized,
+                r"normally(?: this is)? the active installed copy",
+            )
+            self.assertIn("missing or mismatched", normalized)
+        for content in (skill, contracts, reviewer, agents_policy, change_delivery):
+            normalized = content.lower()
+            self.assertIn("candidate-head markdown", normalized)
+            self.assertIn("review subject", normalized)
+            self.assertIn("independently trusted", normalized)
+        self.assertIn("pinned outside", contracts)
+        self.assertNotIn(
+            "must be the frozen repo-local copy at the review head",
+            change_delivery,
+        )
         self.assertIn(
             "exact parent-selected authoritative playbook path/version or digest",
             change_delivery,
@@ -3364,10 +3720,952 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("GIT_NO_LAZY_FETCH=1", content)
             self.assertIn("GIT_TERMINAL_PROMPT=0", content)
             self.assertIn("locally complete", content)
-        self.assertIn("without rendering or persisting a full diff", contracts)
+        self.assertIn("non-rendering plumbing", contracts)
         self.assertIn("never let the reviewer trigger an on-demand fetch", skill)
         self.assertIn("forbid `fetch`, `pull`", templates)
         self.assertNotIn("prepared full diff", contracts)
+
+    def test_named_lanes_use_the_narrow_shipped_guard_before_launch(self) -> None:
+        agents = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
+            encoding="utf-8"
+        )
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+
+        for content in (agents, skill, contracts, canonical):
+            self.assertIn("scripts/named_lane_guard", content)
+            self.assertIn("validate-worktree", content)
+        for anchor in (
+            "stable tracked source symlinks",
+            "absolute targets",
+            "transitive escape",
+            "unstable or mismatched tracked symlinks",
+            "ordinary non-symlink regular file",
+            "without reading an escaping target",
+            "blocked-safety",
+        ):
+            self.assertIn(anchor, contracts)
+        for overreach in (
+            "raw-object workspace",
+            "immutable guidance snapshots",
+            "general secret/content scan",
+        ):
+            self.assertIn(overreach, contracts)
+        self.assertIn(
+            "Do not expand that guard into",
+            contracts,
+        )
+        for content in (skill, contracts, canonical):
+            self.assertIn("30-second", content)
+            self.assertIn("4,096", content)
+            self.assertIn("16 KiB", content)
+            self.assertIn("64 MiB", content)
+
+    def test_named_lane_runtime_import_closure_matches_control_manifest(self) -> None:
+        guard = SCRIPTS / "named_lane_guard"
+
+        def loaded_bound_modules(*profile_args: str) -> list[str]:
+            probe = "\n".join(
+                (
+                    "import json",
+                    "import pathlib",
+                    "import sys",
+                    f"guard = pathlib.Path({str(guard)!r})",
+                    f"sys.argv = [str(guard), *{list(profile_args)!r}]",
+                    "namespace = {'__name__': '_guard_contract_probe', "
+                    "'__file__': str(guard)}",
+                    "exec(compile(guard.read_bytes(), str(guard), 'exec'), namespace)",
+                    "print(json.dumps(sorted(name for name in sys.modules "
+                    "if name == 'review_runtime' "
+                    "or name.startswith('review_runtime.') "
+                    "or name == 'validate_claude_stream')))",
+                )
+            )
+            completed = subprocess.run(
+                (sys.executable, "-I", "-B", "-S", "-c", probe),
+                cwd=REPO_ROOT,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            return json.loads(completed.stdout)
+
+        self.assertEqual(
+            loaded_bound_modules(),
+            ["review_runtime", "review_runtime.common", "review_runtime.named_lane"],
+        )
+        self.assertEqual(
+            loaded_bound_modules("preflight-claude"),
+            [
+                "review_runtime",
+                "review_runtime.claude_capabilities",
+                "review_runtime.claude_linux",
+                "review_runtime.claude_provenance",
+                "review_runtime.claude_refresh_lock",
+                "review_runtime.claude_stream_contract",
+                "review_runtime.claude_version_policy",
+                "review_runtime.common",
+                "review_runtime.named_claude_preflight",
+            ],
+        )
+        self.assertEqual(
+            loaded_bound_modules("validate-claude-stream"),
+            [
+                "review_runtime",
+                "review_runtime.claude_capabilities",
+                "review_runtime.claude_linux",
+                "review_runtime.claude_provenance",
+                "review_runtime.claude_refresh_lock",
+                "review_runtime.claude_stream_contract",
+                "review_runtime.claude_version_policy",
+                "review_runtime.common",
+                "validate_claude_stream",
+            ],
+        )
+        self.assertEqual(
+            loaded_bound_modules("classify-review-result"),
+            ["review_runtime", "review_runtime.review_result"],
+        )
+
+        entrypoint = guard.read_text(encoding="utf-8")
+        for anchor in (
+            "_DEFAULT_RUNTIME_SOURCES",
+            "_CLAUDE_PREFLIGHT_SOURCES",
+            "_CLAUDE_STREAM_RUNTIME_SOURCES",
+            "_CLAUDE_STREAM_VALIDATOR_SOURCES",
+            "_REVIEW_RESULT_SOURCES",
+            "_load_default_entrypoint",
+            "_load_claude_preflight_entrypoint",
+            "_load_claude_stream_validator_entrypoint",
+            "_load_review_result_entrypoint",
+            '"review_runtime.claude_refresh_lock"',
+            '"claude_refresh_lock.py"',
+            '"review_runtime.claude_linux"',
+            '"claude_linux.py"',
+            '"CLAUDE_RELEASE_KEY_BYTES"',
+            '"COMPATIBILITY_JSON_BYTES"',
+            '"BASELINE_SCHEMA_BYTES"',
+            '"PROFILE_SCHEMA_BYTES"',
+            '"CAPABILITY_SOURCE_BYTES"',
+            '"FD_EXEC_BYTES"',
+            '"fd_exec.py"',
+            'argv[0] == "preflight-claude"',
+            'argv[0] == "validate-claude-stream"',
+            'argv[0] == "classify-review-result"',
+        ):
+            self.assertIn(anchor, entrypoint)
+        self.assertNotIn("sys.path.insert", entrypoint)
+        self.assertNotIn("from review_runtime", entrypoint)
+
+    def test_named_claude_profiles_consume_guard_bound_companion_bytes(
+        self,
+    ) -> None:
+        guard = (SCRIPTS / "named_lane_guard").read_text(encoding="utf-8")
+        provenance = (SCRIPTS / "review_runtime/claude_provenance.py").read_text(
+            encoding="utf-8"
+        )
+        common = (SCRIPTS / "review_runtime/common.py").read_text(encoding="utf-8")
+        validator = (SCRIPTS / "validate_claude_stream.py").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+
+        for binding in (
+            "CLAUDE_RELEASE_KEY_BYTES",
+            "COMPATIBILITY_JSON_BYTES",
+            "BASELINE_SCHEMA_BYTES",
+            "PROFILE_SCHEMA_BYTES",
+            "CAPABILITY_SOURCE_BYTES",
+        ):
+            self.assertIn(f'"{binding}"', guard)
+        self.assertIn("byte_bindings", guard)
+        self.assertIn("_CompanionBinding = bytes", guard)
+        self.assertIn('"FD_EXEC_BYTES"', guard)
+        self.assertIn("FD_EXEC_BYTES: bytes | None = None", common)
+        self.assertIn("bound_launcher = FD_EXEC_BYTES", common)
+        self.assertIn(
+            '"-I",\n            "-B",\n            "-S",\n            "-c"', common
+        )
+        descriptor_launcher = common.split("bound_launcher = FD_EXEC_BYTES", 1)[
+            1
+        ].split("def _descriptor_exec_error", 1)[0]
+        self.assertNotIn("str(launcher)", descriptor_launcher.split("else:", 1)[1])
+        companion_validator = guard.split("def _validate_bound_companion(", 1)[1].split(
+            "def _guard_companions(", 1
+        )[0]
+        self.assertIn("return payload", companion_validator)
+        self.assertNotIn("return identity", companion_validator)
+        companion_guard = guard.split("def _guard_companions(", 1)[1].split(
+            "def _load_default_entrypoint(", 1
+        )[0]
+        self.assertNotIn("actual_binding[0]", companion_guard)
+        self.assertNotIn("actual_binding[1]", companion_guard)
+        self.assertIn("actual_binding != expected_binding", companion_guard)
+        self.assertNotIn("st_mtime", companion_guard)
+        self.assertNotIn("st_ctime", companion_guard)
+
+        self.assertIn("CLAUDE_RELEASE_KEY_BYTES: bytes | None = None", provenance)
+        self.assertIn("bound_release_key = CLAUDE_RELEASE_KEY_BYTES", provenance)
+        self.assertIn("if bound_release_key is None:", provenance)
+        self.assertIn("release_key = bytes(bound_release_key)", provenance)
+        self.assertEqual(provenance.count("CLAUDE_RELEASE_KEY_PATH.read_bytes()"), 1)
+
+        for binding in (
+            "COMPATIBILITY_JSON_BYTES",
+            "BASELINE_SCHEMA_BYTES",
+            "PROFILE_SCHEMA_BYTES",
+            "CAPABILITY_SOURCE_BYTES",
+        ):
+            self.assertIn(f"{binding}: bytes | None = None", validator)
+        self.assertIn("bound_payloads = (", validator)
+        self.assertIn("if all(payload is None for payload in bound_payloads):", validator)
+        self.assertIn("elif any(payload is None for payload in bound_payloads):", validator)
+        self.assertIn("_load_bound_stream_contract(", validator)
+
+        for anchor in (
+            "retains those exact immutable bytes",
+            "gives the same buffers to the consumer",
+            "must not reopen a companion path after final validation",
+            "compares only complete bytes across the two reads",
+            "does not compare dev/ino, `mtime`, or `ctime` across them",
+            "same-content ordinary-file replacement is allowed",
+            "same-inode and same-size content change",
+            "CLAUDE_RELEASE_KEY_BYTES",
+            "COMPATIBILITY_JSON_BYTES",
+            "BASELINE_SCHEMA_BYTES",
+            "PROFILE_SCHEMA_BYTES",
+            "CAPABILITY_SOURCE_BYTES",
+            "FD_EXEC_BYTES",
+            "isolated `-I -B -S -c` bootstrap",
+            "never reopen the `review_runtime/fd_exec.py` path",
+            "consumers do not reopen those companions after final revalidation",
+        ):
+            self.assertIn(anchor, contracts)
+
+    def test_self_policy_migration_uses_an_external_trusted_control_plane(
+        self,
+    ) -> None:
+        policy_scope_root = _repository_policy_scope_root(REPO_ROOT, CI_PROFILE)
+        agents = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
+            encoding="utf-8"
+        )
+        reviewer = (policy_scope_root / "agents/reviewer.toml").read_text(
+            encoding="utf-8"
+        )
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
+            encoding="utf-8"
+        )
+
+        for content in (agents, reviewer, skill, contracts, templates):
+            normalized = content.lower()
+            self.assertIn("candidate-head markdown", normalized)
+            self.assertIn("review subject", normalized)
+            self.assertIn("candidate-head python", normalized)
+            self.assertIn("trusted", normalized)
+        for content in (agents, skill, contracts, templates):
+            self.assertIn("absolute", content)
+            self.assertIn("version", content)
+            self.assertIn("SHA-256", content)
+        self.assertIn("independently trusted bundle pinned outside", agents)
+        self.assertIn("prior trusted policy", agents)
+        self.assertIn("merge and release", contracts)
+        self.assertIn("activate the new guard", contracts)
+        self.assertIn("Ordinary implementation tests", contracts)
+        manifest_paths = (
+            "agents/reviewer.toml",
+            "skills/review-orchestration-playbook/SKILL.md",
+            "skills/review-orchestration-playbook/references/base-only-retarget-state-machine.json",
+            "skills/review-orchestration-playbook/references/canonical-claude-lane.md",
+            "skills/review-orchestration-playbook/references/claude-2.1.212-stream-schema.json",
+            "skills/review-orchestration-playbook/references/claude-runtime-trust.md",
+            "skills/review-orchestration-playbook/references/claude-stream-compatibility.json",
+            "skills/review-orchestration-playbook/references/claude-stream-schema.json",
+            "skills/review-orchestration-playbook/references/egress-consent.md",
+            "skills/review-orchestration-playbook/references/github-pr-probes.md",
+            "skills/review-orchestration-playbook/references/pr-readiness.md",
+            "skills/review-orchestration-playbook/references/review-lane-contracts.md",
+            "skills/review-orchestration-playbook/references/review-prompt-templates.md",
+            "skills/review-orchestration-playbook/scripts/named_claude_preflight",
+            "skills/review-orchestration-playbook/scripts/named_lane_guard",
+            "skills/review-orchestration-playbook/scripts/review_runtime/__init__.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_capabilities.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_code_release.asc",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_linux.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_provenance.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_refresh_lock.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_stream_contract.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_version_policy.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/common.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/fd_exec.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/named_claude_preflight.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/named_lane.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/review_result.py",
+            "skills/review-orchestration-playbook/scripts/validate_claude_stream.py",
+        )
+        self.assertEqual(
+            manifest_paths,
+            tuple(sorted(manifest_paths, key=lambda value: value.encode("utf-8"))),
+        )
+        manifest_clause = (
+            "; ".join(f"`{path}`" for path in manifest_paths[:-1])
+            + f"; and `{manifest_paths[-1]}`."
+        )
+        self.assertIn(manifest_clause, contracts)
+
+        outcome_policy_paths = (
+            "skills/review-orchestration-playbook/references/base-only-retarget-state-machine.json",
+            "skills/review-orchestration-playbook/references/egress-consent.md",
+            "skills/review-orchestration-playbook/references/github-pr-probes.md",
+            "skills/review-orchestration-playbook/references/pr-readiness.md",
+            "skills/review-orchestration-playbook/scripts/review_runtime/review_result.py",
+        )
+
+        def manifest_digest(overrides: dict[str, bytes] | None = None) -> str:
+            replacements = overrides or {}
+            records = []
+            for relative_path in manifest_paths:
+                payload = replacements.get(
+                    relative_path,
+                    (policy_scope_root / relative_path).read_bytes(),
+                )
+                records.append(
+                    f"{hashlib.sha256(payload).hexdigest()}  {relative_path}\n".encode(
+                        "utf-8"
+                    )
+                )
+            return hashlib.sha256(b"".join(records)).hexdigest()
+
+        baseline_manifest_digest = manifest_digest()
+        for relative_path in outcome_policy_paths:
+            original = (policy_scope_root / relative_path).read_bytes()
+            self.assertNotEqual(
+                manifest_digest({relative_path: original + b"\0"}),
+                baseline_manifest_digest,
+                relative_path,
+            )
+        for anchor in (
+            "publisher-provided release identifier or frozen commit ID",
+            "canonical UTF-8 manifest",
+            "<lowercase-file-sha256><two ASCII spaces><relative-path><LF>",
+            "contains both `agents/` and `skills/` as the single bundle root",
+            "agents/reviewer.toml",
+            "skills/review-orchestration-playbook/SKILL.md",
+            "skills/review-orchestration-playbook/references/claude-2.1.212-stream-schema.json",
+            "skills/review-orchestration-playbook/references/claude-stream-compatibility.json",
+            "skills/review-orchestration-playbook/references/claude-stream-schema.json",
+            "skills/review-orchestration-playbook/references/base-only-retarget-state-machine.json",
+            "skills/review-orchestration-playbook/references/egress-consent.md",
+            "skills/review-orchestration-playbook/references/github-pr-probes.md",
+            "skills/review-orchestration-playbook/references/pr-readiness.md",
+            "skills/review-orchestration-playbook/references/review-lane-contracts.md",
+            "skills/review-orchestration-playbook/references/review-prompt-templates.md",
+            "skills/review-orchestration-playbook/references/canonical-claude-lane.md",
+            "skills/review-orchestration-playbook/references/claude-runtime-trust.md",
+            "skills/review-orchestration-playbook/scripts/named_claude_preflight",
+            "skills/review-orchestration-playbook/scripts/named_lane_guard",
+            "skills/review-orchestration-playbook/scripts/review_runtime/__init__.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_capabilities.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_code_release.asc",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_linux.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_provenance.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_refresh_lock.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_stream_contract.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/claude_version_policy.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/named_claude_preflight.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/named_lane.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/review_result.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/common.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/fd_exec.py",
+            "review_runtime.common.FD_EXEC_BYTES",
+            "isolated `-I -B -S -c` bootstrap",
+            "never reopen the `review_runtime/fd_exec.py` path",
+            "skills/review-orchestration-playbook/scripts/validate_claude_stream.py",
+            "immediately before each guard, Claude preflight, stream-validator, Claude-launch, and Codex-spawn use",
+            "Recompute it after each lane",
+            "exact bytes must match the manifest entry",
+            "exact three-source bound-source raw loader",
+            "default guard code-origin/import boundary",
+            "exact nine-source closure",
+            "Both Linux support modules are mandatory",
+            "Neither profile may widen its control-plane closure to `review_runtime.workspace`, `review_runtime.prompt`, or `review_runtime.synthetic_tokens`",
+            "preflight-claude",
+            "validate-claude-stream",
+            "classify-review-result",
+        ):
+            self.assertIn(anchor, contracts)
+        self.assertNotIn(
+            "use the repo-local playbook from the frozen review head",
+            agents,
+        )
+
+    def test_named_claude_control_plane_profiles_have_distinct_boundaries(
+        self,
+    ) -> None:
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        boundaries = contracts.split(
+            "### Claude Control-Plane Sequence And Boundaries",
+            1,
+        )[1].split("## GitHub Codex Lane Contract", 1)[0]
+
+        formal_prefix = (
+            "<trusted-python-absolute-path> -I -B -S "
+            "<trusted-bundle-absolute-path>/skills/review-orchestration-playbook/"
+            "scripts/named_lane_guard"
+        )
+        for profile in (
+            "preflight-claude",
+            "validate-claude-stream",
+            "classify-review-result",
+        ):
+            self.assertIn(f"{formal_prefix} {profile}", contracts)
+        for anchor in (
+            "exact three-source bound-source raw loader",
+            "default eager runtime closure",
+            "exact two-source closure",
+            "review_runtime.review_result",
+            "same-content ordinary-file replacement is harmless",
+            "review_runtime.claude_refresh_lock",
+            "review_runtime.claude_linux",
+            "review_runtime.claude_provenance",
+            "review_runtime.claude_stream_contract",
+            "review_runtime.claude_version_policy",
+            "review_runtime.claude_capabilities",
+            "review_runtime.named_claude_preflight",
+            "claude_code_release.asc",
+            "standalone validator plus its exact required runtime-source closure",
+            "stream compatibility profile, audited schema baseline, versioned profile schema, and capability-contract source",
+            "same bounded bytes retained through final validation",
+            "must not reopen a companion path after final validation",
+            "compatibility wrapper",
+            "never the formal named-lane or self-policy-migration entry",
+            "Neither profile may use the candidate wrapper",
+            "Do not inherit ambient `HOME`",
+            "pwd.getpwuid(os.getuid())",
+            "without treating directory `mtime`, `ctime`, or child churn",
+            "fixed `--authentication-source local-login`",
+            "child's exact `returncode` from the guard's machine result",
+            "8 MiB stream cap",
+            "64 MiB stdout cap",
+        ):
+            self.assertIn(anchor, contracts)
+
+        ordered_controls = (
+            "trusted bundle digest binds",
+            "selects and publisher-verifies",
+            "final clean/safety launch gate",
+            "launches that snapshot as its direct child",
+            "runs only after that parent receipt comparison",
+        )
+        positions = [boundaries.index(anchor) for anchor in ordered_controls]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("default guard code-origin/import boundary", contracts)
+        self.assertIn(
+            "Neither profile may use the candidate wrapper, ordinary bundle-path "
+            "import resolution, a candidate-head source/schema, or a path re-read "
+            "in place of the bound bytes.",
+            contracts,
+        )
+
+    def test_formal_guard_paths_resolve_from_manifest_bundle_root(self) -> None:
+        self.assertTrue((SKILL_SCOPE_ROOT / "agents").is_dir())
+        self.assertTrue((SKILL_SCOPE_ROOT / "skills").is_dir())
+        guard_relative = pathlib.Path(
+            "skills/review-orchestration-playbook/scripts/named_lane_guard"
+        )
+        guard = SKILL_SCOPE_ROOT / guard_relative
+        self.assertEqual(guard, SCRIPTS / "named_lane_guard")
+        self.assertTrue(guard.is_file())
+
+        expected = (
+            "<trusted-bundle-absolute-path>/"
+            "skills/review-orchestration-playbook/scripts/named_lane_guard"
+        )
+        flattened = "<trusted-bundle-absolute-path>/scripts/named_lane_guard"
+        for document in (
+            SKILL_ROOT / "SKILL.md",
+            SKILL_ROOT / "references/canonical-claude-lane.md",
+        ):
+            content = document.read_text(encoding="utf-8")
+            self.assertNotIn(flattened, content)
+            formal_lines = [
+                line
+                for line in content.splitlines()
+                if "<trusted-bundle-absolute-path>" in line
+                and "named_lane_guard" in line
+            ]
+            self.assertTrue(formal_lines)
+            for line in formal_lines:
+                self.assertIn(expected, line)
+
+    def test_repo_visible_git_includes_are_blocked_without_expansion(self) -> None:
+        agents = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
+            encoding="utf-8"
+        )
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(encoding="utf-8")
+
+        for content in (agents, skill, contracts, canonical):
+            self.assertIn("`include.path`", content)
+            self.assertIn("`includeIf.*.path`", content)
+            self.assertIn("`blocked-safety`", content)
+            lowered = content.lower()
+            self.assertTrue(
+                "includes disabled" in lowered or "includes stay disabled" in lowered
+            )
+        self.assertIn("even when its condition is inactive", contracts)
+        self.assertIn(
+            "never accepts included values as safety configuration", contracts
+        )
+        self.assertIn("provide no no-read guarantee", contracts)
+        self.assertIn("every raw gitlink", contracts)
+        self.assertIn("global pathspecs apply", contracts)
+        for retired_included_config_contract in (
+            "effective included Git configuration",
+            "effective included `core.fsmonitor`",
+            "earlier included path overridden",
+        ):
+            for content in (skill, contracts, canonical):
+                self.assertNotIn(retired_included_config_contract, content)
+        for anchor in (
+            "_validate_git_config_includes",
+            'lower_key == b"include.path"',
+            'lower_key.startswith(b"includeif.")',
+            '"--no-includes"',
+        ):
+            self.assertIn(anchor, runtime)
+
+    def test_codex_reviewer_git_is_bound_to_the_sanitized_prefix(self) -> None:
+        policy_scope_root = _repository_policy_scope_root(REPO_ROOT, CI_PROFILE)
+        reviewer = (policy_scope_root / "agents/reviewer.toml").read_text(
+            encoding="utf-8"
+        )
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        templates = (SKILL_ROOT / "references/review-prompt-templates.md").read_text(
+            encoding="utf-8"
+        )
+
+        for content in (reviewer, skill, contracts, templates):
+            self.assertIn("exact sanitized Git argv prefix", content)
+            self.assertIn("`/usr/bin/env -i`", content)
+            self.assertIn("trusted `PATH`", content)
+            self.assertIn("`LANG`/`LC_*`", content)
+            self.assertIn("`PAGER`", content)
+            self.assertIn("`GIT_*`", content)
+            self.assertIn("resolved trusted Git executable", content)
+            self.assertIn("safe `-c` flags", content)
+            self.assertIn("-C", content)
+            self.assertIn("--no-ext-diff --no-textconv", content)
+        self.assertIn("never run bare `git`", reviewer)
+        self.assertIn("forbid bare `git`", templates)
+        self.assertIn("another worktree are forbidden", skill)
+        exact_prefix_contract = contracts[
+            contracts.index(
+                "for Codex, the exact sanitized Git argv prefix"
+            ) : contracts.index("The parent must not:")
+        ]
+        for anchor in (
+            "`/usr/bin/env -i`",
+            "recorded trusted `PATH`",
+            "fixed `LANG`/`LC_ALL`",
+            "`GIT_ASKPASS=/usr/bin/false`",
+            "`GIT_ATTR_NOSYSTEM=1`",
+            "`GIT_CEILING_DIRECTORIES=<absolute-clean-worktree-parent>`",
+            "`GIT_CONFIG_GLOBAL=/dev/null`",
+            "`GIT_CONFIG_SYSTEM=/dev/null`",
+            "`GIT_CONFIG_NOSYSTEM=1`",
+            "`GIT_NO_LAZY_FETCH=1`",
+            "`GIT_TERMINAL_PROMPT=0`",
+            "`GIT_NO_REPLACE_OBJECTS=1`",
+            "`GIT_OPTIONAL_LOCKS=0`",
+            "`PAGER=cat`",
+            "`GIT_PAGER=cat`",
+            "`--no-pager",
+            "core.commitGraph=false",
+            "core.multiPackIndex=false",
+            "core.fsmonitor=false",
+            "core.fileMode=true",
+            "core.hooksPath=/dev/null",
+            "core.attributesFile=/dev/null",
+            "diff.external=",
+            "color.ui=false",
+            "-C <absolute-clean-worktree>",
+        ):
+            self.assertIn(anchor, exact_prefix_contract)
+
+    def test_named_lane_pristine_guard_covers_hidden_ignored_and_gitlinks(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(encoding="utf-8")
+        policy = (skill, contracts, canonical)
+
+        for content in policy:
+            for anchor in (
+                "assume-unchanged",
+                "skip-worktree",
+                "ignored",
+                "uninitialized",
+                "materialized",
+            ):
+                with self.subTest(anchor=anchor):
+                    self.assertIn(anchor, content)
+        self.assertIn("absent or empty uninitialized gitlink", skill)
+        self.assertIn("path is absent or is an empty directory", contracts)
+        self.assertIn("may consume only that exact status record", contracts)
+        self.assertIn("every materialized or initialized submodule", canonical)
+        self.assertIn("per-name boolean precedence", canonical)
+        self.assertIn("repeated `submodule.active` pathspec", contracts)
+        self.assertIn("explicit per-name false", contracts.lower())
+        self.assertIn("global pathspecs apply to every raw gitlink", contracts)
+        self.assertIn("forces `core.fileMode=true`", contracts)
+        self.assertIn("forces `core.commitGraph=false`", contracts)
+        self.assertIn("`core.multiPackIndex=false`", contracts)
+        self.assertIn("`diff.external`", contracts)
+        self.assertIn("`diff.<driver>.command`", contracts)
+        self.assertIn("`diff.<driver>.textconv`", contracts)
+        self.assertIn("both `--no-ext-diff` and `--no-textconv`", contracts)
+
+        for anchor in (
+            "_validate_index_flags",
+            '"ls-files", "--cached", "--full-name", "-v", "-z", "--"',
+            '"--ignored=matching"',
+            '"--ignore-submodules=none"',
+            '"--no-renames"',
+            'entry[0] == "160000"',
+            "_validate_initialized_submodules",
+            'r"^submodule\\..*\\.path$"',
+            "_effective_submodule_active_pathspecs",
+            "_match_submodule_active_pathspecs",
+            '"core.fileMode=true"',
+            '"core.commitGraph=false"',
+            '"core.multiPackIndex=false"',
+            "_validate_executable_git_config",
+            "_validate_materialized_gitlink",
+            "_status_has_disallowed_changes",
+        ):
+            self.assertIn(anchor, runtime)
+
+    def test_named_lane_guard_is_property_scoped_not_a_content_snapshot(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "compare only properties relevant to object completeness, checkout safety, clean state, or reviewer safety",
+            skill,
+        )
+        self.assertIn("Keep the guard property-scoped", contracts)
+        self.assertIn("must not treat `mtime`, `ctime`", contracts)
+        self.assertIn("must not snapshot or rehash ordinary file contents", contracts)
+        self.assertIn("does not compare `mtime`/`ctime`", canonical)
+        self.assertIn("or snapshot ordinary file contents", canonical)
+        for overstrict_implementation in (
+            "st_mtime",
+            "st_ctime",
+            '"hash-object"',
+        ):
+            self.assertNotIn(overstrict_implementation, runtime)
+        self.assertIn('("cat-file", "--batch")', runtime)
+        self.assertIn("SYMLINK_COUNT_LIMIT", runtime)
+        self.assertIn("SYMLINK_BATCH_OUTPUT_LIMIT_BYTES", runtime)
+        self.assertNotIn('("cat-file", "blob"', runtime)
+
+    def test_named_lane_guard_blocks_effective_fsmonitor_before_reviewer_git(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(encoding="utf-8")
+
+        for content in (skill, contracts, canonical):
+            self.assertIn("`core.fsmonitor`", content)
+            self.assertIn("Git-false", content)
+            self.assertIn("path", content)
+            self.assertIn("reviewer Git", content)
+        self.assertIn("A built-in daemon (`true`)", contracts)
+        self.assertIn("a no-value declaration", contracts)
+        self.assertIn(
+            "direct local/per-worktree precedence remains effective", contracts
+        )
+        self.assertNotIn("effective included `core.fsmonitor`", contracts)
+        self.assertNotIn("an earlier included path overridden by a later", contracts)
+        for anchor in (
+            "_validate_core_fsmonitor_config",
+            '"core.fsmonitor=false"',
+            "neutralize_fsmonitor=False",
+            '"config", "--no-includes", "--null", "--get", "core.fsmonitor"',
+        ):
+            self.assertIn(anchor, runtime)
+
+    def test_direct_claude_guard_has_minimal_environment_and_output_paths(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(encoding="utf-8")
+
+        for content in (skill, contracts, canonical):
+            for anchor in (
+                "real `HOME`",
+                "PATH",
+                "locale/UI",
+                "proxy",
+                "CA",
+                "Claude/Anthropic",
+                "cloud-provider",
+                "dynamic-loader",
+                "tool-control",
+            ):
+                with self.subTest(anchor=anchor):
+                    self.assertIn(anchor, content)
+            self.assertIn("--inherit-node-extra-ca-certs", content)
+            self.assertIn("Ambient `NODE_EXTRA_CA_CERTS`", content)
+        for anchor in (
+            "pwd.getpwuid(os.getuid())",
+            "GIT_NO_LAZY_FETCH=1",
+            "GIT_TERMINAL_PROMPT=0",
+            "GIT_NO_REPLACE_OBJECTS=1",
+            "GIT_CONFIG_GLOBAL=/dev/null",
+            "GIT_CONFIG_NOSYSTEM=1",
+            "GIT_OPTIONAL_LOCKS=0",
+            "GIT_ASKPASS=/usr/bin/false",
+            "GIT_ATTR_NOSYSTEM=1",
+            "GIT_PAGER=cat",
+            "PAGER=cat",
+            "ambient Claude or Anthropic API/config variable",
+        ):
+            self.assertIn(anchor, canonical)
+        for anchor in (
+            "caller supplies a lane-unique",
+            "canonical real parent directory",
+            "absent, non-symlink leaf",
+        ):
+            self.assertIn(anchor, skill)
+        self.assertIn("already-canonical real directory", canonical)
+        self.assertIn("current-user-owned", canonical)
+        self.assertIn("exact-mode-`0700`", canonical)
+        self.assertIn("cooperatively exclude every other same-UID writer", canonical)
+        self.assertIn("no portable conditional unlink", canonical)
+        self.assertIn("explicit commit point", canonical)
+        self.assertIn("leaf must be absent and non-symlink", canonical)
+        self.assertIn("open directory descriptor", canonical)
+        self.assertIn("(st_dev, st_ino)", canonical)
+
+        self.assertIn("CLAUDE_ENV_PASSTHROUGH_KEYS", runtime)
+        self.assertIn("pwd.getpwuid(os.getuid())", runtime)
+        self.assertIn(
+            "env=_claude_environment(root, inherit_node_extra_ca_certs)",
+            runtime,
+        )
+        self.assertNotIn("env=dict(os.environ)", runtime)
+        for key in (
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "TERM",
+            "COLORTERM",
+            "NO_COLOR",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "REQUESTS_CA_BUNDLE",
+            "CURL_CA_BUNDLE",
+            "GIT_SSL_CAINFO",
+        ):
+            with self.subTest(key=key):
+                self.assertIn(f'"{key}"', runtime)
+        self.assertIn('os.environ.get("NODE_EXTRA_CA_CERTS")', runtime)
+        self.assertIn('"--inherit-node-extra-ca-certs"', runtime)
+        self.assertIn("_validate_node_extra_ca_certs", runtime)
+        self.assertIn("_OutputTarget", runtime)
+        self.assertIn("dir_fd=target.parent_fd", runtime)
+        self.assertIn("_revalidate_output_parent(stdout)", runtime)
+        self.assertIn("_revalidate_output_parent(stderr)", runtime)
+        self.assertIn("Claude output temporary cleanup failed", runtime)
+        self.assertIn("Claude output cleanup or rollback remained incomplete", runtime)
+        self.assertIn("Claude output path must not already exist", runtime)
+        self.assertIn("Claude output parent must be a real directory", runtime)
+        self.assertIn("Claude output parent must not traverse a symlink", runtime)
+
+    def test_named_lane_guard_failure_classification_is_subcommand_specific(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(encoding="utf-8")
+
+        for content in (skill, contracts, canonical):
+            self.assertIn("blocked-safety", content)
+            self.assertIn("run-claude", content)
+            self.assertIn("inconclusive", content)
+        self.assertIn(
+            "Every bounded Git/materialization/preflight/cleanup error", skill
+        )
+        self.assertIn("Every bounded Git, output-limit, deadline", contracts)
+        self.assertIn("Every `run-claude` supervision failure", contracts)
+        self.assertIn(
+            "Every bounded materialization, validation, or cleanup failure", canonical
+        )
+        self.assertIn("Every `run-claude` supervision failure", canonical)
+        self.assertIn('args.command_name == "validate-worktree"', runtime)
+        self.assertIn('"blocked-safety"', runtime)
+        self.assertIn('"inconclusive"', runtime)
+
+    def test_direct_claude_guard_has_finite_process_boundaries(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        entrypoint_path = SCRIPTS / "named_lane_guard"
+        entrypoint = entrypoint_path.read_text(encoding="utf-8")
+        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(encoding="utf-8")
+
+        for content in (skill, contracts, canonical):
+            self.assertIn("run-claude", content)
+            self.assertIn("1,800-second monotonic deadline", content)
+            self.assertIn("worktree Git", content)
+            self.assertIn("64 MiB", content)
+            self.assertIn("128 MiB aggregate", content)
+            self.assertIn("TERM/KILL/drain/reap", content)
+            self.assertIn("direct", content)
+            self.assertIn("inconclusive", content)
+            self.assertIn("partial", content)
+            self.assertIn("initial supervisor process group", content)
+            self.assertIn("inherited stream", content)
+            self.assertIn("setsid()", content)
+            self.assertIn("not a process-tree sandbox", content)
+        for non_guarantee in (
+            "prepare",
+            "review logic",
+            "executable provenance",
+            "authenticate",
+            "general content/secrets",
+        ):
+            self.assertIn(non_guarantee, contracts)
+        self.assertIn("direct child `argv[0]`", canonical)
+        self.assertIn("direct argv/no shell", canonical)
+        self.assertIn("Only complete structured terminal output", canonical)
+        self.assertEqual(entrypoint_path.stat().st_mode & 0o111, 0)
+        self.assertFalse(entrypoint.startswith("#!"))
+        self.assertIn("named_lane_guard requires Python 3.10 or later", entrypoint)
+        self.assertIn("sys.flags.isolated", entrypoint)
+        self.assertIn("sys.flags.ignore_environment", entrypoint)
+        self.assertIn("sys.flags.no_site", entrypoint)
+        self.assertIn("sys.flags.no_user_site", entrypoint)
+        self.assertIn("sys.flags.dont_write_bytecode", entrypoint)
+        self.assertIn("invoked with -I -B -S", entrypoint)
+        self.assertIn("_read_bound_source", entrypoint)
+        self.assertIn("_load_bound_sources", entrypoint)
+        self.assertIn("_load_default_entrypoint", entrypoint)
+        self.assertIn("_select_entrypoint", entrypoint)
+        self.assertIn('("review_runtime", "__init__.py", True)', entrypoint)
+        self.assertIn('("review_runtime.common", "common.py", False)', entrypoint)
+        self.assertIn(
+            '("review_runtime.named_lane", "named_lane.py", False)', entrypoint
+        )
+        self.assertNotIn("sys.path.insert", entrypoint)
+        self.assertNotIn("from review_runtime", entrypoint)
+        self.assertLess(
+            entrypoint.index("sys.flags.no_site"),
+            entrypoint.index("main, _MAIN_ARGV = _select_entrypoint"),
+        )
+        self.assertIn("DEFAULT_TIMEOUT_SECONDS = 1_800.0", runtime)
+        self.assertIn("DEFAULT_STREAM_LIMIT_BYTES = 64 * 1024 * 1024", runtime)
+        self.assertIn("_read_control_prompt", runtime)
+        self.assertIn("_structured_forwarded_signals", runtime)
+        self.assertIn("_remaining_deadline_seconds", runtime)
+        self.assertIn("withholds EOF", canonical)
+        self.assertIn("withholds EOF", contracts)
+        self.assertIn("structured `inconclusive` / `forwarded-signal`", canonical)
+        self.assertIn("reason `forwarded-signal`", contracts)
+        self.assertIn("run_bounded_capture", runtime)
+        self.assertIn("whole-process-tree quiescence", canonical)
+
+    def test_direct_claude_test_overrides_cannot_raise_production_caps(
+        self,
+    ) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(encoding="utf-8")
+
+        for content in (skill, contracts, canonical):
+            self.assertIn("test-oriented", content.lower())
+            self.assertIn("1,800", content)
+            self.assertIn("64 MiB", content)
+            self.assertIn("256 KiB", content)
+            self.assertIn("Python", content)
+        for anchor in (
+            "DEFAULT_TIMEOUT_SECONDS = 1_800.0",
+            "DEFAULT_STREAM_LIMIT_BYTES = 64 * 1024 * 1024",
+            "DEFAULT_PROMPT_LIMIT_BYTES = 256 * 1024",
+            "_validate_timeout_limit",
+            "_validate_byte_limit",
+            '"--timeout-seconds"',
+            '"--stream-limit-bytes"',
+            '"--prompt-limit-bytes"',
+        ):
+            self.assertIn(anchor, runtime)
 
     def test_named_lane_separates_artifact_outcome_and_presentation(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
@@ -3599,8 +4897,11 @@ class RepositoryContractTest(unittest.TestCase):
         )
 
         for anchor in (
-            "ordinary Claude CLI authentication",
+            "ordinary local Claude CLI login",
+            "only authentication interface",
             "trusted control plane",
+            "accepts no API key",
+            "OAuth-token environment interface",
             "ordinary CLI-owned authentication and runtime state",
             "credential refresh and possible cache or tool-result artifacts",
             "not model-authorized review mutations",
@@ -3612,6 +4913,27 @@ class RepositoryContractTest(unittest.TestCase):
             "does not take or verify a complete real-`HOME` diff",
         ):
             self.assertIn(anchor, canonical)
+        canonical_runtime = runtime[
+            runtime.index("### Canonical Lane Applicability") : runtime.index(
+                "### Native Selected-Deny Read Boundary"
+            )
+        ]
+        canonical_runtime_normalized = " ".join(canonical_runtime.split())
+        for anchor in (
+            "only authentication interface",
+            "ordinary local Claude CLI login",
+            "accepts no API key",
+            "OAuth-token environment interface",
+            "blocked-authentication",
+        ):
+            self.assertIn(anchor, canonical_runtime_normalized)
+        self.assertNotIn("explicitly authorized API key", canonical_runtime)
+        self.assertIn("only API-key/OAuth-token credentials", canonical)
+        self.assertIn(
+            "organization policy forbids ordinary CLI control-plane writes", canonical
+        )
+        self.assertIn("The canonical lane does not use or", runtime)
+        self.assertIn("helper's credential-lock catalog", runtime)
         self.assertIn(
             "The canonical lane does not enumerate or attest every CLI-owned `HOME` write",
             runtime,
@@ -3658,31 +4980,139 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertNotIn(retired_global_detail, agents)
 
-    def test_canonical_claude_provenance_is_direct_not_helper_snapshot(self) -> None:
+    def test_canonical_claude_provenance_rejects_npm_nvm_shims(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
         canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
             encoding="utf-8"
         )
-        runtime = (SKILL_ROOT / "references/claude-runtime-trust.md").read_text(
+
+        for content in (skill, contracts, canonical):
+            self.assertIn("npm/NVM", content)
+            self.assertIn("shebang shims", content)
+            self.assertIn("script", content)
+            self.assertIn("interpreter wrapper", content)
+            self.assertIn("trusted `PATH`", content)
+            self.assertIn("does not establish", content)
+        self.assertIn("user-writable npm/NVM directory", canonical)
+        self.assertIn("does not establish publisher provenance", canonical)
+
+    def test_canonical_claude_launch_uses_preflight_bound_verified_snapshot(
+        self,
+    ) -> None:
+        canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
+            encoding="utf-8"
+        )
+        runtime_trust = (SKILL_ROOT / "references/claude-runtime-trust.md").read_text(
             encoding="utf-8"
         )
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        implementation = (SCRIPTS / "review_runtime/named_lane.py").read_text(
+            encoding="utf-8"
+        )
 
+        for content in (skill, contracts, canonical, runtime_trust):
+            for anchor in (
+                "--preflight-result",
+                "verified-snapshot",
+                "`mtime`",
+                "`ctime`",
+                "`nlink`",
+                "benign churn",
+                "raw source path",
+                "forwarded-signal-masked",
+                "snapshot-cleanup",
+                "`process_reason`",
+                "`retained_path`",
+                "`retained_locator`",
+                "complete flushed",
+                "receipt write/flush failure",
+            ):
+                with self.subTest(anchor=anchor):
+                    self.assertIn(anchor, content)
         for anchor in (
             "## Canonical Executable Provenance",
-            "one resolved path accepted by the selection preflight",
-            "fixed credential-free environment",
-            "`>=2.1.211,<3.0.0`",
             "fixed Anthropic release-signing key",
-            "signed per-version manifest",
-            "`verify_claude_release` or equivalent checks",
-            "immediately before launch",
-            "revalidate it again after process completion",
-            "does not call `snapshot_verified_claude_executable`",
-            "do not claim the stronger immutability of the helper snapshot",
+            "signed manifest",
+            "guard-created verified snapshot",
+            "opened source descriptor",
+            "single-link mode-`0500` snapshot",
+            "cannot alter the executed bytes",
+            "without claiming the raw host path itself ran or requiring parent before/after raw-path checks",
+            "`launch_binding`",
+            "preflight SHA-256",
+            "signed artifact size/SHA-256",
         ):
             self.assertIn(anchor, canonical)
-        self.assertIn("do not create a helper snapshot", runtime)
-        self.assertIn("For the low-level helper, after the signed manifest", runtime)
+        self.assertIn("Before invoking `validate-claude-stream`", skill)
+        self.assertIn("Before stream validation", contracts)
+        self.assertIn("Before invoking the stream validator", canonical)
+        self.assertIn("Before stream validation", runtime_trust)
+        for content in (skill, contracts, canonical, runtime_trust):
+            self.assertIn("does not consume", content)
+            self.assertNotIn("source descriptor open through process spawn", content)
+            self.assertNotIn("snapshot descriptor open through process spawn", content)
+        for content in (skill, contracts, canonical):
+            for field in (
+                "preflight_sha256",
+                "resolved_path",
+                "identity",
+                "artifact_sha256",
+                "artifact_size",
+            ):
+                with self.subTest(field=field):
+                    self.assertIn(field, content)
+        self.assertNotIn(
+            "revalidate that exact resolved path immediately before and after launch",
+            runtime_trust,
+        )
+        self.assertNotIn(
+            "uses the revalidated host-installed executable path for the actual",
+            canonical,
+        )
+
+        self.assertIn(
+            'claude.add_argument("--preflight-result", required=True)',
+            implementation,
+        )
+        self.assertIn("_read_claude_preflight_evidence", implementation)
+        self.assertIn("_create_claude_launch_snapshot", implementation)
+        self.assertIn("snapshot_command = (str(snapshot.path)", implementation)
+        self.assertIn("snapshot_mask = block_forwarded_signals()", implementation)
+        self.assertIn("class _ClaudeLaunchSnapshotCleanupError", implementation)
+        self.assertIn('"reason": "snapshot-cleanup"', implementation)
+        self.assertIn("_output_parent_path_names_bound_directory", implementation)
+        self.assertIn('payload["retained_locator"]', implementation)
+        self.assertIn("def _emit_claude_receipt", implementation)
+        self.assertIn("_receipt_emitter=_emit_claude_receipt", implementation)
+        snapshot_creation = implementation.split(
+            "def _create_claude_launch_snapshot(", 1
+        )[1].split("def _cleanup_claude_launch_snapshot(", 1)[0]
+        self.assertEqual(
+            snapshot_creation.count("_remaining_deadline_seconds("),
+            2,
+        )
+        self.assertIn('"mode": "verified-snapshot"', implementation)
+        self.assertIn('"preflight_sha256": binding.preflight_checksum', implementation)
+        self.assertIn('"resolved_path": str(binding.source_path)', implementation)
+        self.assertIn(
+            '"identity": dict(_expected_executable_identity(binding))',
+            implementation,
+        )
+        self.assertIn('"artifact_sha256": binding.artifact_checksum', implementation)
+        self.assertIn('"artifact_size": binding.artifact_size', implementation)
+        expected_identity = implementation.split(
+            "def _expected_executable_identity(", 1
+        )[1].split("def _write_all(", 1)[0]
+        for field in ("device", "inode", "file_type", "mode", "uid", "gid", "size"):
+            self.assertIn(f'"{field}"', expected_identity)
+        for excluded in ("nlink", "mtime", "ctime"):
+            self.assertNotIn(excluded, expected_identity)
         self.assertIn(
             "Follow **Compatible-Version Selection**, **Canonical Executable Provenance**",
             skill,
@@ -3738,6 +5168,8 @@ class RepositoryContractTest(unittest.TestCase):
                 "real `HOME`",
                 "review_contract: supplied-diff-private-git",
                 "`--include-source-wip`",
+                "accepts only ordinary local login",
+                "low-level helper selects authentication with "
                 "`ANTHROPIC_API_KEY` > `CLAUDE_CODE_OAUTH_TOKEN` > local login",
                 "broker/carrier/catalog/full refresh transaction",
                 "publisher-verified strict stable Claude Code `>=2.1.211,<3.0.0`",

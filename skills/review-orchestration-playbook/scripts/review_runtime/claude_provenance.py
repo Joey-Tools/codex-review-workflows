@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 CLAUDE_RELEASE_BASE_URL = "https://downloads.claude.ai/claude-code-releases"
 CLAUDE_RELEASE_KEY_FINGERPRINT = "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE"
 CLAUDE_RELEASE_KEY_PATH = pathlib.Path(__file__).with_name("claude_code_release.asc")
+CLAUDE_RELEASE_KEY_BYTES: bytes | None = None
 CLAUDE_MANIFEST_MAX_BYTES = 256 * 1024
 CLAUDE_SIGNATURE_MAX_BYTES = 64 * 1024
 CLAUDE_BINARY_MAX_BYTES = 1024 * 1024 * 1024
@@ -1804,12 +1805,16 @@ def verify_manifest_signature(
         temp_root,
         validator=temp_root_validator,
     )
-    try:
-        release_key = CLAUDE_RELEASE_KEY_PATH.read_bytes()
-    except OSError as error:
-        raise ClaudeProvenanceUnavailable(
-            f"cannot read vendored Claude Code release key: {error}"
-        ) from error
+    bound_release_key = CLAUDE_RELEASE_KEY_BYTES
+    if bound_release_key is None:
+        try:
+            release_key = CLAUDE_RELEASE_KEY_PATH.read_bytes()
+        except OSError as error:
+            raise ClaudeProvenanceUnavailable(
+                f"cannot read vendored Claude Code release key: {error}"
+            ) from error
+    else:
+        release_key = bytes(bound_release_key)
     with tempfile.TemporaryDirectory(
         prefix="claude-provenance-gpg-",
         dir=trusted_temp_root.resolved,

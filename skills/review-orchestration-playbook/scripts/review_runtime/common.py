@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import contextlib
 import enum
 import errno
@@ -355,6 +356,24 @@ DESCRIPTOR_CWD_HANDOFF_TIMEOUT_SECONDS = 10.0
 GATED_ENVIRONMENT_MAGIC = b"CGR1"
 MAX_GATED_ENVIRONMENT_BYTES = 8 * 1024 * 1024
 FD_EXEC_ERROR_PREFIX = b"fd_exec.py: launch-error:"
+FD_EXEC_BYTES: bytes | None = None
+MAX_BOUND_FD_EXEC_BYTES = 64 * 1024
+_BOUND_FD_EXEC_FILENAME = "<guard-bound fd_exec.py>"
+_BOUND_FD_EXEC_BOOTSTRAP = (
+    "import base64, sys\n"
+    "source = base64.b64decode(sys.argv.pop(1), validate=True)\n"
+    f"filename = {_BOUND_FD_EXEC_FILENAME!r}\n"
+    "sys.argv[0] = 'fd_exec.py'\n"
+    "namespace = {\n"
+    "    '__name__': '__main__',\n"
+    "    '__file__': filename,\n"
+    "    '__package__': None,\n"
+    "    '__spec__': None,\n"
+    "    '__cached__': None,\n"
+    "}\n"
+    "exec(compile(source, filename, 'exec', dont_inherit=True), "
+    "namespace, namespace)\n"
+)
 _PROCESS_SPAWN_THREAD = threading.Thread
 _ATOMIC_WRITE_REDACTION_LOCK = threading.RLock()
 _ATOMIC_WRITE_REDACTION_SCOPES: list[
@@ -918,9 +937,6 @@ def _descriptor_cwd_command(
             ) from error
         if not stat.S_ISDIR(metadata.st_mode):
             raise ReviewError("descriptor-backed cwd is not a directory")
-    launcher = pathlib.Path(__file__).with_name("fd_exec.py")
-    if not launcher.is_file():
-        raise ReviewError("descriptor-backed cwd launcher is unavailable")
     inherited_descriptors = tuple(
         descriptor
         for descriptor in (cwd_fd, status_fd, gate_fd)
@@ -938,15 +954,47 @@ def _descriptor_cwd_command(
             str(status_fd) if status_fd is not None else "-",
             str(gate_fd),
         )
-    return (
-        (
+    bound_launcher = FD_EXEC_BYTES
+    if bound_launcher is None:
+        launcher = pathlib.Path(__file__).with_name("fd_exec.py")
+        if not launcher.is_file():
+            raise ReviewError("descriptor-backed cwd launcher is unavailable")
+        launcher_command = (
             sys.executable,
             "-I",
             "-S",
             str(launcher),
-            *launcher_arguments,
-            *command,
-        ),
+        )
+    else:
+        if (
+            type(bound_launcher) is not bytes
+            or not bound_launcher
+            or len(bound_launcher) > MAX_BOUND_FD_EXEC_BYTES
+        ):
+            raise ReviewError("guard-bound descriptor launcher bytes are invalid")
+        try:
+            compile(
+                bound_launcher,
+                _BOUND_FD_EXEC_FILENAME,
+                "exec",
+                dont_inherit=True,
+            )
+        except (SyntaxError, TypeError, ValueError) as error:
+            raise ReviewError(
+                "guard-bound descriptor launcher is not valid Python source"
+            ) from error
+        encoded_launcher = base64.b64encode(bound_launcher).decode("ascii")
+        launcher_command = (
+            sys.executable,
+            "-I",
+            "-B",
+            "-S",
+            "-c",
+            _BOUND_FD_EXEC_BOOTSTRAP,
+            encoded_launcher,
+        )
+    return (
+        (*launcher_command, *launcher_arguments, *command),
         inherited_descriptors,
     )
 
@@ -1236,7 +1284,9 @@ def terminate_process_group(
                 process.kill()
                 process.wait()
         return
-    if not _process_group_exists(process.pid):
+    # Linux may report a zombie-only process group as absent. Poll before
+    # returning so the direct child is reaped and cannot leak a Popen warning.
+    if not _process_group_exists(process.pid) and process.poll() is not None:
         return
     if not signal_already_sent:
         signal_process_group(process, initial_signal)
@@ -1652,7 +1702,14 @@ def _run_logged_process(
                 daemon=True,
             )
             spawn_thread_start_attempted = True
-            spawn_thread.start()
+            try:
+                spawn_thread.start()
+            except ForwardedSignal:
+                raise
+            except RuntimeError as error:
+                raise ReviewOutputDrainError(
+                    "command process-spawn worker could not start"
+                ) from error
             spawn_thread_start_confirmed = True
             while not spawn_worker_ready.wait(PROCESS_GROUP_POLL_SECONDS):
                 raise_pending_process_signal()
@@ -1839,6 +1896,23 @@ def _run_logged_process(
             finally:
                 view.release()
 
+        def start_io_thread(thread: threading.Thread) -> None:
+            nonlocal process_cleanup_inconclusive
+            try:
+                thread.start()
+            except ForwardedSignal:
+                process_cleanup_inconclusive = True
+                raise
+            except RuntimeError as error:
+                process_cleanup_inconclusive = True
+                raise ReviewOutputDrainError(
+                    f"command I/O thread could not start: {' '.join(command)}"
+                ) from error
+            except BaseException:
+                process_cleanup_inconclusive = True
+                raise
+            io_threads.append(thread)
+
         thread_start_mask_owner = ForwardedSignalMaskOwner()
         thread_start_error: BaseException | None = None
         try:
@@ -1859,12 +1933,7 @@ def _run_logged_process(
                         args=(stream, destination, limit_bytes, redactor),
                         daemon=True,
                     )
-                    try:
-                        thread.start()
-                    except BaseException:
-                        process_cleanup_inconclusive = True
-                        raise
-                    io_threads.append(thread)
+                    start_io_thread(thread)
                 if stdin is not None:
                     assert process.stdin is not None
                     thread = threading.Thread(
@@ -1872,12 +1941,7 @@ def _run_logged_process(
                         args=(process.stdin, stdin),
                         daemon=True,
                     )
-                    try:
-                        thread.start()
-                    except BaseException:
-                        process_cleanup_inconclusive = True
-                        raise
-                    io_threads.append(thread)
+                    start_io_thread(thread)
             except BaseException as error:
                 thread_start_error = error
                 raise
@@ -2596,6 +2660,26 @@ def is_relative_to(path: pathlib.Path, parent: pathlib.Path) -> bool:
         path.relative_to(parent)
     except ValueError:
         return False
+    return True
+
+
+def symlink_target_stays_within_workspace(
+    link_relative_path: pathlib.PurePosixPath,
+    target_text: str,
+) -> bool:
+    """Return whether a relative symlink target stays inside the frozen root."""
+
+    target = pathlib.PurePosixPath(target_text)
+    if target.is_absolute():
+        return False
+    depth = len(link_relative_path.parent.parts)
+    for component in target.parts:
+        if component == "..":
+            if depth == 0:
+                return False
+            depth -= 1
+        elif component not in {"", "."}:
+            depth += 1
     return True
 
 
