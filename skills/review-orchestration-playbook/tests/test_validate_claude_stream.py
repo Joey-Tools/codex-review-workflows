@@ -711,7 +711,9 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                     "Grep": {
                         "path_field": "path",
                         "path_required": False,
-                        "path_if_present": "absolute",
+                        "path_if_present": "absolute_or_cwd_relative",
+                        "relative_path_base": "host_workspace_cwd",
+                        "home_shorthand": "scope_unverified",
                     },
                     "Glob": {
                         "path_field": "path",
@@ -1175,6 +1177,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                             "reasons": ["validator.contract-invalid"],
                         },
                     )
+
     def test_accepts_complete_stream_and_preserves_findings_verbatim(self) -> None:
         outcome = self._validate(raw=self._raw(self._full_events(), blank_edges=True))
 
@@ -1384,6 +1387,7 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
         cases = {
             "absolute-read": ("Read", {"file_path": str(self.review_file)}),
             "absolute-grep": ("Grep", {"path": str(self.src_dir)}),
+            "relative-grep": ("Grep", {"path": "src"}),
             "absolute-glob": (
                 "Glob",
                 {"path": str(self.cwd), "pattern": "src/*.py"},
@@ -1403,11 +1407,16 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                     {"classification": "accepted", "findings": "\nNo findings.\n"},
                 )
 
-    def test_relative_or_home_shorthand_tool_paths_are_scope_unverified(self) -> None:
+    def test_unproved_relative_or_home_shorthand_paths_are_scope_unverified(
+        self,
+    ) -> None:
         cases = {
             "relative-read": ("Read", {"file_path": "review.py"}),
             "home-read": ("Read", {"file_path": "~/.claude/spill.txt"}),
-            "relative-grep": ("Grep", {"path": "src"}),
+            "home-grep": ("Grep", {"path": "~/.claude"}),
+            "named-home-grep": ("Grep", {"path": "~alice/.ssh"}),
+            "current-home-grep": ("Grep", {"path": "~+/src"}),
+            "previous-home-grep": ("Grep", {"path": "~-/src"}),
             "relative-glob-path": (
                 "Glob",
                 {"path": "src", "pattern": "*.py"},
@@ -1426,6 +1435,31 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                     {
                         "classification": "inconclusive",
                         "reasons": [validator.TOOL_PATH_SCOPE_UNVERIFIED_REASON],
+                    },
+                )
+
+    def test_blocks_relative_grep_escape_and_symlink_escape(self) -> None:
+        outside_dir = self.temporary_root / "outside"
+        outside_dir.mkdir()
+        inside_link = self.cwd / "outside-link"
+        inside_link.symlink_to(outside_dir, target_is_directory=True)
+
+        for name, path_value in (
+            ("parent", "../outside"),
+            ("symlink", "outside-link"),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    self._validate(
+                        self._tool_events(
+                            "Grep",
+                            {"path": path_value},
+                            tool_id=f"toolu-relative-{name}",
+                        )
+                    ),
+                    {
+                        "classification": "blocked",
+                        "reasons": [validator.TOOL_PATH_OUTSIDE_WORKSPACE_REASON],
                     },
                 )
 

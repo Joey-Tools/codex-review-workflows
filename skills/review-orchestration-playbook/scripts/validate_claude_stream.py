@@ -326,7 +326,9 @@ STRUCTURED_TOOL_PATH_SCOPE_CONTRACT = {
         "Grep": {
             "path_field": "path",
             "path_required": False,
-            "path_if_present": "absolute",
+            "path_if_present": "absolute_or_cwd_relative",
+            "relative_path_base": "host_workspace_cwd",
+            "home_shorthand": "scope_unverified",
         },
         "Glob": {
             "path_field": "path",
@@ -2503,7 +2505,15 @@ def _audit_structured_tool_path(
         else:
             raw_path = Path(path_value)
             if not raw_path.is_absolute():
-                scope, resolved_path = "unverified", None
+                if tool_contract[
+                    "path_if_present"
+                ] != "absolute_or_cwd_relative" or path_value.startswith("~"):
+                    scope, resolved_path = "unverified", None
+                else:
+                    scope, resolved_path = _candidate_path_scope(
+                        binding.expected_cwd / raw_path,
+                        binding,
+                    )
             else:
                 scope, resolved_path = _candidate_path_scope(raw_path, binding)
             _record_structured_scope(scope, evidence)
