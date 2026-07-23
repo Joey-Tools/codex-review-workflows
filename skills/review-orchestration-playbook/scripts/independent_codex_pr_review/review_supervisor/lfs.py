@@ -12,7 +12,6 @@ V1_ALIASES = frozenset(
     }
 )
 OID_PATTERN = re.compile(rb"sha256:[0-9a-f]{64}\Z")
-EXTENSION_PREFIX_PATTERN = re.compile(rb"\Aext-[0-9]{1}-\w+")
 SIZE_PATTERN = re.compile(rb"[+-]?[0-9]+\Z")
 
 
@@ -56,14 +55,27 @@ def _go_scan_lines(payload: bytes) -> list[bytes]:
     return [record[:-1] if record.endswith(b"\r") else record for record in records]
 
 
+def _extension_priority(key: bytes) -> int | None:
+    parts = key.split(b"-", 2)
+    if (
+        len(parts) != 3
+        or parts[0] != b"ext"
+        or not parts[1]
+        or not parts[1].isdigit()
+        or not parts[2]
+    ):
+        return None
+    return int(parts[1], 10)
+
+
 def is_git_lfs_pointer(payload: bytes) -> bool:
-    """Mirror git-lfs 3.7.1 DecodePointer acceptance for small blobs."""
+    """Conservatively recognize small Git LFS pointer-shaped blobs."""
     if not payload or len(payload) >= POINTER_MAX_BYTES:
         return False
 
     pointer_keys = (b"version", b"oid", b"size")
     core: dict[bytes, bytes] = {}
-    extensions: list[tuple[bytes, bytes]] = []
+    extensions: dict[bytes, tuple[int, bytes]] = {}
     line = 0
     for record in _go_scan_lines(_go_bytes_trim_space(payload)):
         if not record:
@@ -73,9 +85,10 @@ def is_git_lfs_pointer(payload: bytes) -> bool:
             return False
         key, value = parts
         if key != pointer_keys[line]:
-            if EXTENSION_PREFIX_PATTERN.match(key) is None:
+            priority = _extension_priority(key)
+            if priority is None:
                 return False
-            extensions.append((key, value))
+            extensions[key] = (priority, value)
             continue
         core[key] = value
         line += 1
@@ -95,14 +108,7 @@ def is_git_lfs_pointer(payload: bytes) -> bool:
         return False
 
     priorities: set[int] = set()
-    for key, value in extensions:
-        key_parts = key.split(b"-", 2)
-        if len(key_parts) != 3 or key_parts[0] != b"ext":
-            return False
-        try:
-            priority = int(key_parts[1], 10)
-        except ValueError:
-            return False
+    for priority, value in extensions.values():
         if priority in priorities:
             return False
         priorities.add(priority)

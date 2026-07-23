@@ -55,6 +55,28 @@ class GitLfsPointerTests(unittest.TestCase):
             )
         )
         self.assertTrue(is_git_lfs_pointer(b" \t" + crlf + b"\r\n"))
+        repeated = (
+            b"version https://git-lfs.github.com/spec/v1\n"
+            b"ext-1-one "
+            + OID
+            + b"\next-1-one "
+            + OID
+            + b"\noid "
+            + OID
+            + b"\nsize 1\n"
+        )
+        self.assertTrue(is_git_lfs_pointer(repeated))
+
+    def test_accepts_extended_priority_and_opaque_name(self) -> None:
+        pointer = b"\n".join(
+            (
+                b"version https://git-lfs.github.com/spec/v1",
+                b"ext-10-!opaque/name sha256:" + b"b" * 64,
+                b"oid " + OID,
+                b"size 1",
+            )
+        )
+        self.assertTrue(is_git_lfs_pointer(pointer + b"\n"))
 
     def test_rejects_near_misses(self) -> None:
         self.assertFalse(is_git_lfs_pointer(INVALID_UPPERCASE_OID))
@@ -63,8 +85,6 @@ class GitLfsPointerTests(unittest.TestCase):
             b"oid " + OID + b"\nsize 1\next-1-late " + OID,
             b"version https://git-lfs.github.com/spec/v1\n"
             b"ext-1-one " + OID + b"\next-1-two " + OID + b"\noid " + OID + b"\nsize 1",
-            b"version https://git-lfs.github.com/spec/v1\n"
-            b"ext-1-one " + OID + b"\next-1-one " + OID + b"\noid " + OID + b"\nsize 1",
             b"version https://git-lfs.github.com/spec/v1\n \noid " + OID + b"\nsize 1",
             b"version https://git-lfs.github.com/spec/v1\noid " + OID + b"\nsize -1",
             b"version https://git-lfs.github.com/spec/v1\noid "

@@ -48,6 +48,7 @@ from .secureio import (
     open_absolute_directory_chain,
     open_regular_at,
     read_fd_exact,
+    rename_noreplace,
     sha256_bytes,
     validate_private_directory_fd,
     validate_private_regular_fd,
@@ -56,12 +57,17 @@ from .secureio import (
 
 MAX_ATTEMPT_STATE_BYTES = 1024 * 1024
 ATTEMPT_DIRECTORY_PATTERN = re.compile(rb"attempt-([0-9]+)-[0-9a-f]{32}\Z")
+RECLAIM_DIRECTORY_PATTERN = re.compile(
+    rb"\.reclaim-(attempt-[0-9]+-[0-9a-f]{32})-[0-9a-f]{32}\Z"
+)
 ATOMIC_STATE_TEMP_PATTERN = re.compile(
     rb"\.state\.json\.tmp-([1-9][0-9]*)-[0-9a-f]{16}\Z"
 )
 INITIAL_CRASH_RECLAIM_AGE_SECONDS = 30.0
 INITIAL_CRASH_TIMESTAMP_SKEW_SECONDS = 300.0
 INITIAL_CRASH_TEMP_CAP = 8
+RETENTION_LOCK_TOKEN_PREFIX = b"retention-lease-v1:"
+RETENTION_LOCK_TOKEN_BYTES = len(RETENTION_LOCK_TOKEN_PREFIX) + 32 + 1
 
 
 class EntryCountMismatch(ValueError):
@@ -103,12 +109,20 @@ class LedgerSnapshot:
     attempt_count: int
 
 
+@dataclass(frozen=True)
+class AttemptBinding:
+    name: bytes
+    identity: Identity
+
+
 @dataclass
 class RetentionLease:
     root: pathlib.Path
     fd: int
     root_fd: int
     root_identity: Identity
+    lock_identity: Identity
+    lock_token: bytes
 
     def revalidate_root(self) -> Identity:
         if self.fd < 0 or self.root_fd < 0:
@@ -125,6 +139,56 @@ class RetentionLease:
                 raise OSError(errno.ESTALE, "retention root binding changed")
         finally:
             os.close(current_fd)
+
+        held_lock_identity = validate_private_regular_fd(
+            self.fd,
+            self.root / "retention.lock",
+        )
+        if held_lock_identity != self.lock_identity:
+            raise OSError(errno.ESTALE, "retention lock descriptor identity changed")
+        if _read_retention_lock_token(self.fd) != self.lock_token:
+            raise OSError(errno.ESTALE, "retention lock ownership token changed")
+        probe_fd, current_lock_identity = open_regular_at(
+            self.root_fd,
+            b"retention.lock",
+            expected_uid=os.getuid(),
+            private_metadata=True,
+        )
+        try:
+            if current_lock_identity != self.lock_identity:
+                raise OSError(errno.ESTALE, "retention lock path identity changed")
+            if _read_retention_lock_token(probe_fd) != self.lock_token:
+                raise OSError(errno.ESTALE, "retention lock ownership token changed")
+            try:
+                fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                fcntl.flock(probe_fd, fcntl.LOCK_UN)
+                raise OSError(errno.ENOLCK, "exclusive retention lock is not held")
+            path_lock_identity = identity_from_stat(
+                os.stat(
+                    b"retention.lock",
+                    dir_fd=self.root_fd,
+                    follow_symlinks=False,
+                )
+            )
+            if path_lock_identity != self.lock_identity:
+                raise OSError(errno.ESTALE, "retention lock path identity changed")
+        finally:
+            os.close(probe_fd)
+        final_root_fd, final_root_identity = open_absolute_directory_chain(
+            self.root,
+            private_leaf=True,
+        )
+        try:
+            if not directory_identities_match(
+                final_root_identity,
+                self.root_identity,
+            ):
+                raise OSError(errno.ESTALE, "retention root binding changed")
+        finally:
+            os.close(final_root_fd)
         return held_identity
 
     def close(self) -> None:
@@ -154,6 +218,7 @@ def acquire_retention_lease(root: pathlib.Path, *, deadline: float) -> Retention
             lock_fd, identity = open_regular_at(
                 root_fd,
                 b"retention.lock",
+                writable=True,
                 expected_uid=os.getuid(),
                 private_metadata=True,
             )
@@ -175,44 +240,119 @@ def acquire_retention_lease(root: pathlib.Path, *, deadline: float) -> Retention
             lock_fd = -1
             raise ValueError("retention lock has an unsafe identity or mode")
         acquire_flock(lock_fd, fcntl.LOCK_EX, deadline=deadline)
-        return RetentionLease(
+        lock_token = (
+            RETENTION_LOCK_TOKEN_PREFIX + uuid.uuid4().hex.encode("ascii") + b"\n"
+        )
+        identity = _write_retention_lock_token(lock_fd, lock_token)
+        path_identity = identity_from_stat(
+            os.stat(
+                b"retention.lock",
+                dir_fd=root_fd,
+                follow_symlinks=False,
+            )
+        )
+        if path_identity != identity:
+            raise OSError(errno.ESTALE, "retention lock path changed after acquire")
+        lease = RetentionLease(
             root=root,
             fd=lock_fd,
             root_fd=root_fd,
             root_identity=root_identity,
+            lock_identity=identity,
+            lock_token=lock_token,
         )
-    except Exception as error:
+        lease.revalidate_root()
+        return lease
+    except BaseException as error:
+        cleanup_failures = 0
         if lock_fd >= 0:
-            os.close(lock_fd)
-        os.close(root_fd)
+            try:
+                os.close(lock_fd)
+            except OSError:
+                cleanup_failures += 1
+        try:
+            os.close(root_fd)
+        except OSError:
+            cleanup_failures += 1
+        if not isinstance(error, Exception):
+            if cleanup_failures:
+                error.add_note("retention lease descriptor cleanup was incomplete")
+            raise
+        cleanup_suffix = (
+            "; descriptor cleanup was incomplete" if cleanup_failures else ""
+        )
         raise inconclusive(
-            f"cannot acquire independent-review retention lock: {error}",
+            "cannot acquire independent-review retention lock: "
+            f"{error}{cleanup_suffix}",
             stage="admission",
             code="retention-lock-unavailable",
         ) from error
 
 
-def read_attempt_state(attempt_dir: pathlib.Path) -> tuple[dict[str, Any], bytes, str]:
-    attempt_fd, _ = open_absolute_directory_chain(attempt_dir, private_leaf=True)
+def _write_retention_lock_token(fd: int, token: bytes) -> Identity:
+    if (
+        len(token) != RETENTION_LOCK_TOKEN_BYTES
+        or not token.startswith(RETENTION_LOCK_TOKEN_PREFIX)
+        or not token.endswith(b"\n")
+    ):
+        raise ValueError("retention lock token is malformed")
+    os.ftruncate(fd, 0)
+    offset = 0
+    while offset < len(token):
+        written = os.pwrite(fd, token[offset:], offset)
+        if written <= 0:
+            raise OSError(errno.EIO, "retention lock token write made no progress")
+        offset += written
+    os.fsync(fd)
+    identity = validate_private_regular_fd(fd, pathlib.Path("retention.lock"))
+    if identity.size != len(token):
+        raise OSError(errno.EIO, "retention lock token size is invalid")
+    if _read_retention_lock_token(fd) != token:
+        raise OSError(errno.EIO, "retention lock token readback mismatch")
+    return identity
+
+
+def _read_retention_lock_token(fd: int) -> bytes:
+    metadata = os.fstat(fd)
+    if metadata.st_size != RETENTION_LOCK_TOKEN_BYTES:
+        raise OSError(errno.EIO, "retention lock token size is invalid")
+    chunks: list[bytes] = []
+    offset = 0
+    while offset < RETENTION_LOCK_TOKEN_BYTES:
+        chunk = os.pread(fd, RETENTION_LOCK_TOKEN_BYTES - offset, offset)
+        if not chunk:
+            raise OSError(errno.EIO, "retention lock token read was truncated")
+        chunks.append(chunk)
+        offset += len(chunk)
+    token = b"".join(chunks)
+    if (
+        not token.startswith(RETENTION_LOCK_TOKEN_PREFIX)
+        or not token.endswith(b"\n")
+        or len(token) != RETENTION_LOCK_TOKEN_BYTES
+    ):
+        raise OSError(errno.EIO, "retention lock token is malformed")
+    return token
+
+
+def _read_attempt_state_fd(
+    attempt_fd: int,
+) -> tuple[dict[str, Any], bytes, str]:
+    state_fd, identity = open_regular_at(
+        attempt_fd,
+        b"state.json",
+        expected_uid=os.getuid(),
+        private_metadata=True,
+    )
     try:
-        state_fd, identity = open_regular_at(
-            attempt_fd,
-            b"state.json",
-            expected_uid=os.getuid(),
-            private_metadata=True,
+        if identity.size > MAX_ATTEMPT_STATE_BYTES:
+            raise ValueError("attempt state exceeds its byte limit")
+        raw = read_fd_exact(
+            state_fd,
+            max_bytes=MAX_ATTEMPT_STATE_BYTES,
+            expected_size=identity.size,
         )
-        try:
-            if identity.size > MAX_ATTEMPT_STATE_BYTES:
-                raise ValueError("attempt state exceeds its byte limit")
-            raw = read_fd_exact(
-                state_fd,
-                max_bytes=MAX_ATTEMPT_STATE_BYTES,
-                expected_size=identity.size,
-            )
-        finally:
-            os.close(state_fd)
     finally:
-        os.close(attempt_fd)
+        os.close(state_fd)
     state = decode_json_bytes(raw)
     if not isinstance(state, dict) or state.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("attempt state schema is invalid")
@@ -220,14 +360,170 @@ def read_attempt_state(attempt_dir: pathlib.Path) -> tuple[dict[str, Any], bytes
     return state, raw, sha256_bytes(raw)
 
 
-def _pid_exists(pid: int) -> bool:
+def read_attempt_state(attempt_dir: pathlib.Path) -> tuple[dict[str, Any], bytes, str]:
+    attempt_fd, _ = open_absolute_directory_chain(attempt_dir, private_leaf=True)
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+        return _read_attempt_state_fd(attempt_fd)
+    finally:
+        os.close(attempt_fd)
+
+
+def _open_attempt_directory_at(
+    root_fd: int,
+    name: bytes,
+) -> tuple[int, Identity]:
+    metadata = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+    identity = identity_from_stat(metadata)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise ValueError("retained attempt has unsafe ownership or mode")
+    attempt_fd = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=root_fd,
+    )
+    try:
+        descriptor_identity = identity_from_stat(os.fstat(attempt_fd))
+        if descriptor_identity != identity:
+            raise OSError(errno.ESTALE, "retained attempt identity changed")
+        return attempt_fd, descriptor_identity
+    except BaseException:
+        os.close(attempt_fd)
+        raise
+
+
+def _measure_filesystem_fd(directory_fd: int) -> FilesystemMeasure:
+    metadata = os.fstat(directory_fd)
+    values = os.fstatvfs(directory_fd)
+    allocation_unit = max(4096, values.f_frsize or values.f_bsize)
+    free_bytes = values.f_bavail * (values.f_frsize or values.f_bsize)
+    fsid = getattr(values, "f_fsid", None)
+    identity = f"dev:{metadata.st_dev}:fsid:{fsid if fsid is not None else 'unknown'}"
+    return FilesystemMeasure(
+        identity=identity,
+        device=metadata.st_dev,
+        allocation_unit=allocation_unit,
+        free_bytes=free_bytes,
+    )
+
+
+def _bounded_directory_names(directory_fd: int, *, cap: int) -> tuple[bytes, ...]:
+    if cap < 0:
+        raise ValueError("directory entry cap is negative")
+    scan_fd = os.dup(directory_fd)
+    names: list[bytes] = []
+    try:
+        with os.scandir(scan_fd) as iterator:
+            for entry in iterator:
+                if len(names) >= cap:
+                    raise ValueError("directory entry count exceeds cap")
+                name = os.fsencode(entry.name)
+                if not name or b"/" in name or b"\0" in name:
+                    raise ValueError("directory returned an invalid entry name")
+                names.append(name)
+    finally:
+        os.close(scan_fd)
+    return tuple(names)
+
+
+def _allocated_bytes_fd(directory_fd: int, *, entry_cap: int) -> int:
+    root_metadata = os.fstat(directory_fd)
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise ValueError("allocated-byte inventory root is not a directory")
+    total = root_metadata.st_blocks * 512
+    count = 1
+    stack = [os.dup(directory_fd)]
+    try:
+        while stack:
+            current_fd = stack.pop()
+            try:
+                scan_fd = os.dup(current_fd)
+                try:
+                    with os.scandir(scan_fd) as iterator:
+                        for entry in iterator:
+                            name = os.fsencode(entry.name)
+                            if not name or b"/" in name or b"\0" in name:
+                                raise ValueError(
+                                    "allocated-byte inventory returned an invalid entry"
+                                )
+                            count += 1
+                            if count > entry_cap:
+                                raise ValueError(
+                                    "allocated-byte inventory exceeds entry cap"
+                                )
+                            metadata = os.stat(
+                                name,
+                                dir_fd=current_fd,
+                                follow_symlinks=False,
+                            )
+                            total = checked_add(total, metadata.st_blocks * 512)
+                            if stat.S_ISDIR(metadata.st_mode):
+                                child_fd = os.open(
+                                    name,
+                                    os.O_RDONLY
+                                    | os.O_DIRECTORY
+                                    | os.O_CLOEXEC
+                                    | os.O_NOFOLLOW,
+                                    dir_fd=current_fd,
+                                )
+                                child_identity = identity_from_stat(
+                                    os.fstat(child_fd)
+                                )
+                                if child_identity != identity_from_stat(metadata):
+                                    os.close(child_fd)
+                                    raise OSError(
+                                        errno.ESTALE,
+                                        "allocated-byte directory identity changed",
+                                    )
+                                stack.append(child_fd)
+                finally:
+                    os.close(scan_fd)
+            finally:
+                os.close(current_fd)
+        return total
+    finally:
+        for pending_fd in stack:
+            os.close(pending_fd)
+
+
+def _remove_bound_attempt_directory(
+    *,
+    root_fd: int,
+    name: bytes,
+    attempt_fd: int,
+) -> None:
+    expected = identity_from_stat(os.fstat(attempt_fd))
+    quarantine = b".reclaim-" + name + b"-" + uuid.uuid4().hex.encode("ascii")
+    isolated = False
+    try:
+        rename_noreplace(root_fd, name, root_fd, quarantine)
+        isolated = True
+        isolated_identity = identity_from_stat(
+            os.stat(quarantine, dir_fd=root_fd, follow_symlinks=False)
+        )
+        if not directory_identities_match(isolated_identity, expected):
+            raise OSError(
+                errno.ESTALE,
+                "isolated reclaim directory identity changed",
+            )
+        if _bounded_directory_names(attempt_fd, cap=1):
+            raise ValueError("isolated reclaim directory is not empty")
+        os.rmdir(quarantine, dir_fd=root_fd)
+        isolated = False
+        os.fsync(root_fd)
+    except BaseException as error:
+        if isolated:
+            try:
+                rename_noreplace(root_fd, quarantine, root_fd, name)
+                os.fsync(root_fd)
+            except BaseException:
+                error.add_note(
+                    "isolated reclaim directory could not be restored safely"
+                )
+        raise
 
 
 def _reclaim_initial_crash_attempt(
@@ -240,8 +536,17 @@ def _reclaim_initial_crash_attempt(
     now: float,
 ) -> bool:
     if not entries:
-        os.rmdir(name, dir_fd=root_fd)
-        os.fsync(root_fd)
+        attempt_fd, attempt_identity = _open_attempt_directory_at(root_fd, name)
+        try:
+            if attempt_identity != identity_from_stat(directory_metadata):
+                raise OSError(errno.ESTALE, "initial attempt identity changed")
+            _remove_bound_attempt_directory(
+                root_fd=root_fd,
+                name=name,
+                attempt_fd=attempt_fd,
+            )
+        finally:
+            os.close(attempt_fd)
         return True
     if b"state.json" in entries:
         return False
@@ -299,8 +604,6 @@ def _reclaim_initial_crash_attempt(
             pid = int(temp_match.group(1))
             if pid > 2_147_483_647:
                 raise ValueError("initial attempt state writer PID is invalid")
-            if _pid_exists(pid):
-                raise ValueError("initial attempt state writer may still be alive")
             temp_fd, identity = open_regular_at(
                 attempt_fd,
                 entry,
@@ -354,9 +657,9 @@ def _reclaim_initial_crash_attempt(
             identities.append((entry, identity))
         if now - newest_timestamp < INITIAL_CRASH_RECLAIM_AGE_SECONDS:
             raise ValueError("initial attempt crash residue is not old enough")
-        if tuple(
-            sorted(os.fsencode(value) for value in os.listdir(attempt_fd))
-        ) != tuple(sorted(entries)):
+        if tuple(sorted(_bounded_directory_names(attempt_fd, cap=len(entries)))) != tuple(
+            sorted(entries)
+        ):
             raise ValueError("initial attempt crash residue changed during inspection")
         for entry, expected in identities:
             current = identity_from_stat(
@@ -369,75 +672,148 @@ def _reclaim_initial_crash_attempt(
         for entry, _ in identities:
             os.unlink(entry, dir_fd=attempt_fd)
         os.fsync(attempt_fd)
-        if os.listdir(attempt_fd):
+        if _bounded_directory_names(attempt_fd, cap=1):
             raise ValueError("initial attempt crash residue is not empty after reclaim")
+        _remove_bound_attempt_directory(
+            root_fd=root_fd,
+            name=name,
+            attempt_fd=attempt_fd,
+        )
     finally:
         os.close(attempt_fd)
-    os.rmdir(name, dir_fd=root_fd)
-    os.fsync(root_fd)
     return True
 
 
-def _attempt_directories(root: pathlib.Path) -> tuple[pathlib.Path, ...]:
-    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
-    try:
-        names = tuple(os.fsencode(name) for name in os.listdir(root_fd))
-        if len(names) > 10_000:
-            raise ValueError("retention root contains too many entries")
-        attempts: list[pathlib.Path] = []
-        for name in names:
-            if name == b"retention.lock":
-                continue
-            metadata = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
-            if not name.startswith(b"attempt-") or not stat.S_ISDIR(metadata.st_mode):
-                raise ValueError("retention root contains an unrecognized entry")
+def _attempt_directories(
+    *,
+    lease: RetentionLease,
+) -> tuple[AttemptBinding, ...]:
+    names = _bounded_directory_names(lease.root_fd, cap=10_000)
+    attempts: list[AttemptBinding] = []
+    for discovered_name in names:
+        lease.revalidate_root()
+        name = discovered_name
+        if name == b"retention.lock":
+            continue
+        reclaim_match = RECLAIM_DIRECTORY_PATTERN.fullmatch(name)
+        if reclaim_match is not None:
+            restored_name = reclaim_match.group(1)
+            try:
+                os.stat(
+                    restored_name,
+                    dir_fd=lease.root_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise ValueError(
+                    "isolated reclaim residue conflicts with its attempt name"
+                )
+            metadata = os.stat(name, dir_fd=lease.root_fd, follow_symlinks=False)
             if (
-                metadata.st_uid != os.getuid()
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
                 or stat.S_IMODE(metadata.st_mode) != 0o700
             ):
-                raise ValueError("retained attempt has unsafe ownership or mode")
-            attempt_match = ATTEMPT_DIRECTORY_PATTERN.fullmatch(name)
-            if attempt_match is not None:
-                attempt_fd = os.open(
-                    name,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                    dir_fd=root_fd,
+                raise ValueError("isolated reclaim residue has unsafe metadata")
+            rename_noreplace(
+                lease.root_fd,
+                name,
+                lease.root_fd,
+                restored_name,
+            )
+            os.fsync(lease.root_fd)
+            name = restored_name
+            lease.revalidate_root()
+        metadata = os.stat(name, dir_fd=lease.root_fd, follow_symlinks=False)
+        if not name.startswith(b"attempt-") or not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError("retention root contains an unrecognized entry")
+        if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
+            raise ValueError("retained attempt has unsafe ownership or mode")
+        attempt_fd, attempt_identity = _open_attempt_directory_at(
+            lease.root_fd,
+            name,
+        )
+        try:
+            if attempt_identity != identity_from_stat(metadata):
+                raise OSError(errno.ESTALE, "retained attempt identity changed")
+            try:
+                os.stat(
+                    b"state.json",
+                    dir_fd=attempt_fd,
+                    follow_symlinks=False,
                 )
-                try:
-                    entries = tuple(
-                        sorted(os.fsencode(value) for value in os.listdir(attempt_fd))
-                    )
-                finally:
-                    os.close(attempt_fd)
-                if _reclaim_initial_crash_attempt(
-                    root_fd=root_fd,
-                    name=name,
-                    directory_metadata=metadata,
-                    match=attempt_match,
-                    entries=entries,
-                    now=time.time(),
-                ):
-                    continue
-            attempts.append(root / os.fsdecode(name))
-        return tuple(sorted(attempts))
-    finally:
-        os.close(root_fd)
+            except FileNotFoundError:
+                has_state = False
+                entries = _bounded_directory_names(
+                    attempt_fd,
+                    cap=INITIAL_CRASH_TEMP_CAP,
+                )
+            else:
+                has_state = True
+                entries = ()
+        finally:
+            os.close(attempt_fd)
+        attempt_match = ATTEMPT_DIRECTORY_PATTERN.fullmatch(name)
+        if attempt_match is not None and not has_state:
+            lease.revalidate_root()
+            if _reclaim_initial_crash_attempt(
+                root_fd=lease.root_fd,
+                name=name,
+                directory_metadata=metadata,
+                match=attempt_match,
+                entries=entries,
+                now=time.time(),
+            ):
+                lease.revalidate_root()
+                continue
+        attempts.append(AttemptBinding(name=name, identity=attempt_identity))
+    lease.revalidate_root()
+    return tuple(sorted(attempts, key=lambda attempt: attempt.name))
 
 
-def reconcile_ledger(root: pathlib.Path) -> LedgerSnapshot:
+def reconcile_ledger(
+    root: pathlib.Path,
+    *,
+    lease: RetentionLease | None = None,
+) -> LedgerSnapshot:
+    if lease is None:
+        with acquire_retention_lease(
+            root,
+            deadline=time.monotonic() + 30,
+        ) as owned_lease:
+            return reconcile_ledger(root, lease=owned_lease)
+    if lease.root != root:
+        raise ValueError("retention lease does not bind the reconciled root")
+    lease.revalidate_root()
+
     process_bytes = 0
     checkout_bytes = 0
     process_physical: dict[str, int] = {}
     checkout_physical: dict[str, int] = {}
     retained_worktree: str | None = None
-    attempts = _attempt_directories(root)
-    for attempt_dir in attempts:
+    attempts = _attempt_directories(lease=lease)
+    for attempt in attempts:
+        attempt_name = attempt.name
+        attempt_dir = root / os.fsdecode(attempt_name)
+        attempt_fd = -1
         try:
-            state, _, _ = read_attempt_state(attempt_dir)
+            lease.revalidate_root()
+            attempt_fd, attempt_identity = _open_attempt_directory_at(
+                lease.root_fd,
+                attempt_name,
+            )
+            if attempt_identity != attempt.identity:
+                raise OSError(
+                    errno.ESTALE,
+                    "retained attempt changed after enumeration",
+                )
+            state, _, _ = _read_attempt_state_fd(attempt_fd)
             attempt_id = state.get("attempt_id")
             if (
                 not isinstance(attempt_id, str)
-                or attempt_dir.name != f"attempt-{attempt_id}"
+                or os.fsdecode(attempt_name) != f"attempt-{attempt_id}"
             ):
                 raise ValueError("attempt directory does not match state identity")
             process_remaining = state.get("process_physical_remaining_by_fs", {})
@@ -466,7 +842,7 @@ def reconcile_ledger(root: pathlib.Path) -> LedgerSnapshot:
                 "reclaimed",
             }:
                 raise ValueError("attempt retention state is invalid")
-            attempt_fs = measure_filesystem(attempt_dir)
+            attempt_fs = _measure_filesystem_fd(attempt_fd)
             process_settlement = state.get("process_settlement")
             if process_settlement == "outstanding":
                 process_charge = PROCESS_ENVELOPE_BYTES
@@ -493,12 +869,15 @@ def reconcile_ledger(root: pathlib.Path) -> LedgerSnapshot:
                 if retention_state == "reclaimed":
                     if recorded_process_charge != 0 or process_remaining:
                         raise ValueError("reclaimed process settlement is not zero")
-                    if sorted(os.listdir(attempt_dir)) != ["state.json"]:
+                    if sorted(_bounded_directory_names(attempt_fd, cap=2)) != [
+                        b"state.json"
+                    ]:
                         raise ValueError("reclaimed tombstone still contains artifacts")
                     process_charge = 0
                 else:
-                    measured_process_charge = allocated_bytes(
-                        attempt_dir, entry_cap=1_000
+                    measured_process_charge = _allocated_bytes_fd(
+                        attempt_fd,
+                        entry_cap=1_000,
                     )
                     if measured_process_charge > PROCESS_ENVELOPE_BYTES:
                         raise ValueError(
@@ -554,13 +933,30 @@ def reconcile_ledger(root: pathlib.Path) -> LedgerSnapshot:
                 checkout_physical[identity] = checked_add(
                     checkout_physical.get(identity, 0), charge
                 )
+            current_attempt_identity = identity_from_stat(
+                os.stat(
+                    attempt_name,
+                    dir_fd=lease.root_fd,
+                    follow_symlinks=False,
+                )
+            )
+            if (
+                current_attempt_identity != attempt_identity
+                or current_attempt_identity != attempt.identity
+            ):
+                raise OSError(errno.ESTALE, "retained attempt identity changed")
+            lease.revalidate_root()
         except (OSError, ValueError, OverflowError) as error:
             raise inconclusive(
                 f"retention reconciliation is uncertain for {attempt_dir.name}: {error}",
                 stage="admission",
                 code="retention-reconciliation-uncertain",
             ) from error
-    return LedgerSnapshot(
+        finally:
+            if attempt_fd >= 0:
+                os.close(attempt_fd)
+    lease.revalidate_root()
+    snapshot = LedgerSnapshot(
         process_logical_bytes=process_bytes,
         checkout_logical_bytes=checkout_bytes,
         process_physical_remaining_by_fs=process_physical,
@@ -568,6 +964,8 @@ def reconcile_ledger(root: pathlib.Path) -> LedgerSnapshot:
         retained_worktree_attempt=retained_worktree,
         attempt_count=len(attempts),
     )
+    lease.revalidate_root()
+    return snapshot
 
 
 def aggregate_unique_parents(

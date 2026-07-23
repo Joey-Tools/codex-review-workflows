@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import pathlib
 import stat
 import unittest
 from unittest import mock
 
+import review_supervisor.ledger as ledger_module
 from review_supervisor.codex_executable import ExtendedMetadataEvidence
 from review_supervisor.errors import SupervisorError
 from review_supervisor.ledger import acquire_retention_lease
@@ -154,20 +156,88 @@ class PrivateDirectoryAnchorTests(unittest.TestCase):
             self.assertIn("private ACL", caught.exception.failure.message)
 
     def test_retention_lease_detects_root_replacement(self) -> None:
-        with owned_temporary_directory("secureio-anchor-") as parent:
+        cases = (
+            "root-replaced",
+            "lock-replaced",
+            "lock-unlocked",
+            "lock-reowned",
+        )
+        for case in cases:
+            with (
+                self.subTest(case=case),
+                owned_temporary_directory(f"secureio-anchor-{case}-") as parent,
+            ):
+                retention = parent / "retention"
+                lease = acquire_retention_lease(
+                    retention,
+                    deadline=10**12,
+                )
+                successor = None
+                try:
+                    if case == "root-replaced":
+                        retention.rename(parent / "moved-retention")
+                        retention.mkdir(mode=0o700)
+                        message = "binding changed"
+                    elif case == "lock-replaced":
+                        replacement = retention / "replacement.lock"
+                        replacement.write_bytes(b"")
+                        replacement.chmod(0o600)
+                        replacement.replace(retention / "retention.lock")
+                        message = "unexpected link count|lock path identity changed"
+                    elif case == "lock-unlocked":
+                        fcntl.flock(lease.fd, fcntl.LOCK_UN)
+                        message = "exclusive retention lock is not held"
+                    else:
+                        fcntl.flock(lease.fd, fcntl.LOCK_UN)
+                        successor = acquire_retention_lease(
+                            retention,
+                            deadline=10**12,
+                        )
+                        message = "retention lock ownership token changed"
+                    with self.assertRaisesRegex(OSError, message):
+                        lease.revalidate_root()
+                finally:
+                    if successor is not None:
+                        successor.close()
+                    lease.close()
+
+        with owned_temporary_directory("secureio-anchor-acquire-swap-") as parent:
             retention = parent / "retention"
-            moved = parent / "moved-retention"
-            lease = acquire_retention_lease(
-                retention,
-                deadline=10**12,
-            )
-            try:
-                retention.rename(moved)
-                retention.mkdir(mode=0o700)
-                with self.assertRaisesRegex(OSError, "binding changed"):
-                    lease.revalidate_root()
-            finally:
-                lease.close()
+            initial = acquire_retention_lease(retention, deadline=10**12)
+            initial.close()
+            original_acquire = ledger_module.acquire_flock
+
+            def replace_after_lock(fd: int, operation: int, *, deadline: float) -> None:
+                original_acquire(fd, operation, deadline=deadline)
+                replacement = retention / "replacement.lock"
+                replacement.write_bytes(b"")
+                replacement.chmod(0o600)
+                replacement.replace(retention / "retention.lock")
+
+            with (
+                mock.patch(
+                    "review_supervisor.ledger.acquire_flock",
+                    side_effect=replace_after_lock,
+                ),
+                self.assertRaisesRegex(
+                    SupervisorError,
+                    "cannot acquire independent-review retention lock",
+                ),
+            ):
+                acquire_retention_lease(retention, deadline=10**12)
+
+        with owned_temporary_directory("secureio-anchor-interrupt-") as parent:
+            retention = parent / "retention"
+            with (
+                mock.patch(
+                    "review_supervisor.ledger._write_retention_lock_token",
+                    side_effect=KeyboardInterrupt,
+                ),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                acquire_retention_lease(retention, deadline=10**12)
+            with acquire_retention_lease(retention, deadline=10**12) as lease:
+                lease.revalidate_root()
 
 
 class PrivateMetadataTests(unittest.TestCase):

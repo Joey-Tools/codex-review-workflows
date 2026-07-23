@@ -276,13 +276,15 @@ def open_regular_at(
     parent_fd: int,
     name: bytes,
     *,
+    writable: bool = False,
     expected_uid: int | None = None,
     require_link_one: bool = True,
     private_metadata: bool = False,
 ) -> tuple[int, Identity]:
     if not name or b"/" in name or name in {b".", b".."} or b"\0" in name:
         raise ValueError("invalid leaf name")
-    fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
+    flags = (os.O_RDWR if writable else os.O_RDONLY) | os.O_CLOEXEC | os.O_NOFOLLOW
+    fd = os.open(name, flags, dir_fd=parent_fd)
     try:
         path_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         identity = _validate_regular_fd(

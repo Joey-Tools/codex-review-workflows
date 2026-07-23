@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import os
 import pathlib
+import threading
 import time
 import unittest
 from unittest import mock
 
+import review_supervisor.ledger as ledger_module
 from review_supervisor.constants import (
     LOW_LEVEL_HELPER_REVIEW_CONTRACT,
     NAMED_LANE_ELIGIBLE,
@@ -33,6 +36,7 @@ from review_supervisor.models import (
 )
 from review_supervisor.secureio import (
     canonical_json,
+    decode_json_bytes,
     directory_identities_match,
     identity_from_stat,
 )
@@ -208,7 +212,64 @@ class InitialAttemptCrashRecoveryTests(unittest.TestCase):
             }
         )
 
-    def test_pre_rename_atomic_temp_is_reclaimed_after_stale_writer_check(
+    def _reconcilable_state(self, attempt: pathlib.Path, created_at: int) -> bytes:
+        state = decode_json_bytes(self._initial_state(attempt, created_at))
+        state.update(
+            {
+                "process_physical_remaining_by_fs": {},
+                "checkout_physical_remaining_by_fs": {},
+                "admission": {"checkout_accounting_bound": 0},
+                "worktree_status": "none",
+                "registration": None,
+            }
+        )
+        return canonical_json(state)
+
+    def test_bounded_directory_scan_stops_at_cap_plus_one(self) -> None:
+        counters = {"next": 0, "name": 0}
+
+        class Entry:
+            def __init__(self, index: int) -> None:
+                self.index = index
+
+            @property
+            def name(self) -> str:
+                counters["name"] += 1
+                return f"entry-{self.index}"
+
+        class Scanner:
+            def __enter__(self) -> "Scanner":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def __iter__(self) -> "Scanner":
+                return self
+
+            def __next__(self) -> Entry:
+                counters["next"] += 1
+                if counters["next"] > 3:
+                    raise AssertionError("bounded scan consumed beyond cap plus one")
+                return Entry(counters["next"])
+
+        with owned_temporary_directory("ledger-bounded-directory-") as root:
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with (
+                    mock.patch(
+                        "review_supervisor.ledger.os.scandir",
+                        return_value=Scanner(),
+                    ),
+                    self.assertRaisesRegex(ValueError, "entry count exceeds cap"),
+                ):
+                    ledger_module._bounded_directory_names(root_fd, cap=2)
+            finally:
+                os.close(root_fd)
+
+        self.assertEqual(counters, {"next": 3, "name": 2})
+
+    def test_pre_rename_atomic_temp_is_reclaimed_under_exclusive_lease(
         self,
     ) -> None:
         with owned_temporary_directory("ledger-initial-crash-") as root:
@@ -217,21 +278,62 @@ class InitialAttemptCrashRecoveryTests(unittest.TestCase):
             temporary.write_bytes(self._initial_state(attempt, created_at))
             temporary.chmod(0o600)
 
-            with (
-                mock.patch(
-                    "review_supervisor.ledger.time.time",
-                    return_value=created_at + INITIAL_CRASH_RECLAIM_AGE_SECONDS + 5,
-                ),
-                mock.patch(
-                    "review_supervisor.ledger._pid_exists",
-                    return_value=False,
-                ) as pid_exists,
-            ):
-                snapshot = reconcile_ledger(retention)
+            lease = acquire_retention_lease(retention, deadline=10**12)
+            outcomes: list[LedgerSnapshot | BaseException] = []
+            waiting_for_lease = threading.Event()
+            reconciliation_finished = threading.Event()
+            original_acquire_flock = ledger_module.acquire_flock
+
+            def reconcile() -> None:
+                try:
+                    outcomes.append(reconcile_ledger(retention))
+                except BaseException as error:
+                    outcomes.append(error)
+                finally:
+                    reconciliation_finished.set()
+
+            def observe_lease_wait(
+                fd: int,
+                operation: int,
+                *,
+                deadline: float,
+            ) -> None:
+                waiting_for_lease.set()
+                original_acquire_flock(fd, operation, deadline=deadline)
+
+            try:
+                with (
+                    mock.patch(
+                        "review_supervisor.ledger.time.time",
+                        return_value=(
+                            created_at + INITIAL_CRASH_RECLAIM_AGE_SECONDS + 5
+                        ),
+                    ),
+                    mock.patch(
+                        "review_supervisor.ledger.acquire_flock",
+                        side_effect=observe_lease_wait,
+                    ),
+                ):
+                    worker = threading.Thread(target=reconcile)
+                    worker.start()
+                    self.assertTrue(waiting_for_lease.wait(timeout=5))
+                    self.assertTrue(worker.is_alive())
+                    self.assertTrue(temporary.is_file())
+                    lease.close()
+                    self.assertTrue(reconciliation_finished.wait(timeout=5))
+                    worker.join(timeout=0)
+            finally:
+                lease.close()
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(outcomes), 1)
+            snapshot = outcomes[0]
+            if isinstance(snapshot, BaseException):
+                raise snapshot
+            self.assertIsInstance(snapshot, LedgerSnapshot)
 
             self.assertEqual(snapshot.attempt_count, 0)
             self.assertFalse(attempt.exists())
-            pid_exists.assert_called_once_with(999999)
 
     def test_state_less_attempt_with_unknown_content_is_rejected(self) -> None:
         with owned_temporary_directory("ledger-unknown-crash-") as root:
@@ -249,26 +351,157 @@ class InitialAttemptCrashRecoveryTests(unittest.TestCase):
             self.assertTrue(attempt.is_dir())
             self.assertTrue(unknown.is_file())
 
-    def test_live_atomic_temp_writer_blocks_reclaim(self) -> None:
-        with owned_temporary_directory("ledger-live-writer-") as root:
+    def test_reused_live_pid_does_not_block_reclaim(self) -> None:
+        with owned_temporary_directory("ledger-reused-pid-") as root:
             retention, attempt, created_at = self._attempt(root)
-            temporary = attempt / ".state.json.tmp-1234-fedcba9876543210"
+            temporary = attempt / (
+                f".state.json.tmp-{os.getpid()}-fedcba9876543210"
+            )
             temporary.write_bytes(self._initial_state(attempt, created_at))
             temporary.chmod(0o600)
 
+            with mock.patch(
+                "review_supervisor.ledger.time.time",
+                return_value=created_at + INITIAL_CRASH_RECLAIM_AGE_SECONDS + 5,
+            ):
+                snapshot = reconcile_ledger(retention)
+
+            self.assertEqual(snapshot.attempt_count, 0)
+            self.assertFalse(attempt.exists())
+
+    def test_attempt_replacement_after_enumeration_is_rejected(self) -> None:
+        with owned_temporary_directory("ledger-attempt-enumeration-swap-") as root:
+            retention, attempt, created_at = self._attempt(root)
+            state_bytes = self._reconcilable_state(attempt, created_at)
+            state_path = attempt / "state.json"
+            state_path.write_bytes(state_bytes)
+            state_path.chmod(0o600)
+            original_attempt = root / "enumerated-attempt"
+            marker = attempt / "replacement-marker"
+            original_enumeration = ledger_module._attempt_directories
+
+            def swap_after_enumeration(
+                *, lease: ledger_module.RetentionLease
+            ) -> tuple[ledger_module.AttemptBinding, ...]:
+                bindings = original_enumeration(lease=lease)
+                attempt.rename(original_attempt)
+                attempt.mkdir(mode=0o700)
+                replacement_state = attempt / "state.json"
+                replacement_state.write_bytes(state_bytes)
+                replacement_state.chmod(0o600)
+                marker.write_bytes(b"replacement\n")
+                marker.chmod(0o600)
+                return bindings
+
             with (
                 mock.patch(
-                    "review_supervisor.ledger.time.time",
-                    return_value=created_at + INITIAL_CRASH_RECLAIM_AGE_SECONDS + 5,
+                    "review_supervisor.ledger._attempt_directories",
+                    side_effect=swap_after_enumeration,
                 ),
-                mock.patch(
-                    "review_supervisor.ledger._pid_exists",
-                    return_value=True,
+                self.assertRaisesRegex(
+                    SupervisorError,
+                    "changed after enumeration",
                 ),
             ):
-                with self.assertRaisesRegex(ValueError, "writer may still be alive"):
-                    reconcile_ledger(retention)
-            self.assertTrue(temporary.is_file())
+                reconcile_ledger(retention)
+
+            self.assertEqual(marker.read_bytes(), b"replacement\n")
+            self.assertEqual(
+                (original_attempt / "state.json").read_bytes(),
+                state_bytes,
+            )
+
+    def test_reclaim_restores_same_name_replacement(self) -> None:
+        with owned_temporary_directory("ledger-reclaim-swap-") as root:
+            retention, attempt, _ = self._attempt(root)
+            original_attempt = root / "opened-attempt"
+            marker = attempt / "replacement-marker"
+            original_rename = ledger_module.rename_noreplace
+            swapped = False
+
+            def swap_before_isolation(
+                source_dir_fd: int,
+                source: bytes,
+                destination_dir_fd: int,
+                destination: bytes,
+            ) -> None:
+                nonlocal swapped
+                if source == os.fsencode(attempt.name) and not swapped:
+                    swapped = True
+                    attempt.rename(original_attempt)
+                    attempt.mkdir(mode=0o700)
+                    marker.write_bytes(b"replacement\n")
+                    marker.chmod(0o600)
+                original_rename(
+                    source_dir_fd,
+                    source,
+                    destination_dir_fd,
+                    destination,
+                )
+
+            with (
+                mock.patch(
+                    "review_supervisor.ledger.rename_noreplace",
+                    side_effect=swap_before_isolation,
+                ),
+                self.assertRaisesRegex(OSError, "identity changed"),
+            ):
+                reconcile_ledger(retention)
+
+            self.assertTrue(swapped)
+            self.assertEqual(marker.read_bytes(), b"replacement\n")
+            self.assertTrue(original_attempt.is_dir())
+            self.assertEqual(
+                list(retention.glob(".reclaim-attempt-*")),
+                [],
+            )
+
+    def test_reclaim_residue_is_restored_and_completed(self) -> None:
+        with owned_temporary_directory("ledger-reclaim-resume-") as root:
+            retention, attempt, _ = self._attempt(root)
+            residue = retention / f".reclaim-{attempt.name}-{'b' * 32}"
+            attempt.rename(residue)
+
+            snapshot = reconcile_ledger(retention)
+
+            self.assertEqual(snapshot.attempt_count, 0)
+            self.assertFalse(attempt.exists())
+            self.assertFalse(residue.exists())
+
+    def test_root_replacement_during_state_read_fails_closed(self) -> None:
+        with owned_temporary_directory("ledger-root-swap-") as root:
+            retention, attempt, created_at = self._attempt(root)
+            state_path = attempt / "state.json"
+            state_path.write_bytes(self._reconcilable_state(attempt, created_at))
+            state_path.chmod(0o600)
+            moved = root / "moved-retention"
+            original_read = ledger_module._read_attempt_state_fd
+
+            def replace_root(
+                attempt_fd: int,
+            ) -> tuple[dict[str, object], bytes, str]:
+                retention.rename(moved)
+                retention.mkdir(mode=0o700)
+                marker = retention / "new-root-marker"
+                marker.write_bytes(b"untouched\n")
+                marker.chmod(0o600)
+                return original_read(attempt_fd)
+
+            with (
+                acquire_retention_lease(retention, deadline=10**12) as lease,
+                mock.patch(
+                    "review_supervisor.ledger._read_attempt_state_fd",
+                    side_effect=replace_root,
+                ),
+                self.assertRaisesRegex(SupervisorError, "binding changed"),
+            ):
+                reconcile_ledger(retention, lease=lease)
+
+            self.assertEqual(
+                (retention / "new-root-marker").read_bytes(),
+                b"untouched\n",
+            )
+            self.assertTrue((moved / attempt.name / "state.json").is_file())
 
     def test_atomic_temp_with_unknown_state_content_is_rejected(self) -> None:
         with owned_temporary_directory("ledger-unknown-state-") as root:
@@ -277,15 +510,9 @@ class InitialAttemptCrashRecoveryTests(unittest.TestCase):
             temporary.write_bytes(canonical_json({"not": "an initial state"}))
             temporary.chmod(0o600)
 
-            with (
-                mock.patch(
-                    "review_supervisor.ledger.time.time",
-                    return_value=created_at + INITIAL_CRASH_RECLAIM_AGE_SECONDS + 5,
-                ),
-                mock.patch(
-                    "review_supervisor.ledger._pid_exists",
-                    return_value=False,
-                ),
+            with mock.patch(
+                "review_supervisor.ledger.time.time",
+                return_value=created_at + INITIAL_CRASH_RECLAIM_AGE_SECONDS + 5,
             ):
                 with self.assertRaisesRegex(ValueError, "content is not authentic"):
                     reconcile_ledger(retention)

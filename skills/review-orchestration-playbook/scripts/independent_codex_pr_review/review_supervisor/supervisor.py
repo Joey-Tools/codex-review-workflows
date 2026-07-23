@@ -377,7 +377,7 @@ def _prepare_with_reclamation(
     git_executable: str,
     codex_executable: str | None,
 ) -> PreparedRun:
-    reconcile_ledger(retention_root)
+    reconcile_ledger(retention_root, lease=lease)
     _reclaim_released_attempts(
         entrypoint=entrypoint,
         root=retention_root,
@@ -386,7 +386,7 @@ def _prepare_with_reclamation(
         released_before=time.time() - RELEASED_TTL_SECONDS,
     )
     while True:
-        snapshot = reconcile_ledger(retention_root)
+        snapshot = reconcile_ledger(retention_root, lease=lease)
         try:
             return prepare_run(
                 helper_state=helper_state,

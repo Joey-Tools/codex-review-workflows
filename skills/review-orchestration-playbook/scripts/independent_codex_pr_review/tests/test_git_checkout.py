@@ -1506,6 +1506,8 @@ class RawGitCheckoutTests(unittest.TestCase):
             repo, base_sha, _ = _build_repository(root)
             pointer = (
                 b"version https://git-lfs.github.com/spec/v1\n"
+                b"ext-10-!opaque/name sha256:" + b"b" * 64 + b"\n"
+                b"ext-10-!opaque/name sha256:" + b"b" * 64 + b"\n"
                 b"oid sha256:" + b"a" * 64 + b"\n"
                 b"size +0001\n"
             )
