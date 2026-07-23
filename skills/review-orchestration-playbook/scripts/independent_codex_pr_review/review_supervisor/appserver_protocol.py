@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -586,12 +585,19 @@ def decode_json_line(
             )
         return int(value)
 
+    def reject_float(_value: str) -> None:
+        raise AppServerProtocolError(
+            "protocol JSON floating-point numbers are forbidden",
+            code="invalid-json-number",
+        )
+
     try:
         text = payload.decode("utf-8", "strict")
         parsed = json.loads(
             text,
             object_pairs_hook=reject_duplicate_keys,
             parse_constant=reject_constant,
+            parse_float=reject_float,
             parse_int=parse_int64,
         )
     except AppServerProtocolError:
@@ -2635,12 +2641,10 @@ def _validate_json_tree(value: Any, *, depth: int = 1) -> None:
             _int64(value, "JSON integer")
         return
     if isinstance(value, float):
-        if not math.isfinite(value):
-            raise AppServerProtocolError(
-                "protocol JSON contains a non-finite number",
-                code="invalid-json-number",
-            )
-        return
+        raise AppServerProtocolError(
+            "protocol JSON floating-point numbers are forbidden",
+            code="invalid-json-number",
+        )
     if isinstance(value, str):
         try:
             value.encode("utf-8", "strict")

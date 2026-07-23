@@ -301,6 +301,28 @@ class PrivateMetadataTests(unittest.TestCase):
             )
         verifier.assert_not_called()
 
+    def test_permitted_directory_acl_uses_property_scoped_revalidation(self) -> None:
+        evidence = self._evidence(acl_entries=("group:fixture:deny:write",))
+        path = pathlib.Path("/Users/fixture")
+        with (
+            mock.patch("review_supervisor.secureio.sys.platform", "darwin"),
+            mock.patch(
+                "review_supervisor.codex_executable.inspect_macos_filesystem_metadata",
+                return_value=evidence,
+            ),
+            mock.patch(
+                "review_supervisor.codex_executable.verify_macos_filesystem_metadata",
+                return_value=evidence,
+            ) as verifier,
+        ):
+            _verify_macos_metadata(123, path, "directory", private=False)
+        verifier.assert_called_once_with(
+            123,
+            path,
+            "directory",
+            require_directory_metadata_stability=False,
+        )
+
     def test_atomic_write_checks_temp_and_published_file_metadata(self) -> None:
         with owned_temporary_directory("secureio-atomic-") as root:
             calls: list[pathlib.Path] = []

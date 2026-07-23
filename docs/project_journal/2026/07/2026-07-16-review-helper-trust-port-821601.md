@@ -3,7 +3,7 @@ id: 20260716-821601
 title: Review Helper Trust Hardening Port
 status: completed
 created: 2026-07-16
-updated: 2026-07-22
+updated: 2026-07-23
 branch: wip/review-helper-trust-port
 pr: 53
 supersedes: []
@@ -979,3 +979,33 @@ metadata behavior.
   contract tests pass under Python 3.13 after resolution. The trusted new base
   now supports the installed Claude Code 2.1.216 stream, so no temporary older
   binary acquisition is needed.
+- The final closure-recovery audit hardened every bounded Git and `cat-file`
+  control lifetime. Temporary controls now keep nested signal deferral through
+  process settlement, control removal, and recovery-root `fsync`; a process-free
+  cleanup gap uses an explicit `not-applicable` process receipt rather than a
+  fabricated PID. Creation and deletion sync the owner-private parent, a retry
+  that observes an already absent child syncs that parent again, and generated
+  config is atomically published in its final exact `0400` mode. `CatFileBatch`
+  transfers its constructor scope even when control creation itself raises the
+  process-free closure marker. Final worktree recovery separately names the Git
+  control root and cleanup-manifest namespace, so the final registration scan
+  proves the real private registry is empty.
+- Two complete bounded fresh-context audits found and then closed the remaining
+  control-cleanup and constructor-signal ownership gaps. The final follow-up
+  found no actionable issue in the repaired call chains. Property-scoped tests
+  distinguish directory child churn from object replacement, content mutation,
+  access-policy drift, unreadable revalidation, and directory-entry durability.
+  The fixed Python 3.13 deterministic identity remains 389 tests with SHA-256
+  `88dd5351f4158847e8aee6a461c9b437113e43acde477e81b95f8e18627231a8`;
+  all 389 passed in 206.107 seconds. The expanded Git/runtime/recovery set passed
+  all 167 tests with one expected platform skip, and all 91 repository contract
+  tests passed.
+- Final Python 3.13 discovery ran 2,790 tests in 2,063.999 seconds with 6
+  expected platform skips. Its sole in-app failure was the documented nested
+  Desktop `sandbox-exec` denial in the one-shot Claude keychain broker test;
+  that exact test passed outside the Desktop sandbox in 3.025 seconds. Ruff
+  lint, focused changed-file formatting, compileall, the supervisor CLI, strict
+  Linux launcher C syntax, the official skill validator through an offline
+  cached PyYAML environment, project-journal validation, and `git diff --check`
+  pass. The whole-tree format probe reports only six pre-existing untouched
+  files outside this workstream's edits. No local Python 3.10 run was performed.

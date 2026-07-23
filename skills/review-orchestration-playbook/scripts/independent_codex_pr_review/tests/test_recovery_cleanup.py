@@ -8,6 +8,9 @@ import time
 import unittest
 from unittest import mock
 
+import review_supervisor.gitraw as gitraw
+import review_supervisor.runtime as runtime
+
 from review_supervisor.constants import (
     LOW_LEVEL_HELPER_REVIEW_CONTRACT,
     NAMED_LANE_ELIGIBLE,
@@ -15,9 +18,11 @@ from review_supervisor.constants import (
 )
 from review_supervisor.gitraw import (
     add_detached_worktree,
+    create_sanitized_view,
     enumerate_registration,
     initialize_index,
     inspect_repository,
+    remove_both_present_worktree,
 )
 from review_supervisor.ledger import (
     acquire_retention_lease,
@@ -183,11 +188,18 @@ class TargetedRecoveryTests(unittest.TestCase):
         )
         checkout_parent = root / "checkouts"
         checkout_parent.mkdir(mode=0o700)
+        retention = root / "retention"
+        retention.mkdir(mode=0o700)
+        attempt_id = f"1-{'b' * 32}"
+        attempt = retention / f"attempt-{attempt_id}"
+        attempt.mkdir(mode=0o700)
+        control = create_sanitized_view(info, attempt / "git-control")
         worktree = checkout_parent / "review-fixture"
         registration = add_detached_worktree(
             info,
             worktree,
             lock_reason=lock_reason,
+            control=control,
         )
         initialize_index(info, registration)
         count, path_bytes = enumerate_registration(registration.registration)
@@ -196,11 +208,6 @@ class TargetedRecoveryTests(unittest.TestCase):
         registration_value["descendant_path_bytes"] = path_bytes
         namespace = checkout_parent / ".review-control-fixture"
         namespace.mkdir(mode=0o700)
-        retention = root / "retention"
-        retention.mkdir(mode=0o700)
-        attempt_id = f"1-{'b' * 32}"
-        attempt = retention / f"attempt-{attempt_id}"
-        attempt.mkdir(mode=0o700)
         state = {
             "schema_version": SCHEMA_VERSION,
             "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
@@ -217,6 +224,7 @@ class TargetedRecoveryTests(unittest.TestCase):
             "control_namespace": str(namespace),
             "targeted_manifest_published": str(namespace / "manifest.bin"),
             "registration": registration_value,
+            "git_control_binding": registration_value["control"],
             "worktree_status": "active",
             "checkout_settlement": "outstanding",
             "checkout_physical_remaining_by_fs": {"fixture": 1},
@@ -278,10 +286,31 @@ class TargetedRecoveryTests(unittest.TestCase):
             diagnostic.write_bytes(b"retained diagnostics\n")
             diagnostic.chmod(0o600)
             shutil.rmtree(registration.registration)
+            scanned_git_dirs: list[pathlib.Path] = []
+            original_scan = runtime.enumerate_registration_conflicts
 
-            state, _ = self._cleanup(retention, attempt, state, digest)
+            def capture_registration_scan(
+                *,
+                common_git_dir: pathlib.Path,
+                worktree: pathlib.Path,
+            ):
+                scanned_git_dirs.append(common_git_dir)
+                return original_scan(
+                    common_git_dir=common_git_dir,
+                    worktree=worktree,
+                )
 
-            self.assertEqual(state["checkout_settlement"], "exact")
+            with mock.patch(
+                "review_supervisor.runtime.enumerate_registration_conflicts",
+                side_effect=capture_registration_scan,
+            ):
+                state, _ = self._cleanup(retention, attempt, state, digest)
+
+            self.assertEqual(
+                state["checkout_settlement"],
+                "exact",
+                state.get("cleanup_error"),
+            )
             self.assertEqual(
                 state["checkout_cleanup_evidence"]["branch"], "checkout-only"
             )
@@ -292,6 +321,11 @@ class TargetedRecoveryTests(unittest.TestCase):
             self.assertFalse(worktree.exists())
             self.assertFalse(namespace.exists())
             self.assertTrue(diagnostic.is_file())
+            self.assertTrue(scanned_git_dirs)
+            self.assertEqual(
+                set(scanned_git_dirs),
+                {registration.control.path},
+            )
             clauses = {item["clause"] for item in state["unsupported_clauses"]}
             self.assertEqual(clauses, {"optional-fixture-clause"})
 
@@ -356,10 +390,79 @@ class TargetedRecoveryTests(unittest.TestCase):
             state["phase"] = "worktree-adding"
             state["worktree_status"] = "adding"
             state["worktree_create_intent"] = {
-                "version": 1,
+                "version": 2,
                 "worktree": str(worktree),
+                "control_git_dir": str(registration.control.path),
                 "registration_parent": str(registration.registration.parent),
                 "lock_reason": lock_reason,
+            }
+            state["record_generation"] += 1
+            state["previous_record_sha256"] = digest
+            state_path = attempt / "state.json"
+            state_path.write_bytes(canonical_json(state))
+            state_path.chmod(0o600)
+            state, _, digest = read_attempt_state(attempt)
+
+            config = pathlib.Path(state["repo"]) / ".git" / "config"
+            original_config = config.read_bytes()
+            original_run = gitraw.run_bounded
+            injected_calls = 0
+
+            def run_with_source_config_aba(
+                *args: object,
+                **kwargs: object,
+            ) -> tuple[int, bytes, bytes]:
+                nonlocal injected_calls
+                injected_calls += 1
+                config.write_bytes(b"[include]\n\tpath = /untrusted/recovery.config\n")
+                try:
+                    return original_run(*args, **kwargs)
+                finally:
+                    config.write_bytes(original_config)
+
+            with mock.patch(
+                "review_supervisor.gitraw.run_bounded",
+                side_effect=run_with_source_config_aba,
+            ):
+                state, _ = self._cleanup(retention, attempt, state, digest)
+
+            self.assertEqual(
+                state["checkout_settlement"],
+                "exact",
+                state.get("cleanup_error"),
+            )
+            self.assertGreaterEqual(injected_calls, 5)
+            self.assertEqual(state["worktree_status"], "removed")
+            self.assertEqual(
+                state["checkout_cleanup_evidence"]["branch"],
+                "both-present",
+            )
+            self.assertFalse(worktree.exists())
+            self.assertFalse(registration.registration.exists())
+
+    def test_bound_control_without_created_worktree_cleans_exactly(self) -> None:
+        with owned_temporary_directory("control-before-worktree-") as root:
+            retention, attempt, worktree, registration, _, state, digest = (
+                self._prepare(root)
+            )
+            remove_both_present_worktree(
+                inspect_repository(
+                    repo=pathlib.Path(state["repo"]),
+                    base_sha=state["base_sha"],
+                    head_sha=state["head_sha"],
+                    git_executable=state["git_executable"],
+                ),
+                registration,
+            )
+            state["registration"] = None
+            state["phase"] = "worktree-adding"
+            state["worktree_status"] = "adding"
+            state["worktree_create_intent"] = {
+                "version": 2,
+                "worktree": str(worktree),
+                "control_git_dir": str(registration.control.path),
+                "registration_parent": str(registration.registration.parent),
+                "lock_reason": f"independent-codex-pr-review:{'d' * 64}",
             }
             state["record_generation"] += 1
             state["previous_record_sha256"] = digest
@@ -371,13 +474,8 @@ class TargetedRecoveryTests(unittest.TestCase):
             state, _ = self._cleanup(retention, attempt, state, digest)
 
             self.assertEqual(state["checkout_settlement"], "exact")
-            self.assertEqual(state["worktree_status"], "removed")
-            self.assertEqual(
-                state["checkout_cleanup_evidence"]["branch"],
-                "both-present",
-            )
-            self.assertFalse(worktree.exists())
-            self.assertFalse(registration.registration.exists())
+            self.assertEqual(state["worktree_status"], "absent")
+            self.assertFalse(registration.control.path.exists())
 
     def test_persisted_intent_without_live_descriptors_requires_manual_recovery(
         self,

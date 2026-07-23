@@ -32,6 +32,7 @@ from review_supervisor.runtime import (
     DirectProcessClosureUnproven,
     _compact_terminal,
     _validate_terminal_lifecycle,
+    build_unsettled_checkout_summary,
     direct_process_closure_failure,
 )
 from review_supervisor.secureio import (
@@ -44,19 +45,25 @@ from review_supervisor.secureio import (
     sha256_bytes,
 )
 from review_supervisor.supervisor import (
+    _derive_unsettled_checkout_summary,
     _prepare_with_reclamation,
     _prequiescence_abort,
+    _publish_attempt_git_closure_recovery,
     _publish_final_authorization,
+    _publish_retained_git_closure_recovery,
     _reclaim_released_attempts,
     _require_primary_evidence_budget,
     _require_primary_serialized_evidence_budget,
     _resolve_codex,
+    _select_reaped_attempt_terminal,
     _settle_rewritten_process_charge,
     _terminate_incomplete_handoff,
+    _validate_unsettled_checkout_summary,
     cleanup,
     final_result,
     recover,
     release,
+    run as run_supervisor,
     status,
 )
 
@@ -68,6 +75,127 @@ ENTRYPOINT = TOOL_ROOT / "independent-codex-pr-review"
 
 
 class ReviewContractEnvelopeTests(unittest.TestCase):
+    def test_unsettled_checkout_summary_binds_attempt_and_recovery_paths(self) -> None:
+        attempt_dir = pathlib.Path("/private/review/attempt-1")
+        token = "a" * 64
+        retained = attempt_dir / "codex-git-control-synthetic"
+        receipt = {
+            "version": 1,
+            "token": token,
+            "worker": {
+                "pid": 200,
+                "start_identity": "darwin-proc-start:200:1",
+            },
+            "process": {
+                "identity_status": "anchored",
+                "pid": 201,
+                "pgid": 201,
+                "start_identity": "darwin-proc-start:201:1",
+            },
+            "control_scope": "temporary",
+            "retained_cleanup_paths": [str(retained)],
+        }
+        summary = build_unsettled_checkout_summary(
+            attempt_dir=attempt_dir,
+            receipt=receipt,
+        )
+        _validate_unsettled_checkout_summary(
+            summary,
+            attempt_dir=attempt_dir,
+            token=token,
+        )
+        for field, value in (
+            ("attempt_dir", "/private/review/attempt-2"),
+            ("closure_receipt", {**receipt, "token": "b" * 64}),
+            ("failure_code", "other"),
+            ("closure_receipt_status", "missing"),
+        ):
+            with self.subTest(field=field):
+                malformed = dict(summary)
+                malformed[field] = value
+                with self.assertRaises(ValueError):
+                    _validate_unsettled_checkout_summary(
+                        malformed,
+                        attempt_dir=attempt_dir,
+                        token=token,
+                    )
+        for receipt_status in ("published", "publication-failed"):
+            with self.subTest(receipt_status=receipt_status):
+                malformed = dict(summary)
+                malformed["closure_receipt_status"] = receipt_status
+                malformed["closure_receipt"] = None
+                with self.assertRaises(ValueError):
+                    _validate_unsettled_checkout_summary(
+                        malformed,
+                        attempt_dir=attempt_dir,
+                        token=token,
+                    )
+        durable_state = {
+            "handoff": "complete",
+            "process_owner": "attempt-supervisor",
+            "handoff_token": token,
+            "terminal_at": None,
+        }
+        with (
+            mock.patch(
+                "review_supervisor.supervisor.read_bound_attempt_state",
+                return_value=(durable_state, b"{}", "state-digest"),
+            ),
+            mock.patch(
+                "review_supervisor.supervisor._read_checkout_closure_receipt",
+                return_value=(receipt, "receipt-digest"),
+            ),
+        ):
+            self.assertEqual(
+                _derive_unsettled_checkout_summary(
+                    mock.Mock(),
+                    attempt_dir=attempt_dir,
+                    token=token,
+                ),
+                summary,
+            )
+        with (
+            mock.patch(
+                "review_supervisor.supervisor.read_bound_attempt_state",
+                return_value=(durable_state, b"{}", "state-digest"),
+            ),
+            mock.patch(
+                "review_supervisor.supervisor._read_checkout_closure_receipt",
+                return_value=None,
+            ),
+            self.assertRaisesRegex(ValueError, "no durable closure receipt"),
+        ):
+            _derive_unsettled_checkout_summary(
+                mock.Mock(),
+                attempt_dir=attempt_dir,
+                token=token,
+            )
+        with mock.patch(
+            "review_supervisor.supervisor._derive_unsettled_checkout_summary",
+            return_value=summary,
+        ) as derive:
+            self.assertEqual(
+                _select_reaped_attempt_terminal(
+                    exit_code=2,
+                    terminal={"forged": True},
+                    terminal_receive_error=EOFError("synthetic missing terminal IPC"),
+                    completion_attempt=mock.Mock(),
+                    attempt_dir=attempt_dir,
+                    token=token,
+                ),
+                summary,
+            )
+        derive.assert_called_once()
+        with self.assertRaisesRegex(EOFError, "synthetic missing terminal IPC"):
+            _select_reaped_attempt_terminal(
+                exit_code=0,
+                terminal=None,
+                terminal_receive_error=EOFError("synthetic missing terminal IPC"),
+                completion_attempt=mock.Mock(),
+                attempt_dir=attempt_dir,
+                token=token,
+            )
+
     def test_compact_terminal_is_always_named_lane_ineligible(self) -> None:
         cases = (
             ("clean", True),
@@ -543,9 +671,7 @@ class ReclaimCrashSafetyTests(unittest.TestCase):
         with owned_temporary_directory("reclaim-empty-residue-") as root:
             retention, attempt = self._released_attempt(root)
 
-            def remove_state_then_stop(
-                attempt_lease: object, _state: object
-            ) -> None:
+            def remove_state_then_stop(attempt_lease: object, _state: object) -> None:
                 path = attempt_lease.path
                 os.unlink(path / "state.json")
                 fsync_directory(path)
@@ -1576,6 +1702,293 @@ class ReclamationPolicyTests(unittest.TestCase):
 
 
 class IncompleteHandoffProcessTests(unittest.TestCase):
+    def test_preflight_git_closure_publishes_recovery_before_signal_release(
+        self,
+    ) -> None:
+        with owned_temporary_directory("preflight-closure-") as root:
+            retention = root / "retention"
+            retention.mkdir(mode=0o700)
+            retained = retention / "codex-git-control-synthetic"
+            retained.mkdir(mode=0o700)
+            process = SimpleNamespace(pid=124)
+            failure = GitProcessClosureUnproven(
+                process,
+                None,
+                TimeoutError("synthetic cleanup timeout"),
+            )
+            failure.add_post_closure_cleanup(
+                mock.Mock(),
+                retained_path=retained,
+            )
+            signal_release = mock.Mock()
+            failure.bind_signal_deferral_release(signal_release)
+            with acquire_retention_lease(
+                retention, deadline=time.monotonic() + 5
+            ) as lease:
+                recovery = _publish_retained_git_closure_recovery(
+                    recovery_root=retention,
+                    revalidate_owner=lease.revalidate_root,
+                    error=failure,
+                    token="a" * 64,
+                )
+            receipt_path = retained / "closure-recovery.json"
+            self.assertEqual(recovery["status"], "published")
+            self.assertEqual(recovery["receipt_path"], str(receipt_path))
+            self.assertEqual(
+                sha256_bytes(receipt_path.read_bytes()),
+                recovery["receipt_sha256"],
+            )
+            signal_release.assert_called_once_with(False)
+
+            process_free_retained = retention / "codex-git-control-process-free"
+            process_free_retained.mkdir(mode=0o700)
+            process_free_failure = GitProcessClosureUnproven(
+                None,
+                None,
+                OSError("synthetic control-only cleanup failure"),
+            )
+            process_free_failure.add_post_closure_cleanup(
+                mock.Mock(),
+                retained_path=process_free_retained,
+            )
+            with acquire_retention_lease(
+                retention, deadline=time.monotonic() + 5
+            ) as lease:
+                process_free_recovery = _publish_retained_git_closure_recovery(
+                    recovery_root=retention,
+                    revalidate_owner=lease.revalidate_root,
+                    error=process_free_failure,
+                    token="c" * 64,
+                )
+            self.assertEqual(process_free_recovery["status"], "published")
+            self.assertEqual(
+                process_free_recovery["receipt"]["process"],
+                {
+                    "identity_status": "not-applicable",
+                    "pid": None,
+                    "pgid": None,
+                    "start_identity": None,
+                },
+            )
+
+            attempt_path = retention / "attempt-synthetic"
+            attempt_failure = GitProcessClosureUnproven(
+                SimpleNamespace(pid=125),
+                None,
+                TimeoutError("synthetic attempt cleanup timeout"),
+            )
+            attempt_signal_release = mock.Mock()
+            attempt_failure.bind_signal_deferral_release(attempt_signal_release)
+            attempt = SimpleNamespace(path=attempt_path)
+            with (
+                mock.patch(
+                    "review_supervisor.supervisor.read_bound_attempt_state",
+                    return_value=({"phase": "failed"}, b"state", "digest"),
+                ),
+                mock.patch(
+                    "review_supervisor.supervisor.process_start_identity",
+                    return_value="darwin-proc-start:123:456",
+                ),
+                mock.patch(
+                    "review_supervisor.supervisor._persist_attempt_git_closure_receipt",
+                    side_effect=lambda **kwargs: {
+                        "version": 1,
+                        "token": kwargs["token"],
+                        "worker": {
+                            "pid": os.getpid(),
+                            "start_identity": kwargs["owner_start_identity"],
+                        },
+                        "process": attempt_failure.process_receipt,
+                        "control_scope": "attempt-private",
+                        "retained_cleanup_paths": [],
+                    },
+                ) as persist,
+            ):
+                attempt_recovery = _publish_attempt_git_closure_recovery(
+                    attempt=attempt,
+                    error=attempt_failure,
+                    token="b" * 64,
+                )
+            self.assertEqual(attempt_recovery["status"], "published")
+            self.assertEqual(
+                attempt_recovery["receipt_path"],
+                str(attempt_path / "checkout-closure-recovery.json"),
+            )
+            persist.assert_called_once()
+            attempt_signal_release.assert_called_once_with(False)
+
+    def test_preflight_git_closure_reports_receipt_preparation_failure(self) -> None:
+        process = SimpleNamespace(pid=124)
+        failure = GitProcessClosureUnproven(
+            process,
+            None,
+            TimeoutError("synthetic cleanup timeout"),
+        )
+        signal_release = mock.Mock()
+        failure.bind_signal_deferral_release(signal_release)
+        with (
+            mock.patch(
+                "review_supervisor.supervisor._build_checkout_closure_receipt",
+                side_effect=ValueError("synthetic receipt failure"),
+            ),
+            mock.patch(
+                "review_supervisor.supervisor.process_start_identity",
+                return_value="darwin-proc-start:123:456",
+            ),
+        ):
+            recovery = _publish_retained_git_closure_recovery(
+                recovery_root=pathlib.Path("/private/review"),
+                revalidate_owner=mock.Mock(),
+                error=failure,
+                token="a" * 64,
+            )
+        self.assertEqual(
+            recovery,
+            {
+                "status": "receipt-preparation-failed",
+                "receipt_path": None,
+                "receipt_sha256": None,
+                "receipt": None,
+            },
+        )
+        signal_release.assert_called_once_with(False)
+
+        with owned_temporary_directory("preflight-checkpoint-") as root:
+            retained_recovery = {
+                "status": "published",
+                "receipt_path": str(root / "receipt.json"),
+                "receipt_sha256": "a" * 64,
+                "receipt": {"version": 1},
+            }
+            run_failure = GitProcessClosureUnproven(
+                SimpleNamespace(pid=126),
+                None,
+                TimeoutError("synthetic run cleanup timeout"),
+            )
+            with (
+                mock.patch(
+                    "review_supervisor.supervisor._prepare_with_reclamation",
+                    side_effect=run_failure,
+                ),
+                mock.patch(
+                    "review_supervisor.supervisor.retry_git_process_closure",
+                    return_value=False,
+                ),
+                mock.patch(
+                    "review_supervisor.supervisor._publish_retained_git_closure_recovery",
+                    return_value=retained_recovery,
+                ),
+                mock.patch(
+                    "review_supervisor.supervisor.checkpoint_bound_signal_interrupt"
+                ) as checkpoint,
+                mock.patch(
+                    "review_supervisor.supervisor._prequiescence_abort"
+                ) as abort,
+            ):
+                code, result = run_supervisor(
+                    entrypoint=root / "entrypoint",
+                    helper_state=root / "helper-state",
+                    repo=root / "repo",
+                    base_sha="1" * 40,
+                    head_sha="2" * 40,
+                    pr_url="https://github.com/example/repository/pull/1",
+                    retention_root=root / "retention",
+                    checkout_parent=root / "checkout",
+                    git_executable="/usr/bin/git",
+                    codex_executable="/usr/bin/false",
+                )
+            self.assertEqual(code, 2)
+            self.assertEqual(result["process_closure_recovery"], retained_recovery)
+            checkpoint.assert_called_once_with(force=True)
+            abort.assert_not_called()
+
+        with owned_temporary_directory("preflight-retry-interrupt-") as root:
+            retry_failure = GitProcessClosureUnproven(
+                SimpleNamespace(pid=128),
+                None,
+                TimeoutError("synthetic retry cleanup timeout"),
+            )
+            retry_failure.__cause__ = RuntimeError("synthetic preflight failure")
+            with (
+                mock.patch(
+                    "review_supervisor.supervisor._prepare_with_reclamation",
+                    side_effect=retry_failure,
+                ),
+                mock.patch(
+                    "review_supervisor.supervisor.retry_git_process_closure",
+                    return_value=True,
+                ),
+                mock.patch(
+                    "review_supervisor.supervisor._publish_retained_git_closure_recovery"
+                ) as publish_recovery,
+                mock.patch(
+                    "review_supervisor.supervisor.checkpoint_bound_signal_interrupt",
+                    side_effect=KeyboardInterrupt,
+                ) as checkpoint,
+                mock.patch(
+                    "review_supervisor.supervisor._prequiescence_abort"
+                ) as abort,
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                run_supervisor(
+                    entrypoint=root / "entrypoint",
+                    helper_state=root / "helper-state",
+                    repo=root / "repo",
+                    base_sha="1" * 40,
+                    head_sha="2" * 40,
+                    pr_url="https://github.com/example/repository/pull/1",
+                    retention_root=root / "retention",
+                    checkout_parent=root / "checkout",
+                    git_executable="/usr/bin/git",
+                    codex_executable="/usr/bin/false",
+                )
+            checkpoint.assert_called_once_with(force=True)
+            publish_recovery.assert_not_called()
+            abort.assert_not_called()
+
+        with owned_temporary_directory("preflight-interrupt-") as root:
+            interrupt_failure = GitProcessClosureUnproven(
+                SimpleNamespace(pid=127),
+                None,
+                TimeoutError("synthetic interrupted cleanup timeout"),
+            )
+            with (
+                mock.patch(
+                    "review_supervisor.supervisor._prepare_with_reclamation",
+                    side_effect=interrupt_failure,
+                ),
+                mock.patch(
+                    "review_supervisor.supervisor.retry_git_process_closure",
+                    return_value=False,
+                ),
+                mock.patch(
+                    "review_supervisor.supervisor._publish_retained_git_closure_recovery",
+                    return_value={"status": "published"},
+                ),
+                mock.patch(
+                    "review_supervisor.supervisor.checkpoint_bound_signal_interrupt",
+                    side_effect=KeyboardInterrupt,
+                ) as checkpoint,
+                mock.patch(
+                    "review_supervisor.supervisor._prequiescence_abort"
+                ) as abort,
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                run_supervisor(
+                    entrypoint=root / "entrypoint",
+                    helper_state=root / "helper-state",
+                    repo=root / "repo",
+                    base_sha="1" * 40,
+                    head_sha="2" * 40,
+                    pr_url="https://github.com/example/repository/pull/1",
+                    retention_root=root / "retention",
+                    checkout_parent=root / "checkout",
+                    git_executable="/usr/bin/git",
+                    codex_executable="/usr/bin/false",
+                )
+            checkpoint.assert_called_once_with(force=True)
+            abort.assert_not_called()
+
     def test_cleanup_failure_latches_the_incomplete_handoff_receipt(self) -> None:
         process = SpawnedProcess(
             pid=123,

@@ -574,6 +574,77 @@ class CodexExecutableAuthenticationTests(unittest.TestCase):
                     "directory",
                 )
 
+    def test_relaxed_directory_metadata_inspection_uses_property_scoped_identity(
+        self,
+    ) -> None:
+        directory_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        self.addCleanup(os.close, directory_fd)
+        base = NodeIdentity.from_stat(os.stat("/"))
+        churned = replace(
+            base,
+            link_count=base.link_count + 1,
+            size=base.size + 1,
+            mtime_ns=base.mtime_ns + 1,
+            ctime_ns=base.ctime_ns + 1,
+        )
+        access_policy_changed = replace(churned, mode=churned.mode ^ stat.S_IWUSR)
+
+        for identities, accepted in (
+            ((base, churned, churned), True),
+            ((base, access_policy_changed, access_policy_changed), False),
+        ):
+            with (
+                self.subTest(accepted=accepted),
+                mock.patch.object(
+                    NodeIdentity,
+                    "from_stat",
+                    side_effect=identities,
+                ),
+                mock.patch(
+                    "review_supervisor.codex_executable."
+                    "_read_macos_filesystem_metadata",
+                    return_value=CLEAR_METADATA,
+                ),
+            ):
+                if accepted:
+                    evidence = codex_executable.inspect_macos_filesystem_metadata(
+                        directory_fd,
+                        "directory",
+                        require_directory_metadata_stability=False,
+                    )
+                    self.assertEqual(evidence, CLEAR_METADATA)
+                else:
+                    with self.assertRaisesRegex(OSError, "changed during inspection"):
+                        codex_executable.inspect_macos_filesystem_metadata(
+                            directory_fd,
+                            "directory",
+                            require_directory_metadata_stability=False,
+                        )
+
+    def test_strict_directory_metadata_inspection_still_rejects_ctime_churn(
+        self,
+    ) -> None:
+        directory_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        self.addCleanup(os.close, directory_fd)
+        base = NodeIdentity.from_stat(os.stat("/"))
+        churned = replace(base, ctime_ns=base.ctime_ns + 1)
+        with (
+            mock.patch.object(
+                NodeIdentity,
+                "from_stat",
+                side_effect=(base, churned, churned),
+            ),
+            mock.patch(
+                "review_supervisor.codex_executable._read_macos_filesystem_metadata",
+                return_value=CLEAR_METADATA,
+            ),
+            self.assertRaisesRegex(OSError, "changed during inspection"),
+        ):
+            codex_executable.inspect_macos_filesystem_metadata(
+                directory_fd,
+                "directory",
+            )
+
     def test_transient_directory_metadata_mutation_changes_the_ctime_window(
         self,
     ) -> None:

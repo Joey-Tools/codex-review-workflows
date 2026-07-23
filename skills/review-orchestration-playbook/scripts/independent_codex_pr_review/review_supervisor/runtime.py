@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import math
 import os
 import pathlib
@@ -34,6 +33,7 @@ from .constants import (
     PROCESS_TERM_GRACE_SECONDS,
     READER_DRAIN_SECONDS,
     REVIEWER_LAUNCH_SECONDS,
+    UNSUPPORTED_CLAUSES,
     tool_root,
 )
 from .evidence import (
@@ -45,17 +45,21 @@ from .evidence import (
 from .errors import SupervisorError, UnprovenDirectHelperClosure, inconclusive
 from .gitraw import (
     CatFileBatch,
+    GitControlBinding,
     GitProcessClosureUnproven,
     RepositoryInfo,
     WorktreeRegistration,
     add_detached_worktree,
+    create_sanitized_view,
     enumerate_registration,
     enumerate_registration_fd,
     enumerate_tree,
     initialize_index,
     inspect_repository,
     manifest_digest,
+    remove_sanitized_view,
     remove_both_present_worktree,
+    revalidate_git_control,
     retry_git_process_closure,
     verify_worktree_absent,
 )
@@ -95,23 +99,23 @@ from .secureio import (
     allocated_bytes,
     allocated_bytes_fd,
     canonical_json,
+    decode_json_bytes,
     directory_identities_match,
     identity_from_stat,
     measure_filesystem_fd,
     open_absolute_directory_chain,
+    open_directory,
     open_regular_at,
-    open_regular_nofollow,
-    publish_bytes,
     publish_bytes_at,
     read_fd_exact,
     sha256_bytes,
-    fsync_directory,
     validate_private_directory_fd,
 )
 from .settlement_state import publish_exact_process_settlement
 from .signal_relay import (
     DeferredSignalInterrupt,
     activate_deferred_signal_interrupt,
+    checkpoint_bound_signal_interrupt,
     deactivate_deferred_signal_interrupt,
 )
 from .wire import (
@@ -128,6 +132,39 @@ _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _HANDOFF_TOKEN_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _WORKTREE_LOCK_REASON_PATTERN = re.compile(
     r"independent-codex-pr-review:[0-9a-f]{64}\Z"
+)
+_RETAINED_GIT_CONTROL_NAME_PATTERN = re.compile(
+    r"codex-git-control-[A-Za-z0-9_-]{1,64}\Z"
+)
+_CHECKOUT_CLOSURE_RECEIPT_NAME = b"checkout-closure-recovery.json"
+_CHECKOUT_CLOSURE_RECEIPT_MAX_BYTES = 16 * 1024
+_CHECKOUT_CLOSURE_RECEIPT_KEYS = frozenset(
+    {
+        "version",
+        "token",
+        "worker",
+        "process",
+        "control_scope",
+        "retained_cleanup_paths",
+    }
+)
+_CHECKOUT_PROCESS_RECEIPT_KEYS = frozenset(
+    {"identity_status", "pid", "pgid", "start_identity"}
+)
+_CHECKOUT_WORKER_RECEIPT_KEYS = frozenset({"pid", "start_identity"})
+_CHECKOUT_FAILED_RECORD_KEYS = frozenset(
+    {
+        "type",
+        "token",
+        "status",
+        "stage",
+        "code",
+        "error",
+        "closure",
+        "closure_receipt",
+        "closure_receipt_sha256",
+        "closure_receipt_status",
+    }
 )
 _IDENTITY_KEYS = frozenset({"device", "inode", "mode", "link_count", "uid", "size"})
 _FINAL_AUTHORIZATION_KEYS = frozenset(
@@ -212,6 +249,11 @@ _ORDINARY_PHASE_TRANSITIONS = (
         {"reserved"},
         "worktree-adding",
         {"phase", "worktree_create_intent", "worktree_status"},
+    ),
+    _transition(
+        {"worktree-adding"},
+        "worktree-adding",
+        {"git_control_binding"},
     ),
     _transition(
         {"worktree-adding"},
@@ -710,10 +752,29 @@ class DurableProcessLifecycle:
             raise ValueError("durable auth-refresh profile is malformed")
 
 
+def _git_control(value: dict[str, Any]) -> GitControlBinding:
+    return GitControlBinding(
+        path=pathlib.Path(value["path"]),
+        root_identity=_identity(value["root_identity"]),
+        config_identity=_identity(value["config_identity"]),
+        config_sha256=value["config_sha256"],
+    )
+
+
+def _git_control_json(value: GitControlBinding) -> dict[str, Any]:
+    return {
+        "path": str(value.path),
+        "root_identity": value.root_identity.to_json(),
+        "config_identity": value.config_identity.to_json(),
+        "config_sha256": value.config_sha256,
+    }
+
+
 def _registration(value: dict[str, Any]) -> WorktreeRegistration:
     return WorktreeRegistration(
         worktree=pathlib.Path(value["worktree"]),
         registration=pathlib.Path(value["registration"]),
+        control=_git_control(value["control"]),
         worktree_identity=_identity(value["worktree_identity"]),
         registration_identity=_identity(value["registration_identity"]),
         marker_identity=_identity(value["marker_identity"]),
@@ -726,6 +787,7 @@ def _registration_json(value: WorktreeRegistration) -> dict[str, Any]:
     return {
         "worktree": str(value.worktree),
         "registration": str(value.registration),
+        "control": _git_control_json(value.control),
         "worktree_identity": value.worktree_identity.to_json(),
         "registration_identity": value.registration_identity.to_json(),
         "marker_identity": value.marker_identity.to_json(),
@@ -739,18 +801,21 @@ def _worktree_create_intent(state: dict[str, Any]) -> dict[str, Any]:
     expected_keys = {
         "version",
         "worktree",
+        "control_git_dir",
         "registration_parent",
         "lock_reason",
     }
-    common_binding = state.get("common_git_dir_binding")
+    attempt_binding = state.get("attempt_directory_binding")
     if (
         not isinstance(value, dict)
         or set(value) != expected_keys
-        or value.get("version") != 1
+        or value.get("version") != 2
         or value.get("worktree") != state.get("worktree_path")
-        or not isinstance(common_binding, dict)
+        or not isinstance(attempt_binding, dict)
+        or value.get("control_git_dir")
+        != str(pathlib.Path(attempt_binding.get("path", "")) / "git-control")
         or value.get("registration_parent")
-        != str(pathlib.Path(common_binding.get("path", "")) / "worktrees")
+        != str(pathlib.Path(value.get("control_git_dir", "")) / "worktrees")
         or not isinstance(value.get("lock_reason"), str)
         or _WORKTREE_LOCK_REASON_PATTERN.fullmatch(value["lock_reason"]) is None
     ):
@@ -785,13 +850,17 @@ def _read_git_metadata_at(
 
 def _recover_create_in_progress_registration(
     *,
+    info: RepositoryInfo,
+    control: GitControlBinding,
     state: dict[str, Any],
     checkout_parent_fd: int,
-    common_git_fd: int,
 ) -> WorktreeRegistration | None:
     intent = _worktree_create_intent(state)
     worktree = pathlib.Path(intent["worktree"])
-    common_git_dir = pathlib.Path(state["common_git_dir_binding"]["path"])
+    if control.path != pathlib.Path(intent["control_git_dir"]):
+        raise ValueError("create-in-progress Git control path changed")
+    revalidate_git_control(info, control)
+    control_fd = open_directory(control.path)
     worktree_name = os.fsencode(worktree.name)
     try:
         worktree_metadata = os.stat(
@@ -800,15 +869,21 @@ def _recover_create_in_progress_registration(
             follow_symlinks=False,
         )
     except FileNotFoundError:
+        os.close(control_fd)
         return None
     worktree_identity = identity_from_stat(worktree_metadata)
     if not stat.S_ISDIR(worktree_identity.mode) or worktree_identity.uid != os.getuid():
+        os.close(control_fd)
         raise ValueError("create-in-progress worktree entry is unsafe")
-    worktree_fd = os.open(
-        worktree_name,
-        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-        dir_fd=checkout_parent_fd,
-    )
+    try:
+        worktree_fd = os.open(
+            worktree_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=checkout_parent_fd,
+        )
+    except BaseException:
+        os.close(control_fd)
+        raise
     registration_parent_fd: int | None = None
     registration_fd: int | None = None
     try:
@@ -839,7 +914,7 @@ def _recover_create_in_progress_registration(
         registration_parent_fd = os.open(
             b"worktrees",
             os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            dir_fd=common_git_fd,
+            dir_fd=control_fd,
         )
         registration_name = os.fsencode(registration.name)
         registration_metadata = os.stat(
@@ -897,11 +972,12 @@ def _recover_create_in_progress_registration(
             worktree_identity,
         ):
             raise ValueError("create-in-progress binding changed during recovery")
-        if registration.parent != common_git_dir / "worktrees":
+        if registration.parent != control.path / "worktrees":
             raise ValueError("create-in-progress registration parent changed")
         return WorktreeRegistration(
             worktree=worktree,
             registration=registration,
+            control=control,
             worktree_identity=worktree_identity,
             registration_identity=registration_identity,
             marker_identity=marker_identity,
@@ -914,6 +990,7 @@ def _recover_create_in_progress_registration(
         if registration_parent_fd is not None:
             os.close(registration_parent_fd)
         os.close(worktree_fd)
+        os.close(control_fd)
 
 
 class DirectProcessClosureUnproven(UnprovenDirectHelperClosure):
@@ -1061,10 +1138,7 @@ def _accept_attempt_transfer(
     ready_extra: dict[str, Any] | None = None,
 ) -> AttemptLease:
     offer, _ = receive_record(control, deadline=deadline)
-    if (
-        offer.get("type") != "attempt-lease-offer"
-        or offer.get("token") != token
-    ):
+    if offer.get("type") != "attempt-lease-offer" or offer.get("token") != token:
         raise ValueError("attempt lease transfer offer is invalid")
     binding = offer.get("binding")
     attempt = accept_attempt_lease_transfer(
@@ -1870,9 +1944,7 @@ def phase_helper_main(
                     state_digest=digest,
                     updates=updates,
                 )
-            next_state, next_digest = commit_state(
-                attempt, state, digest, **updates
-            )
+            next_state, next_digest = commit_state(attempt, state, digest, **updates)
         else:
             if state.get("closure") not in {
                 "proven-by-owner",
@@ -2557,9 +2629,11 @@ def checkout_worker_main(
     signal_binding: Any | None = None
     attempt: AttemptLease | None = None
     descriptors_owned = True
+    worker_start_identity: str | None = None
     try:
         signal_guard = _install_checkout_worker_signal_handlers()
         signal_binding = activate_deferred_signal_interrupt(signal_guard.interrupt)
+        worker_start_identity = process_start_identity(os.getpid())
         descriptors_owned = False
         attempt = _accept_attempt_transfer(
             control=control,
@@ -2577,11 +2651,13 @@ def checkout_worker_main(
         if identity_from_stat(os.fstat(source_fd)) != custody.source_identity:
             raise ValueError("checkout worker source descriptor identity is invalid")
         deadline = time.monotonic() + CHECKOUT_SECONDS
+        attempt.revalidate(state)
         info = inspect_repository(
             repo=pathlib.Path(state["repo"]),
             base_sha=state["base_sha"],
             head_sha=state["head_sha"],
             git_executable=state["git_executable"],
+            temporary_control_parent=attempt.path,
         )
         base = enumerate_tree(info, info.base_sha)
         head = enumerate_tree(info, info.head_sha)
@@ -2593,10 +2669,45 @@ def checkout_worker_main(
         ):
             raise ValueError("worker tree enumeration differs from reserved manifests")
         create_intent = _worktree_create_intent(state)
+        if state.get("git_control_binding") is not None:
+            raise ValueError("worker Git control binding is not pristine")
+        control_binding = create_sanitized_view(
+            info,
+            pathlib.Path(create_intent["control_git_dir"]),
+        )
+        control_updates = {
+            "git_control_binding": _git_control_json(control_binding),
+        }
+        _validate_ordinary_phase_updates(
+            attempt=attempt,
+            state=state,
+            state_digest=state_digest,
+            updates=control_updates,
+        )
+        state, state_digest = commit_state(
+            attempt,
+            state,
+            state_digest,
+            **control_updates,
+        )
+        send_record(
+            control,
+            {
+                "type": "git-control-created",
+                "token": token,
+                "binding": control_updates["git_control_binding"],
+                "state_sha256": state_digest,
+            },
+            deadline=deadline,
+        )
+        release, _ = receive_record(control, deadline=deadline)
+        if release != {"type": "continue-worktree-add", "token": token}:
+            raise ValueError("checkout worker Git control release is invalid")
         registration = add_detached_worktree(
             info,
             pathlib.Path(state["worktree_path"]),
             lock_reason=create_intent["lock_reason"],
+            control=control_binding,
         )
         registration_json = _registration_json(registration)
         registration_updates = {
@@ -2732,32 +2843,82 @@ def checkout_worker_main(
         return 0
     except BaseException as error:
         failure = error.failure if isinstance(error, SupervisorError) else None
-        detached_process_closure_unproven = isinstance(
-            error,
-            GitProcessClosureUnproven,
-        )
+        closure_error = error if isinstance(error, GitProcessClosureUnproven) else None
+        detached_process_closure_unproven = closure_error is not None
         if detached_process_closure_unproven and retry_git_process_closure(error):
             detached_process_closure_unproven = False
+        closure_receipt: dict[str, Any] | None = None
+        closure_receipt_sha256: str | None = None
+        closure_receipt_status = "not-applicable"
         try:
-            send_record(
-                control,
-                {
-                    "type": "checkout-failed",
-                    "token": token,
-                    "status": failure.status if failure else "inconclusive",
-                    "stage": failure.stage if failure else "checkout",
-                    "code": failure.code if failure else "checkout-worker-failed",
-                    "detached_process_closure": (
-                        "unproven" if detached_process_closure_unproven else None
-                    ),
-                    "error": failure.message
-                    if failure
-                    else f"{type(error).__name__}: {error}",
-                },
-                deadline=time.monotonic() + 1,
-            )
+            if detached_process_closure_unproven:
+                assert isinstance(error, GitProcessClosureUnproven)
+                assert attempt is not None
+                assert worker_start_identity is not None
+                closure_receipt = _build_checkout_closure_receipt(
+                    error,
+                    attempt_dir=attempt.path,
+                    token=token,
+                    owner_pid=os.getpid(),
+                    owner_start_identity=worker_start_identity,
+                )
+                payload = canonical_json(closure_receipt)
+                closure_receipt_sha256 = sha256_bytes(payload)
+                try:
+                    attempt.revalidate(state)
+                    published_payload, published_sha256 = (
+                        _publish_checkout_closure_receipt(
+                            attempt,
+                            closure_receipt,
+                        )
+                    )
+                    attempt.revalidate(state)
+                    if (
+                        published_payload != payload
+                        or published_sha256 != closure_receipt_sha256
+                    ):
+                        raise ValueError("checkout closure receipt publication changed")
+                    closure_receipt_status = "published"
+                except BaseException:
+                    closure_receipt_status = "publication-failed"
         except BaseException:
-            pass
+            if closure_error is not None:
+                closure_error.finish_signal_deferral(deliver=False)
+            checkpoint_bound_signal_interrupt(force=True)
+            raise
+        error_text = (
+            (failure.message if failure else f"{type(error).__name__}: {error}")
+            .encode("utf-8", "replace")[:4096]
+            .decode("utf-8", "ignore")
+        )
+        try:
+            try:
+                send_record(
+                    control,
+                    {
+                        "type": "checkout-failed",
+                        "token": token,
+                        "status": failure.status if failure else "inconclusive",
+                        "stage": failure.stage if failure else "checkout",
+                        "code": failure.code if failure else "checkout-worker-failed",
+                        "error": error_text,
+                        "closure": (
+                            "unproven"
+                            if detached_process_closure_unproven
+                            else "proven"
+                        ),
+                        "closure_receipt": closure_receipt,
+                        "closure_receipt_sha256": closure_receipt_sha256,
+                        "closure_receipt_status": closure_receipt_status,
+                    },
+                    deadline=time.monotonic() + 1,
+                )
+            except BaseException:
+                pass
+        finally:
+            if closure_error is not None:
+                closure_error.finish_signal_deferral(deliver=False)
+        checkpoint_bound_signal_interrupt(force=True)
         return 1
     finally:
         if signal_guard is not None:
@@ -2784,8 +2945,333 @@ class OuterAbandoned(RuntimeError):
     pass
 
 
+def _build_checkout_closure_receipt(
+    error: GitProcessClosureUnproven,
+    *,
+    attempt_dir: pathlib.Path,
+    token: str,
+    owner_pid: int,
+    owner_start_identity: str,
+) -> dict[str, Any]:
+    return validate_checkout_closure_receipt(
+        {
+            "version": 1,
+            "token": token,
+            "worker": {
+                "pid": owner_pid,
+                "start_identity": owner_start_identity,
+            },
+            "process": error.process_receipt,
+            "control_scope": (
+                "temporary" if error.retained_cleanup_paths else "attempt-private"
+            ),
+            "retained_cleanup_paths": [
+                str(path) for path in error.retained_cleanup_paths
+            ],
+        },
+        attempt_dir=attempt_dir,
+        token=token,
+    )
+
+
+def validate_retained_git_control_paths(
+    value: object,
+    *,
+    attempt_dir: pathlib.Path,
+) -> tuple[pathlib.Path, ...]:
+    if not isinstance(value, list) or len(value) > 8:
+        raise ValueError("retained Git-control recovery paths are malformed")
+    if not attempt_dir.is_absolute() or attempt_dir != pathlib.Path(
+        os.path.abspath(attempt_dir)
+    ):
+        raise ValueError("attempt recovery directory is not canonical")
+    retained: list[pathlib.Path] = []
+    for raw_path in value:
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ValueError("retained Git-control recovery path is malformed")
+        path = pathlib.Path(raw_path)
+        if (
+            not path.is_absolute()
+            or path != pathlib.Path(os.path.abspath(raw_path))
+            or path.parent != attempt_dir
+            or _RETAINED_GIT_CONTROL_NAME_PATTERN.fullmatch(path.name) is None
+            or path in retained
+        ):
+            raise ValueError("retained Git-control recovery path is outside policy")
+        retained.append(path)
+    return tuple(retained)
+
+
+def _validate_checkout_process_receipt(
+    value: object,
+) -> dict[str, int | str | None]:
+    if not isinstance(value, dict) or set(value) != _CHECKOUT_PROCESS_RECEIPT_KEYS:
+        raise ValueError("checkout process receipt is malformed")
+    identity_status = value.get("identity_status")
+    pid = value.get("pid")
+    pgid = value.get("pgid")
+    start_identity = value.get("start_identity")
+    if identity_status == "not-applicable":
+        if pid is not None or pgid is not None or start_identity is not None:
+            raise ValueError("process-free checkout closure receipt is malformed")
+    elif type(pid) is not int or pid <= 1:
+        raise ValueError("checkout process PID is malformed")
+    elif identity_status == "anchored":
+        if (
+            type(pgid) is not int
+            or pgid != pid
+            or not isinstance(start_identity, str)
+            or not start_identity
+            or len(start_identity.encode("utf-8")) > 512
+        ):
+            raise ValueError("anchored checkout process receipt is malformed")
+    elif identity_status == "unbound":
+        if pgid is not None or start_identity is not None:
+            raise ValueError("unbound checkout process receipt is malformed")
+    else:
+        raise ValueError("checkout process identity status is malformed")
+    return {
+        "identity_status": identity_status,
+        "pid": pid,
+        "pgid": pgid,
+        "start_identity": start_identity,
+    }
+
+
+def validate_checkout_closure_receipt(
+    value: object,
+    *,
+    attempt_dir: pathlib.Path,
+    token: str,
+    expected_worker: SpawnedProcess | None = None,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != _CHECKOUT_CLOSURE_RECEIPT_KEYS:
+        raise ValueError("checkout closure recovery receipt is malformed")
+    if value.get("version") != 1 or value.get("token") != token:
+        raise ValueError("checkout closure recovery receipt binding is invalid")
+    worker = value.get("worker")
+    if not isinstance(worker, dict) or set(worker) != _CHECKOUT_WORKER_RECEIPT_KEYS:
+        raise ValueError("checkout closure worker receipt is malformed")
+    worker_pid = worker.get("pid")
+    worker_start = worker.get("start_identity")
+    if (
+        type(worker_pid) is not int
+        or worker_pid <= 1
+        or not isinstance(worker_start, str)
+        or not worker_start
+        or len(worker_start.encode("utf-8")) > 512
+    ):
+        raise ValueError("checkout closure worker identity is malformed")
+    if expected_worker is not None and (
+        worker_pid != expected_worker.pid
+        or worker_start != expected_worker.start_identity
+    ):
+        raise ValueError("checkout closure receipt names the wrong worker")
+    process = _validate_checkout_process_receipt(value.get("process"))
+    retained = validate_retained_git_control_paths(
+        value.get("retained_cleanup_paths"),
+        attempt_dir=attempt_dir,
+    )
+    control_scope = value.get("control_scope")
+    if control_scope not in {"attempt-private", "temporary"} or (
+        control_scope == "temporary"
+    ) != bool(retained):
+        raise ValueError("checkout closure control scope is malformed")
+    return {
+        "version": 1,
+        "token": token,
+        "worker": {
+            "pid": worker_pid,
+            "start_identity": worker_start,
+        },
+        "process": process,
+        "control_scope": control_scope,
+        "retained_cleanup_paths": [str(path) for path in retained],
+    }
+
+
+def _publish_checkout_closure_receipt(
+    attempt: AttemptLease,
+    receipt: dict[str, Any],
+) -> tuple[bytes, str]:
+    payload = canonical_json(receipt)
+    if len(payload) > _CHECKOUT_CLOSURE_RECEIPT_MAX_BYTES:
+        raise ValueError("checkout closure recovery receipt is oversized")
+    publish_bytes_at(
+        attempt.fd,
+        _CHECKOUT_CLOSURE_RECEIPT_NAME,
+        payload,
+        path_hint=attempt.path / os.fsdecode(_CHECKOUT_CLOSURE_RECEIPT_NAME),
+        mode=0o600,
+    )
+    return payload, sha256_bytes(payload)
+
+
+def _persist_attempt_git_closure_receipt(
+    *,
+    attempt: AttemptLease,
+    state: dict[str, Any],
+    error: GitProcessClosureUnproven,
+    token: str,
+    owner_start_identity: str,
+) -> dict[str, Any]:
+    receipt = _build_checkout_closure_receipt(
+        error,
+        attempt_dir=attempt.path,
+        token=token,
+        owner_pid=os.getpid(),
+        owner_start_identity=owner_start_identity,
+    )
+    expected_payload = canonical_json(receipt)
+    expected_sha256 = sha256_bytes(expected_payload)
+    attempt.revalidate(state)
+    payload, digest = _publish_checkout_closure_receipt(attempt, receipt)
+    attempt.revalidate(state)
+    if payload != expected_payload or digest != expected_sha256:
+        raise ValueError("attempt Git closure receipt publication changed")
+    return receipt
+
+
+def _read_checkout_closure_receipt(
+    attempt: AttemptLease,
+    *,
+    token: str,
+    expected_worker: SpawnedProcess | None = None,
+) -> tuple[dict[str, Any], str] | None:
+    try:
+        descriptor, identity = open_regular_at(
+            attempt.fd,
+            _CHECKOUT_CLOSURE_RECEIPT_NAME,
+            expected_uid=os.getuid(),
+            private_metadata=True,
+        )
+    except FileNotFoundError:
+        return None
+    try:
+        payload = read_fd_exact(
+            descriptor,
+            max_bytes=_CHECKOUT_CLOSURE_RECEIPT_MAX_BYTES,
+            expected_size=identity.size,
+        )
+    finally:
+        os.close(descriptor)
+    value = decode_json_bytes(payload)
+    receipt = validate_checkout_closure_receipt(
+        value,
+        attempt_dir=attempt.path,
+        token=token,
+        expected_worker=expected_worker,
+    )
+    if canonical_json(receipt) != payload:
+        raise ValueError("checkout closure recovery receipt is not canonical")
+    return receipt, sha256_bytes(payload)
+
+
+def _validate_checkout_failed_record(
+    record: object,
+    *,
+    attempt_dir: pathlib.Path,
+    token: str,
+    expected_worker: SpawnedProcess,
+) -> dict[str, Any]:
+    if not isinstance(record, dict) or set(record) != _CHECKOUT_FAILED_RECORD_KEYS:
+        raise ValueError("checkout worker failure record is not a closed schema")
+    if record.get("type") != "checkout-failed" or record.get("token") != token:
+        raise ValueError("checkout worker failure record binding is invalid")
+    status = record.get("status")
+    stage = record.get("stage")
+    code = record.get("code")
+    error = record.get("error")
+    if status not in {"blocked", "inconclusive"}:
+        raise ValueError("checkout worker failure status is malformed")
+    for label, value in (("stage", stage), ("code", code), ("error", error)):
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value.encode("utf-8")) > (4096 if label == "error" else 512)
+        ):
+            raise ValueError(f"checkout worker failure {label} is malformed")
+    closure = record.get("closure")
+    receipt = record.get("closure_receipt")
+    receipt_sha256 = record.get("closure_receipt_sha256")
+    receipt_status = record.get("closure_receipt_status")
+    if closure == "proven":
+        if (
+            receipt is not None
+            or receipt_sha256 is not None
+            or receipt_status != "not-applicable"
+        ):
+            raise ValueError("proven checkout closure carries recovery evidence")
+        normalized_receipt = None
+    elif closure == "unproven":
+        normalized_receipt = validate_checkout_closure_receipt(
+            receipt,
+            attempt_dir=attempt_dir,
+            token=token,
+            expected_worker=expected_worker,
+        )
+        if (
+            not isinstance(receipt_sha256, str)
+            or not _SHA256_PATTERN.fullmatch(receipt_sha256)
+            or receipt_sha256 != sha256_bytes(canonical_json(normalized_receipt))
+            or receipt_status not in {"published", "publication-failed"}
+        ):
+            raise ValueError("checkout closure recovery commitment is malformed")
+    else:
+        raise ValueError("checkout worker closure status is malformed")
+    return {
+        "type": "checkout-failed",
+        "token": token,
+        "status": status,
+        "stage": stage,
+        "code": code,
+        "error": error,
+        "closure": closure,
+        "closure_receipt": normalized_receipt,
+        "closure_receipt_sha256": receipt_sha256,
+        "closure_receipt_status": receipt_status,
+    }
+
+
 class PrelaunchWorkerClosureUnproven(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        closure_receipt: dict[str, Any] | None = None,
+        closure_receipt_status: str = "missing",
+    ) -> None:
+        if closure_receipt_status not in {
+            "published",
+            "missing",
+            "malformed",
+            "publication-failed",
+        }:
+            raise ValueError("checkout closure receipt status is malformed")
+        self.closure_receipt = closure_receipt
+        self.closure_receipt_status = closure_receipt_status
+        super().__init__(message)
+
+
+def build_unsettled_checkout_summary(
+    *,
+    attempt_dir: pathlib.Path,
+    receipt: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+        "named_lane_eligible": NAMED_LANE_ELIGIBLE,
+        "overall_status": "inconclusive",
+        "review_status": "not-run",
+        "launch_status": "uncertain",
+        "failure_stage": "checkout",
+        "failure_code": "detached-process-closure-unproven",
+        "message": "checkout Git process closure is unproven",
+        "attempt_dir": str(attempt_dir),
+        "closure_receipt_status": "published",
+        "closure_receipt": receipt,
+        "unsupported_clauses": list(UNSUPPORTED_CLAUSES),
+    }
 
 
 def _require_outer_liveness(outer: socket.socket) -> None:
@@ -3524,12 +4010,12 @@ def _run_checkout(
 ) -> tuple[dict[str, Any], str]:
     deadline = time.monotonic() + CHECKOUT_SECONDS
     token = os.urandom(32).hex()
+    control_git_dir = attempt.path / "git-control"
     create_intent = {
-        "version": 1,
+        "version": 2,
         "worktree": state["worktree_path"],
-        "registration_parent": str(
-            pathlib.Path(state["common_git_dir_binding"]["path"]) / "worktrees"
-        ),
+        "control_git_dir": str(control_git_dir),
+        "registration_parent": str(control_git_dir / "worktrees"),
         "lock_reason": f"independent-codex-pr-review:{token}",
     }
     state, state_digest = commit_via_helper(
@@ -3547,27 +4033,106 @@ def _run_checkout(
     parent, child = socket_pair()
     worker: SpawnedProcess | None = None
 
+    def load_durable_closure_receipt(
+        failed_worker: SpawnedProcess,
+    ) -> tuple[dict[str, Any] | None, str]:
+        try:
+            recovered = _read_checkout_closure_receipt(
+                attempt,
+                token=token,
+                expected_worker=failed_worker,
+            )
+        except BaseException:
+            return None, "malformed"
+        if recovered is None:
+            return None, "missing"
+        return recovered[0], "published"
+
     def raise_worker_failure(record: dict[str, Any]) -> None:
         nonlocal worker
         if worker is None:
             raise ValueError("checkout worker failure has no process owner")
-        wait_terminal(worker.pid, deadline=deadline)
-        exit_code = reap(worker.pid, deadline=deadline)
-        worker = None
-        if exit_code == 0:
-            raise ValueError("checkout worker reported failure with a zero exit")
-        closure = record.get("detached_process_closure")
-        if closure == "unproven":
-            raise PrelaunchWorkerClosureUnproven(
-                "checkout worker reported unproven detached-process closure"
+        failed_worker = worker
+        wait_terminal(failed_worker.pid, deadline=deadline)
+        exit_code = reap(failed_worker.pid, deadline=deadline)
+
+        try:
+            normalized = _validate_checkout_failed_record(
+                record,
+                attempt_dir=attempt.path,
+                token=token,
+                expected_worker=failed_worker,
             )
-        if closure is not None:
-            raise ValueError("checkout worker closure evidence is malformed")
+        except BaseException as validation_error:
+            recovered_receipt, recovered_status = load_durable_closure_receipt(
+                failed_worker
+            )
+            worker = None
+            raise PrelaunchWorkerClosureUnproven(
+                "checkout worker failure record is malformed",
+                closure_receipt=recovered_receipt,
+                closure_receipt_status=recovered_status,
+            ) from validation_error
+
+        if exit_code == 0:
+            recovered_receipt, recovered_status = load_durable_closure_receipt(
+                failed_worker
+            )
+            worker = None
+            raise PrelaunchWorkerClosureUnproven(
+                "checkout worker reported failure with a zero exit",
+                closure_receipt=recovered_receipt,
+                closure_receipt_status=recovered_status,
+            )
+
+        if normalized["closure"] == "unproven":
+            receipt = normalized["closure_receipt"]
+            receipt_sha256 = normalized["closure_receipt_sha256"]
+            recovered_receipt, recovered_status = load_durable_closure_receipt(
+                failed_worker
+            )
+            if recovered_receipt is None and recovered_status == "missing":
+                try:
+                    _, published_sha256 = _publish_checkout_closure_receipt(
+                        attempt,
+                        receipt,
+                    )
+                    if published_sha256 != receipt_sha256:
+                        raise ValueError(
+                            "parent-published checkout receipt digest changed"
+                        )
+                    recovered_receipt, recovered_status = load_durable_closure_receipt(
+                        failed_worker
+                    )
+                except BaseException:
+                    recovered_receipt = receipt
+                    recovered_status = "publication-failed"
+            elif recovered_receipt != receipt:
+                recovered_receipt = receipt
+                recovered_status = "malformed"
+            worker = None
+            raise PrelaunchWorkerClosureUnproven(
+                "checkout worker reported unproven detached-process closure",
+                closure_receipt=recovered_receipt,
+                closure_receipt_status=recovered_status,
+            )
+
+        recovered_receipt, recovered_status = load_durable_closure_receipt(
+            failed_worker
+        )
+        if recovered_receipt is not None or recovered_status == "malformed":
+            worker = None
+            raise PrelaunchWorkerClosureUnproven(
+                "proven checkout failure conflicts with closure recovery evidence",
+                closure_receipt=recovered_receipt,
+                closure_receipt_status=recovered_status,
+            )
+        worker = None
         raise SupervisorError(
-            record.get("error", "checkout worker failed"),
-            status=record.get("status", "inconclusive"),
-            stage=record.get("stage", "checkout"),
-            code=record.get("code", "checkout-worker-failed"),
+            normalized["error"],
+            status=normalized["status"],
+            stage=normalized["stage"],
+            code=normalized["code"],
         )
 
     try:
@@ -3610,6 +4175,44 @@ def _run_checkout(
             ready_type="checkout-worker-ready",
             deadline=deadline,
         )
+        control_created = _wait_child_record(
+            child=parent,
+            outer=outer,
+            deadline=deadline,
+        )
+        if control_created.get("type") == "checkout-failed":
+            raise_worker_failure(control_created)
+        if (
+            control_created.get("type") != "git-control-created"
+            or control_created.get("token") != token
+        ):
+            raise ValueError("checkout worker Git control record is invalid")
+        control_value = control_created.get("binding")
+        control_state_digest = control_created.get("state_sha256")
+        if not isinstance(control_value, dict) or not isinstance(
+            control_state_digest,
+            str,
+        ):
+            raise ValueError("checkout worker Git control evidence is malformed")
+        control_state, _, durable_control_digest = read_bound_attempt_state(attempt)
+        if (
+            control_state_digest != durable_control_digest
+            or control_state.get("previous_record_sha256") != state_digest
+            or control_state.get("record_generation")
+            != state.get("record_generation", 0) + 1
+            or control_state.get("phase") != "worktree-adding"
+            or control_state.get("worktree_status") != "adding"
+            or control_state.get("worktree_create_intent") != create_intent
+            or control_state.get("git_control_binding") != control_value
+            or control_state.get("registration") is not None
+        ):
+            raise ValueError("checkout worker durable Git control is invalid")
+        state, state_digest = control_state, control_state_digest
+        send_record(
+            parent,
+            {"type": "continue-worktree-add", "token": token},
+            deadline=deadline,
+        )
         created = _wait_child_record(child=parent, outer=outer, deadline=deadline)
         if created.get("type") == "checkout-failed":
             raise_worker_failure(created)
@@ -3631,6 +4234,8 @@ def _run_checkout(
             or worker_state.get("phase") != "worktree-adding"
             or worker_state.get("worktree_status") != "active"
             or worker_state.get("worktree_create_intent") != create_intent
+            or worker_state.get("git_control_binding")
+            != registration_value.get("control")
             or worker_state.get("registration") != registration_value
         ):
             raise ValueError("checkout worker durable registration is invalid")
@@ -3739,19 +4344,30 @@ def _run_checkout(
         return state, state_digest
     except BaseException as error:
         if worker is not None:
+            failed_worker = worker
             try:
-                _terminate_group(worker)
+                _terminate_group(failed_worker)
             except BaseException as cleanup_error:
+                recovered_receipt, recovered_status = load_durable_closure_receipt(
+                    failed_worker
+                )
                 if isinstance(error, UnprovenDirectHelperClosure):
                     raise error from cleanup_error
                 raise PrelaunchWorkerClosureUnproven(
-                    "checkout worker group closure is unproven"
+                    "checkout worker group closure is unproven",
+                    closure_receipt=recovered_receipt,
+                    closure_receipt_status=recovered_status,
                 ) from cleanup_error
             worker = None
             if isinstance(error, UnprovenDirectHelperClosure):
                 raise
+            recovered_receipt, recovered_status = load_durable_closure_receipt(
+                failed_worker
+            )
             raise PrelaunchWorkerClosureUnproven(
-                "checkout worker descendants cannot be proven absent"
+                "checkout worker descendants cannot be proven absent",
+                closure_receipt=recovered_receipt,
+                closure_receipt_status=recovered_status,
             ) from error
         raise
     finally:
@@ -3929,6 +4545,7 @@ def _cleanup_worktree(
     registration_value = state.get("registration")
     checkout_parent_fd: int | None = None
     common_git_fd: int | None = None
+    git_control_fd: int | None = None
     registration_parent_fd: int | None = None
     manifest: CustodiedManifest | None = None
     try:
@@ -3967,6 +4584,24 @@ def _cleanup_worktree(
         ):
             raise ValueError("reserved parent directory identity changed")
 
+        info = inspect_repository(
+            repo=pathlib.Path(state["repo"]),
+            base_sha=state["base_sha"],
+            head_sha=state["head_sha"],
+            git_executable=state["git_executable"],
+            temporary_control_parent=attempt.path,
+        )
+        control_value = state.get("git_control_binding")
+        control: GitControlBinding | None = None
+        if control_value is not None:
+            if not isinstance(control_value, dict):
+                raise ValueError("Git control binding is malformed")
+            control = _git_control(control_value)
+            if control.path != attempt_dir / "git-control":
+                raise ValueError("Git control path escaped the attempt directory")
+            revalidate_git_control(info, control)
+            git_control_fd = open_directory(control.path)
+
         worktree_name = os.fsencode(worktree.name)
         try:
             worktree_identity = identity_from_stat(
@@ -3985,30 +4620,44 @@ def _cleanup_worktree(
         registration_identity: Identity | None = None
         registration_present = False
         registration_parent_identity: Identity | None = None
-        if registration_value is None and state.get("worktree_create_intent") is not None:
-            assert common_git_fd is not None
-            registration = _recover_create_in_progress_registration(
-                state=state,
-                checkout_parent_fd=checkout_parent_fd,
-                common_git_fd=common_git_fd,
-            )
-            if registration is not None:
-                registration_value = _registration_json(registration)
+        if (
+            registration_value is None
+            and state.get("worktree_create_intent") is not None
+        ):
+            if control is None:
+                if worktree_present:
+                    raise ValueError(
+                        "worktree exists without a durable Git control binding"
+                    )
+            else:
+                assert git_control_fd is not None
+                registration = _recover_create_in_progress_registration(
+                    info=info,
+                    control=control,
+                    state=state,
+                    checkout_parent_fd=checkout_parent_fd,
+                )
+                if registration is not None:
+                    registration_value = _registration_json(registration)
         if registration_value is not None:
             if not isinstance(registration_value, dict):
                 raise ValueError("worktree registration record is malformed")
             registration = _registration(registration_value)
             if registration.worktree != worktree:
                 raise ValueError("recorded worktree path changed")
-            expected_registration_parent = common_git_dir / "worktrees"
+            if control is None or registration.control != control:
+                raise ValueError("recorded Git control binding changed")
+            expected_registration_parent = control.path / "worktrees"
             if registration.registration.parent != expected_registration_parent:
-                raise ValueError("registration parent escaped the common Git directory")
-            assert common_git_fd is not None
+                raise ValueError(
+                    "registration parent escaped the Git control directory"
+                )
+            assert git_control_fd is not None
             try:
                 registration_parent_fd = os.open(
                     b"worktrees",
                     os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                    dir_fd=common_git_fd,
+                    dir_fd=git_control_fd,
                 )
                 registration_parent_identity = identity_from_stat(
                     os.fstat(registration_parent_fd)
@@ -4028,8 +4677,11 @@ def _cleanup_worktree(
                 except FileNotFoundError:
                     pass
 
+        git_control_path = (
+            control.path if control is not None else attempt_dir / "git-control"
+        )
         registration_scan = enumerate_registration_conflicts(
-            common_git_dir=common_git_dir,
+            common_git_dir=git_control_path,
             worktree=worktree,
         )
         if registration is None:
@@ -4046,15 +4698,20 @@ def _cleanup_worktree(
                     evidence={"registration_scan": registration_scan},
                 )
 
-        info = inspect_repository(
-            repo=pathlib.Path(state["repo"]),
-            base_sha=state["base_sha"],
-            head_sha=state["head_sha"],
-            git_executable=state["git_executable"],
-        )
-
         if not worktree_present and not registration_present:
             require_no_registration_conflicts(registration_scan)
+            try:
+                os.lstat(git_control_path)
+            except FileNotFoundError:
+                pass
+            else:
+                if git_control_fd is not None:
+                    os.close(git_control_fd)
+                    git_control_fd = None
+                remove_sanitized_view(
+                    git_control_path,
+                    allow_partial=control is None,
+                )
             _cleanup_control_namespace(state)
             return commit_via_helper(
                 entrypoint=entrypoint,
@@ -4079,9 +4736,8 @@ def _cleanup_worktree(
         allocated = 0
         if worktree_present:
             allocated += allocated_bytes(worktree)
-        if registration_present:
-            assert registration is not None
-            allocated += allocated_bytes(registration.registration)
+        if control is not None:
+            allocated += allocated_bytes(control.path)
 
         if worktree_present:
             assert worktree_identity is not None
@@ -4140,7 +4796,7 @@ def _cleanup_worktree(
             if worktree_present
             else "registration-only"
         )
-        control_path, control_identity = _ensure_control_namespace(
+        cleanup_control_path, control_identity = _ensure_control_namespace(
             state,
             checkout_parent_fd=checkout_parent_fd,
             checkout_parent_identity=checkout_parent_identity,
@@ -4189,9 +4845,12 @@ def _cleanup_worktree(
             if type(entry_cap) is not int or type(payload_cap) is not int:
                 raise ValueError("targeted cleanup manifest bounds are malformed")
             manifest_path = pathlib.Path(
-                state.get("targeted_manifest_published", control_path / "manifest.bin")
+                state.get(
+                    "targeted_manifest_published",
+                    cleanup_control_path / "manifest.bin",
+                )
             )
-            if manifest_path != control_path / "manifest.bin":
+            if manifest_path != cleanup_control_path / "manifest.bin":
                 raise ValueError("targeted cleanup manifest path escaped its namespace")
             manifest = build_custodied_manifest(
                 roots=tuple(roots),
@@ -4315,13 +4974,22 @@ def _cleanup_worktree(
         )
 
         registration_scan = enumerate_registration_conflicts(
-            common_git_dir=common_git_dir,
+            common_git_dir=git_control_path,
             worktree=worktree,
         )
         require_no_registration_conflicts(registration_scan)
-        verify_worktree_absent(info, worktree)
+        if control is None:
+            raise ValueError("completed worktree cleanup has no Git control binding")
+        verify_worktree_absent(info, worktree, control)
         if manifest_seal is not None:
             remove_published_manifest(manifest_seal)
+        if registration_parent_fd is not None:
+            os.close(registration_parent_fd)
+            registration_parent_fd = None
+        if git_control_fd is not None:
+            os.close(git_control_fd)
+            git_control_fd = None
+        remove_sanitized_view(control.path)
         _cleanup_control_namespace(state, expected_identity=control_identity)
         completed_warning = {
             **cleanup_warning,
@@ -4366,10 +5034,11 @@ def _cleanup_worktree(
     except BaseException as error:
         if isinstance(error, UnprovenDirectHelperClosure):
             raise
-        if isinstance(
-            error, GitProcessClosureUnproven
-        ) and not retry_git_process_closure(error):
-            raise
+        if isinstance(error, GitProcessClosureUnproven):
+            if not retry_git_process_closure(error):
+                raise
+            error.finish_signal_deferral(deliver=False)
+            checkpoint_bound_signal_interrupt(force=True)
         require_direct_process_closure_proven()
         disk_state, _, disk_digest = read_bound_attempt_state(attempt)
         return _manual_worktree_recovery(
@@ -4385,6 +5054,8 @@ def _cleanup_worktree(
             manifest.close()
         if registration_parent_fd is not None:
             os.close(registration_parent_fd)
+        if git_control_fd is not None:
+            os.close(git_control_fd)
         if common_git_fd is not None:
             os.close(common_git_fd)
         if checkout_parent_fd is not None:
@@ -4622,11 +5293,11 @@ def attempt_supervisor_main(
     final_text: str | None = None
     abandoned = False
     attempt: AttemptLease | None = None
-    descriptors_owned = True
+    unsettled_terminal_summary: dict[str, Any] | None = None
+    start_identity: str | None = None
     try:
         handoff_deadline = time.monotonic() + HANDOFF_SECONDS
         start_identity = process_start_identity(os.getpid())
-        descriptors_owned = False
         attempt = _accept_attempt_transfer(
             control=outer,
             lease_fd=lease_fd,
@@ -4759,6 +5430,15 @@ def attempt_supervisor_main(
         if isinstance(error, OuterAbandoned):
             abandoned = True
         if (
+            isinstance(error, PrelaunchWorkerClosureUnproven)
+            and error.closure_receipt_status == "published"
+            and error.closure_receipt is not None
+        ):
+            unsettled_terminal_summary = build_unsettled_checkout_summary(
+                attempt_dir=attempt_dir,
+                receipt=error.closure_receipt,
+            )
+        if (
             isinstance(
                 error,
                 (UnprovenDirectHelperClosure, PrelaunchWorkerClosureUnproven),
@@ -4773,7 +5453,9 @@ def attempt_supervisor_main(
         ):
             try:
                 if attempt is None:
-                    raise ValueError("attempt lease is unavailable during failure recording")
+                    raise ValueError(
+                        "attempt lease is unavailable during failure recording"
+                    )
                 state, _, state_digest = read_bound_attempt_state(attempt)
                 state, state_digest = _record_failure(
                     entrypoint=entrypoint,
@@ -4798,6 +5480,19 @@ def attempt_supervisor_main(
             os.close(cleanup_lock_fd)
 
     if state is None or state_digest is None:
+        if unsettled_terminal_summary is not None:
+            try:
+                send_record(
+                    outer,
+                    {
+                        "type": "attempt-terminal",
+                        "token": handoff_token,
+                        "summary": unsettled_terminal_summary,
+                    },
+                    deadline=time.monotonic() + 5,
+                )
+            except BaseException:
+                pass
         outer.close()
         if attempt is not None:
             attempt.close()
@@ -4861,6 +5556,36 @@ def attempt_supervisor_main(
             )
             else 1
         )
+    except GitProcessClosureUnproven as error:
+        try:
+            if attempt is not None and state is not None and start_identity is not None:
+                try:
+                    current_state, _, _ = read_bound_attempt_state(attempt)
+                    receipt = _persist_attempt_git_closure_receipt(
+                        attempt=attempt,
+                        state=current_state,
+                        error=error,
+                        token=handoff_token,
+                        owner_start_identity=start_identity,
+                    )
+                    send_record(
+                        outer,
+                        {
+                            "type": "attempt-terminal",
+                            "token": handoff_token,
+                            "summary": build_unsettled_checkout_summary(
+                                attempt_dir=attempt_dir,
+                                receipt=receipt,
+                            ),
+                        },
+                        deadline=time.monotonic() + 5,
+                    )
+                except BaseException:
+                    pass
+        finally:
+            error.finish_signal_deferral(deliver=False)
+            checkpoint_bound_signal_interrupt(force=True)
+        return 2
     except BaseException:
         return 2
     finally:

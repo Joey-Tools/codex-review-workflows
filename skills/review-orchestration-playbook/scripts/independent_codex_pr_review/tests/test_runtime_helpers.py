@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -42,17 +43,22 @@ from review_supervisor.runtime import (
     _build_appserver_evidence_attestation,
     _kill_direct,
     _record_failure,
+    _read_checkout_closure_receipt,
     _run_checkout,
     _run_authenticated_review_boundary,
     _spawn_internal,
+    _validate_checkout_failed_record,
     _validate_final_authorization_updates,
     authorize_terminal_via_helper,
     attempt_supervisor_main,
     commit_via_helper,
     direct_process_closure_failure,
     publish_terminal_review,
+    _publish_checkout_closure_receipt,
     run_reviewer,
     settle_process_via_helper,
+    validate_checkout_closure_receipt,
+    validate_retained_git_control_paths,
     verify_prompt_via_helper,
 )
 from review_supervisor.secureio import (
@@ -125,6 +131,187 @@ class _FakeCatFileBatch:
 
 
 class RuntimeHelperTests(unittest.TestCase):
+    def test_retained_git_control_paths_are_closed_to_the_temporary_root(self) -> None:
+        attempt_dir = pathlib.Path("/private/review/attempt-1")
+        retained = attempt_dir / "codex-git-control-synthetic"
+        self.assertEqual(
+            validate_retained_git_control_paths(
+                [str(retained)],
+                attempt_dir=attempt_dir,
+            ),
+            (retained,),
+        )
+        self.assertEqual(
+            validate_retained_git_control_paths([], attempt_dir=attempt_dir),
+            (),
+        )
+        for malformed in (
+            [str(retained), str(retained)],
+            [str(retained.parent / "other-control")],
+            [str(retained / "nested")],
+            ["/tmp/codex-git-control-synthetic"],
+            ["relative/codex-git-control-synthetic"],
+        ):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(ValueError):
+                    validate_retained_git_control_paths(
+                        malformed,
+                        attempt_dir=attempt_dir,
+                    )
+
+    def test_checkout_closure_receipt_is_durable_and_failure_schema_is_closed(
+        self,
+    ) -> None:
+        with owned_temporary_directory("checkout-closure-receipt-") as root:
+            retention = root / "retention"
+            retention.mkdir(mode=0o700)
+            attempt = retention / f"attempt-1-{'a' * 32}"
+            attempt.mkdir(mode=0o700)
+            state = {
+                "schema_version": SCHEMA_VERSION,
+                "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+                "named_lane_eligible": NAMED_LANE_ELIGIBLE,
+                "attempt_id": f"1-{'a' * 32}",
+                "record_generation": 1,
+                "previous_record_sha256": None,
+            }
+            bind_attempt_state(
+                state,
+                retention_root=retention,
+                attempt_dir=attempt,
+            )
+            (attempt / "state.json").write_bytes(canonical_json(state))
+            (attempt / "state.json").chmod(0o600)
+            token = "a" * 64
+            worker = SpawnedProcess(
+                pid=200,
+                pgid=200,
+                acknowledgement_fd=-1,
+                passed_fd_numbers=(),
+                start_identity="darwin-proc-start:200:1",
+            )
+            receipt = validate_checkout_closure_receipt(
+                {
+                    "version": 1,
+                    "token": token,
+                    "worker": {
+                        "pid": worker.pid,
+                        "start_identity": worker.start_identity,
+                    },
+                    "process": {
+                        "identity_status": "anchored",
+                        "pid": 201,
+                        "pgid": 201,
+                        "start_identity": "darwin-proc-start:201:1",
+                    },
+                    "control_scope": "temporary",
+                    "retained_cleanup_paths": [
+                        str(attempt / "codex-git-control-synthetic")
+                    ],
+                },
+                attempt_dir=attempt,
+                token=token,
+                expected_worker=worker,
+            )
+            process_free_receipt = validate_checkout_closure_receipt(
+                {
+                    **receipt,
+                    "process": {
+                        "identity_status": "not-applicable",
+                        "pid": None,
+                        "pgid": None,
+                        "start_identity": None,
+                    },
+                },
+                attempt_dir=attempt,
+                token=token,
+                expected_worker=worker,
+            )
+            self.assertEqual(
+                process_free_receipt["process"]["identity_status"],
+                "not-applicable",
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "process-free checkout closure receipt",
+            ):
+                validate_checkout_closure_receipt(
+                    {
+                        **receipt,
+                        "process": {
+                            "identity_status": "not-applicable",
+                            "pid": 201,
+                            "pgid": None,
+                            "start_identity": None,
+                        },
+                    },
+                    attempt_dir=attempt,
+                    token=token,
+                    expected_worker=worker,
+                )
+            with acquire_retention_lease(
+                retention,
+                deadline=time.monotonic() + 5,
+            ) as lease:
+                with open_attempt_lease(lease, attempt) as attempt_lease:
+                    payload, digest = _publish_checkout_closure_receipt(
+                        attempt_lease,
+                        receipt,
+                    )
+                    self.assertEqual(payload, canonical_json(receipt))
+                    self.assertEqual(digest, sha256_bytes(payload))
+                    self.assertEqual(
+                        _read_checkout_closure_receipt(
+                            attempt_lease,
+                            token=token,
+                            expected_worker=worker,
+                        ),
+                        (receipt, digest),
+                    )
+            record = {
+                "type": "checkout-failed",
+                "token": token,
+                "status": "inconclusive",
+                "stage": "checkout",
+                "code": "checkout-worker-failed",
+                "error": "synthetic closure gap",
+                "closure": "unproven",
+                "closure_receipt": receipt,
+                "closure_receipt_sha256": digest,
+                "closure_receipt_status": "published",
+            }
+            self.assertEqual(
+                _validate_checkout_failed_record(
+                    record,
+                    attempt_dir=attempt,
+                    token=token,
+                    expected_worker=worker,
+                ),
+                record,
+            )
+            for field in record:
+                with self.subTest(field=field):
+                    malformed = dict(record)
+                    malformed.pop(field)
+                    with self.assertRaises(ValueError):
+                        _validate_checkout_failed_record(
+                            malformed,
+                            attempt_dir=attempt,
+                            token=token,
+                            expected_worker=worker,
+                        )
+            wrong_worker = dataclasses.replace(
+                worker,
+                start_identity="darwin-proc-start:200:2",
+            )
+            with self.assertRaisesRegex(ValueError, "wrong worker"):
+                _validate_checkout_failed_record(
+                    record,
+                    attempt_dir=attempt,
+                    token=token,
+                    expected_worker=wrong_worker,
+                )
+
     def test_checkout_phase0_failure_reaps_worker_before_classification(self) -> None:
         token = "01" * 32
         worker = SpawnedProcess(
@@ -140,11 +327,22 @@ class RuntimeHelperTests(unittest.TestCase):
             descendant_count=0,
             descendant_path_bytes=0,
         )
+        control_binding = {"synthetic": True}
+        registration_value = {
+            "control": control_binding,
+            "synthetic": True,
+        }
         records = (
+            {
+                "type": "git-control-created",
+                "token": token,
+                "binding": control_binding,
+                "state_sha256": "control-digest",
+            },
             {
                 "type": "worktree-created",
                 "token": token,
-                "registration": {"synthetic": True},
+                "registration": registration_value,
                 "state_sha256": "worker-digest",
             },
             {
@@ -155,11 +353,15 @@ class RuntimeHelperTests(unittest.TestCase):
             },
             {
                 "type": "checkout-failed",
+                "token": token,
                 "status": "inconclusive",
                 "stage": "checkout",
                 "code": "synthetic-phase0-failure",
-                "detached_process_closure": None,
                 "error": "synthetic phase-0 failure",
+                "closure": "proven",
+                "closure_receipt": None,
+                "closure_receipt_sha256": None,
+                "closure_receipt_status": "not-applicable",
             },
         )
 
@@ -177,19 +379,30 @@ class RuntimeHelperTests(unittest.TestCase):
             "worktree_path": "/tmp/review-worktree",
             "common_git_dir_binding": {"path": "/tmp/repository.git"},
         }
-        durable_worker_state = {
+        durable_control_state = {
             **initial_state,
             "record_generation": 3,
             "previous_record_sha256": "next-digest",
             "phase": "worktree-adding",
-            "worktree_status": "active",
+            "worktree_status": "adding",
             "worktree_create_intent": {
-                "version": 1,
+                "version": 2,
                 "worktree": "/tmp/review-worktree",
-                "registration_parent": "/tmp/repository.git/worktrees",
+                "control_git_dir": str(ENTRYPOINT.parent / "git-control"),
+                "registration_parent": str(
+                    ENTRYPOINT.parent / "git-control" / "worktrees"
+                ),
                 "lock_reason": f"independent-codex-pr-review:{token}",
             },
-            "registration": {"synthetic": True},
+            "git_control_binding": control_binding,
+            "registration": None,
+        }
+        durable_worker_state = {
+            **durable_control_state,
+            "record_generation": 4,
+            "previous_record_sha256": "control-digest",
+            "worktree_status": "active",
+            "registration": registration_value,
         }
 
         with (
@@ -216,6 +429,10 @@ class RuntimeHelperTests(unittest.TestCase):
             ),
             mock.patch("review_supervisor.runtime._authenticate_attempt_transfer"),
             mock.patch(
+                "review_supervisor.runtime._read_checkout_closure_receipt",
+                return_value=None,
+            ),
+            mock.patch(
                 "review_supervisor.runtime._registration",
                 return_value=registration,
             ),
@@ -225,7 +442,10 @@ class RuntimeHelperTests(unittest.TestCase):
             ),
             mock.patch(
                 "review_supervisor.runtime.read_bound_attempt_state",
-                return_value=(durable_worker_state, b"{}", "worker-digest"),
+                side_effect=(
+                    (durable_control_state, b"{}", "control-digest"),
+                    (durable_worker_state, b"{}", "worker-digest"),
+                ),
             ),
             mock.patch("review_supervisor.runtime.wait_terminal") as wait_terminal,
             mock.patch("review_supervisor.runtime.reap", return_value=1) as reap,
@@ -1253,6 +1473,12 @@ class RuntimeHelperTests(unittest.TestCase):
                 "repo": str(root),
                 "codex_executable": "/authenticated/codex",
                 "registration": {
+                    "control": {
+                        "path": str(root),
+                        "root_identity": identity.to_json(),
+                        "config_identity": identity.to_json(),
+                        "config_sha256": "0" * 64,
+                    },
                     "descendant_count": 1,
                     "descendant_path_bytes": 1,
                     "marker_identity": identity.to_json(),
@@ -1549,9 +1775,7 @@ class RuntimeHelperTests(unittest.TestCase):
                     retention,
                     deadline=time.monotonic() + 5,
                 ) as lease:
-                    with open_attempt_lease(
-                        lease, tampered_attempt
-                    ) as tampered_lease:
+                    with open_attempt_lease(lease, tampered_attempt) as tampered_lease:
                         with self.assertRaises(OuterAbandoned):
                             authorize_terminal_via_helper(
                                 entrypoint=ENTRYPOINT,

@@ -9,9 +9,11 @@ import selectors
 import signal
 import stat
 import subprocess
+import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Iterator
 
 from .constants import (
     MAX_BLOB_BYTES,
@@ -66,55 +68,139 @@ _CONFIG_KEY_PATTERN = re.compile(rb"^([A-Za-z][A-Za-z0-9-]*)")
 class GitProcessClosureUnproven(RuntimeError):
     def __init__(
         self,
-        process: subprocess.Popen[bytes],
+        process: subprocess.Popen[bytes] | None,
         group_anchor: SpawnedProcess | None,
         cleanup_error: BaseException,
     ) -> None:
+        if process is None and group_anchor is not None:
+            raise ValueError("a Git process-group anchor requires a process")
         self.process = process
-        self.pid = process.pid
+        self.pid = process.pid if process is not None else None
         self.group_anchor = group_anchor
+        self._post_closure_cleanup: list[
+            tuple[Callable[[], None], pathlib.Path | None]
+        ] = []
+        self._signal_deferral_releases: list[Callable[[bool], None]] = []
         identity = (
-            group_anchor.start_identity if group_anchor is not None else "unbound"
+            "not-applicable"
+            if process is None
+            else group_anchor.start_identity
+            if group_anchor is not None
+            else "unbound"
         )
         super().__init__(
-            "Git process closure is unproven: "
-            f"pid={process.pid}, start_identity={identity}, "
+            "Git process or control-resource closure is unproven: "
+            f"pid={self.pid}, start_identity={identity}, "
             f"cleanup_error={type(cleanup_error).__name__}"
         )
+
+    @property
+    def retained_cleanup_paths(self) -> tuple[pathlib.Path, ...]:
+        return tuple(path for _, path in self._post_closure_cleanup if path is not None)
+
+    @property
+    def process_receipt(self) -> dict[str, int | str | None]:
+        if self.process is None:
+            return {
+                "identity_status": "not-applicable",
+                "pid": None,
+                "pgid": None,
+                "start_identity": None,
+            }
+        anchor = self.group_anchor
+        return {
+            "identity_status": "anchored" if anchor is not None else "unbound",
+            "pid": self.pid,
+            "pgid": anchor.pgid if anchor is not None else None,
+            "start_identity": anchor.start_identity if anchor is not None else None,
+        }
+
+    def add_post_closure_cleanup(
+        self,
+        cleanup: Callable[[], None],
+        *,
+        retained_path: pathlib.Path | None = None,
+    ) -> None:
+        self._post_closure_cleanup.append((cleanup, retained_path))
+
+    def bind_signal_deferral_release(
+        self,
+        release: Callable[[bool], None],
+    ) -> None:
+        self._signal_deferral_releases.append(release)
+
+    def finish_signal_deferral(self, *, deliver: bool) -> None:
+        releases = self._signal_deferral_releases
+        self._signal_deferral_releases = []
+        errors: list[BaseException] = []
+        for release in releases:
+            try:
+                release(deliver)
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            raise errors[0]
+
+    def finish_post_closure_cleanup(self) -> bool:
+        while self._post_closure_cleanup:
+            cleanup, _ = self._post_closure_cleanup[0]
+            try:
+                cleanup()
+            except BaseException:
+                return False
+            self._post_closure_cleanup.pop(0)
+        return True
 
 
 def retry_git_process_closure(failure: GitProcessClosureUnproven) -> bool:
     process = failure.process
-    try:
-        if process.returncode is None:
-            if failure.group_anchor is None:
-                _abort_unanchored_fresh_session(process)
-            else:
-                _terminate_process(process, group_anchor=failure.group_anchor)
-    except BaseException:
-        return False
-    for stream in (process.stdin, process.stdout, process.stderr):
-        if stream is not None and not stream.closed:
-            stream.close()
-    checkpoint_bound_signal_interrupt(force=True)
-    return True
+    if process is not None:
+        try:
+            if process.returncode is None:
+                if failure.group_anchor is None:
+                    _abort_unanchored_fresh_session(process)
+                else:
+                    _terminate_process(process, group_anchor=failure.group_anchor)
+        except BaseException:
+            return False
+        try:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None and not stream.closed:
+                    stream.close()
+        except BaseException:
+            return False
+    post_closure_cleanup_complete = failure.finish_post_closure_cleanup()
+    return post_closure_cleanup_complete
 
 
 @dataclass(frozen=True)
 class RepositoryInfo:
     repo: pathlib.Path
     common_git_dir: pathlib.Path
+    object_directory: pathlib.Path
+    object_directory_identity: Identity
     object_format: str
     object_hex_length: int
     base_sha: str
     head_sha: str
     git_executable: str
+    temporary_control_parent: pathlib.Path | None = None
+    temporary_control_parent_identity: Identity | None = None
+
+
+@dataclass(frozen=True)
+class GitControlBinding:
+    path: pathlib.Path
+    root_identity: Identity
+    config_identity: Identity
+    config_sha256: str
 
 
 @dataclass(frozen=True)
 class WorktreeRegistration:
     worktree: pathlib.Path
     registration: pathlib.Path
+    control: GitControlBinding
     worktree_identity: Identity
     registration_identity: Identity
     marker_identity: Identity
@@ -130,6 +216,7 @@ def sanitized_git_environment(extra: dict[str, str] | None = None) -> dict[str, 
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_SYSTEM": "/dev/null",
         "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_COUNT": "0",
         "GIT_ATTR_NOSYSTEM": "1",
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_NO_LAZY_FETCH": "1",
@@ -400,6 +487,12 @@ def run_bounded(
                 group_anchor,
                 cleanup_error,
             )
+            if signal_scope is not None:
+                transferred_scope = signal_scope
+                signal_scope = None
+                closure_failure.bind_signal_deferral_release(
+                    lambda deliver: transferred_scope.finish(deliver=deliver)
+                )
             pending_error = closure_failure
             raise closure_failure from error
         checkpoint_bound_signal_interrupt(force=True)
@@ -666,7 +759,11 @@ def _preflight_local_git_config(repo: pathlib.Path) -> tuple[pathlib.Path, str]:
             max_bytes=LOCAL_CONFIG_BYTES_LIMIT,
         )
         if config is None:
-            raise ValueError("source repository has no local config")
+            raise FileNotFoundError(
+                errno.ENOENT,
+                "source repository has no local config",
+                common / "config",
+            )
         object_format = _reject_local_config_includes(
             config,
             label="source repository config",
@@ -699,6 +796,7 @@ def inspect_repository(
     base_sha: str,
     head_sha: str,
     git_executable: str,
+    temporary_control_parent: pathlib.Path | None = None,
 ) -> RepositoryInfo:
     executable = pathlib.Path(git_executable)
     if not executable.is_absolute():
@@ -720,60 +818,117 @@ def inspect_repository(
         )
     canonical_repo = repo.resolve(strict=True)
     try:
-        common, preflight_object_format = _preflight_local_git_config(
-            canonical_repo
-        )
-    except (OSError, ValueError) as error:
+        common, preflight_object_format = _preflight_local_git_config(canonical_repo)
+    except FileNotFoundError as error:
         raise blocked(
-            f"cannot authenticate repository local config: {error}",
+            f"repository local config or metadata is missing: {error}",
             stage="git-preflight",
-            code="frozen-range-invalid",
+            code="git-config-missing",
         ) from error
-    environment = sanitized_git_environment()
+    except OSError as error:
+        if error.errno == errno.ESTALE:
+            message = "repository local config or metadata failed revalidation"
+            code = "git-config-revalidation-mismatch"
+        elif error.errno in {
+            errno.EPERM,
+            errno.ELOOP,
+            errno.ENOTDIR,
+            errno.EINVAL,
+            errno.EMLINK,
+        }:
+            message = "repository local config or metadata mismatched access policy"
+            code = "git-config-policy-mismatch"
+        else:
+            message = "repository local config or metadata is unreadable"
+            code = "git-config-unreadable"
+        raise blocked(
+            f"{message}: {error}",
+            stage="git-preflight",
+            code=code,
+        ) from error
+    except ValueError as error:
+        raise blocked(
+            f"repository local config or metadata mismatched policy: {error}",
+            stage="git-preflight",
+            code="git-config-mismatch",
+        ) from error
+    try:
+        objects = common / "objects"
+        objects_fd, objects_identity = open_absolute_directory_chain(objects)
+        os.close(objects_fd)
+    except FileNotFoundError as error:
+        raise blocked(
+            f"repository object directory is missing: {error}",
+            stage="git-preflight",
+            code="git-object-directory-missing",
+        ) from error
+    except OSError as error:
+        raise blocked(
+            f"repository object directory is unreadable: {error}",
+            stage="git-preflight",
+            code="git-object-directory-unreadable",
+        ) from error
 
-    def query(*arguments: str, cap: int = 8192) -> bytes:
-        checked_common, checked_format = _preflight_local_git_config(canonical_repo)
-        if checked_common != common or checked_format != preflight_object_format:
-            raise OSError("source repository config binding changed before Git")
-        argv = (
-            str(executable),
-            "-C",
-            str(canonical_repo),
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-            *arguments,
+    temporary_control_parent_identity: Identity | None = None
+    if temporary_control_parent is not None:
+        if (
+            not temporary_control_parent.is_absolute()
+            or temporary_control_parent
+            != pathlib.Path(os.path.abspath(temporary_control_parent))
+        ):
+            raise blocked(
+                "temporary Git control parent is not canonical",
+                stage="git-preflight",
+                code="git-control-parent-invalid",
+            )
+        temporary_parent_fd, temporary_control_parent_identity = (
+            open_absolute_directory_chain(temporary_control_parent)
         )
-        code, stdout, stderr = run_bounded(
-            argv,
-            cwd=canonical_repo,
-            environment=environment,
-            timeout=15,
-            stdout_limit=cap,
-            stderr_limit=8192,
-        )
-        if code != 0:
-            raise ValueError(_git_error(argv, stderr))
-        checked_common, checked_format = _preflight_local_git_config(canonical_repo)
-        if checked_common != common or checked_format != preflight_object_format:
-            raise OSError("source repository config binding changed after Git")
-        return stdout.strip()
+        try:
+            validate_private_directory_fd(
+                temporary_parent_fd,
+                temporary_control_parent,
+            )
+        finally:
+            os.close(temporary_parent_fd)
+
+    width = 40 if preflight_object_format == "sha1" else 64
+    provisional = RepositoryInfo(
+        repo=canonical_repo,
+        common_git_dir=common,
+        object_directory=objects,
+        object_directory_identity=objects_identity,
+        object_format=preflight_object_format,
+        object_hex_length=width,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        git_executable=str(executable),
+        temporary_control_parent=temporary_control_parent,
+        temporary_control_parent_identity=temporary_control_parent_identity,
+    )
 
     try:
-        common_raw = query("rev-parse", "--path-format=absolute", "--git-common-dir")
-        format_raw = query("rev-parse", "--show-object-format")
-        resolved_base = query("rev-parse", "--verify", f"{base_sha}^{{commit}}")
-        resolved_head = query("rev-parse", "--verify", f"{head_sha}^{{commit}}")
-        queried_common = pathlib.Path(os.fsdecode(common_raw)).resolve(strict=True)
-        if queried_common != common:
-            raise ValueError("Git common directory differs from no-follow preflight")
-        if format_raw not in {b"sha1", b"sha256"}:
-            raise ValueError("repository object format is unsupported")
-        object_format = format_raw.decode("ascii")
-        if object_format != preflight_object_format:
-            raise ValueError("Git object format differs from no-follow preflight")
-        width = 40 if object_format == "sha1" else 64
+        with temporary_git_control(provisional) as control:
+
+            def query(*arguments: str, cap: int = 8192) -> bytes:
+                argv = _git_control_argv(provisional, control, *arguments)
+                code, stdout, stderr = run_bounded(
+                    argv,
+                    cwd=control.path.parent,
+                    environment=_git_control_environment(provisional, control),
+                    timeout=15,
+                    stdout_limit=cap,
+                    stderr_limit=8192,
+                )
+                if code != 0:
+                    raise ValueError(_git_error(argv, stderr))
+                return stdout.strip()
+
+            format_raw = query("rev-parse", "--show-object-format")
+            resolved_base = query("rev-parse", "--verify", f"{base_sha}^{{commit}}")
+            resolved_head = query("rev-parse", "--verify", f"{head_sha}^{{commit}}")
+        if format_raw.decode("ascii", "strict") != preflight_object_format:
+            raise ValueError("private Git control view has the wrong object format")
         if (
             resolved_base.decode("ascii") != base_sha
             or resolved_head.decode("ascii") != head_sha
@@ -783,20 +938,8 @@ def inspect_repository(
             )
         if len(base_sha) != width or len(head_sha) != width:
             raise ValueError("commit IDs do not match the repository object format")
-        common_fd, _ = open_absolute_directory_chain(common)
-        os.close(common_fd)
-        objects = common / "objects"
-        objects_fd, _ = open_absolute_directory_chain(objects)
-        os.close(objects_fd)
-        return RepositoryInfo(
-            repo=canonical_repo,
-            common_git_dir=common,
-            object_format=object_format,
-            object_hex_length=width,
-            base_sha=base_sha,
-            head_sha=head_sha,
-            git_executable=str(executable),
-        )
+        _revalidate_object_directory(provisional)
+        return provisional
     except GitProcessClosureUnproven:
         raise
     except Exception as error:
@@ -861,31 +1004,253 @@ def validate_raw_path(path: bytes) -> None:
             raise ValueError("tree path has an invalid component")
 
 
-def enumerate_tree(info: RepositoryInfo, commit: str) -> TreeManifest:
-    argv = (
+def _revalidate_object_directory(info: RepositoryInfo) -> None:
+    descriptor, observed = open_absolute_directory_chain(info.object_directory)
+    try:
+        if not directory_identities_match(
+            observed,
+            info.object_directory_identity,
+        ):
+            raise OSError(
+                errno.ESTALE,
+                "repository object directory identity or access policy changed",
+            )
+    finally:
+        os.close(descriptor)
+
+
+def _git_control_argv(
+    info: RepositoryInfo,
+    control: GitControlBinding,
+    *arguments: str,
+) -> tuple[str, ...]:
+    return (
         info.git_executable,
         "--git-dir",
-        str(info.common_git_dir),
+        str(control.path),
         "-c",
         "core.hooksPath=/dev/null",
         "-c",
         "core.fsmonitor=false",
-        "ls-tree",
-        "-rz",
-        "-l",
-        "--full-tree",
-        "-r",
-        commit,
+        *arguments,
     )
+
+
+def _git_control_environment(
+    info: RepositoryInfo,
+    control: GitControlBinding,
+    extra: dict[str, str] | None = None,
+) -> dict[str, str]:
+    revalidate_git_control(info, control)
+    _revalidate_object_directory(info)
+    values = {
+        "GIT_DIR": str(control.path),
+        "GIT_OBJECT_DIRECTORY": str(info.object_directory),
+    }
+    if extra:
+        values.update(extra)
+    return sanitized_git_environment(values)
+
+
+@contextmanager
+def temporary_git_control(
+    info: RepositoryInfo,
+) -> Iterator[GitControlBinding]:
+    signal_scope = begin_bound_signal_deferral()
     try:
-        code, stdout, stderr = run_bounded(
-            argv,
-            cwd=info.repo,
-            environment=sanitized_git_environment(),
-            timeout=120,
-            stdout_limit=MAX_TREE_METADATA_BYTES,
-            stderr_limit=8192,
+        try:
+            parent, binding = _create_temporary_git_control(info)
+        except GitProcessClosureUnproven as failure:
+            if signal_scope is not None:
+                transferred_scope = signal_scope
+                signal_scope = None
+                failure.bind_signal_deferral_release(
+                    lambda deliver: transferred_scope.finish(deliver=deliver)
+                )
+            raise
+        try:
+            yield binding
+        except GitProcessClosureUnproven as failure:
+            failure.add_post_closure_cleanup(
+                lambda: _cleanup_temporary_git_control(info, parent, binding.path),
+                retained_path=parent,
+            )
+            if signal_scope is not None:
+                transferred_scope = signal_scope
+                signal_scope = None
+                failure.bind_signal_deferral_release(
+                    lambda deliver: transferred_scope.finish(deliver=deliver)
+                )
+            raise
+        except BaseException as error:
+            try:
+                _cleanup_temporary_git_control(info, parent, binding.path)
+            except BaseException as cleanup_error:
+                failure = GitProcessClosureUnproven(None, None, cleanup_error)
+                failure.add_post_closure_cleanup(
+                    lambda: _cleanup_temporary_git_control(
+                        info,
+                        parent,
+                        binding.path,
+                    ),
+                    retained_path=parent,
+                )
+                if signal_scope is not None:
+                    transferred_scope = signal_scope
+                    signal_scope = None
+                    failure.bind_signal_deferral_release(
+                        lambda deliver: transferred_scope.finish(deliver=deliver)
+                    )
+                raise failure from error
+            raise
+        else:
+            try:
+                _cleanup_temporary_git_control(info, parent, binding.path)
+            except BaseException as cleanup_error:
+                failure = GitProcessClosureUnproven(None, None, cleanup_error)
+                failure.add_post_closure_cleanup(
+                    lambda: _cleanup_temporary_git_control(
+                        info,
+                        parent,
+                        binding.path,
+                    ),
+                    retained_path=parent,
+                )
+                if signal_scope is not None:
+                    transferred_scope = signal_scope
+                    signal_scope = None
+                    failure.bind_signal_deferral_release(
+                        lambda deliver: transferred_scope.finish(deliver=deliver)
+                    )
+                raise failure from cleanup_error
+    finally:
+        if signal_scope is not None:
+            signal_scope.finish()
+
+
+def _open_bound_temporary_control_parent(
+    info: RepositoryInfo,
+    path: pathlib.Path,
+) -> int:
+    descriptor, identity = open_absolute_directory_chain(path)
+    try:
+        expected_path = info.temporary_control_parent
+        expected_identity = info.temporary_control_parent_identity
+        if (expected_path is None) != (expected_identity is None):
+            raise ValueError("temporary Git control parent binding is incomplete")
+        if expected_path is not None:
+            assert expected_identity is not None
+            if path != expected_path:
+                raise OSError(
+                    errno.ESTALE,
+                    "temporary Git control parent path changed",
+                )
+            validate_private_directory_fd(descriptor, path)
+            if not directory_identities_match(identity, expected_identity):
+                raise OSError(
+                    errno.ESTALE,
+                    "temporary Git control parent identity changed",
+                )
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _create_temporary_git_control(
+    info: RepositoryInfo,
+) -> tuple[pathlib.Path, GitControlBinding]:
+    temporary_parent = info.temporary_control_parent
+    expected_parent_identity = info.temporary_control_parent_identity
+    if (temporary_parent is None) != (expected_parent_identity is None):
+        raise ValueError("temporary Git control parent binding is incomplete")
+    if temporary_parent is not None:
+        parent_fd = _open_bound_temporary_control_parent(info, temporary_parent)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    parent = pathlib.Path(
+        tempfile.mkdtemp(
+            prefix="codex-git-control-",
+            dir=temporary_parent,
         )
+    )
+    control = parent / "git"
+    parent_root_fd: int | None = None
+    try:
+        parent_root_fd = _open_bound_temporary_control_parent(info, parent.parent)
+        os.fsync(parent_root_fd)
+        binding = create_sanitized_view(info, control)
+        if temporary_parent is not None:
+            parent_fd = _open_bound_temporary_control_parent(info, temporary_parent)
+            os.close(parent_fd)
+        return parent, binding
+    except BaseException as error:
+        try:
+            _cleanup_temporary_git_control(info, parent, control)
+        except BaseException as cleanup_error:
+            failure = GitProcessClosureUnproven(None, None, cleanup_error)
+            failure.add_post_closure_cleanup(
+                lambda: _cleanup_temporary_git_control(info, parent, control),
+                retained_path=parent,
+            )
+            raise failure from error
+        raise
+    finally:
+        if parent_root_fd is not None:
+            os.close(parent_root_fd)
+
+
+def _cleanup_temporary_git_control(
+    info: RepositoryInfo,
+    parent: pathlib.Path,
+    control: pathlib.Path,
+) -> None:
+    parent_root_fd = _open_bound_temporary_control_parent(info, parent.parent)
+    try:
+        try:
+            os.stat(
+                os.fsencode(parent.name),
+                dir_fd=parent_root_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            os.fsync(parent_root_fd)
+            return
+        try:
+            os.lstat(control)
+        except FileNotFoundError:
+            pass
+        else:
+            remove_sanitized_view(control, allow_partial=True)
+        os.rmdir(os.fsencode(parent.name), dir_fd=parent_root_fd)
+        os.fsync(parent_root_fd)
+    finally:
+        os.close(parent_root_fd)
+
+
+def enumerate_tree(info: RepositoryInfo, commit: str) -> TreeManifest:
+    try:
+        with temporary_git_control(info) as control:
+            argv = _git_control_argv(
+                info,
+                control,
+                "ls-tree",
+                "-rz",
+                "-l",
+                "--full-tree",
+                "-r",
+                commit,
+            )
+            code, stdout, stderr = run_bounded(
+                argv,
+                cwd=control.path.parent,
+                environment=_git_control_environment(info, control),
+                timeout=120,
+                stdout_limit=MAX_TREE_METADATA_BYTES,
+                stderr_limit=8192,
+            )
     except (TimeoutError, OverflowError) as error:
         raise inconclusive(
             f"frozen tree enumeration did not complete safely: {error}",
@@ -968,23 +1333,23 @@ def manifest_digest(manifest: TreeManifest) -> str:
 class CatFileBatch:
     def __init__(self, info: RepositoryInfo) -> None:
         self.info = info
-        argv = (
-            info.git_executable,
-            "--git-dir",
-            str(info.common_git_dir),
-            "-c",
-            "core.hooksPath=/dev/null",
-            "cat-file",
-            "--batch",
-        )
         process: subprocess.Popen[bytes] | None = None
         group_anchor: SpawnedProcess | None = None
+        self._control_parent: pathlib.Path | None = None
+        self.control: GitControlBinding | None = None
         self._signal_scope: DeferredSignalScope | None = begin_bound_signal_deferral()
         try:
+            self._control_parent, self.control = _create_temporary_git_control(info)
+            argv = _git_control_argv(
+                info,
+                self.control,
+                "cat-file",
+                "--batch",
+            )
             process = subprocess.Popen(
                 argv,
-                cwd=info.repo,
-                env=sanitized_git_environment(),
+                cwd=self.control.path.parent,
+                env=_git_control_environment(info, self.control),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1003,6 +1368,9 @@ class CatFileBatch:
                 or process.stderr is None
             ):
                 raise RuntimeError("cannot create cat-file batch pipes")
+        except GitProcessClosureUnproven as failure:
+            self._attach_signal_deferral(failure)
+            raise
         except BaseException as error:
             try:
                 try:
@@ -1025,12 +1393,22 @@ class CatFileBatch:
                                 stream.close()
             except BaseException as cleanup_error:
                 assert process is not None
-                raise GitProcessClosureUnproven(
+                failure = GitProcessClosureUnproven(
                     process,
                     group_anchor,
                     cleanup_error,
+                )
+                self._attach_post_closure_cleanup(failure)
+                self._attach_signal_deferral(failure)
+                raise failure from error
+            try:
+                self._cleanup_private_control()
+            except BaseException as cleanup_error:
+                raise self._control_cleanup_failure(
+                    cleanup_error,
                 ) from error
-            self._finish_signal_scope()
+            else:
+                self._finish_signal_scope()
             raise
         self.requests = 0
         self.closed = False
@@ -1042,6 +1420,60 @@ class CatFileBatch:
             return
         self._signal_scope = None
         scope.finish(deliver=deliver)
+
+    def _attach_post_closure_cleanup(
+        self,
+        failure: GitProcessClosureUnproven,
+    ) -> None:
+        failure.add_post_closure_cleanup(
+            self._finish_after_unproven_closure,
+            retained_path=self._control_parent,
+        )
+
+    def _attach_signal_deferral(
+        self,
+        failure: GitProcessClosureUnproven,
+    ) -> None:
+        failure.bind_signal_deferral_release(
+            lambda deliver: self._finish_signal_scope(deliver=deliver)
+        )
+
+    def _finish_after_unproven_closure(self) -> None:
+        process = getattr(self, "process", None)
+        if process is not None:
+            for stream in (
+                process.stdin,
+                process.stdout,
+                process.stderr,
+            ):
+                if stream is not None and not stream.closed:
+                    stream.close()
+        self.closed = True
+        self._cleanup_private_control()
+
+    def _control_cleanup_failure(
+        self,
+        cleanup_error: BaseException,
+    ) -> GitProcessClosureUnproven:
+        process = getattr(self, "process", None)
+        group_anchor = getattr(self, "group_anchor", None)
+        failure = GitProcessClosureUnproven(
+            process,
+            group_anchor if process is not None else None,
+            cleanup_error,
+        )
+        self._attach_post_closure_cleanup(failure)
+        self._attach_signal_deferral(failure)
+        return failure
+
+    def _cleanup_private_control(self) -> None:
+        parent = self._control_parent
+        control = self.control
+        if parent is None or control is None:
+            return
+        _cleanup_temporary_git_control(self.info, parent, control.path)
+        self._control_parent = None
+        self.control = None
 
     def read_blob(
         self,
@@ -1246,7 +1678,14 @@ class CatFileBatch:
                     if stream is not None and not stream.closed:
                         stream.close()
                 self.closed = True
-                self._finish_signal_scope()
+                try:
+                    self._cleanup_private_control()
+                except BaseException as cleanup_error:
+                    raise self._control_cleanup_failure(
+                        cleanup_error,
+                    ) from cleanup_error
+                else:
+                    self._finish_signal_scope()
         if extra:
             raise ValueError("cat-file emitted bytes after the exact request stream")
         if len(stderr) > CAT_FILE_STDERR_LIMIT_BYTES or returncode != 0:
@@ -1263,11 +1702,14 @@ class CatFileBatch:
                 group_anchor=self.group_anchor,
             )
         except BaseException as cleanup_error:
-            raise GitProcessClosureUnproven(
+            failure = GitProcessClosureUnproven(
                 self.process,
                 self.group_anchor,
                 cleanup_error,
-            ) from error
+            )
+            self._attach_post_closure_cleanup(failure)
+            self._attach_signal_deferral(failure)
+            raise failure from error
 
     def abort(self) -> None:
         if self.closed:
@@ -1279,11 +1721,14 @@ class CatFileBatch:
                     group_anchor=self.group_anchor,
                 )
         except BaseException as cleanup_error:
-            raise GitProcessClosureUnproven(
+            failure = GitProcessClosureUnproven(
                 self.process,
                 self.group_anchor,
                 cleanup_error,
-            ) from cleanup_error
+            )
+            self._attach_post_closure_cleanup(failure)
+            self._attach_signal_deferral(failure)
+            raise failure from cleanup_error
         for stream in (
             self.process.stdin,
             self.process.stdout,
@@ -1292,7 +1737,12 @@ class CatFileBatch:
             if stream is not None and not stream.closed:
                 stream.close()
         self.closed = True
-        self._finish_signal_scope()
+        try:
+            self._cleanup_private_control()
+        except BaseException as cleanup_error:
+            raise self._control_cleanup_failure(cleanup_error) from cleanup_error
+        else:
+            self._finish_signal_scope()
 
     def __enter__(self) -> "CatFileBatch":
         return self
@@ -1304,17 +1754,8 @@ class CatFileBatch:
             self.abort()
 
 
-def _git_worktree_argv(info: RepositoryInfo, *args: str) -> tuple[str, ...]:
-    return (
-        info.git_executable,
-        "-C",
-        str(info.repo),
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-c",
-        "core.fsmonitor=false",
-        *args,
-    )
+def control_git_dir_for_worktree(path: pathlib.Path) -> pathlib.Path:
+    return path.parent / f".{path.name}.git-control"
 
 
 def add_detached_worktree(
@@ -1322,6 +1763,7 @@ def add_detached_worktree(
     path: pathlib.Path,
     *,
     lock_reason: str = "independent-codex-pr-review",
+    control: GitControlBinding | None = None,
 ) -> WorktreeRegistration:
     if (
         not isinstance(lock_reason, str)
@@ -1330,8 +1772,16 @@ def add_detached_worktree(
         or any(character in lock_reason for character in ("\0", "\r", "\n"))
     ):
         raise ValueError("worktree lock reason is invalid")
-    argv = _git_worktree_argv(
+    if control is None:
+        control = create_sanitized_view(
+            info,
+            control_git_dir_for_worktree(path),
+        )
+    else:
+        revalidate_git_control(info, control)
+    argv = _git_control_argv(
         info,
+        control,
         "worktree",
         "add",
         "--detach",
@@ -1345,8 +1795,8 @@ def add_detached_worktree(
     )
     code, _, stderr = run_bounded(
         argv,
-        cwd=info.repo,
-        environment=sanitized_git_environment(),
+        cwd=path.parent,
+        environment=_git_control_environment(info, control),
         timeout=120,
         stdout_limit=8 * 1024 * 1024,
         stderr_limit=8 * 1024 * 1024,
@@ -1379,7 +1829,7 @@ def add_detached_worktree(
     registration = pathlib.Path(os.fsdecode(marker[len(b"gitdir: ") : -1])).resolve(
         strict=True
     )
-    expected_parent = (info.common_git_dir / "worktrees").resolve(strict=True)
+    expected_parent = (control.path / "worktrees").resolve(strict=True)
     if registration.parent != expected_parent:
         raise ValueError(
             "worktree registration is outside the common Git worktrees directory"
@@ -1408,6 +1858,7 @@ def add_detached_worktree(
     return WorktreeRegistration(
         worktree=path,
         registration=registration,
+        control=control,
         worktree_identity=worktree_identity,
         registration_identity=registration_identity,
         marker_identity=marker_identity,
@@ -1426,9 +1877,7 @@ def enumerate_registration_fd(root_fd: int) -> tuple[int, int]:
             try:
                 names = tuple(os.fsencode(name) for name in os.listdir(current_fd))
                 if len(names) > REGISTRATION_DESCENDANT_COUNT_CAP + 1:
-                    raise ValueError(
-                        "worktree registration exceeds its descendant cap"
-                    )
+                    raise ValueError("worktree registration exceeds its descendant cap")
                 for name in names:
                     relative = name if not prefix else prefix + b"/" + name
                     count += 1
@@ -1448,10 +1897,7 @@ def enumerate_registration_fd(root_fd: int) -> tuple[int, int]:
                     if stat.S_ISDIR(metadata.st_mode):
                         child_fd = os.open(
                             name,
-                            os.O_RDONLY
-                            | os.O_DIRECTORY
-                            | os.O_CLOEXEC
-                            | os.O_NOFOLLOW,
+                            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
                             dir_fd=current_fd,
                         )
                         if not directory_identities_match(
@@ -1481,16 +1927,17 @@ def enumerate_registration(path: pathlib.Path) -> tuple[int, int]:
 
 
 def initialize_index(info: RepositoryInfo, registration: WorktreeRegistration) -> None:
-    environment = sanitized_git_environment(
+    environment = _git_control_environment(
+        info,
+        registration.control,
         {
-            "GIT_DIR": str(registration.registration),
             "GIT_WORK_TREE": str(registration.worktree),
-        }
+            "GIT_INDEX_FILE": str(registration.registration / "index"),
+        },
     )
-    argv = (
-        info.git_executable,
-        "-c",
-        "core.hooksPath=/dev/null",
+    argv = _git_control_argv(
+        info,
+        registration.control,
         "-c",
         "core.fsmonitor=false",
         "-c",
@@ -1517,7 +1964,103 @@ def initialize_index(info: RepositoryInfo, registration: WorktreeRegistration) -
         raise ValueError(_git_error(argv, stderr))
 
 
-def create_sanitized_view(info: RepositoryInfo, view: pathlib.Path) -> None:
+def _git_control_config(info: RepositoryInfo) -> bytes:
+    repository_format_version = 1 if info.object_format == "sha256" else 0
+    config = (
+        b"[core]\n\trepositoryformatversion = "
+        + str(repository_format_version).encode("ascii")
+        + b"\n\tbare = true\n"
+        + b"\thooksPath = /dev/null\n"
+        + b"\tfsmonitor = false\n"
+    )
+    if info.object_format == "sha256":
+        config += b"[extensions]\n\tobjectFormat = sha256\n"
+    return config
+
+
+def _read_git_control_binding_once(
+    info: RepositoryInfo,
+    view: pathlib.Path,
+) -> GitControlBinding:
+    view_fd, root_identity = open_absolute_directory_chain(
+        view,
+        private_leaf=True,
+    )
+    try:
+        config_fd, config_identity = open_regular_at(
+            view_fd,
+            b"config",
+            expected_uid=os.getuid(),
+            private_metadata=True,
+        )
+        try:
+            if stat.S_IMODE(config_identity.mode) != 0o400:
+                raise OSError(
+                    errno.EPERM,
+                    "private Git control config access policy is unsafe",
+                )
+            config = read_fd_exact(
+                config_fd,
+                max_bytes=LOCAL_CONFIG_BYTES_LIMIT,
+                expected_size=config_identity.size,
+            )
+        finally:
+            os.close(config_fd)
+    finally:
+        os.close(view_fd)
+    expected = _git_control_config(info)
+    if config != expected:
+        raise ValueError("private Git control config content mismatched")
+    return GitControlBinding(
+        path=view,
+        root_identity=root_identity,
+        config_identity=config_identity,
+        config_sha256=hashlib.sha256(config).hexdigest(),
+    )
+
+
+def _read_git_control_binding(
+    info: RepositoryInfo,
+    view: pathlib.Path,
+) -> GitControlBinding:
+    for attempt in range(2):
+        try:
+            return _read_git_control_binding_once(info, view)
+        except OSError as error:
+            if error.errno != errno.ESTALE or attempt:
+                raise
+    raise AssertionError("unreachable Git control revalidation state")
+
+
+def revalidate_git_control(
+    info: RepositoryInfo,
+    control: GitControlBinding,
+) -> None:
+    observed = _read_git_control_binding(info, control.path)
+    if not directory_identities_match(
+        observed.root_identity,
+        control.root_identity,
+    ):
+        raise OSError(
+            errno.ESTALE,
+            "private Git control directory identity or access policy changed",
+        )
+    if observed.config_identity != control.config_identity:
+        raise OSError(
+            errno.ESTALE,
+            "private Git control config identity or access policy changed",
+        )
+    if observed.config_sha256 != control.config_sha256:
+        raise OSError(
+            errno.ESTALE,
+            "private Git control config content changed",
+        )
+
+
+def create_sanitized_view(
+    info: RepositoryInfo,
+    view: pathlib.Path,
+) -> GitControlBinding:
     parent_fd, _ = open_absolute_directory_chain(view.parent, private_leaf=True)
     view_fd: int | None = None
     try:
@@ -1529,7 +2072,7 @@ def create_sanitized_view(info: RepositoryInfo, view: pathlib.Path) -> None:
             dir_fd=parent_fd,
         )
         validate_private_directory_fd(view_fd, view)
-        for name in ("objects", "refs"):
+        for name in ("objects", "refs", "worktrees"):
             os.mkdir(os.fsencode(name), 0o700, dir_fd=view_fd)
             child_fd = os.open(
                 os.fsencode(name),
@@ -1545,16 +2088,9 @@ def create_sanitized_view(info: RepositoryInfo, view: pathlib.Path) -> None:
         if view_fd is not None:
             os.close(view_fd)
         os.close(parent_fd)
-    repository_format_version = 1 if info.object_format == "sha256" else 0
-    config = (
-        b"[core]\n\trepositoryformatversion = "
-        + str(repository_format_version).encode("ascii")
-        + b"\n\tbare = true\n"
-    )
-    if info.object_format == "sha256":
-        config += b"[extensions]\n\tobjectFormat = sha256\n"
-    publish_bytes(view / "config", config)
+    publish_bytes(view / "config", _git_control_config(info), mode=0o400)
     publish_bytes(view / "HEAD", b"ref: refs/heads/invalid\n")
+    return _read_git_control_binding(info, view)
 
 
 def remove_sanitized_view(view: pathlib.Path, *, allow_partial: bool = False) -> None:
@@ -1562,6 +2098,7 @@ def remove_sanitized_view(view: pathlib.Path, *, allow_partial: bool = False) ->
     view_fd: int | None = None
     objects_fd: int | None = None
     refs_fd: int | None = None
+    worktrees_fd: int | None = None
     try:
         view_fd = os.open(
             os.fsencode(view.name),
@@ -1573,11 +2110,13 @@ def remove_sanitized_view(view: pathlib.Path, *, allow_partial: bool = False) ->
         if view_stat.st_uid != os.getuid() or stat.S_IMODE(view_stat.st_mode) != 0o700:
             raise ValueError("sanitized Git view root identity is unsafe")
         names = {os.fsencode(value) for value in os.listdir(view_fd)}
-        expected_names = {b"HEAD", b"config", b"objects", b"refs"}
+        required_names = {b"HEAD", b"config", b"objects", b"refs"}
+        expected_names = required_names | {b"worktrees"}
         if (
-            not allow_partial and names != expected_names
+            not allow_partial and not required_names <= names
         ) or not names <= expected_names:
-            raise ValueError("sanitized Git view entry set changed")
+            rendered = sorted(os.fsdecode(name) for name in names)
+            raise ValueError(f"sanitized Git view entry set changed: {rendered!r}")
         for name in (b"HEAD", b"config"):
             if name not in names:
                 continue
@@ -1614,6 +2153,21 @@ def remove_sanitized_view(view: pathlib.Path, *, allow_partial: bool = False) ->
                 or os.listdir(refs_fd)
             ):
                 raise ValueError("sanitized Git refs view is not empty and private")
+        if b"worktrees" in names:
+            worktrees_fd = os.open(
+                b"worktrees",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=view_fd,
+            )
+            worktrees_stat = os.fstat(worktrees_fd)
+            if (
+                worktrees_stat.st_uid != os.getuid()
+                or stat.S_IMODE(worktrees_stat.st_mode) != 0o700
+                or os.listdir(worktrees_fd)
+            ):
+                raise ValueError(
+                    "sanitized Git worktree registry is not empty and private"
+                )
         for name in (b"HEAD", b"config"):
             if name in names:
                 os.unlink(name, dir_fd=view_fd)
@@ -1625,6 +2179,10 @@ def remove_sanitized_view(view: pathlib.Path, *, allow_partial: bool = False) ->
             os.close(refs_fd)
             refs_fd = None
             os.rmdir(b"refs", dir_fd=view_fd)
+        if worktrees_fd is not None:
+            os.close(worktrees_fd)
+            worktrees_fd = None
+            os.rmdir(b"worktrees", dir_fd=view_fd)
         os.fsync(view_fd)
         os.close(view_fd)
         view_fd = None
@@ -1635,6 +2193,8 @@ def remove_sanitized_view(view: pathlib.Path, *, allow_partial: bool = False) ->
             os.close(objects_fd)
         if refs_fd is not None:
             os.close(refs_fd)
+        if worktrees_fd is not None:
+            os.close(worktrees_fd)
         if view_fd is not None:
             os.close(view_fd)
         os.close(parent_fd)
@@ -1643,21 +2203,21 @@ def remove_sanitized_view(view: pathlib.Path, *, allow_partial: bool = False) ->
 def _view_environment(
     info: RepositoryInfo,
     registration: WorktreeRegistration,
-    view: pathlib.Path,
+    view: GitControlBinding,
 ) -> dict[str, str]:
-    return sanitized_git_environment(
+    return _git_control_environment(
+        info,
+        view,
         {
-            "GIT_DIR": str(view),
             "GIT_INDEX_FILE": str(registration.registration / "index"),
-            "GIT_OBJECT_DIRECTORY": str(info.common_git_dir / "objects"),
-        }
+        },
     )
 
 
 def check_attributes(
     info: RepositoryInfo,
     registration: WorktreeRegistration,
-    view: pathlib.Path,
+    view: GitControlBinding,
     paths: tuple[bytes, ...],
 ) -> None:
     input_bytes = b"\0".join(paths) + b"\0"
@@ -1719,7 +2279,7 @@ def check_attributes(
 def verify_index(
     info: RepositoryInfo,
     registration: WorktreeRegistration,
-    view: pathlib.Path,
+    view: GitControlBinding,
     manifest: TreeManifest,
 ) -> None:
     argv = (info.git_executable, "ls-files", "--stage", "-z")
@@ -1749,11 +2309,11 @@ def remove_both_present_worktree(
         ("worktree", "unlock", str(registration.worktree)),
         ("worktree", "remove", "--force", str(registration.worktree)),
     ):
-        argv = _git_worktree_argv(info, *subcommand)
+        argv = _git_control_argv(info, registration.control, *subcommand)
         code, _, stderr = run_bounded(
             argv,
-            cwd=info.repo,
-            environment=sanitized_git_environment(),
+            cwd=registration.worktree.parent,
+            environment=_git_control_environment(info, registration.control),
             timeout=120,
             stdout_limit=8192,
             stderr_limit=8192,
@@ -1762,14 +2322,19 @@ def remove_both_present_worktree(
             raise ValueError(_git_error(argv, stderr))
 
 
-def verify_worktree_absent(info: RepositoryInfo, worktree: pathlib.Path) -> None:
+def verify_worktree_absent(
+    info: RepositoryInfo,
+    worktree: pathlib.Path,
+    control: GitControlBinding,
+) -> None:
     try:
         os.lstat(worktree)
     except FileNotFoundError:
         pass
     else:
         raise ValueError("worktree path still exists after removal")
-    registrations_parent = info.common_git_dir / "worktrees"
+    revalidate_git_control(info, control)
+    registrations_parent = control.path / "worktrees"
     try:
         parent_fd = open_directory(registrations_parent)
     except FileNotFoundError:

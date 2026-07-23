@@ -421,13 +421,53 @@ class JsonLineTests(unittest.TestCase):
             decode_json_line(record)
         self.assertEqual(raised.exception.code, "invalid-json-number")
 
+    def test_rejects_every_float_token_before_conversion(self) -> None:
+        tokens = (
+            b"0.0",
+            b"-0.0",
+            b"1.7976931348623157e308",
+            b"2.2250738585072014e-308",
+            b"5e-324",
+            b"1e-324",
+            b"1e309",
+            b"1e999999",
+            b"1e-999999",
+        )
+        for token in tokens:
+            with (
+                self.subTest(token=token),
+                self.assertRaises(AppServerProtocolError) as raised,
+            ):
+                decode_json_line(b'{"value":' + token + b"}\n")
+            self.assertEqual(raised.exception.code, "invalid-json-number")
+
+        framing = len(b'{"value":0.}\n')
+        huge_mantissa = (
+            b'{"value":0.' + b"1" * (APP_SERVER_MAX_RECORD_BYTES + 1 - framing) + b"}\n"
+        )
+        self.assertEqual(len(huge_mantissa), APP_SERVER_MAX_RECORD_BYTES + 1)
+        with self.assertRaises(AppServerProtocolError) as raised:
+            decode_json_line(huge_mantissa)
+        self.assertEqual(raised.exception.code, "invalid-json-number")
+
+    def test_outbound_protocol_rejects_floats(self) -> None:
+        for value in (0.0, 1.5, float("inf"), float("nan")):
+            with (
+                self.subTest(value=value),
+                self.assertRaises(AppServerProtocolError) as raised,
+            ):
+                encode_json_line({"value": value})
+            self.assertEqual(raised.exception.code, "invalid-json-number")
+
     def test_does_not_reclassify_unrelated_json_value_errors(self) -> None:
         with (
             mock.patch(
                 "review_supervisor.appserver_protocol.json.loads",
                 side_effect=ValueError("synthetic non-parser failure"),
             ),
-            self.assertRaisesRegex(ValueError, "synthetic non-parser failure") as raised,
+            self.assertRaisesRegex(
+                ValueError, "synthetic non-parser failure"
+            ) as raised,
         ):
             decode_json_line(b'{"id":1}\n')
         self.assertNotIsInstance(raised.exception, AppServerProtocolError)
@@ -1163,7 +1203,12 @@ class AppServerProtocolTests(unittest.TestCase):
                 protocol.accept_message({"method": method, "params": {}})
 
     def test_rejects_wrong_response_id_schema_and_remote_failure(self) -> None:
-        for response_id in (2, 1.0, True, "1"):
+        for response_id, expected_code in (
+            (2, "response-id"),
+            (1.0, "invalid-json-number"),
+            (True, "response-id"),
+            ("1", "response-id"),
+        ):
             protocol = self.protocol()
             protocol.start()
             with (
@@ -1173,7 +1218,7 @@ class AppServerProtocolTests(unittest.TestCase):
                 protocol.accept_message(
                     {"id": response_id, "result": initialize_result()}
                 )
-            self.assertEqual(raised.exception.code, "response-id")
+            self.assertEqual(raised.exception.code, expected_code)
 
         protocol = self.protocol()
         protocol.start()

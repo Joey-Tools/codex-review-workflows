@@ -848,7 +848,7 @@ class RawMaterializer:
             view_complete = False
             view_cleanup_allowed = True
             try:
-                create_sanitized_view(self.info, self.view_path)
+                view_binding = create_sanitized_view(self.info, self.view_path)
                 view_complete = True
                 attribute_paths = tuple(entry.path for entry in self.head.entries) + (
                     PRIMARY_DIFF_RELATIVE_PATH.encode("ascii"),
@@ -856,10 +856,10 @@ class RawMaterializer:
                 check_attributes(
                     self.info,
                     self.registration,
-                    self.view_path,
+                    view_binding,
                     attribute_paths,
                 )
-                verify_index(self.info, self.registration, self.view_path, self.head)
+                verify_index(self.info, self.registration, view_binding, self.head)
             except GitProcessClosureUnproven:
                 view_cleanup_allowed = False
                 raise
@@ -875,7 +875,7 @@ class RawMaterializer:
                             allow_partial=not view_complete,
                         )
             checkout_bytes = allocated_bytes(self.registration.worktree)
-            git_bytes = allocated_bytes(self.registration.registration)
+            git_bytes = allocated_bytes(self.registration.control.path)
             if checkout_bytes > self.checkout_root_bound:
                 raise ValueError("checkout allocation exceeds its reserved bound")
             if git_bytes > self.git_admin_bound:

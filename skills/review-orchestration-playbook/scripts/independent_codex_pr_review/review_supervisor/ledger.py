@@ -35,8 +35,6 @@ from .process import require_authenticated_no_child_process_profile
 from .secureio import (
     acquire_flock,
     align_up,
-    allocated_bytes,
-    atomic_write_json,
     atomic_write_json_at,
     boot_identifier,
     canonical_json,
@@ -116,9 +114,7 @@ class AttemptBinding:
     identity: Identity
 
 
-_IDENTITY_FIELDS = frozenset(
-    {"device", "inode", "mode", "link_count", "uid", "size"}
-)
+_IDENTITY_FIELDS = frozenset({"device", "inode", "mode", "link_count", "uid", "size"})
 
 
 def _identity_from_binding(value: Any, *, label: str) -> Identity:
@@ -351,7 +347,10 @@ def accept_attempt_lease_transfer(
     if not root.is_absolute() or attempt_path.parent != root:
         raise ValueError("attempt lease transfer paths are invalid")
     token_hex = binding.get("lock_token_hex")
-    if not isinstance(token_hex, str) or len(token_hex) != RETENTION_LOCK_TOKEN_BYTES * 2:
+    if (
+        not isinstance(token_hex, str)
+        or len(token_hex) != RETENTION_LOCK_TOKEN_BYTES * 2
+    ):
         raise ValueError("attempt lease transfer token is malformed")
     try:
         token = bytes.fromhex(token_hex)
@@ -702,9 +701,7 @@ def _allocated_bytes_fd(directory_fd: int, *, entry_cap: int) -> int:
                                     | os.O_NOFOLLOW,
                                     dir_fd=current_fd,
                                 )
-                                child_identity = identity_from_stat(
-                                    os.fstat(child_fd)
-                                )
+                                child_identity = identity_from_stat(os.fstat(child_fd))
                                 if not directory_identities_match(
                                     child_identity,
                                     identity_from_stat(metadata),
@@ -929,9 +926,9 @@ def _reclaim_initial_crash_attempt(
             identities.append((entry, identity))
         if now - newest_timestamp < INITIAL_CRASH_RECLAIM_AGE_SECONDS:
             raise ValueError("initial attempt crash residue is not old enough")
-        if tuple(sorted(_bounded_directory_names(attempt_fd, cap=len(entries)))) != tuple(
-            sorted(entries)
-        ):
+        if tuple(
+            sorted(_bounded_directory_names(attempt_fd, cap=len(entries)))
+        ) != tuple(sorted(entries)):
             raise ValueError("initial attempt crash residue changed during inspection")
         for entry, expected in identities:
             current = identity_from_stat(
@@ -1224,15 +1221,12 @@ def reconcile_ledger(
                     follow_symlinks=False,
                 )
             )
-            if (
-                not directory_identities_match(
-                    current_attempt_identity,
-                    attempt_identity,
-                )
-                or not directory_identities_match(
-                    current_attempt_identity,
-                    attempt.identity,
-                )
+            if not directory_identities_match(
+                current_attempt_identity,
+                attempt_identity,
+            ) or not directory_identities_match(
+                current_attempt_identity,
+                attempt.identity,
             ):
                 raise OSError(errno.ESTALE, "retained attempt identity changed")
             lease.revalidate_root()
@@ -1429,6 +1423,7 @@ def calculate_admission(
     lease: RetentionLease | None = None,
     checkout_parent: pathlib.Path,
     common_git_dir: pathlib.Path,
+    git_admin_parent: pathlib.Path | None = None,
     manifest: TreeManifest,
     diff_length: int,
 ) -> Admission:
@@ -1447,7 +1442,9 @@ def calculate_admission(
     else:
         retention_fs = measure_filesystem(retention_root)
     checkout_fs = measure_filesystem(checkout_parent)
-    git_fs = measure_filesystem(common_git_dir)
+    git_fs = measure_filesystem(
+        common_git_dir if git_admin_parent is None else git_admin_parent
+    )
     if (
         checked_add(snapshot.process_logical_bytes, PROCESS_ENVELOPE_BYTES)
         > RETENTION_CAP_BYTES
@@ -1724,6 +1721,7 @@ def create_reserved_attempt(
             )
         ),
         "registration": None,
+        "git_control_binding": None,
         "worktree_create_intent": None,
         "leader": None,
         "runtime_process_binding": None,

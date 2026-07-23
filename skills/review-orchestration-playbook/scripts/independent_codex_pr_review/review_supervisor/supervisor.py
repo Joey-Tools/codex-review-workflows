@@ -12,7 +12,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from .constants import (
     CHECKOUT_SECONDS,
@@ -49,6 +49,7 @@ from .gitraw import (
     enumerate_tree,
     inspect_repository,
     manifest_digest,
+    retry_git_process_closure,
 )
 from .ledger import (
     AttemptLease,
@@ -91,11 +92,15 @@ from .recovery_cleanup import (
 from .review_execution import projected_isolated_review_environment
 from .runtime import (
     _authenticate_attempt_transfer,
+    _build_checkout_closure_receipt,
     _cleanup_worktree,
     _compact_terminal,
     _kill_direct,
+    _persist_attempt_git_closure_receipt,
+    _read_checkout_closure_receipt,
     _settle_process,
     _validate_terminal_lifecycle,
+    build_unsettled_checkout_summary,
     build_final_authorization_rewrite,
     commit_via_helper,
     complete_final_authorization_rewrite,
@@ -103,26 +108,24 @@ from .runtime import (
     latch_direct_process_closure_unproven,
     publish_prompt_via_helper,
     require_direct_process_closure_proven,
+    validate_checkout_closure_receipt,
     validate_final_authorization_rewrite,
 )
 from .secureio import (
-    allocated_bytes,
     allocated_bytes_fd,
     boot_identifier,
     canonical_json,
     directory_identities_match,
     ensure_no_path_value,
-    fsync_directory,
     identity_from_stat,
-    measure_filesystem,
     measure_filesystem_fd,
-    open_absolute_directory_chain,
     open_regular_at,
-    open_regular_nofollow,
+    publish_bytes,
     read_fd_exact,
     require_private_directory,
     sha256_bytes,
 )
+from .signal_relay import checkpoint_bound_signal_interrupt
 from .wire import receive_record, send_blob, send_record, socket_pair
 
 
@@ -148,6 +151,23 @@ FINAL_AUTHORIZATION_KEYS = frozenset(
         "binding_sha256",
     }
 )
+UNSETTLED_CHECKOUT_SUMMARY_KEYS = frozenset(
+    {
+        "review_contract",
+        "named_lane_eligible",
+        "overall_status",
+        "review_status",
+        "launch_status",
+        "failure_stage",
+        "failure_code",
+        "message",
+        "attempt_dir",
+        "closure_receipt_status",
+        "closure_receipt",
+        "unsupported_clauses",
+    }
+)
+ATTEMPT_TERMINAL_RECORD_KEYS = frozenset({"type", "token", "summary"})
 
 
 @dataclass(frozen=True)
@@ -312,6 +332,7 @@ def prepare_run(
         base_sha=base_sha,
         head_sha=head_sha,
         git_executable=git_executable,
+        temporary_control_parent=retention_root,
     )
     base_manifest = enumerate_tree(repository, base_sha)
     head_manifest = enumerate_tree(repository, head_sha)
@@ -321,6 +342,7 @@ def prepare_run(
         lease=lease,
         checkout_parent=checkout_parent,
         common_git_dir=repository.common_git_dir,
+        git_admin_parent=retention_root,
         manifest=head_manifest,
         diff_length=helper.diff_length,
     )
@@ -1163,6 +1185,137 @@ def _publish_final_authorization(
     raise ValueError("final authorization allocation accounting did not converge")
 
 
+def _publish_retained_git_closure_recovery(
+    *,
+    recovery_root: pathlib.Path,
+    revalidate_owner: Callable[[], None],
+    error: GitProcessClosureUnproven,
+    token: str,
+) -> dict[str, Any]:
+    try:
+        receipt = _build_checkout_closure_receipt(
+            error,
+            attempt_dir=recovery_root,
+            token=token,
+            owner_pid=os.getpid(),
+            owner_start_identity=process_start_identity(os.getpid()),
+        )
+        retained_paths = receipt["retained_cleanup_paths"]
+        receipt_path = (
+            pathlib.Path(retained_paths[0]) / "closure-recovery.json"
+            if retained_paths
+            else None
+        )
+        receipt_payload = canonical_json(receipt)
+        receipt_status = "publication-failed"
+        if receipt_path is not None:
+            try:
+                revalidate_owner()
+                publish_bytes(receipt_path, receipt_payload)
+                revalidate_owner()
+                receipt_status = "published"
+            except BaseException:
+                receipt_status = "publication-failed"
+        return {
+            "status": receipt_status,
+            "receipt_path": str(receipt_path) if receipt_path is not None else None,
+            "receipt_sha256": sha256_bytes(receipt_payload),
+            "receipt": receipt,
+        }
+    except BaseException:
+        return {
+            "status": "receipt-preparation-failed",
+            "receipt_path": None,
+            "receipt_sha256": None,
+            "receipt": None,
+        }
+    finally:
+        error.finish_signal_deferral(deliver=False)
+
+
+def _publish_attempt_git_closure_recovery(
+    *,
+    attempt: AttemptLease,
+    error: GitProcessClosureUnproven,
+    token: str,
+) -> dict[str, Any]:
+    try:
+        state, _, _ = read_bound_attempt_state(attempt)
+        owner_start_identity = process_start_identity(os.getpid())
+        receipt = _build_checkout_closure_receipt(
+            error,
+            attempt_dir=attempt.path,
+            token=token,
+            owner_pid=os.getpid(),
+            owner_start_identity=owner_start_identity,
+        )
+        receipt_payload = canonical_json(receipt)
+        receipt_path = attempt.path / "checkout-closure-recovery.json"
+        receipt_status = "publication-failed"
+        try:
+            persisted = _persist_attempt_git_closure_receipt(
+                attempt=attempt,
+                state=state,
+                error=error,
+                token=token,
+                owner_start_identity=owner_start_identity,
+            )
+            if persisted != receipt:
+                raise ValueError(
+                    "attempt Git closure receipt changed during publication"
+                )
+            receipt_status = "published"
+        except BaseException:
+            receipt_status = "publication-failed"
+        return {
+            "status": receipt_status,
+            "receipt_path": str(receipt_path),
+            "receipt_sha256": sha256_bytes(receipt_payload),
+            "receipt": receipt,
+        }
+    except BaseException:
+        return {
+            "status": "receipt-preparation-failed",
+            "receipt_path": None,
+            "receipt_sha256": None,
+            "receipt": None,
+        }
+    finally:
+        error.finish_signal_deferral(deliver=False)
+
+
+def _select_reaped_attempt_terminal(
+    *,
+    exit_code: int,
+    terminal: dict[str, Any] | None,
+    terminal_receive_error: Exception | None,
+    completion_attempt: AttemptLease,
+    attempt_dir: pathlib.Path,
+    token: str,
+) -> dict[str, Any]:
+    if exit_code == 2:
+        return _derive_unsettled_checkout_summary(
+            completion_attempt,
+            attempt_dir=attempt_dir,
+            token=token,
+        )
+    if exit_code not in {0, 1}:
+        raise ValueError("nonzero attempt supervisor summary is not authenticated")
+    if terminal_receive_error is not None:
+        raise terminal_receive_error
+    if (
+        terminal is None
+        or set(terminal) != ATTEMPT_TERMINAL_RECORD_KEYS
+        or terminal.get("type") != "attempt-terminal"
+        or terminal.get("token") != token
+    ):
+        raise ValueError("attempt supervisor terminal record is invalid")
+    summary = terminal.get("summary")
+    if not isinstance(summary, dict):
+        raise ValueError("attempt terminal summary is malformed")
+    return summary
+
+
 def run(
     *,
     entrypoint: pathlib.Path,
@@ -1188,6 +1341,9 @@ def run(
     custody = None
     ownership_complete = False
     incomplete_handoff_writers_stopped = True
+    preflight_closure_token = os.urandom(32).hex()
+    process_closure_recovery: dict[str, Any] | None = None
+    git_signal_checkpoint_required = False
     try:
         prepared = _prepare_with_reclamation(
             entrypoint=entrypoint,
@@ -1341,16 +1497,16 @@ def run(
             + REVIEWER_RUNTIME_SECONDS
             + 10 * 60
         )
-        terminal, _ = receive_record(parent, deadline=terminal_deadline)
-        if terminal.get("type") != "attempt-terminal" or terminal.get("token") != token:
-            raise ValueError("attempt supervisor terminal record is invalid")
+        terminal: dict[str, Any] | None = None
+        terminal_receive_error: Exception | None = None
+        try:
+            terminal, _ = receive_record(parent, deadline=terminal_deadline)
+        except Exception as error:
+            terminal_receive_error = error
         wait_terminal(supervisor.pid, deadline=time.monotonic() + 30)
         exit_code = reap(supervisor.pid)
         supervisor = None
-        summary = terminal.get("summary")
-        if not isinstance(summary, dict):
-            raise ValueError("attempt terminal summary is malformed")
-        if exit_code == 0:
+        if exit_code in {0, 1}:
             if supervisor_binding is None:
                 raise ValueError("completed supervisor has no authenticated binding")
             with acquire_retention_lease(
@@ -1359,6 +1515,14 @@ def run(
                 with open_attempt_lease(
                     completion_lease, attempt_dir
                 ) as completion_attempt:
+                    summary = _select_reaped_attempt_terminal(
+                        exit_code=exit_code,
+                        terminal=terminal,
+                        terminal_receive_error=terminal_receive_error,
+                        completion_attempt=completion_attempt,
+                        attempt_dir=attempt_dir,
+                        token=token,
+                    )
                     completed_state, _, completed_digest = read_bound_attempt_state(
                         completion_attempt
                     )
@@ -1366,30 +1530,74 @@ def run(
                         raise ValueError(
                             "attempt terminal summary differs from durable terminal state"
                         )
-                    completed_state, completed_digest = _publish_final_authorization(
-                        entrypoint=entrypoint,
-                        attempt=completion_attempt,
-                        state=completed_state,
-                        state_digest=completed_digest,
-                        supervisor_binding=supervisor_binding,
-                        supervisor_exit_code=exit_code,
+                    if exit_code == 0:
+                        completed_state, completed_digest = (
+                            _publish_final_authorization(
+                                entrypoint=entrypoint,
+                                attempt=completion_attempt,
+                                state=completed_state,
+                                state_digest=completed_digest,
+                                supervisor_binding=supervisor_binding,
+                                supervisor_exit_code=exit_code,
+                            )
+                        )
+                        if not _has_exact_final_authorization(
+                            completion_attempt,
+                            completed_state,
+                        ):
+                            raise ValueError(
+                                "published final authorization is not exact"
+                            )
+                        summary = _compact_terminal(
+                            completed_state,
+                            final_authorization_exact=True,
+                        )
+        elif exit_code == 2:
+            with acquire_retention_lease(
+                retention_root, deadline=time.monotonic() + 30
+            ) as completion_lease:
+                with open_attempt_lease(
+                    completion_lease, attempt_dir
+                ) as completion_attempt:
+                    summary = _select_reaped_attempt_terminal(
+                        exit_code=exit_code,
+                        terminal=terminal,
+                        terminal_receive_error=terminal_receive_error,
+                        completion_attempt=completion_attempt,
+                        attempt_dir=attempt_dir,
+                        token=token,
                     )
-                    if not _has_exact_final_authorization(
-                        completion_attempt,
-                        completed_state,
-                    ):
-                        raise ValueError("published final authorization is not exact")
-                    summary = _compact_terminal(
-                        completed_state,
-                        final_authorization_exact=True,
-                    )
+        else:
+            raise ValueError("nonzero attempt supervisor summary is not authenticated")
         return exit_code, summary
     except BaseException as caught_error:
         failure_error = caught_error
+        if isinstance(caught_error, GitProcessClosureUnproven):
+            if retry_git_process_closure(caught_error):
+                caught_error.finish_signal_deferral(deliver=False)
+                git_signal_checkpoint_required = True
+                failure_error = caught_error.__cause__ or caught_error
+            else:
+                process_closure_recovery = _publish_retained_git_closure_recovery(
+                    recovery_root=retention_root,
+                    revalidate_owner=lease.revalidate_root,
+                    error=caught_error,
+                    token=preflight_closure_token,
+                )
+                git_signal_checkpoint_required = True
+        outer_cleanup_error: BaseException | None = None
         if custody is not None:
-            custody.close()
-            custody = None
-        parent.close()
+            try:
+                custody.close()
+            except BaseException as cleanup_error:
+                outer_cleanup_error = cleanup_error
+            finally:
+                custody = None
+        try:
+            parent.close()
+        except BaseException as cleanup_error:
+            if outer_cleanup_error is None:
+                outer_cleanup_error = cleanup_error
         if supervisor is not None:
             if ownership_complete:
                 try:
@@ -1410,13 +1618,21 @@ def run(
                 except BaseException:
                     incomplete_handoff_writers_stopped = False
             supervisor = None
+        if git_signal_checkpoint_required:
+            checkpoint_bound_signal_interrupt(force=True)
+            git_signal_checkpoint_required = False
+        if outer_cleanup_error is not None:
+            raise outer_cleanup_error
         if (
             attempt_dir is not None
             and not ownership_complete
             and incomplete_handoff_writers_stopped
             and attempt is not None
             and lease.fd >= 0
-            and not isinstance(failure_error, UnprovenDirectHelperClosure)
+            and not isinstance(
+                failure_error,
+                (GitProcessClosureUnproven, UnprovenDirectHelperClosure),
+            )
             and direct_process_closure_failure() is None
         ):
             try:
@@ -1425,10 +1641,16 @@ def run(
                     attempt=attempt,
                     message=(f"{type(failure_error).__name__}: {failure_error}"),
                 )
-            except (
-                GitProcessClosureUnproven,
-                UnprovenDirectHelperClosure,
-            ) as closure_error:
+            except GitProcessClosureUnproven as closure_error:
+                failure_error = closure_error
+                incomplete_handoff_writers_stopped = False
+                process_closure_recovery = _publish_attempt_git_closure_recovery(
+                    attempt=attempt,
+                    error=closure_error,
+                    token=preflight_closure_token,
+                )
+                checkpoint_bound_signal_interrupt(force=True)
+            except UnprovenDirectHelperClosure as closure_error:
                 failure_error = closure_error
                 incomplete_handoff_writers_stopped = False
         failure = (
@@ -1447,6 +1669,7 @@ def run(
             if failure
             else f"{type(failure_error).__name__}: {failure_error}",
             "attempt_dir": str(attempt_dir) if attempt_dir else None,
+            "process_closure_recovery": process_closure_recovery,
             "unsupported_clauses": list(UNSUPPORTED_CLAUSES),
         }
     finally:
@@ -1464,6 +1687,60 @@ def _normalize_absolute(path: pathlib.Path) -> pathlib.Path:
     if not normalized.is_absolute():
         raise ValueError("path did not normalize to an absolute path")
     return normalized
+
+
+def _validate_unsettled_checkout_summary(
+    summary: dict[str, Any],
+    *,
+    attempt_dir: pathlib.Path,
+    token: str,
+) -> None:
+    if set(summary) != UNSETTLED_CHECKOUT_SUMMARY_KEYS:
+        raise ValueError("unsettled checkout terminal summary is malformed")
+    receipt = summary.get("closure_receipt")
+    normalized_receipt = validate_checkout_closure_receipt(
+        receipt,
+        attempt_dir=attempt_dir,
+        token=token,
+    )
+    if summary != build_unsettled_checkout_summary(
+        attempt_dir=attempt_dir,
+        receipt=normalized_receipt,
+    ):
+        raise ValueError("unsettled checkout terminal summary is not canonical")
+
+
+def _derive_unsettled_checkout_summary(
+    attempt: AttemptLease,
+    *,
+    attempt_dir: pathlib.Path,
+    token: str,
+) -> dict[str, Any]:
+    state, _, _ = read_bound_attempt_state(attempt)
+    if (
+        state.get("handoff") != "complete"
+        or state.get("process_owner") != "attempt-supervisor"
+        or state.get("handoff_token") != token
+        or state.get("terminal_at") is not None
+    ):
+        raise ValueError("unsettled checkout has no eligible durable state")
+    recovered = _read_checkout_closure_receipt(
+        attempt,
+        token=token,
+    )
+    if recovered is None:
+        raise ValueError("unsettled checkout has no durable closure receipt")
+    receipt, _ = recovered
+    summary = build_unsettled_checkout_summary(
+        attempt_dir=attempt_dir,
+        receipt=receipt,
+    )
+    _validate_unsettled_checkout_summary(
+        summary,
+        attempt_dir=attempt_dir,
+        token=token,
+    )
+    return summary
 
 
 def _normalize_attempt_directory(
@@ -1512,9 +1789,7 @@ def _list_attempt_directories(lease: RetentionLease) -> tuple[pathlib.Path, ...]
             if name == b"retention.lock":
                 continue
             text = os.fsdecode(name)
-            metadata = os.stat(
-                name, dir_fd=lease.root_fd, follow_symlinks=False
-            )
+            metadata = os.stat(name, dir_fd=lease.root_fd, follow_symlinks=False)
             if ATTEMPT_NAME_PATTERN.fullmatch(text) is None or not stat.S_ISDIR(
                 metadata.st_mode
             ):
@@ -1706,9 +1981,7 @@ def final_result(
                     stage="output",
                     code="final-authorization-invalid",
                 ) from error
-            if not isinstance(seal, dict) or not isinstance(
-                seal.get("identity"), dict
-            ):
+            if not isinstance(seal, dict) or not isinstance(seal.get("identity"), dict):
                 raise inconclusive(
                     "durable final seal is malformed",
                     stage="output",
@@ -1809,10 +2082,7 @@ def _validate_process_inventory(
                 runtime_identity = identity_from_stat(metadata).to_json()
                 runtime_fd = os.open(
                     raw_name,
-                    os.O_RDONLY
-                    | os.O_DIRECTORY
-                    | os.O_CLOEXEC
-                    | os.O_NOFOLLOW,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
                     dir_fd=directory_fd,
                 )
                 try:
@@ -1820,9 +2090,7 @@ def _validate_process_inventory(
                         identity_from_stat(os.fstat(runtime_fd)),
                         identity_from_stat(metadata),
                     ):
-                        raise OSError(
-                            "retained review runtime identity changed"
-                        )
+                        raise OSError("retained review runtime identity changed")
                     runtime_allocated_bytes = allocated_bytes_fd(
                         runtime_fd,
                         entry_cap=RUNTIME_CLEANUP_ENTRY_CAP,

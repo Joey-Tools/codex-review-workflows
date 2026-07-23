@@ -84,7 +84,11 @@ def _verify_macos_metadata(
         verify_macos_filesystem_metadata,
     )
 
-    evidence = inspect_macos_filesystem_metadata(fd, kind)
+    evidence = inspect_macos_filesystem_metadata(
+        fd,
+        kind,
+        require_directory_metadata_stability=False,
+    )
     if private:
         if (
             evidence.acl_entry_count != 0
@@ -101,7 +105,12 @@ def _verify_macos_metadata(
         and set(evidence.xattrs) <= {"com.apple.provenance", "com.apple.rootless"}
     ):
         return
-    verify_macos_filesystem_metadata(fd, path, kind)
+    verify_macos_filesystem_metadata(
+        fd,
+        path,
+        kind,
+        require_directory_metadata_stability=(kind != "directory"),
+    )
 
 
 def _directory_is_trusted_ancestor(metadata: os.stat_result) -> bool:
@@ -569,9 +578,7 @@ def atomic_write_json_at(
         raise ValueError("invalid JSON destination name")
     data = canonical_json(value)
     temp_name = (
-        b"."
-        + destination
-        + f".tmp-{os.getpid()}-{os.urandom(8).hex()}".encode("ascii")
+        b"." + destination + f".tmp-{os.getpid()}-{os.urandom(8).hex()}".encode("ascii")
     )
     temp_fd: int | None = None
     try:

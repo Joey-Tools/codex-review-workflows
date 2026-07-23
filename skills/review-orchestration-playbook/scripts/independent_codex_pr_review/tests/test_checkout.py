@@ -15,7 +15,7 @@ from review_supervisor.checkout import (
 from review_supervisor.constants import MAX_RAW_BLOB_BYTES
 from review_supervisor.errors import SupervisorError
 from review_supervisor.gitraw import RepositoryInfo, object_digest
-from review_supervisor.models import TreeEntry, TreeManifest
+from review_supervisor.models import Identity, TreeEntry, TreeManifest
 from review_supervisor.secureio import rename_exchange
 
 from tests.support import owned_temporary_directory
@@ -90,6 +90,8 @@ def _info() -> RepositoryInfo:
     return RepositoryInfo(
         repo=pathlib.Path("/unused/repo"),
         common_git_dir=pathlib.Path("/unused/repo/.git"),
+        object_directory=pathlib.Path("/unused/repo/.git/objects"),
+        object_directory_identity=Identity(0, 0, 0o40700, 1, 0, 0),
         object_format="sha1",
         object_hex_length=40,
         base_sha="1" * 40,

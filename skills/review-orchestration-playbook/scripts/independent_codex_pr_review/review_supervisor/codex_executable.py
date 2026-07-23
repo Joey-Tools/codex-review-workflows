@@ -821,15 +821,22 @@ def _read_macos_filesystem_metadata(fd: int) -> ExtendedMetadataEvidence:
 def inspect_macos_filesystem_metadata(
     fd: int,
     kind: str,
+    *,
+    require_directory_metadata_stability: bool = True,
 ) -> ExtendedMetadataEvidence:
     before = NodeIdentity.from_stat(os.fstat(fd))
     first = _read_macos_filesystem_metadata(fd)
     middle = NodeIdentity.from_stat(os.fstat(fd))
     second = _read_macos_filesystem_metadata(fd)
     after = NodeIdentity.from_stat(os.fstat(fd))
+    identity_matches = (
+        _same_node_during_metadata_inspection
+        if require_directory_metadata_stability
+        else _same_node_for_kind
+    )
     if (
-        not _same_node_during_metadata_inspection(before, middle, kind=kind)
-        or not _same_node_during_metadata_inspection(middle, after, kind=kind)
+        not identity_matches(before, middle, kind=kind)
+        or not identity_matches(middle, after, kind=kind)
         or first != second
     ):
         raise OSError(errno.ESTALE, "filesystem metadata changed during inspection")
@@ -840,8 +847,14 @@ def verify_macos_filesystem_metadata(
     fd: int,
     path: pathlib.Path,
     kind: str,
+    *,
+    require_directory_metadata_stability: bool = True,
 ) -> ExtendedMetadataEvidence:
-    evidence = inspect_macos_filesystem_metadata(fd, kind)
+    evidence = inspect_macos_filesystem_metadata(
+        fd,
+        kind,
+        require_directory_metadata_stability=require_directory_metadata_stability,
+    )
     if not _filesystem_metadata_is_permitted(evidence, path=path, kind=kind):
         raise ValueError("extended ACLs, xattrs, and quarantine are forbidden")
     return evidence

@@ -1621,7 +1621,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
         self.assertIn("expected_count != 7", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 368", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 389", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
@@ -2135,9 +2135,7 @@ class RepositoryContractTest(unittest.TestCase):
             "delivery entrypoint": delivery,
         }
         if CI_PROFILE == "canonical":
-            documents["README"] = (REPO_ROOT / "README.md").read_text(
-                encoding="utf-8"
-            )
+            documents["README"] = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
         for name, content in documents.items():
             with self.subTest(document=name):
@@ -2215,9 +2213,7 @@ class RepositoryContractTest(unittest.TestCase):
         canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
             encoding="utf-8"
         )
-        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(
-            encoding="utf-8"
-        )
+        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(encoding="utf-8")
 
         self.assertIn("device, inode, file type, and owner", skill)
         self.assertIn("(st_dev, st_ino, file type, st_uid)", contracts)
@@ -2246,9 +2242,9 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("not a claim", contracts)
         self.assertIn("producer-output bound", canonical)
 
-        marker_binding = runtime.split(
-            "class _MaterializerSourceMarkerBinding:", 1
-        )[1].split("@dataclass", 1)[0]
+        marker_binding = runtime.split("class _MaterializerSourceMarkerBinding:", 1)[
+            1
+        ].split("@dataclass", 1)[0]
         for field in ("device", "inode", "file_type", "owner", "is_gitfile"):
             self.assertIn(f"{field}:", marker_binding)
         for excluded in ("mtime", "ctime", "nlink", "digest"):
@@ -4168,8 +4164,12 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertIn(f"{binding}: bytes | None = None", validator)
         self.assertIn("bound_payloads = (", validator)
-        self.assertIn("if all(payload is None for payload in bound_payloads):", validator)
-        self.assertIn("elif any(payload is None for payload in bound_payloads):", validator)
+        self.assertIn(
+            "if all(payload is None for payload in bound_payloads):", validator
+        )
+        self.assertIn(
+            "elif any(payload is None for payload in bound_payloads):", validator
+        )
         self.assertIn("_load_bound_stream_contract(", validator)
 
         for anchor in (

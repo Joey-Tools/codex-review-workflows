@@ -6,11 +6,13 @@ import os
 import pathlib
 import selectors
 import signal
+import stat
 import subprocess
 import sys
 import threading
 import time
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest import mock
 
@@ -37,12 +39,15 @@ from review_supervisor.gitraw import (
     _parse_tree_record,
     add_detached_worktree,
     check_attributes,
+    create_sanitized_view,
     enumerate_tree,
     enumerate_registration,
     initialize_index,
     inspect_repository,
     object_digest,
     remove_both_present_worktree,
+    remove_sanitized_view,
+    revalidate_git_control,
     retry_git_process_closure,
     sanitized_git_environment,
     verify_worktree_absent,
@@ -52,7 +57,7 @@ from review_supervisor.ledger import (
     open_attempt_lease,
     read_bound_attempt_state,
 )
-from review_supervisor.models import HelperCustody, TreeEntry
+from review_supervisor.models import HelperCustody, Identity, TreeEntry
 from review_supervisor.process import (
     process_start_identity,
     signal_anchored_group,
@@ -159,6 +164,8 @@ def _protocol_batch(response: bytes) -> tuple[CatFileBatch, int]:
     batch.info = RepositoryInfo(
         repo=pathlib.Path("/unused/repo"),
         common_git_dir=pathlib.Path("/unused/repo/.git"),
+        object_directory=pathlib.Path("/unused/repo/.git/objects"),
+        object_directory_identity=Identity(0, 0, 0o40700, 1, 0, 0),
         object_format="sha1",
         object_hex_length=40,
         base_sha="1" * 40,
@@ -177,6 +184,8 @@ def _protocol_batch(response: bytes) -> tuple[CatFileBatch, int]:
     batch.requests = 0
     batch.closed = False
     batch.stderr = bytearray()
+    batch._control_parent = None
+    batch.control = None
     return batch, request_reader
 
 
@@ -194,6 +203,8 @@ def _close_protocol_batch(batch: CatFileBatch, request_reader: int) -> None:
 def _scripted_batch(root: pathlib.Path, script: bytes) -> CatFileBatch:
     repo = root / "repo"
     repo.mkdir(mode=0o700)
+    object_directory = repo / ".git" / "objects"
+    object_directory.mkdir(mode=0o700, parents=True)
     executable = root / "fake-git"
     executable.write_bytes(script)
     executable.chmod(0o700)
@@ -201,6 +212,8 @@ def _scripted_batch(root: pathlib.Path, script: bytes) -> CatFileBatch:
         RepositoryInfo(
             repo=repo,
             common_git_dir=repo / ".git",
+            object_directory=object_directory,
+            object_directory_identity=identity_from_stat(os.stat(object_directory)),
             object_format="sha1",
             object_hex_length=40,
             base_sha="1" * 40,
@@ -275,28 +288,42 @@ def _kill_verified_process(pid: int, start_identity: str) -> None:
 
 class RawGitProtocolTests(unittest.TestCase):
     def test_repository_inspection_preserves_unproven_git_closure(self) -> None:
-        process = SimpleNamespace(pid=123)
+        process = SimpleNamespace(
+            pid=123,
+            returncode=0,
+            stdin=None,
+            stdout=None,
+            stderr=None,
+        )
         failure = GitProcessClosureUnproven(
             process,
             None,
             TimeoutError("synthetic cleanup timeout"),
         )
-        with (
-            owned_temporary_directory("git-inspection-closure-gap-") as root,
-            mock.patch.object(
-                gitraw,
-                "_preflight_local_git_config",
-                return_value=(root / ".git", "sha1"),
-            ),
-            mock.patch.object(gitraw, "run_bounded", side_effect=failure),
-            self.assertRaises(GitProcessClosureUnproven) as raised,
-        ):
-            inspect_repository(
-                repo=root,
-                base_sha="a" * 40,
-                head_sha="b" * 40,
-                git_executable=str(GIT),
-            )
+        with owned_temporary_directory("git-inspection-closure-gap-") as root:
+            repo, _, _ = _build_repository(root)
+            with (
+                mock.patch.object(
+                    gitraw,
+                    "_preflight_local_git_config",
+                    return_value=(repo / ".git", "sha1"),
+                ),
+                mock.patch.object(gitraw, "run_bounded", side_effect=failure),
+                self.assertRaises(GitProcessClosureUnproven) as raised,
+            ):
+                inspect_repository(
+                    repo=repo,
+                    base_sha="a" * 40,
+                    head_sha="b" * 40,
+                    git_executable=str(GIT),
+                    temporary_control_parent=root,
+                )
+            self.assertEqual(len(failure.retained_cleanup_paths), 1)
+            retained_parent = failure.retained_cleanup_paths[0]
+            self.assertEqual(retained_parent.parent, root)
+            self.assertTrue(retained_parent.is_dir())
+            self.assertTrue(retry_git_process_closure(failure))
+            self.assertFalse(retained_parent.exists())
         self.assertIs(raised.exception, failure)
 
     def test_repository_inspection_rejects_local_includes_before_git(self) -> None:
@@ -311,9 +338,7 @@ class RawGitProtocolTests(unittest.TestCase):
             ):
                 repo, base, head = _build_repository(root)
                 outside = root / "outside.config"
-                outside.write_bytes(
-                    b"[core]\n\tfsmonitor = /definitely/not/executed\n"
-                )
+                outside.write_bytes(b"[core]\n\tfsmonitor = /definitely/not/executed\n")
                 outside.chmod(0o000)
                 _git(repo, "config", "--local", "--add", key, value)
                 with (
@@ -328,7 +353,7 @@ class RawGitProtocolTests(unittest.TestCase):
                     )
                 run_git.assert_not_called()
                 self.assertEqual(raised.exception.failure.stage, "git-preflight")
-                self.assertEqual(raised.exception.failure.code, "frozen-range-invalid")
+                self.assertEqual(raised.exception.failure.code, "git-config-mismatch")
 
         for case, relative_path, content in (
             (
@@ -339,7 +364,7 @@ class RawGitProtocolTests(unittest.TestCase):
             (
                 "worktree-config",
                 pathlib.Path("config.worktree"),
-                b"[includeIf \"gitdir:/tmp/**\"]\n\tpath = ../outside.config\n",
+                b'[includeIf "gitdir:/tmp/**"]\n\tpath = ../outside.config\n',
             ),
         ):
             with (
@@ -362,7 +387,473 @@ class RawGitProtocolTests(unittest.TestCase):
                     )
                 run_git.assert_not_called()
                 self.assertEqual(raised.exception.failure.stage, "git-preflight")
-                self.assertEqual(raised.exception.failure.code, "frozen-range-invalid")
+                self.assertEqual(raised.exception.failure.code, "git-config-mismatch")
+
+    def test_source_config_injection_after_preflight_is_never_consumed(self) -> None:
+        with owned_temporary_directory("git-config-private-view-") as root:
+            repo, base, head = _build_repository(root)
+            config = repo / ".git" / "config"
+            original = config.read_bytes()
+            injected = b"[include]\n\tpath = /definitely/unreadable/codex.config\n"
+            original_run = gitraw.run_bounded
+            injected_during_git = False
+
+            def run_with_source_injection(
+                *args: object,
+                **kwargs: object,
+            ) -> tuple[int, bytes, bytes]:
+                nonlocal injected_during_git
+                if not injected_during_git:
+                    injected_during_git = True
+                    replacement = config.with_name("config.injected")
+                    replacement.write_bytes(injected)
+                    replacement.chmod(0o600)
+                    os.replace(replacement, config)
+                return original_run(*args, **kwargs)
+
+            try:
+                with mock.patch(
+                    "review_supervisor.gitraw.run_bounded",
+                    side_effect=run_with_source_injection,
+                ):
+                    info = inspect_repository(
+                        repo=repo,
+                        base_sha=base,
+                        head_sha=head,
+                        git_executable=str(GIT),
+                    )
+                    manifest = enumerate_tree(info, head)
+                self.assertTrue(injected_during_git)
+                self.assertGreater(manifest.entry_count, 0)
+            finally:
+                config.write_bytes(original)
+                config.chmod(0o600)
+
+    def test_actual_linked_worktree_config_is_audited_without_git(self) -> None:
+        with owned_temporary_directory("git-linked-config-") as root:
+            repo, _, head = _build_repository(root)
+            linked = root / "linked"
+            _git(repo, "config", "extensions.worktreeConfig", "true")
+            _git(
+                repo,
+                "worktree",
+                "add",
+                "--detach",
+                "--no-checkout",
+                str(linked),
+                head,
+            )
+            _git(
+                linked,
+                "config",
+                "--worktree",
+                "include.path",
+                "/untrusted/linked-worktree.config",
+            )
+            with (
+                mock.patch.object(gitraw, "run_bounded") as run_git,
+                self.assertRaises(SupervisorError) as raised,
+            ):
+                inspect_repository(
+                    repo=linked,
+                    base_sha=head,
+                    head_sha=head,
+                    git_executable=str(GIT),
+                )
+            run_git.assert_not_called()
+            self.assertEqual(raised.exception.failure.code, "git-config-mismatch")
+
+    def test_linked_worktree_config_aba_during_git_is_never_consumed(
+        self,
+    ) -> None:
+        with owned_temporary_directory("git-linked-config-aba-") as root:
+            repo, _, head = _build_repository(root)
+            linked = root / "linked"
+            _git(repo, "config", "extensions.worktreeConfig", "true")
+            _git(
+                repo,
+                "worktree",
+                "add",
+                "--detach",
+                "--no-checkout",
+                str(linked),
+                head,
+            )
+            _git(
+                linked,
+                "config",
+                "--worktree",
+                "core.sparseCheckout",
+                "false",
+            )
+            git_dir = gitraw._parse_gitdir_pointer(
+                (linked / ".git").read_bytes(),
+                repo=linked,
+            )
+            config = git_dir / "config.worktree"
+            original = config.read_bytes()
+            original_mode = stat.S_IMODE(config.stat().st_mode)
+            injected = (
+                b'[includeIf "gitdir:**"]\n\tpath = /untrusted/linked-worktree.config\n'
+            )
+            original_run = gitraw.run_bounded
+            invocation_count = 0
+
+            def run_with_linked_config_aba(
+                *args: object,
+                **kwargs: object,
+            ) -> tuple[int, bytes, bytes]:
+                nonlocal invocation_count
+                invocation_count += 1
+                malicious = config.with_name("config.worktree.malicious")
+                malicious.write_bytes(injected)
+                malicious.chmod(original_mode)
+                os.replace(malicious, config)
+                try:
+                    return original_run(*args, **kwargs)
+                finally:
+                    safe = config.with_name("config.worktree.safe")
+                    safe.write_bytes(original)
+                    safe.chmod(original_mode)
+                    os.replace(safe, config)
+
+            try:
+                with mock.patch(
+                    "review_supervisor.gitraw.run_bounded",
+                    side_effect=run_with_linked_config_aba,
+                ):
+                    info = inspect_repository(
+                        repo=linked,
+                        base_sha=head,
+                        head_sha=head,
+                        git_executable=str(GIT),
+                    )
+                    manifest = enumerate_tree(info, head)
+                self.assertGreaterEqual(invocation_count, 4)
+                self.assertGreater(manifest.entry_count, 0)
+            finally:
+                config.write_bytes(original)
+                config.chmod(original_mode)
+
+    def test_source_config_missing_and_unreadable_are_distinct(self) -> None:
+        for case, expected_code in (
+            ("missing", "git-config-missing"),
+            ("unreadable", "git-config-unreadable"),
+        ):
+            with (
+                self.subTest(case=case),
+                owned_temporary_directory(f"git-config-{case}-") as root,
+            ):
+                repo, base, head = _build_repository(root)
+                config = repo / ".git" / "config"
+                if case == "missing":
+                    config.unlink()
+                else:
+                    config.chmod(0o000)
+                with self.assertRaises(SupervisorError) as raised:
+                    inspect_repository(
+                        repo=repo,
+                        base_sha=base,
+                        head_sha=head,
+                        git_executable=str(GIT),
+                    )
+                self.assertEqual(raised.exception.failure.code, expected_code)
+
+    def test_source_config_policy_and_revalidation_mismatch_are_distinct(
+        self,
+    ) -> None:
+        for error_number, expected_code in (
+            (errno.EPERM, "git-config-policy-mismatch"),
+            (errno.ESTALE, "git-config-revalidation-mismatch"),
+        ):
+            with (
+                self.subTest(error_number=error_number),
+                owned_temporary_directory("git-config-mismatch-") as root,
+            ):
+                repo, base, head = _build_repository(root)
+                with (
+                    mock.patch.object(
+                        gitraw,
+                        "_preflight_local_git_config",
+                        side_effect=OSError(error_number, "synthetic mismatch"),
+                    ),
+                    self.assertRaises(SupervisorError) as raised,
+                ):
+                    inspect_repository(
+                        repo=repo,
+                        base_sha=base,
+                        head_sha=head,
+                        git_executable=str(GIT),
+                    )
+                self.assertEqual(raised.exception.failure.code, expected_code)
+
+    def test_private_git_control_property_scoped_revalidation(self) -> None:
+        with owned_temporary_directory("git-control-binding-") as root:
+            repo, base, head = _build_repository(root)
+            info = inspect_repository(
+                repo=repo,
+                base_sha=base,
+                head_sha=head,
+                git_executable=str(GIT),
+            )
+
+            bound_info = replace(
+                info,
+                temporary_control_parent=root,
+                temporary_control_parent_identity=identity_from_stat(os.stat(root)),
+            )
+            root_stat = os.stat(root)
+            root_syncs = 0
+            original_fsync = os.fsync
+
+            def track_root_fsync(descriptor: int) -> None:
+                nonlocal root_syncs
+                metadata = os.fstat(descriptor)
+                if (
+                    metadata.st_dev == root_stat.st_dev
+                    and metadata.st_ino == root_stat.st_ino
+                ):
+                    root_syncs += 1
+                original_fsync(descriptor)
+
+            with mock.patch(
+                "review_supervisor.gitraw.os.fsync",
+                side_effect=track_root_fsync,
+            ):
+                with gitraw.temporary_git_control(bound_info) as temporary:
+                    retained_parent = temporary.path.parent
+                    self.assertTrue(retained_parent.is_dir())
+            self.assertFalse(retained_parent.exists())
+            self.assertGreaterEqual(root_syncs, 2)
+
+            retained_after_unfsynced_delete: pathlib.Path | None = None
+            deletion_sync_failed = False
+
+            def fail_first_deletion_sync(descriptor: int) -> None:
+                nonlocal deletion_sync_failed
+                metadata = os.fstat(descriptor)
+                is_root = (
+                    metadata.st_dev == root_stat.st_dev
+                    and metadata.st_ino == root_stat.st_ino
+                )
+                if (
+                    is_root
+                    and retained_after_unfsynced_delete is not None
+                    and not retained_after_unfsynced_delete.exists()
+                    and not deletion_sync_failed
+                ):
+                    deletion_sync_failed = True
+                    raise OSError("synthetic deletion fsync failure")
+                original_fsync(descriptor)
+
+            with mock.patch(
+                "review_supervisor.gitraw.os.fsync",
+                side_effect=fail_first_deletion_sync,
+            ):
+                with self.assertRaises(GitProcessClosureUnproven) as raised:
+                    with gitraw.temporary_git_control(bound_info) as temporary:
+                        retained_after_unfsynced_delete = temporary.path.parent
+                deletion_failure = raised.exception
+                self.assertTrue(deletion_sync_failed)
+                retained_path = retained_after_unfsynced_delete
+                self.assertIsNotNone(retained_path)
+                assert retained_path is not None
+                self.assertFalse(retained_path.exists())
+                self.assertTrue(retry_git_process_closure(deletion_failure))
+
+            published_modes: dict[str, int] = {}
+            original_publish = gitraw.publish_bytes
+
+            def track_publication(
+                path: pathlib.Path,
+                data: bytes,
+                *,
+                mode: int = 0o600,
+            ):
+                published_modes[path.name] = mode
+                return original_publish(path, data, mode=mode)
+
+            with mock.patch(
+                "review_supervisor.gitraw.publish_bytes",
+                side_effect=track_publication,
+            ):
+                atomic_mode = create_sanitized_view(
+                    info,
+                    root / "atomic-mode-control",
+                )
+            self.assertEqual(published_modes["config"], 0o400)
+            remove_sanitized_view(atomic_mode.path)
+
+            benign = create_sanitized_view(info, root / "benign-control")
+            config = benign.path / "config"
+            metadata = config.stat()
+            os.utime(
+                config,
+                ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1),
+            )
+            child = benign.path / "worktrees" / "transient"
+            child.mkdir(mode=0o700)
+            child.rmdir()
+            revalidate_git_control(info, benign)
+            original_read_binding = gitraw._read_git_control_binding_once
+            materialization_checks = 0
+
+            def transient_materialization(
+                checked_info: RepositoryInfo,
+                checked_view: pathlib.Path,
+            ):
+                nonlocal materialization_checks
+                materialization_checks += 1
+                if materialization_checks == 1:
+                    raise OSError(
+                        errno.ESTALE,
+                        "synthetic File Provider metadata transition",
+                    )
+                return original_read_binding(checked_info, checked_view)
+
+            with mock.patch(
+                "review_supervisor.gitraw._read_git_control_binding_once",
+                side_effect=transient_materialization,
+            ):
+                revalidate_git_control(info, benign)
+            self.assertEqual(materialization_checks, 2)
+            remove_sanitized_view(benign.path)
+
+            replaced = create_sanitized_view(info, root / "replaced-control")
+            replacement = replaced.path / "config.replacement"
+            replacement.write_bytes((replaced.path / "config").read_bytes())
+            replacement.chmod(0o400)
+            os.replace(replacement, replaced.path / "config")
+            with self.assertRaises(OSError) as raised:
+                revalidate_git_control(info, replaced)
+            self.assertEqual(raised.exception.errno, errno.ESTALE)
+            remove_sanitized_view(replaced.path)
+
+            mutated = create_sanitized_view(info, root / "mutated-control")
+            (mutated.path / "config").chmod(0o600)
+            (mutated.path / "config").write_bytes(
+                b"[include]\n\tpath = /untrusted/config\n"
+            )
+            (mutated.path / "config").chmod(0o400)
+            with self.assertRaisesRegex(ValueError, "content mismatched"):
+                revalidate_git_control(info, mutated)
+            (mutated.path / "config").chmod(0o600)
+            (mutated.path / "config").write_bytes(gitraw._git_control_config(info))
+            (mutated.path / "config").chmod(0o400)
+            remove_sanitized_view(mutated.path)
+
+            policy = create_sanitized_view(info, root / "policy-control")
+            (policy.path / "config").chmod(0o644)
+            with self.assertRaises(OSError) as raised:
+                revalidate_git_control(info, policy)
+            self.assertEqual(raised.exception.errno, errno.EPERM)
+            (policy.path / "config").chmod(0o400)
+            remove_sanitized_view(policy.path)
+
+            unreadable = create_sanitized_view(info, root / "unreadable-control")
+            (unreadable.path / "config").chmod(0o000)
+            with self.assertRaises(OSError) as raised:
+                revalidate_git_control(info, unreadable)
+            self.assertIn(raised.exception.errno, {errno.EACCES, errno.EPERM})
+            (unreadable.path / "config").chmod(0o400)
+            remove_sanitized_view(unreadable.path)
+
+            missing = create_sanitized_view(info, root / "missing-control")
+            (missing.path / "config").unlink()
+            with self.assertRaises(FileNotFoundError):
+                revalidate_git_control(info, missing)
+            (missing.path / "config").write_bytes(gitraw._git_control_config(info))
+            (missing.path / "config").chmod(0o400)
+            remove_sanitized_view(missing.path)
+
+    def test_object_directory_child_churn_passes_replacement_and_policy_fail(
+        self,
+    ) -> None:
+        with owned_temporary_directory("git-object-binding-") as root:
+            repo, base, head = _build_repository(root)
+            info = inspect_repository(
+                repo=repo,
+                base_sha=base,
+                head_sha=head,
+                git_executable=str(GIT),
+            )
+            transient = info.object_directory / "transient-child"
+            transient.mkdir()
+            transient.rmdir()
+            self.assertGreater(enumerate_tree(info, head).entry_count, 0)
+
+            original_mode = stat.S_IMODE(info.object_directory.stat().st_mode)
+            changed_mode = 0o700 if original_mode != 0o700 else 0o750
+            info.object_directory.chmod(changed_mode)
+            try:
+                with self.assertRaises(OSError) as raised:
+                    enumerate_tree(info, head)
+                self.assertEqual(raised.exception.errno, errno.ESTALE)
+            finally:
+                info.object_directory.chmod(original_mode)
+
+            original_objects = info.object_directory.with_name("objects.original")
+            info.object_directory.rename(original_objects)
+            info.object_directory.mkdir(mode=original_mode)
+            try:
+                with self.assertRaises(OSError) as raised:
+                    enumerate_tree(info, head)
+                self.assertEqual(raised.exception.errno, errno.ESTALE)
+            finally:
+                info.object_directory.rmdir()
+                original_objects.rename(info.object_directory)
+
+    def test_worktree_add_and_remove_ignore_mid_invocation_source_include(
+        self,
+    ) -> None:
+        with owned_temporary_directory("git-worktree-config-isolation-") as root:
+            repo, base, head = _build_repository(root)
+            info = inspect_repository(
+                repo=repo,
+                base_sha=base,
+                head_sha=head,
+                git_executable=str(GIT),
+            )
+            config = repo / ".git" / "config"
+            original = config.read_bytes()
+            injected = b'[includeIf "gitdir:**"]\n\tpath = /untrusted/config\n'
+            original_run = gitraw.run_bounded
+            invocation_count = 0
+
+            def run_with_aba(
+                *args: object,
+                **kwargs: object,
+            ) -> tuple[int, bytes, bytes]:
+                nonlocal invocation_count
+                invocation_count += 1
+                config.write_bytes(injected)
+                try:
+                    return original_run(*args, **kwargs)
+                finally:
+                    config.write_bytes(original)
+
+            checkout = root / "checkout"
+            registration = None
+            try:
+                with mock.patch(
+                    "review_supervisor.gitraw.run_bounded",
+                    side_effect=run_with_aba,
+                ):
+                    registration = add_detached_worktree(info, checkout)
+                    initialize_index(info, registration)
+                    remove_both_present_worktree(info, registration)
+                self.assertGreaterEqual(invocation_count, 4)
+                verify_worktree_absent(info, checkout, registration.control)
+                remove_sanitized_view(registration.control.path)
+            finally:
+                config.write_bytes(original)
+                config.chmod(0o600)
+                if (
+                    registration is not None
+                    and checkout.exists()
+                    and registration.registration.exists()
+                ):
+                    remove_both_present_worktree(info, registration)
 
     def test_local_config_content_check_ignores_timestamps_but_rejects_mutation(
         self,
@@ -652,6 +1143,190 @@ class RawGitProtocolTests(unittest.TestCase):
         self.assertEqual(captured, payload)
         self.assertEqual(batch.requests, 1)
         self.assertEqual(request, object_id.encode("ascii") + b"\n")
+
+    def test_cat_file_cleanup_failure_still_releases_signal_scope(self) -> None:
+        batch, request_reader = _protocol_batch(b"")
+        batch.process.pid = 123
+        batch._cleanup_private_control = mock.Mock(
+            side_effect=[
+                OSError("synthetic control cleanup failure"),
+                None,
+            ]
+        )
+        batch._finish_signal_scope = mock.Mock()
+        try:
+            with self.assertRaises(GitProcessClosureUnproven) as raised:
+                batch.abort()
+            failure = raised.exception
+            self.assertEqual(
+                failure.process_receipt,
+                {
+                    "identity_status": "unbound",
+                    "pid": 123,
+                    "pgid": None,
+                    "start_identity": None,
+                },
+            )
+            batch._finish_signal_scope.assert_not_called()
+            self.assertTrue(retry_git_process_closure(failure))
+            failure.finish_signal_deferral(deliver=False)
+            batch._finish_signal_scope.assert_called_once_with(deliver=False)
+        finally:
+            os.close(request_reader)
+
+        parent = pathlib.Path("/synthetic/codex-git-control-cleanup")
+        binding = SimpleNamespace(path=parent / "git")
+        signal_scope = mock.Mock()
+        cleanup = mock.Mock(
+            side_effect=[
+                OSError("synthetic temporary cleanup failure"),
+                None,
+            ]
+        )
+        with (
+            mock.patch(
+                "review_supervisor.gitraw.begin_bound_signal_deferral",
+                return_value=signal_scope,
+            ),
+            mock.patch(
+                "review_supervisor.gitraw._create_temporary_git_control",
+                return_value=(parent, binding),
+            ),
+            mock.patch(
+                "review_supervisor.gitraw._cleanup_temporary_git_control",
+                cleanup,
+            ),
+        ):
+            with self.assertRaises(GitProcessClosureUnproven) as raised:
+                with gitraw.temporary_git_control(SimpleNamespace()):
+                    pass
+            temporary_failure = raised.exception
+            self.assertEqual(
+                temporary_failure.process_receipt,
+                {
+                    "identity_status": "not-applicable",
+                    "pid": None,
+                    "pgid": None,
+                    "start_identity": None,
+                },
+            )
+            self.assertEqual(
+                temporary_failure.retained_cleanup_paths,
+                (parent,),
+            )
+            signal_scope.finish.assert_not_called()
+            self.assertTrue(retry_git_process_closure(temporary_failure))
+            temporary_failure.finish_signal_deferral(deliver=False)
+            signal_scope.finish.assert_called_once_with(deliver=False)
+
+        constructor_parent = pathlib.Path("/synthetic/codex-git-control-constructor")
+        constructor_cleanup = mock.Mock()
+        constructor_failure = GitProcessClosureUnproven(
+            None,
+            None,
+            OSError("synthetic constructor control cleanup failure"),
+        )
+        constructor_failure.add_post_closure_cleanup(
+            constructor_cleanup,
+            retained_path=constructor_parent,
+        )
+        constructor_scope = mock.Mock()
+
+        def finish_constructor_scope(*, deliver: bool = True) -> None:
+            if deliver:
+                raise KeyboardInterrupt
+
+        constructor_scope.finish.side_effect = finish_constructor_scope
+        with (
+            mock.patch(
+                "review_supervisor.gitraw.begin_bound_signal_deferral",
+                return_value=constructor_scope,
+            ),
+            mock.patch(
+                "review_supervisor.gitraw._create_temporary_git_control",
+                side_effect=constructor_failure,
+            ),
+            self.assertRaises(GitProcessClosureUnproven) as constructor_raised,
+        ):
+            CatFileBatch(SimpleNamespace())
+        self.assertIs(constructor_raised.exception, constructor_failure)
+        constructor_scope.finish.assert_not_called()
+        self.assertTrue(retry_git_process_closure(constructor_failure))
+        constructor_failure.finish_signal_deferral(deliver=False)
+        constructor_scope.finish.assert_called_once_with(deliver=False)
+
+    def test_cat_file_closure_retry_finishes_control_and_signal_cleanup(self) -> None:
+        with owned_temporary_directory("cat-file-closure-finalizer-") as root:
+            batch = _scripted_batch(root, b"#!/bin/sh\nexec /bin/sleep 30\n")
+            retained_parent = batch._control_parent
+            self.assertIsNotNone(retained_parent)
+            signal_scope = mock.Mock()
+            batch._signal_scope = signal_scope
+            try:
+                with (
+                    mock.patch.object(
+                        gitraw,
+                        "_terminate_process",
+                        side_effect=TimeoutError("synthetic cleanup timeout"),
+                    ),
+                    self.assertRaises(GitProcessClosureUnproven) as raised,
+                ):
+                    batch.abort()
+                failure = raised.exception
+                self.assertEqual(failure.retained_cleanup_paths, (retained_parent,))
+                self.assertEqual(failure.process_receipt["identity_status"], "anchored")
+                self.assertEqual(failure.process_receipt["pid"], batch.process.pid)
+                self.assertEqual(failure.process_receipt["pgid"], batch.process.pid)
+                self.assertTrue(retained_parent.is_dir())
+                self.assertTrue(retry_git_process_closure(failure))
+                self.assertFalse(retained_parent.exists())
+                self.assertTrue(batch.closed)
+                signal_scope.finish.assert_not_called()
+                failure.finish_signal_deferral(deliver=False)
+                signal_scope.finish.assert_called_once_with(deliver=False)
+            finally:
+                if batch.process.returncode is None:
+                    _force_cleanup_batch(batch)
+
+        failed_cleanup = GitProcessClosureUnproven(
+            SimpleNamespace(
+                pid=123,
+                returncode=0,
+                stdin=None,
+                stdout=None,
+                stderr=None,
+            ),
+            None,
+            TimeoutError("synthetic cleanup timeout"),
+        )
+        cleanup = mock.Mock(side_effect=OSError("synthetic retained residue"))
+        release_signal = mock.Mock()
+        release_outer_signal = mock.Mock()
+        retained = pathlib.Path("/synthetic/retained-control")
+        failed_cleanup.add_post_closure_cleanup(cleanup, retained_path=retained)
+        failed_cleanup.bind_signal_deferral_release(release_signal)
+        failed_cleanup.bind_signal_deferral_release(release_outer_signal)
+        with mock.patch.object(
+            gitraw,
+            "checkpoint_bound_signal_interrupt",
+        ) as checkpoint:
+            self.assertFalse(retry_git_process_closure(failed_cleanup))
+        checkpoint.assert_not_called()
+        release_signal.assert_not_called()
+        release_outer_signal.assert_not_called()
+        failed_cleanup.finish_signal_deferral(deliver=False)
+        release_signal.assert_called_once_with(False)
+        release_outer_signal.assert_called_once_with(False)
+        self.assertEqual(
+            failed_cleanup.process_receipt,
+            {
+                "identity_status": "unbound",
+                "pid": 123,
+                "pgid": None,
+                "start_identity": None,
+            },
+        )
+        self.assertEqual(failed_cleanup.retained_cleanup_paths, (retained,))
 
     def test_cat_file_close_is_bounded_on_output_and_open_pipes(self) -> None:
         scripts = (
@@ -985,6 +1660,7 @@ class RawGitProtocolTests(unittest.TestCase):
             descendant_pid: int | None = None
 
             selector_type = selectors.DefaultSelector
+            signal_scope = mock.Mock()
 
             class CloseFailingSelector:
                 def __init__(self) -> None:
@@ -1008,6 +1684,11 @@ class RawGitProtocolTests(unittest.TestCase):
                         gitraw,
                         "_terminate_process",
                         side_effect=TimeoutError("synthetic cleanup timeout"),
+                    ),
+                    mock.patch.object(
+                        gitraw,
+                        "begin_bound_signal_deferral",
+                        return_value=signal_scope,
                     ),
                     self.assertRaises(GitProcessClosureUnproven) as raised,
                 ):
@@ -1034,6 +1715,9 @@ class RawGitProtocolTests(unittest.TestCase):
                 self.assertIsInstance(raised.exception.__cause__, OverflowError)
                 self.assertTrue(retry_git_process_closure(raised.exception))
                 self.assertIsNotNone(raised.exception.process.returncode)
+                signal_scope.finish.assert_not_called()
+                raised.exception.finish_signal_deferral(deliver=False)
+                signal_scope.finish.assert_called_once_with(deliver=False)
             finally:
                 if leader_pid is not None:
                     try:
@@ -1357,6 +2041,50 @@ class RawGitCheckoutTests(unittest.TestCase):
         read_state.assert_not_called()
         recovery.assert_not_called()
 
+        retried_failure = GitProcessClosureUnproven(
+            process,
+            None,
+            TimeoutError("synthetic retry cleanup"),
+        )
+        signal_release = mock.Mock()
+        retried_failure.bind_signal_deferral_release(signal_release)
+        recovered_state = {**state, "worktree_status": "manual-recovery-required"}
+        expected = (recovered_state, "recovered-digest")
+        with (
+            mock.patch(
+                "review_supervisor.runtime._DIRECT_PROCESS_CLOSURE_UNPROVEN",
+                None,
+            ),
+            mock.patch(
+                "review_supervisor.runtime.open_absolute_directory_chain",
+                side_effect=retried_failure,
+            ),
+            mock.patch(
+                "review_supervisor.runtime.retry_git_process_closure",
+                return_value=True,
+            ),
+            mock.patch(
+                "review_supervisor.runtime.require_direct_process_closure_proven",
+            ),
+            mock.patch(
+                "review_supervisor.runtime.read_bound_attempt_state",
+                return_value=(state, b"state", "disk-digest"),
+            ),
+            mock.patch(
+                "review_supervisor.runtime._manual_worktree_recovery",
+                return_value=expected,
+            ) as recovery,
+        ):
+            result = _cleanup_worktree(
+                entrypoint=pathlib.Path("/tmp/entrypoint"),
+                attempt=attempt_lease,
+                state=state,
+                state_digest="digest",
+            )
+        self.assertEqual(result, expected)
+        signal_release.assert_called_once_with(False)
+        recovery.assert_called_once()
+
     def test_check_attributes_accepts_many_short_unspecified_paths(self) -> None:
         paths = tuple(f"p{index:03d}".encode("ascii") for index in range(200))
         output = b"".join(
@@ -1384,9 +2112,15 @@ class RawGitCheckoutTests(unittest.TestCase):
             self.assertEqual(kwargs["stdout_limit"], len(output))
             return 0, output, b""
 
-        with mock.patch(
-            "review_supervisor.gitraw.run_bounded",
-            side_effect=run_with_limit,
+        with (
+            mock.patch(
+                "review_supervisor.gitraw.run_bounded",
+                side_effect=run_with_limit,
+            ),
+            mock.patch(
+                "review_supervisor.gitraw._view_environment",
+                return_value=sanitized_git_environment(),
+            ),
         ):
             check_attributes(
                 info,
@@ -1406,15 +2140,20 @@ class RawGitCheckoutTests(unittest.TestCase):
             )
             checkout_parent = root / "checkouts"
             checkout_parent.mkdir(mode=0o700)
-            worktree = checkout_parent / "review-fixture"
-            registration = add_detached_worktree(info, worktree)
-            namespace = checkout_parent / ".review-control-fixture"
-            namespace.mkdir(mode=0o700)
             retention = root / "retention"
             retention.mkdir(mode=0o700)
             attempt_id = f"1-{'d' * 32}"
             attempt = retention / f"attempt-{attempt_id}"
             attempt.mkdir(mode=0o700)
+            control = create_sanitized_view(info, attempt / "git-control")
+            worktree = checkout_parent / "review-fixture"
+            registration = add_detached_worktree(
+                info,
+                worktree,
+                control=control,
+            )
+            namespace = checkout_parent / ".review-control-fixture"
+            namespace.mkdir(mode=0o700)
             try:
                 initialize_index(info, registration)
                 post_index_count, post_index_path_bytes = enumerate_registration(
@@ -1439,6 +2178,7 @@ class RawGitCheckoutTests(unittest.TestCase):
                     "worktree_path": str(worktree),
                     "control_namespace": str(namespace),
                     "registration": registration_value,
+                    "git_control_binding": registration_value["control"],
                     "worktree_status": "active",
                     "checkout_settlement": "outstanding",
                     "checkout_physical_remaining_by_fs": {"fixture": 1},
@@ -1736,7 +2476,8 @@ class RawGitCheckoutTests(unittest.TestCase):
                 remove_both_present_worktree(info, registration)
             if namespace.exists():
                 namespace.rmdir()
-        verify_worktree_absent(info, checkout)
+        verify_worktree_absent(info, checkout, registration.control)
+        remove_sanitized_view(registration.control.path)
 
     def test_raw_detached_checkout_and_sealed_diff(self) -> None:
         with owned_temporary_directory("git-checkout-") as root:
@@ -1773,7 +2514,13 @@ class RawGitCheckoutTests(unittest.TestCase):
         self.assertEqual(environment["GIT_LFS_SKIP_SMUDGE"], "1")
         self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(environment["GIT_PROTOCOL_FROM_USER"], "0")
+        self.assertEqual(environment["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(environment["GIT_CONFIG_SYSTEM"], "/dev/null")
         self.assertEqual(environment["GIT_CONFIG_GLOBAL"], "/dev/null")
+        self.assertEqual(environment["GIT_CONFIG_COUNT"], "0")
+        self.assertEqual(environment["HOME"], "/var/empty")
+        self.assertNotIn("GIT_CONFIG", environment)
+        self.assertNotIn("XDG_CONFIG_HOME", environment)
 
     def test_materializer_blocks_small_lfs_pointer_content(self) -> None:
         with owned_temporary_directory("git-lfs-block-") as root:
