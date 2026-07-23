@@ -1,9 +1,10 @@
 # Placeholder-Only Fixture Templates
 
-First require `isolated_review synthetic-tokens validate`, select IDs from the
-metadata-only `isolated_review synthetic-tokens list --json` result, and resolve
-each placeholder with single-ID
-`isolated_review synthetic-tokens get <id> --json`. Replace the complete
+First resolve `catalog_cli` exactly as required by the parent skill. Require
+`"$catalog_cli" synthetic-tokens validate`, select IDs from the metadata-only
+`"$catalog_cli" synthetic-tokens list --json` result, and resolve each
+placeholder with single-ID
+`"$catalog_cli" synthetic-tokens get <id> --json`. Replace the complete
 placeholder with the returned value. Do not concatenate, transform, encode, or
 partially substitute a value.
 

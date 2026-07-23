@@ -54,6 +54,8 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
         ):
             self.assertIn(command, normalized_skill)
             self.assertIn(command, normalized_templates)
+            self.assertIn(f'"$catalog_cli" {command}', templates)
+        self.assertNotIn("isolated_review synthetic-tokens", templates)
         self.assertNotIn("synthetic-tokens list-exemptions", normalized_skill)
         self.assertNotIn("synthetic-tokens audit-master", normalized_skill)
         self.assertFalse((SKILL_ROOT / "scripts").exists())

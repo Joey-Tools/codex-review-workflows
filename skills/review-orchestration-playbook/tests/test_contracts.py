@@ -176,9 +176,14 @@ def _secret_admission_repository_policy_files(
 
 
 class RepositoryContractTest(unittest.TestCase):
-    def test_change_delivery_uses_a_thin_authoritative_runtime_rule(self) -> None:
+    def test_change_delivery_delegates_version_selection_and_isolation(self) -> None:
         skill = (
             SKILL_SCOPE_ROOT / "skills/change-delivery-workflow/SKILL.md"
+        ).read_text(encoding="utf-8")
+        validation_environments = (
+            SKILL_SCOPE_ROOT
+            / "skills/change-delivery-workflow/references/"
+            / "validation-environments.md"
         ).read_text(encoding="utf-8")
 
         normalized = " ".join(skill.split())
@@ -192,15 +197,19 @@ class RepositoryContractTest(unittest.TestCase):
             "fail closed instead of guessing or silently falling back",
         ):
             self.assertIn(anchor, normalized)
-        for duplicated_detail in (
+        self.assertIn(
+            "[validation-environments.md](references/validation-environments.md)",
+            skill,
+        )
+        normalized_environments = " ".join(validation_environments.split())
+        for delegated_detail in (
             "CI matrix",
             "supported-version set",
             "canonical version ordering",
-            "multi-version",
             "installed inventory",
-            "independent worktree/cache/state",
+            "independent worktree, cache, and state roots",
         ):
-            self.assertNotIn(duplicated_detail, normalized)
+            self.assertIn(delegated_detail, normalized_environments)
 
     def test_cleanup_only_legacy_0664_lock_migration_is_private_and_ordered(
         self,
@@ -1839,9 +1848,7 @@ class RepositoryContractTest(unittest.TestCase):
             "repository policy": repository_policy,
         }
         if CI_PROFILE == "canonical":
-            documents["README"] = (REPO_ROOT / "README.md").read_text(
-                encoding="utf-8"
-            )
+            documents["README"] = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
         for name, content in documents.items():
             with self.subTest(document=name):
@@ -1919,9 +1926,7 @@ class RepositoryContractTest(unittest.TestCase):
         canonical = (SKILL_ROOT / "references/canonical-claude-lane.md").read_text(
             encoding="utf-8"
         )
-        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(
-            encoding="utf-8"
-        )
+        runtime = (SCRIPTS / "review_runtime/named_lane.py").read_text(encoding="utf-8")
 
         self.assertIn("device, inode, file type, and owner", skill)
         self.assertIn("(st_dev, st_ino, file type, st_uid)", contracts)
@@ -1950,9 +1955,9 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("not a claim", contracts)
         self.assertIn("producer-output bound", canonical)
 
-        marker_binding = runtime.split(
-            "class _MaterializerSourceMarkerBinding:", 1
-        )[1].split("@dataclass", 1)[0]
+        marker_binding = runtime.split("class _MaterializerSourceMarkerBinding:", 1)[
+            1
+        ].split("@dataclass", 1)[0]
         for field in ("device", "inode", "file_type", "owner", "is_gitfile"):
             self.assertIn(f"{field}:", marker_binding)
         for excluded in ("mtime", "ctime", "nlink", "digest"):
@@ -3898,8 +3903,12 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertIn(f"{binding}: bytes | None = None", validator)
         self.assertIn("bound_payloads = (", validator)
-        self.assertIn("if all(payload is None for payload in bound_payloads):", validator)
-        self.assertIn("elif any(payload is None for payload in bound_payloads):", validator)
+        self.assertIn(
+            "if all(payload is None for payload in bound_payloads):", validator
+        )
+        self.assertIn(
+            "elif any(payload is None for payload in bound_payloads):", validator
+        )
         self.assertIn("_load_bound_stream_contract(", validator)
 
         for anchor in (
