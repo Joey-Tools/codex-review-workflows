@@ -19,6 +19,7 @@ from .secureio import (
     publish_bytes,
     read_fd_exact,
     sha256_bytes,
+    validate_private_directory_fd,
 )
 
 
@@ -41,6 +42,7 @@ class RootSpec:
     parent_identity: Identity
     name: bytes
     expected_identity: Identity
+    private_metadata: bool = False
 
 
 @dataclass(frozen=True)
@@ -220,7 +222,19 @@ class CustodiedManifest:
         spec = self.roots[index]
         root_fd = self.root_fds[index]
         _require_parent_custody(spec)
-        descriptor = identity_from_stat(os.fstat(root_fd))
+        try:
+            descriptor = (
+                validate_private_directory_fd(
+                    root_fd,
+                    pathlib.Path(os.fsdecode(spec.name)),
+                )
+                if spec.private_metadata
+                else identity_from_stat(os.fstat(root_fd))
+            )
+        except (OSError, ValueError) as error:
+            raise CustodyLostError(
+                f"targeted cleanup access policy changed for {spec.label}"
+            ) from error
         path_identity = identity_from_stat(
             os.stat(spec.name, dir_fd=spec.parent_fd, follow_symlinks=False)
         )
@@ -371,7 +385,14 @@ def build_custodied_manifest(
                 dir_fd=spec.parent_fd,
             )
             root_fds.append(root_fd)
-            descriptor = identity_from_stat(os.fstat(root_fd))
+            descriptor = (
+                validate_private_directory_fd(
+                    root_fd,
+                    pathlib.Path(os.fsdecode(spec.name)),
+                )
+                if spec.private_metadata
+                else identity_from_stat(os.fstat(root_fd))
+            )
             path_identity = identity_from_stat(path_metadata)
             if (
                 not directory_identities_match(descriptor, spec.expected_identity)
@@ -428,6 +449,7 @@ def build_custodied_manifest(
                     "name_hex": spec.name.hex(),
                     "parent_identity": spec.parent_identity.to_json(),
                     "root_identity": spec.expected_identity.to_json(),
+                    "private_metadata": spec.private_metadata,
                 }
                 for spec in roots
             ],

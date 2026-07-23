@@ -42,6 +42,7 @@ from review_supervisor.runtime import (
     _MAX_NEARBY_CONTEXT_CANDIDATES,
     _build_appserver_evidence_attestation,
     _kill_direct,
+    _persist_attempt_git_closure_receipt,
     _record_failure,
     _read_checkout_closure_receipt,
     _run_checkout,
@@ -162,6 +163,47 @@ class RuntimeHelperTests(unittest.TestCase):
     def test_checkout_closure_receipt_is_durable_and_failure_schema_is_closed(
         self,
     ) -> None:
+        invalid_handoffs = (
+            {
+                "handoff": "incomplete",
+                "process_owner": "attempt-supervisor",
+                "handoff_token": "a" * 64,
+            },
+            {
+                "handoff": "complete",
+                "process_owner": "checkout-worker",
+                "handoff_token": "a" * 64,
+            },
+            {
+                "handoff": "complete",
+                "process_owner": "attempt-supervisor",
+                "handoff_token": "b" * 64,
+            },
+        )
+        for invalid_state in invalid_handoffs:
+            with (
+                self.subTest(invalid_state=invalid_state),
+                mock.patch(
+                    "review_supervisor.runtime._build_checkout_closure_receipt"
+                ) as build_receipt,
+                mock.patch(
+                    "review_supervisor.runtime._publish_checkout_closure_receipt"
+                ) as publish_receipt,
+                self.assertRaisesRegex(
+                    ValueError,
+                    "durable ownership binding",
+                ),
+            ):
+                _persist_attempt_git_closure_receipt(
+                    attempt=_fake_attempt(),
+                    state=invalid_state,
+                    error=mock.Mock(),
+                    token="a" * 64,
+                    owner_start_identity="synthetic-owner",
+                )
+            build_receipt.assert_not_called()
+            publish_receipt.assert_not_called()
+
         with owned_temporary_directory("checkout-closure-receipt-") as root:
             retention = root / "retention"
             retention.mkdir(mode=0o700)
@@ -378,6 +420,9 @@ class RuntimeHelperTests(unittest.TestCase):
             "record_generation": 1,
             "worktree_path": "/tmp/review-worktree",
             "common_git_dir_binding": {"path": "/tmp/repository.git"},
+            "handoff": "complete",
+            "process_owner": "attempt-supervisor",
+            "handoff_token": token,
         }
         durable_control_state = {
             **initial_state,
@@ -459,6 +504,7 @@ class RuntimeHelperTests(unittest.TestCase):
                 state=initial_state,
                 state_digest="initial-digest",
                 source_fd=-1,
+                token=token,
             )
 
         self.assertEqual(raised.exception.failure.code, "synthetic-phase0-failure")

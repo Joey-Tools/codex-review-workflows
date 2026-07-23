@@ -253,6 +253,34 @@ def _wait_for_process_exit(pid: int, *, timeout: float) -> bool:
     return True
 
 
+def _wait_for_pid_record(
+    path: pathlib.Path,
+    *,
+    field_count: int,
+    timeout: float,
+) -> tuple[int, ...]:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            payload = path.read_bytes()
+        except FileNotFoundError:
+            payload = b""
+        if len(payload) > 128:
+            raise AssertionError("fixture PID record exceeded its byte bound")
+        if payload.endswith(b"\n"):
+            fields = payload[:-1].split()
+            if (
+                len(fields) == field_count
+                and all(field.isdigit() for field in fields)
+                and all(int(field) > 0 for field in fields)
+            ):
+                return tuple(int(field) for field in fields)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError("fixture PID record was not published completely")
+        time.sleep(min(0.01, remaining))
+
+
 def _force_cleanup_batch(batch: CatFileBatch) -> None:
     group_anchor = getattr(batch, "group_anchor", None)
     if group_anchor is not None:
@@ -1547,15 +1575,11 @@ class RawGitProtocolTests(unittest.TestCase):
             worker = threading.Thread(target=invoke, daemon=True)
             try:
                 worker.start()
-                deadline = time.monotonic() + 2
-                while not pid_path.exists() and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                self.assertTrue(pid_path.exists(), "bounded Git PIDs were not recorded")
-                leader_raw, descendant_raw = pid_path.read_text(
-                    encoding="ascii"
-                ).split()
-                leader_pid = int(leader_raw)
-                descendant_pid = int(descendant_raw)
+                leader_pid, descendant_pid = _wait_for_pid_record(
+                    pid_path,
+                    field_count=2,
+                    timeout=2,
+                )
                 descendant_identity = process_start_identity(descendant_pid)
                 descendant_group = os.getpgid(descendant_pid)
                 release_path.write_bytes(b"release\n")
@@ -1612,15 +1636,11 @@ class RawGitProtocolTests(unittest.TestCase):
             worker = threading.Thread(target=invoke, daemon=True)
             try:
                 worker.start()
-                deadline = time.monotonic() + 2
-                while not pid_path.exists() and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                self.assertTrue(pid_path.exists(), "bounded Git PIDs were not recorded")
-                leader_raw, descendant_raw = pid_path.read_text(
-                    encoding="ascii"
-                ).split()
-                leader_pid = int(leader_raw)
-                descendant_pid = int(descendant_raw)
+                leader_pid, descendant_pid = _wait_for_pid_record(
+                    pid_path,
+                    field_count=2,
+                    timeout=2,
+                )
                 descendant_identity = process_start_identity(descendant_pid)
                 descendant_group = os.getpgid(descendant_pid)
                 release_path.write_bytes(b"release\n")
@@ -1701,15 +1721,11 @@ class RawGitProtocolTests(unittest.TestCase):
                         stderr_limit=8192,
                     )
 
-                deadline = time.monotonic() + 2
-                while not pid_path.exists() and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                self.assertTrue(pid_path.exists(), "bounded Git PIDs were not recorded")
-                leader_raw, descendant_raw = pid_path.read_text(
-                    encoding="ascii"
-                ).split()
-                leader_pid = int(leader_raw)
-                descendant_pid = int(descendant_raw)
+                leader_pid, descendant_pid = _wait_for_pid_record(
+                    pid_path,
+                    field_count=2,
+                    timeout=2,
+                )
                 self.assertEqual(raised.exception.pid, leader_pid)
                 self.assertIsNotNone(raised.exception.group_anchor)
                 self.assertIsInstance(raised.exception.__cause__, OverflowError)
@@ -1758,16 +1774,11 @@ class RawGitProtocolTests(unittest.TestCase):
                 nonlocal descendant_pid
                 nonlocal descendant_identity
                 nonlocal descendant_group
-                deadline = time.monotonic() + 2
-                while not pid_path.exists() and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                if not pid_path.exists():
-                    raise AssertionError("bounded Git PIDs were not recorded")
-                leader_raw, descendant_raw = pid_path.read_text(
-                    encoding="ascii"
-                ).split()
-                leader_pid = int(leader_raw)
-                descendant_pid = int(descendant_raw)
+                leader_pid, descendant_pid = _wait_for_pid_record(
+                    pid_path,
+                    field_count=2,
+                    timeout=2,
+                )
                 descendant_identity = process_start_identity(descendant_pid)
                 descendant_group = os.getpgid(descendant_pid)
                 raise RuntimeError("synthetic selector failure")
@@ -1834,14 +1845,11 @@ class RawGitProtocolTests(unittest.TestCase):
             descendant_identity: str | None = None
             worker: threading.Thread | None = None
             try:
-                deadline = time.monotonic() + 2
-                while not pid_path.exists() and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                self.assertTrue(
-                    pid_path.exists(),
-                    "background child PID was not recorded",
+                (descendant_pid,) = _wait_for_pid_record(
+                    pid_path,
+                    field_count=1,
+                    timeout=2,
                 )
-                descendant_pid = int(pid_path.read_text(encoding="ascii").strip())
                 descendant_identity = process_start_identity(descendant_pid)
                 wait_terminal(
                     live_batch.process.pid,
@@ -1901,14 +1909,11 @@ class RawGitProtocolTests(unittest.TestCase):
             descendant_pid: int | None = None
             descendant_identity: str | None = None
             try:
-                deadline = time.monotonic() + 2
-                while not pid_path.exists() and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                self.assertTrue(
-                    pid_path.exists(),
-                    "background child PID was not recorded",
+                (descendant_pid,) = _wait_for_pid_record(
+                    pid_path,
+                    field_count=1,
+                    timeout=2,
                 )
-                descendant_pid = int(pid_path.read_text(encoding="ascii").strip())
                 descendant_identity = process_start_identity(descendant_pid)
                 wait_terminal(
                     live_batch.process.pid,

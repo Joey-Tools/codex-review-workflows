@@ -1009,3 +1009,38 @@ metadata behavior.
   cached PyYAML environment, project-journal validation, and `git diff --check`
   pass. The whole-tree format probe reports only six pre-existing untouched
   files outside this workstream's edits. No local Python 3.10 run was performed.
+- A later formal fresh-context review found that an attempt-private Git closure
+  receipt could survive a restart without being admitted by boot-change
+  recovery. The receipt publisher and persistence primitive now independently
+  require the complete durable handoff, exact attempt-supervisor ownership, and
+  matching 256-bit handoff token before publishing bytes. Authenticated
+  boot-change recovery accepts only the exact private canonical receipt, binds
+  every listed direct-child control root, and separates object identity,
+  content stability, and access-policy proof. It revalidates owner, mode, ACL,
+  and xattr policy on held root descriptors during inventory and immediately
+  before deletion.
+- Two follow-up audits closed the remaining restart semantics. Up to eight
+  retained roots are removed through two-root custodied-manifest batches under
+  one deadline; completed batches may be absent on retry, while the unchanged
+  receipt remains until every listed exact name is proved absent. A regression
+  now completes the first batch, interrupts the second, and succeeds on a fresh
+  recovery with complete absent-name evidence. Another regression injects an
+  access-policy failure after manifest construction but before deletion, and
+  malformed token and mode cases leave both state and receipt unchanged. A
+  final fresh-context follow-up audit reported no actionable findings.
+- The fixed deterministic supervisor identity is 391 tests with SHA-256
+  `3050bca4b65cb180b68a4fe807632c1b98724634c6f14b5c5492aa01b6614d47`;
+  all 391 passed in 295.858 seconds under Python 3.13.0. The focused
+  runtime/recovery set passed 72 tests, and the three exact receipt/restart
+  regressions passed together. A high-load run exposed a test-only PID-file
+  publication race: shell redirection creates an empty file before `printf`
+  commits the newline-terminated record. Six affected process tests now wait
+  for one bounded complete PID record; all six pass.
+- Final Python 3.13.0 discovery ran 2,790 tests in 2,050.229 seconds with 6
+  expected platform skips. Its sole in-app failure was the documented nested
+  Desktop `sandbox-exec` denial in
+  `test_claude_keychain_broker_serves_one_in_memory_value`; that exact test
+  passed outside the Desktop sandbox in 4.008 seconds. Ruff lint and focused
+  formatting, compileall with bytecode disabled, the repository contract
+  assertion, and `git diff --check` pass. No local Python 3.10 run was
+  performed.

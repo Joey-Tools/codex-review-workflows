@@ -91,6 +91,8 @@ from .recovery_cleanup import (
 )
 from .review_execution import projected_isolated_review_environment
 from .runtime import (
+    _CHECKOUT_CLOSURE_RECEIPT_MAX_BYTES,
+    _CHECKOUT_CLOSURE_RECEIPT_NAME,
     _authenticate_attempt_transfer,
     _build_checkout_closure_receipt,
     _cleanup_worktree,
@@ -118,12 +120,14 @@ from .secureio import (
     directory_identities_match,
     ensure_no_path_value,
     identity_from_stat,
+    identities_match,
     measure_filesystem_fd,
     open_regular_at,
     publish_bytes,
     read_fd_exact,
     require_private_directory,
     sha256_bytes,
+    validate_private_directory_fd,
 )
 from .signal_relay import checkpoint_bound_signal_interrupt
 from .wire import receive_record, send_blob, send_record, socket_pair
@@ -1241,6 +1245,17 @@ def _publish_attempt_git_closure_recovery(
 ) -> dict[str, Any]:
     try:
         state, _, _ = read_bound_attempt_state(attempt)
+        durable_token = state.get("handoff_token")
+        if (
+            state.get("handoff") != "complete"
+            or state.get("process_owner") != "attempt-supervisor"
+            or not isinstance(durable_token, str)
+            or HANDOFF_TOKEN_PATTERN.fullmatch(durable_token) is None
+            or token != durable_token
+        ):
+            raise ValueError(
+                "attempt Git closure receipt has no durable ownership binding"
+            )
         owner_start_identity = process_start_identity(os.getpid())
         receipt = _build_checkout_closure_receipt(
             error,
@@ -2047,6 +2062,7 @@ def _validate_process_inventory(
     state: dict[str, Any],
     *,
     allow_fifo: bool,
+    allow_checkout_closure_recovery: bool = False,
 ) -> dict[str, Any]:
     attempt.revalidate(state)
     directory_fd = os.dup(attempt.fd)
@@ -2062,12 +2078,109 @@ def _validate_process_inventory(
         observed: list[str] = []
         runtime_identity: dict[str, Any] | None = None
         runtime_allocated_bytes = 0
+        closure_recovery: dict[str, Any] | None = None
+        closure_recovery_roots: dict[str, dict[str, Any]] = {}
+        closure_receipt_name = os.fsdecode(_CHECKOUT_CLOSURE_RECEIPT_NAME)
+        if _CHECKOUT_CLOSURE_RECEIPT_NAME in names:
+            if not allow_checkout_closure_recovery:
+                raise ValueError(
+                    "checkout closure recovery receipt is not allowed in this phase"
+                )
+            handoff_token = state.get("handoff_token")
+            if (
+                state.get("handoff") != "complete"
+                or state.get("process_owner") != "attempt-supervisor"
+                or not isinstance(handoff_token, str)
+                or HANDOFF_TOKEN_PATTERN.fullmatch(handoff_token) is None
+            ):
+                raise ValueError(
+                    "checkout closure recovery receipt has no durable ownership token"
+                )
+            receipt_metadata = os.stat(
+                _CHECKOUT_CLOSURE_RECEIPT_NAME,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            receipt_identity = identity_from_stat(receipt_metadata)
+            if (
+                not stat.S_ISREG(receipt_metadata.st_mode)
+                or receipt_metadata.st_uid != os.getuid()
+                or stat.S_IMODE(receipt_metadata.st_mode) != 0o600
+                or receipt_metadata.st_nlink != 1
+                or receipt_metadata.st_size > _CHECKOUT_CLOSURE_RECEIPT_MAX_BYTES
+            ):
+                raise ValueError("checkout closure recovery receipt is unsafe")
+            recovered = _read_checkout_closure_receipt(
+                attempt,
+                token=handoff_token,
+            )
+            if recovered is None:
+                raise ValueError("checkout closure recovery receipt disappeared")
+            receipt, receipt_sha256 = recovered
+            refreshed_identity = identity_from_stat(
+                os.stat(
+                    _CHECKOUT_CLOSURE_RECEIPT_NAME,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            )
+            if not identities_match(
+                receipt_identity,
+                refreshed_identity,
+            ):
+                raise ValueError("checkout closure recovery receipt changed identity")
+            retained_names = {
+                pathlib.Path(path).name for path in receipt["retained_cleanup_paths"]
+            }
+            if len(retained_names) != len(receipt["retained_cleanup_paths"]):
+                raise ValueError("checkout closure recovery roots are not unique")
+            closure_recovery = {
+                "receipt_sha256": receipt_sha256,
+                "receipt_identity": receipt_identity.to_json(),
+                "retained_names": sorted(retained_names),
+            }
         for raw_name in names:
             name = os.fsdecode(raw_name)
             metadata = os.stat(raw_name, dir_fd=directory_fd, follow_symlinks=False)
             if metadata.st_uid != os.getuid():
                 raise ValueError(f"attempt artifact has unexpected owner: {name}")
             observed.append(name)
+            if (
+                closure_recovery is not None
+                and name in closure_recovery["retained_names"]
+            ):
+                if (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or stat.S_IMODE(metadata.st_mode) != 0o700
+                ):
+                    raise ValueError(
+                        "retained Git-control recovery root identity is unsafe"
+                    )
+                closure_recovery_roots[name] = {
+                    "identity": identity_from_stat(metadata).to_json(),
+                    "allocated_bytes": 0,
+                }
+                root_fd = os.open(
+                    raw_name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=directory_fd,
+                )
+                try:
+                    refreshed = validate_private_directory_fd(
+                        root_fd,
+                        pathlib.Path(name),
+                    )
+                    expected = Identity(**closure_recovery_roots[name]["identity"])
+                    if not directory_identities_match(refreshed, expected):
+                        raise OSError(
+                            "retained Git-control recovery root identity changed"
+                        )
+                    closure_recovery_roots[name]["allocated_bytes"] = (
+                        allocated_bytes_fd(root_fd, entry_cap=1_000)
+                    )
+                finally:
+                    os.close(root_fd)
+                continue
             if name == "final.fifo":
                 if not allow_fifo or not stat.S_ISFIFO(metadata.st_mode):
                     raise ValueError("unexpected or unsafe final FIFO")
@@ -2102,6 +2215,8 @@ def _validate_process_inventory(
                 raise ValueError(
                     f"attempt artifact is not a single-link regular file: {name}"
                 )
+            if name == closure_receipt_name:
+                continue
             if name == "state.json":
                 continue
             if RECOVERY_TEMP_PATTERN.fullmatch(name):
@@ -2132,6 +2247,14 @@ def _validate_process_inventory(
             )
         if "state.json" not in observed:
             raise ValueError("attempt inventory has no state record")
+        if closure_recovery is not None:
+            retained_names = set(closure_recovery["retained_names"])
+            if not set(closure_recovery_roots) <= retained_names:
+                raise ValueError("checkout closure recovery root inventory escaped")
+            closure_recovery["retained_roots"] = closure_recovery_roots
+            closure_recovery["absent_names"] = sorted(
+                retained_names - set(closure_recovery_roots)
+            )
         return {
             "entry_count": len(names),
             "allocated_bytes": allocated_bytes_fd(directory_fd, entry_cap=1_000),
@@ -2139,6 +2262,7 @@ def _validate_process_inventory(
             "temporary_names": sorted(temporary_names),
             "runtime_identity": runtime_identity,
             "runtime_allocated_bytes": runtime_allocated_bytes,
+            "checkout_closure_recovery": closure_recovery,
         }
     finally:
         os.close(directory_fd)
@@ -2155,6 +2279,7 @@ def _remove_recovery_artifacts(
     prompt_result = "absent"
     removed_temporaries: list[str] = []
     runtime_cleanup: dict[str, Any] | None = None
+    closure_cleanup: dict[str, Any] | None = None
     try:
         for name in inventory["temporary_names"]:
             raw_name = os.fsencode(name)
@@ -2236,6 +2361,109 @@ def _remove_recovery_artifacts(
                 if deleted:
                     remove_published_manifest(manifest.seal)
             os.fsync(directory_fd)
+        closure_recovery = inventory.get("checkout_closure_recovery")
+        if closure_recovery is not None:
+            if not isinstance(closure_recovery, dict):
+                raise ValueError("checkout closure recovery inventory is malformed")
+            retained_roots = closure_recovery.get("retained_roots")
+            if not isinstance(retained_roots, dict):
+                raise ValueError(
+                    "checkout closure recovery root inventory is malformed"
+                )
+            retained_cleanup_batches: list[dict[str, Any]] = []
+            if retained_roots:
+                parent_identity = identity_from_stat(os.fstat(directory_fd))
+                retained_items = sorted(retained_roots.items())
+                cleanup_deadline = time.monotonic() + 30
+                for offset in range(0, len(retained_items), 2):
+                    batch = retained_items[offset : offset + 2]
+                    manifest = build_custodied_manifest(
+                        roots=tuple(
+                            RootSpec(
+                                label=f"retained-git-control:{name}",
+                                parent_fd=directory_fd,
+                                parent_identity=parent_identity,
+                                name=os.fsencode(name),
+                                expected_identity=Identity(**details["identity"]),
+                                private_metadata=True,
+                            )
+                            for name, details in batch
+                        ),
+                        manifest_path=attempt.path / RUNTIME_CLEANUP_MANIFEST,
+                        entry_cap=RUNTIME_CLEANUP_ENTRY_CAP,
+                        payload_cap=RUNTIME_CLEANUP_PAYLOAD_CAP,
+                        deadline=cleanup_deadline,
+                    )
+                    deleted = False
+                    try:
+                        batch_cleanup = delete_custodied_roots(
+                            manifest,
+                            deadline=cleanup_deadline,
+                        )
+                        deleted = True
+                    finally:
+                        manifest.close()
+                        if deleted:
+                            remove_published_manifest(manifest.seal)
+                    retained_cleanup_batches.append(batch_cleanup)
+                    os.fsync(directory_fd)
+            handoff_token = state.get("handoff_token")
+            if not isinstance(handoff_token, str):
+                raise ValueError(
+                    "checkout closure recovery lost its durable ownership token"
+                )
+            recovered = _read_checkout_closure_receipt(
+                attempt,
+                token=handoff_token,
+            )
+            if recovered is None or recovered[1] != closure_recovery.get(
+                "receipt_sha256"
+            ):
+                raise ValueError(
+                    "checkout closure recovery receipt changed before cleanup"
+                )
+            retained_names = closure_recovery.get("retained_names")
+            if not isinstance(retained_names, list):
+                raise ValueError(
+                    "checkout closure recovery retained-name inventory is malformed"
+                )
+            for name in retained_names:
+                try:
+                    os.stat(
+                        os.fsencode(name),
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    continue
+                raise ValueError(
+                    "checkout closure recovery root remains before receipt cleanup"
+                )
+            expected_receipt_identity = Identity(**closure_recovery["receipt_identity"])
+            current_receipt_identity = identity_from_stat(
+                os.stat(
+                    _CHECKOUT_CLOSURE_RECEIPT_NAME,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            )
+            if not identities_match(
+                expected_receipt_identity,
+                current_receipt_identity,
+            ):
+                raise ValueError(
+                    "checkout closure recovery receipt changed identity before cleanup"
+                )
+            os.unlink(_CHECKOUT_CLOSURE_RECEIPT_NAME, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+            closure_cleanup = {
+                "receipt": "removed",
+                "retained_git_control_cleanup": {
+                    "batch_count": len(retained_cleanup_batches),
+                    "batches": retained_cleanup_batches,
+                    "exact_names_absent": True,
+                },
+            }
     finally:
         os.close(directory_fd)
         attempt.revalidate(state)
@@ -2243,6 +2471,7 @@ def _remove_recovery_artifacts(
         "prompt_reconciliation": prompt_result,
         "removed_state_temporaries": removed_temporaries,
         "retained_runtime_cleanup": runtime_cleanup,
+        "checkout_closure_recovery_cleanup": closure_cleanup,
     }
 
 
@@ -2586,7 +2815,12 @@ def recover(
                     stage="recovery",
                     code="recovery-reviewer-closure-invalid",
                 ) from error
-        inventory = _validate_process_inventory(attempt, state, allow_fifo=True)
+        inventory = _validate_process_inventory(
+            attempt,
+            state,
+            allow_fifo=True,
+            allow_checkout_closure_recovery=True,
+        )
         process_was_exact = state.get("process_settlement") == "exact"
         if process_was_exact:
             state, digest = _commit_conservative_process_rewrite(

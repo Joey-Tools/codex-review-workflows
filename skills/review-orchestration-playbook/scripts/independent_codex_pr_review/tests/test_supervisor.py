@@ -10,6 +10,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import review_supervisor.supervisor as supervisor_module
 from review_supervisor.constants import (
     LOW_LEVEL_HELPER_REVIEW_CONTRACT,
     MAX_EVIDENCE_PRIMARY_BYTES,
@@ -897,6 +898,308 @@ class FinalAuthorizationTests(unittest.TestCase):
 
 
 class RecoverySettlementTests(unittest.TestCase):
+    def test_boot_change_rejects_unbound_or_nonprivate_closure_receipt(
+        self,
+    ) -> None:
+        cases = (
+            ("wrong-token", "b" * 64, 0o600),
+            ("wrong-mode", "a" * 64, 0o640),
+        )
+        for index, (label, receipt_token, receipt_mode) in enumerate(cases):
+            with (
+                self.subTest(label=label),
+                owned_temporary_directory(f"reject-checkout-closure-{label}-") as root,
+            ):
+                retention = root / "retention"
+                retention.mkdir(mode=0o700)
+                attempt = _write_attempt(
+                    retention,
+                    suffix=str(index + 8) * 32,
+                    retention_state="held",
+                    released_at=None,
+                )
+                handoff_token = "a" * 64
+                receipt_path = attempt / "checkout-closure-recovery.json"
+                receipt_path.write_bytes(
+                    canonical_json(
+                        {
+                            "version": 1,
+                            "token": receipt_token,
+                            "worker": {
+                                "pid": 4321,
+                                "start_identity": "previous-boot-worker",
+                            },
+                            "process": {
+                                "identity_status": "not-applicable",
+                                "pid": None,
+                                "pgid": None,
+                                "start_identity": None,
+                            },
+                            "control_scope": "attempt-private",
+                            "retained_cleanup_paths": [],
+                        }
+                    )
+                )
+                receipt_path.chmod(receipt_mode)
+                state, _, _ = read_attempt_state(attempt)
+                state.update(
+                    {
+                        "boot_id": "previous-boot",
+                        "handoff": "complete",
+                        "handoff_token": handoff_token,
+                        "process_owner": "attempt-supervisor",
+                        "process_settlement": "outstanding",
+                        "admission": {
+                            "retention_fs": {
+                                "identity": measure_filesystem(attempt).identity,
+                            }
+                        },
+                    }
+                )
+                _write_exact_state(attempt, state)
+                before_state = (attempt / "state.json").read_bytes()
+
+                with (
+                    mock.patch(
+                        "review_supervisor.supervisor.boot_identifier",
+                        return_value="current-boot",
+                    ),
+                    self.assertRaises(ValueError),
+                ):
+                    recover(
+                        entrypoint=ENTRYPOINT,
+                        retention_root=retention,
+                        attempt_dir=attempt,
+                    )
+
+                self.assertTrue(receipt_path.exists())
+                self.assertEqual((attempt / "state.json").read_bytes(), before_state)
+
+        with owned_temporary_directory(
+            "reject-checkout-closure-root-metadata-"
+        ) as root:
+            retention = root / "retention"
+            retention.mkdir(mode=0o700)
+            attempt = _write_attempt(
+                retention,
+                suffix="6" * 32,
+                retention_state="held",
+                released_at=None,
+            )
+            retained_control = attempt / "codex-git-control-private-metadata"
+            retained_control.mkdir(mode=0o700)
+            handoff_token = "a" * 64
+            receipt_path = attempt / "checkout-closure-recovery.json"
+            receipt_path.write_bytes(
+                canonical_json(
+                    {
+                        "version": 1,
+                        "token": handoff_token,
+                        "worker": {
+                            "pid": 4321,
+                            "start_identity": "previous-boot-worker",
+                        },
+                        "process": {
+                            "identity_status": "not-applicable",
+                            "pid": None,
+                            "pgid": None,
+                            "start_identity": None,
+                        },
+                        "control_scope": "temporary",
+                        "retained_cleanup_paths": [str(retained_control)],
+                    }
+                )
+            )
+            receipt_path.chmod(0o600)
+            state, _, _ = read_attempt_state(attempt)
+            state.update(
+                {
+                    "boot_id": "previous-boot",
+                    "handoff": "complete",
+                    "handoff_token": handoff_token,
+                    "process_owner": "attempt-supervisor",
+                    "process_settlement": "outstanding",
+                    "admission": {
+                        "retention_fs": {
+                            "identity": measure_filesystem(attempt).identity,
+                        }
+                    },
+                }
+            )
+            _write_exact_state(attempt, state)
+            before_state = (attempt / "state.json").read_bytes()
+
+            validation_calls = 0
+
+            def reject_before_delete(
+                descriptor: int,
+                path: pathlib.Path,
+            ) -> object:
+                nonlocal validation_calls
+                validation_calls += 1
+                if validation_calls < 3:
+                    return identity_from_stat(os.fstat(descriptor))
+                raise ValueError("private ACL")
+
+            with (
+                mock.patch(
+                    "review_supervisor.supervisor.boot_identifier",
+                    return_value="current-boot",
+                ),
+                mock.patch(
+                    "review_supervisor.recovery_cleanup.validate_private_directory_fd",
+                    side_effect=reject_before_delete,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "access policy changed",
+                ),
+            ):
+                recover(
+                    entrypoint=ENTRYPOINT,
+                    retention_root=retention,
+                    attempt_dir=attempt,
+                )
+
+            self.assertTrue(receipt_path.exists())
+            self.assertTrue(retained_control.exists())
+            self.assertEqual(validation_calls, 3)
+            self.assertEqual((attempt / "state.json").read_bytes(), before_state)
+
+    def test_boot_change_recovers_bound_checkout_closure_receipt(self) -> None:
+        with owned_temporary_directory("recover-checkout-closure-") as root:
+            retention = root / "retention"
+            retention.mkdir(mode=0o700)
+            attempt = _write_attempt(
+                retention,
+                suffix="7" * 32,
+                retention_state="held",
+                released_at=None,
+            )
+            retained_controls = tuple(
+                attempt / f"codex-git-control-restart-{index}" for index in range(3)
+            )
+            for retained_control in retained_controls:
+                retained_control.mkdir(mode=0o700)
+                retained_artifact = retained_control / "config"
+                retained_artifact.write_bytes(b"retained control state\n")
+                retained_artifact.chmod(0o600)
+            already_removed_control = attempt / "codex-git-control-already-removed"
+            handoff_token = "a" * 64
+            receipt = {
+                "version": 1,
+                "token": handoff_token,
+                "worker": {
+                    "pid": 4321,
+                    "start_identity": "previous-boot-worker",
+                },
+                "process": {
+                    "identity_status": "anchored",
+                    "pid": 4322,
+                    "pgid": 4322,
+                    "start_identity": "previous-boot-git",
+                },
+                "control_scope": "temporary",
+                "retained_cleanup_paths": [
+                    *(str(path) for path in retained_controls),
+                    str(already_removed_control),
+                ],
+            }
+            receipt_path = attempt / "checkout-closure-recovery.json"
+            receipt_path.write_bytes(canonical_json(receipt))
+            receipt_path.chmod(0o600)
+
+            state, _, _ = read_attempt_state(attempt)
+            state.update(
+                {
+                    "boot_id": "previous-boot",
+                    "handoff": "complete",
+                    "handoff_token": handoff_token,
+                    "process_owner": "attempt-supervisor",
+                    "process_settlement": "outstanding",
+                    "admission": {
+                        "retention_fs": {
+                            "identity": measure_filesystem(attempt).identity,
+                        }
+                    },
+                }
+            )
+            _write_exact_state(attempt, state)
+
+            delete_calls = 0
+            real_delete = supervisor_module.delete_custodied_roots
+
+            def interrupt_second_batch(
+                manifest: object,
+                *,
+                deadline: float | None = None,
+            ) -> dict[str, object]:
+                nonlocal delete_calls
+                delete_calls += 1
+                if delete_calls == 2:
+                    raise RuntimeError("synthetic cleanup batch interruption")
+                return real_delete(manifest, deadline=deadline)
+
+            with (
+                mock.patch(
+                    "review_supervisor.supervisor.boot_identifier",
+                    return_value="current-boot",
+                ),
+                mock.patch(
+                    "review_supervisor.supervisor.delete_custodied_roots",
+                    side_effect=interrupt_second_batch,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "synthetic cleanup batch interruption",
+                ),
+            ):
+                recover(
+                    entrypoint=ENTRYPOINT,
+                    retention_root=retention,
+                    attempt_dir=attempt,
+                )
+
+            self.assertEqual(delete_calls, 2)
+            self.assertTrue(receipt_path.exists())
+            self.assertFalse(retained_controls[0].exists())
+            self.assertFalse(retained_controls[1].exists())
+            self.assertTrue(retained_controls[2].exists())
+
+            with mock.patch(
+                "review_supervisor.supervisor.boot_identifier",
+                return_value="current-boot",
+            ):
+                exit_code, result = recover(
+                    entrypoint=ENTRYPOINT,
+                    retention_root=retention,
+                    attempt_dir=attempt,
+                )
+
+            self.assertEqual(exit_code, 0, result)
+            self.assertFalse(receipt_path.exists())
+            for retained_control in retained_controls:
+                self.assertFalse(retained_control.exists())
+            self.assertFalse(already_removed_control.exists())
+            recovered, _, _ = read_attempt_state(attempt)
+            cleanup = recovered["recovery"]["checkout_closure_recovery_cleanup"]
+            self.assertEqual(cleanup["receipt"], "removed")
+            self.assertEqual(
+                cleanup["retained_git_control_cleanup"]["batch_count"],
+                1,
+            )
+            self.assertEqual(
+                recovered["recovery"]["process_inventory"]["checkout_closure_recovery"][
+                    "absent_names"
+                ],
+                [
+                    "codex-git-control-already-removed",
+                    "codex-git-control-restart-0",
+                    "codex-git-control-restart-1",
+                ],
+            )
+            self.assertEqual(recovered["process_settlement"], "exact")
+
     def test_released_attempt_chains_runtime_cleanup_reauthorization(self) -> None:
         with owned_temporary_directory("recover-released-runtime-") as root:
             retention = root / "retention"
@@ -1783,7 +2086,16 @@ class IncompleteHandoffProcessTests(unittest.TestCase):
             with (
                 mock.patch(
                     "review_supervisor.supervisor.read_bound_attempt_state",
-                    return_value=({"phase": "failed"}, b"state", "digest"),
+                    return_value=(
+                        {
+                            "phase": "failed",
+                            "handoff": "complete",
+                            "process_owner": "attempt-supervisor",
+                            "handoff_token": "b" * 64,
+                        },
+                        b"state",
+                        "digest",
+                    ),
                 ),
                 mock.patch(
                     "review_supervisor.supervisor.process_start_identity",

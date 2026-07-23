@@ -3115,6 +3115,16 @@ def _persist_attempt_git_closure_receipt(
     token: str,
     owner_start_identity: str,
 ) -> dict[str, Any]:
+    attempt.revalidate(state)
+    durable_token = state.get("handoff_token")
+    if (
+        state.get("handoff") != "complete"
+        or state.get("process_owner") != "attempt-supervisor"
+        or not isinstance(durable_token, str)
+        or _HANDOFF_TOKEN_PATTERN.fullmatch(durable_token) is None
+        or token != durable_token
+    ):
+        raise ValueError("attempt Git closure receipt has no durable ownership binding")
     receipt = _build_checkout_closure_receipt(
         error,
         attempt_dir=attempt.path,
@@ -4007,9 +4017,16 @@ def _run_checkout(
     state: dict[str, Any],
     state_digest: str,
     source_fd: int,
+    token: str,
 ) -> tuple[dict[str, Any], str]:
     deadline = time.monotonic() + CHECKOUT_SECONDS
-    token = os.urandom(32).hex()
+    if (
+        _HANDOFF_TOKEN_PATTERN.fullmatch(token) is None
+        or state.get("handoff") != "complete"
+        or state.get("process_owner") != "attempt-supervisor"
+        or state.get("handoff_token") != token
+    ):
+        raise ValueError("checkout token is not bound to durable process ownership")
     control_git_dir = attempt.path / "git-control"
     create_intent = {
         "version": 2,
@@ -5408,6 +5425,7 @@ def attempt_supervisor_main(
                 state=state,
                 state_digest=state_digest,
                 source_fd=source_fd,
+                token=handoff_token,
             )
             os.close(source_fd)
             source_fd = None
