@@ -834,6 +834,7 @@ _UNEXTRACTABLE_SECRET_CANDIDATE_END = -1
 class SecretScanResult:
     blocking_rule: str | None
     unextractable_rule: str | None
+    unextractable_container_counts: Counter[tuple[str, bytes, bytes | None]]
     accepted_counts: Counter[AcceptedSyntheticValue]
     accepted_candidates: dict[AcceptedSyntheticValue, set[bytes]]
     blocking_candidates: dict[bytes, set[str]]
@@ -852,6 +853,7 @@ class SecretScanResult:
             None,
             None,
             Counter(),
+            Counter(),
             {},
             {},
             Counter(),
@@ -869,6 +871,9 @@ class SecretScanResult:
             self.blocking_rule = other.blocking_rule
         if self.unextractable_rule is None:
             self.unextractable_rule = other.unextractable_rule
+        self.unextractable_container_counts.update(
+            other.unextractable_container_counts
+        )
         self.accepted_counts.update(other.accepted_counts)
         self.raw_occurrence_counts.update(other.raw_occurrence_counts)
         self.unembedded_occurrence_counts.update(other.unembedded_occurrence_counts)
@@ -6038,6 +6043,10 @@ def _scan_frozen_tree_values(
                 _continue_after_blocking=_continue_after_blocking,
             )
             result.merge(path_scan)
+            if path_scan.unextractable_rule is not None:
+                result.unextractable_container_counts[
+                    ("path", raw_path, None)
+                ] += 1
             if mode == "160000" and object_type == "commit":
                 continue
             if object_type != "blob":
@@ -6087,6 +6096,10 @@ def _scan_frozen_tree_values(
                 exact_only=exact_only,
                 _continue_after_blocking=_continue_after_blocking,
             )
+            if scan.unextractable_rule is not None:
+                result.unextractable_container_counts[
+                    ("blob", raw_path, object_id.encode("ascii"))
+                ] += 1
             if capture_reduction_identities:
                 for descriptor, offsets in scan.reduction_occurrence_offsets.items():
                     identities = scan.reduction_occurrence_identities.setdefault(
@@ -6948,6 +6961,52 @@ def _shard_catalog_count_manifest(
     return committed_shards[0], committed_shards[1]
 
 
+def _require_unextractable_container_nonincrease(
+    *,
+    base_discovery: SecretScanResult,
+    head_discovery: SecretScanResult,
+) -> None:
+    projected_counts: list[Counter[tuple[str, bytes]]] = []
+    for discovery in (base_discovery, head_discovery):
+        has_unextractable_rule = discovery.unextractable_rule is not None
+        has_container_counts = bool(discovery.unextractable_container_counts)
+        if has_unextractable_rule != has_container_counts:
+            raise ReviewError(
+                "an unextractable exact secret candidate lost its container identity"
+            )
+        projected: Counter[tuple[str, bytes]] = Counter()
+        for (
+            surface,
+            raw_path,
+            object_id,
+        ), count in discovery.unextractable_container_counts.items():
+            if not raw_path or count <= 0:
+                raise ReviewError(
+                    "an unextractable exact secret container identity is invalid"
+                )
+            if surface == "path" and object_id is None:
+                identity = (surface, raw_path)
+            elif (
+                surface == "blob"
+                and object_id is not None
+                and re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", object_id)
+                is not None
+            ):
+                identity = (surface, object_id)
+            else:
+                raise ReviewError(
+                    "an unextractable exact secret container identity is invalid"
+                )
+            projected[identity] += count
+        projected_counts.append(projected)
+    base_counts, head_counts = projected_counts
+    for identity, head_count in head_counts.items():
+        if head_count > base_counts[identity]:
+            raise ReviewError(
+                "an exact secret candidate could not be extracted completely"
+            )
+
+
 def _secret_count_manifests(
     *,
     git_view: pathlib.Path,
@@ -6990,8 +7049,24 @@ def _secret_count_manifests(
         reduced_secret_values=legacy_raw_values,
         _continue_after_blocking=True,
     )
-    if head_discovery.unextractable_rule is not None:
-        raise ReviewError("an exact secret candidate could not be extracted completely")
+    _require_unextractable_container_nonincrease(
+        base_discovery=base_discovery,
+        head_discovery=head_discovery,
+    )
+    if source_head_sha is not None and source_head_sha != head_sha:
+        source_head_discovery = _scan_frozen_tree_values(
+            git_view=git_view,
+            object_directory=object_directory,
+            commit=source_head_sha,
+            accepted_values=scan_accepted,
+            capture_blocking_candidates=True,
+            reduced_secret_values=legacy_raw_values,
+            _continue_after_blocking=True,
+        )
+        _require_unextractable_container_nonincrease(
+            base_discovery=base_discovery,
+            head_discovery=source_head_discovery,
+        )
     discovery = base_discovery
     discovery.merge(head_discovery)
     # Non-exact expressions have no stable byte identity and intentionally do

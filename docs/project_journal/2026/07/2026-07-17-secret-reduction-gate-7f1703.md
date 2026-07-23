@@ -3,7 +3,7 @@ id: 20260717-7f1703
 title: Trust Reviewers and Gate Exact-Secret Growth
 status: completed
 created: 2026-07-17
-updated: 2026-07-22
+updated: 2026-07-24
 branch: codex/secret-reduction-review
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/60
 supersedes: []
@@ -71,7 +71,11 @@ The counter consumes exact raw candidates only. It does not derive canonical Bas
 
 This creates a deliberate limitation: an encoded or transformed form is not linked to the raw secret unless that byte string independently becomes an exact scanner candidate. Evidence must state this limitation without generating the missing variants.
 
-A dynamic expression that cannot produce one stable exact byte value does not enter the counter and is not itself an admission violation. This is not the same as an incomplete scan. A scanner-recognized shape that is unextractable only in base is treated as a permitted deletion; an unextractable head-side shape is `inconclusive`. If the helper cannot completely enumerate or read the bounded base/head trees, loses counter integrity, or otherwise cannot finish counting an exact candidate, admission is also `inconclusive` and records a bounded failure class without exposing the raw diagnostic.
+A dynamic expression that cannot produce one stable exact byte value does not enter the counter and is not itself an admission violation. This is not the same as an incomplete scan. For a scanner-recognized shape whose exact raw value cannot be extracted, the helper retains bounded opaque container evidence: raw Git path bytes identify path containers, while blob OIDs identify regular-file and symlink content independently of path and mode. An unchanged container, same-blob move, balanced identical copy/removal, or deletion passes when every projected head identity count is no greater than base. A new or renamed path identity, a new or changed content OID, greater identical-blob multiplicity, missing identity, incomplete tree read, or lost count integrity is `inconclusive`, not a proved violation.
+
+### Opaque Container Follow-up
+
+The 2026-07-24 maintenance follow-up closes a false-inconclusive case where unchanged scanner-recognized test fixtures repeatedly exposed an unextractable assignment shape. The comparison remains fail-closed for new or changed opaque content: it proves only that the bounded opaque container multiset did not grow, while the exact raw-value counter continues to detect and report independently extractable secret growth.
 
 ### Violation Reporting
 
@@ -133,7 +137,7 @@ Implementation and final combined code validation now preserve both layers: the 
 - Authoring-catalog safe fixtures retain exact declared-rule acceptance.
 - Base64 and other encoded variants are neither derived nor scanned as aliases.
 - Non-exact dynamic expressions are excluded from the counter.
-- Base-only unextractable shapes may be deleted, while head-side or otherwise genuinely incomplete scans report `inconclusive`.
+- Unextractable opaque containers pass only when their projected path/blob identity multiplicities do not grow; unmatched, changed, or greater-multiplicity head containers remain `inconclusive`.
 - Violation diagnostics include only newly added `path:line` locations.
 - Ambiguous move-plus-copy or cross-surface endpoint mappings never overstate addition locations; they retain the proved global violation while reporting location evidence as `inconclusive`.
 - Single/double/triple review counting remains Codex / Codex+actual Claude Code / Codex+actual Claude Code+GitHub Codex, each local named lane using its own clean Git worktree without an injected full diff.
@@ -203,3 +207,5 @@ The remaining unchecked items are post-commit delivery operations. They are inte
 - Official skill validator: `Skill is valid!`.
 - Project journal validator: `Project journal validation passed.`.
 - The final immutable whole-range review result is recorded in PR #60 after the signed implementation anchor exists; it is not pre-claimed by this commit.
+- Opaque-container follow-up regressions cover unchanged content, same-blob move, deletion, new content, duplicate growth, changed content, path rename, and independently extractable exact-secret growth.
+- Real-range follow-up admission: BBDown-rust `57bd18d9e039b9370e36fa5676a539bc0e72081d..6a9bf18a19e223c7c39328f80a9d9acf18ecddf1` and Webex-generic-account-bot `0288dfeef678b00a272ea9213aa91813a277ebfe..0633d5a863388a28b641dd54f8ccaea5fe7e4412` both returned exit `0`, `secret_delta.status=clean`, `reviewer_started=false`, and complete temporary cleanup with the follow-up implementation.
