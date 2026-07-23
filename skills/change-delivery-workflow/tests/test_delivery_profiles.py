@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import unittest
 
@@ -8,6 +9,45 @@ SKILL_ROOT = Path(__file__).resolve().parents[1]
 CHANGE_SKILL = SKILL_ROOT / "SKILL.md"
 AGILE_SKILL = SKILL_ROOT.parent / "agile-delivery-workflow" / "SKILL.md"
 VALIDATION_ENVIRONMENTS = SKILL_ROOT / "references" / "validation-environments.md"
+DELIVERY_RESULT_SCHEMA = SKILL_ROOT / "references" / "delivery-result.schema.json"
+PROFILE_SELECTION_CASES = (
+    SKILL_ROOT / "tests" / "fixtures" / "profile-selection-cases.json"
+)
+
+RESULT_FIELDS = {
+    "schema_version",
+    "profile",
+    "constraints",
+    "commit_mode",
+    "remote_mutation",
+    "handoff",
+}
+PROFILES = {
+    "focused-checkpoint",
+    "local-gate",
+    "pr-readiness-handoff",
+}
+CONSTRAINTS = {
+    "local-only",
+    "report-only",
+    "probe-only",
+    "read-only",
+    "no-remote",
+    "no-commit",
+}
+REMOTE_LIMITING_CONSTRAINTS = {
+    "local-only",
+    "report-only",
+    "probe-only",
+    "read-only",
+    "no-remote",
+}
+COMMIT_LIMITING_CONSTRAINTS = {
+    "report-only",
+    "probe-only",
+    "read-only",
+    "no-commit",
+}
 
 
 def documented_profile_cases(skill: str) -> dict[str, tuple[str, str]]:
@@ -21,6 +61,66 @@ def documented_profile_cases(skill: str) -> dict[str, tuple[str, str]]:
         prompt, profile, transition = cells
         cases[prompt.strip("`")] = (profile.strip("`"), transition)
     return cases
+
+
+def profile_selection_cases() -> list[dict[str, object]]:
+    payload = json.loads(PROFILE_SELECTION_CASES.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != 1:
+        raise AssertionError("unexpected profile-selection fixture version")
+    cases = payload.get("cases")
+    if not isinstance(cases, list):
+        raise AssertionError("profile-selection cases must be a list")
+    return cases
+
+
+def assert_valid_result_contract(result: object) -> None:
+    if not isinstance(result, dict):
+        raise AssertionError("delivery result must be an object")
+    if set(result) != RESULT_FIELDS:
+        raise AssertionError("delivery result fields do not match the closed contract")
+    if result["schema_version"] != 1:
+        raise AssertionError("unexpected delivery result schema version")
+    if result["profile"] not in PROFILES:
+        raise AssertionError("unknown delivery profile")
+
+    constraints = result["constraints"]
+    if not isinstance(constraints, list):
+        raise AssertionError("constraints must be a list")
+    if len(constraints) != len(set(constraints)):
+        raise AssertionError("constraints must be unique")
+    if not set(constraints) <= CONSTRAINTS:
+        raise AssertionError("unknown delivery constraint")
+
+    commit_mode = result["commit_mode"]
+    if commit_mode not in {"allowed", "forbidden"}:
+        raise AssertionError("unknown commit mode")
+    remote_mutation = result["remote_mutation"]
+    if remote_mutation not in {
+        "forbidden",
+        "review-authorization-required",
+    }:
+        raise AssertionError("unknown remote-mutation mode")
+    handoff = result["handoff"]
+    if handoff not in {"none", "review-orchestration-playbook"}:
+        raise AssertionError("unknown handoff")
+
+    constraint_set = set(constraints)
+    if constraint_set & COMMIT_LIMITING_CONSTRAINTS:
+        if commit_mode != "forbidden":
+            raise AssertionError("commit-limiting constraint was discarded")
+    if constraint_set & REMOTE_LIMITING_CONSTRAINTS:
+        if result["profile"] == "pr-readiness-handoff":
+            raise AssertionError("remote-limiting constraint allowed PR handoff")
+        if remote_mutation != "forbidden" or handoff != "none":
+            raise AssertionError("remote-limiting constraint was discarded")
+
+    if result["profile"] == "pr-readiness-handoff":
+        if remote_mutation != "review-authorization-required":
+            raise AssertionError("PR handoff bypassed review authorization")
+        if handoff != "review-orchestration-playbook":
+            raise AssertionError("PR handoff did not route to the review skill")
+    elif remote_mutation != "forbidden" or handoff != "none":
+        raise AssertionError("a local profile attempted a remote handoff")
 
 
 class DeliveryProfileContractTest(unittest.TestCase):
@@ -60,34 +160,15 @@ class DeliveryProfileContractTest(unittest.TestCase):
 
     def test_prompt_classification_uses_terminal_outcome_precedence(self) -> None:
         expected = {
-            "Deliver a quick MVP and stop at a local checkpoint.": (
-                "focused-checkpoint",
-                "focused checkpoint, then stop",
-            ),
-            "Deliver an MVP, then open a PR for feedback.": (
-                "pr-readiness-handoff",
-                "focused slice, full local gate, then PR handoff",
-            ),
-            "Start with an MVP but complete the full local gate now.": (
-                "local-gate",
-                "focused slice, full local gate, then stop",
-            ),
-            "Complete this non-trivial implementation locally.": (
-                "local-gate",
-                "full local gate, then stop",
-            ),
-            "Take the implementation to merge-ready and stop before merge.": (
-                "pr-readiness-handoff",
-                "full local gate, then PR handoff",
-            ),
-            "Probe local gate readiness, but do not commit.": (
-                "local-gate",
-                "gate-only report under `no-commit`",
-            ),
+            case["prompt"]: (
+                case["result"]["profile"],
+                case["transition"],
+            )
+            for case in profile_selection_cases()
         }
         self.assertEqual(documented_profile_cases(self.change), expected)
         for anchor in (
-            "Choose by the requested terminal outcome, using this precedence",
+            "After applying hard constraints, choose by the remaining requested terminal outcome",
             "combined MVP-plus-PR request therefore selects `pr-readiness-handoff`",
             "combined MVP-plus-full-local-gate request similarly selects `local-gate`",
             "remote or full-gate work must wait for a later request",
@@ -95,20 +176,174 @@ class DeliveryProfileContractTest(unittest.TestCase):
             self.assertIn(anchor, self.normalized_change)
 
     def test_no_commit_constraint_precedes_every_checkpoint(self) -> None:
-        mode_heading = self.change.index("## Resolve Commit Mode First")
+        mode_heading = self.change.index("## Resolve Hard Constraints First")
         profile_heading = self.change.index("## Choose The Profile")
         self.assertLess(mode_heading, profile_heading)
         for anchor in (
-            "hard constraint for the whole run",
+            "sets commit mode to `forbidden` for the whole run",
             "before any review checkpoint, anchor, or landing commit",
             "A delivery profile never overrides it",
             "leave Git history unchanged",
             "pre-existing exact committed range",
             "do not create an implicit checkpoint",
-            "Under `report-only`, `probe-only`, or `no-commit`, do not create a checkpoint or anchor",
+            "Under `report-only`, `probe-only`, `read-only`, or `no-commit`, do not create a checkpoint or anchor",
             "otherwise report the formal lane blocked",
         ):
             self.assertIn(anchor, self.normalized_change)
+
+    def test_scope_constraints_precede_pr_signals_and_survive_handoff(
+        self,
+    ) -> None:
+        cases = {case["prompt"]: case["result"] for case in profile_selection_cases()}
+        constrained_expectations = {
+            "Run the full workflow locally, report-only.": {
+                "constraints": ["local-only", "report-only"],
+                "commit_mode": "forbidden",
+            },
+            "Run the full workflow with no remote work.": {
+                "constraints": ["no-remote"],
+                "commit_mode": "allowed",
+            },
+            "Review full-workflow readiness read-only.": {
+                "constraints": ["read-only"],
+                "commit_mode": "forbidden",
+            },
+            "Probe full workflow and PR readiness; do not make remote changes.": {
+                "constraints": ["probe-only", "no-remote"],
+                "commit_mode": "forbidden",
+            },
+        }
+        for prompt, expected in constrained_expectations.items():
+            with self.subTest(prompt=prompt):
+                result = cases[prompt]
+                self.assertEqual(result["profile"], "local-gate")
+                self.assertEqual(result["constraints"], expected["constraints"])
+                self.assertEqual(result["commit_mode"], expected["commit_mode"])
+                self.assertEqual(result["remote_mutation"], "forbidden")
+                self.assertEqual(result["handoff"], "none")
+
+        positive = cases["Run the full workflow and open a PR."]
+        self.assertEqual(positive["profile"], "pr-readiness-handoff")
+        self.assertEqual(positive["constraints"], [])
+        self.assertEqual(
+            positive["remote_mutation"],
+            "review-authorization-required",
+        )
+        self.assertEqual(positive["handoff"], "review-orchestration-playbook")
+
+        for anchor in (
+            "constraints are subtractive and take precedence over `full workflow`",
+            "forbids `pr-readiness-handoff` and every remote mutation",
+            "a downstream workflow may not reinterpret it",
+            "hard constraint that forbids PR handoff always wins at this step",
+            "[delivery-result.schema.json](references/delivery-result.schema.json)",
+            "Preserve these fields unchanged across any handoff",
+            "Receivers must fail closed",
+        ):
+            self.assertIn(anchor, self.normalized_change)
+
+    def test_delivery_result_schema_is_closed_and_fixture_cases_conform(
+        self,
+    ) -> None:
+        schema = json.loads(DELIVERY_RESULT_SCHEMA.read_text(encoding="utf-8"))
+        self.assertEqual(
+            schema["$schema"], "https://json-schema.org/draft/2020-12/schema"
+        )
+        self.assertEqual(set(schema["required"]), RESULT_FIELDS)
+        self.assertEqual(set(schema["properties"]), RESULT_FIELDS)
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(
+            set(schema["properties"]["profile"]["enum"]),
+            PROFILES,
+        )
+        self.assertEqual(
+            set(schema["properties"]["constraints"]["items"]["enum"]),
+            CONSTRAINTS,
+        )
+        self.assertEqual(len(schema["allOf"]), 3)
+        remote_constraint, commit_constraint, profile_constraint = schema["allOf"]
+        self.assertEqual(
+            set(
+                remote_constraint["if"]["properties"]["constraints"]["contains"]["enum"]
+            ),
+            REMOTE_LIMITING_CONSTRAINTS,
+        )
+        self.assertEqual(
+            set(remote_constraint["then"]["properties"]["profile"]["enum"]),
+            {"focused-checkpoint", "local-gate"},
+        )
+        self.assertEqual(
+            remote_constraint["then"]["properties"]["remote_mutation"]["const"],
+            "forbidden",
+        )
+        self.assertEqual(
+            remote_constraint["then"]["properties"]["handoff"]["const"],
+            "none",
+        )
+        self.assertEqual(
+            set(
+                commit_constraint["if"]["properties"]["constraints"]["contains"]["enum"]
+            ),
+            COMMIT_LIMITING_CONSTRAINTS,
+        )
+        self.assertEqual(
+            commit_constraint["then"]["properties"]["commit_mode"]["const"],
+            "forbidden",
+        )
+        self.assertEqual(
+            profile_constraint["if"]["properties"]["profile"]["const"],
+            "pr-readiness-handoff",
+        )
+        self.assertEqual(
+            profile_constraint["then"]["properties"]["remote_mutation"]["const"],
+            "review-authorization-required",
+        )
+        self.assertEqual(
+            profile_constraint["then"]["properties"]["handoff"]["const"],
+            "review-orchestration-playbook",
+        )
+        self.assertEqual(
+            profile_constraint["else"]["properties"]["remote_mutation"]["const"],
+            "forbidden",
+        )
+        self.assertEqual(
+            profile_constraint["else"]["properties"]["handoff"]["const"],
+            "none",
+        )
+
+        for case in profile_selection_cases():
+            with self.subTest(prompt=case["prompt"]):
+                assert_valid_result_contract(case["result"])
+
+    def test_constrained_result_cannot_be_reinterpreted_downstream(self) -> None:
+        constrained = next(
+            case["result"]
+            for case in profile_selection_cases()
+            if case["prompt"] == "Run the full workflow locally, report-only."
+        )
+        invalid_results = []
+
+        missing_constraints = dict(constrained)
+        del missing_constraints["constraints"]
+        invalid_results.append(missing_constraints)
+
+        unknown_field = dict(constrained)
+        unknown_field["remote_authorized"] = True
+        invalid_results.append(unknown_field)
+
+        widened_profile = dict(constrained)
+        widened_profile["profile"] = "pr-readiness-handoff"
+        invalid_results.append(widened_profile)
+
+        widened_handoff = dict(constrained)
+        widened_handoff["remote_mutation"] = "review-authorization-required"
+        widened_handoff["handoff"] = "review-orchestration-playbook"
+        invalid_results.append(widened_handoff)
+
+        for result in invalid_results:
+            with self.subTest(result=result):
+                with self.assertRaises(AssertionError):
+                    assert_valid_result_contract(result)
 
     def test_journal_gate_does_not_force_first_time_adoption(self) -> None:
         for anchor in (
@@ -127,7 +362,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
         for anchor in (
             "create a signed local checkpoint automatically",
             "create a signed landing commit automatically",
-            "`report-only`, `probe-only`, or `no-commit`",
+            "`report-only`, `probe-only`, `read-only`, or `no-commit`",
             "do not ask again merely to commit",
             "git commit -S",
             "Treat a signing failure as a blocker",

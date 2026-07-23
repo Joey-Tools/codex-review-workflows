@@ -14,29 +14,53 @@ one profile before implementation:
 - `local-gate`
 - `pr-readiness-handoff`
 
-Keep the selected profile stable. Do not downgrade it because a gate is slow,
-and do not silently promote a local checkpoint into PR, CI, release, or merge
-work. Record a new profile only when the user changes the requested outcome.
+Keep the selected profile and its scope constraints stable. Do not downgrade it
+because a gate is slow, do not silently promote a local checkpoint into
+PR, CI, release, or merge work, and do not discard a limiting constraint
+because the same request also says `full workflow` or mentions a PR. Record a
+new profile or remove a constraint only when the user changes the requested
+outcome.
 
-## Resolve Commit Mode First
+## Resolve Hard Constraints First
 
-Resolve commit mode before selecting a profile. An explicit `report-only`,
-`probe-only`, or `no-commit` request is a hard constraint for the whole run:
-apply it before any review checkpoint, anchor, or landing commit. A delivery
-profile never overrides it.
+Resolve explicit scope and commit constraints before selecting a profile:
 
-When the hard constraint applies, run only the requested inspection or gate
-work and leave Git history unchanged. A formal review may use a pre-existing
-exact committed range only when it already represents the result under review.
+- `local-only`: the requested terminal scope is explicitly local, such as
+  `locally and stop` or `only work locally`. A mere reference to the local-gate
+  phase inside an otherwise explicit PR request is not this constraint.
+- `report-only` or `probe-only`: inspect or evaluate without delivery mutation.
+- `read-only`: do not mutate the working result or any remote state.
+- `no-remote`: do not push, create or update a PR, comment, start a remote
+  readiness wait, release, or perform another remote mutation.
+- `no-commit`: leave Git history unchanged.
+
+These constraints are subtractive and take precedence over `full workflow`,
+PR-ish, merge-ready, or similar expansion signals in the same request. Any of
+`local-only`, `report-only`, `probe-only`, `read-only`, or `no-remote` forbids
+`pr-readiness-handoff` and every remote mutation. Select the appropriate
+remaining local profile and stop locally. A later explicit user request may
+remove the constraint; a downstream workflow may not reinterpret it.
+
+An explicit `report-only`, `probe-only`, `read-only`, or `no-commit` request
+also sets commit mode to `forbidden` for the whole run. Apply it before any
+review checkpoint, anchor, or landing commit. A delivery profile never
+overrides it.
+
+When commit mode is `forbidden`, run only the requested inspection or gate work
+and leave Git history unchanged. A formal review may use a pre-existing exact
+committed range only when it already represents the result under review.
 Otherwise skip the formal lane and report that the missing committed range is a
 blocker; do not create an implicit checkpoint to satisfy the reviewer.
 
 ## Choose The Profile
 
-Choose by the requested terminal outcome, using this precedence:
+After applying hard constraints, choose by the remaining requested terminal
+outcome, using this precedence:
 
 1. An explicit PR, PR-readiness, full-workflow, or merge-ready outcome selects
-   `pr-readiness-handoff`.
+   `pr-readiness-handoff` only when no hard constraint forbids that handoff.
+   When the handoff is forbidden, the same full-workflow signal selects
+   `local-gate` and stops there.
 2. Otherwise, an explicit full local gate or local landing outcome selects
    `local-gate`.
 3. Otherwise, an explicit early usable slice selects `focused-checkpoint`.
@@ -57,6 +81,11 @@ instead says that remote or full-gate work must wait for a later request, select
 | `Complete this non-trivial implementation locally.` | `local-gate` | full local gate, then stop |
 | `Take the implementation to merge-ready and stop before merge.` | `pr-readiness-handoff` | full local gate, then PR handoff |
 | `Probe local gate readiness, but do not commit.` | `local-gate` | gate-only report under `no-commit` |
+| `Run the full workflow locally, report-only.` | `local-gate` | gate-only report under local/report constraints |
+| `Run the full workflow with no remote work.` | `local-gate` | full local gate, then stop under `no-remote` |
+| `Review full-workflow readiness read-only.` | `local-gate` | read-only gate report with no handoff |
+| `Probe full workflow and PR readiness; do not make remote changes.` | `local-gate` | probe-only local report with no handoff |
+| `Run the full workflow and open a PR.` | `pr-readiness-handoff` | full local gate, then PR handoff |
 
 ### `focused-checkpoint`
 
@@ -106,8 +135,8 @@ authorization.
 
 1. Confirm scope.
 - Read the applicable repository policy and preserve unrelated user changes.
-- Record the selected profile, intended local outcome, and any requested remote
-  handoff.
+- Record the selected profile, every canonical hard-constraint token, resolved
+  commit mode, intended local outcome, and any permitted remote handoff.
 - Fix only blockers that are necessary for that outcome.
 
 2. Implement.
@@ -152,9 +181,9 @@ authorization.
 - Use risk-proportionate local diff/self-review for `focused-checkpoint`; start a
   formal lane only when the user or repository policy requires it.
 - Apply the resolved commit mode before creating anything for review. Under
-  `report-only`, `probe-only`, or `no-commit`, do not create a checkpoint or
-  anchor. Use a pre-existing exact committed range only when it already
-  represents the result; otherwise report the formal lane blocked.
+  `report-only`, `probe-only`, `read-only`, or `no-commit`, do not create a
+  checkpoint or anchor. Use a pre-existing exact committed range only when it
+  already represents the result; otherwise report the formal lane blocked.
 - When a formal review is required and commits are allowed, create a signed
   review checkpoint after implementation, validation, and the journal gate,
   then hand the exact frozen range to the authoritative
@@ -196,6 +225,34 @@ authorization.
 - `pr-readiness-handoff` continues through `$review-orchestration-playbook` and
   stops at merge-ready or a clear blocker, including a missing committed range,
   never at merge.
+- A hard constraint that forbids PR handoff always wins at this step. Do not
+  invoke the review skill's PR-readiness path, push, create or update a PR,
+  comment, start a remote wait, or release.
+
+## Emit The Result And Handoff Record
+
+Every terminal report and permitted handoff must include the JSON-compatible
+record defined by
+[delivery-result.schema.json](references/delivery-result.schema.json). Preserve
+these fields unchanged across any handoff:
+
+- `profile`
+- every explicit canonical token in `constraints`
+- resolved `commit_mode`
+- resolved `remote_mutation`
+- `handoff`
+
+For `local-only`, `report-only`, `probe-only`, `read-only`, or `no-remote`,
+`remote_mutation` must be `forbidden`, `handoff` must be `none`, and `profile`
+must not be `pr-readiness-handoff`. For `report-only`, `probe-only`,
+`read-only`, or `no-commit`, `commit_mode` must be `forbidden`.
+
+Only a `pr-readiness-handoff` record without a remote-limiting constraint may
+set `handoff` to `review-orchestration-playbook` and `remote_mutation` to
+`review-authorization-required`. That value is not remote authorization; it
+means the review skill must perform its own target and lifecycle preflight.
+Receivers must fail closed on a missing constraint, an unknown field, or an
+internally contradictory record instead of inferring a broader scope from prose.
 
 ## Compatibility And Guardrails
 

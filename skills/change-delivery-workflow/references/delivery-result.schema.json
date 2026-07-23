@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://joey-tools.invalid/change-delivery-workflow/delivery-result.schema.json",
+  "title": "Change Delivery Result And Handoff Record",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "profile",
+    "constraints",
+    "commit_mode",
+    "remote_mutation",
+    "handoff"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "profile": {
+      "enum": [
+        "focused-checkpoint",
+        "local-gate",
+        "pr-readiness-handoff"
+      ]
+    },
+    "constraints": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "local-only",
+          "report-only",
+          "probe-only",
+          "read-only",
+          "no-remote",
+          "no-commit"
+        ]
+      },
+      "uniqueItems": true
+    },
+    "commit_mode": {
+      "enum": [
+        "allowed",
+        "forbidden"
+      ]
+    },
+    "remote_mutation": {
+      "enum": [
+        "forbidden",
+        "review-authorization-required"
+      ]
+    },
+    "handoff": {
+      "enum": [
+        "none",
+        "review-orchestration-playbook"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "constraints": {
+            "contains": {
+              "enum": [
+                "local-only",
+                "report-only",
+                "probe-only",
+                "read-only",
+                "no-remote"
+              ]
+            }
+          }
+        },
+        "required": [
+          "constraints"
+        ]
+      },
+      "then": {
+        "properties": {
+          "profile": {
+            "enum": [
+              "focused-checkpoint",
+              "local-gate"
+            ]
+          },
+          "remote_mutation": {
+            "const": "forbidden"
+          },
+          "handoff": {
+            "const": "none"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "constraints": {
+            "contains": {
+              "enum": [
+                "report-only",
+                "probe-only",
+                "read-only",
+                "no-commit"
+              ]
+            }
+          }
+        },
+        "required": [
+          "constraints"
+        ]
+      },
+      "then": {
+        "properties": {
+          "commit_mode": {
+            "const": "forbidden"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "profile": {
+            "const": "pr-readiness-handoff"
+          }
+        },
+        "required": [
+          "profile"
+        ]
+      },
+      "then": {
+        "properties": {
+          "remote_mutation": {
+            "const": "review-authorization-required"
+          },
+          "handoff": {
+            "const": "review-orchestration-playbook"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "remote_mutation": {
+            "const": "forbidden"
+          },
+          "handoff": {
+            "const": "none"
+          }
+        }
+      }
+    }
+  ]
+}

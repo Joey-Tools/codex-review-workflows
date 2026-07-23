@@ -1,0 +1,152 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "prompt": "Deliver a quick MVP and stop at a local checkpoint.",
+      "transition": "focused checkpoint, then stop",
+      "result": {
+        "schema_version": 1,
+        "profile": "focused-checkpoint",
+        "constraints": [],
+        "commit_mode": "allowed",
+        "remote_mutation": "forbidden",
+        "handoff": "none"
+      }
+    },
+    {
+      "prompt": "Deliver an MVP, then open a PR for feedback.",
+      "transition": "focused slice, full local gate, then PR handoff",
+      "result": {
+        "schema_version": 1,
+        "profile": "pr-readiness-handoff",
+        "constraints": [],
+        "commit_mode": "allowed",
+        "remote_mutation": "review-authorization-required",
+        "handoff": "review-orchestration-playbook"
+      }
+    },
+    {
+      "prompt": "Start with an MVP but complete the full local gate now.",
+      "transition": "focused slice, full local gate, then stop",
+      "result": {
+        "schema_version": 1,
+        "profile": "local-gate",
+        "constraints": [],
+        "commit_mode": "allowed",
+        "remote_mutation": "forbidden",
+        "handoff": "none"
+      }
+    },
+    {
+      "prompt": "Complete this non-trivial implementation locally.",
+      "transition": "full local gate, then stop",
+      "result": {
+        "schema_version": 1,
+        "profile": "local-gate",
+        "constraints": [
+          "local-only"
+        ],
+        "commit_mode": "allowed",
+        "remote_mutation": "forbidden",
+        "handoff": "none"
+      }
+    },
+    {
+      "prompt": "Take the implementation to merge-ready and stop before merge.",
+      "transition": "full local gate, then PR handoff",
+      "result": {
+        "schema_version": 1,
+        "profile": "pr-readiness-handoff",
+        "constraints": [],
+        "commit_mode": "allowed",
+        "remote_mutation": "review-authorization-required",
+        "handoff": "review-orchestration-playbook"
+      }
+    },
+    {
+      "prompt": "Probe local gate readiness, but do not commit.",
+      "transition": "gate-only report under `no-commit`",
+      "result": {
+        "schema_version": 1,
+        "profile": "local-gate",
+        "constraints": [
+          "probe-only",
+          "no-commit"
+        ],
+        "commit_mode": "forbidden",
+        "remote_mutation": "forbidden",
+        "handoff": "none"
+      }
+    },
+    {
+      "prompt": "Run the full workflow locally, report-only.",
+      "transition": "gate-only report under local/report constraints",
+      "result": {
+        "schema_version": 1,
+        "profile": "local-gate",
+        "constraints": [
+          "local-only",
+          "report-only"
+        ],
+        "commit_mode": "forbidden",
+        "remote_mutation": "forbidden",
+        "handoff": "none"
+      }
+    },
+    {
+      "prompt": "Run the full workflow with no remote work.",
+      "transition": "full local gate, then stop under `no-remote`",
+      "result": {
+        "schema_version": 1,
+        "profile": "local-gate",
+        "constraints": [
+          "no-remote"
+        ],
+        "commit_mode": "allowed",
+        "remote_mutation": "forbidden",
+        "handoff": "none"
+      }
+    },
+    {
+      "prompt": "Review full-workflow readiness read-only.",
+      "transition": "read-only gate report with no handoff",
+      "result": {
+        "schema_version": 1,
+        "profile": "local-gate",
+        "constraints": [
+          "read-only"
+        ],
+        "commit_mode": "forbidden",
+        "remote_mutation": "forbidden",
+        "handoff": "none"
+      }
+    },
+    {
+      "prompt": "Probe full workflow and PR readiness; do not make remote changes.",
+      "transition": "probe-only local report with no handoff",
+      "result": {
+        "schema_version": 1,
+        "profile": "local-gate",
+        "constraints": [
+          "probe-only",
+          "no-remote"
+        ],
+        "commit_mode": "forbidden",
+        "remote_mutation": "forbidden",
+        "handoff": "none"
+      }
+    },
+    {
+      "prompt": "Run the full workflow and open a PR.",
+      "transition": "full local gate, then PR handoff",
+      "result": {
+        "schema_version": 1,
+        "profile": "pr-readiness-handoff",
+        "constraints": [],
+        "commit_mode": "allowed",
+        "remote_mutation": "review-authorization-required",
+        "handoff": "review-orchestration-playbook"
+      }
+    }
+  ]
+}

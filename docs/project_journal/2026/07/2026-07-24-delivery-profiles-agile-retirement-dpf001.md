@@ -29,6 +29,13 @@ superseded_by:
 - Commit mode is resolved before profile selection or any review anchor. A
   no-commit run may reuse an already-correct committed range, but it never
   creates history merely to satisfy a formal lane.
+- Explicit local-only, report-only, probe-only, read-only, and no-remote
+  constraints are resolved before terminal-outcome signals. They prevent a
+  conflicting `full workflow` or PR phrase from selecting PR readiness or
+  authorizing remote mutation.
+- Every terminal result or permitted handoff carries a closed, versioned record
+  with the selected profile, immutable constraint list, commit mode, remote
+  mutation mode, and handoff target. Conflicting or widened records fail closed.
 - Terminal-outcome precedence makes a combined MVP-plus-PR request run the
   focused slice, full local gate, and PR handoff in that order. A clean signed
   review checkpoint is already the landing commit; the workflow never creates
@@ -55,7 +62,8 @@ superseded_by:
 ## Evidence
 
 - `python3 -B skills/change-delivery-workflow/tests/test_delivery_profiles.py`
-  passed (`10` tests).
+  passed (`13` tests), including deterministic constrained-scope conflicts,
+  positive PR-handoff controls, and closed result-record rejection cases.
 - `python3 -B skills/synthetic-token-fixtures/tests/test_skill_contract.py -v`
   passed (`2` tests).
 - `python3 -B skills/review-orchestration-playbook/tests/test_synthetic_tokens.py SyntheticTokenCliTest -v`
@@ -63,12 +71,13 @@ superseded_by:
 - `python3 -B skills/review-orchestration-playbook/tests/test_contracts.py -q`
   passed (`86` tests).
 - `uv run --isolated --with pyyaml python3 /Users/hoteng/.codex/skills/joey-skill-authoring/scripts/codex_skill_validate.py skills/change-delivery-workflow skills/agile-delivery-workflow skills/synthetic-token-fixtures`
-  passed (`3/3` skills valid) before the final review-fix round. During the
-  final round, network-restricted dependency resolution was unavailable; a
-  fallback YAML/frontmatter/name/body and `agents/openai.yaml` validation
-  passed for the two modified skills.
+  passed (`3/3` skills valid) after the constrained-scope review-fix round.
+- `python3 -m json.tool` passed for the delivery-result schema and deterministic
+  profile-selection fixture.
 - `python3 /Users/hoteng/.codex/personal-sync/overlays/private/releases/9257aca19dc7c370418c1dcf7b8c194b0353eafe/personal_codex/skills/project-journal/scripts/project_journal.py validate --repo .`
   passed.
 - `ruff check skills/change-delivery-workflow/tests/test_delivery_profiles.py skills/synthetic-token-fixtures/tests/test_skill_contract.py skills/review-orchestration-playbook/tests/test_contracts.py`
-  passed.
+  passed, and `ruff format --check` passed for the same files.
+- The validator's task-local `uv` cache and test-created Python bytecode were
+  removed after validation; the final ignored-cache scan passed.
 - `git diff --check` passed for tracked changes.
