@@ -9089,6 +9089,137 @@ class WorkspaceTest(unittest.TestCase):
             1,
         )
 
+    def test_new_unextractable_container_does_not_hide_exact_growth(
+        self,
+    ) -> None:
+        opaque_payload = b'password = "' + b"Y" * 32
+        scan = workspace_runtime._scan_secret_value(
+            opaque_payload,
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+        self.assertEqual(scan.unextractable_rule, "generic-secret-assignment")
+
+        exact_value = unregistered_generic_credential()
+        (self.repo / "opaque-secret.txt").write_bytes(opaque_payload)
+        (self.repo / "exact-secret.txt").write_bytes(
+            b'password = "' + exact_value + b'"\n'
+        )
+        git(self.repo, "add", "opaque-secret.txt", "exact-secret.txt")
+        git(self.repo, "commit", "-m", "Add opaque and exact credentials")
+        mixed_head = git(self.repo, "rev-parse", "HEAD")
+
+        exit_code, summary = workspace_runtime.secret_admission(
+            repo=self.repo,
+            base_ref=self.head,
+            head_ref=mixed_head,
+        )
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(summary["status"], "violations")
+        self.assertEqual(summary["secret_delta"]["status"], "violations")
+        self.assertEqual(len(summary["secret_delta"]["violations"]), 1)
+        violation = summary["secret_delta"]["violations"][0]
+        self.assertEqual(violation["base_count"], 0)
+        self.assertEqual(violation["head_count"], 1)
+        self.assertEqual(
+            violation["value_sha256"],
+            hashlib.sha256(exact_value).hexdigest(),
+        )
+
+    def test_changed_unextractable_container_does_not_hide_exact_growth(
+        self,
+    ) -> None:
+        first_payload = b'password = "' + b"Y" * 32
+        second_payload = b'password = "' + b"Z" * 32
+        for payload in (first_payload, second_payload):
+            scan = workspace_runtime._scan_secret_value(
+                payload,
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+            self.assertEqual(scan.unextractable_rule, "generic-secret-assignment")
+
+        opaque_base = self.commit_bytes(
+            "opaque-secret.txt",
+            first_payload,
+            "Add opaque credential container",
+        )
+        exact_value = unregistered_generic_credential()
+        (self.repo / "opaque-secret.txt").write_bytes(second_payload)
+        (self.repo / "exact-secret.txt").write_bytes(
+            b'password = "' + exact_value + b'"\n'
+        )
+        git(self.repo, "add", "opaque-secret.txt", "exact-secret.txt")
+        git(self.repo, "commit", "-m", "Change opaque and add exact credential")
+        mixed_head = git(self.repo, "rev-parse", "HEAD")
+
+        exit_code, summary = workspace_runtime.secret_admission(
+            repo=self.repo,
+            base_ref=opaque_base,
+            head_ref=mixed_head,
+        )
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(summary["status"], "violations")
+        self.assertEqual(summary["secret_delta"]["status"], "violations")
+        self.assertEqual(len(summary["secret_delta"]["violations"]), 1)
+        violation = summary["secret_delta"]["violations"][0]
+        self.assertEqual(violation["base_count"], 0)
+        self.assertEqual(violation["head_count"], 1)
+        self.assertEqual(
+            violation["value_sha256"],
+            hashlib.sha256(exact_value).hexdigest(),
+        )
+
+    def test_source_wip_cannot_delete_source_head_exact_growth(
+        self,
+    ) -> None:
+        opaque_payload = b'password = "' + b"R" * 32
+        scan = workspace_runtime._scan_secret_value(
+            opaque_payload,
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+        self.assertEqual(scan.unextractable_rule, "generic-secret-assignment")
+        opaque_base = self.commit_bytes(
+            "opaque-secret.txt",
+            opaque_payload,
+            "Add retained opaque credential container",
+        )
+
+        exact_value = unregistered_generic_credential()
+        source_head = self.commit_bytes(
+            "exact-secret.txt",
+            b'password = "' + exact_value + b'"\n',
+            "Add exact credential to source HEAD",
+        )
+        git(self.repo, "rm", "exact-secret.txt")
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=opaque_base,
+            head_ref=source_head,
+            include_source_wip=True,
+        )
+        self.reviews.append(review)
+        manifest = json.loads(
+            (
+                review.workspace_root
+                / ".codex-review"
+                / workspace_runtime.SYNTHETIC_MANIFEST_NAME
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["secret_delta"]["status"], "inconclusive")
+        self.assertEqual(
+            manifest["secret_delta"]["failure_class"],
+            "source-head-exact-growth",
+        )
+
+        with self.assertRaisesRegex(
+            ReviewError,
+            "sensitive content preflight blocked external review",
+        ):
+            validate_external_workspace(review)
+
     def test_unregistered_secret_addition_is_raw_with_violation_evidence(
         self,
     ) -> None:

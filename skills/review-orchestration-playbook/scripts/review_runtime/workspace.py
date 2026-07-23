@@ -6961,11 +6961,11 @@ def _shard_catalog_count_manifest(
     return committed_shards[0], committed_shards[1]
 
 
-def _require_unextractable_container_nonincrease(
+def _unextractable_container_nonincrease(
     *,
     base_discovery: SecretScanResult,
     head_discovery: SecretScanResult,
-) -> None:
+) -> bool:
     projected_counts: list[Counter[tuple[str, bytes]]] = []
     for discovery in (base_discovery, head_discovery):
         has_unextractable_rule = discovery.unextractable_rule is not None
@@ -7000,11 +7000,10 @@ def _require_unextractable_container_nonincrease(
             projected[identity] += count
         projected_counts.append(projected)
     base_counts, head_counts = projected_counts
-    for identity, head_count in head_counts.items():
-        if head_count > base_counts[identity]:
-            raise ReviewError(
-                "an exact secret candidate could not be extracted completely"
-            )
+    return all(
+        head_count <= base_counts[identity]
+        for identity, head_count in head_counts.items()
+    )
 
 
 def _secret_count_manifests(
@@ -7049,10 +7048,11 @@ def _secret_count_manifests(
         reduced_secret_values=legacy_raw_values,
         _continue_after_blocking=True,
     )
-    _require_unextractable_container_nonincrease(
+    opaque_containers_nonincreasing = _unextractable_container_nonincrease(
         base_discovery=base_discovery,
         head_discovery=head_discovery,
     )
+    source_head_discovery: SecretScanResult | None = None
     if source_head_sha is not None and source_head_sha != head_sha:
         source_head_discovery = _scan_frozen_tree_values(
             git_view=git_view,
@@ -7063,12 +7063,21 @@ def _secret_count_manifests(
             reduced_secret_values=legacy_raw_values,
             _continue_after_blocking=True,
         )
-        _require_unextractable_container_nonincrease(
-            base_discovery=base_discovery,
-            head_discovery=source_head_discovery,
+        source_opaque_containers_nonincreasing = (
+            _unextractable_container_nonincrease(
+                base_discovery=base_discovery,
+                head_discovery=source_head_discovery,
+            )
         )
-    discovery = base_discovery
+        opaque_containers_nonincreasing = (
+            opaque_containers_nonincreasing
+            and source_opaque_containers_nonincreasing
+        )
+    discovery = SecretScanResult.empty()
+    discovery.merge(base_discovery)
     discovery.merge(head_discovery)
+    if source_head_discovery is not None:
+        discovery.merge(source_head_discovery)
     # Non-exact expressions have no stable byte identity and intentionally do
     # not enter the counter. Scanner resource failures still raise and are
     # recorded by the caller as an inconclusive merge gate.
@@ -7125,6 +7134,7 @@ def _secret_count_manifests(
         source_head_scan = head_scan
     entries: list[dict[str, Any]] = []
     violations: dict[AcceptedSyntheticValue, tuple[int, int]] = {}
+    source_head_exact_growth_hidden = False
     for exemption in catalog.legacy_exemptions:
         for token in exemption.values:
             descriptor = next(
@@ -7180,7 +7190,14 @@ def _secret_count_manifests(
     for descriptor in reduction_descriptors:
         base_count = base_scan.raw_occurrence_counts[descriptor]
         head_count = head_scan.raw_occurrence_counts[descriptor]
+        source_head_count = source_head_scan.raw_occurrence_counts[descriptor]
         rules = sorted(discovery.blocking_candidates[descriptor.value])
+        if (
+            source_head_sha is not None
+            and source_head_count > base_count
+            and head_count <= base_count
+        ):
+            source_head_exact_growth_hidden = True
         if head_count > base_count:
             violations[descriptor] = (base_count, head_count)
         reduction_entries.append(
@@ -7302,6 +7319,18 @@ def _secret_count_manifests(
         private_manifest,
         label="synthetic secret helper-private state",
     )
+    if source_head_exact_growth_hidden and not violation_entries:
+        return _inconclusive_secret_count_manifests(
+            base_sha=base_sha,
+            head_sha=head_sha,
+            catalog=catalog,
+            failure_class="source-head-exact-growth",
+            evidence_head_ref=evidence_head_ref,
+        )
+    if not opaque_containers_nonincreasing and not violation_entries:
+        raise ReviewError(
+            "an exact secret candidate could not be extracted completely"
+        )
     return public_manifest, private_manifest, reduction_descriptors
 
 
