@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import pathlib
@@ -46,7 +47,11 @@ from review_supervisor.gitraw import (
     sanitized_git_environment,
     verify_worktree_absent,
 )
-from review_supervisor.ledger import acquire_retention_lease, read_attempt_state
+from review_supervisor.ledger import (
+    acquire_retention_lease,
+    open_attempt_lease,
+    read_bound_attempt_state,
+)
 from review_supervisor.models import HelperCustody, TreeEntry
 from review_supervisor.process import (
     process_start_identity,
@@ -61,7 +66,11 @@ from review_supervisor.secureio import (
     sha256_bytes,
 )
 
-from tests.support import build_helper_fixture, owned_temporary_directory
+from tests.support import (
+    bind_attempt_state,
+    build_helper_fixture,
+    owned_temporary_directory,
+)
 
 
 GIT = pathlib.Path("/usr/bin/git")
@@ -274,6 +283,11 @@ class RawGitProtocolTests(unittest.TestCase):
         )
         with (
             owned_temporary_directory("git-inspection-closure-gap-") as root,
+            mock.patch.object(
+                gitraw,
+                "_preflight_local_git_config",
+                return_value=(root / ".git", "sha1"),
+            ),
             mock.patch.object(gitraw, "run_bounded", side_effect=failure),
             self.assertRaises(GitProcessClosureUnproven) as raised,
         ):
@@ -284,6 +298,256 @@ class RawGitProtocolTests(unittest.TestCase):
                 git_executable=str(GIT),
             )
         self.assertIs(raised.exception, failure)
+
+    def test_repository_inspection_rejects_local_includes_before_git(self) -> None:
+        directives = (
+            ("include.path", "../outside.config"),
+            ("includeIf.gitdir:/tmp/**.path", "../outside.config"),
+        )
+        for key, value in directives:
+            with (
+                self.subTest(key=key),
+                owned_temporary_directory("git-local-include-") as root,
+            ):
+                repo, base, head = _build_repository(root)
+                outside = root / "outside.config"
+                outside.write_bytes(
+                    b"[core]\n\tfsmonitor = /definitely/not/executed\n"
+                )
+                outside.chmod(0o000)
+                _git(repo, "config", "--local", "--add", key, value)
+                with (
+                    mock.patch.object(gitraw, "run_bounded") as run_git,
+                    self.assertRaises(SupervisorError) as raised,
+                ):
+                    inspect_repository(
+                        repo=repo,
+                        base_sha=base,
+                        head_sha=head,
+                        git_executable=str(GIT),
+                    )
+                run_git.assert_not_called()
+                self.assertEqual(raised.exception.failure.stage, "git-preflight")
+                self.assertEqual(raised.exception.failure.code, "frozen-range-invalid")
+
+        for case, relative_path, content in (
+            (
+                "bom-common-config",
+                pathlib.Path("config"),
+                b"\xef\xbb\xbf[include]\n\tpath = ../outside.config\n",
+            ),
+            (
+                "worktree-config",
+                pathlib.Path("config.worktree"),
+                b"[includeIf \"gitdir:/tmp/**\"]\n\tpath = ../outside.config\n",
+            ),
+        ):
+            with (
+                self.subTest(case=case),
+                owned_temporary_directory(f"git-local-include-{case}-") as root,
+            ):
+                repo, base, head = _build_repository(root)
+                config_path = repo / ".git" / relative_path
+                config_path.write_bytes(content)
+                config_path.chmod(0o600)
+                with (
+                    mock.patch.object(gitraw, "run_bounded") as run_git,
+                    self.assertRaises(SupervisorError) as raised,
+                ):
+                    inspect_repository(
+                        repo=repo,
+                        base_sha=base,
+                        head_sha=head,
+                        git_executable=str(GIT),
+                    )
+                run_git.assert_not_called()
+                self.assertEqual(raised.exception.failure.stage, "git-preflight")
+                self.assertEqual(raised.exception.failure.code, "frozen-range-invalid")
+
+    def test_local_config_content_check_ignores_timestamps_but_rejects_mutation(
+        self,
+    ) -> None:
+        with owned_temporary_directory("git-local-config-stability-") as root:
+            repo, _, _ = _build_repository(root)
+            config = repo / ".git" / "config"
+            expected = config.read_bytes()
+            parent_fd = os.open(config.parent, os.O_RDONLY | os.O_DIRECTORY)
+            original_read = gitraw.read_fd_exact
+            touched = False
+
+            def read_then_touch(
+                fd: int,
+                *,
+                max_bytes: int,
+                expected_size: int | None = None,
+            ) -> bytes:
+                nonlocal touched
+                content = original_read(
+                    fd,
+                    max_bytes=max_bytes,
+                    expected_size=expected_size,
+                )
+                if not touched:
+                    touched = True
+                    metadata = config.stat()
+                    os.utime(
+                        config,
+                        ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1),
+                    )
+                return content
+
+            try:
+                with mock.patch(
+                    "review_supervisor.gitraw.read_fd_exact",
+                    side_effect=read_then_touch,
+                ):
+                    observed = gitraw._read_optional_git_file(
+                        parent_fd,
+                        b"config",
+                        max_bytes=gitraw.LOCAL_CONFIG_BYTES_LIMIT,
+                    )
+            finally:
+                os.close(parent_fd)
+            self.assertTrue(touched)
+            self.assertEqual(observed, expected)
+
+            config.chmod(0o666)
+            parent_fd = os.open(config.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with self.assertRaises(OSError) as raised:
+                    gitraw._read_optional_git_file(
+                        parent_fd,
+                        b"config",
+                        max_bytes=gitraw.LOCAL_CONFIG_BYTES_LIMIT,
+                    )
+            finally:
+                os.close(parent_fd)
+                config.chmod(0o644)
+            self.assertEqual(raised.exception.errno, errno.EPERM)
+
+            parent_fd = os.open(config.parent, os.O_RDONLY | os.O_DIRECTORY)
+            mutated = b"#" + expected[1:]
+            changed = False
+
+            def read_then_mutate(
+                fd: int,
+                *,
+                max_bytes: int,
+                expected_size: int | None = None,
+            ) -> bytes:
+                nonlocal changed
+                content = original_read(
+                    fd,
+                    max_bytes=max_bytes,
+                    expected_size=expected_size,
+                )
+                if not changed:
+                    changed = True
+                    write_fd = os.open(config, os.O_WRONLY | os.O_NOFOLLOW)
+                    try:
+                        os.pwrite(write_fd, mutated, 0)
+                        os.fsync(write_fd)
+                    finally:
+                        os.close(write_fd)
+                return content
+
+            try:
+                with (
+                    mock.patch(
+                        "review_supervisor.gitraw.read_fd_exact",
+                        side_effect=read_then_mutate,
+                    ),
+                    self.assertRaises(OSError) as raised,
+                ):
+                    gitraw._read_optional_git_file(
+                        parent_fd,
+                        b"config",
+                        max_bytes=gitraw.LOCAL_CONFIG_BYTES_LIMIT,
+                    )
+            finally:
+                os.close(parent_fd)
+            self.assertTrue(changed)
+            self.assertEqual(raised.exception.errno, errno.ESTALE)
+
+    def test_registration_scan_accepts_child_churn_but_rejects_replacement(
+        self,
+    ) -> None:
+        original_open = os.open
+        with owned_temporary_directory("git-registration-churn-") as root:
+            registration = root / "registration"
+            registration.mkdir(mode=0o700)
+            child = registration / "child"
+            child.mkdir(mode=0o700)
+            registration_fd = original_open(
+                registration,
+                os.O_RDONLY | os.O_DIRECTORY,
+            )
+            churned = False
+
+            def open_after_child_churn(
+                path: bytes | str,
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal churned
+                if path == b"child" and not churned:
+                    churned = True
+                    (child / "late-entry").mkdir(mode=0o700)
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            try:
+                with mock.patch(
+                    "review_supervisor.gitraw.os.open",
+                    side_effect=open_after_child_churn,
+                ):
+                    self.assertEqual(
+                        gitraw.enumerate_registration_fd(registration_fd)[0],
+                        2,
+                    )
+            finally:
+                os.close(registration_fd)
+            self.assertTrue(churned)
+
+        with owned_temporary_directory("git-registration-replacement-") as root:
+            registration = root / "registration"
+            registration.mkdir(mode=0o700)
+            child = registration / "child"
+            child.mkdir(mode=0o700)
+            moved = root / "original-child"
+            registration_fd = original_open(
+                registration,
+                os.O_RDONLY | os.O_DIRECTORY,
+            )
+            replaced = False
+
+            def open_after_child_replacement(
+                path: bytes | str,
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal replaced
+                if path == b"child" and not replaced:
+                    replaced = True
+                    child.rename(moved)
+                    child.mkdir(mode=0o700)
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            try:
+                with (
+                    mock.patch(
+                        "review_supervisor.gitraw.os.open",
+                        side_effect=open_after_child_replacement,
+                    ),
+                    self.assertRaisesRegex(OSError, "identity changed"),
+                ):
+                    gitraw.enumerate_registration_fd(registration_fd)
+            finally:
+                os.close(registration_fd)
+            self.assertTrue(replaced)
 
     def test_materializer_preserves_unproven_git_closure(self) -> None:
         process = SimpleNamespace(pid=124)
@@ -1057,6 +1321,10 @@ class RawGitCheckoutTests(unittest.TestCase):
                 "identity": {},
             },
         }
+        attempt_lease = SimpleNamespace(
+            path=pathlib.Path("/tmp/attempt"),
+            revalidate=mock.Mock(),
+        )
         with (
             mock.patch(
                 "review_supervisor.runtime._DIRECT_PROCESS_CLOSURE_UNPROVEN",
@@ -1070,7 +1338,9 @@ class RawGitCheckoutTests(unittest.TestCase):
                 "review_supervisor.runtime.retry_git_process_closure",
                 return_value=False,
             ) as retry,
-            mock.patch("review_supervisor.runtime.read_attempt_state") as read_state,
+            mock.patch(
+                "review_supervisor.runtime.read_bound_attempt_state"
+            ) as read_state,
             mock.patch(
                 "review_supervisor.runtime._manual_worktree_recovery"
             ) as recovery,
@@ -1078,8 +1348,7 @@ class RawGitCheckoutTests(unittest.TestCase):
         ):
             _cleanup_worktree(
                 entrypoint=pathlib.Path("/tmp/entrypoint"),
-                attempt_dir=pathlib.Path("/tmp/attempt"),
-                lease_fd=-1,
+                attempt=attempt_lease,
                 state=state,
                 state_digest="digest",
             )
@@ -1187,22 +1456,27 @@ class RawGitCheckoutTests(unittest.TestCase):
                         ).to_json(),
                     },
                 }
+                bind_attempt_state(
+                    state,
+                    retention_root=retention,
+                    attempt_dir=attempt,
+                )
                 state_path = attempt / "state.json"
                 state_path.write_bytes(canonical_json(state))
                 state_path.chmod(0o600)
-                state, _, digest = read_attempt_state(attempt)
                 with acquire_retention_lease(
                     retention,
                     deadline=time.monotonic() + 5,
                 ) as lease:
-                    state, _ = _cleanup_worktree(
-                        entrypoint=pathlib.Path(__file__).resolve().parent.parent
-                        / "independent-codex-pr-review",
-                        attempt_dir=attempt,
-                        lease_fd=lease.fd,
-                        state=state,
-                        state_digest=digest,
-                    )
+                    with open_attempt_lease(lease, attempt) as attempt_lease:
+                        state, _, digest = read_bound_attempt_state(attempt_lease)
+                        state, _ = _cleanup_worktree(
+                            entrypoint=pathlib.Path(__file__).resolve().parent.parent
+                            / "independent-codex-pr-review",
+                            attempt=attempt_lease,
+                            state=state,
+                            state_digest=digest,
+                        )
                 self.assertEqual(state["checkout_settlement"], "exact")
                 self.assertEqual(state["worktree_status"], "removed")
                 self.assertFalse(worktree.exists())

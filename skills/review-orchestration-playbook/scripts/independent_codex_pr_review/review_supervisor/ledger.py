@@ -37,6 +37,7 @@ from .secureio import (
     align_up,
     allocated_bytes,
     atomic_write_json,
+    atomic_write_json_at,
     boot_identifier,
     canonical_json,
     checked_add,
@@ -115,6 +116,21 @@ class AttemptBinding:
     identity: Identity
 
 
+_IDENTITY_FIELDS = frozenset(
+    {"device", "inode", "mode", "link_count", "uid", "size"}
+)
+
+
+def _identity_from_binding(value: Any, *, label: str) -> Identity:
+    if (
+        not isinstance(value, dict)
+        or set(value) != _IDENTITY_FIELDS
+        or any(type(value[field]) is not int for field in _IDENTITY_FIELDS)
+    ):
+        raise ValueError(f"{label} identity is malformed")
+    return Identity(**value)
+
+
 @dataclass
 class RetentionLease:
     root: pathlib.Path
@@ -123,6 +139,16 @@ class RetentionLease:
     root_identity: Identity
     lock_identity: Identity
     lock_token: bytes
+
+    def transfer_binding(self) -> dict[str, Any]:
+        self.revalidate_root()
+        return {
+            "version": 1,
+            "retention_root": str(self.root),
+            "root_identity": self.root_identity.to_json(),
+            "lock_identity": self.lock_identity.to_json(),
+            "lock_token_hex": self.lock_token.hex(),
+        }
 
     def revalidate_root(self) -> Identity:
         if self.fd < 0 or self.root_fd < 0:
@@ -140,14 +166,6 @@ class RetentionLease:
         finally:
             os.close(current_fd)
 
-        held_lock_identity = validate_private_regular_fd(
-            self.fd,
-            self.root / "retention.lock",
-        )
-        if held_lock_identity != self.lock_identity:
-            raise OSError(errno.ESTALE, "retention lock descriptor identity changed")
-        if _read_retention_lock_token(self.fd) != self.lock_token:
-            raise OSError(errno.ESTALE, "retention lock ownership token changed")
         probe_fd, current_lock_identity = open_regular_at(
             self.root_fd,
             b"retention.lock",
@@ -157,6 +175,20 @@ class RetentionLease:
         try:
             if current_lock_identity != self.lock_identity:
                 raise OSError(errno.ESTALE, "retention lock path identity changed")
+            held_lock_identity = validate_private_regular_fd(
+                self.fd,
+                self.root / "retention.lock",
+            )
+            if held_lock_identity != self.lock_identity:
+                raise OSError(
+                    errno.ESTALE,
+                    "retention lock descriptor identity changed",
+                )
+            if _read_retention_lock_token(self.fd) != self.lock_token:
+                raise OSError(
+                    errno.ESTALE,
+                    "retention lock ownership token changed",
+                )
             if _read_retention_lock_token(probe_fd) != self.lock_token:
                 raise OSError(errno.ESTALE, "retention lock ownership token changed")
             try:
@@ -204,6 +236,162 @@ class RetentionLease:
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self.close()
+
+
+@dataclass
+class AttemptLease:
+    retention: RetentionLease
+    path: pathlib.Path
+    fd: int
+    identity: Identity
+
+    @property
+    def name(self) -> bytes:
+        return os.fsencode(self.path.name)
+
+    def revalidate(self, state: dict[str, Any] | None = None) -> Identity:
+        self.retention.revalidate_root()
+        if self.fd < 0:
+            raise OSError(errno.EBADF, "attempt lease is closed")
+        held_identity = validate_private_directory_fd(self.fd, self.path)
+        path_identity = identity_from_stat(
+            os.stat(
+                self.name,
+                dir_fd=self.retention.root_fd,
+                follow_symlinks=False,
+            )
+        )
+        if not directory_identities_match(held_identity, self.identity) or not (
+            directory_identities_match(path_identity, self.identity)
+        ):
+            raise OSError(errno.ESTALE, "attempt directory binding changed")
+        if state is not None:
+            _validate_durable_bindings(state, lease=self.retention, attempt=self)
+        self.retention.revalidate_root()
+        return held_identity
+
+    def transfer_binding(self) -> dict[str, Any]:
+        self.revalidate()
+        return {
+            **self.retention.transfer_binding(),
+            "attempt_dir": str(self.path),
+            "attempt_identity": self.identity.to_json(),
+        }
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+    def __enter__(self) -> "AttemptLease":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
+
+def _validate_durable_bindings(
+    state: dict[str, Any],
+    *,
+    lease: RetentionLease,
+    attempt: AttemptLease,
+) -> None:
+    root_binding = state.get("retention_root_binding")
+    if not isinstance(root_binding, dict) or set(root_binding) != {"path", "identity"}:
+        raise ValueError("attempt state retention root binding is missing or malformed")
+    if root_binding.get("path") != str(lease.root) or not directory_identities_match(
+        _identity_from_binding(
+            root_binding.get("identity"),
+            label="retention root binding",
+        ),
+        lease.root_identity,
+    ):
+        raise OSError(errno.ESTALE, "attempt state retention root binding changed")
+
+    attempt_binding = state.get("attempt_directory_binding")
+    if not isinstance(attempt_binding, dict) or set(attempt_binding) != {
+        "path",
+        "identity",
+    }:
+        raise ValueError("attempt state directory binding is missing or malformed")
+    if attempt_binding.get("path") != str(attempt.path) or not (
+        directory_identities_match(
+            _identity_from_binding(
+                attempt_binding.get("identity"),
+                label="attempt directory binding",
+            ),
+            attempt.identity,
+        )
+    ):
+        raise OSError(errno.ESTALE, "attempt state directory binding changed")
+
+
+def accept_attempt_lease_transfer(
+    *,
+    lease_fd: int,
+    root_fd: int,
+    attempt_fd: int,
+    binding: Any,
+) -> AttemptLease:
+    expected_fields = {
+        "version",
+        "retention_root",
+        "root_identity",
+        "lock_identity",
+        "lock_token_hex",
+        "attempt_dir",
+        "attempt_identity",
+    }
+    if not isinstance(binding, dict) or set(binding) != expected_fields:
+        raise ValueError("attempt lease transfer binding is malformed")
+    if binding.get("version") != 1:
+        raise ValueError("attempt lease transfer version is unsupported")
+    root = pathlib.Path(binding.get("retention_root", ""))
+    attempt_path = pathlib.Path(binding.get("attempt_dir", ""))
+    if not root.is_absolute() or attempt_path.parent != root:
+        raise ValueError("attempt lease transfer paths are invalid")
+    token_hex = binding.get("lock_token_hex")
+    if not isinstance(token_hex, str) or len(token_hex) != RETENTION_LOCK_TOKEN_BYTES * 2:
+        raise ValueError("attempt lease transfer token is malformed")
+    try:
+        token = bytes.fromhex(token_hex)
+    except ValueError as error:
+        raise ValueError("attempt lease transfer token is malformed") from error
+    lease = RetentionLease(
+        root=root,
+        fd=lease_fd,
+        root_fd=root_fd,
+        root_identity=_identity_from_binding(
+            binding.get("root_identity"), label="transferred retention root"
+        ),
+        lock_identity=_identity_from_binding(
+            binding.get("lock_identity"), label="transferred retention lock"
+        ),
+        lock_token=token,
+    )
+    attempt: AttemptLease | None = None
+    try:
+        fcntl.flock(lease.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lease.revalidate_root()
+        attempt = AttemptLease(
+            retention=lease,
+            path=attempt_path,
+            fd=attempt_fd,
+            identity=_identity_from_binding(
+                binding.get("attempt_identity"), label="transferred attempt"
+            ),
+        )
+        attempt.revalidate()
+        if attempt.transfer_binding() != binding:
+            raise OSError(errno.ESTALE, "attempt lease transfer binding changed")
+        return attempt
+    except BaseException:
+        if attempt is not None:
+            attempt.close()
+        else:
+            os.close(attempt_fd)
+        lease.close()
+        raise
 
 
 def acquire_retention_lease(root: pathlib.Path, *, deadline: float) -> RetentionLease:
@@ -360,12 +548,13 @@ def _read_attempt_state_fd(
     return state, raw, sha256_bytes(raw)
 
 
-def read_attempt_state(attempt_dir: pathlib.Path) -> tuple[dict[str, Any], bytes, str]:
-    attempt_fd, _ = open_absolute_directory_chain(attempt_dir, private_leaf=True)
-    try:
-        return _read_attempt_state_fd(attempt_fd)
-    finally:
-        os.close(attempt_fd)
+def read_bound_attempt_state(
+    attempt: AttemptLease,
+) -> tuple[dict[str, Any], bytes, str]:
+    attempt.revalidate()
+    state, raw, digest = _read_attempt_state_fd(attempt.fd)
+    attempt.revalidate(state)
+    return state, raw, digest
 
 
 def _open_attempt_directory_at(
@@ -387,12 +576,56 @@ def _open_attempt_directory_at(
     )
     try:
         descriptor_identity = identity_from_stat(os.fstat(attempt_fd))
-        if descriptor_identity != identity:
+        if not directory_identities_match(descriptor_identity, identity):
             raise OSError(errno.ESTALE, "retained attempt identity changed")
         return attempt_fd, descriptor_identity
     except BaseException:
         os.close(attempt_fd)
         raise
+
+
+def open_attempt_lease(
+    lease: RetentionLease,
+    attempt_dir: pathlib.Path,
+    *,
+    expected_identity: Identity | None = None,
+) -> AttemptLease:
+    if attempt_dir.parent != lease.root:
+        raise ValueError("attempt directory is not an exact retention-root child")
+    name = os.fsencode(attempt_dir.name)
+    lease.revalidate_root()
+    attempt_fd, identity = _open_attempt_directory_at(lease.root_fd, name)
+    attempt = AttemptLease(
+        retention=lease,
+        path=attempt_dir,
+        fd=attempt_fd,
+        identity=expected_identity or identity,
+    )
+    try:
+        if expected_identity is not None and not directory_identities_match(
+            identity, expected_identity
+        ):
+            raise OSError(errno.ESTALE, "attempt directory identity changed")
+        attempt.revalidate()
+        return attempt
+    except BaseException:
+        attempt.close()
+        raise
+
+
+def read_attempt_state(
+    attempt_dir: pathlib.Path,
+    *,
+    lease: RetentionLease | None = None,
+) -> tuple[dict[str, Any], bytes, str]:
+    if lease is None:
+        with acquire_retention_lease(
+            attempt_dir.parent,
+            deadline=time.monotonic() + 30,
+        ) as owned_lease:
+            return read_attempt_state(attempt_dir, lease=owned_lease)
+    with open_attempt_lease(lease, attempt_dir) as attempt:
+        return read_bound_attempt_state(attempt)
 
 
 def _measure_filesystem_fd(directory_fd: int) -> FilesystemMeasure:
@@ -472,7 +705,10 @@ def _allocated_bytes_fd(directory_fd: int, *, entry_cap: int) -> int:
                                 child_identity = identity_from_stat(
                                     os.fstat(child_fd)
                                 )
-                                if child_identity != identity_from_stat(metadata):
+                                if not directory_identities_match(
+                                    child_identity,
+                                    identity_from_stat(metadata),
+                                ):
                                     os.close(child_fd)
                                     raise OSError(
                                         errno.ESTALE,
@@ -498,9 +734,16 @@ def _remove_bound_attempt_directory(
     expected = identity_from_stat(os.fstat(attempt_fd))
     quarantine = b".reclaim-" + name + b"-" + uuid.uuid4().hex.encode("ascii")
     isolated = False
+    quarantine_deleted = False
     try:
         rename_noreplace(root_fd, name, root_fd, quarantine)
         isolated = True
+        try:
+            os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise OSError(errno.ESTALE, "reclaimed attempt name was replaced")
         isolated_identity = identity_from_stat(
             os.stat(quarantine, dir_fd=root_fd, follow_symlinks=False)
         )
@@ -512,10 +755,17 @@ def _remove_bound_attempt_directory(
         if _bounded_directory_names(attempt_fd, cap=1):
             raise ValueError("isolated reclaim directory is not empty")
         os.rmdir(quarantine, dir_fd=root_fd)
-        isolated = False
+        quarantine_deleted = True
         os.fsync(root_fd)
+        try:
+            os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise OSError(errno.ESTALE, "reclaimed attempt name was replaced")
+        isolated = False
     except BaseException as error:
-        if isolated:
+        if isolated and not quarantine_deleted:
             try:
                 rename_noreplace(root_fd, quarantine, root_fd, name)
                 os.fsync(root_fd)
@@ -524,6 +774,25 @@ def _remove_bound_attempt_directory(
                     "isolated reclaim directory could not be restored safely"
                 )
         raise
+
+
+def remove_bound_attempt_directory(attempt: AttemptLease) -> None:
+    attempt.revalidate()
+    _remove_bound_attempt_directory(
+        root_fd=attempt.retention.root_fd,
+        name=attempt.name,
+        attempt_fd=attempt.fd,
+    )
+    attempt.retention.revalidate_root()
+    try:
+        os.stat(
+            attempt.name,
+            dir_fd=attempt.retention.root_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return
+    raise OSError(errno.ESTALE, "reclaimed attempt name was replaced")
 
 
 def _reclaim_initial_crash_attempt(
@@ -538,7 +807,10 @@ def _reclaim_initial_crash_attempt(
     if not entries:
         attempt_fd, attempt_identity = _open_attempt_directory_at(root_fd, name)
         try:
-            if attempt_identity != identity_from_stat(directory_metadata):
+            if not directory_identities_match(
+                attempt_identity,
+                identity_from_stat(directory_metadata),
+            ):
                 raise OSError(errno.ESTALE, "initial attempt identity changed")
             _remove_bound_attempt_directory(
                 root_fd=root_fd,
@@ -736,7 +1008,10 @@ def _attempt_directories(
             name,
         )
         try:
-            if attempt_identity != identity_from_stat(metadata):
+            if not directory_identities_match(
+                attempt_identity,
+                identity_from_stat(metadata),
+            ):
                 raise OSError(errno.ESTALE, "retained attempt identity changed")
             try:
                 os.stat(
@@ -804,12 +1079,21 @@ def reconcile_ledger(
                 lease.root_fd,
                 attempt_name,
             )
-            if attempt_identity != attempt.identity:
+            if not directory_identities_match(
+                attempt_identity,
+                attempt.identity,
+            ):
                 raise OSError(
                     errno.ESTALE,
                     "retained attempt changed after enumeration",
                 )
-            state, _, _ = _read_attempt_state_fd(attempt_fd)
+            bound_attempt = AttemptLease(
+                retention=lease,
+                path=attempt_dir,
+                fd=attempt_fd,
+                identity=attempt_identity,
+            )
+            state, _, _ = read_bound_attempt_state(bound_attempt)
             attempt_id = state.get("attempt_id")
             if (
                 not isinstance(attempt_id, str)
@@ -941,8 +1225,14 @@ def reconcile_ledger(
                 )
             )
             if (
-                current_attempt_identity != attempt_identity
-                or current_attempt_identity != attempt.identity
+                not directory_identities_match(
+                    current_attempt_identity,
+                    attempt_identity,
+                )
+                or not directory_identities_match(
+                    current_attempt_identity,
+                    attempt.identity,
+                )
             ):
                 raise OSError(errno.ESTALE, "retained attempt identity changed")
             lease.revalidate_root()
@@ -1136,6 +1426,7 @@ def calculate_admission(
     *,
     snapshot: LedgerSnapshot,
     retention_root: pathlib.Path,
+    lease: RetentionLease | None = None,
     checkout_parent: pathlib.Path,
     common_git_dir: pathlib.Path,
     manifest: TreeManifest,
@@ -1147,7 +1438,14 @@ def calculate_admission(
             stage="admission",
             code="blocked-worktree-capacity",
         )
-    retention_fs = measure_filesystem(retention_root)
+    if lease is not None:
+        if lease.root != retention_root:
+            raise ValueError("retention lease does not bind the admission root")
+        lease.revalidate_root()
+        retention_fs = _measure_filesystem_fd(lease.root_fd)
+        lease.revalidate_root()
+    else:
+        retention_fs = measure_filesystem(retention_root)
     checkout_fs = measure_filesystem(checkout_parent)
     git_fs = measure_filesystem(common_git_dir)
     if (
@@ -1261,7 +1559,7 @@ def calculate_admission(
                 else "frozen-path-accounting-invalid"
             ),
         ) from error
-    return Admission(
+    admission = Admission(
         retention_fs=retention_fs,
         checkout_fs=checkout_fs,
         git_fs=git_fs,
@@ -1273,6 +1571,9 @@ def calculate_admission(
         process_charge=PROCESS_ENVELOPE_BYTES,
         **latest,
     )
+    if lease is not None:
+        lease.revalidate_root()
+    return admission
 
 
 def _group_charges(entries: Iterable[tuple[str, int]]) -> dict[str, int]:
@@ -1423,6 +1724,7 @@ def create_reserved_attempt(
             )
         ),
         "registration": None,
+        "worktree_create_intent": None,
         "leader": None,
         "runtime_process_binding": None,
         "no_child_process_profile": None,
@@ -1432,7 +1734,27 @@ def create_reserved_attempt(
         "unsupported_clauses": list(UNSUPPORTED_CLAUSES),
     }
     try:
-        _, digest = atomic_write_json(attempt_dir / "state.json", state, replace=False)
+        with open_attempt_lease(
+            lease,
+            attempt_dir,
+            expected_identity=attempt_identity,
+        ) as attempt:
+            attempt.revalidate()
+            _, digest = atomic_write_json_at(
+                attempt.fd,
+                b"state.json",
+                state,
+                replace=False,
+                path_hint=attempt_dir / "state.json",
+            )
+            attempt.revalidate(state)
+            readback, raw, readback_digest = read_bound_attempt_state(attempt)
+            if (
+                readback != state
+                or readback_digest != digest
+                or raw != canonical_json(state)
+            ):
+                raise ValueError("reserved attempt state exact readback failed")
         return attempt_dir, state, digest
     except Exception as error:
         raise inconclusive(
@@ -1443,12 +1765,25 @@ def create_reserved_attempt(
 
 
 def commit_state(
-    attempt_dir: pathlib.Path,
+    attempt: AttemptLease | pathlib.Path,
     current: dict[str, Any],
     current_digest: str,
     **updates: Any,
 ) -> tuple[dict[str, Any], str]:
-    disk, _, disk_digest = read_attempt_state(attempt_dir)
+    if isinstance(attempt, pathlib.Path):
+        with acquire_retention_lease(
+            attempt.parent,
+            deadline=time.monotonic() + 30,
+        ) as lease:
+            with open_attempt_lease(lease, attempt) as bound_attempt:
+                return commit_state(
+                    bound_attempt,
+                    current,
+                    current_digest,
+                    **updates,
+                )
+    attempt.revalidate(current)
+    disk, _, disk_digest = read_bound_attempt_state(attempt)
     if disk_digest != current_digest or disk != current:
         raise ValueError("attempt state predecessor changed")
     next_state = dict(current)
@@ -1456,10 +1791,16 @@ def commit_state(
     next_state["record_generation"] = current["record_generation"] + 1
     next_state["previous_record_sha256"] = current_digest
     _validate_review_contract(next_state)
-    _, next_digest = atomic_write_json(
-        attempt_dir / "state.json", next_state, replace=True
+    _validate_durable_bindings(next_state, lease=attempt.retention, attempt=attempt)
+    _, next_digest = atomic_write_json_at(
+        attempt.fd,
+        b"state.json",
+        next_state,
+        replace=True,
+        path_hint=attempt.path / "state.json",
     )
-    readback, raw, readback_digest = read_attempt_state(attempt_dir)
+    attempt.revalidate(next_state)
+    readback, raw, readback_digest = read_bound_attempt_state(attempt)
     if (
         readback != next_state
         or readback_digest != next_digest

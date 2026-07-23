@@ -53,6 +53,12 @@ def identities_match(left: Identity, right: Identity) -> bool:
 
 
 def directory_identities_match(left: Identity, right: Identity) -> bool:
+    """Compare directory object identity and access policy.
+
+    Device/inode bind the object while type, owner, and mode bind access policy.
+    Directory size, link count, and timestamps are deliberately excluded because
+    ordinary child-entry churn can change them without changing either property.
+    """
     return (
         stat.S_ISDIR(left.mode)
         and stat.S_ISDIR(right.mode)
@@ -546,13 +552,27 @@ def rename_exchange(
         raise OSError(error_number, os.strerror(error_number))
 
 
-def atomic_write_json(
-    path: pathlib.Path, value: Any, *, replace: bool
+def atomic_write_json_at(
+    parent_fd: int,
+    destination: bytes,
+    value: Any,
+    *,
+    replace: bool,
+    path_hint: pathlib.Path,
 ) -> tuple[Identity, str]:
+    if (
+        not destination
+        or b"/" in destination
+        or destination in {b".", b".."}
+        or b"\0" in destination
+    ):
+        raise ValueError("invalid JSON destination name")
     data = canonical_json(value)
-    parent_fd, _ = open_absolute_directory_chain(path.parent, private_leaf=True)
-    temp_name = f".{path.name}.tmp-{os.getpid()}-{os.urandom(8).hex()}".encode("ascii")
-    destination = os.fsencode(path.name)
+    temp_name = (
+        b"."
+        + destination
+        + f".tmp-{os.getpid()}-{os.urandom(8).hex()}".encode("ascii")
+    )
     temp_fd: int | None = None
     try:
         temp_fd = os.open(
@@ -565,7 +585,7 @@ def atomic_write_json(
         os.fsync(temp_fd)
         written_identity = _validate_regular_fd(
             temp_fd,
-            path.parent / os.fsdecode(temp_name),
+            path_hint.parent / os.fsdecode(temp_name),
             expected_uid=os.getuid(),
             expected_mode=0o600,
             private_metadata=True,
@@ -587,7 +607,7 @@ def atomic_write_json(
         try:
             identity = _validate_regular_fd(
                 fd,
-                path,
+                path_hint,
                 expected_uid=os.getuid(),
                 expected_mode=0o600,
                 private_metadata=True,
@@ -607,13 +627,37 @@ def atomic_write_json(
             os.unlink(temp_name, dir_fd=parent_fd)
         except FileNotFoundError:
             pass
+
+
+def atomic_write_json(
+    path: pathlib.Path, value: Any, *, replace: bool
+) -> tuple[Identity, str]:
+    parent_fd, _ = open_absolute_directory_chain(path.parent, private_leaf=True)
+    try:
+        return atomic_write_json_at(
+            parent_fd,
+            os.fsencode(path.name),
+            value,
+            replace=replace,
+            path_hint=path,
+        )
+    finally:
         os.close(parent_fd)
 
 
-def publish_bytes(path: pathlib.Path, data: bytes, *, mode: int = 0o600) -> Identity:
-    parent_fd, _ = open_absolute_directory_chain(path.parent, private_leaf=True)
-    name = os.fsencode(path.name)
-    temp_name = f".{path.name}.tmp-{os.getpid()}-{os.urandom(8).hex()}".encode("ascii")
+def publish_bytes_at(
+    parent_fd: int,
+    name: bytes,
+    data: bytes,
+    *,
+    path_hint: pathlib.Path,
+    mode: int = 0o600,
+) -> Identity:
+    if not name or b"/" in name or name in {b".", b".."} or b"\0" in name:
+        raise ValueError("invalid publication name")
+    temp_name = (
+        b"." + name + f".tmp-{os.getpid()}-{os.urandom(8).hex()}".encode("ascii")
+    )
     temp_fd: int | None = None
     try:
         temp_fd = os.open(
@@ -626,7 +670,7 @@ def publish_bytes(path: pathlib.Path, data: bytes, *, mode: int = 0o600) -> Iden
         os.fsync(temp_fd)
         written_identity = _validate_regular_fd(
             temp_fd,
-            path.parent / os.fsdecode(temp_name),
+            path_hint.parent / os.fsdecode(temp_name),
             expected_uid=os.getuid(),
             expected_mode=mode,
             private_metadata=True,
@@ -643,7 +687,7 @@ def publish_bytes(path: pathlib.Path, data: bytes, *, mode: int = 0o600) -> Iden
         try:
             read_identity = _validate_regular_fd(
                 read_fd,
-                path,
+                path_hint,
                 expected_uid=os.getuid(),
                 expected_mode=mode,
                 private_metadata=True,
@@ -665,6 +709,19 @@ def publish_bytes(path: pathlib.Path, data: bytes, *, mode: int = 0o600) -> Iden
             os.unlink(temp_name, dir_fd=parent_fd)
         except FileNotFoundError:
             pass
+
+
+def publish_bytes(path: pathlib.Path, data: bytes, *, mode: int = 0o600) -> Identity:
+    parent_fd, _ = open_absolute_directory_chain(path.parent, private_leaf=True)
+    try:
+        return publish_bytes_at(
+            parent_fd,
+            os.fsencode(path.name),
+            data,
+            path_hint=path,
+            mode=mode,
+        )
+    finally:
         os.close(parent_fd)
 
 
@@ -679,13 +736,11 @@ def acquire_flock(fd: int, operation: int, *, deadline: float) -> None:
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
-def measure_filesystem(path: pathlib.Path) -> FilesystemMeasure:
-    directory_fd = open_directory(path)
-    try:
-        metadata = os.fstat(directory_fd)
-        values = os.fstatvfs(directory_fd)
-    finally:
-        os.close(directory_fd)
+def measure_filesystem_fd(directory_fd: int) -> FilesystemMeasure:
+    metadata = os.fstat(directory_fd)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError("filesystem measurement root is not a directory")
+    values = os.fstatvfs(directory_fd)
     allocation_unit = max(4096, values.f_frsize or values.f_bsize)
     free_bytes = values.f_bavail * (values.f_frsize or values.f_bsize)
     fsid = getattr(values, "f_fsid", None)
@@ -698,23 +753,81 @@ def measure_filesystem(path: pathlib.Path) -> FilesystemMeasure:
     )
 
 
+def measure_filesystem(path: pathlib.Path) -> FilesystemMeasure:
+    directory_fd = open_directory(path)
+    try:
+        return measure_filesystem_fd(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def allocated_bytes_fd(directory_fd: int, *, entry_cap: int = 200_000) -> int:
+    root_metadata = os.fstat(directory_fd)
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise ValueError("allocated-byte inventory root is not a directory")
+    total = root_metadata.st_blocks * 512
+    count = 1
+    stack = [os.dup(directory_fd)]
+    try:
+        while stack:
+            current_fd = stack.pop()
+            try:
+                scan_fd = os.dup(current_fd)
+                try:
+                    with os.scandir(scan_fd) as iterator:
+                        for entry in iterator:
+                            name = os.fsencode(entry.name)
+                            if not name or b"/" in name or b"\0" in name:
+                                raise ValueError(
+                                    "allocated-byte inventory returned an invalid entry"
+                                )
+                            count += 1
+                            if count > entry_cap:
+                                raise ValueError(
+                                    "allocated-byte inventory exceeds entry cap"
+                                )
+                            metadata = os.stat(
+                                name,
+                                dir_fd=current_fd,
+                                follow_symlinks=False,
+                            )
+                            total = checked_add(total, metadata.st_blocks * 512)
+                            if stat.S_ISDIR(metadata.st_mode):
+                                child_fd = os.open(
+                                    name,
+                                    os.O_RDONLY
+                                    | os.O_DIRECTORY
+                                    | os.O_CLOEXEC
+                                    | os.O_NOFOLLOW,
+                                    dir_fd=current_fd,
+                                )
+                                child_identity = identity_from_stat(os.fstat(child_fd))
+                                if not directory_identities_match(
+                                    child_identity,
+                                    identity_from_stat(metadata),
+                                ):
+                                    os.close(child_fd)
+                                    raise OSError(
+                                        errno.ESTALE,
+                                        "allocated-byte directory identity changed",
+                                    )
+                                stack.append(child_fd)
+                finally:
+                    os.close(scan_fd)
+            finally:
+                os.close(current_fd)
+        return total
+    finally:
+        for pending_fd in stack:
+            os.close(pending_fd)
+
+
 def allocated_bytes(path: pathlib.Path, *, entry_cap: int = 200_000) -> int:
-    total = 0
-    count = 0
-    stack = [path]
-    while stack:
-        current = stack.pop()
-        metadata = os.lstat(current)
-        count += 1
-        if count > entry_cap:
-            raise ValueError("allocated-byte inventory exceeds entry cap")
-        total += metadata.st_blocks * 512
-        if stat.S_ISDIR(metadata.st_mode):
-            with os.scandir(current) as iterator:
-                children = list(iterator)
-            for child in children:
-                stack.append(pathlib.Path(child.path))
-    return total
+    directory_fd = open_directory(path)
+    try:
+        return allocated_bytes_fd(directory_fd, entry_cap=entry_cap)
+    finally:
+        os.close(directory_fd)
 
 
 def raw_directory_entries(path: pathlib.Path, *, cap: int) -> tuple[bytes, ...]:

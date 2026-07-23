@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import pathlib
 import threading
@@ -19,12 +20,15 @@ from review_supervisor.ledger import (
     EntryCountMismatch,
     INITIAL_CRASH_RECLAIM_AGE_SECONDS,
     LedgerSnapshot,
+    accept_attempt_lease_transfer,
     acquire_retention_lease,
     aggregate_unique_parents,
     calculate_admission,
     commit_state,
     create_reserved_attempt,
+    open_attempt_lease,
     read_attempt_state,
+    read_bound_attempt_state,
     reconcile_ledger,
 )
 from review_supervisor.models import (
@@ -41,7 +45,7 @@ from review_supervisor.secureio import (
     identity_from_stat,
 )
 
-from tests.support import owned_temporary_directory
+from tests.support import bind_attempt_state, owned_temporary_directory
 
 
 class _NeverIterate:
@@ -182,6 +186,210 @@ class AdmissionProjectionTests(unittest.TestCase):
         self.assertEqual(counters["path_reads"], entry_count)
 
 
+class BindingContinuityTests(unittest.TestCase):
+    def _bound_attempt(
+        self,
+        root: pathlib.Path,
+    ) -> tuple[pathlib.Path, pathlib.Path, dict[str, object]]:
+        retention = root / "retention"
+        retention.mkdir(mode=0o700)
+        attempt = retention / f"attempt-1-{'a' * 32}"
+        attempt.mkdir(mode=0o700)
+        state: dict[str, object] = {
+            "schema_version": SCHEMA_VERSION,
+            "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+            "named_lane_eligible": NAMED_LANE_ELIGIBLE,
+            "attempt_id": f"1-{'a' * 32}",
+            "record_generation": 1,
+            "previous_record_sha256": None,
+            "phase": "reserved",
+        }
+        bind_attempt_state(
+            state,
+            retention_root=retention,
+            attempt_dir=attempt,
+        )
+        state_path = attempt / "state.json"
+        state_path.write_bytes(canonical_json(state))
+        state_path.chmod(0o600)
+        return retention, attempt, state
+
+    def test_transferred_lease_detects_post_handoff_binding_replacements(self) -> None:
+        for case in ("root", "lock", "attempt"):
+            with (
+                self.subTest(case=case),
+                owned_temporary_directory(f"lease-handoff-{case}-") as root,
+            ):
+                retention, attempt, state = self._bound_attempt(root)
+                lease = acquire_retention_lease(retention, deadline=10**12)
+                attempt_lease = open_attempt_lease(lease, attempt)
+                accepted = accept_attempt_lease_transfer(
+                    lease_fd=os.dup(lease.fd),
+                    root_fd=os.dup(lease.root_fd),
+                    attempt_fd=os.dup(attempt_lease.fd),
+                    binding=attempt_lease.transfer_binding(),
+                )
+                try:
+                    if case == "root":
+                        retention.rename(root / "original-retention")
+                        retention.mkdir(mode=0o700)
+                    elif case == "lock":
+                        lock_path = retention / "retention.lock"
+                        lock_path.unlink()
+                        lock_path.write_bytes(lease.lock_token)
+                        lock_path.chmod(0o600)
+                    else:
+                        raw_state = (attempt / "state.json").read_bytes()
+                        attempt.rename(retention / "original-attempt")
+                        attempt.mkdir(mode=0o700)
+                        replacement_state = attempt / "state.json"
+                        replacement_state.write_bytes(raw_state)
+                        replacement_state.chmod(0o600)
+                    with self.assertRaises(OSError):
+                        accepted.revalidate(state)
+                finally:
+                    accepted.close()
+                    accepted.retention.close()
+                    attempt_lease.close()
+                    lease.close()
+
+    def test_transfer_rejects_wrong_lease_token(self) -> None:
+        with owned_temporary_directory("lease-handoff-token-") as root:
+            retention, attempt, _ = self._bound_attempt(root)
+            with acquire_retention_lease(retention, deadline=10**12) as lease:
+                with open_attempt_lease(lease, attempt) as attempt_lease:
+                    binding = attempt_lease.transfer_binding()
+                    binding["lock_token_hex"] = "0" * len(binding["lock_token_hex"])
+                    with self.assertRaisesRegex(OSError, "ownership token changed"):
+                        accept_attempt_lease_transfer(
+                            lease_fd=os.dup(lease.fd),
+                            root_fd=os.dup(lease.root_fd),
+                            attempt_fd=os.dup(attempt_lease.fd),
+                            binding=binding,
+                        )
+
+    def test_commit_rejects_same_name_copied_state_replacement(self) -> None:
+        with owned_temporary_directory("attempt-commit-copy-swap-") as root:
+            retention, attempt, _ = self._bound_attempt(root)
+            with acquire_retention_lease(retention, deadline=10**12) as lease:
+                with open_attempt_lease(lease, attempt) as attempt_lease:
+                    state, raw, digest = read_bound_attempt_state(attempt_lease)
+                    original = retention / "original-attempt"
+                    attempt.rename(original)
+                    attempt.mkdir(mode=0o700)
+                    replacement_state = attempt / "state.json"
+                    replacement_state.write_bytes(raw)
+                    replacement_state.chmod(0o600)
+
+                    with self.assertRaisesRegex(OSError, "binding changed"):
+                        commit_state(
+                            attempt_lease,
+                            state,
+                            digest,
+                            phase="changed",
+                        )
+
+                    self.assertEqual(replacement_state.read_bytes(), raw)
+                    self.assertEqual((original / "state.json").read_bytes(), raw)
+
+    def test_reopen_rejects_same_name_copied_state_replacement(self) -> None:
+        with owned_temporary_directory("attempt-reopen-copy-swap-") as root:
+            retention, attempt, _ = self._bound_attempt(root)
+            with acquire_retention_lease(retention, deadline=10**12) as lease:
+                raw = (attempt / "state.json").read_bytes()
+                attempt.rename(retention / "original-attempt")
+                attempt.mkdir(mode=0o700)
+                replacement_state = attempt / "state.json"
+                replacement_state.write_bytes(raw)
+                replacement_state.chmod(0o600)
+
+                with self.assertRaisesRegex(OSError, "directory binding changed"):
+                    read_attempt_state(attempt, lease=lease)
+
+                self.assertEqual(replacement_state.read_bytes(), raw)
+
+    def test_child_churn_and_identical_state_materialization_are_benign(self) -> None:
+        with owned_temporary_directory("attempt-benign-metadata-") as root:
+            retention, attempt, _ = self._bound_attempt(root)
+            with acquire_retention_lease(retention, deadline=10**12) as lease:
+                with open_attempt_lease(lease, attempt) as attempt_lease:
+                    state, raw, digest = read_bound_attempt_state(attempt_lease)
+
+                    root_child = retention / "benign-root-child"
+                    root_child.mkdir(mode=0o700)
+                    root_child.rmdir()
+                    attempt_child = attempt / "benign-attempt-child"
+                    attempt_child.mkdir(mode=0o700)
+                    attempt_child.rmdir()
+
+                    materialized = attempt / ".state.materialized"
+                    materialized.write_bytes(raw)
+                    materialized.chmod(0o600)
+                    materialized.replace(attempt / "state.json")
+                    os.fsync(attempt_lease.fd)
+
+                    attempt_lease.revalidate(state)
+                    reread, reread_raw, reread_digest = read_bound_attempt_state(
+                        attempt_lease
+                    )
+                    self.assertEqual(
+                        (reread, reread_raw, reread_digest),
+                        (state, raw, digest),
+                    )
+                    committed, _ = commit_state(
+                        attempt_lease,
+                        state,
+                        digest,
+                        phase="materialized",
+                    )
+                    self.assertEqual(committed["phase"], "materialized")
+
+    def test_binding_failures_keep_missing_mismatch_and_unreadable_distinct(
+        self,
+    ) -> None:
+        with owned_temporary_directory("attempt-binding-missing-") as root:
+            retention, _, _ = self._bound_attempt(root)
+            with acquire_retention_lease(retention, deadline=10**12) as lease:
+                (retention / "retention.lock").unlink()
+                with self.assertRaises(FileNotFoundError):
+                    lease.revalidate_root()
+
+        with owned_temporary_directory("attempt-binding-mismatch-") as root:
+            retention, attempt, _ = self._bound_attempt(root)
+            with acquire_retention_lease(retention, deadline=10**12) as lease:
+                with open_attempt_lease(lease, attempt) as attempt_lease:
+                    attempt.rename(retention / "original-attempt")
+                    attempt.mkdir(mode=0o700)
+                    with self.assertRaises(OSError) as raised:
+                        attempt_lease.revalidate()
+                    self.assertEqual(raised.exception.errno, errno.ESTALE)
+
+        with owned_temporary_directory("attempt-binding-policy-") as root:
+            retention, attempt, _ = self._bound_attempt(root)
+            with acquire_retention_lease(retention, deadline=10**12) as lease:
+                with open_attempt_lease(lease, attempt) as attempt_lease:
+                    attempt.chmod(0o750)
+                    with self.assertRaises(OSError) as raised:
+                        attempt_lease.revalidate()
+                    self.assertEqual(raised.exception.errno, errno.EPERM)
+
+        with owned_temporary_directory("attempt-binding-unreadable-") as root:
+            retention, _, _ = self._bound_attempt(root)
+            with acquire_retention_lease(retention, deadline=10**12) as lease:
+                with (
+                    mock.patch(
+                        "review_supervisor.ledger.open_absolute_directory_chain",
+                        side_effect=PermissionError(
+                            errno.EACCES,
+                            "synthetic revalidation denial",
+                        ),
+                    ),
+                    self.assertRaises(PermissionError) as raised,
+                ):
+                    lease.revalidate_root()
+                self.assertEqual(raised.exception.errno, errno.EACCES)
+
+
 class InitialAttemptCrashRecoveryTests(unittest.TestCase):
     def _attempt(self, root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, int]:
         retention = root / "retention"
@@ -193,7 +401,8 @@ class InitialAttemptCrashRecoveryTests(unittest.TestCase):
 
     def _initial_state(self, attempt: pathlib.Path, created_at: int) -> bytes:
         return canonical_json(
-            {
+            bind_attempt_state(
+                {
                 "schema_version": SCHEMA_VERSION,
                 "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
                 "named_lane_eligible": NAMED_LANE_ELIGIBLE,
@@ -208,8 +417,11 @@ class InitialAttemptCrashRecoveryTests(unittest.TestCase):
                 "process_settlement": "outstanding",
                 "checkout_settlement": "outstanding",
                 "retention_state": "active/unsafe",
-                "leader": None,
-            }
+                    "leader": None,
+                },
+                retention_root=attempt.parent,
+                attempt_dir=attempt,
+            )
         )
 
     def _reconcilable_state(self, attempt: pathlib.Path, created_at: int) -> bytes:
@@ -456,6 +668,62 @@ class InitialAttemptCrashRecoveryTests(unittest.TestCase):
                 [],
             )
 
+    def test_reclaim_rejects_replacement_after_quarantine_deletion(self) -> None:
+        with owned_temporary_directory("ledger-reclaim-post-delete-swap-") as root:
+            retention, attempt, _ = self._attempt(root)
+            marker = attempt / "replacement-marker"
+            original_rmdir = ledger_module.os.rmdir
+            replaced = False
+
+            def replace_after_quarantine_delete(
+                path: bytes | str,
+                *,
+                dir_fd: int | None = None,
+            ) -> None:
+                nonlocal replaced
+                original_rmdir(path, dir_fd=dir_fd)
+                if (
+                    isinstance(path, bytes)
+                    and path.startswith(b".reclaim-")
+                    and not replaced
+                ):
+                    replaced = True
+                    assert dir_fd is not None
+                    os.mkdir(os.fsencode(attempt.name), 0o700, dir_fd=dir_fd)
+                    replacement_fd = os.open(
+                        os.fsencode(attempt.name),
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        dir_fd=dir_fd,
+                    )
+                    try:
+                        marker_fd = os.open(
+                            b"replacement-marker",
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                            0o600,
+                            dir_fd=replacement_fd,
+                        )
+                        try:
+                            os.write(marker_fd, b"replacement\n")
+                            os.fsync(marker_fd)
+                        finally:
+                            os.close(marker_fd)
+                        os.fsync(replacement_fd)
+                    finally:
+                        os.close(replacement_fd)
+
+            with (
+                mock.patch(
+                    "review_supervisor.ledger.os.rmdir",
+                    side_effect=replace_after_quarantine_delete,
+                ),
+                self.assertRaisesRegex(OSError, "name was replaced"),
+            ):
+                reconcile_ledger(retention)
+
+            self.assertTrue(replaced)
+            self.assertEqual(marker.read_bytes(), b"replacement\n")
+            self.assertEqual(list(retention.glob(".reclaim-attempt-*")), [])
+
     def test_reclaim_residue_is_restored_and_completed(self) -> None:
         with owned_temporary_directory("ledger-reclaim-resume-") as root:
             retention, attempt, _ = self._attempt(root)
@@ -678,6 +946,11 @@ class InitialAttemptCrashRecoveryTests(unittest.TestCase):
                 "checkout_physical_remaining_by_fs": {},
                 "retention_state": "held",
             }
+            bind_attempt_state(
+                state,
+                retention_root=retention,
+                attempt_dir=attempt,
+            )
             state_path = attempt / "state.json"
             state_path.write_bytes(canonical_json(state))
             state_path.chmod(0o600)

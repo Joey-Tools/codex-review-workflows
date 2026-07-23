@@ -11,11 +11,17 @@ from review_supervisor.constants import (
     PROCESS_ENVELOPE_BYTES,
     SCHEMA_VERSION,
 )
-from review_supervisor.ledger import read_attempt_state, reconcile_ledger
+from review_supervisor.ledger import (
+    acquire_retention_lease,
+    open_attempt_lease,
+    read_bound_attempt_state,
+    read_attempt_state,
+    reconcile_ledger,
+)
 from review_supervisor.secureio import allocated_bytes, canonical_json
 from review_supervisor.settlement_state import publish_exact_process_settlement
 
-from tests.support import owned_temporary_directory
+from tests.support import bind_attempt_state, owned_temporary_directory
 
 
 class ProcessSettlementTests(unittest.TestCase):
@@ -41,6 +47,11 @@ class ProcessSettlementTests(unittest.TestCase):
             "retention_state": "active/unsafe",
             "reservation_status": "outstanding",
         }
+        bind_attempt_state(
+            state,
+            retention_root=retention,
+            attempt_dir=attempt,
+        )
         state_path = attempt / "state.json"
         state_path.write_bytes(canonical_json(state))
         state_path.chmod(0o600)
@@ -52,16 +63,17 @@ class ProcessSettlementTests(unittest.TestCase):
 
     def test_exact_is_published_only_after_candidate_proof(self) -> None:
         with owned_temporary_directory("settlement-success-") as root:
-            _, attempt, current, digest = self._build_attempt(root)
-
-            settled, settled_digest = publish_exact_process_settlement(
-                attempt,
-                current,
-                digest,
-                deadline=time.monotonic() + 5.0,
-            )
-
-            disk, _, disk_digest = read_attempt_state(attempt)
+            retention, attempt, current, digest = self._build_attempt(root)
+            with acquire_retention_lease(
+                retention, deadline=time.monotonic() + 5.0
+            ) as lease, open_attempt_lease(lease, attempt) as attempt_lease:
+                settled, settled_digest = publish_exact_process_settlement(
+                    attempt_lease,
+                    current,
+                    digest,
+                    deadline=time.monotonic() + 5.0,
+                )
+                disk, _, disk_digest = read_bound_attempt_state(attempt_lease)
             self.assertEqual(disk, settled)
             self.assertEqual(disk_digest, settled_digest)
             self.assertEqual(settled["process_settlement"], "exact")
@@ -74,22 +86,50 @@ class ProcessSettlementTests(unittest.TestCase):
             self.assertEqual(proof["readback"], "exact-before-publication")
             self.assertTrue((attempt / proof["predecessor_retained_name"]).is_file())
 
-    def test_exchange_failure_leaves_outstanding_charge(self) -> None:
-        with owned_temporary_directory("settlement-failure-") as root:
+    def test_attempt_replacement_before_settlement_is_rejected(self) -> None:
+        with owned_temporary_directory("settlement-attempt-replacement-") as root:
             retention, attempt, current, digest = self._build_attempt(root)
-            with mock.patch(
-                "review_supervisor.settlement_state.rename_exchange",
-                side_effect=OSError("injected exchange failure"),
-            ):
-                with self.assertRaisesRegex(OSError, "injected exchange failure"):
+            original = retention / "original-attempt"
+            state_raw = (attempt / "state.json").read_bytes()
+            with acquire_retention_lease(
+                retention, deadline=time.monotonic() + 5.0
+            ) as lease, open_attempt_lease(lease, attempt) as attempt_lease:
+                attempt.rename(original)
+                attempt.mkdir(mode=0o700)
+                replacement_state = attempt / "state.json"
+                replacement_state.write_bytes(state_raw)
+                replacement_state.chmod(0o600)
+
+                with self.assertRaisesRegex(OSError, "binding changed"):
                     publish_exact_process_settlement(
-                        attempt,
+                        attempt_lease,
                         current,
                         digest,
                         deadline=time.monotonic() + 5.0,
                     )
 
-            disk, _, disk_digest = read_attempt_state(attempt)
+            self.assertEqual(replacement_state.read_bytes(), state_raw)
+            self.assertTrue((original / "state.json").is_file())
+
+    def test_exchange_failure_leaves_outstanding_charge(self) -> None:
+        with owned_temporary_directory("settlement-failure-") as root:
+            retention, attempt, current, digest = self._build_attempt(root)
+            with acquire_retention_lease(
+                retention, deadline=time.monotonic() + 5.0
+            ) as lease, open_attempt_lease(lease, attempt) as attempt_lease:
+                with mock.patch(
+                    "review_supervisor.settlement_state.rename_exchange",
+                    side_effect=OSError("injected exchange failure"),
+                ):
+                    with self.assertRaisesRegex(OSError, "injected exchange failure"):
+                        publish_exact_process_settlement(
+                            attempt_lease,
+                            current,
+                            digest,
+                            deadline=time.monotonic() + 5.0,
+                        )
+
+                disk, _, disk_digest = read_bound_attempt_state(attempt_lease)
             self.assertEqual(disk_digest, digest)
             self.assertEqual(disk["process_settlement"], "outstanding")
             temporary_names = [

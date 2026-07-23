@@ -649,7 +649,12 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                 "legacy-base": {},
                 "extended-2x": {
                     "diagnostics": {
-                        "rule": "null",
+                        "rule": "null_or_exact_object",
+                        "object": {
+                            "cache_miss_reason": {
+                                "type": "unavailable",
+                            }
+                        },
                         "failure": "inconclusive",
                     }
                 },
@@ -1351,23 +1356,63 @@ class ClaudeStreamValidatorTest(unittest.TestCase):
                         },
                     )
 
-    def test_extended_assistant_diagnostics_nonnull_is_inconclusive(self) -> None:
+    def test_extended_assistant_exact_cache_miss_diagnostics_is_accepted(self) -> None:
         for version in ("2.1.216", "2.9.999"):
             with self.subTest(version=version):
                 events = self._full_events()
                 events[0]["claude_code_version"] = version
                 message = events[1]["message"]
                 assert isinstance(message, dict)
-                message["diagnostics"] = {}
+                message["diagnostics"] = {
+                    "cache_miss_reason": {"type": "unavailable"}
+                }
                 self.assertEqual(
                     self._validate(events, claude_code_version=version),
                     {
-                        "classification": "inconclusive",
-                        "reasons": [
-                            "intermediate.assistant.message.diagnostics.nonnull"
-                        ],
+                        "classification": "accepted",
+                        "findings": "\nNo findings.\n",
                     },
                 )
+
+    def test_extended_assistant_unknown_diagnostics_shapes_are_inconclusive(
+        self,
+    ) -> None:
+        invalid_values = {
+            "empty": {},
+            "outer-extra-key": {
+                "cache_miss_reason": {"type": "unavailable"},
+                "extra": None,
+            },
+            "outer-wrong-type": [],
+            "nested-wrong-type": {"cache_miss_reason": "unavailable"},
+            "nested-extra-key": {
+                "cache_miss_reason": {
+                    "type": "unavailable",
+                    "extra": None,
+                }
+            },
+            "wrong-value": {"cache_miss_reason": {"type": "available"}},
+            "extra-nesting": {
+                "cache_miss_reason": {"type": {"value": "unavailable"}}
+            },
+        }
+        for version in ("2.1.216", "2.9.999"):
+            for case, diagnostics in invalid_values.items():
+                with self.subTest(version=version, case=case):
+                    events = self._full_events()
+                    events[0]["claude_code_version"] = version
+                    message = events[1]["message"]
+                    assert isinstance(message, dict)
+                    message["diagnostics"] = diagnostics
+                    self.assertEqual(
+                        self._validate(events, claude_code_version=version),
+                        {
+                            "classification": "inconclusive",
+                            "reasons": [
+                                "intermediate.assistant.message.diagnostics.unsupported"
+                            ],
+                        },
+                    )
 
     def test_legacy_assistant_diagnostics_presence_is_inconclusive(self) -> None:
         events = self._legacy_events("2.1.215")

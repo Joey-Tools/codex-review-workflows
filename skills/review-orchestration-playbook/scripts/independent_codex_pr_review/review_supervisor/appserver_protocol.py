@@ -572,12 +572,27 @@ def decode_json_line(
             code="invalid-json-number",
         )
 
+    def parse_int64(value: str) -> int:
+        negative = value.startswith("-")
+        digits = value[1:] if negative else value
+        limit = b"9223372036854775808" if negative else b"9223372036854775807"
+        encoded = digits.encode("ascii", "strict")
+        if len(encoded) > len(limit) or (
+            len(encoded) == len(limit) and encoded > limit
+        ):
+            raise AppServerProtocolError(
+                "protocol JSON integer is outside int64 bounds",
+                code="invalid-json-number",
+            )
+        return int(value)
+
     try:
         text = payload.decode("utf-8", "strict")
         parsed = json.loads(
             text,
             object_pairs_hook=reject_duplicate_keys,
             parse_constant=reject_constant,
+            parse_int=parse_int64,
         )
     except AppServerProtocolError:
         raise

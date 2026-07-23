@@ -18,6 +18,7 @@ from review_supervisor.constants import (
     HELPER_PREFLIGHT_STATUS,
     HELPER_STATE_MARKER_TEXT,
 )
+from review_supervisor.secureio import identity_from_stat
 
 
 _RUNTIME_ROOT: pathlib.Path | None = None
@@ -190,6 +191,33 @@ def _digest(value: bytes) -> str:
 
 def _names_digest(names: set[str]) -> str:
     return _digest(b"\0".join(name.encode("ascii") for name in sorted(names)))
+
+
+def bind_attempt_state(
+    state: dict[str, object],
+    *,
+    retention_root: pathlib.Path,
+    attempt_dir: pathlib.Path,
+) -> dict[str, object]:
+    if attempt_dir.parent != retention_root:
+        raise ValueError("test attempt is not an exact retention-root child")
+    state.update(
+        {
+            "retention_root_binding": {
+                "path": str(retention_root),
+                "identity": identity_from_stat(
+                    os.stat(retention_root, follow_symlinks=False)
+                ).to_json(),
+            },
+            "attempt_directory_binding": {
+                "path": str(attempt_dir),
+                "identity": identity_from_stat(
+                    os.stat(attempt_dir, follow_symlinks=False)
+                ).to_json(),
+            },
+        }
+    )
+    return state
 
 
 def build_helper_fixture(

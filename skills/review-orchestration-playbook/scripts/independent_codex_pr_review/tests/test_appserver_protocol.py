@@ -415,6 +415,23 @@ class JsonLineTests(unittest.TestCase):
             decode_json_line(b'{"nested":[]}\n')
         self.assertEqual(raised.exception.code, "json-depth")
 
+    def test_rejects_oversized_integer_before_python_digit_conversion(self) -> None:
+        record = b'{"id":' + (b"9" * 5000) + b"}\n"
+        with self.assertRaises(AppServerProtocolError) as raised:
+            decode_json_line(record)
+        self.assertEqual(raised.exception.code, "invalid-json-number")
+
+    def test_does_not_reclassify_unrelated_json_value_errors(self) -> None:
+        with (
+            mock.patch(
+                "review_supervisor.appserver_protocol.json.loads",
+                side_effect=ValueError("synthetic non-parser failure"),
+            ),
+            self.assertRaisesRegex(ValueError, "synthetic non-parser failure") as raised,
+        ):
+            decode_json_line(b'{"id":1}\n')
+        self.assertNotIsInstance(raised.exception, AppServerProtocolError)
+
     def test_prelaunch_turn_start_budget_includes_json_escaping(self) -> None:
         self.assertGreater(validate_prelaunch_turn_start_record(b"evidence"), 0)
 

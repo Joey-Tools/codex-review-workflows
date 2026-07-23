@@ -19,7 +19,11 @@ from review_supervisor.gitraw import (
     initialize_index,
     inspect_repository,
 )
-from review_supervisor.ledger import acquire_retention_lease, read_attempt_state
+from review_supervisor.ledger import (
+    acquire_retention_lease,
+    open_attempt_lease,
+    read_attempt_state,
+)
 from review_supervisor.models import Identity
 from review_supervisor.recovery_cleanup import (
     RootSpec,
@@ -31,7 +35,7 @@ from review_supervisor.recovery_cleanup import (
 from review_supervisor.runtime import _cleanup_worktree, _registration_json
 from review_supervisor.secureio import canonical_json, identity_from_stat
 
-from tests.support import owned_temporary_directory
+from tests.support import bind_attempt_state, owned_temporary_directory
 from tests.test_git_checkout import GIT, _build_repository
 
 
@@ -163,7 +167,13 @@ class ManifestTraversalTests(unittest.TestCase):
 
 @unittest.skipUnless(GIT.is_file(), "/usr/bin/git is required")
 class TargetedRecoveryTests(unittest.TestCase):
-    def _prepare(self, root: pathlib.Path, *, cleanup_status: str = "clean"):
+    def _prepare(
+        self,
+        root: pathlib.Path,
+        *,
+        cleanup_status: str = "clean",
+        lock_reason: str = "independent-codex-pr-review",
+    ):
         repo, base_sha, head_sha = _build_repository(root)
         info = inspect_repository(
             repo=repo,
@@ -174,7 +184,11 @@ class TargetedRecoveryTests(unittest.TestCase):
         checkout_parent = root / "checkouts"
         checkout_parent.mkdir(mode=0o700)
         worktree = checkout_parent / "review-fixture"
-        registration = add_detached_worktree(info, worktree)
+        registration = add_detached_worktree(
+            info,
+            worktree,
+            lock_reason=lock_reason,
+        )
         initialize_index(info, registration)
         count, path_bytes = enumerate_registration(registration.registration)
         registration_value = _registration_json(registration)
@@ -225,6 +239,11 @@ class TargetedRecoveryTests(unittest.TestCase):
                 {"clause": "optional-fixture-clause"},
             ],
         }
+        bind_attempt_state(
+            state,
+            retention_root=retention,
+            attempt_dir=attempt,
+        )
         state_path = attempt / "state.json"
         state_path.write_bytes(canonical_json(state))
         state_path.chmod(0o600)
@@ -236,13 +255,13 @@ class TargetedRecoveryTests(unittest.TestCase):
             retention,
             deadline=time.monotonic() + 5.0,
         ) as lease:
-            return _cleanup_worktree(
-                entrypoint=ENTRYPOINT,
-                attempt_dir=attempt,
-                lease_fd=lease.fd,
-                state=state,
-                state_digest=digest,
-            )
+            with open_attempt_lease(lease, attempt) as bound_attempt:
+                return _cleanup_worktree(
+                    entrypoint=ENTRYPOINT,
+                    attempt=bound_attempt,
+                    state=state,
+                    state_digest=digest,
+                )
 
     def test_checkout_only_is_removed_from_external_manifest(self) -> None:
         with owned_temporary_directory("checkout-only-") as root:
@@ -324,6 +343,41 @@ class TargetedRecoveryTests(unittest.TestCase):
             self.assertIn(registration.registration.name, evidence["alias_matches"])
             self.assertTrue(worktree.exists())
             self.assertTrue(registration.registration.exists())
+
+    def test_create_in_progress_recovers_authenticated_locked_registration(
+        self,
+    ) -> None:
+        with owned_temporary_directory("registration-create-intent-") as root:
+            lock_reason = f"independent-codex-pr-review:{'c' * 64}"
+            retention, attempt, worktree, registration, _, state, digest = (
+                self._prepare(root, lock_reason=lock_reason)
+            )
+            state["registration"] = None
+            state["phase"] = "worktree-adding"
+            state["worktree_status"] = "adding"
+            state["worktree_create_intent"] = {
+                "version": 1,
+                "worktree": str(worktree),
+                "registration_parent": str(registration.registration.parent),
+                "lock_reason": lock_reason,
+            }
+            state["record_generation"] += 1
+            state["previous_record_sha256"] = digest
+            state_path = attempt / "state.json"
+            state_path.write_bytes(canonical_json(state))
+            state_path.chmod(0o600)
+            state, _, digest = read_attempt_state(attempt)
+
+            state, _ = self._cleanup(retention, attempt, state, digest)
+
+            self.assertEqual(state["checkout_settlement"], "exact")
+            self.assertEqual(state["worktree_status"], "removed")
+            self.assertEqual(
+                state["checkout_cleanup_evidence"]["branch"],
+                "both-present",
+            )
+            self.assertFalse(worktree.exists())
+            self.assertFalse(registration.registration.exists())
 
     def test_persisted_intent_without_live_descriptors_requires_manual_recovery(
         self,

@@ -21,7 +21,11 @@ from review_supervisor.constants import (
 )
 from review_supervisor.evidence import ManifestEntry, manifest_sha256
 from review_supervisor.errors import SupervisorError, inconclusive
-from review_supervisor.ledger import acquire_retention_lease, read_attempt_state
+from review_supervisor.ledger import (
+    acquire_retention_lease,
+    open_attempt_lease,
+    read_attempt_state,
+)
 from review_supervisor.models import TreeEntry, TreeManifest
 from review_supervisor.process import (
     ForkedProcessClosureUnproven,
@@ -52,6 +56,7 @@ from review_supervisor.runtime import (
     verify_prompt_via_helper,
 )
 from review_supervisor.secureio import (
+    allocated_bytes_fd,
     canonical_json,
     identity_from_stat,
     publish_bytes,
@@ -59,12 +64,22 @@ from review_supervisor.secureio import (
 )
 from review_supervisor.wire import receive_record, send_blob, send_record, socket_pair
 
-from tests.support import owned_temporary_directory
+from tests.support import bind_attempt_state, owned_temporary_directory
 
 
 ENTRYPOINT = (
     pathlib.Path(__file__).resolve().parent.parent / "independent-codex-pr-review"
 )
+
+
+def _fake_attempt(path: pathlib.Path = pathlib.Path("/attempt")) -> SimpleNamespace:
+    return SimpleNamespace(
+        path=path,
+        fd=-1,
+        retention=SimpleNamespace(fd=-1, root_fd=-1),
+        revalidate=mock.Mock(),
+        transfer_binding=mock.Mock(return_value={"fixture": True}),
+    )
 
 
 def _tracked_blob(path: bytes, content: bytes, object_number: int) -> TreeEntry:
@@ -130,6 +145,7 @@ class RuntimeHelperTests(unittest.TestCase):
                 "type": "worktree-created",
                 "token": token,
                 "registration": {"synthetic": True},
+                "state_sha256": "worker-digest",
             },
             {
                 "type": "index-initialized",
@@ -150,7 +166,31 @@ class RuntimeHelperTests(unittest.TestCase):
         def commit(**kwargs: object) -> tuple[dict[str, object], str]:
             next_state = dict(kwargs["state"])
             next_state.update(kwargs["updates"])
+            next_state["record_generation"] = (
+                int(next_state.get("record_generation", 0)) + 1
+            )
+            next_state["previous_record_sha256"] = kwargs["state_digest"]
             return next_state, "next-digest"
+
+        initial_state = {
+            "record_generation": 1,
+            "worktree_path": "/tmp/review-worktree",
+            "common_git_dir_binding": {"path": "/tmp/repository.git"},
+        }
+        durable_worker_state = {
+            **initial_state,
+            "record_generation": 3,
+            "previous_record_sha256": "next-digest",
+            "phase": "worktree-adding",
+            "worktree_status": "active",
+            "worktree_create_intent": {
+                "version": 1,
+                "worktree": "/tmp/review-worktree",
+                "registration_parent": "/tmp/repository.git/worktrees",
+                "lock_reason": f"independent-codex-pr-review:{token}",
+            },
+            "registration": {"synthetic": True},
+        }
 
         with (
             mock.patch(
@@ -174,6 +214,7 @@ class RuntimeHelperTests(unittest.TestCase):
                 "review_supervisor.runtime.commit_via_helper",
                 side_effect=commit,
             ),
+            mock.patch("review_supervisor.runtime._authenticate_attempt_transfer"),
             mock.patch(
                 "review_supervisor.runtime._registration",
                 return_value=registration,
@@ -182,6 +223,10 @@ class RuntimeHelperTests(unittest.TestCase):
                 "review_supervisor.runtime._registration_json",
                 return_value={"synthetic": True},
             ),
+            mock.patch(
+                "review_supervisor.runtime.read_bound_attempt_state",
+                return_value=(durable_worker_state, b"{}", "worker-digest"),
+            ),
             mock.patch("review_supervisor.runtime.wait_terminal") as wait_terminal,
             mock.patch("review_supervisor.runtime.reap", return_value=1) as reap,
             mock.patch("review_supervisor.runtime._terminate_group") as terminate,
@@ -189,10 +234,9 @@ class RuntimeHelperTests(unittest.TestCase):
         ):
             _run_checkout(
                 entrypoint=ENTRYPOINT,
-                attempt_dir=ENTRYPOINT.parent,
-                lease_fd=-1,
+                attempt=_fake_attempt(ENTRYPOINT.parent),
                 outer=mock.Mock(),
-                state={},
+                state=initial_state,
                 state_digest="initial-digest",
                 source_fd=-1,
             )
@@ -361,8 +405,7 @@ class RuntimeHelperTests(unittest.TestCase):
 
         lifecycle = DurableProcessLifecycle(
             entrypoint=ENTRYPOINT,
-            attempt_dir=pathlib.Path("/attempt"),
-            lease_fd=3,
+            attempt=_fake_attempt(),
             state={
                 "phase": "validating",
                 "launch_status": "not-attempted",
@@ -415,8 +458,7 @@ class RuntimeHelperTests(unittest.TestCase):
     def test_durable_process_lifecycle_rejects_an_unclosed_predecessor(self) -> None:
         lifecycle = DurableProcessLifecycle(
             entrypoint=ENTRYPOINT,
-            attempt_dir=pathlib.Path("/attempt"),
-            lease_fd=3,
+            attempt=_fake_attempt(),
             state={
                 "phase": "launched",
                 "launch_status": "launched",
@@ -448,8 +490,7 @@ class RuntimeHelperTests(unittest.TestCase):
         }
         lifecycle = DurableProcessLifecycle(
             entrypoint=ENTRYPOINT,
-            attempt_dir=pathlib.Path("/attempt"),
-            lease_fd=3,
+            attempt=_fake_attempt(),
             state={
                 "phase": "validating",
                 "launch_status": "completed",
@@ -510,8 +551,82 @@ class RuntimeHelperTests(unittest.TestCase):
             self.assertFalse(destination.exists())
             self.assertEqual(tuple(root.iterdir()), ())
 
+    def test_directory_inventory_accepts_child_churn_but_rejects_replacement(
+        self,
+    ) -> None:
+        original_open = os.open
+        with owned_temporary_directory("runtime-directory-churn-") as root:
+            inventory = root / "inventory"
+            inventory.mkdir(mode=0o700)
+            child = inventory / "child"
+            child.mkdir(mode=0o700)
+            root_fd = original_open(inventory, os.O_RDONLY | os.O_DIRECTORY)
+            churned = False
+
+            def open_after_child_churn(
+                path: bytes | str,
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal churned
+                if path == b"child" and not churned:
+                    churned = True
+                    (child / "materialized").mkdir(mode=0o700)
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            try:
+                with mock.patch(
+                    "review_supervisor.secureio.os.open",
+                    side_effect=open_after_child_churn,
+                ):
+                    self.assertGreaterEqual(allocated_bytes_fd(root_fd), 0)
+            finally:
+                os.close(root_fd)
+            self.assertTrue(churned)
+
+        with owned_temporary_directory("runtime-directory-replacement-") as root:
+            inventory = root / "inventory"
+            inventory.mkdir(mode=0o700)
+            child = inventory / "child"
+            child.mkdir(mode=0o700)
+            moved = root / "original-child"
+            root_fd = original_open(inventory, os.O_RDONLY | os.O_DIRECTORY)
+            replaced = False
+
+            def open_after_child_replacement(
+                path: bytes | str,
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal replaced
+                if path == b"child" and not replaced:
+                    replaced = True
+                    child.rename(moved)
+                    child.mkdir(mode=0o700)
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            try:
+                with (
+                    mock.patch(
+                        "review_supervisor.secureio.os.open",
+                        side_effect=open_after_child_replacement,
+                    ),
+                    self.assertRaisesRegex(OSError, "identity changed"),
+                ):
+                    allocated_bytes_fd(root_fd)
+            finally:
+                os.close(root_fd)
+            self.assertTrue(replaced)
+
     def test_terminal_review_is_authorized_before_classification_commit(self) -> None:
         with owned_temporary_directory("terminal-review-") as attempt:
+            attempt_fd = os.open(attempt, os.O_RDONLY | os.O_DIRECTORY)
+            attempt_lease = _fake_attempt(attempt)
+            attempt_lease.fd = attempt_fd
             outer, peer = socket_pair()
             predecessor = {"phase": "launched"}
             authorization_pending = {
@@ -547,8 +662,7 @@ class RuntimeHelperTests(unittest.TestCase):
                 ):
                     state, digest = publish_terminal_review(
                         entrypoint=ENTRYPOINT,
-                        attempt_dir=attempt,
-                        lease_fd=3,
+                        attempt=attempt_lease,
                         outer=outer,
                         state=predecessor,
                         state_digest="predecessor-digest",
@@ -560,6 +674,7 @@ class RuntimeHelperTests(unittest.TestCase):
             finally:
                 outer.close()
                 peer.close()
+                os.close(attempt_fd)
 
             self.assertEqual((state, digest), (completed, "completed-digest"))
             first_updates = commits.call_args_list[0].kwargs["updates"]
@@ -603,8 +718,7 @@ class RuntimeHelperTests(unittest.TestCase):
         ) as commit:
             _record_failure(
                 entrypoint=ENTRYPOINT,
-                attempt_dir=pathlib.Path("/unused"),
-                lease_fd=3,
+                attempt=_fake_attempt(pathlib.Path("/unused")),
                 state=state,
                 state_digest="previous-digest",
                 error=error,
@@ -627,8 +741,7 @@ class RuntimeHelperTests(unittest.TestCase):
         ) as commit:
             _record_failure(
                 entrypoint=ENTRYPOINT,
-                attempt_dir=pathlib.Path("/unused"),
-                lease_fd=3,
+                attempt=_fake_attempt(pathlib.Path("/unused")),
                 state=state,
                 state_digest="previous-digest",
                 error=PrelaunchWorkerClosureUnproven("uncertain"),
@@ -655,6 +768,11 @@ class RuntimeHelperTests(unittest.TestCase):
                 "previous_record_sha256": None,
                 "phase": "validating",
             }
+            bind_attempt_state(
+                state,
+                retention_root=retention,
+                attempt_dir=attempt,
+            )
             (attempt / "state.json").write_bytes(canonical_json(state))
             (attempt / "state.json").chmod(0o600)
             state, _, digest = read_attempt_state(attempt)
@@ -662,6 +780,7 @@ class RuntimeHelperTests(unittest.TestCase):
                 retention,
                 deadline=time.monotonic() + 5,
             ) as lease:
+                attempt_lease = open_attempt_lease(lease, attempt)
                 for field, value in {
                     "terminal_commit_authorized": True,
                     "terminal_authorization": {},
@@ -678,13 +797,13 @@ class RuntimeHelperTests(unittest.TestCase):
                     ):
                         commit_via_helper(
                             entrypoint=ENTRYPOINT,
-                            attempt_dir=attempt,
-                            lease_fd=lease.fd,
+                            attempt=attempt_lease,
                             state=state,
                             state_digest=digest,
                             updates={field: value},
                             deadline=time.monotonic() + 10,
                         )
+                attempt_lease.close()
 
     def test_phase_helper_rejects_boot_id_and_two_stage_phase_forgery(self) -> None:
         with owned_temporary_directory("phase-transition-forgery-") as root:
@@ -701,6 +820,11 @@ class RuntimeHelperTests(unittest.TestCase):
                 "previous_record_sha256": None,
                 "phase": "validating",
             }
+            bind_attempt_state(
+                state,
+                retention_root=retention,
+                attempt_dir=attempt,
+            )
             (attempt / "state.json").write_bytes(canonical_json(state))
             (attempt / "state.json").chmod(0o600)
             state, _, digest = read_attempt_state(attempt)
@@ -713,11 +837,11 @@ class RuntimeHelperTests(unittest.TestCase):
                 retention,
                 deadline=time.monotonic() + 5,
             ) as lease:
+                attempt_lease = open_attempt_lease(lease, attempt)
                 with self.assertRaisesRegex(ValueError, "not allowlisted"):
                     commit_via_helper(
                         entrypoint=ENTRYPOINT,
-                        attempt_dir=attempt,
-                        lease_fd=lease.fd,
+                        attempt=attempt_lease,
                         state=state,
                         state_digest=digest,
                         updates={"boot_id": "forged-boot"},
@@ -725,8 +849,7 @@ class RuntimeHelperTests(unittest.TestCase):
                     )
                 state, digest = commit_via_helper(
                     entrypoint=ENTRYPOINT,
-                    attempt_dir=attempt,
-                    lease_fd=lease.fd,
+                    attempt=attempt_lease,
                     state=state,
                     state_digest=digest,
                     updates={
@@ -748,8 +871,7 @@ class RuntimeHelperTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "not allowlisted"):
                     commit_via_helper(
                         entrypoint=ENTRYPOINT,
-                        attempt_dir=attempt,
-                        lease_fd=lease.fd,
+                        attempt=attempt_lease,
                         state=state,
                         state_digest=digest,
                         updates={
@@ -769,6 +891,7 @@ class RuntimeHelperTests(unittest.TestCase):
                         },
                         deadline=time.monotonic() + 10,
                     )
+                attempt_lease.close()
             durable, _, durable_digest = read_attempt_state(attempt)
             self.assertEqual(durable, state)
             self.assertEqual(durable_digest, digest)
@@ -790,6 +913,11 @@ class RuntimeHelperTests(unittest.TestCase):
                 "phase": "prelaunch-aborted",
                 "closure": "unproven",
             }
+            bind_attempt_state(
+                state,
+                retention_root=retention,
+                attempt_dir=attempt,
+            )
             (attempt / "state.json").write_bytes(canonical_json(state))
             (attempt / "state.json").chmod(0o600)
             state, _, digest = read_attempt_state(attempt)
@@ -797,15 +925,15 @@ class RuntimeHelperTests(unittest.TestCase):
                 retention,
                 deadline=time.monotonic() + 5,
             ) as lease:
-                with self.assertRaisesRegex(ValueError, "proven process closure"):
-                    settle_process_via_helper(
-                        entrypoint=ENTRYPOINT,
-                        attempt_dir=attempt,
-                        lease_fd=lease.fd,
-                        state=state,
-                        state_digest=digest,
-                        deadline=time.monotonic() + 10,
-                    )
+                with open_attempt_lease(lease, attempt) as attempt_lease:
+                    with self.assertRaisesRegex(ValueError, "proven process closure"):
+                        settle_process_via_helper(
+                            entrypoint=ENTRYPOINT,
+                            attempt=attempt_lease,
+                            state=state,
+                            state_digest=digest,
+                            deadline=time.monotonic() + 10,
+                        )
 
     def test_final_authorization_commit_rejects_a_live_supervisor(self) -> None:
         with owned_temporary_directory("final-auth-live-supervisor-") as attempt:
@@ -827,7 +955,7 @@ class RuntimeHelperTests(unittest.TestCase):
             }
             with self.assertRaisesRegex(ValueError, "still live"):
                 _validate_final_authorization_updates(
-                    attempt_dir=attempt,
+                    attempt=_fake_attempt(attempt),
                     state=state,
                     state_digest="a" * 64,
                     updates={
@@ -884,7 +1012,7 @@ class RuntimeHelperTests(unittest.TestCase):
             }
             with self.assertRaisesRegex(ValueError, "process history"):
                 _validate_final_authorization_updates(
-                    attempt_dir=attempt,
+                    attempt=_fake_attempt(attempt),
                     state=state,
                     state_digest="a" * 64,
                     updates={
@@ -1177,8 +1305,7 @@ class RuntimeHelperTests(unittest.TestCase):
                 ):
                     completed, digest, final_text = run_reviewer(
                         entrypoint=ENTRYPOINT,
-                        attempt_dir=root,
-                        lease_fd=3,
+                        attempt=_fake_attempt(root),
                         outer=outer,
                         state=state,
                         state_digest="digest",
@@ -1191,8 +1318,7 @@ class RuntimeHelperTests(unittest.TestCase):
                         with self.assertRaises(SupervisorError) as raised:
                             run_reviewer(
                                 entrypoint=ENTRYPOINT,
-                                attempt_dir=root,
-                                lease_fd=3,
+                                attempt=_fake_attempt(root),
                                 outer=tampered_outer,
                                 state=state,
                                 state_digest="digest",
@@ -1288,6 +1414,11 @@ class RuntimeHelperTests(unittest.TestCase):
                 "prompt_sha256": sha256_bytes(prompt),
                 "prompt_identity": identity.to_json(),
             }
+            bind_attempt_state(
+                state,
+                retention_root=retention,
+                attempt_dir=attempt,
+            )
             state_path = attempt / "state.json"
             state_path.write_bytes(canonical_json(state))
             state_path.chmod(0o600)
@@ -1296,24 +1427,23 @@ class RuntimeHelperTests(unittest.TestCase):
                 retention,
                 deadline=time.monotonic() + 5,
             ) as lease:
-                verify_prompt_via_helper(
-                    entrypoint=ENTRYPOINT,
-                    attempt_dir=attempt,
-                    lease_fd=lease.fd,
-                    state_digest=digest,
-                    prompt=prompt,
-                    deadline=time.monotonic() + 10,
-                )
-                prompt_path.write_bytes(b"tampered exact prompt")
-                with self.assertRaises(ValueError):
+                with open_attempt_lease(lease, attempt) as attempt_lease:
                     verify_prompt_via_helper(
                         entrypoint=ENTRYPOINT,
-                        attempt_dir=attempt,
-                        lease_fd=lease.fd,
+                        attempt=attempt_lease,
                         state_digest=digest,
                         prompt=prompt,
                         deadline=time.monotonic() + 10,
                     )
+                    prompt_path.write_bytes(b"tampered exact prompt")
+                    with self.assertRaises(ValueError):
+                        verify_prompt_via_helper(
+                            entrypoint=ENTRYPOINT,
+                            attempt=attempt_lease,
+                            state_digest=digest,
+                            prompt=prompt,
+                            deadline=time.monotonic() + 10,
+                        )
 
     def test_terminal_authorizer_performs_its_own_exact_final_readback(self) -> None:
         with owned_temporary_directory("terminal-authorizer-") as root:
@@ -1340,6 +1470,11 @@ class RuntimeHelperTests(unittest.TestCase):
                 "record_generation": 1,
                 "previous_record_sha256": None,
             }
+            bind_attempt_state(
+                state,
+                retention_root=retention,
+                attempt_dir=attempt,
+            )
             state_path = attempt / "state.json"
             state_path.write_bytes(canonical_json(state))
             state_path.chmod(0o600)
@@ -1350,17 +1485,17 @@ class RuntimeHelperTests(unittest.TestCase):
                     retention,
                     deadline=time.monotonic() + 5,
                 ) as lease:
-                    authorized, _ = authorize_terminal_via_helper(
-                        entrypoint=ENTRYPOINT,
-                        attempt_dir=attempt,
-                        lease_fd=lease.fd,
-                        outer=outer,
-                        state=state,
-                        state_digest=digest,
-                        leader_exit=0,
-                        final_seal=final_seal,
-                        deadline=time.monotonic() + 10,
-                    )
+                    with open_attempt_lease(lease, attempt) as attempt_lease:
+                        authorized, _ = authorize_terminal_via_helper(
+                            entrypoint=ENTRYPOINT,
+                            attempt=attempt_lease,
+                            outer=outer,
+                            state=state,
+                            state_digest=digest,
+                            leader_exit=0,
+                            final_seal=final_seal,
+                            deadline=time.monotonic() + 10,
+                        )
                 authorization = authorized["terminal_authorization"]
                 self.assertEqual(
                     set(authorization),
@@ -1398,6 +1533,11 @@ class RuntimeHelperTests(unittest.TestCase):
                 "record_generation": 1,
                 "previous_record_sha256": None,
             }
+            bind_attempt_state(
+                tampered_state,
+                retention_root=retention,
+                attempt_dir=tampered_attempt,
+            )
             tampered_state_path = tampered_attempt / "state.json"
             tampered_state_path.write_bytes(canonical_json(tampered_state))
             tampered_state_path.chmod(0o600)
@@ -1409,18 +1549,20 @@ class RuntimeHelperTests(unittest.TestCase):
                     retention,
                     deadline=time.monotonic() + 5,
                 ) as lease:
-                    with self.assertRaises(OuterAbandoned):
-                        authorize_terminal_via_helper(
-                            entrypoint=ENTRYPOINT,
-                            attempt_dir=tampered_attempt,
-                            lease_fd=lease.fd,
-                            outer=outer,
-                            state=tampered_state,
-                            state_digest=tampered_digest,
-                            leader_exit=0,
-                            final_seal=tampered_seal,
-                            deadline=time.monotonic() + 10,
-                        )
+                    with open_attempt_lease(
+                        lease, tampered_attempt
+                    ) as tampered_lease:
+                        with self.assertRaises(OuterAbandoned):
+                            authorize_terminal_via_helper(
+                                entrypoint=ENTRYPOINT,
+                                attempt=tampered_lease,
+                                outer=outer,
+                                state=tampered_state,
+                                state_digest=tampered_digest,
+                                leader_exit=0,
+                                final_seal=tampered_seal,
+                                deadline=time.monotonic() + 10,
+                            )
             finally:
                 outer.close()
                 peer.close()
@@ -1473,6 +1615,11 @@ class RuntimeHelperTests(unittest.TestCase):
                     },
                     "helper_custody": {},
                 }
+                bind_attempt_state(
+                    state,
+                    retention_root=root,
+                    attempt_dir=attempt,
+                )
                 state_path = attempt / "state.json"
                 state_path.write_bytes(canonical_json(state))
                 state_path.chmod(0o600)
@@ -1482,7 +1629,11 @@ class RuntimeHelperTests(unittest.TestCase):
                 source_path.write_bytes(b"diff")
                 cleanup_fd = os.open(cleanup_path, os.O_RDONLY | os.O_CLOEXEC)
                 source_fd = os.open(source_path, os.O_RDONLY | os.O_CLOEXEC)
-                lease_fd = os.open(root / "lease", os.O_RDWR | os.O_CREAT, 0o600)
+                lease = acquire_retention_lease(
+                    root,
+                    deadline=time.monotonic() + 5,
+                )
+                attempt_lease = open_attempt_lease(lease, attempt)
                 outer, peer = socket_pair()
                 checkout = mock.Mock(side_effect=checkout_error)
                 record_failure = mock.Mock(
@@ -1528,6 +1679,15 @@ class RuntimeHelperTests(unittest.TestCase):
 
                 driver = threading.Thread(target=drive_outer)
                 try:
+                    send_record(
+                        peer,
+                        {
+                            "type": "attempt-lease-offer",
+                            "token": token,
+                            "binding": attempt_lease.transfer_binding(),
+                        },
+                        deadline=time.monotonic() + 5,
+                    )
                     send_record(
                         peer,
                         {
@@ -1594,7 +1754,9 @@ class RuntimeHelperTests(unittest.TestCase):
                             entrypoint=ENTRYPOINT,
                             attempt_dir=attempt,
                             control_fd=os.dup(outer.fileno()),
-                            lease_fd=os.dup(lease_fd),
+                            lease_fd=os.dup(lease.fd),
+                            root_fd=os.dup(lease.root_fd),
+                            attempt_fd=os.dup(attempt_lease.fd),
                             handoff_token=token,
                         )
                     self.assertEqual(result, 2)
@@ -1607,7 +1769,8 @@ class RuntimeHelperTests(unittest.TestCase):
                     outer.close()
                     os.close(cleanup_fd)
                     os.close(source_fd)
-                    os.close(lease_fd)
+                    attempt_lease.close()
+                    lease.close()
                 self.assertFalse(driver.is_alive())
                 if thread_errors:
                     raise thread_errors[0]

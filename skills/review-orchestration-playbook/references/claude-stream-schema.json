@@ -339,7 +339,12 @@
                   "legacy-base": {},
                   "extended-2x": {
                     "diagnostics": {
-                      "rule": "null",
+                      "rule": "null_or_exact_object",
+                      "object": {
+                        "cache_miss_reason": {
+                          "type": "unavailable"
+                        }
+                      },
                       "failure": "inconclusive"
                     }
                   }

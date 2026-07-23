@@ -50,6 +50,7 @@ from .gitraw import (
     WorktreeRegistration,
     add_detached_worktree,
     enumerate_registration,
+    enumerate_registration_fd,
     enumerate_tree,
     initialize_index,
     inspect_repository,
@@ -58,7 +59,12 @@ from .gitraw import (
     retry_git_process_closure,
     verify_worktree_absent,
 )
-from .ledger import commit_state, read_attempt_state
+from .ledger import (
+    AttemptLease,
+    accept_attempt_lease_transfer,
+    commit_state,
+    read_bound_attempt_state,
+)
 from .models import HelperCustody, Identity, TreeEntry, TreeManifest
 from .no_child_profile import LaunchedNoChildProcess
 from .process import (
@@ -87,13 +93,16 @@ from .recovery_cleanup import (
 )
 from .secureio import (
     allocated_bytes,
+    allocated_bytes_fd,
     canonical_json,
     directory_identities_match,
     identity_from_stat,
-    measure_filesystem,
+    measure_filesystem_fd,
     open_absolute_directory_chain,
+    open_regular_at,
     open_regular_nofollow,
     publish_bytes,
+    publish_bytes_at,
     read_fd_exact,
     sha256_bytes,
     fsync_directory,
@@ -117,6 +126,9 @@ from .wire import (
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _HANDOFF_TOKEN_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+_WORKTREE_LOCK_REASON_PATTERN = re.compile(
+    r"independent-codex-pr-review:[0-9a-f]{64}\Z"
+)
 _IDENTITY_KEYS = frozenset({"device", "inode", "mode", "link_count", "uid", "size"})
 _FINAL_AUTHORIZATION_KEYS = frozenset(
     {
@@ -199,7 +211,7 @@ _ORDINARY_PHASE_TRANSITIONS = (
     _transition(
         {"reserved"},
         "worktree-adding",
-        {"phase", "worktree_status"},
+        {"phase", "worktree_create_intent", "worktree_status"},
     ),
     _transition(
         {"worktree-adding"},
@@ -523,8 +535,7 @@ def _custody(value: dict[str, Any]) -> HelperCustody:
 @dataclass
 class DurableProcessLifecycle:
     entrypoint: pathlib.Path
-    attempt_dir: pathlib.Path
-    lease_fd: int
+    attempt: AttemptLease
     state: dict[str, Any]
     state_digest: str
 
@@ -533,8 +544,7 @@ class DurableProcessLifecycle:
         self._validate_begin_predecessor(stage)
         self.state, self.state_digest = commit_via_helper(
             entrypoint=self.entrypoint,
-            attempt_dir=self.attempt_dir,
-            lease_fd=self.lease_fd,
+            attempt=self.attempt,
             state=self.state,
             state_digest=self.state_digest,
             updates={
@@ -568,8 +578,7 @@ class DurableProcessLifecycle:
         }
         self.state, self.state_digest = commit_via_helper(
             entrypoint=self.entrypoint,
-            attempt_dir=self.attempt_dir,
-            lease_fd=self.lease_fd,
+            attempt=self.attempt,
             state=self.state,
             state_digest=self.state_digest,
             updates={
@@ -620,8 +629,7 @@ class DurableProcessLifecycle:
         ]
         self.state, self.state_digest = commit_via_helper(
             entrypoint=self.entrypoint,
-            attempt_dir=self.attempt_dir,
-            lease_fd=self.lease_fd,
+            attempt=self.attempt,
             state=self.state,
             state_digest=self.state_digest,
             updates={
@@ -726,6 +734,188 @@ def _registration_json(value: WorktreeRegistration) -> dict[str, Any]:
     }
 
 
+def _worktree_create_intent(state: dict[str, Any]) -> dict[str, Any]:
+    value = state.get("worktree_create_intent")
+    expected_keys = {
+        "version",
+        "worktree",
+        "registration_parent",
+        "lock_reason",
+    }
+    common_binding = state.get("common_git_dir_binding")
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected_keys
+        or value.get("version") != 1
+        or value.get("worktree") != state.get("worktree_path")
+        or not isinstance(common_binding, dict)
+        or value.get("registration_parent")
+        != str(pathlib.Path(common_binding.get("path", "")) / "worktrees")
+        or not isinstance(value.get("lock_reason"), str)
+        or _WORKTREE_LOCK_REASON_PATTERN.fullmatch(value["lock_reason"]) is None
+    ):
+        raise ValueError("durable worktree creation intent is malformed")
+    return value
+
+
+def _read_git_metadata_at(
+    parent_fd: int,
+    name: bytes,
+    *,
+    max_bytes: int,
+) -> tuple[bytes, Identity]:
+    descriptor, identity = open_regular_at(
+        parent_fd,
+        name,
+        expected_uid=os.getuid(),
+        private_metadata=True,
+    )
+    try:
+        return (
+            read_fd_exact(
+                descriptor,
+                max_bytes=max_bytes,
+                expected_size=identity.size,
+            ),
+            identity,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _recover_create_in_progress_registration(
+    *,
+    state: dict[str, Any],
+    checkout_parent_fd: int,
+    common_git_fd: int,
+) -> WorktreeRegistration | None:
+    intent = _worktree_create_intent(state)
+    worktree = pathlib.Path(intent["worktree"])
+    common_git_dir = pathlib.Path(state["common_git_dir_binding"]["path"])
+    worktree_name = os.fsencode(worktree.name)
+    try:
+        worktree_metadata = os.stat(
+            worktree_name,
+            dir_fd=checkout_parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+    worktree_identity = identity_from_stat(worktree_metadata)
+    if not stat.S_ISDIR(worktree_identity.mode) or worktree_identity.uid != os.getuid():
+        raise ValueError("create-in-progress worktree entry is unsafe")
+    worktree_fd = os.open(
+        worktree_name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=checkout_parent_fd,
+    )
+    registration_parent_fd: int | None = None
+    registration_fd: int | None = None
+    try:
+        if not directory_identities_match(
+            identity_from_stat(os.fstat(worktree_fd)), worktree_identity
+        ):
+            raise ValueError("create-in-progress worktree identity changed")
+        marker, marker_identity = _read_git_metadata_at(
+            worktree_fd,
+            b".git",
+            max_bytes=4096,
+        )
+        if (
+            not marker.startswith(b"gitdir: ")
+            or not marker.endswith(b"\n")
+            or marker.count(b"\n") != 1
+        ):
+            raise ValueError("create-in-progress worktree marker is malformed")
+        registration = pathlib.Path(os.fsdecode(marker[len(b"gitdir: ") : -1]))
+        expected_parent = pathlib.Path(intent["registration_parent"])
+        if (
+            not registration.is_absolute()
+            or registration.parent != expected_parent
+            or not registration.name
+            or registration.name in {".", ".."}
+        ):
+            raise ValueError("create-in-progress registration escaped its binding")
+        registration_parent_fd = os.open(
+            b"worktrees",
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=common_git_fd,
+        )
+        registration_name = os.fsencode(registration.name)
+        registration_metadata = os.stat(
+            registration_name,
+            dir_fd=registration_parent_fd,
+            follow_symlinks=False,
+        )
+        registration_identity = identity_from_stat(registration_metadata)
+        if (
+            not stat.S_ISDIR(registration_identity.mode)
+            or registration_identity.uid != os.getuid()
+        ):
+            raise ValueError("create-in-progress registration entry is unsafe")
+        registration_fd = os.open(
+            registration_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=registration_parent_fd,
+        )
+        if not directory_identities_match(
+            identity_from_stat(os.fstat(registration_fd)), registration_identity
+        ):
+            raise ValueError("create-in-progress registration identity changed")
+        gitdir, _ = _read_git_metadata_at(
+            registration_fd,
+            b"gitdir",
+            max_bytes=4096,
+        )
+        if gitdir != os.fsencode(worktree / ".git") + b"\n":
+            raise ValueError("create-in-progress registration backlink is invalid")
+        locked, _ = _read_git_metadata_at(
+            registration_fd,
+            b"locked",
+            max_bytes=513,
+        )
+        if locked != intent["lock_reason"].encode("utf-8") + b"\n":
+            raise ValueError("create-in-progress lock authentication failed")
+        count, path_bytes = enumerate_registration_fd(registration_fd)
+        if not directory_identities_match(
+            identity_from_stat(
+                os.stat(
+                    registration_name,
+                    dir_fd=registration_parent_fd,
+                    follow_symlinks=False,
+                )
+            ),
+            registration_identity,
+        ) or not directory_identities_match(
+            identity_from_stat(
+                os.stat(
+                    worktree_name,
+                    dir_fd=checkout_parent_fd,
+                    follow_symlinks=False,
+                )
+            ),
+            worktree_identity,
+        ):
+            raise ValueError("create-in-progress binding changed during recovery")
+        if registration.parent != common_git_dir / "worktrees":
+            raise ValueError("create-in-progress registration parent changed")
+        return WorktreeRegistration(
+            worktree=worktree,
+            registration=registration,
+            worktree_identity=worktree_identity,
+            registration_identity=registration_identity,
+            marker_identity=marker_identity,
+            descendant_count=count,
+            descendant_path_bytes=path_bytes,
+        )
+    finally:
+        if registration_fd is not None:
+            os.close(registration_fd)
+        if registration_parent_fd is not None:
+            os.close(registration_parent_fd)
+        os.close(worktree_fd)
+
+
 class DirectProcessClosureUnproven(UnprovenDirectHelperClosure):
     def __init__(self, process: SpawnedProcess) -> None:
         self.process = process
@@ -826,9 +1016,81 @@ def _spawn_internal(
         os.close(devnull)
 
 
+def _authenticate_attempt_transfer(
+    *,
+    control: socket.socket,
+    process: SpawnedProcess,
+    attempt: AttemptLease,
+    token: str,
+    ready_type: str,
+    deadline: float,
+    ready_extra: dict[str, Any] | None = None,
+) -> None:
+    binding = attempt.transfer_binding()
+    binding_sha256 = sha256_bytes(canonical_json(binding))
+    send_record(
+        control,
+        {
+            "type": "attempt-lease-offer",
+            "token": token,
+            "binding": binding,
+        },
+        deadline=deadline,
+    )
+    ready, _ = receive_record(control, deadline=deadline)
+    if ready != {
+        "type": ready_type,
+        "token": token,
+        "pid": process.pid,
+        "binding_sha256": binding_sha256,
+        **(ready_extra or {}),
+    }:
+        raise ValueError("attempt lease transfer acknowledgement is invalid")
+    attempt.revalidate()
+
+
+def _accept_attempt_transfer(
+    *,
+    control: socket.socket,
+    lease_fd: int,
+    root_fd: int,
+    attempt_fd: int,
+    token: str,
+    ready_type: str,
+    deadline: float,
+    ready_extra: dict[str, Any] | None = None,
+) -> AttemptLease:
+    offer, _ = receive_record(control, deadline=deadline)
+    if (
+        offer.get("type") != "attempt-lease-offer"
+        or offer.get("token") != token
+    ):
+        raise ValueError("attempt lease transfer offer is invalid")
+    binding = offer.get("binding")
+    attempt = accept_attempt_lease_transfer(
+        lease_fd=lease_fd,
+        root_fd=root_fd,
+        attempt_fd=attempt_fd,
+        binding=binding,
+    )
+    read_bound_attempt_state(attempt)
+    send_record(
+        control,
+        {
+            "type": ready_type,
+            "token": token,
+            "pid": os.getpid(),
+            "binding_sha256": sha256_bytes(canonical_json(binding)),
+            **(ready_extra or {}),
+        },
+        deadline=deadline,
+    )
+    return attempt
+
+
 def _validate_ordinary_phase_updates(
     *,
-    attempt_dir: pathlib.Path,
+    attempt: AttemptLease,
     state: dict[str, Any],
     state_digest: str,
     updates: dict[str, Any],
@@ -910,7 +1172,7 @@ def _validate_ordinary_phase_updates(
         if current_rewrite is None:
             operation = rewrite.get("operation") if isinstance(rewrite, dict) else None
             expected_rewrite = build_final_authorization_rewrite(
-                attempt_dir=attempt_dir,
+                attempt=attempt,
                 state=state,
                 state_digest=state_digest,
                 operation=operation,
@@ -928,7 +1190,7 @@ def _validate_ordinary_phase_updates(
                     rewrite.get("operation") if isinstance(rewrite, dict) else None
                 )
                 expected_rewrite = build_final_authorization_rewrite(
-                    attempt_dir=attempt_dir,
+                    attempt=attempt,
                     state=state,
                     state_digest=state_digest,
                     operation=operation,
@@ -1297,10 +1559,11 @@ def _validate_terminal_lifecycle(
 
 def _validate_final_authorization_record(
     *,
-    attempt_dir: pathlib.Path,
+    attempt: AttemptLease,
     state: dict[str, Any],
 ) -> dict[str, Any]:
-    handoff_token = _validate_terminal_lifecycle(attempt_dir, state)
+    attempt.revalidate(state)
+    handoff_token = _validate_terminal_lifecycle(attempt.path, state)
     authorization = state.get("final_authorization")
     generation = state.get("record_generation")
     if (
@@ -1324,8 +1587,10 @@ def _validate_final_authorization_record(
     }
     if authorization.get("binding_sha256") != sha256_bytes(canonical_json(payload)):
         raise ValueError("existing final authorization digest is invalid")
-    measured = allocated_bytes(attempt_dir, entry_cap=1_000)
-    filesystem_identity = measure_filesystem(attempt_dir).identity
+    measured = allocated_bytes_fd(attempt.fd, entry_cap=1_000)
+    attempt.revalidate(state)
+    filesystem_identity = measure_filesystem_fd(attempt.fd).identity
+    attempt.revalidate(state)
     expected_physical = {filesystem_identity: measured} if measured else {}
     if (
         state.get("retained_process_bytes") != measured
@@ -1337,7 +1602,7 @@ def _validate_final_authorization_record(
 
 def build_final_authorization_rewrite(
     *,
-    attempt_dir: pathlib.Path,
+    attempt: AttemptLease,
     state: dict[str, Any],
     state_digest: str,
     operation: Any,
@@ -1358,7 +1623,7 @@ def build_final_authorization_rewrite(
     source_authorization: dict[str, Any] | None = None
     if authorization_required:
         source_authorization = _validate_final_authorization_record(
-            attempt_dir=attempt_dir,
+            attempt=attempt,
             state=state,
         )
     elif state.get("final_authorization") is not None:
@@ -1466,7 +1731,7 @@ def complete_final_authorization_rewrite(
 
 def _validate_final_authorization_updates(
     *,
-    attempt_dir: pathlib.Path,
+    attempt: AttemptLease,
     state: dict[str, Any],
     state_digest: str,
     updates: dict[str, Any],
@@ -1504,7 +1769,8 @@ def _validate_final_authorization_updates(
             raise ValueError("former attempt supervisor liveness is inconclusive")
     if actual_start == supervisor["start_identity"]:
         raise ValueError("attempt supervisor is still live")
-    handoff_token = _validate_terminal_lifecycle(attempt_dir, state)
+    attempt.revalidate(state)
+    handoff_token = _validate_terminal_lifecycle(attempt.path, state)
     if rewrite is not None:
         validated_rewrite = validate_final_authorization_rewrite(state)
         if updates.get(
@@ -1535,10 +1801,12 @@ def _validate_final_authorization_updates(
     if updates.get("final_authorization") != expected_authorization:
         raise ValueError("final authorization is not bound to its predecessor")
     charge = updates.get("retained_process_bytes")
-    current_allocated = allocated_bytes(attempt_dir, entry_cap=1_000)
+    current_allocated = allocated_bytes_fd(attempt.fd, entry_cap=1_000)
+    attempt.revalidate(state)
     if type(charge) is not int or charge != current_allocated:
         raise ValueError("final authorization process charge is invalid")
-    filesystem_identity = measure_filesystem(attempt_dir).identity
+    filesystem_identity = measure_filesystem_fd(attempt.fd).identity
+    attempt.revalidate(state)
     expected_physical = {filesystem_identity: charge} if charge else {}
     if updates.get("process_physical_remaining_by_fs") != expected_physical:
         raise ValueError("final authorization physical charge is invalid")
@@ -1549,16 +1817,26 @@ def phase_helper_main(
     attempt_dir: pathlib.Path,
     control_fd: int,
     lease_fd: int,
+    root_fd: int,
+    attempt_fd: int,
     token: str,
 ) -> int:
     control = socket.socket(fileno=control_fd)
+    attempt: AttemptLease | None = None
+    descriptors_owned = True
     try:
-        fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        send_record(
-            control,
-            {"type": "phase-helper-ready", "token": token, "pid": os.getpid()},
+        descriptors_owned = False
+        attempt = _accept_attempt_transfer(
+            control=control,
+            lease_fd=lease_fd,
+            root_fd=root_fd,
+            attempt_fd=attempt_fd,
+            token=token,
+            ready_type="phase-helper-ready",
             deadline=time.monotonic() + 5,
         )
+        if attempt.path != attempt_dir:
+            raise ValueError("phase helper attempt path differs from its binding")
         request, _ = receive_record(control, deadline=time.monotonic() + 30)
         request_type = request.get("type")
         if (
@@ -1571,7 +1849,7 @@ def phase_helper_main(
             or request.get("token") != token
         ):
             raise ValueError("phase helper request is invalid")
-        state, _, digest = read_attempt_state(attempt_dir)
+        state, _, digest = read_bound_attempt_state(attempt)
         if digest != request.get("predecessor_sha256"):
             raise ValueError("phase helper predecessor digest mismatch")
         if request_type in {"phase-commit", "final-authorization-commit"}:
@@ -1580,20 +1858,20 @@ def phase_helper_main(
                 raise ValueError("phase helper updates are malformed")
             if request_type == "phase-commit":
                 _validate_ordinary_phase_updates(
-                    attempt_dir=attempt_dir,
+                    attempt=attempt,
                     state=state,
                     state_digest=digest,
                     updates=updates,
                 )
             else:
                 _validate_final_authorization_updates(
-                    attempt_dir=attempt_dir,
+                    attempt=attempt,
                     state=state,
                     state_digest=digest,
                     updates=updates,
                 )
             next_state, next_digest = commit_state(
-                attempt_dir, state, digest, **updates
+                attempt, state, digest, **updates
             )
         else:
             if state.get("closure") not in {
@@ -1602,7 +1880,7 @@ def phase_helper_main(
             }:
                 raise ValueError("process settlement requires proven process closure")
             next_state, next_digest = publish_exact_process_settlement(
-                attempt_dir,
+                attempt,
                 state,
                 digest,
                 deadline=time.monotonic() + 30,
@@ -1640,14 +1918,18 @@ def phase_helper_main(
         return 1
     finally:
         control.close()
-        os.close(lease_fd)
+        if attempt is not None:
+            attempt.close()
+            attempt.retention.close()
+        elif descriptors_owned:
+            for descriptor in (lease_fd, root_fd, attempt_fd):
+                os.close(descriptor)
 
 
 def commit_via_helper(
     *,
     entrypoint: pathlib.Path,
-    attempt_dir: pathlib.Path,
-    lease_fd: int,
+    attempt: AttemptLease,
     state: dict[str, Any],
     state_digest: str,
     updates: dict[str, Any],
@@ -1665,23 +1947,37 @@ def commit_via_helper(
             mode="_phase-helper",
             arguments=(
                 "--attempt-dir",
-                str(attempt_dir),
+                str(attempt.path),
                 "--control-fd",
                 "3",
                 "--lease-fd",
                 "4",
+                "--root-fd",
+                "5",
+                "--attempt-fd",
+                "6",
                 "--token",
                 token,
             ),
-            cwd=attempt_dir,
-            pass_fds=(child.fileno(), lease_fd),
+            cwd=attempt.path,
+            pass_fds=(
+                child.fileno(),
+                attempt.retention.fd,
+                attempt.retention.root_fd,
+                attempt.fd,
+            ),
             own_process_group=False,
         )
         child.close()
         await_exec(process, deadline=deadline)
-        ready, _ = receive_record(parent, deadline=deadline)
-        if ready.get("type") != "phase-helper-ready" or ready.get("token") != token:
-            raise ValueError("phase helper ready record is invalid")
+        _authenticate_attempt_transfer(
+            control=parent,
+            process=process,
+            attempt=attempt,
+            token=token,
+            ready_type="phase-helper-ready",
+            deadline=deadline,
+        )
         send_record(
             parent,
             {
@@ -1710,7 +2006,7 @@ def commit_via_helper(
         next_digest = result.get("state_sha256")
         if not isinstance(next_state, dict) or not isinstance(next_digest, str):
             raise ValueError("phase helper result is malformed")
-        disk_state, _, disk_digest = read_attempt_state(attempt_dir)
+        disk_state, _, disk_digest = read_bound_attempt_state(attempt)
         if disk_state != next_state or disk_digest != next_digest:
             raise ValueError("phase helper result does not match durable state")
         return next_state, next_digest
@@ -1724,8 +2020,7 @@ def commit_via_helper(
 def settle_process_via_helper(
     *,
     entrypoint: pathlib.Path,
-    attempt_dir: pathlib.Path,
-    lease_fd: int,
+    attempt: AttemptLease,
     state: dict[str, Any],
     state_digest: str,
     deadline: float,
@@ -1739,23 +2034,37 @@ def settle_process_via_helper(
             mode="_phase-helper",
             arguments=(
                 "--attempt-dir",
-                str(attempt_dir),
+                str(attempt.path),
                 "--control-fd",
                 "3",
                 "--lease-fd",
                 "4",
+                "--root-fd",
+                "5",
+                "--attempt-fd",
+                "6",
                 "--token",
                 token,
             ),
-            cwd=attempt_dir,
-            pass_fds=(child.fileno(), lease_fd),
+            cwd=attempt.path,
+            pass_fds=(
+                child.fileno(),
+                attempt.retention.fd,
+                attempt.retention.root_fd,
+                attempt.fd,
+            ),
             own_process_group=False,
         )
         child.close()
         await_exec(process, deadline=deadline)
-        ready, _ = receive_record(parent, deadline=deadline)
-        if ready.get("type") != "phase-helper-ready" or ready.get("token") != token:
-            raise ValueError("process settlement helper ready record is invalid")
+        _authenticate_attempt_transfer(
+            control=parent,
+            process=process,
+            attempt=attempt,
+            token=token,
+            ready_type="phase-helper-ready",
+            deadline=deadline,
+        )
         send_record(
             parent,
             {
@@ -1782,7 +2091,7 @@ def settle_process_via_helper(
         next_digest = result.get("state_sha256")
         if not isinstance(next_state, dict) or not isinstance(next_digest, str):
             raise ValueError("process settlement helper result is malformed")
-        disk_state, _, disk_digest = read_attempt_state(attempt_dir)
+        disk_state, _, disk_digest = read_bound_attempt_state(attempt)
         if disk_state != next_state or disk_digest != next_digest:
             raise ValueError("process settlement helper result is not durable")
         return next_state, next_digest
@@ -1798,22 +2107,32 @@ def prompt_helper_main(
     attempt_dir: pathlib.Path,
     control_fd: int,
     lease_fd: int,
+    root_fd: int,
+    attempt_fd: int,
     token: str,
 ) -> int:
     control = socket.socket(fileno=control_fd)
+    attempt: AttemptLease | None = None
+    descriptors_owned = True
     try:
-        fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        send_record(
-            control,
-            {"type": "prompt-helper-ready", "token": token, "pid": os.getpid()},
+        descriptors_owned = False
+        attempt = _accept_attempt_transfer(
+            control=control,
+            lease_fd=lease_fd,
+            root_fd=root_fd,
+            attempt_fd=attempt_fd,
+            token=token,
+            ready_type="prompt-helper-ready",
             deadline=time.monotonic() + 5,
         )
+        if attempt.path != attempt_dir:
+            raise ValueError("prompt helper attempt path differs from its binding")
         request, _ = receive_record(control, deadline=time.monotonic() + 30)
         if request.get("type") != "prompt-offer" or request.get("token") != token:
             raise ValueError("prompt helper offer is invalid")
         prompt = receive_blob(control, token, deadline=time.monotonic() + 30)
         evidence = prompt_evidence(prompt)
-        state, _, digest = read_attempt_state(attempt_dir)
+        state, _, digest = read_bound_attempt_state(attempt)
         if digest != request.get("predecessor_sha256"):
             raise ValueError("prompt helper predecessor digest mismatch")
         if evidence != {
@@ -1822,9 +2141,18 @@ def prompt_helper_main(
         }:
             raise ValueError("prompt helper bytes do not match the reservation")
         prompt_path = pathlib.Path(state["prompt_path"])
-        identity = publish_bytes(prompt_path, prompt)
+        if prompt_path != attempt.path / "prompt.txt":
+            raise ValueError("prompt path differs from the attempt binding")
+        attempt.revalidate(state)
+        identity = publish_bytes_at(
+            attempt.fd,
+            b"prompt.txt",
+            prompt,
+            path_hint=prompt_path,
+        )
+        attempt.revalidate(state)
         next_state, next_digest = commit_state(
-            attempt_dir,
+            attempt,
             state,
             digest,
             prompt_published=True,
@@ -1859,14 +2187,18 @@ def prompt_helper_main(
         return 1
     finally:
         control.close()
-        os.close(lease_fd)
+        if attempt is not None:
+            attempt.close()
+            attempt.retention.close()
+        elif descriptors_owned:
+            for descriptor in (lease_fd, root_fd, attempt_fd):
+                os.close(descriptor)
 
 
 def publish_prompt_via_helper(
     *,
     entrypoint: pathlib.Path,
-    attempt_dir: pathlib.Path,
-    lease_fd: int,
+    attempt: AttemptLease,
     state: dict[str, Any],
     state_digest: str,
     prompt: bytes,
@@ -1881,23 +2213,37 @@ def publish_prompt_via_helper(
             mode="_prompt-helper",
             arguments=(
                 "--attempt-dir",
-                str(attempt_dir),
+                str(attempt.path),
                 "--control-fd",
                 "3",
                 "--lease-fd",
                 "4",
+                "--root-fd",
+                "5",
+                "--attempt-fd",
+                "6",
                 "--token",
                 token,
             ),
-            cwd=attempt_dir,
-            pass_fds=(child.fileno(), lease_fd),
+            cwd=attempt.path,
+            pass_fds=(
+                child.fileno(),
+                attempt.retention.fd,
+                attempt.retention.root_fd,
+                attempt.fd,
+            ),
             own_process_group=False,
         )
         child.close()
         await_exec(process, deadline=deadline)
-        ready, _ = receive_record(parent, deadline=deadline)
-        if ready.get("type") != "prompt-helper-ready" or ready.get("token") != token:
-            raise ValueError("prompt helper ready record is invalid")
+        _authenticate_attempt_transfer(
+            control=parent,
+            process=process,
+            attempt=attempt,
+            token=token,
+            ready_type="prompt-helper-ready",
+            deadline=deadline,
+        )
         send_record(
             parent,
             {
@@ -1920,6 +2266,9 @@ def publish_prompt_via_helper(
         next_digest = result.get("state_sha256")
         if not isinstance(next_state, dict) or not isinstance(next_digest, str):
             raise ValueError("prompt helper result is malformed")
+        disk_state, _, disk_digest = read_bound_attempt_state(attempt)
+        if disk_state != next_state or disk_digest != next_digest:
+            raise ValueError("prompt helper result does not match durable state")
         return next_state, next_digest
     finally:
         parent.close()
@@ -2196,6 +2545,9 @@ def checkout_worker_main(
     *,
     attempt_dir: pathlib.Path,
     control_fd: int,
+    lease_fd: int,
+    root_fd: int,
+    attempt_fd: int,
     source_fd: int,
     token: str,
 ) -> int:
@@ -2203,10 +2555,24 @@ def checkout_worker_main(
     materializer: RawMaterializer | None = None
     signal_guard: CheckoutWorkerSignalGuard | None = None
     signal_binding: Any | None = None
+    attempt: AttemptLease | None = None
+    descriptors_owned = True
     try:
         signal_guard = _install_checkout_worker_signal_handlers()
         signal_binding = activate_deferred_signal_interrupt(signal_guard.interrupt)
-        state, _, _ = read_attempt_state(attempt_dir)
+        descriptors_owned = False
+        attempt = _accept_attempt_transfer(
+            control=control,
+            lease_fd=lease_fd,
+            root_fd=root_fd,
+            attempt_fd=attempt_fd,
+            token=token,
+            ready_type="checkout-worker-ready",
+            deadline=time.monotonic() + 5,
+        )
+        if attempt.path != attempt_dir:
+            raise ValueError("checkout worker attempt path differs from its binding")
+        state, _, state_digest = read_bound_attempt_state(attempt)
         custody = _custody(state["helper_custody"])
         if identity_from_stat(os.fstat(source_fd)) != custody.source_identity:
             raise ValueError("checkout worker source descriptor identity is invalid")
@@ -2226,13 +2592,36 @@ def checkout_worker_main(
             or head.metadata_bytes != state["admission"]["tree_metadata_bytes"]
         ):
             raise ValueError("worker tree enumeration differs from reserved manifests")
-        registration = add_detached_worktree(info, pathlib.Path(state["worktree_path"]))
+        create_intent = _worktree_create_intent(state)
+        registration = add_detached_worktree(
+            info,
+            pathlib.Path(state["worktree_path"]),
+            lock_reason=create_intent["lock_reason"],
+        )
+        registration_json = _registration_json(registration)
+        registration_updates = {
+            "registration": registration_json,
+            "worktree_status": "active",
+        }
+        _validate_ordinary_phase_updates(
+            attempt=attempt,
+            state=state,
+            state_digest=state_digest,
+            updates=registration_updates,
+        )
+        state, state_digest = commit_state(
+            attempt,
+            state,
+            state_digest,
+            **registration_updates,
+        )
         send_record(
             control,
             {
                 "type": "worktree-created",
                 "token": token,
-                "registration": _registration_json(registration),
+                "registration": registration_json,
+                "state_sha256": state_digest,
             },
             deadline=deadline,
         )
@@ -2330,6 +2719,7 @@ def checkout_worker_main(
             head=head,
             primary_entry=primary_entry,
         )
+        attempt.revalidate(state)
         send_record(
             control,
             {
@@ -2377,6 +2767,12 @@ def checkout_worker_main(
                 materializer.close()
             os.close(source_fd)
             control.close()
+            if attempt is not None:
+                attempt.close()
+                attempt.retention.close()
+            elif descriptors_owned:
+                for descriptor in (lease_fd, root_fd, attempt_fd):
+                    os.close(descriptor)
         finally:
             if signal_guard is not None:
                 if signal_binding is not None:
@@ -2397,7 +2793,11 @@ def _require_outer_liveness(outer: socket.socket) -> None:
         raise OuterAbandoned("outer liveness peer closed")
 
 
-def _verify_prompt_artifact(state: dict[str, Any], prompt: bytes) -> None:
+def _verify_prompt_artifact(
+    attempt: AttemptLease,
+    state: dict[str, Any],
+    prompt: bytes,
+) -> None:
     evidence = prompt_evidence(prompt)
     if evidence != {
         "length": state["prompt_length"],
@@ -2405,8 +2805,12 @@ def _verify_prompt_artifact(state: dict[str, Any], prompt: bytes) -> None:
     }:
         raise ValueError("supervisor-private prompt does not match durable state")
     path = pathlib.Path(state["prompt_path"])
-    fd, identity = open_regular_nofollow(
-        path,
+    if path != attempt.path / "prompt.txt":
+        raise ValueError("published prompt path differs from the attempt binding")
+    attempt.revalidate(state)
+    fd, identity = open_regular_at(
+        attempt.fd,
+        b"prompt.txt",
         expected_uid=os.getuid(),
         private_metadata=True,
     )
@@ -2420,6 +2824,7 @@ def _verify_prompt_artifact(state: dict[str, Any], prompt: bytes) -> None:
             )
     finally:
         os.close(fd)
+    attempt.revalidate(state)
 
 
 def prompt_verifier_main(
@@ -2427,16 +2832,26 @@ def prompt_verifier_main(
     attempt_dir: pathlib.Path,
     control_fd: int,
     lease_fd: int,
+    root_fd: int,
+    attempt_fd: int,
     token: str,
 ) -> int:
     control = socket.socket(fileno=control_fd)
+    attempt: AttemptLease | None = None
+    descriptors_owned = True
     try:
-        fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        send_record(
-            control,
-            {"type": "prompt-verifier-ready", "token": token, "pid": os.getpid()},
+        descriptors_owned = False
+        attempt = _accept_attempt_transfer(
+            control=control,
+            lease_fd=lease_fd,
+            root_fd=root_fd,
+            attempt_fd=attempt_fd,
+            token=token,
+            ready_type="prompt-verifier-ready",
             deadline=time.monotonic() + 5,
         )
+        if attempt.path != attempt_dir:
+            raise ValueError("prompt verifier attempt path differs from its binding")
         request, descriptors = receive_record(
             control,
             deadline=time.monotonic() + 30,
@@ -2446,10 +2861,10 @@ def prompt_verifier_main(
         if request.get("type") != "verify-prompt" or request.get("token") != token:
             raise ValueError("prompt verifier request is invalid")
         prompt = receive_blob(control, token, deadline=time.monotonic() + 30)
-        state, _, digest = read_attempt_state(attempt_dir)
+        state, _, digest = read_bound_attempt_state(attempt)
         if digest != request.get("predecessor_sha256"):
             raise ValueError("prompt verifier predecessor digest changed")
-        _verify_prompt_artifact(state, prompt)
+        _verify_prompt_artifact(attempt, state, prompt)
         send_record(
             control,
             {
@@ -2478,14 +2893,18 @@ def prompt_verifier_main(
         return 1
     finally:
         control.close()
-        os.close(lease_fd)
+        if attempt is not None:
+            attempt.close()
+            attempt.retention.close()
+        elif descriptors_owned:
+            for descriptor in (lease_fd, root_fd, attempt_fd):
+                os.close(descriptor)
 
 
 def verify_prompt_via_helper(
     *,
     entrypoint: pathlib.Path,
-    attempt_dir: pathlib.Path,
-    lease_fd: int,
+    attempt: AttemptLease,
     state_digest: str,
     prompt: bytes,
     deadline: float,
@@ -2499,23 +2918,37 @@ def verify_prompt_via_helper(
             mode="_prompt-verifier",
             arguments=(
                 "--attempt-dir",
-                str(attempt_dir),
+                str(attempt.path),
                 "--control-fd",
                 "3",
                 "--lease-fd",
                 "4",
+                "--root-fd",
+                "5",
+                "--attempt-fd",
+                "6",
                 "--token",
                 token,
             ),
-            cwd=attempt_dir,
-            pass_fds=(child.fileno(), lease_fd),
+            cwd=attempt.path,
+            pass_fds=(
+                child.fileno(),
+                attempt.retention.fd,
+                attempt.retention.root_fd,
+                attempt.fd,
+            ),
             own_process_group=False,
         )
         child.close()
         await_exec(process, deadline=deadline)
-        ready, _ = receive_record(parent, deadline=deadline)
-        if ready.get("type") != "prompt-verifier-ready" or ready.get("token") != token:
-            raise ValueError("prompt verifier ready record is invalid")
+        _authenticate_attempt_transfer(
+            control=parent,
+            process=process,
+            attempt=attempt,
+            token=token,
+            ready_type="prompt-verifier-ready",
+            deadline=deadline,
+        )
         send_record(
             parent,
             {
@@ -2605,18 +3038,28 @@ def authorization_helper_main(
     attempt_dir: pathlib.Path,
     control_fd: int,
     lease_fd: int,
+    root_fd: int,
+    attempt_fd: int,
     outer_liveness_fd: int,
     token: str,
 ) -> int:
     control = socket.socket(fileno=control_fd)
     outer = socket.socket(fileno=outer_liveness_fd)
+    attempt: AttemptLease | None = None
+    descriptors_owned = True
     try:
-        fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        send_record(
-            control,
-            {"type": "authorization-ready", "token": token, "pid": os.getpid()},
+        descriptors_owned = False
+        attempt = _accept_attempt_transfer(
+            control=control,
+            lease_fd=lease_fd,
+            root_fd=root_fd,
+            attempt_fd=attempt_fd,
+            token=token,
+            ready_type="authorization-ready",
             deadline=time.monotonic() + 5,
         )
+        if attempt.path != attempt_dir:
+            raise ValueError("authorization attempt path differs from its binding")
         request, _ = receive_record(control, deadline=time.monotonic() + 30)
         if request.get("type") != "authorize-terminal" or request.get("token") != token:
             raise ValueError("terminal authorization request is invalid")
@@ -2632,7 +3075,7 @@ def authorization_helper_main(
                 deadline=time.monotonic() + 2,
             )
             return 2
-        state, _, digest = read_attempt_state(attempt_dir)
+        state, _, digest = read_bound_attempt_state(attempt)
         if digest != request.get("predecessor_sha256"):
             raise ValueError("terminal authorization predecessor changed")
         requested_seal = request.get("final_seal")
@@ -2644,12 +3087,12 @@ def authorization_helper_main(
         ):
             raise ValueError("terminal authorization evidence is malformed")
         final_path = pathlib.Path(requested_seal.get("path", ""))
-        if final_path != attempt_dir / "final.txt":
+        if final_path != attempt.path / "final.txt":
             raise ValueError("terminal authorization final path is invalid")
-        _, verified_seal = _verify_final_seal(final_path, requested_seal)
+        _, verified_seal = _verify_final_seal(attempt, requested_seal)
         if verified_seal != requested_seal:
             raise ValueError("terminal authorization final seal changed on readback")
-        rebound_state, _, rebound_digest = read_attempt_state(attempt_dir)
+        rebound_state, _, rebound_digest = read_bound_attempt_state(attempt)
         if rebound_state != state or rebound_digest != digest:
             raise ValueError(
                 "terminal authorization predecessor changed during readback"
@@ -2666,7 +3109,7 @@ def authorization_helper_main(
         )
         authorized_at = time.time()
         next_state, next_digest = commit_state(
-            attempt_dir,
+            attempt,
             state,
             digest,
             terminal_commit_authorized=True,
@@ -2715,14 +3158,18 @@ def authorization_helper_main(
     finally:
         control.close()
         outer.close()
-        os.close(lease_fd)
+        if attempt is not None:
+            attempt.close()
+            attempt.retention.close()
+        elif descriptors_owned:
+            for descriptor in (lease_fd, root_fd, attempt_fd):
+                os.close(descriptor)
 
 
 def authorize_terminal_via_helper(
     *,
     entrypoint: pathlib.Path,
-    attempt_dir: pathlib.Path,
-    lease_fd: int,
+    attempt: AttemptLease,
     outer: socket.socket,
     state: dict[str, Any],
     state_digest: str,
@@ -2739,25 +3186,40 @@ def authorize_terminal_via_helper(
             mode="_authorization-helper",
             arguments=(
                 "--attempt-dir",
-                str(attempt_dir),
+                str(attempt.path),
                 "--control-fd",
                 "3",
                 "--lease-fd",
                 "4",
-                "--outer-liveness-fd",
+                "--root-fd",
                 "5",
+                "--attempt-fd",
+                "6",
+                "--outer-liveness-fd",
+                "7",
                 "--token",
                 token,
             ),
-            cwd=attempt_dir,
-            pass_fds=(child.fileno(), lease_fd, outer.fileno()),
+            cwd=attempt.path,
+            pass_fds=(
+                child.fileno(),
+                attempt.retention.fd,
+                attempt.retention.root_fd,
+                attempt.fd,
+                outer.fileno(),
+            ),
             own_process_group=False,
         )
         child.close()
         await_exec(process, deadline=deadline)
-        ready, _ = receive_record(parent, deadline=deadline)
-        if ready.get("type") != "authorization-ready" or ready.get("token") != token:
-            raise ValueError("terminal authorization helper ready record is invalid")
+        _authenticate_attempt_transfer(
+            control=parent,
+            process=process,
+            attempt=attempt,
+            token=token,
+            ready_type="authorization-ready",
+            deadline=deadline,
+        )
         send_record(
             parent,
             {
@@ -2781,6 +3243,9 @@ def authorize_terminal_via_helper(
         next_digest = result.get("state_sha256")
         if not isinstance(next_state, dict) or not isinstance(next_digest, str):
             raise ValueError("terminal authorization result is malformed")
+        disk_state, _, disk_digest = read_bound_attempt_state(attempt)
+        if disk_state != next_state or disk_digest != next_digest:
+            raise ValueError("terminal authorization result is not durable")
         return next_state, next_digest
     finally:
         parent.close()
@@ -2790,15 +3255,18 @@ def authorize_terminal_via_helper(
 
 
 def _verify_final_seal(
-    path: pathlib.Path,
+    attempt: AttemptLease,
     reader_result: dict[str, Any],
 ) -> tuple[bytes, dict[str, Any]]:
+    path = attempt.path / "final.txt"
     identity_value = reader_result.get("identity")
     if not isinstance(identity_value, dict):
         raise ValueError("reader seal does not contain an identity")
     expected = _identity(identity_value)
-    fd, actual = open_regular_nofollow(
-        path,
+    attempt.revalidate()
+    fd, actual = open_regular_at(
+        attempt.fd,
+        b"final.txt",
         expected_uid=os.getuid(),
         private_metadata=True,
     )
@@ -2812,6 +3280,7 @@ def _verify_final_seal(
         )
     finally:
         os.close(fd)
+    attempt.revalidate()
     digest = sha256_bytes(content)
     if (
         reader_result.get("length") != len(content)
@@ -2829,8 +3298,7 @@ def _verify_final_seal(
 def publish_terminal_review(
     *,
     entrypoint: pathlib.Path,
-    attempt_dir: pathlib.Path,
-    lease_fd: int,
+    attempt: AttemptLease,
     outer: socket.socket,
     state: dict[str, Any],
     state_digest: str,
@@ -2846,8 +3314,16 @@ def publish_terminal_review(
     final_bytes = final_text.encode("utf-8", "strict")
     if not 1 <= len(final_bytes) <= FINAL_MESSAGE_BYTES:
         raise ValueError("terminal review artifact exceeds its byte bound")
-    final_path = attempt_dir / "final.txt"
-    final_identity = publish_bytes(final_path, final_bytes, mode=0o600)
+    final_path = attempt.path / "final.txt"
+    attempt.revalidate(state)
+    final_identity = publish_bytes_at(
+        attempt.fd,
+        b"final.txt",
+        final_bytes,
+        path_hint=final_path,
+        mode=0o600,
+    )
+    attempt.revalidate(state)
     final_seal = {
         "path": str(final_path),
         "identity": final_identity.to_json(),
@@ -2856,8 +3332,7 @@ def publish_terminal_review(
     }
     state, state_digest = commit_via_helper(
         entrypoint=entrypoint,
-        attempt_dir=attempt_dir,
-        lease_fd=lease_fd,
+        attempt=attempt,
         state=state,
         state_digest=state_digest,
         updates={
@@ -2870,8 +3345,7 @@ def publish_terminal_review(
     )
     state, state_digest = authorize_terminal_via_helper(
         entrypoint=entrypoint,
-        attempt_dir=attempt_dir,
-        lease_fd=lease_fd,
+        attempt=attempt,
         outer=outer,
         state=state,
         state_digest=state_digest,
@@ -2881,8 +3355,7 @@ def publish_terminal_review(
     )
     return commit_via_helper(
         entrypoint=entrypoint,
-        attempt_dir=attempt_dir,
-        lease_fd=lease_fd,
+        attempt=attempt,
         state=state,
         state_digest=state_digest,
         updates={
@@ -2910,8 +3383,7 @@ def _run_authenticated_review_boundary(
 def run_reviewer(
     *,
     entrypoint: pathlib.Path,
-    attempt_dir: pathlib.Path,
-    lease_fd: int,
+    attempt: AttemptLease,
     outer: socket.socket,
     state: dict[str, Any],
     state_digest: str,
@@ -2922,8 +3394,7 @@ def run_reviewer(
     launch_deadline = time.monotonic() + REVIEWER_LAUNCH_SECONDS
     verify_prompt_via_helper(
         entrypoint=entrypoint,
-        attempt_dir=attempt_dir,
-        lease_fd=lease_fd,
+        attempt=attempt,
         state_digest=state_digest,
         prompt=prompt,
         deadline=launch_deadline,
@@ -2970,17 +3441,16 @@ def run_reviewer(
 
     lifecycle = DurableProcessLifecycle(
         entrypoint=entrypoint,
-        attempt_dir=attempt_dir,
-        lease_fd=lease_fd,
+        attempt=attempt,
         state=state,
         state_digest=state_digest,
     )
     result, execution_failed = _run_authenticated_review_boundary(
         codex_executable=pathlib.Path(state["codex_executable"]),
-        runtime_root=attempt_dir / "review-runtime",
+        runtime_root=attempt.path / "review-runtime",
         repo=pathlib.Path(state["repo"]),
         helper_root=tool_root(),
-        retention_root=attempt_dir.parent,
+        retention_root=attempt.path.parent,
         checkout_root=worktree,
         prompt=prepared_input.prompt,
         requested_model=state["requested_model"],
@@ -3031,8 +3501,7 @@ def run_reviewer(
     }
     state, state_digest = publish_terminal_review(
         entrypoint=entrypoint,
-        attempt_dir=attempt_dir,
-        lease_fd=lease_fd,
+        attempt=attempt,
         outer=outer,
         state=state,
         state_digest=state_digest,
@@ -3047,25 +3516,35 @@ def run_reviewer(
 def _run_checkout(
     *,
     entrypoint: pathlib.Path,
-    attempt_dir: pathlib.Path,
-    lease_fd: int,
+    attempt: AttemptLease,
     outer: socket.socket,
     state: dict[str, Any],
     state_digest: str,
     source_fd: int,
 ) -> tuple[dict[str, Any], str]:
     deadline = time.monotonic() + CHECKOUT_SECONDS
+    token = os.urandom(32).hex()
+    create_intent = {
+        "version": 1,
+        "worktree": state["worktree_path"],
+        "registration_parent": str(
+            pathlib.Path(state["common_git_dir_binding"]["path"]) / "worktrees"
+        ),
+        "lock_reason": f"independent-codex-pr-review:{token}",
+    }
     state, state_digest = commit_via_helper(
         entrypoint=entrypoint,
-        attempt_dir=attempt_dir,
-        lease_fd=lease_fd,
+        attempt=attempt,
         state=state,
         state_digest=state_digest,
-        updates={"phase": "worktree-adding", "worktree_status": "adding"},
+        updates={
+            "phase": "worktree-adding",
+            "worktree_create_intent": create_intent,
+            "worktree_status": "adding",
+        },
         deadline=deadline,
     )
     parent, child = socket_pair()
-    token = os.urandom(32).hex()
     worker: SpawnedProcess | None = None
 
     def raise_worker_failure(record: dict[str, Any]) -> None:
@@ -3097,41 +3576,65 @@ def _run_checkout(
             mode="_checkout-worker",
             arguments=(
                 "--attempt-dir",
-                str(attempt_dir),
+                str(attempt.path),
                 "--control-fd",
                 "3",
-                "--source-fd",
+                "--lease-fd",
                 "4",
+                "--root-fd",
+                "5",
+                "--attempt-fd",
+                "6",
+                "--source-fd",
+                "7",
                 "--token",
                 token,
             ),
-            cwd=attempt_dir,
-            pass_fds=(child.fileno(), source_fd),
+            cwd=attempt.path,
+            pass_fds=(
+                child.fileno(),
+                attempt.retention.fd,
+                attempt.retention.root_fd,
+                attempt.fd,
+                source_fd,
+            ),
             own_process_group=True,
         )
         child.close()
         await_exec(worker, deadline=deadline)
+        _authenticate_attempt_transfer(
+            control=parent,
+            process=worker,
+            attempt=attempt,
+            token=token,
+            ready_type="checkout-worker-ready",
+            deadline=deadline,
+        )
         created = _wait_child_record(child=parent, outer=outer, deadline=deadline)
         if created.get("type") == "checkout-failed":
             raise_worker_failure(created)
         if created.get("type") != "worktree-created" or created.get("token") != token:
             raise ValueError("checkout worker registration record is invalid")
         registration_value = created.get("registration")
-        if not isinstance(registration_value, dict):
+        worker_state_digest = created.get("state_sha256")
+        if not isinstance(registration_value, dict) or not isinstance(
+            worker_state_digest, str
+        ):
             raise ValueError("checkout worker registration evidence is malformed")
         registration = _registration(registration_value)
-        state, state_digest = commit_via_helper(
-            entrypoint=entrypoint,
-            attempt_dir=attempt_dir,
-            lease_fd=lease_fd,
-            state=state,
-            state_digest=state_digest,
-            updates={
-                "registration": _registration_json(registration),
-                "worktree_status": "active",
-            },
-            deadline=deadline,
-        )
+        worker_state, _, durable_worker_digest = read_bound_attempt_state(attempt)
+        if (
+            worker_state_digest != durable_worker_digest
+            or worker_state.get("previous_record_sha256") != state_digest
+            or worker_state.get("record_generation")
+            != state.get("record_generation", 0) + 1
+            or worker_state.get("phase") != "worktree-adding"
+            or worker_state.get("worktree_status") != "active"
+            or worker_state.get("worktree_create_intent") != create_intent
+            or worker_state.get("registration") != registration_value
+        ):
+            raise ValueError("checkout worker durable registration is invalid")
+        state, state_digest = worker_state, worker_state_digest
         send_record(
             parent, {"type": "continue-index", "token": token}, deadline=deadline
         )
@@ -3154,8 +3657,7 @@ def _run_checkout(
         updated_registration["descendant_path_bytes"] = post_index_path_bytes
         state, state_digest = commit_via_helper(
             entrypoint=entrypoint,
-            attempt_dir=attempt_dir,
-            lease_fd=lease_fd,
+            attempt=attempt,
             state=state,
             state_digest=state_digest,
             updates={
@@ -3178,8 +3680,7 @@ def _run_checkout(
             raise ValueError("checkout worker phase-0 record is invalid")
         state, state_digest = commit_via_helper(
             entrypoint=entrypoint,
-            attempt_dir=attempt_dir,
-            lease_fd=lease_fd,
+            attempt=attempt,
             state=state,
             state_digest=state_digest,
             updates={
@@ -3225,8 +3726,7 @@ def _run_checkout(
         )
         state, state_digest = commit_via_helper(
             entrypoint=entrypoint,
-            attempt_dir=attempt_dir,
-            lease_fd=lease_fd,
+            attempt=attempt,
             state=state,
             state_digest=state_digest,
             updates={
@@ -3376,8 +3876,7 @@ def _cleanup_control_namespace(
 def _manual_worktree_recovery(
     *,
     entrypoint: pathlib.Path,
-    attempt_dir: pathlib.Path,
-    lease_fd: int,
+    attempt: AttemptLease,
     state: dict[str, Any],
     state_digest: str,
     stage: str,
@@ -3398,8 +3897,7 @@ def _manual_worktree_recovery(
     message = error if isinstance(error, str) else f"{type(error).__name__}: {error}"
     return commit_via_helper(
         entrypoint=entrypoint,
-        attempt_dir=attempt_dir,
-        lease_fd=lease_fd,
+        attempt=attempt,
         state=state,
         state_digest=state_digest,
         updates={
@@ -3420,15 +3918,17 @@ def _manual_worktree_recovery(
 def _cleanup_worktree(
     *,
     entrypoint: pathlib.Path,
-    attempt_dir: pathlib.Path,
-    lease_fd: int,
+    attempt: AttemptLease,
     state: dict[str, Any],
     state_digest: str,
 ) -> tuple[dict[str, Any], str]:
     require_direct_process_closure_proven()
+    attempt_dir = attempt.path
+    attempt.revalidate(state)
     worktree = pathlib.Path(state["worktree_path"])
     registration_value = state.get("registration")
     checkout_parent_fd: int | None = None
+    common_git_fd: int | None = None
     registration_parent_fd: int | None = None
     manifest: CustodiedManifest | None = None
     try:
@@ -3436,8 +3936,7 @@ def _cleanup_worktree(
         if isinstance(existing_intent, dict) and existing_intent.get("outstanding"):
             return _manual_worktree_recovery(
                 entrypoint=entrypoint,
-                attempt_dir=attempt_dir,
-                lease_fd=lease_fd,
+                attempt=attempt,
                 state=state,
                 state_digest=state_digest,
                 stage="worktree-cleanup-custody-lost",
@@ -3458,18 +3957,15 @@ def _cleanup_worktree(
             worktree.parent,
             private_leaf=True,
         )
-        common_fd, common_identity = open_absolute_directory_chain(common_git_dir)
-        try:
-            if not directory_identities_match(
-                checkout_parent_identity,
-                _identity(checkout_binding["identity"]),
-            ) or not directory_identities_match(
-                common_identity,
-                _identity(common_binding["identity"]),
-            ):
-                raise ValueError("reserved parent directory identity changed")
-        finally:
-            os.close(common_fd)
+        common_git_fd, common_identity = open_absolute_directory_chain(common_git_dir)
+        if not directory_identities_match(
+            checkout_parent_identity,
+            _identity(checkout_binding["identity"]),
+        ) or not directory_identities_match(
+            common_identity,
+            _identity(common_binding["identity"]),
+        ):
+            raise ValueError("reserved parent directory identity changed")
 
         worktree_name = os.fsencode(worktree.name)
         try:
@@ -3489,6 +3985,15 @@ def _cleanup_worktree(
         registration_identity: Identity | None = None
         registration_present = False
         registration_parent_identity: Identity | None = None
+        if registration_value is None and state.get("worktree_create_intent") is not None:
+            assert common_git_fd is not None
+            registration = _recover_create_in_progress_registration(
+                state=state,
+                checkout_parent_fd=checkout_parent_fd,
+                common_git_fd=common_git_fd,
+            )
+            if registration is not None:
+                registration_value = _registration_json(registration)
         if registration_value is not None:
             if not isinstance(registration_value, dict):
                 raise ValueError("worktree registration record is malformed")
@@ -3498,9 +4003,15 @@ def _cleanup_worktree(
             expected_registration_parent = common_git_dir / "worktrees"
             if registration.registration.parent != expected_registration_parent:
                 raise ValueError("registration parent escaped the common Git directory")
+            assert common_git_fd is not None
             try:
-                registration_parent_fd, registration_parent_identity = (
-                    open_absolute_directory_chain(expected_registration_parent)
+                registration_parent_fd = os.open(
+                    b"worktrees",
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=common_git_fd,
+                )
+                registration_parent_identity = identity_from_stat(
+                    os.fstat(registration_parent_fd)
                 )
             except FileNotFoundError:
                 registration_parent_fd = None
@@ -3527,8 +4038,7 @@ def _cleanup_worktree(
             except BaseException as error:
                 return _manual_worktree_recovery(
                     entrypoint=entrypoint,
-                    attempt_dir=attempt_dir,
-                    lease_fd=lease_fd,
+                    attempt=attempt,
                     state=state,
                     state_digest=state_digest,
                     stage="worktree-registration-unknown",
@@ -3548,8 +4058,7 @@ def _cleanup_worktree(
             _cleanup_control_namespace(state)
             return commit_via_helper(
                 entrypoint=entrypoint,
-                attempt_dir=attempt_dir,
-                lease_fd=lease_fd,
+                attempt=attempt,
                 state=state,
                 state_digest=state_digest,
                 updates={
@@ -3719,8 +4228,7 @@ def _cleanup_worktree(
         }
         state, state_digest = commit_via_helper(
             entrypoint=entrypoint,
-            attempt_dir=attempt_dir,
-            lease_fd=lease_fd,
+            attempt=attempt,
             state=state,
             state_digest=state_digest,
             updates={
@@ -3793,8 +4301,7 @@ def _cleanup_worktree(
         }
         state, state_digest = commit_via_helper(
             entrypoint=entrypoint,
-            attempt_dir=attempt_dir,
-            lease_fd=lease_fd,
+            attempt=attempt,
             state=state,
             state_digest=state_digest,
             updates={
@@ -3829,8 +4336,7 @@ def _cleanup_worktree(
         }
         state, state_digest = commit_via_helper(
             entrypoint=entrypoint,
-            attempt_dir=attempt_dir,
-            lease_fd=lease_fd,
+            attempt=attempt,
             state=state,
             state_digest=state_digest,
             updates={
@@ -3865,11 +4371,10 @@ def _cleanup_worktree(
         ) and not retry_git_process_closure(error):
             raise
         require_direct_process_closure_proven()
-        disk_state, _, disk_digest = read_attempt_state(attempt_dir)
+        disk_state, _, disk_digest = read_bound_attempt_state(attempt)
         return _manual_worktree_recovery(
             entrypoint=entrypoint,
-            attempt_dir=attempt_dir,
-            lease_fd=lease_fd,
+            attempt=attempt,
             state=disk_state,
             state_digest=disk_digest,
             stage="worktree-cleanup",
@@ -3880,12 +4385,15 @@ def _cleanup_worktree(
             manifest.close()
         if registration_parent_fd is not None:
             os.close(registration_parent_fd)
+        if common_git_fd is not None:
+            os.close(common_git_fd)
         if checkout_parent_fd is not None:
             os.close(checkout_parent_fd)
 
 
-def _remove_clean_logs(attempt_dir: pathlib.Path) -> None:
-    directory_fd, _ = open_absolute_directory_chain(attempt_dir, private_leaf=True)
+def _remove_clean_logs(attempt: AttemptLease, state: dict[str, Any]) -> None:
+    attempt.revalidate(state)
+    directory_fd = os.dup(attempt.fd)
     try:
         for name in tuple(os.fsencode(value) for value in os.listdir(directory_fd)):
             if not (
@@ -3899,32 +4407,39 @@ def _remove_clean_logs(attempt_dir: pathlib.Path) -> None:
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
+    attempt.revalidate(state)
 
 
 def _settle_process(
     *,
     entrypoint: pathlib.Path,
-    attempt_dir: pathlib.Path,
-    lease_fd: int,
+    attempt: AttemptLease,
     state: dict[str, Any],
     state_digest: str,
 ) -> tuple[dict[str, Any], str]:
     fifo_path = pathlib.Path(state["final_fifo_path"])
+    if fifo_path != attempt.path / "final.fifo":
+        raise ValueError("final transport path differs from the attempt binding")
+    attempt.revalidate(state)
     try:
-        fifo_stat = os.lstat(fifo_path)
+        fifo_stat = os.stat(
+            b"final.fifo",
+            dir_fd=attempt.fd,
+            follow_symlinks=False,
+        )
     except FileNotFoundError:
         pass
     else:
         if not stat.S_ISFIFO(fifo_stat.st_mode) or fifo_stat.st_uid != os.getuid():
             raise ValueError("unsettled final transport path is unsafe")
-        os.unlink(fifo_path)
-        fsync_directory(fifo_path.parent)
+        os.unlink(b"final.fifo", dir_fd=attempt.fd)
+        os.fsync(attempt.fd)
+    attempt.revalidate(state)
     if state.get("review_status") == "clean" and state.get("cleanup_status") == "clean":
-        _remove_clean_logs(attempt_dir)
+        _remove_clean_logs(attempt, state)
     return settle_process_via_helper(
         entrypoint=entrypoint,
-        attempt_dir=attempt_dir,
-        lease_fd=lease_fd,
+        attempt=attempt,
         state=state,
         state_digest=state_digest,
         deadline=time.monotonic() + 30,
@@ -3934,8 +4449,7 @@ def _settle_process(
 def _record_failure(
     *,
     entrypoint: pathlib.Path,
-    attempt_dir: pathlib.Path,
-    lease_fd: int,
+    attempt: AttemptLease,
     state: dict[str, Any],
     state_digest: str,
     error: BaseException,
@@ -4006,8 +4520,7 @@ def _record_failure(
         updates["observed_runtime"] = dict(observed_runtime)
     return commit_via_helper(
         entrypoint=entrypoint,
-        attempt_dir=attempt_dir,
-        lease_fd=lease_fd,
+        attempt=attempt,
         state=state,
         state_digest=state_digest,
         updates=updates,
@@ -4096,6 +4609,8 @@ def attempt_supervisor_main(
     attempt_dir: pathlib.Path,
     control_fd: int,
     lease_fd: int,
+    root_fd: int,
+    attempt_fd: int,
     handoff_token: str,
 ) -> int:
     outer = socket.socket(fileno=control_fd)
@@ -4106,20 +4621,25 @@ def attempt_supervisor_main(
     state_digest: str | None = None
     final_text: str | None = None
     abandoned = False
+    attempt: AttemptLease | None = None
+    descriptors_owned = True
     try:
         handoff_deadline = time.monotonic() + HANDOFF_SECONDS
-        fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        state, _, state_digest = read_attempt_state(attempt_dir)
-        send_record(
-            outer,
-            {
-                "type": "attempt-supervisor-ready",
-                "token": handoff_token,
-                "pid": os.getpid(),
-                "start_identity": process_start_identity(os.getpid()),
-            },
+        start_identity = process_start_identity(os.getpid())
+        descriptors_owned = False
+        attempt = _accept_attempt_transfer(
+            control=outer,
+            lease_fd=lease_fd,
+            root_fd=root_fd,
+            attempt_fd=attempt_fd,
+            token=handoff_token,
+            ready_type="attempt-supervisor-ready",
             deadline=handoff_deadline,
+            ready_extra={"start_identity": start_identity},
         )
+        if attempt.path != attempt_dir:
+            raise ValueError("attempt supervisor path differs from its binding")
+        state, _, state_digest = read_bound_attempt_state(attempt)
         custody_record, custody_fds = receive_record(
             outer,
             deadline=handoff_deadline,
@@ -4150,18 +4670,17 @@ def attempt_supervisor_main(
         if offer != {"type": "prompt-offer", "token": handoff_token}:
             raise ValueError("prompt handoff offer is invalid")
         prompt = receive_blob(outer, handoff_token, deadline=handoff_deadline)
-        state, _, state_digest = read_attempt_state(attempt_dir)
+        state, _, state_digest = read_bound_attempt_state(attempt)
         if (
             state.get("handoff") != "pending"
             or state.get("handoff_token") != handoff_token
             or state.get("supervisor", {}).get("pid") != os.getpid()
         ):
             raise ValueError("durable pending handoff state is invalid")
-        _verify_prompt_artifact(state, prompt)
+        _verify_prompt_artifact(attempt, state, prompt)
         state, state_digest = commit_via_helper(
             entrypoint=entrypoint,
-            attempt_dir=attempt_dir,
-            lease_fd=lease_fd,
+            attempt=attempt,
             state=state,
             state_digest=state_digest,
             updates={"handoff": "accepted", "prompt_private_copy_verified": True},
@@ -4181,8 +4700,7 @@ def attempt_supervisor_main(
             raise ValueError("handoff start acknowledgement is invalid")
         state, state_digest = commit_via_helper(
             entrypoint=entrypoint,
-            attempt_dir=attempt_dir,
-            lease_fd=lease_fd,
+            attempt=attempt,
             state=state,
             state_digest=state_digest,
             updates={
@@ -4214,8 +4732,7 @@ def attempt_supervisor_main(
         try:
             state, state_digest = _run_checkout(
                 entrypoint=entrypoint,
-                attempt_dir=attempt_dir,
-                lease_fd=lease_fd,
+                attempt=attempt,
                 outer=outer,
                 state=state,
                 state_digest=state_digest,
@@ -4227,8 +4744,7 @@ def attempt_supervisor_main(
             cleanup_lock_fd = None
             state, state_digest, final_text = run_reviewer(
                 entrypoint=entrypoint,
-                attempt_dir=attempt_dir,
-                lease_fd=lease_fd,
+                attempt=attempt,
                 outer=outer,
                 state=state,
                 state_digest=state_digest,
@@ -4256,11 +4772,12 @@ def attempt_supervisor_main(
             and state.get("handoff") == "complete"
         ):
             try:
-                state, _, state_digest = read_attempt_state(attempt_dir)
+                if attempt is None:
+                    raise ValueError("attempt lease is unavailable during failure recording")
+                state, _, state_digest = read_bound_attempt_state(attempt)
                 state, state_digest = _record_failure(
                     entrypoint=entrypoint,
-                    attempt_dir=attempt_dir,
-                    lease_fd=lease_fd,
+                    attempt=attempt,
                     state=state,
                     state_digest=state_digest,
                     error=error,
@@ -4270,7 +4787,9 @@ def attempt_supervisor_main(
                 state = None
         else:
             outer.close()
-            os.close(lease_fd)
+            if attempt is not None:
+                attempt.close()
+                attempt.retention.close()
             return 2
     finally:
         if source_fd is not None:
@@ -4280,21 +4799,24 @@ def attempt_supervisor_main(
 
     if state is None or state_digest is None:
         outer.close()
-        os.close(lease_fd)
+        if attempt is not None:
+            attempt.close()
+            attempt.retention.close()
+        return 2
+    if attempt is None:
+        outer.close()
         return 2
     try:
         require_direct_process_closure_proven()
         state, state_digest = _cleanup_worktree(
             entrypoint=entrypoint,
-            attempt_dir=attempt_dir,
-            lease_fd=lease_fd,
+            attempt=attempt,
             state=state,
             state_digest=state_digest,
         )
         state, state_digest = commit_via_helper(
             entrypoint=entrypoint,
-            attempt_dir=attempt_dir,
-            lease_fd=lease_fd,
+            attempt=attempt,
             state=state,
             state_digest=state_digest,
             updates={
@@ -4314,8 +4836,7 @@ def attempt_supervisor_main(
         )
         state, state_digest = _settle_process(
             entrypoint=entrypoint,
-            attempt_dir=attempt_dir,
-            lease_fd=lease_fd,
+            attempt=attempt,
             state=state,
             state_digest=state_digest,
         )
@@ -4344,4 +4865,5 @@ def attempt_supervisor_main(
         return 2
     finally:
         outer.close()
-        os.close(lease_fd)
+        attempt.close()
+        attempt.retention.close()

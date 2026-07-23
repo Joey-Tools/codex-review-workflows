@@ -291,13 +291,18 @@ ASSISTANT_MESSAGE_FIELDS = frozenset(
         "usage",
     )
 )
+ASSISTANT_DIAGNOSTICS_CACHE_MISS_UNAVAILABLE = {
+    "cache_miss_reason": {"type": "unavailable"}
+}
+ASSISTANT_DIAGNOSTICS_CONTRACT = {
+    "rule": "null_or_exact_object",
+    "object": ASSISTANT_DIAGNOSTICS_CACHE_MISS_UNAVAILABLE,
+    "failure": "inconclusive",
+}
 ASSISTANT_MESSAGE_PROFILE_OPTIONAL_FIELD_CONTRACTS = {
     "legacy-base": {},
     "extended-2x": {
-        "diagnostics": {
-            "rule": "null",
-            "failure": "inconclusive",
-        }
+        "diagnostics": ASSISTANT_DIAGNOSTICS_CONTRACT,
     },
 }
 ASSISTANT_CONTENT_BLOCK_FIELDS = {
@@ -2656,9 +2661,15 @@ def _validate_assistant_event(
             message, field_name, label=message_label, evidence=evidence
         )
     if "diagnostics" in optional_field_contracts:
-        _validate_intermediate_null(
-            message, "diagnostics", label=message_label, evidence=evidence
-        )
+        diagnostics = message.get("diagnostics")
+        if diagnostics is not None and not (
+            type(diagnostics) is dict
+            and diagnostics == ASSISTANT_DIAGNOSTICS_CACHE_MISS_UNAVAILABLE
+            and type(diagnostics.get("cache_miss_reason")) is dict
+        ):
+            evidence.inconclusive.add(
+                "intermediate.assistant.message.diagnostics.unsupported"
+            )
     _validate_intermediate_exact_value(
         message, "type", "message", label=message_label, evidence=evidence
     )

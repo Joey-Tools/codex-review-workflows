@@ -24,7 +24,7 @@ from review_supervisor.secureio import (
     sha256_bytes,
 )
 
-from tests.support import owned_temporary_directory
+from tests.support import bind_attempt_state, owned_temporary_directory
 
 
 TOOL_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -104,6 +104,11 @@ def _write_attempt(
         "released_at": None,
         "release_reason": None,
     }
+    bind_attempt_state(
+        state,
+        retention_root=retention,
+        attempt_dir=attempt,
+    )
     (attempt / "state.json").write_bytes(canonical_json(state))
     os.chmod(attempt / "state.json", 0o600)
     return attempt

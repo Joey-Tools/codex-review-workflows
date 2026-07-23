@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import pathlib
+import re
 import selectors
 import signal
 import stat
@@ -32,6 +34,8 @@ from .process import (
     wait_terminal,
 )
 from .secureio import (
+    directory_identities_match,
+    identity_from_stat,
     open_absolute_directory_chain,
     open_directory,
     open_regular_at,
@@ -53,6 +57,10 @@ CAT_FILE_READ_TIMEOUT_SECONDS = 30.0
 CAT_FILE_STDERR_LIMIT_BYTES = 8192
 PROCESS_GROUP_TERMINATE_GRACE_SECONDS = 0.1
 PROCESS_GROUP_CLEANUP_TIMEOUT_SECONDS = 2.0
+LOCAL_CONFIG_BYTES_LIMIT = 1024 * 1024
+GITDIR_POINTER_BYTES_LIMIT = 64 * 1024
+_CONFIG_SECTION_PATTERN = re.compile(rb"^\[\s*([A-Za-z0-9][A-Za-z0-9-]*)")
+_CONFIG_KEY_PATTERN = re.compile(rb"^([A-Za-z][A-Za-z0-9-]*)")
 
 
 class GitProcessClosureUnproven(RuntimeError):
@@ -504,6 +512,187 @@ def _git_error(argv: tuple[str, ...], stderr: bytes) -> str:
     return f"Git command failed ({' '.join(argv[1:4])}): {tail.strip()}"
 
 
+def _read_optional_git_file(
+    parent_fd: int,
+    name: bytes,
+    *,
+    max_bytes: int,
+) -> bytes | None:
+    try:
+        fd, identity = open_regular_at(
+            parent_fd,
+            name,
+            expected_uid=os.getuid(),
+        )
+    except FileNotFoundError:
+        return None
+    try:
+        if identity.mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise OSError(
+                errno.EPERM,
+                "local Git metadata is writable outside its owner",
+            )
+        if identity.size > max_bytes:
+            raise ValueError("local Git metadata file exceeds its byte limit")
+        content = read_fd_exact(
+            fd,
+            max_bytes=max_bytes,
+            expected_size=identity.size,
+        )
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if identity != identity_from_stat(current):
+            raise OSError(
+                errno.ESTALE,
+                "local Git metadata identity changed while reading",
+            )
+        # The descriptor/path identity and single-link policy protect custody;
+        # exact reread protects content stability without treating timestamps as
+        # content evidence.
+        if identity_from_stat(os.fstat(fd)) != identity:
+            raise OSError(
+                errno.ESTALE,
+                "local Git metadata descriptor identity changed while reading",
+            )
+        if (
+            read_fd_exact(
+                fd,
+                max_bytes=max_bytes,
+                expected_size=identity.size,
+            )
+            != content
+        ):
+            raise OSError(
+                errno.ESTALE,
+                "local Git metadata content changed while reading",
+            )
+        return content
+    finally:
+        os.close(fd)
+
+
+def _metadata_path(base: pathlib.Path, raw: bytes, *, label: str) -> pathlib.Path:
+    if not raw or b"\0" in raw or b"\r" in raw or b"\n" in raw:
+        raise ValueError(f"{label} path is malformed")
+    value = pathlib.Path(os.fsdecode(raw))
+    return pathlib.Path(
+        os.path.abspath(os.fspath(value if value.is_absolute() else base / value))
+    )
+
+
+def _parse_gitdir_pointer(raw: bytes, *, repo: pathlib.Path) -> pathlib.Path:
+    prefix = b"gitdir:"
+    if not raw.endswith(b"\n") or not raw.lower().startswith(prefix):
+        raise ValueError("worktree .git pointer is malformed")
+    value = raw[len(prefix) : -1].strip()
+    return _metadata_path(repo, value, label="worktree gitdir")
+
+
+def _reject_local_config_includes(raw: bytes, *, label: str) -> str | None:
+    if len(raw) > LOCAL_CONFIG_BYTES_LIMIT or b"\0" in raw:
+        raise ValueError(f"{label} is malformed or exceeds its byte limit")
+    section: bytes | None = None
+    object_format: str | None = None
+    for physical_line in raw.splitlines():
+        line = physical_line.strip()
+        if not line or line.startswith((b"#", b";")):
+            continue
+        if line.startswith(b"["):
+            match = _CONFIG_SECTION_PATTERN.match(line)
+            if match is None or b"]" not in line:
+                raise ValueError(f"{label} contains a malformed section")
+            section = match.group(1).lower()
+            if section in {b"include", b"includeif"}:
+                raise ValueError(f"{label} contains a forbidden include directive")
+            continue
+        key_match = _CONFIG_KEY_PATTERN.match(line)
+        if key_match is None:
+            raise ValueError(f"{label} contains a malformed key")
+        key = key_match.group(1).lower()
+        if key in {b"include", b"includeif"} or line.lower().startswith(
+            (b"include.", b"includeif.")
+        ):
+            raise ValueError(f"{label} contains a forbidden include directive")
+        if section == b"extensions" and key == b"objectformat":
+            value = line[key_match.end() :].lstrip()
+            if value.startswith(b"="):
+                value = value[1:].strip()
+            if value not in {b"sha1", b"sha256"}:
+                raise ValueError(f"{label} contains an unsupported object format")
+            parsed = value.decode("ascii")
+            if object_format is not None and parsed != object_format:
+                raise ValueError(f"{label} contains conflicting object formats")
+            object_format = parsed
+    return object_format
+
+
+def _preflight_local_git_config(repo: pathlib.Path) -> tuple[pathlib.Path, str]:
+    repo_fd = open_directory(repo)
+    git_dir_fd: int | None = None
+    common_fd: int | None = None
+    try:
+        dot_git = os.stat(b".git", dir_fd=repo_fd, follow_symlinks=False)
+        if stat.S_ISDIR(dot_git.st_mode):
+            git_dir = repo / ".git"
+        elif stat.S_ISREG(dot_git.st_mode):
+            pointer = _read_optional_git_file(
+                repo_fd,
+                b".git",
+                max_bytes=GITDIR_POINTER_BYTES_LIMIT,
+            )
+            assert pointer is not None
+            git_dir = _parse_gitdir_pointer(pointer, repo=repo)
+        else:
+            raise ValueError("source repository .git entry is unsafe")
+
+        git_dir_fd, _ = open_absolute_directory_chain(git_dir)
+        common_pointer = _read_optional_git_file(
+            git_dir_fd,
+            b"commondir",
+            max_bytes=GITDIR_POINTER_BYTES_LIMIT,
+        )
+        common = (
+            git_dir
+            if common_pointer is None
+            else _metadata_path(
+                git_dir,
+                common_pointer.strip(),
+                label="Git common directory",
+            )
+        )
+        common_fd, _ = open_absolute_directory_chain(common)
+        config = _read_optional_git_file(
+            common_fd,
+            b"config",
+            max_bytes=LOCAL_CONFIG_BYTES_LIMIT,
+        )
+        if config is None:
+            raise ValueError("source repository has no local config")
+        object_format = _reject_local_config_includes(
+            config,
+            label="source repository config",
+        )
+        worktree_config = _read_optional_git_file(
+            git_dir_fd,
+            b"config.worktree",
+            max_bytes=LOCAL_CONFIG_BYTES_LIMIT,
+        )
+        if worktree_config is not None:
+            worktree_format = _reject_local_config_includes(
+                worktree_config,
+                label="source worktree config",
+            )
+            if worktree_format is not None and worktree_format != object_format:
+                raise ValueError("source local configs disagree on object format")
+            object_format = object_format or worktree_format
+        return common, object_format or "sha1"
+    finally:
+        if common_fd is not None:
+            os.close(common_fd)
+        if git_dir_fd is not None:
+            os.close(git_dir_fd)
+        os.close(repo_fd)
+
+
 def inspect_repository(
     *,
     repo: pathlib.Path,
@@ -530,9 +719,22 @@ def inspect_repository(
             code="git-executable-unsafe",
         )
     canonical_repo = repo.resolve(strict=True)
+    try:
+        common, preflight_object_format = _preflight_local_git_config(
+            canonical_repo
+        )
+    except (OSError, ValueError) as error:
+        raise blocked(
+            f"cannot authenticate repository local config: {error}",
+            stage="git-preflight",
+            code="frozen-range-invalid",
+        ) from error
     environment = sanitized_git_environment()
 
     def query(*arguments: str, cap: int = 8192) -> bytes:
+        checked_common, checked_format = _preflight_local_git_config(canonical_repo)
+        if checked_common != common or checked_format != preflight_object_format:
+            raise OSError("source repository config binding changed before Git")
         argv = (
             str(executable),
             "-C",
@@ -553,6 +755,9 @@ def inspect_repository(
         )
         if code != 0:
             raise ValueError(_git_error(argv, stderr))
+        checked_common, checked_format = _preflight_local_git_config(canonical_repo)
+        if checked_common != common or checked_format != preflight_object_format:
+            raise OSError("source repository config binding changed after Git")
         return stdout.strip()
 
     try:
@@ -560,10 +765,14 @@ def inspect_repository(
         format_raw = query("rev-parse", "--show-object-format")
         resolved_base = query("rev-parse", "--verify", f"{base_sha}^{{commit}}")
         resolved_head = query("rev-parse", "--verify", f"{head_sha}^{{commit}}")
-        common = pathlib.Path(os.fsdecode(common_raw)).resolve(strict=True)
+        queried_common = pathlib.Path(os.fsdecode(common_raw)).resolve(strict=True)
+        if queried_common != common:
+            raise ValueError("Git common directory differs from no-follow preflight")
         if format_raw not in {b"sha1", b"sha256"}:
             raise ValueError("repository object format is unsupported")
         object_format = format_raw.decode("ascii")
+        if object_format != preflight_object_format:
+            raise ValueError("Git object format differs from no-follow preflight")
         width = 40 if object_format == "sha1" else 64
         if (
             resolved_base.decode("ascii") != base_sha
@@ -1109,8 +1318,18 @@ def _git_worktree_argv(info: RepositoryInfo, *args: str) -> tuple[str, ...]:
 
 
 def add_detached_worktree(
-    info: RepositoryInfo, path: pathlib.Path
+    info: RepositoryInfo,
+    path: pathlib.Path,
+    *,
+    lock_reason: str = "independent-codex-pr-review",
 ) -> WorktreeRegistration:
+    if (
+        not isinstance(lock_reason, str)
+        or not lock_reason
+        or len(lock_reason.encode("utf-8")) > 512
+        or any(character in lock_reason for character in ("\0", "\r", "\n"))
+    ):
+        raise ValueError("worktree lock reason is invalid")
     argv = _git_worktree_argv(
         info,
         "worktree",
@@ -1120,7 +1339,7 @@ def add_detached_worktree(
         "--no-guess-remote",
         "--lock",
         "--reason",
-        "independent-codex-pr-review",
+        lock_reason,
         str(path),
         info.head_sha,
     )
@@ -1166,8 +1385,26 @@ def add_detached_worktree(
             "worktree registration is outside the common Git worktrees directory"
         )
     registration_fd, registration_identity = open_absolute_directory_chain(registration)
-    os.close(registration_fd)
-    count, path_bytes = enumerate_registration(registration)
+    try:
+        locked_fd, locked_identity = open_regular_at(
+            registration_fd,
+            b"locked",
+            expected_uid=os.getuid(),
+            private_metadata=True,
+        )
+        try:
+            locked = read_fd_exact(
+                locked_fd,
+                max_bytes=513,
+                expected_size=locked_identity.size,
+            )
+        finally:
+            os.close(locked_fd)
+        if locked != lock_reason.encode("utf-8") + b"\n":
+            raise ValueError("worktree lock reason differs from its creation intent")
+        count, path_bytes = enumerate_registration_fd(registration_fd)
+    finally:
+        os.close(registration_fd)
     return WorktreeRegistration(
         worktree=path,
         registration=registration,
@@ -1179,34 +1416,68 @@ def add_detached_worktree(
     )
 
 
-def enumerate_registration(path: pathlib.Path) -> tuple[int, int]:
+def enumerate_registration_fd(root_fd: int) -> tuple[int, int]:
     count = 0
     path_bytes = 0
-    stack: list[tuple[pathlib.Path, bytes]] = [(path, b"")]
-    while stack:
-        current, prefix = stack.pop()
-        current_fd = open_directory(current)
-        try:
-            names = tuple(os.fsencode(name) for name in os.listdir(current_fd))
-            if len(names) > REGISTRATION_DESCENDANT_COUNT_CAP + 1:
-                raise ValueError("worktree registration exceeds its descendant cap")
-            for name in names:
-                relative = name if not prefix else prefix + b"/" + name
-                count += 1
-                path_bytes += len(relative)
-                if (
-                    count > REGISTRATION_DESCENDANT_COUNT_CAP
-                    or path_bytes > REGISTRATION_PATH_BYTES_CAP
-                ):
+    stack: list[tuple[int, bytes]] = [(os.dup(root_fd), b"")]
+    try:
+        while stack:
+            current_fd, prefix = stack.pop()
+            try:
+                names = tuple(os.fsencode(name) for name in os.listdir(current_fd))
+                if len(names) > REGISTRATION_DESCENDANT_COUNT_CAP + 1:
                     raise ValueError(
-                        "worktree registration exceeds its reserved manifest bounds"
+                        "worktree registration exceeds its descendant cap"
                     )
-                metadata = os.stat(name, dir_fd=current_fd, follow_symlinks=False)
-                if stat.S_ISDIR(metadata.st_mode):
-                    stack.append((current / os.fsdecode(name), relative))
-        finally:
-            os.close(current_fd)
-    return count, path_bytes
+                for name in names:
+                    relative = name if not prefix else prefix + b"/" + name
+                    count += 1
+                    path_bytes += len(relative)
+                    if (
+                        count > REGISTRATION_DESCENDANT_COUNT_CAP
+                        or path_bytes > REGISTRATION_PATH_BYTES_CAP
+                    ):
+                        raise ValueError(
+                            "worktree registration exceeds its reserved manifest bounds"
+                        )
+                    metadata = os.stat(
+                        name,
+                        dir_fd=current_fd,
+                        follow_symlinks=False,
+                    )
+                    if stat.S_ISDIR(metadata.st_mode):
+                        child_fd = os.open(
+                            name,
+                            os.O_RDONLY
+                            | os.O_DIRECTORY
+                            | os.O_CLOEXEC
+                            | os.O_NOFOLLOW,
+                            dir_fd=current_fd,
+                        )
+                        if not directory_identities_match(
+                            identity_from_stat(os.fstat(child_fd)),
+                            identity_from_stat(metadata),
+                        ):
+                            os.close(child_fd)
+                            raise OSError(
+                                errno.ESTALE,
+                                "worktree registration directory identity changed",
+                            )
+                        stack.append((child_fd, relative))
+            finally:
+                os.close(current_fd)
+        return count, path_bytes
+    finally:
+        for pending_fd, _ in stack:
+            os.close(pending_fd)
+
+
+def enumerate_registration(path: pathlib.Path) -> tuple[int, int]:
+    root_fd = open_directory(path)
+    try:
+        return enumerate_registration_fd(root_fd)
+    finally:
+        os.close(root_fd)
 
 
 def initialize_index(info: RepositoryInfo, registration: WorktreeRegistration) -> None:

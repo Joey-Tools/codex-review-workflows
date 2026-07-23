@@ -6,11 +6,10 @@ import stat
 import time
 from typing import Any
 
-from .ledger import MAX_ATTEMPT_STATE_BYTES, read_attempt_state
+from .ledger import AttemptLease, MAX_ATTEMPT_STATE_BYTES, read_bound_attempt_state
 from .secureio import (
-    allocated_bytes,
+    allocated_bytes_fd,
     canonical_json,
-    open_absolute_directory_chain,
     open_regular_at,
     read_fd_exact,
     rename_exchange,
@@ -64,13 +63,14 @@ def _candidate_state(
 
 
 def publish_exact_process_settlement(
-    attempt_dir: pathlib.Path,
+    attempt: AttemptLease,
     current: dict[str, Any],
     current_digest: str,
     *,
     deadline: float,
 ) -> tuple[dict[str, Any], str]:
-    disk, predecessor_raw, disk_digest = read_attempt_state(attempt_dir)
+    attempt.revalidate(current)
+    disk, predecessor_raw, disk_digest = read_bound_attempt_state(attempt)
     if disk != current or disk_digest != current_digest:
         raise ValueError("process settlement predecessor changed")
     admission = current.get("admission")
@@ -83,10 +83,7 @@ def publish_exact_process_settlement(
     if not isinstance(retention_fs_identity, str) or not retention_fs_identity:
         raise ValueError("process settlement has no retention filesystem identity")
 
-    directory_fd, _ = open_absolute_directory_chain(
-        attempt_dir,
-        private_leaf=True,
-    )
+    directory_fd = os.dup(attempt.fd)
     candidate_name = f".state.json.tmp-{os.getpid()}-{os.urandom(8).hex()}"
     candidate_raw_name = os.fsencode(candidate_name)
     candidate_fd: int | None = None
@@ -100,11 +97,11 @@ def publish_exact_process_settlement(
         )
         validate_private_regular_fd(
             candidate_fd,
-            attempt_dir / candidate_name,
+            attempt.path / candidate_name,
         )
         anchor = os.fstat(candidate_fd)
 
-        retained_bytes = allocated_bytes(attempt_dir, entry_cap=1_000)
+        retained_bytes = allocated_bytes_fd(attempt.fd, entry_cap=1_000)
         candidate: dict[str, Any] | None = None
         candidate_data: bytes | None = None
         for _ in range(8):
@@ -128,7 +125,7 @@ def publish_exact_process_settlement(
             os.fsync(candidate_fd)
             identity = validate_private_regular_fd(
                 candidate_fd,
-                attempt_dir / candidate_name,
+                attempt.path / candidate_name,
             )
             if (
                 not stat.S_ISREG(identity.mode)
@@ -146,7 +143,7 @@ def publish_exact_process_settlement(
             )
             if readback != candidate_data:
                 raise ValueError("process settlement candidate readback differs")
-            actual = allocated_bytes(attempt_dir, entry_cap=1_000)
+            actual = allocated_bytes_fd(attempt.fd, entry_cap=1_000)
             if actual == retained_bytes:
                 break
             retained_bytes = actual
@@ -154,7 +151,7 @@ def publish_exact_process_settlement(
             raise ValueError("process settlement allocation proof did not converge")
 
         assert candidate is not None and candidate_data is not None
-        disk, exact_predecessor_raw, disk_digest = read_attempt_state(attempt_dir)
+        disk, exact_predecessor_raw, disk_digest = read_bound_attempt_state(attempt)
         if (
             disk != current
             or disk_digest != current_digest
@@ -163,7 +160,7 @@ def publish_exact_process_settlement(
             raise ValueError(
                 "process settlement predecessor changed before publication"
             )
-        if allocated_bytes(attempt_dir, entry_cap=1_000) != retained_bytes:
+        if allocated_bytes_fd(attempt.fd, entry_cap=1_000) != retained_bytes:
             raise ValueError("process settlement allocation changed before publication")
         final_candidate_readback = read_fd_exact(
             candidate_fd,
@@ -181,6 +178,7 @@ def publish_exact_process_settlement(
         )
         exchanged = True
         os.fsync(directory_fd)
+        attempt.revalidate(candidate)
 
         state_fd, published_identity = open_regular_at(
             directory_fd,
@@ -223,8 +221,9 @@ def publish_exact_process_settlement(
             or sha256_bytes(retained_predecessor) != current_digest
         ):
             raise ValueError("retained process settlement predecessor differs")
-        if allocated_bytes(attempt_dir, entry_cap=1_000) != retained_bytes:
+        if allocated_bytes_fd(attempt.fd, entry_cap=1_000) != retained_bytes:
             raise ValueError("published process settlement allocation differs")
+        attempt.revalidate(candidate)
         return candidate, sha256_bytes(candidate_data)
     finally:
         if candidate_fd is not None:

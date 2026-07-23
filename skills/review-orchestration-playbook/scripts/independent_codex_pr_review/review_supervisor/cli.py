@@ -145,26 +145,37 @@ def _internal_parser(mode: str) -> argparse.ArgumentParser:
         parser.add_argument("--attempt-dir", required=True, type=_absolute)
         parser.add_argument("--control-fd", required=True, type=int)
         parser.add_argument("--lease-fd", required=True, type=int)
+        parser.add_argument("--root-fd", required=True, type=int)
+        parser.add_argument("--attempt-fd", required=True, type=int)
         parser.add_argument("--token", required=True)
     elif mode == "_prompt-helper":
         parser.add_argument("--attempt-dir", required=True, type=_absolute)
         parser.add_argument("--control-fd", required=True, type=int)
         parser.add_argument("--lease-fd", required=True, type=int)
+        parser.add_argument("--root-fd", required=True, type=int)
+        parser.add_argument("--attempt-fd", required=True, type=int)
         parser.add_argument("--token", required=True)
     elif mode == "_prompt-verifier":
         parser.add_argument("--attempt-dir", required=True, type=_absolute)
         parser.add_argument("--control-fd", required=True, type=int)
         parser.add_argument("--lease-fd", required=True, type=int)
+        parser.add_argument("--root-fd", required=True, type=int)
+        parser.add_argument("--attempt-fd", required=True, type=int)
         parser.add_argument("--token", required=True)
     elif mode == "_authorization-helper":
         parser.add_argument("--attempt-dir", required=True, type=_absolute)
         parser.add_argument("--control-fd", required=True, type=int)
         parser.add_argument("--lease-fd", required=True, type=int)
+        parser.add_argument("--root-fd", required=True, type=int)
+        parser.add_argument("--attempt-fd", required=True, type=int)
         parser.add_argument("--outer-liveness-fd", required=True, type=int)
         parser.add_argument("--token", required=True)
     elif mode == "_checkout-worker":
         parser.add_argument("--attempt-dir", required=True, type=_absolute)
         parser.add_argument("--control-fd", required=True, type=int)
+        parser.add_argument("--lease-fd", required=True, type=int)
+        parser.add_argument("--root-fd", required=True, type=int)
+        parser.add_argument("--attempt-fd", required=True, type=int)
         parser.add_argument("--source-fd", required=True, type=int)
         parser.add_argument("--token", required=True)
     elif mode == "_fifo-reader":
@@ -177,6 +188,8 @@ def _internal_parser(mode: str) -> argparse.ArgumentParser:
         parser.add_argument("--attempt-dir", required=True, type=_absolute)
         parser.add_argument("--control-fd", required=True, type=int)
         parser.add_argument("--lease-fd", required=True, type=int)
+        parser.add_argument("--root-fd", required=True, type=int)
+        parser.add_argument("--attempt-fd", required=True, type=int)
         parser.add_argument("--handoff-token", required=True)
     elif mode == "_custody-helper":
         parser.add_argument("--control-fd", required=True, type=int)
@@ -197,6 +210,8 @@ def _run_internal(mode: str, argv: Sequence[str]) -> int:
             attempt_dir=arguments.attempt_dir,
             control_fd=arguments.control_fd,
             lease_fd=arguments.lease_fd,
+            root_fd=arguments.root_fd,
+            attempt_fd=arguments.attempt_fd,
             token=arguments.token,
         )
     if mode == "_prompt-helper":
@@ -204,6 +219,8 @@ def _run_internal(mode: str, argv: Sequence[str]) -> int:
             attempt_dir=arguments.attempt_dir,
             control_fd=arguments.control_fd,
             lease_fd=arguments.lease_fd,
+            root_fd=arguments.root_fd,
+            attempt_fd=arguments.attempt_fd,
             token=arguments.token,
         )
     if mode == "_prompt-verifier":
@@ -211,6 +228,8 @@ def _run_internal(mode: str, argv: Sequence[str]) -> int:
             attempt_dir=arguments.attempt_dir,
             control_fd=arguments.control_fd,
             lease_fd=arguments.lease_fd,
+            root_fd=arguments.root_fd,
+            attempt_fd=arguments.attempt_fd,
             token=arguments.token,
         )
     if mode == "_authorization-helper":
@@ -218,6 +237,8 @@ def _run_internal(mode: str, argv: Sequence[str]) -> int:
             attempt_dir=arguments.attempt_dir,
             control_fd=arguments.control_fd,
             lease_fd=arguments.lease_fd,
+            root_fd=arguments.root_fd,
+            attempt_fd=arguments.attempt_fd,
             outer_liveness_fd=arguments.outer_liveness_fd,
             token=arguments.token,
         )
@@ -225,6 +246,9 @@ def _run_internal(mode: str, argv: Sequence[str]) -> int:
         return checkout_worker_main(
             attempt_dir=arguments.attempt_dir,
             control_fd=arguments.control_fd,
+            lease_fd=arguments.lease_fd,
+            root_fd=arguments.root_fd,
+            attempt_fd=arguments.attempt_fd,
             source_fd=arguments.source_fd,
             token=arguments.token,
         )
@@ -249,6 +273,8 @@ def _run_internal(mode: str, argv: Sequence[str]) -> int:
         attempt_dir=arguments.attempt_dir,
         control_fd=arguments.control_fd,
         lease_fd=arguments.lease_fd,
+        root_fd=arguments.root_fd,
+        attempt_fd=arguments.attempt_fd,
         handoff_token=arguments.handoff_token,
     )
 

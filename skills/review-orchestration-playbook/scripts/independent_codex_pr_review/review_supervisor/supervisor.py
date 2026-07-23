@@ -51,12 +51,15 @@ from .gitraw import (
     manifest_digest,
 )
 from .ledger import (
+    AttemptLease,
     RetentionLease,
     acquire_retention_lease,
     calculate_admission,
     create_reserved_attempt,
-    read_attempt_state,
+    open_attempt_lease,
+    read_bound_attempt_state,
     reconcile_ledger,
+    remove_bound_attempt_directory,
 )
 from .models import HelperCustody, Identity
 from .process import (
@@ -87,6 +90,7 @@ from .recovery_cleanup import (
 )
 from .review_execution import projected_isolated_review_environment
 from .runtime import (
+    _authenticate_attempt_transfer,
     _cleanup_worktree,
     _compact_terminal,
     _kill_direct,
@@ -103,6 +107,7 @@ from .runtime import (
 )
 from .secureio import (
     allocated_bytes,
+    allocated_bytes_fd,
     boot_identifier,
     canonical_json,
     directory_identities_match,
@@ -110,7 +115,9 @@ from .secureio import (
     fsync_directory,
     identity_from_stat,
     measure_filesystem,
+    measure_filesystem_fd,
     open_absolute_directory_chain,
+    open_regular_at,
     open_regular_nofollow,
     read_fd_exact,
     require_private_directory,
@@ -286,6 +293,7 @@ def prepare_run(
     git_executable: str,
     codex_executable: str | None,
     snapshot: Any,
+    lease: RetentionLease,
 ) -> PreparedRun:
     pr_url = validate_canonical_pr_url(pr_url)
     helper = authenticate_helper_state(
@@ -310,6 +318,7 @@ def prepare_run(
     admission = calculate_admission(
         snapshot=snapshot,
         retention_root=retention_root,
+        lease=lease,
         checkout_parent=checkout_parent,
         common_git_dir=repository.common_git_dir,
         manifest=head_manifest,
@@ -399,6 +408,7 @@ def _prepare_with_reclamation(
                 git_executable=git_executable,
                 codex_executable=codex_executable,
                 snapshot=snapshot,
+                lease=lease,
             )
         except SupervisorError as error:
             if error.failure.code not in {
@@ -477,9 +487,8 @@ def preflight(
 def _spawn_attempt_supervisor(
     *,
     entrypoint: pathlib.Path,
-    attempt_dir: pathlib.Path,
+    attempt: AttemptLease,
     control_child: socket.socket,
-    lease_fd: int,
     token: str,
 ) -> SpawnedProcess:
     require_direct_process_closure_proven()
@@ -492,22 +501,31 @@ def _spawn_attempt_supervisor(
             "--entrypoint",
             str(entrypoint),
             "--attempt-dir",
-            str(attempt_dir),
+            str(attempt.path),
             "--control-fd",
             "3",
             "--lease-fd",
             "4",
+            "--root-fd",
+            "5",
+            "--attempt-fd",
+            "6",
             "--handoff-token",
             token,
         )
         try:
             return fork_exec(
                 argv,
-                cwd=attempt_dir,
+                cwd=attempt.path,
                 stdin_fd=devnull,
                 stdout_fd=devnull,
                 stderr_fd=devnull,
-                pass_fds=(control_child.fileno(), lease_fd),
+                pass_fds=(
+                    control_child.fileno(),
+                    attempt.retention.fd,
+                    attempt.retention.root_fd,
+                    attempt.fd,
+                ),
                 own_process_group=True,
             )
         except ForkedProcessClosureUnproven as error:
@@ -667,17 +685,15 @@ def _acquire_source_custody_via_helper(
 def _prequiescence_abort(
     *,
     entrypoint: pathlib.Path,
-    attempt_dir: pathlib.Path,
-    lease: RetentionLease,
+    attempt: AttemptLease,
     message: str,
 ) -> None:
     require_direct_process_closure_proven()
     try:
-        state, _, digest = read_attempt_state(attempt_dir)
+        state, _, digest = read_bound_attempt_state(attempt)
         state, digest = commit_via_helper(
             entrypoint=entrypoint,
-            attempt_dir=attempt_dir,
-            lease_fd=lease.fd,
+            attempt=attempt,
             state=state,
             state_digest=digest,
             updates={
@@ -698,9 +714,13 @@ def _prequiescence_abort(
             deadline=time.monotonic() + 30,
         )
         prompt_path = pathlib.Path(state["prompt_path"])
+        if prompt_path != attempt.path / "prompt.txt":
+            raise ValueError("prompt path differs from the attempt binding")
+        attempt.revalidate(state)
         try:
-            fd, identity = open_regular_nofollow(
-                prompt_path,
+            fd, identity = open_regular_at(
+                attempt.fd,
+                b"prompt.txt",
                 expected_uid=os.getuid(),
                 private_metadata=True,
             )
@@ -709,21 +729,20 @@ def _prequiescence_abort(
                 **state["prompt_identity"]
             ):
                 raise ValueError("prompt identity changed before pre-handoff cleanup")
-            os.unlink(prompt_path)
-            fsync_directory(prompt_path.parent)
+            os.unlink(b"prompt.txt", dir_fd=attempt.fd)
+            os.fsync(attempt.fd)
         except FileNotFoundError:
             pass
+        attempt.revalidate(state)
         state, digest = _cleanup_worktree(
             entrypoint=entrypoint,
-            attempt_dir=attempt_dir,
-            lease_fd=lease.fd,
+            attempt=attempt,
             state=state,
             state_digest=digest,
         )
         _settle_process(
             entrypoint=entrypoint,
-            attempt_dir=attempt_dir,
-            lease_fd=lease.fd,
+            attempt=attempt,
             state=state,
             state_digest=digest,
         )
@@ -734,12 +753,14 @@ def _prequiescence_abort(
 
 
 def _process_charge_fields(
-    attempt_dir: pathlib.Path,
+    attempt: AttemptLease,
     charge: int,
 ) -> dict[str, Any]:
     if type(charge) is not int or not 0 <= charge <= PROCESS_ENVELOPE_BYTES:
         raise ValueError("retained process charge is outside its envelope")
-    identity = measure_filesystem(attempt_dir).identity
+    attempt.revalidate()
+    identity = measure_filesystem_fd(attempt.fd).identity
+    attempt.revalidate()
     return {
         "retained_process_bytes": charge,
         "process_physical_remaining_by_fs": {identity: charge} if charge else {},
@@ -747,12 +768,14 @@ def _process_charge_fields(
 
 
 def _process_accounting_is_exact(
-    attempt_dir: pathlib.Path,
+    attempt: AttemptLease,
     state: dict[str, Any],
 ) -> bool:
     try:
-        measured = allocated_bytes(attempt_dir, entry_cap=1_000)
-        expected = _process_charge_fields(attempt_dir, measured)
+        attempt.revalidate(state)
+        measured = allocated_bytes_fd(attempt.fd, entry_cap=1_000)
+        attempt.revalidate(state)
+        expected = _process_charge_fields(attempt, measured)
     except (OSError, ValueError):
         return False
     return bool(
@@ -765,8 +788,7 @@ def _process_accounting_is_exact(
 def _commit_conservative_process_rewrite(
     *,
     entrypoint: pathlib.Path,
-    attempt_dir: pathlib.Path,
-    lease_fd: int,
+    attempt: AttemptLease,
     state: dict[str, Any],
     state_digest: str,
     updates: dict[str, Any],
@@ -775,13 +797,12 @@ def _commit_conservative_process_rewrite(
         raise ValueError("only exact process state can be rewritten conservatively")
     return commit_via_helper(
         entrypoint=entrypoint,
-        attempt_dir=attempt_dir,
-        lease_fd=lease_fd,
+        attempt=attempt,
         state=state,
         state_digest=state_digest,
         updates={
             **updates,
-            **_process_charge_fields(attempt_dir, PROCESS_ENVELOPE_BYTES),
+            **_process_charge_fields(attempt, PROCESS_ENVELOPE_BYTES),
         },
         deadline=time.monotonic() + 30,
     )
@@ -790,16 +811,17 @@ def _commit_conservative_process_rewrite(
 def _settle_rewritten_process_charge(
     *,
     entrypoint: pathlib.Path,
-    attempt_dir: pathlib.Path,
-    lease_fd: int,
+    attempt: AttemptLease,
     state: dict[str, Any],
     state_digest: str,
 ) -> tuple[dict[str, Any], str]:
     if state.get("process_settlement") != "exact":
         raise ValueError("rewritten process state is not exactly settleable")
     for _ in range(8):
-        measured = allocated_bytes(attempt_dir, entry_cap=1_000)
-        expected = _process_charge_fields(attempt_dir, measured)
+        attempt.revalidate(state)
+        measured = allocated_bytes_fd(attempt.fd, entry_cap=1_000)
+        attempt.revalidate(state)
+        expected = _process_charge_fields(attempt, measured)
         if (
             state.get("retained_process_bytes") == measured
             and state.get("process_physical_remaining_by_fs")
@@ -808,8 +830,7 @@ def _settle_rewritten_process_charge(
             return state, state_digest
         state, state_digest = commit_via_helper(
             entrypoint=entrypoint,
-            attempt_dir=attempt_dir,
-            lease_fd=lease_fd,
+            attempt=attempt,
             state=state,
             state_digest=state_digest,
             updates=expected,
@@ -821,8 +842,7 @@ def _settle_rewritten_process_charge(
 def _begin_final_authorization_rewrite(
     *,
     entrypoint: pathlib.Path,
-    attempt_dir: pathlib.Path,
-    lease_fd: int,
+    attempt: AttemptLease,
     state: dict[str, Any],
     state_digest: str,
     operation: str,
@@ -834,15 +854,14 @@ def _begin_final_authorization_rewrite(
         if existing["status"] != "complete":
             raise ValueError("final authorization rewrite is already pending")
     rewrite = build_final_authorization_rewrite(
-        attempt_dir=attempt_dir,
+        attempt=attempt,
         state=state,
         state_digest=state_digest,
         operation=operation,
     )
     return _commit_conservative_process_rewrite(
         entrypoint=entrypoint,
-        attempt_dir=attempt_dir,
-        lease_fd=lease_fd,
+        attempt=attempt,
         state=state,
         state_digest=state_digest,
         updates={**updates, "final_authorization_rewrite": rewrite},
@@ -852,8 +871,7 @@ def _begin_final_authorization_rewrite(
 def _complete_unauthed_final_authorization_rewrite(
     *,
     entrypoint: pathlib.Path,
-    attempt_dir: pathlib.Path,
-    lease_fd: int,
+    attempt: AttemptLease,
     state: dict[str, Any],
     state_digest: str,
 ) -> tuple[dict[str, Any], str]:
@@ -864,8 +882,7 @@ def _complete_unauthed_final_authorization_rewrite(
     if rewrite != completed:
         state, state_digest = commit_via_helper(
             entrypoint=entrypoint,
-            attempt_dir=attempt_dir,
-            lease_fd=lease_fd,
+            attempt=attempt,
             state=state,
             state_digest=state_digest,
             updates={"final_authorization_rewrite": completed},
@@ -873,8 +890,7 @@ def _complete_unauthed_final_authorization_rewrite(
         )
     return _settle_rewritten_process_charge(
         entrypoint=entrypoint,
-        attempt_dir=attempt_dir,
-        lease_fd=lease_fd,
+        attempt=attempt,
         state=state,
         state_digest=state_digest,
     )
@@ -1095,8 +1111,7 @@ def _final_authorization_record(
 def _publish_final_authorization(
     *,
     entrypoint: pathlib.Path,
-    attempt_dir: pathlib.Path,
-    lease: RetentionLease,
+    attempt: AttemptLease,
     state: dict[str, Any],
     state_digest: str,
     supervisor_binding: dict[str, Any],
@@ -1106,7 +1121,9 @@ def _publish_final_authorization(
         state, supervisor_binding, supervisor_exit_code
     )
     for _ in range(8):
-        measured = allocated_bytes(attempt_dir, entry_cap=1_000)
+        attempt.revalidate(state)
+        measured = allocated_bytes_fd(attempt.fd, entry_cap=1_000)
+        attempt.revalidate(state)
         authorization = _final_authorization_record(
             state=state,
             state_digest=state_digest,
@@ -1126,22 +1143,22 @@ def _publish_final_authorization(
         )
         state, state_digest = commit_via_helper(
             entrypoint=entrypoint,
-            attempt_dir=attempt_dir,
-            lease_fd=lease.fd,
+            attempt=attempt,
             state=state,
             state_digest=state_digest,
             updates={
                 "supervisor_exit_code": supervisor_exit_code,
                 "final_authorization": authorization,
                 **rewrite_updates,
-                **_process_charge_fields(attempt_dir, measured),
+                **_process_charge_fields(attempt, measured),
             },
             deadline=time.monotonic() + 30,
             request_type="final-authorization-commit",
         )
-        if allocated_bytes(attempt_dir, entry_cap=1_000) == state.get(
-            "retained_process_bytes"
-        ):
+        attempt.revalidate(state)
+        readback_charge = allocated_bytes_fd(attempt.fd, entry_cap=1_000)
+        attempt.revalidate(state)
+        if readback_charge == state.get("retained_process_bytes"):
             return state, state_digest
     raise ValueError("final authorization allocation accounting did not converge")
 
@@ -1164,6 +1181,7 @@ def run(
     require_private_directory(checkout_parent, create=True)
     lease = acquire_retention_lease(retention_root, deadline=time.monotonic() + 30)
     attempt_dir: pathlib.Path | None = None
+    attempt: AttemptLease | None = None
     supervisor: SpawnedProcess | None = None
     supervisor_binding: dict[str, Any] | None = None
     parent, child = socket_pair()
@@ -1201,10 +1219,13 @@ def run(
             exec_budget=prepared.exec_budget,
             attempt_id=prepared.attempt_id,
         )
+        attempt = open_attempt_lease(lease, attempt_dir)
+        disk_state, _, disk_digest = read_bound_attempt_state(attempt)
+        if disk_state != state or disk_digest != state_digest:
+            raise ValueError("reserved attempt binding readback failed")
         state, state_digest = publish_prompt_via_helper(
             entrypoint=entrypoint,
-            attempt_dir=attempt_dir,
-            lease_fd=lease.fd,
+            attempt=attempt,
             state=state,
             state_digest=state_digest,
             prompt=prepared.prompt,
@@ -1214,24 +1235,25 @@ def run(
         token = os.urandom(32).hex()
         supervisor = _spawn_attempt_supervisor(
             entrypoint=entrypoint,
-            attempt_dir=attempt_dir,
+            attempt=attempt,
             control_child=child,
-            lease_fd=lease.fd,
             token=token,
         )
         incomplete_handoff_writers_stopped = False
         child.close()
         await_exec(supervisor, deadline=handoff_deadline)
-        ready, _ = receive_record(parent, deadline=handoff_deadline)
-        if (
-            ready.get("type") != "attempt-supervisor-ready"
-            or ready.get("token") != token
-            or ready.get("pid") != supervisor.pid
-        ):
-            raise ValueError("attempt supervisor ready record is invalid")
+        _authenticate_attempt_transfer(
+            control=parent,
+            process=supervisor,
+            attempt=attempt,
+            token=token,
+            ready_type="attempt-supervisor-ready",
+            deadline=handoff_deadline,
+            ready_extra={"start_identity": supervisor.start_identity},
+        )
         supervisor_binding = {
             "pid": supervisor.pid,
-            "start_identity": ready.get("start_identity"),
+            "start_identity": supervisor.start_identity,
         }
         custody = _acquire_source_custody_via_helper(
             entrypoint=entrypoint,
@@ -1253,8 +1275,7 @@ def run(
             raise ValueError("attempt supervisor did not accept source custody")
         state, state_digest = commit_via_helper(
             entrypoint=entrypoint,
-            attempt_dir=attempt_dir,
-            lease_fd=lease.fd,
+            attempt=attempt,
             state=state,
             state_digest=state_digest,
             updates={
@@ -1262,7 +1283,7 @@ def run(
                 "handoff_token": token,
                 "supervisor": {
                     "pid": supervisor.pid,
-                    "start_identity": ready.get("start_identity"),
+                    "start_identity": supervisor.start_identity,
                 },
                 "source_custody_transferred": True,
             },
@@ -1278,7 +1299,7 @@ def run(
             or accepted.get("state_sha256") is None
         ):
             raise ValueError("attempt supervisor handoff acceptance is invalid")
-        disk_state, _, disk_digest = read_attempt_state(attempt_dir)
+        disk_state, _, disk_digest = read_bound_attempt_state(attempt)
         if (
             disk_digest != accepted["state_sha256"]
             or disk_state.get("handoff") != "accepted"
@@ -1290,7 +1311,7 @@ def run(
         complete, _ = receive_record(parent, deadline=handoff_deadline)
         if complete.get("type") != "handoff-complete" or complete.get("token") != token:
             raise ValueError("attempt supervisor ownership completion is invalid")
-        disk_state, _, disk_digest = read_attempt_state(attempt_dir)
+        disk_state, _, disk_digest = read_bound_attempt_state(attempt)
         if (
             disk_digest != complete.get("state_sha256")
             or disk_state.get("handoff") != "complete"
@@ -1309,6 +1330,8 @@ def run(
         )
         custody.close()
         custody = None
+        attempt.close()
+        attempt = None
         lease.close()
 
         terminal_deadline = (
@@ -1333,29 +1356,33 @@ def run(
             with acquire_retention_lease(
                 retention_root, deadline=time.monotonic() + 30
             ) as completion_lease:
-                completed_state, _, completed_digest = read_attempt_state(attempt_dir)
-                if _compact_terminal(completed_state) != summary:
-                    raise ValueError(
-                        "attempt terminal summary differs from durable terminal state"
+                with open_attempt_lease(
+                    completion_lease, attempt_dir
+                ) as completion_attempt:
+                    completed_state, _, completed_digest = read_bound_attempt_state(
+                        completion_attempt
                     )
-                completed_state, completed_digest = _publish_final_authorization(
-                    entrypoint=entrypoint,
-                    attempt_dir=attempt_dir,
-                    lease=completion_lease,
-                    state=completed_state,
-                    state_digest=completed_digest,
-                    supervisor_binding=supervisor_binding,
-                    supervisor_exit_code=exit_code,
-                )
-                if not _has_exact_final_authorization(
-                    attempt_dir,
-                    completed_state,
-                ):
-                    raise ValueError("published final authorization is not exact")
-                summary = _compact_terminal(
-                    completed_state,
-                    final_authorization_exact=True,
-                )
+                    if _compact_terminal(completed_state) != summary:
+                        raise ValueError(
+                            "attempt terminal summary differs from durable terminal state"
+                        )
+                    completed_state, completed_digest = _publish_final_authorization(
+                        entrypoint=entrypoint,
+                        attempt=completion_attempt,
+                        state=completed_state,
+                        state_digest=completed_digest,
+                        supervisor_binding=supervisor_binding,
+                        supervisor_exit_code=exit_code,
+                    )
+                    if not _has_exact_final_authorization(
+                        completion_attempt,
+                        completed_state,
+                    ):
+                        raise ValueError("published final authorization is not exact")
+                    summary = _compact_terminal(
+                        completed_state,
+                        final_authorization_exact=True,
+                    )
         return exit_code, summary
     except BaseException as caught_error:
         failure_error = caught_error
@@ -1387,6 +1414,7 @@ def run(
             attempt_dir is not None
             and not ownership_complete
             and incomplete_handoff_writers_stopped
+            and attempt is not None
             and lease.fd >= 0
             and not isinstance(failure_error, UnprovenDirectHelperClosure)
             and direct_process_closure_failure() is None
@@ -1394,8 +1422,7 @@ def run(
             try:
                 _prequiescence_abort(
                     entrypoint=entrypoint,
-                    attempt_dir=attempt_dir,
-                    lease=lease,
+                    attempt=attempt,
                     message=(f"{type(failure_error).__name__}: {failure_error}"),
                 )
             except (
@@ -1427,6 +1454,8 @@ def run(
         child.close()
         if custody is not None:
             custody.close()
+        if attempt is not None:
+            attempt.close()
         lease.close()
 
 
@@ -1437,62 +1466,45 @@ def _normalize_absolute(path: pathlib.Path) -> pathlib.Path:
     return normalized
 
 
-def _bound_identity(value: Any) -> Identity:
-    fields = {"device", "inode", "mode", "link_count", "uid", "size"}
-    if (
-        not isinstance(value, dict)
-        or set(value) != fields
-        or any(type(value[field]) is not int for field in fields)
-    ):
-        raise ValueError("directory binding identity is malformed")
-    return Identity(**value)
-
-
-def _validate_attempt_directory(
+def _normalize_attempt_directory(
     retention_root: pathlib.Path,
     attempt_dir: pathlib.Path,
 ) -> tuple[pathlib.Path, pathlib.Path]:
     root = _normalize_absolute(retention_root)
     attempt = _normalize_absolute(attempt_dir)
-    root_identity = require_private_directory(root)
     match = ATTEMPT_NAME_PATTERN.fullmatch(attempt.name)
     if attempt.parent != root or match is None:
         raise ValueError(
             "attempt directory is not an exact child of the retention root"
         )
-    attempt_identity = require_private_directory(attempt)
-    state, _, _ = read_attempt_state(attempt)
-    if state.get("attempt_id") != match.group(1):
-        raise ValueError("attempt directory name does not match durable state")
-    root_binding = state.get("retention_root_binding")
-    if root_binding is not None and (
-        not isinstance(root_binding, dict)
-        or pathlib.Path(root_binding.get("path", "")) != root
-        or not directory_identities_match(
-            root_identity,
-            _bound_identity(root_binding.get("identity")),
-        )
-    ):
-        raise ValueError("retention root differs from the durable binding")
-    attempt_binding = state.get("attempt_directory_binding")
-    if attempt_binding is not None and (
-        not isinstance(attempt_binding, dict)
-        or pathlib.Path(attempt_binding.get("path", "")) != attempt
-        or not directory_identities_match(
-            attempt_identity,
-            _bound_identity(attempt_binding.get("identity")),
-        )
-    ):
-        raise ValueError("attempt directory differs from the durable binding")
     return root, attempt
 
 
-def _list_attempt_directories(retention_root: pathlib.Path) -> tuple[pathlib.Path, ...]:
-    root = _normalize_absolute(retention_root)
-    require_private_directory(root)
-    root_fd, _ = open_absolute_directory_chain(root, private_leaf=True)
+def _open_validated_attempt(
+    lease: RetentionLease,
+    attempt_dir: pathlib.Path,
+) -> AttemptLease:
+    root, attempt_path = _normalize_attempt_directory(lease.root, attempt_dir)
+    if root != lease.root:
+        raise ValueError("retention lease does not bind the attempt root")
+    attempt = open_attempt_lease(lease, attempt_path)
     try:
-        names = tuple(os.fsencode(value) for value in os.listdir(root_fd))
+        state, _, _ = read_bound_attempt_state(attempt)
+        match = ATTEMPT_NAME_PATTERN.fullmatch(attempt_path.name)
+        assert match is not None
+        if state.get("attempt_id") != match.group(1):
+            raise ValueError("attempt directory name does not match durable state")
+        return attempt
+    except BaseException:
+        attempt.close()
+        raise
+
+
+def _list_attempt_directories(lease: RetentionLease) -> tuple[pathlib.Path, ...]:
+    lease.revalidate_root()
+    scan_fd = os.dup(lease.root_fd)
+    try:
+        names = tuple(os.fsencode(value) for value in os.listdir(scan_fd))
         if len(names) > 10_001:
             raise ValueError("retention root contains too many entries")
         attempts: list[pathlib.Path] = []
@@ -1500,7 +1512,9 @@ def _list_attempt_directories(retention_root: pathlib.Path) -> tuple[pathlib.Pat
             if name == b"retention.lock":
                 continue
             text = os.fsdecode(name)
-            metadata = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            metadata = os.stat(
+                name, dir_fd=lease.root_fd, follow_symlinks=False
+            )
             if ATTEMPT_NAME_PATTERN.fullmatch(text) is None or not stat.S_ISDIR(
                 metadata.st_mode
             ):
@@ -1510,10 +1524,12 @@ def _list_attempt_directories(retention_root: pathlib.Path) -> tuple[pathlib.Pat
                 or stat.S_IMODE(metadata.st_mode) != 0o700
             ):
                 raise ValueError("retained attempt has unsafe ownership or mode")
-            attempts.append(root / text)
+            attempts.append(lease.root / text)
+            lease.revalidate_root()
         return tuple(sorted(attempts))
     finally:
-        os.close(root_fd)
+        os.close(scan_fd)
+        lease.revalidate_root()
 
 
 def _owner_liveness(state: dict[str, Any], current_boot: str) -> dict[str, Any]:
@@ -1541,34 +1557,38 @@ def status(
     attempt_dir: pathlib.Path | None = None,
 ) -> dict[str, Any]:
     root = _normalize_absolute(retention_root)
-    paths = (
-        (_validate_attempt_directory(root, attempt_dir)[1],)
-        if attempt_dir is not None
-        else _list_attempt_directories(root)
-    )
     current_boot = boot_identifier()
     attempts: list[dict[str, Any]] = []
-    for path in paths:
-        state, raw, digest = read_attempt_state(path)
-        final_authorization_exact = _has_exact_final_authorization(path, state)
-        attempts.append(
-            {
-                **_compact_terminal(
-                    state,
-                    final_authorization_exact=final_authorization_exact,
-                ),
-                "phase": state.get("phase"),
-                "handoff": state.get("handoff"),
-                "closure": state.get("closure"),
-                "process_settlement": state.get("process_settlement"),
-                "checkout_settlement": state.get("checkout_settlement"),
-                "retention_state": state.get("retention_state"),
-                "record_generation": state.get("record_generation"),
-                "state_length": len(raw),
-                "state_sha256": digest,
-                "owner": _owner_liveness(state, current_boot),
-            }
+    with acquire_retention_lease(root, deadline=time.monotonic() + 30) as lease:
+        paths = (
+            (_normalize_attempt_directory(root, attempt_dir)[1],)
+            if attempt_dir is not None
+            else _list_attempt_directories(lease)
         )
+        for path in paths:
+            with _open_validated_attempt(lease, path) as attempt:
+                state, raw, digest = read_bound_attempt_state(attempt)
+                final_authorization_exact = _has_exact_final_authorization(
+                    attempt, state
+                )
+                attempts.append(
+                    {
+                        **_compact_terminal(
+                            state,
+                            final_authorization_exact=final_authorization_exact,
+                        ),
+                        "phase": state.get("phase"),
+                        "handoff": state.get("handoff"),
+                        "closure": state.get("closure"),
+                        "process_settlement": state.get("process_settlement"),
+                        "checkout_settlement": state.get("checkout_settlement"),
+                        "retention_state": state.get("retention_state"),
+                        "record_generation": state.get("record_generation"),
+                        "state_length": len(raw),
+                        "state_sha256": digest,
+                        "owner": _owner_liveness(state, current_boot),
+                    }
+                )
     return {
         "status": "ok",
         "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
@@ -1580,10 +1600,11 @@ def status(
 
 
 def _validate_final_authorization(
-    attempt: pathlib.Path,
+    attempt: AttemptLease,
     state: dict[str, Any],
 ) -> dict[str, Any]:
-    _validate_terminal_lifecycle(attempt, state)
+    attempt.revalidate(state)
+    _validate_terminal_lifecycle(attempt.path, state)
     supervisor_binding = state.get("supervisor")
     if (
         not isinstance(supervisor_binding, dict)
@@ -1630,7 +1651,8 @@ def _validate_final_authorization(
     }
     if authorization.get("binding_sha256") != sha256_bytes(canonical_json(payload)):
         raise ValueError("final authorization binding digest is invalid")
-    measured = allocated_bytes(attempt, entry_cap=1_000)
+    measured = allocated_bytes_fd(attempt.fd, entry_cap=1_000)
+    attempt.revalidate(state)
     expected_charge = _process_charge_fields(attempt, measured)
     if (
         state.get("retained_process_bytes") != measured
@@ -1647,7 +1669,7 @@ def _validate_final_authorization(
 
 
 def _has_exact_final_authorization(
-    attempt: pathlib.Path,
+    attempt: AttemptLease,
     state: dict[str, Any],
 ) -> bool:
     try:
@@ -1662,55 +1684,64 @@ def final_result(
     retention_root: pathlib.Path,
     attempt_dir: pathlib.Path,
 ) -> dict[str, Any]:
-    _, attempt = _validate_attempt_directory(retention_root, attempt_dir)
-    state, _, state_digest = read_attempt_state(attempt)
-    if (
-        state.get("process_settlement") != "exact"
-        or state.get("review_status") not in {"clean", "findings"}
-        or state.get("terminal_commit_authorized") is not True
-    ):
-        raise blocked(
-            "attempt has no exactly settled authorized review artifact",
-            stage="output",
-            code="final-evidence-unavailable",
-        )
-    try:
-        seal = _validate_final_authorization(attempt, state)
-    except (OSError, TypeError, ValueError) as error:
-        raise inconclusive(
-            f"durable final authorization is invalid: {error}",
-            stage="output",
-            code="final-authorization-invalid",
-        ) from error
-    if not isinstance(seal, dict) or not isinstance(seal.get("identity"), dict):
-        raise inconclusive(
-            "durable final seal is malformed",
-            stage="output",
-            code="final-seal-invalid",
-        )
-    final_path = pathlib.Path(seal.get("path", ""))
-    if final_path != attempt / "final.txt":
-        raise inconclusive(
-            "durable final seal path escaped the attempt directory",
-            stage="output",
-            code="final-seal-invalid",
-        )
-    fd, identity = open_regular_nofollow(
-        final_path,
-        expected_uid=os.getuid(),
-        private_metadata=True,
-    )
-    try:
-        expected_identity = Identity(**seal["identity"])
-        if identity != expected_identity or seal.get("length") != identity.size:
-            raise ValueError("final artifact identity or length differs from its seal")
-        content = read_fd_exact(
-            fd,
-            max_bytes=FINAL_MESSAGE_BYTES,
-            expected_size=identity.size,
-        )
-    finally:
-        os.close(fd)
+    root, attempt_path = _normalize_attempt_directory(retention_root, attempt_dir)
+    with acquire_retention_lease(root, deadline=time.monotonic() + 30) as lease:
+        with _open_validated_attempt(lease, attempt_path) as attempt:
+            state, _, state_digest = read_bound_attempt_state(attempt)
+            if (
+                state.get("process_settlement") != "exact"
+                or state.get("review_status") not in {"clean", "findings"}
+                or state.get("terminal_commit_authorized") is not True
+            ):
+                raise blocked(
+                    "attempt has no exactly settled authorized review artifact",
+                    stage="output",
+                    code="final-evidence-unavailable",
+                )
+            try:
+                seal = _validate_final_authorization(attempt, state)
+            except (OSError, TypeError, ValueError) as error:
+                raise inconclusive(
+                    f"durable final authorization is invalid: {error}",
+                    stage="output",
+                    code="final-authorization-invalid",
+                ) from error
+            if not isinstance(seal, dict) or not isinstance(
+                seal.get("identity"), dict
+            ):
+                raise inconclusive(
+                    "durable final seal is malformed",
+                    stage="output",
+                    code="final-seal-invalid",
+                )
+            final_path = pathlib.Path(seal.get("path", ""))
+            if final_path != attempt.path / "final.txt":
+                raise inconclusive(
+                    "durable final seal path escaped the attempt directory",
+                    stage="output",
+                    code="final-seal-invalid",
+                )
+            attempt.revalidate(state)
+            fd, identity = open_regular_at(
+                attempt.fd,
+                b"final.txt",
+                expected_uid=os.getuid(),
+                private_metadata=True,
+            )
+            try:
+                expected_identity = Identity(**seal["identity"])
+                if identity != expected_identity or seal.get("length") != identity.size:
+                    raise ValueError(
+                        "final artifact identity or length differs from its seal"
+                    )
+                content = read_fd_exact(
+                    fd,
+                    max_bytes=FINAL_MESSAGE_BYTES,
+                    expected_size=identity.size,
+                )
+            finally:
+                os.close(fd)
+            attempt.revalidate(state)
     digest = sha256_bytes(content)
     if seal.get("sha256") != digest:
         raise inconclusive(
@@ -1739,14 +1770,14 @@ def final_result(
 
 
 def _validate_process_inventory(
-    attempt_dir: pathlib.Path,
+    attempt: AttemptLease,
     state: dict[str, Any],
     *,
     allow_fifo: bool,
 ) -> dict[str, Any]:
-    directory_fd, identity = open_absolute_directory_chain(
-        attempt_dir, private_leaf=True
-    )
+    attempt.revalidate(state)
+    directory_fd = os.dup(attempt.fd)
+    identity = identity_from_stat(os.fstat(directory_fd))
     try:
         if identity.uid != os.getuid() or stat.S_IMODE(identity.mode) != 0o700:
             raise ValueError("attempt inventory root identity is unsafe")
@@ -1776,10 +1807,28 @@ def _validate_process_inventory(
                 ):
                     raise ValueError("retained review runtime identity is unsafe")
                 runtime_identity = identity_from_stat(metadata).to_json()
-                runtime_allocated_bytes = allocated_bytes(
-                    attempt_dir / name,
-                    entry_cap=RUNTIME_CLEANUP_ENTRY_CAP,
+                runtime_fd = os.open(
+                    raw_name,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_CLOEXEC
+                    | os.O_NOFOLLOW,
+                    dir_fd=directory_fd,
                 )
+                try:
+                    if not directory_identities_match(
+                        identity_from_stat(os.fstat(runtime_fd)),
+                        identity_from_stat(metadata),
+                    ):
+                        raise OSError(
+                            "retained review runtime identity changed"
+                        )
+                    runtime_allocated_bytes = allocated_bytes_fd(
+                        runtime_fd,
+                        entry_cap=RUNTIME_CLEANUP_ENTRY_CAP,
+                    )
+                finally:
+                    os.close(runtime_fd)
                 continue
             if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
                 raise ValueError(
@@ -1817,7 +1866,7 @@ def _validate_process_inventory(
             raise ValueError("attempt inventory has no state record")
         return {
             "entry_count": len(names),
-            "allocated_bytes": allocated_bytes(attempt_dir, entry_cap=1_000),
+            "allocated_bytes": allocated_bytes_fd(directory_fd, entry_cap=1_000),
             "compressed_log_bytes": log_bytes,
             "temporary_names": sorted(temporary_names),
             "runtime_identity": runtime_identity,
@@ -1825,14 +1874,16 @@ def _validate_process_inventory(
         }
     finally:
         os.close(directory_fd)
+        attempt.revalidate(state)
 
 
 def _remove_recovery_artifacts(
-    attempt_dir: pathlib.Path,
+    attempt: AttemptLease,
     state: dict[str, Any],
     inventory: dict[str, Any],
 ) -> dict[str, Any]:
-    directory_fd, _ = open_absolute_directory_chain(attempt_dir, private_leaf=True)
+    attempt.revalidate(state)
+    directory_fd = os.dup(attempt.fd)
     prompt_result = "absent"
     removed_temporaries: list[str] = []
     runtime_cleanup: dict[str, Any] | None = None
@@ -1849,7 +1900,7 @@ def _remove_recovery_artifacts(
             os.unlink(raw_name, dir_fd=directory_fd)
             removed_temporaries.append(name)
         prompt_path = pathlib.Path(state["prompt_path"])
-        if prompt_path != attempt_dir / "prompt.txt":
+        if prompt_path != attempt.path / "prompt.txt":
             raise ValueError("reserved prompt path escaped the attempt directory")
         try:
             metadata = os.stat(
@@ -1900,7 +1951,7 @@ def _remove_recovery_artifacts(
                         expected_identity=Identity(**runtime_identity),
                     ),
                 ),
-                manifest_path=attempt_dir / RUNTIME_CLEANUP_MANIFEST,
+                manifest_path=attempt.path / RUNTIME_CLEANUP_MANIFEST,
                 entry_cap=RUNTIME_CLEANUP_ENTRY_CAP,
                 payload_cap=RUNTIME_CLEANUP_PAYLOAD_CAP,
                 deadline=time.monotonic() + 30,
@@ -1919,6 +1970,7 @@ def _remove_recovery_artifacts(
             os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
+        attempt.revalidate(state)
     return {
         "prompt_reconciliation": prompt_result,
         "removed_state_temporaries": removed_temporaries,
@@ -1927,10 +1979,12 @@ def _remove_recovery_artifacts(
 
 
 def _remove_exact_settled_runtime(
-    attempt_dir: pathlib.Path,
+    attempt: AttemptLease,
+    state: dict[str, Any],
     inventory: dict[str, Any],
 ) -> dict[str, Any]:
-    directory_fd, _ = open_absolute_directory_chain(attempt_dir, private_leaf=True)
+    attempt.revalidate(state)
+    directory_fd = os.dup(attempt.fd)
     removed_temporaries: list[str] = []
     runtime_cleanup: dict[str, Any] | None = None
     try:
@@ -1960,7 +2014,7 @@ def _remove_exact_settled_runtime(
                         expected_identity=Identity(**runtime_identity),
                     ),
                 ),
-                manifest_path=attempt_dir / RUNTIME_CLEANUP_MANIFEST,
+                manifest_path=attempt.path / RUNTIME_CLEANUP_MANIFEST,
                 entry_cap=RUNTIME_CLEANUP_ENTRY_CAP,
                 payload_cap=RUNTIME_CLEANUP_PAYLOAD_CAP,
                 deadline=time.monotonic() + 30,
@@ -1979,6 +2033,7 @@ def _remove_exact_settled_runtime(
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
+        attempt.revalidate(state)
     return {
         "removed_state_temporaries": removed_temporaries,
         "retained_runtime_cleanup": runtime_cleanup,
@@ -1988,8 +2043,7 @@ def _remove_exact_settled_runtime(
 def _recover_exact_settled_runtime(
     *,
     entrypoint: pathlib.Path,
-    attempt: pathlib.Path,
-    lease: RetentionLease,
+    attempt: AttemptLease,
     state: dict[str, Any],
     state_digest: str,
     inventory: dict[str, Any],
@@ -1998,8 +2052,7 @@ def _recover_exact_settled_runtime(
     if rewrite is None:
         state, state_digest = _begin_final_authorization_rewrite(
             entrypoint=entrypoint,
-            attempt_dir=attempt,
-            lease_fd=lease.fd,
+            attempt=attempt,
             state=state,
             state_digest=state_digest,
             operation="runtime-cleanup",
@@ -2011,8 +2064,7 @@ def _recover_exact_settled_runtime(
         if rewrite["status"] == "complete":
             state, state_digest = _begin_final_authorization_rewrite(
                 entrypoint=entrypoint,
-                attempt_dir=attempt,
-                lease_fd=lease.fd,
+                attempt=attempt,
                 state=state,
                 state_digest=state_digest,
                 operation="runtime-cleanup",
@@ -2022,19 +2074,17 @@ def _recover_exact_settled_runtime(
         elif rewrite["operation"] != "runtime-cleanup":
             raise ValueError("another process rewrite operation is outstanding")
 
-    _remove_exact_settled_runtime(attempt, inventory)
+    _remove_exact_settled_runtime(attempt, state, inventory)
     state, state_digest = _settle_rewritten_process_charge(
         entrypoint=entrypoint,
-        attempt_dir=attempt,
-        lease_fd=lease.fd,
+        attempt=attempt,
         state=state,
         state_digest=state_digest,
     )
     if rewrite["authorization_required"]:
         state, state_digest = _publish_final_authorization(
             entrypoint=entrypoint,
-            attempt_dir=attempt,
-            lease=lease,
+            attempt=attempt,
             state=state,
             state_digest=state_digest,
             supervisor_binding=state.get("supervisor"),
@@ -2045,8 +2095,7 @@ def _recover_exact_settled_runtime(
     else:
         state, state_digest = _complete_unauthed_final_authorization_rewrite(
             entrypoint=entrypoint,
-            attempt_dir=attempt,
-            lease_fd=lease.fd,
+            attempt=attempt,
             state=state,
             state_digest=state_digest,
         )
@@ -2056,8 +2105,7 @@ def _recover_exact_settled_runtime(
 def _finish_release_authorization_rewrite(
     *,
     entrypoint: pathlib.Path,
-    attempt: pathlib.Path,
-    lease: RetentionLease,
+    attempt: AttemptLease,
     state: dict[str, Any],
     state_digest: str,
 ) -> tuple[dict[str, Any], str, bool]:
@@ -2066,16 +2114,14 @@ def _finish_release_authorization_rewrite(
         raise ValueError("release recovery has another rewrite operation")
     state, state_digest = _settle_rewritten_process_charge(
         entrypoint=entrypoint,
-        attempt_dir=attempt,
-        lease_fd=lease.fd,
+        attempt=attempt,
         state=state,
         state_digest=state_digest,
     )
     if rewrite["authorization_required"]:
         state, state_digest = _publish_final_authorization(
             entrypoint=entrypoint,
-            attempt_dir=attempt,
-            lease=lease,
+            attempt=attempt,
             state=state,
             state_digest=state_digest,
             supervisor_binding=state.get("supervisor"),
@@ -2086,8 +2132,7 @@ def _finish_release_authorization_rewrite(
         return state, state_digest, True
     state, state_digest = _complete_unauthed_final_authorization_rewrite(
         entrypoint=entrypoint,
-        attempt_dir=attempt,
-        lease_fd=lease.fd,
+        attempt=attempt,
         state=state,
         state_digest=state_digest,
     )
@@ -2102,9 +2147,12 @@ def recover(
     retention_root: pathlib.Path,
     attempt_dir: pathlib.Path,
 ) -> tuple[int, dict[str, Any]]:
-    root, attempt = _validate_attempt_directory(retention_root, attempt_dir)
-    with acquire_retention_lease(root, deadline=time.monotonic() + 30) as lease:
-        state, _, digest = read_attempt_state(attempt)
+    root, attempt_path = _normalize_attempt_directory(retention_root, attempt_dir)
+    lease = acquire_retention_lease(root, deadline=time.monotonic() + 30)
+    attempt: AttemptLease | None = None
+    try:
+        attempt = _open_validated_attempt(lease, attempt_path)
+        state, _, digest = read_bound_attempt_state(attempt)
         settlements_exact = (
             state.get("process_settlement") == "exact"
             and state.get("checkout_settlement") == "exact"
@@ -2141,7 +2189,6 @@ def recover(
                     _finish_release_authorization_rewrite(
                         entrypoint=entrypoint,
                         attempt=attempt,
-                        lease=lease,
                         state=state,
                         state_digest=digest,
                     )
@@ -2206,7 +2253,6 @@ def recover(
                 state, digest = _recover_exact_settled_runtime(
                     entrypoint=entrypoint,
                     attempt=attempt,
-                    lease=lease,
                     state=state,
                     state_digest=digest,
                     inventory=exact_inventory,
@@ -2277,8 +2323,7 @@ def recover(
         if process_was_exact:
             state, digest = _commit_conservative_process_rewrite(
                 entrypoint=entrypoint,
-                attempt_dir=attempt,
-                lease_fd=lease.fd,
+                attempt=attempt,
                 state=state,
                 state_digest=digest,
                 updates={},
@@ -2308,8 +2353,7 @@ def recover(
             )
         state, digest = commit_via_helper(
             entrypoint=entrypoint,
-            attempt_dir=attempt,
-            lease_fd=lease.fd,
+            attempt=attempt,
             state=state,
             state_digest=digest,
             updates={
@@ -2349,16 +2393,14 @@ def recover(
             try:
                 state, digest = _cleanup_worktree(
                     entrypoint=entrypoint,
-                    attempt_dir=attempt,
-                    lease_fd=lease.fd,
+                    attempt=attempt,
                     state=state,
                     state_digest=digest,
                 )
             except BaseException as cleanup_error:
                 state, digest = commit_via_helper(
                     entrypoint=entrypoint,
-                    attempt_dir=attempt,
-                    lease_fd=lease.fd,
+                    attempt=attempt,
                     state=state,
                     state_digest=digest,
                     updates={
@@ -2374,16 +2416,14 @@ def recover(
         if state.get("process_settlement") != "exact":
             state, digest = _settle_process(
                 entrypoint=entrypoint,
-                attempt_dir=attempt,
-                lease_fd=lease.fd,
+                attempt=attempt,
                 state=state,
                 state_digest=digest,
             )
         else:
             state, digest = _settle_rewritten_process_charge(
                 entrypoint=entrypoint,
-                attempt_dir=attempt,
-                lease_fd=lease.fd,
+                attempt=attempt,
                 state=state,
                 state_digest=digest,
             )
@@ -2395,6 +2435,10 @@ def recover(
                 "state_sha256": digest,
             },
         )
+    finally:
+        if attempt is not None:
+            attempt.close()
+        lease.close()
 
 
 def release(
@@ -2406,9 +2450,12 @@ def release(
 ) -> tuple[int, dict[str, Any]]:
     if reason not in {"resolved", "handoff-complete"}:
         raise ValueError("release reason must be resolved or handoff-complete")
-    root, attempt = _validate_attempt_directory(retention_root, attempt_dir)
-    with acquire_retention_lease(root, deadline=time.monotonic() + 30) as lease:
-        state, _, digest = read_attempt_state(attempt)
+    root, attempt_path = _normalize_attempt_directory(retention_root, attempt_dir)
+    lease = acquire_retention_lease(root, deadline=time.monotonic() + 30)
+    attempt: AttemptLease | None = None
+    try:
+        attempt = _open_validated_attempt(lease, attempt_path)
+        state, _, digest = read_bound_attempt_state(attempt)
         final_authorization_exact = _has_exact_final_authorization(attempt, state)
         process_accounting_exact = _process_accounting_is_exact(attempt, state)
         rewrite = state.get("final_authorization_rewrite")
@@ -2468,8 +2515,7 @@ def release(
         if rewrite is None:
             state, digest = _begin_final_authorization_rewrite(
                 entrypoint=entrypoint,
-                attempt_dir=attempt,
-                lease_fd=lease.fd,
+                attempt=attempt,
                 state=state,
                 state_digest=digest,
                 operation="release",
@@ -2484,7 +2530,6 @@ def release(
             _finish_release_authorization_rewrite(
                 entrypoint=entrypoint,
                 attempt=attempt,
-                lease=lease,
                 state=state,
                 state_digest=digest,
             )
@@ -2497,6 +2542,10 @@ def release(
             ),
             "state_sha256": digest,
         }
+    finally:
+        if attempt is not None:
+            attempt.close()
+        lease.close()
 
 
 def _released_at(state: dict[str, Any]) -> float:
@@ -2509,37 +2558,44 @@ def _released_at(state: dict[str, Any]) -> float:
 
 
 def _released_attempt_candidates(
-    root: pathlib.Path,
+    lease: RetentionLease,
     *,
     released_before: float | None,
 ) -> tuple[pathlib.Path, ...]:
     candidates: list[tuple[float, str, pathlib.Path]] = []
-    for attempt in _list_attempt_directories(root):
-        state, _, _ = read_attempt_state(attempt)
-        retention_state = state.get("retention_state")
-        if retention_state not in {"released", "reclaiming", "reclaimed"}:
-            continue
-        released_at = _released_at(state)
-        if (
-            state.get("process_settlement") != "exact"
-            or state.get("checkout_settlement") != "exact"
-            or state.get("worktree_status") == "manual-recovery-required"
-        ):
-            if retention_state in {"reclaiming", "reclaimed"}:
-                raise ValueError("interrupted reclaim is no longer exactly eligible")
-            continue
-        if (
-            retention_state == "released"
-            and released_before is not None
-            and released_at > released_before
-        ):
-            continue
-        candidates.append((released_at, attempt.name, attempt))
+    for attempt_path in _list_attempt_directories(lease):
+        with _open_validated_attempt(lease, attempt_path) as attempt:
+            state, _, _ = read_bound_attempt_state(attempt)
+            retention_state = state.get("retention_state")
+            if retention_state not in {"released", "reclaiming", "reclaimed"}:
+                continue
+            released_at = _released_at(state)
+            if (
+                state.get("process_settlement") != "exact"
+                or state.get("checkout_settlement") != "exact"
+                or state.get("worktree_status") == "manual-recovery-required"
+            ):
+                if retention_state in {"reclaiming", "reclaimed"}:
+                    raise ValueError(
+                        "interrupted reclaim is no longer exactly eligible"
+                    )
+                continue
+            if (
+                retention_state == "released"
+                and released_before is not None
+                and released_at > released_before
+            ):
+                continue
+            candidates.append((released_at, attempt.path.name, attempt.path))
     return tuple(value[2] for value in sorted(candidates))
 
 
-def _remove_reclaim_artifacts(attempt: pathlib.Path) -> None:
-    attempt_fd, _ = open_absolute_directory_chain(attempt, private_leaf=True)
+def _remove_reclaim_artifacts(
+    attempt: AttemptLease,
+    state: dict[str, Any],
+) -> None:
+    attempt.revalidate(state)
+    attempt_fd = os.dup(attempt.fd)
     try:
         names = tuple(os.fsencode(value) for value in os.listdir(attempt_fd))
         if len(names) > 1_000:
@@ -2560,17 +2616,16 @@ def _remove_reclaim_artifacts(attempt: pathlib.Path) -> None:
         os.fsync(attempt_fd)
     finally:
         os.close(attempt_fd)
+        attempt.revalidate(state)
 
 
-def _remove_reclaimed_attempt(root: pathlib.Path, attempt: pathlib.Path) -> None:
-    root_fd, _ = open_absolute_directory_chain(root, private_leaf=True)
-    attempt_fd: int | None = None
+def _remove_reclaimed_attempt(
+    attempt: AttemptLease,
+    state: dict[str, Any],
+) -> None:
+    attempt.revalidate(state)
+    attempt_fd = os.dup(attempt.fd)
     try:
-        attempt_fd = os.open(
-            os.fsencode(attempt.name),
-            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            dir_fd=root_fd,
-        )
         names = tuple(os.fsencode(value) for value in os.listdir(attempt_fd))
         if names != (b"state.json",):
             raise ValueError(
@@ -2585,27 +2640,21 @@ def _remove_reclaimed_attempt(root: pathlib.Path, attempt: pathlib.Path) -> None
             raise ValueError("reclaimed attempt state is unsafe")
         os.unlink(b"state.json", dir_fd=attempt_fd)
         os.fsync(attempt_fd)
-        os.close(attempt_fd)
-        attempt_fd = None
-        os.rmdir(os.fsencode(attempt.name), dir_fd=root_fd)
-        os.fsync(root_fd)
     finally:
-        if attempt_fd is not None:
-            os.close(attempt_fd)
-        os.close(root_fd)
+        os.close(attempt_fd)
+    attempt.revalidate()
+    remove_bound_attempt_directory(attempt)
 
 
 def _reclaim_attempt_locked(
     *,
     entrypoint: pathlib.Path,
-    root: pathlib.Path,
-    attempt: pathlib.Path,
-    lease: RetentionLease,
+    attempt: AttemptLease,
     trigger: str,
 ) -> dict[str, Any]:
     if trigger not in {"explicit", "ttl", "admission-pressure"}:
         raise ValueError("reclaim trigger is invalid")
-    state, _, digest = read_attempt_state(attempt)
+    state, _, digest = read_bound_attempt_state(attempt)
     retention_state = state.get("retention_state")
     if retention_state not in {"released", "reclaiming", "reclaimed"}:
         raise blocked(
@@ -2658,7 +2707,7 @@ def _reclaim_attempt_locked(
             or state.get("process_physical_remaining_by_fs") != {}
         ):
             raise ValueError("reclaimed attempt retained a nonzero process charge")
-        _remove_reclaimed_attempt(root, attempt)
+        _remove_reclaimed_attempt(attempt, state)
         return {
             "attempt_id": attempt_id,
             "state_sha256_before_removal": digest,
@@ -2671,8 +2720,7 @@ def _reclaim_attempt_locked(
     original_trigger = state.get("reclaim_trigger")
     state, digest = _commit_conservative_process_rewrite(
         entrypoint=entrypoint,
-        attempt_dir=attempt,
-        lease_fd=lease.fd,
+        attempt=attempt,
         state=state,
         state_digest=digest,
         updates={
@@ -2682,11 +2730,10 @@ def _reclaim_attempt_locked(
         },
     )
     _validate_process_inventory(attempt, state, allow_fifo=False)
-    _remove_reclaim_artifacts(attempt)
+    _remove_reclaim_artifacts(attempt, state)
     state, digest = commit_via_helper(
         entrypoint=entrypoint,
-        attempt_dir=attempt,
-        lease_fd=lease.fd,
+        attempt=attempt,
         state=state,
         state_digest=digest,
         updates={
@@ -2697,7 +2744,7 @@ def _reclaim_attempt_locked(
         },
         deadline=time.monotonic() + 30,
     )
-    _remove_reclaimed_attempt(root, attempt)
+    _remove_reclaimed_attempt(attempt, state)
     return {
         "attempt_id": attempt_id,
         "state_sha256_before_removal": digest,
@@ -2716,46 +2763,56 @@ def _reclaim_released_attempts(
     if limit is not None and limit < 1:
         raise ValueError("reclaim limit must be positive")
     reclaimed: list[str] = []
-    for attempt in _released_attempt_candidates(root, released_before=released_before):
-        result = _reclaim_attempt_locked(
-            entrypoint=entrypoint,
-            root=root,
-            attempt=attempt,
-            lease=lease,
-            trigger=trigger,
-        )
+    lease.revalidate_root()
+    for attempt_path in _released_attempt_candidates(
+        lease, released_before=released_before
+    ):
+        with _open_validated_attempt(lease, attempt_path) as attempt:
+            result = _reclaim_attempt_locked(
+                entrypoint=entrypoint,
+                attempt=attempt,
+                trigger=trigger,
+            )
         reclaimed.append(result["attempt_id"])
         if limit is not None and len(reclaimed) >= limit:
             break
     return tuple(reclaimed)
 
 
-def _remove_empty_attempt_residue(root: pathlib.Path, attempt: pathlib.Path) -> bool:
-    root_fd, _ = open_absolute_directory_chain(root, private_leaf=True)
+def _remove_empty_attempt_residue(
+    lease: RetentionLease,
+    attempt_path: pathlib.Path,
+) -> bool:
+    lease.revalidate_root()
     attempt_fd: int | None = None
     try:
         try:
             attempt_fd = os.open(
-                os.fsencode(attempt.name),
+                os.fsencode(attempt_path.name),
                 os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                dir_fd=root_fd,
+                dir_fd=lease.root_fd,
             )
         except FileNotFoundError:
+            lease.revalidate_root()
             return True
         metadata = os.fstat(attempt_fd)
         if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
             raise ValueError("empty cleanup residue has unsafe ownership or mode")
         if os.listdir(attempt_fd):
             return False
-        os.close(attempt_fd)
+        residue = AttemptLease(
+            retention=lease,
+            path=attempt_path,
+            fd=attempt_fd,
+            identity=identity_from_stat(metadata),
+        )
+        remove_bound_attempt_directory(residue)
+        residue.close()
         attempt_fd = None
-        os.rmdir(os.fsencode(attempt.name), dir_fd=root_fd)
-        os.fsync(root_fd)
         return True
     finally:
         if attempt_fd is not None:
             os.close(attempt_fd)
-        os.close(root_fd)
 
 
 def cleanup(
@@ -2764,34 +2821,31 @@ def cleanup(
     retention_root: pathlib.Path,
     attempt_dir: pathlib.Path,
 ) -> tuple[int, dict[str, Any]]:
-    root = _normalize_absolute(retention_root)
-    attempt = _normalize_absolute(attempt_dir)
-    require_private_directory(root)
-    if attempt.parent != root or ATTEMPT_NAME_PATTERN.fullmatch(attempt.name) is None:
-        raise ValueError(
-            "attempt directory is not an exact child of the retention root"
-        )
+    root, attempt_path = _normalize_attempt_directory(retention_root, attempt_dir)
     with acquire_retention_lease(root, deadline=time.monotonic() + 30) as lease:
         try:
-            _validate_attempt_directory(root, attempt)
+            attempt = _open_validated_attempt(lease, attempt_path)
         except FileNotFoundError:
-            if _remove_empty_attempt_residue(root, attempt):
+            if _remove_empty_attempt_residue(lease, attempt_path):
                 return 0, {
                     "status": "already-reclaimed",
-                    "attempt_id": ATTEMPT_NAME_PATTERN.fullmatch(attempt.name).group(1),
-                    "attempt_dir": str(attempt),
+                    "attempt_id": ATTEMPT_NAME_PATTERN.fullmatch(
+                        attempt_path.name
+                    ).group(1),
+                    "attempt_dir": str(attempt_path),
                 }
             raise
-        result = _reclaim_attempt_locked(
-            entrypoint=entrypoint,
-            root=root,
-            attempt=attempt,
-            lease=lease,
-            trigger="explicit",
-        )
+        try:
+            result = _reclaim_attempt_locked(
+                entrypoint=entrypoint,
+                attempt=attempt,
+                trigger="explicit",
+            )
+        finally:
+            attempt.close()
         return 0, {
             "status": "reclaimed",
             "attempt_id": result["attempt_id"],
-            "attempt_dir": str(attempt),
+            "attempt_dir": str(attempt_path),
             "state_sha256_before_removal": result["state_sha256_before_removal"],
         }

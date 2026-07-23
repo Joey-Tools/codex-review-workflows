@@ -23,6 +23,7 @@ from review_supervisor.errors import SupervisorError, blocked
 from review_supervisor.gitraw import GitProcessClosureUnproven
 from review_supervisor.ledger import (
     acquire_retention_lease,
+    open_attempt_lease,
     read_attempt_state,
     reconcile_ledger,
 )
@@ -59,7 +60,7 @@ from review_supervisor.supervisor import (
     status,
 )
 
-from tests.support import owned_temporary_directory
+from tests.support import bind_attempt_state, owned_temporary_directory
 
 
 TOOL_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -195,6 +196,11 @@ class PreflightAdmissionTests(unittest.TestCase):
 
 
 def _write_exact_state(attempt: pathlib.Path, state: dict[str, object]) -> None:
+    bind_attempt_state(
+        state,
+        retention_root=attempt.parent,
+        attempt_dir=attempt,
+    )
     state_path = attempt / "state.json"
     for _ in range(8):
         state_path.write_bytes(canonical_json(state))
@@ -403,15 +409,15 @@ def _write_authorized_attempt(
     _write_exact_state(attempt, state)
     state, _, digest = read_attempt_state(attempt)
     with acquire_retention_lease(retention, deadline=time.monotonic() + 5) as lease:
-        _publish_final_authorization(
-            entrypoint=ENTRYPOINT,
-            attempt_dir=attempt,
-            lease=lease,
-            state=state,
-            state_digest=digest,
-            supervisor_binding=supervisor,
-            supervisor_exit_code=0,
-        )
+        with open_attempt_lease(lease, attempt) as attempt_lease:
+            _publish_final_authorization(
+                entrypoint=ENTRYPOINT,
+                attempt=attempt_lease,
+                state=state,
+                state_digest=digest,
+                supervisor_binding=supervisor,
+                supervisor_exit_code=0,
+            )
     return attempt
 
 
@@ -459,7 +465,8 @@ class ReclaimCrashSafetyTests(unittest.TestCase):
         with owned_temporary_directory("reclaim-partial-delete-") as root:
             retention, attempt = self._released_attempt(root)
 
-            def delete_one_then_stop(path: pathlib.Path) -> None:
+            def delete_one_then_stop(attempt_lease: object, _state: object) -> None:
+                path = attempt_lease.path
                 os.unlink(path / "prompt.txt")
                 fsync_directory(path)
                 raise RuntimeError("kill point after partial deletion")
@@ -537,8 +544,9 @@ class ReclaimCrashSafetyTests(unittest.TestCase):
             retention, attempt = self._released_attempt(root)
 
             def remove_state_then_stop(
-                unused_root: pathlib.Path, path: pathlib.Path
+                attempt_lease: object, _state: object
             ) -> None:
+                path = attempt_lease.path
                 os.unlink(path / "state.json")
                 fsync_directory(path)
                 raise RuntimeError("kill point after state removal")
@@ -658,15 +666,15 @@ class FinalAuthorizationTests(unittest.TestCase):
             with acquire_retention_lease(
                 retention, deadline=time.monotonic() + 5
             ) as lease:
-                state, digest = _publish_final_authorization(
-                    entrypoint=ENTRYPOINT,
-                    attempt_dir=attempt,
-                    lease=lease,
-                    state=state,
-                    state_digest=digest,
-                    supervisor_binding=supervisor,
-                    supervisor_exit_code=0,
-                )
+                with open_attempt_lease(lease, attempt) as attempt_lease:
+                    state, digest = _publish_final_authorization(
+                        entrypoint=ENTRYPOINT,
+                        attempt=attempt_lease,
+                        state=state,
+                        state_digest=digest,
+                        supervisor_binding=supervisor,
+                        supervisor_exit_code=0,
+                    )
             authorization = state["final_authorization"]
             completed = status(
                 retention_root=retention,
@@ -790,22 +798,21 @@ class RecoverySettlementTests(unittest.TestCase):
                 retention,
                 deadline=time.monotonic() + 5,
             ) as lease:
-                state, digest = _settle_rewritten_process_charge(
-                    entrypoint=ENTRYPOINT,
-                    attempt_dir=attempt,
-                    lease_fd=lease.fd,
-                    state=state,
-                    state_digest=digest,
-                )
-                state, _ = _publish_final_authorization(
-                    entrypoint=ENTRYPOINT,
-                    attempt_dir=attempt,
-                    lease=lease,
-                    state=state,
-                    state_digest=digest,
-                    supervisor_binding=state["supervisor"],
-                    supervisor_exit_code=state["supervisor_exit_code"],
-                )
+                with open_attempt_lease(lease, attempt) as attempt_lease:
+                    state, digest = _settle_rewritten_process_charge(
+                        entrypoint=ENTRYPOINT,
+                        attempt=attempt_lease,
+                        state=state,
+                        state_digest=digest,
+                    )
+                    state, _ = _publish_final_authorization(
+                        entrypoint=ENTRYPOINT,
+                        attempt=attempt_lease,
+                        state=state,
+                        state_digest=digest,
+                        supervisor_binding=state["supervisor"],
+                        supervisor_exit_code=state["supervisor_exit_code"],
+                    )
 
             exit_code, result = recover(
                 entrypoint=ENTRYPOINT,
@@ -1600,14 +1607,14 @@ class IncompleteHandoffProcessTests(unittest.TestCase):
             None,
             TimeoutError("synthetic cleanup timeout"),
         )
-        state = {"prompt_path": "/tmp/synthetic-prompt"}
+        state = {"prompt_path": "/tmp/synthetic-attempt/prompt.txt"}
         with (
             mock.patch(
                 "review_supervisor.runtime._DIRECT_PROCESS_CLOSURE_UNPROVEN",
                 None,
             ),
             mock.patch(
-                "review_supervisor.supervisor.read_attempt_state",
+                "review_supervisor.supervisor.read_bound_attempt_state",
                 return_value=(state, b"state", "digest"),
             ),
             mock.patch(
@@ -1615,7 +1622,7 @@ class IncompleteHandoffProcessTests(unittest.TestCase):
                 return_value=(state, "next-digest"),
             ),
             mock.patch(
-                "review_supervisor.supervisor.open_regular_nofollow",
+                "review_supervisor.supervisor.open_regular_at",
                 side_effect=FileNotFoundError,
             ),
             mock.patch(
@@ -1626,8 +1633,11 @@ class IncompleteHandoffProcessTests(unittest.TestCase):
         ):
             _prequiescence_abort(
                 entrypoint=ENTRYPOINT,
-                attempt_dir=pathlib.Path("/tmp/synthetic-attempt"),
-                lease=SimpleNamespace(fd=-1),
+                attempt=SimpleNamespace(
+                    path=pathlib.Path("/tmp/synthetic-attempt"),
+                    fd=-1,
+                    revalidate=mock.Mock(),
+                ),
                 message="synthetic handoff failure",
             )
         self.assertIs(raised.exception, failure)
