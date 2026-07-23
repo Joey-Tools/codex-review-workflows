@@ -1,6 +1,11 @@
 # Placeholder-Only Fixture Templates
 
-Resolve every placeholder through `isolated_review synthetic-tokens get <id> --json`, then replace the complete placeholder with the returned value. Do not concatenate, transform, encode, or partially substitute a value.
+First require `isolated_review synthetic-tokens validate`, select IDs from the
+metadata-only `isolated_review synthetic-tokens list --json` result, and resolve
+each placeholder with single-ID
+`isolated_review synthetic-tokens get <id> --json`. Replace the complete
+placeholder with the returned value. Do not concatenate, transform, encode, or
+partially substitute a value.
 
 ## Single OAuth Session
 
