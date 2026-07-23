@@ -4,7 +4,9 @@ import hashlib
 import inspect
 import json
 import math
+import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1525,6 +1527,36 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn('python-version: "3.10"', workflow)
         self.assertIn("tomli==2.2.1", workflow)
         self.assertIn("requires Python 3.10 or later", readme)
+
+    def test_helper_entrypoint_does_not_write_import_bytecode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            copied_scripts = pathlib.Path(temp_dir) / "scripts"
+            shutil.copytree(
+                SCRIPTS,
+                copied_scripts,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+            environment = os.environ.copy()
+            environment.pop("PYTHONDONTWRITEBYTECODE", None)
+            environment.pop("PYTHONPYCACHEPREFIX", None)
+
+            completed = subprocess.run(
+                (str(copied_scripts / "isolated_review"), "--help"),
+                cwd=copied_scripts,
+                env=environment,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            bytecode_artifacts = sorted(
+                path.relative_to(copied_scripts).as_posix()
+                for path in copied_scripts.rglob("*")
+                if path.name == "__pycache__" or path.suffix == ".pyc"
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(bytecode_artifacts, [])
 
     def test_core_policy_defines_progressive_provider_strict_review_shapes(
         self,
