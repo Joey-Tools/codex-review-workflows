@@ -114,11 +114,22 @@ launcher. Python compatibility workers use the revalidated absolute interpreter
 with `-I -B -S`, a closed environment, and a fixed private working directory.
 Every shipped Python entrypoint disables bytecode before its first local package
 import, and every internal `sys.executable` child argv includes `-B`. Normal
-helper, reviewer, preflight, validator, and package-import use must not create
-`__pycache__`, `.pyc`, or `.pyo` files inside an immutable installed bundle.
+helper, reviewer, preflight, validator, and package-import use through a
+bytecode-disabled launcher must not create `__pycache__`, `.pyc`, or `.pyo`
+files inside an immutable installed bundle. A raw package directory is not an
+entrypoint: direct import is supported only when the caller has disabled
+bytecode before import. Each package initializer fails closed otherwise, but
+CPython may already have written that initializer's `.pyc` before executing the
+guard; bare direct import against an installed release is therefore unsupported.
+Canonical and private CI workflows disable bytecode globally before their test
+and module entrypoints import either package; explicit compile steps remain
+separate build-time checks rather than installed-runtime entrypoints.
 Copied-package contract tests enumerate every shipped Python-shebang entrypoint,
 exercise those ordinary entrypoints with ambient bytecode overrides removed,
-scan every production Python child argv, and reject any cache artifact.
+scan every production Python child argv, and reject any cache artifact. A
+separate writable-copy regression invokes bare direct import without `-B`,
+requires the package guard to reject it, and records the unavoidable initializer
+cache as the reason that path is outside the supported interface.
 All post-launch setup, acknowledgement, binding, selector, and result paths own
 one cleanup boundary: success requires exact leader reap plus the authenticated
 closure proof, while an unproved closure retains the process receipt, writable

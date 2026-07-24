@@ -452,8 +452,7 @@ class RepositoryContractTest(unittest.TestCase):
 
         runtime = (RUNTIME / "workspace.py").read_text(encoding="utf-8")
         self.assertIn(
-            "MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES = "
-            "MAX_SNAPSHOT_ENTRIES",
+            "MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES = MAX_SNAPSHOT_ENTRIES",
             runtime,
         )
         self.assertIn(
@@ -5822,6 +5821,62 @@ class RepositoryContractTest(unittest.TestCase):
                 if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}
             )
             self.assertEqual(bytecode, [])
+
+    def test_bare_direct_package_import_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="review-installed-bare-import-"
+        ) as temporary:
+            copied_skill = pathlib.Path(temporary) / "review-orchestration-playbook"
+            shutil.copytree(
+                SKILL_ROOT,
+                copied_skill,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            )
+            copied_scripts = copied_skill / "scripts"
+            environment = os.environ.copy()
+            environment.pop("PYTHONDONTWRITEBYTECODE", None)
+            environment.pop("PYTHONPYCACHEPREFIX", None)
+            environment.pop("PYTHONPATH", None)
+            packages = {
+                "review_runtime": copied_scripts,
+                "review_supervisor": (copied_scripts / "independent_codex_pr_review"),
+            }
+
+            for package_name, import_root in packages.items():
+                with self.subTest(package=package_name):
+                    import_probe = (
+                        "import sys;"
+                        f"sys.path.insert(0, {str(import_root)!r});"
+                        f"import {package_name}"
+                    )
+                    completed = subprocess.run(
+                        (sys.executable, "-c", import_probe),
+                        cwd=copied_skill,
+                        env=environment,
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=30,
+                    )
+                    self.assertNotEqual(completed.returncode, 0)
+                    self.assertIn(
+                        f"{package_name} requires bytecode to be disabled before import",
+                        completed.stderr,
+                    )
+
+            bytecode = sorted(
+                path.relative_to(copied_skill) for path in copied_skill.rglob("*.pyc")
+            )
+            self.assertEqual(len(bytecode), 2)
+            self.assertTrue(
+                all(path.name.startswith("__init__.") for path in bytecode),
+                bytecode,
+            )
+            self.assertEqual(
+                {path.parent.parent.name for path in bytecode},
+                {"review_runtime", "review_supervisor"},
+            )
 
     def test_installed_bundle_python_child_launchers_pass_no_bytecode(self) -> None:
         launch_vectors: list[tuple[pathlib.Path, int, str]] = []

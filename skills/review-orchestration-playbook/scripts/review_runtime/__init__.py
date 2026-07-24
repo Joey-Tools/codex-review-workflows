@@ -2,7 +2,9 @@
 
 import sys
 
-sys.dont_write_bytecode = True
+# CPython may cache this module before executing it, so callers must opt out first.
+if not sys.dont_write_bytecode:
+    raise RuntimeError("review_runtime requires bytecode to be disabled before import")
 
 
 def main(argv: list[str] | None = None) -> int:

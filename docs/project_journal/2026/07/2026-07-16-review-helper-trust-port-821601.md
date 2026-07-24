@@ -1113,8 +1113,9 @@ metadata behavior.
   this workstream. Every shipped Python entrypoint now disables bytecode before
   importing a local package, every internal Python child argv includes `-B`,
   and copied-package regressions execute ordinary helper, reviewer, preflight,
-  validator, and package-import paths with ambient overrides removed and reject
-  any `__pycache__`, `.pyc`, or `.pyo` artifact.
+  and validator paths with ambient overrides removed. The supported
+  package-import probe uses an explicitly bytecode-disabled interpreter; all
+  supported paths reject any `__pycache__`, `.pyc`, or `.pyo` artifact.
 - The final follow-up closes five asynchronous ownership gaps. Parent at-fork
   completion now remains authoritative when an `OSError` arrives after a
   successful fork but before the caller stores the PID. Probe and preflight
@@ -1162,8 +1163,8 @@ metadata behavior.
   The four directly affected modules passed 100 tests in 105.895 seconds, and
   all 93 repository contract tests passed in 5.137 seconds. The contract set
   includes ordinary installed helper, reviewer, preflight, validator, and
-  package-import execution with ambient bytecode overrides removed and rejects
-  any new `__pycache__`, `.pyc`, or `.pyo` entry in the copied immutable release.
+  explicitly bytecode-disabled package-import execution and rejects any new
+  `__pycache__`, `.pyc`, or `.pyo` entry in the copied immutable release.
   Ruff lint and format checks pass for all ten changed Python files, and
   `git diff --check` passes. No local Python 3.10 run was performed.
 - Master advanced to merge parent
@@ -1255,3 +1256,25 @@ metadata behavior.
   bytecode environment controls, and requires every Python child-launch vector
   to contain `-B`. No test inspects or repairs the currently dirty installed
   release.
+- The current-head fresh-context Codex review identified that the package-local
+  bytecode assignment could be mistaken for protection of `__init__.pyc`
+  itself. Both package initializers now fail closed unless bytecode was disabled
+  before import, and the helper contract explicitly excludes bare direct import
+  from the installed interface because CPython can cache the initializer before
+  its guard executes. A writable-copy regression invokes both packages without
+  `-B`, requires the guards to reject them, and proves that only the two
+  unavoidable initializer caches appear. All 96 repository contract tests pass
+  in 8.292 seconds under Python 3.13.0 with the parent suite bytecode-disabled.
+  Canonical and private CI workflows now also disable bytecode before all
+  runtime imports while preserving explicit compile steps. Replacement
+  current-head validation and formal review remain required.
+- Replacement Python 3.13 full discovery exercised 2,814 tests in 2,031.922
+  seconds with 6 skips. Its only failure was the expected Desktop nested-sandbox
+  denial in the synthetic keychain broker
+  (`sandbox-exec: sandbox_apply: Operation not permitted`); the exact broker
+  regression passed outside that nested sandbox in 3.479 seconds. The fixed
+  deterministic supervisor gate passed all 524 tests in 255.712 seconds, and
+  all 96 repository contract tests passed. Ruff lint and format checks pass for
+  every changed Python file. The final journal, whitespace, signed-commit,
+  exact-secret admission, and replacement fresh-context review gates remain
+  required. No local Python 3.10 run was performed.
