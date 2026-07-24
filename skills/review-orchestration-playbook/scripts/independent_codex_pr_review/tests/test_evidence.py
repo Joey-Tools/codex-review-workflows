@@ -8,6 +8,7 @@ from unittest import mock
 
 from review_supervisor.evidence import (
     AuthenticatedManifest,
+    EvidenceArtifact,
     EvidenceError,
     ManifestEntry,
     build_evidence_bundle,
@@ -87,6 +88,67 @@ class EvidenceBundleTests(unittest.TestCase):
             self.assertNotIn(str(root).encode(), serialized)
             self.assertNotIn(b"src/b.py", serialized)
             self.assertNotIn(b".codex-review/review.diff", serialized)
+
+    def test_context_labels_follow_authenticated_raw_path_order(self) -> None:
+        raw_name = os.fsdecode(b"\x80.py")
+        utf8_name = os.fsdecode(b"\xe2\x82\xac.py")
+        with owned_temporary_directory("evidence-raw-path-order-") as root:
+            primary = b"diff --git a/a.py b/a.py\n+fixed\n"
+            entries = [
+                ManifestEntry(
+                    path=utf8_name,
+                    kind="regular",
+                    size=len(b"utf8-second"),
+                    sha256=sha256_bytes(b"utf8-second"),
+                ),
+                ManifestEntry(
+                    path=".codex-review/review.diff",
+                    kind="regular",
+                    size=len(primary),
+                    sha256=sha256_bytes(primary),
+                ),
+                ManifestEntry(
+                    path=raw_name,
+                    kind="regular",
+                    size=len(b"raw-byte-first"),
+                    sha256=sha256_bytes(b"raw-byte-first"),
+                ),
+            ]
+            manifest = self._manifest(entries)
+            content_by_path = {
+                ".codex-review/review.diff": primary,
+                raw_name: b"raw-byte-first",
+                utf8_name: b"utf8-second",
+            }
+
+            def read_entry(*, entry, label, role, **_kwargs):
+                content = content_by_path[entry.path]
+                return EvidenceArtifact(
+                    label=label,
+                    role=role,
+                    content=content.decode(),
+                    length=len(content),
+                    sha256=sha256_bytes(content),
+                )
+
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with mock.patch(
+                    "review_supervisor.evidence._read_manifest_entry",
+                    side_effect=read_entry,
+                ):
+                    bundle = build_evidence_bundle(
+                        root_fd=root_fd,
+                        manifest=manifest,
+                        nearby_paths=(utf8_name, raw_name),
+                    )
+            finally:
+                os.close(root_fd)
+
+        self.assertEqual(
+            ["raw-byte-first", "utf8-second"],
+            [artifact.content for artifact in bundle.artifacts[1:]],
+        )
 
     def test_manifest_authentication_rejects_mismatch_and_duplicate_paths(self) -> None:
         entry = ManifestEntry(

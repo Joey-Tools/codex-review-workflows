@@ -256,7 +256,10 @@ def build_evidence_bundle(
     artifacts.append(primary)
 
     context_bytes = 0
-    for index, path in enumerate(sorted(requested_nearby), start=1):
+    for index, path in enumerate(
+        sorted(requested_nearby, key=os.fsencode),
+        start=1,
+    ):
         entry = entries.get(path)
         if entry is None:
             raise EvidenceError("requested context is absent from the manifest")

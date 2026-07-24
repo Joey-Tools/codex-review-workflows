@@ -1322,3 +1322,25 @@ metadata behavior.
   and project-journal validation passes. Signed commit, exact-head secret
   admission, replacement fresh-context review, hosted CI, and the unavailable
   Claude/GitHub lanes remain. No local Python 3.10 run was performed.
+- The replacement fresh-context Codex review found that optional-context
+  selection sorted Python strings, while the authenticated evidence manifest
+  and Git path contract use raw path bytes. A surrogateescaped non-UTF-8 path
+  could therefore produce a different budget prefix from the authenticated
+  order. Both evidence enumeration and final app-server admission now sort
+  paths by `os.fsencode`, preserving raw Git byte order through rendering and
+  budget trimming. Two synthetic surrogateescape regressions prove both the
+  retained prefix and emitted context-label order without creating non-UTF-8
+  filesystem entries.
+- The two reviewed regression identities increase the fixed deterministic
+  supervisor set to 530 tests with SHA-256
+  `aeaaa21ed9f16e0a9b691a05c14a06223878edd34a4aa7c750483a91adaee9d7`;
+  all 530 passed in 195.552 seconds. All 96 repository contract tests passed in
+  6.507 seconds. Current-tree Python 3.13 discovery exercised 2,814 tests in
+  1,605.681 seconds with 6 skips; the nested Desktop sandbox again denied only
+  the synthetic keychain broker. That exact broker regression passed outside
+  the nested sandbox in 2.531 seconds, and the required nine live no-child
+  tests passed there in 11.019 seconds. The discovery count is unchanged
+  because the two new tests belong to the separately enumerated deterministic
+  supervisor tree. Signed commit, exact-head secret admission, replacement
+  fresh-context review, hosted CI, and the unavailable Claude/GitHub lanes
+  remain. No local Python 3.10 run was performed.

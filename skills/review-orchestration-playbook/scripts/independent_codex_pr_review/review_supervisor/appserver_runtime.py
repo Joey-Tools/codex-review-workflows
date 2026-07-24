@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-import pathlib
 from dataclasses import dataclass
+import os
+import pathlib
 from typing import BinaryIO
 
 from .appserver_protocol import (
@@ -126,7 +127,7 @@ def _normalize_nearby_paths(
             raise EvidenceError("nearby evidence path is not manifest-authenticated")
         if entry.kind != "regular":
             raise EvidenceError("nearby evidence path is not a regular file")
-    return tuple(sorted(requested))
+    return tuple(sorted(requested, key=os.fsencode))
 
 
 def build_prelaunch_appserver_input(

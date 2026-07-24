@@ -13,12 +13,15 @@ from review_supervisor.appserver_protocol import (
     encode_json_line,
 )
 from review_supervisor.appserver_runtime import (
+    PreparedAppServerInput,
     PrelaunchInputSizeError,
     build_prelaunch_appserver_input,
     run_appserver_stdio_session,
 )
 from review_supervisor.evidence import (
     AuthenticatedManifest,
+    EvidenceArtifact,
+    EvidenceBundle,
     EvidenceError,
     ManifestEntry,
     build_evidence_bundle,
@@ -299,6 +302,102 @@ class AppServerRuntimeTests(unittest.TestCase):
             ["primary_diff"],
         )
         validate_prelaunch_turn_start_record(prepared.prompt)
+
+    def test_budget_prefix_uses_authenticated_raw_path_order(self) -> None:
+        raw_name = os.fsdecode(b"\x80.py")
+        utf8_name = os.fsdecode(b"\xe2\x82\xac.py")
+        with owned_temporary_directory("appserver-raw-path-order-") as root:
+            diff = b"diff --git a/a.py b/a.py\n+fixed\n"
+            entries = (
+                ManifestEntry(
+                    path=".codex-review/review.diff",
+                    kind="regular",
+                    size=len(diff),
+                    sha256=sha256_bytes(diff),
+                ),
+                ManifestEntry(
+                    path=raw_name,
+                    kind="regular",
+                    size=len(b"raw-byte-first"),
+                    sha256=sha256_bytes(b"raw-byte-first"),
+                ),
+                ManifestEntry(
+                    path=utf8_name,
+                    kind="regular",
+                    size=len(b"utf8-second"),
+                    sha256=sha256_bytes(b"utf8-second"),
+                ),
+            )
+            manifest = AuthenticatedManifest.authenticate(
+                entries,
+                expected_sha256=manifest_sha256(entries),
+            )
+            content_by_path = {
+                raw_name: b"raw-byte-first",
+                utf8_name: b"utf8-second",
+            }
+
+            def enforce_one_path(**kwargs):
+                if len(kwargs["nearby_paths"]) > 1:
+                    raise PrelaunchInputSizeError("test budget admits one path")
+                return PreparedAppServerInput(
+                    prompt=b"bounded",
+                    evidence_bundle=kwargs["bundle"],
+                    nearby_paths=kwargs["nearby_paths"],
+                )
+
+            def build_bundle(**kwargs):
+                artifacts = [
+                    EvidenceArtifact(
+                        label="artifact-0000",
+                        role="primary_diff",
+                        content=diff.decode(),
+                        length=len(diff),
+                        sha256=sha256_bytes(diff),
+                    )
+                ]
+                for index, path in enumerate(kwargs["nearby_paths"], start=1):
+                    content = content_by_path[path]
+                    artifacts.append(
+                        EvidenceArtifact(
+                            label=f"artifact-{index:04d}",
+                            role="nearby_context",
+                            content=content.decode(),
+                            length=len(content),
+                            sha256=sha256_bytes(content),
+                        )
+                    )
+                return EvidenceBundle(
+                    artifacts=tuple(artifacts),
+                    manifest_sha256=manifest.sha256,
+                    total_content_bytes=sum(artifact.length for artifact in artifacts),
+                )
+
+            with (
+                mock.patch(
+                    "review_supervisor.appserver_runtime.build_evidence_bundle",
+                    side_effect=build_bundle,
+                ),
+                mock.patch(
+                    "review_supervisor.appserver_runtime._prepare_bundle_input",
+                    side_effect=enforce_one_path,
+                ),
+            ):
+                prepared = build_prelaunch_appserver_input(
+                    root_fd=-1,
+                    manifest=manifest,
+                    pr_url="https://github.example/owner/repo/pull/1",
+                    base_sha="1" * 40,
+                    head_sha="2" * 40,
+                    forbidden_paths=(root,),
+                    nearby_paths=(utf8_name, raw_name),
+                )
+
+        self.assertEqual((raw_name,), prepared.nearby_paths)
+        self.assertEqual(
+            b"raw-byte-first",
+            prepared.evidence_bundle.artifacts[1].content.encode(),
+        )
 
     def test_rejects_malformed_optional_paths_before_budget_selection(self) -> None:
         diff = b"diff --git a/a.py b/a.py\n+fixed\n"
