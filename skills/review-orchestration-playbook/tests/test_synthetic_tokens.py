@@ -8147,21 +8147,28 @@ class SyntheticWorkspaceTest(unittest.TestCase):
         head = self.commit(repo)
         (repo / "copy.cfg").unlink()
 
-        with self.assertRaisesRegex(
-            ReviewError,
-            "count increased in source HEAD",
-        ) as caught:
-            self.prepare(
-                repo=repo,
-                base=base,
-                head=head,
-                catalog=catalog,
-                exemptions=("historical-fixtures",),
-                include_source_wip=True,
-            )
-        self.assertNotIn(LEGACY_A, str(caught.exception))
+        review = self.prepare(
+            repo=repo,
+            base=base,
+            head=head,
+            catalog=catalog,
+            exemptions=("historical-fixtures",),
+            include_source_wip=True,
+        )
+        manifest = self.manifest(review)
+        delta = manifest["secret_delta"]
+        self.assertEqual(delta["status"], "inconclusive")
+        self.assertEqual(
+            delta["failure_class"],
+            "source-head-exact-growth",
+        )
+        evidence = self.validate(review, catalog=catalog)
+        self.assertEqual(evidence["secret_delta"], delta)
+        serialized = json.dumps(evidence, sort_keys=True)
+        self.assertNotIn(LEGACY_A, serialized)
+        self.assertNotIn(legacy_value_base64(LEGACY_A), serialized)
 
-    def test_source_wip_cannot_hide_an_unembedded_increase_in_source_head(
+    def test_source_wip_unembedded_only_increase_is_audit_only(
         self,
     ) -> None:
         longer = LEGACY_A + "Suffix"
@@ -8179,21 +8186,42 @@ class SyntheticWorkspaceTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-        with self.assertRaisesRegex(
-            ReviewError,
-            "unembedded count increased in source HEAD",
-        ) as caught:
-            self.prepare(
-                repo=repo,
-                base=base,
-                head=head,
-                catalog=catalog,
-                exemptions=("historical-fixtures",),
-                include_source_wip=True,
-            )
-        message = str(caught.exception)
-        self.assertNotIn(LEGACY_A, message)
-        self.assertNotIn(longer, message)
+        review = self.prepare(
+            repo=repo,
+            base=base,
+            head=head,
+            catalog=catalog,
+            exemptions=("historical-fixtures",),
+            include_source_wip=True,
+        )
+        manifest = self.manifest(review)
+        delta = manifest["secret_delta"]
+        self.assertEqual(delta["status"], "clean")
+        counts = {
+            entry["value_sha256"]: entry for entry in manifest["entries"]
+        }
+        shorter_count = counts[hashlib.sha256(LEGACY_A.encode()).hexdigest()]
+        self.assertEqual(
+            (
+                shorter_count["base_count"],
+                shorter_count["head_count"],
+                shorter_count["source_head_count"],
+            ),
+            (1, 1, 1),
+        )
+        self.assertEqual(
+            (
+                shorter_count["base_unembedded_count"],
+                shorter_count["head_unembedded_count"],
+                shorter_count["source_head_unembedded_count"],
+            ),
+            (0, 0, 1),
+        )
+        evidence = self.validate(review, catalog=catalog)
+        self.assertEqual(evidence["secret_delta"], delta)
+        serialized = json.dumps(evidence, sort_keys=True)
+        self.assertNotIn(LEGACY_A, serialized)
+        self.assertNotIn(longer, serialized)
 
     def test_source_wip_legacy_manifest_and_validation_bind_source_head_counts(
         self,
