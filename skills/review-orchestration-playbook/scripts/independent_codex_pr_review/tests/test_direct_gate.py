@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import errno
+import dis
 import hashlib
 import os
 import pathlib
 import select
+import sys
+import tempfile
 import threading
 import unittest
 from collections.abc import Iterator
@@ -25,6 +28,7 @@ from review_supervisor.direct_gate import (
     DirectGateError,
     ProcessCustodyState,
 )
+from review_supervisor.codex_executable import build_snapshot_seatbelt_policy
 
 from tests.test_appserver_protocol import (
     CODEX_HOME,
@@ -37,6 +41,27 @@ from tests.test_appserver_protocol import (
     synthetic_external_access_token,
     thread_start_result,
 )
+
+
+def _call_result_store_offset(
+    function: object,
+    *,
+    called_name: str,
+    stored_name: str,
+) -> int:
+    instructions = tuple(dis.get_instructions(function))
+    for index, instruction in enumerate(instructions):
+        if not instruction.opname.startswith("CALL"):
+            continue
+        prior = instructions[max(0, index - 64) : index]
+        if not any(candidate.argval == called_name for candidate in prior):
+            continue
+        store = instructions[index + 1]
+        if store.opname == "STORE_FAST" and store.argval == stored_name:
+            return store.offset
+    raise AssertionError(
+        f"cannot find {called_name} CALL-to-{stored_name} STORE_FAST boundary"
+    )
 
 
 def _running_transcript(config: AppServerSessionConfig) -> list[dict[str, object]]:
@@ -312,12 +337,38 @@ class ControlledAppServer:
 
     @contextmanager
     def patched_runtime(self) -> Iterator[None]:
+        def launch_with_publisher(
+            _launch_function: object,
+            prepared: object,
+            argv: tuple[str, ...],
+            *,
+            result_owner: object,
+            cwd: pathlib.Path,
+            environment: dict[str, str],
+            stdin_fd: int,
+            stdout_fd: int,
+            stderr_fd: int,
+        ) -> object:
+            launched = self.launch(
+                prepared,
+                argv,
+                cwd=cwd,
+                environment=environment,
+                stdin_fd=stdin_fd,
+                stdout_fd=stdout_fd,
+                stderr_fd=stderr_fd,
+            )
+            result_owner.publish(launched)
+            if not result_owner.owns(launched):
+                raise AssertionError("controlled launch owner is incomplete")
+            return launched
+
         with ExitStack() as stack:
             stack.enter_context(
                 mock.patch.object(
                     direct_gate,
-                    "launch_prepared_no_child_process",
-                    side_effect=self.launch,
+                    "launch_no_child_process_with_result_publisher",
+                    side_effect=launch_with_publisher,
                 )
             )
             stack.enter_context(
@@ -345,6 +396,76 @@ class ControlledAppServer:
                     self._join()
         if self.errors:
             raise AssertionError("controlled app-server failed") from self.errors[0]
+
+
+class SnapshotMutationProbeTests(unittest.TestCase):
+    def test_probe_uses_the_bound_python_target_and_authenticated_profile(
+        self,
+    ) -> None:
+        policy = direct_gate.SnapshotSeatbeltPolicy(
+            snapshot_directory="/synthetic/snapshot",
+            protected_ancestors=("/synthetic",),
+            rules='(deny file-write* (subpath "/synthetic/snapshot"))',
+            sha256="a" * 64,
+            required_denials=("write", "chmod", "rename", "unlink"),
+        )
+        prepared = SimpleNamespace(
+            sandboxed_target=SimpleNamespace(path="/synthetic/python3.13")
+        )
+        result = SimpleNamespace(
+            returncode=0,
+            stdout=(b'{"chmod":true,"rename":true,"unlink":true,"write":true}\n'),
+            stderr=b"",
+        )
+        with (
+            mock.patch.object(
+                direct_gate,
+                "prepare_sandboxed_python_no_child_profile",
+                return_value=prepared,
+            ) as prepare,
+            mock.patch.object(
+                direct_gate,
+                "run_bounded_command",
+                return_value=result,
+            ) as run,
+        ):
+            direct_gate._verify_snapshot_mutation_denials(
+                policy=policy,
+                snapshot_path=pathlib.Path("/synthetic/snapshot/codex"),
+            )
+
+        prepare.assert_called_once_with(additional_seatbelt_rules=policy.rules)
+        self.assertEqual(run.call_args.args[0][0], "/synthetic/python3.13")
+        self.assertIs(
+            run.call_args.kwargs["_prepared_no_child_profile"],
+            prepared,
+        )
+
+    @unittest.skipUnless(
+        os.environ.get("CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE") == "1",
+        "live snapshot mutation probe requires an explicit opt-in",
+    )
+    def test_live_probe_denies_every_snapshot_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = pathlib.Path(raw_root).resolve(strict=True)
+            os.chmod(root, 0o700)
+            snapshot_directory = root / "snapshot"
+            snapshot_directory.mkdir(mode=0o700)
+            snapshot_path = snapshot_directory / "codex"
+            snapshot_path.write_bytes(b"synthetic snapshot\n")
+            os.chmod(snapshot_path, 0o500)
+            policy = build_snapshot_seatbelt_policy(snapshot_directory)
+
+            direct_gate._verify_snapshot_mutation_denials(
+                policy=policy,
+                snapshot_path=snapshot_path,
+            )
+
+            self.assertEqual(snapshot_path.read_bytes(), b"synthetic snapshot\n")
+            self.assertEqual(
+                tuple(path.name for path in snapshot_directory.iterdir()),
+                ("codex",),
+            )
 
 
 class BoundedAppServerProcessTests(unittest.TestCase):
@@ -481,6 +602,68 @@ class BoundedAppServerProcessTests(unittest.TestCase):
         self.assertTrue(process_state.leader_reaped)
         self.assertTrue(process_state.process_group_empty)
         self.assertTrue(process_state.pipes_closed)
+
+    def test_launch_call_to_store_interrupt_reaps_prepublished_reviewer(
+        self,
+    ) -> None:
+        server = ControlledAppServer(hold_open=True)
+        process_state = ProcessCustodyState()
+        target_offset = _call_result_store_offset(
+            direct_gate._run_bounded_appserver_process_inner,
+            called_name="launch_no_child_process_with_result_publisher",
+            stored_name="launched",
+        )
+        interruption = KeyboardInterrupt(
+            "injected reviewer launch CALL-to-STORE interrupt"
+        )
+        injected = False
+
+        def interrupt_result_store(
+            frame: object,
+            event: str,
+            _argument: object,
+        ) -> object:
+            nonlocal injected
+            if (
+                getattr(frame, "f_code", None)
+                is direct_gate._run_bounded_appserver_process_inner.__code__
+            ):
+                setattr(frame, "f_trace_opcodes", True)
+                if (
+                    not injected
+                    and event == "opcode"
+                    and getattr(frame, "f_lasti", None) == target_offset
+                ):
+                    injected = True
+                    raise interruption
+            return interrupt_result_store
+
+        previous_trace = sys.gettrace()
+        try:
+            with (
+                server.patched_runtime(),
+                self.assertRaises(KeyboardInterrupt) as caught,
+            ):
+                sys.settrace(interrupt_result_store)
+                direct_gate.run_bounded_appserver_process(
+                    prepared=self.prepared,
+                    argv=("/authenticated/codex", "app-server"),
+                    cwd=pathlib.Path(NEUTRAL_CWD),
+                    environment={"HOME": CODEX_HOME},
+                    prompt=b"self-contained review evidence",
+                    config=self.config,
+                    process_state=process_state,
+                    on_launch=lambda _launched: None,
+                )
+        finally:
+            sys.settrace(previous_trace)
+
+        self.assertTrue(injected)
+        self.assertIs(caught.exception, interruption)
+        self.assertTrue(process_state.leader_reaped)
+        self.assertTrue(process_state.process_group_empty)
+        self.assertTrue(process_state.pipes_closed)
+        self.assertEqual(process_state.process_id, ControlledAppServer.PID)
 
     def test_cleanup_unbinds_relay_before_reaping_terminal_process(self) -> None:
         events: list[tuple[str, int]] = []

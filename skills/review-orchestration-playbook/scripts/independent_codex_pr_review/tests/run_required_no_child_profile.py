@@ -9,6 +9,7 @@ from .test_no_child_profile import (
     NoChildProfileDarwinIntegrationTests,
     REQUIRE_LIVE_NO_CHILD_PROFILE_ENV,
 )
+from .test_direct_gate import SnapshotMutationProbeTests
 
 REQUIRED_NO_CHILD_TEST_METHODS = (
     "test_every_probe_preserves_the_ordered_launch_binding",
@@ -25,6 +26,14 @@ REQUIRED_TEST_CASES = tuple(
     (
         CodexExecutableAuthenticationTests,
         "test_seatbelt_default_denies_firmlink_alias_and_preserves_stdout",
+    ),
+    (
+        CodexExecutableAuthenticationTests,
+        "test_bounded_preflight_cannot_leave_child_after_closing_stdio",
+    ),
+    (
+        SnapshotMutationProbeTests,
+        "test_live_probe_denies_every_snapshot_mutation",
     ),
 )
 REQUIRED_TEST_KEYS = frozenset(
@@ -45,7 +54,7 @@ def main() -> int:
     )
     expected_count = len(REQUIRED_TEST_CASES)
     if (
-        expected_count != 7
+        expected_count != 9
         or len(REQUIRED_TEST_KEYS) != expected_count
         or suite.countTestCases() != expected_count
     ):

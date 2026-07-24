@@ -8,7 +8,7 @@ import selectors
 import signal
 import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from .appserver_protocol import (
     AppServerProtocol,
@@ -20,6 +20,7 @@ from .codex_executable import (
     ProcessQuiescenceEvidence,
     SnapshotProtectionEvidence,
     SnapshotSeatbeltPolicy,
+    launch_no_child_process_with_result_publisher,
     run_bounded_command,
 )
 from .constants import (
@@ -31,10 +32,8 @@ from .constants import (
 from .no_child_profile import (
     LaunchedNoChildProcess,
     PreparedNoChildProfile,
-    SANDBOX_EXEC,
-    build_seatbelt_profile,
     launch_prepared_no_child_process,
-    python_runtime_executable,
+    prepare_sandboxed_python_no_child_profile,
 )
 from .signal_relay import ForwardedHostSignal, HostSignalRelay
 
@@ -103,6 +102,48 @@ class ProcessCustodyState:
     process_group_empty: bool = False
     pipes_closed: bool = False
     exit_code: int | None = None
+
+
+@dataclass
+class _LaunchedProcessCustody:
+    process_state: ProcessCustodyState
+    launched: LaunchedNoChildProcess | None = None
+    transferred: bool = False
+
+    def publish(self, launched: object) -> None:
+        if self.launched is not None and self.launched is launched:
+            self.process_state.process_id = self.launched.pid
+            self.process_state.process_group_id = self.launched.pgid
+            self.process_state.profile_sha256 = self.launched.profile_sha256
+            self.process_state.leader_reaped = False
+            self.process_state.process_group_empty = False
+            self.process_state.pipes_closed = False
+            return
+        if self.launched is not None:
+            raise ValueError("app-server launch custody was published more than once")
+        self.launched = cast(LaunchedNoChildProcess, launched)
+        self.process_state.process_id = self.launched.pid
+        self.process_state.process_group_id = self.launched.pgid
+        self.process_state.profile_sha256 = self.launched.profile_sha256
+        self.process_state.leader_reaped = False
+        self.process_state.process_group_empty = False
+        self.process_state.pipes_closed = False
+
+    def owns(self, launched: object) -> bool:
+        return (
+            self.launched is launched
+            and self.process_state.process_id == self.launched.pid
+            and self.process_state.process_group_id == self.launched.pgid
+            and self.process_state.profile_sha256 == self.launched.profile_sha256
+            and not self.process_state.leader_reaped
+            and not self.process_state.process_group_empty
+            and not self.process_state.pipes_closed
+        )
+
+    def transfer(self, launched: LaunchedNoChildProcess) -> None:
+        if self.launched is not launched or self.transferred:
+            raise ValueError("app-server launch custody transfer is inconsistent")
+        self.transferred = True
 
 
 @dataclass(frozen=True)
@@ -225,6 +266,7 @@ def _run_bounded_appserver_process_inner(
     stdout_buffer = bytearray()
     selector: selectors.BaseSelector | None = None
     launched: LaunchedNoChildProcess | None = None
+    launch_custody = _LaunchedProcessCustody(process_state)
     descriptors: set[int] = set()
     start = time.monotonic()
     deadline = start + REVIEWER_RUNTIME_SECONDS
@@ -236,21 +278,18 @@ def _run_bounded_appserver_process_inner(
         stderr_read, stderr_write = _tracked_pipe(descriptors)
         signal_relay.checkpoint()
         liveness_checkpoint()
-        launched = launch_prepared_no_child_process(
+        launched = launch_no_child_process_with_result_publisher(
+            launch_prepared_no_child_process,
             prepared,
             argv,
+            result_owner=launch_custody,
             cwd=cwd,
             environment=environment,
             stdin_fd=stdin_read,
             stdout_fd=stdout_write,
             stderr_fd=stderr_write,
         )
-        process_state.process_id = launched.pid
-        process_state.process_group_id = launched.pgid
-        process_state.profile_sha256 = launched.profile_sha256
-        process_state.leader_reaped = False
-        process_state.process_group_empty = False
-        process_state.pipes_closed = False
+        launch_custody.transfer(launched)
         signal_relay.bind(launched.pid)
         signal_relay.checkpoint()
         liveness_checkpoint()
@@ -410,22 +449,23 @@ def _run_bounded_appserver_process_inner(
         )
     finally:
         termination_error: BaseException | None = None
+        custodied_launch = launch_custody.launched
         try:
-            if launched is not None and not process_state.leader_reaped:
+            if custodied_launch is not None and not process_state.leader_reaped:
                 process_state.exit_code = _terminate_process(
-                    launched,
+                    custodied_launch,
                     signal_relay=signal_relay,
                 )
                 process_state.leader_reaped = True
                 process_state.process_group_empty = True
-            elif launched is None:
+            elif custodied_launch is None:
                 process_state.leader_reaped = True
                 process_state.process_group_empty = True
         except BaseException as error:
             termination_error = error
         finally:
-            if launched is not None:
-                signal_relay.unbind(launched.pid)
+            if custodied_launch is not None:
+                signal_relay.unbind(custodied_launch.pid)
             for descriptor in tuple(descriptors):
                 try:
                     if selector is not None:
@@ -609,17 +649,20 @@ def _verify_snapshot_mutation_denials(
     policy: SnapshotSeatbeltPolicy,
     snapshot_path: pathlib.Path,
 ) -> None:
-    python = python_runtime_executable()
-    profile = build_seatbelt_profile(
-        python,
-        additional_rules=policy.rules,
+    prepared = prepare_sandboxed_python_no_child_profile(
+        additional_seatbelt_rules=policy.rules,
     )
+    target = prepared.sandboxed_target
+    if target is None:
+        raise DirectGateError(
+            "snapshot mutation probe did not receive a bound Python target",
+            stage="containment",
+            code="mutation-probe-unbound",
+        )
     result = run_bounded_command(
         (
-            str(SANDBOX_EXEC),
-            "-p",
-            profile,
-            str(python),
+            target.path,
+            "-B",
             "-I",
             "-S",
             "-c",
@@ -628,6 +671,7 @@ def _verify_snapshot_mutation_denials(
         ),
         timeout_seconds=MUTATION_PROBE_SECONDS,
         max_output_bytes=MUTATION_PROBE_OUTPUT_BYTES,
+        _prepared_no_child_profile=prepared,
     )
     expected = {"chmod": True, "rename": True, "unlink": True, "write": True}
     try:

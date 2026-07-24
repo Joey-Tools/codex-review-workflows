@@ -92,6 +92,171 @@ Every new state and `egress.json` record is machine-labeled `review_contract: su
 
 The self-contained `independent-codex-pr-review` supervisor uses the same contract values. Every public JSON command envelope and durable attempt state carries both fields; missing, malformed, or non-boolean-false eligibility fails state authentication. Exit `0`, `overall_status: completed`, `review_status: clean`, a requested model name, or `No findings.` never upgrades this supplied-evidence runtime into a named lane.
 
+Its external ChatGPT auth carrier is rebound at every send boundary from one
+no-follow, owner-only source snapshot. Replacement-sensitive object identity is
+device, inode, regular-file or directory type, and the platform generation when
+available. Content stability is exact bounded size plus SHA-256. Access policy
+is owner, group, mode, flags, and exact ACL/xattr evidence. Timestamp and link
+count churn are not content or identity evidence; the initial single-link file
+requirement remains an access and retention admission rule. Missing, operational
+inspection failure, object replacement, content mutation, access-policy change,
+and malformed evidence remain distinct outcomes. Revalidation reparses the
+committed source and requires exact `ExternalChatGPTAuth` access-token, account,
+plan, token-expiry, and digest semantics before reuse. Mutable source, JWT, and
+encoding buffers are zeroed on success and failure. Python and standard-library
+parsing still create immutable string or byte intermediates that cannot be
+forcibly zeroed; those references are dropped promptly, and the contract does
+not claim stronger memory erasure.
+
+Every executable-authentication preflight process, including compatibility,
+version, help, signature, and schema probes, uses the authenticated no-child
+launcher. Python compatibility workers use the revalidated absolute interpreter
+with `-I -B -S`, a closed environment, and a fixed private working directory.
+Every shipped Python entrypoint disables bytecode before its first local package
+import, and every internal `sys.executable` child argv includes `-B`. Normal
+helper, reviewer, preflight, validator, and package-import use must not create
+`__pycache__`, `.pyc`, or `.pyo` files inside an immutable installed bundle.
+Copied-package contract tests enumerate every shipped Python-shebang entrypoint,
+exercise those ordinary entrypoints with ambient bytecode overrides removed,
+scan every production Python child argv, and reject any cache artifact.
+All post-launch setup, acknowledgement, binding, selector, and result paths own
+one cleanup boundary: success requires exact leader reap plus the authenticated
+closure proof, while an unproved closure retains the process receipt, writable
+output, executable snapshot descriptors, runtime lease, and recovery custody.
+If settlement or another finalization step also fails after the typed
+unproved-closure boundary has been crossed, those failures remain attached as
+finalization evidence; they do not replace the unproved-closure classification.
+This typed-primary rule applies independently to managed-auth capability-launch
+settlement, outer auth-refresh finalization, and reviewer finalization.
+No later filesystem cleanup may reinterpret that state as ordinary failure.
+Formal reviewer and auth-refresh launch use a return-before-ownership publisher:
+the no-child launcher publishes the exact child into typed process custody before
+its call can return. An interruption at the launch `CALL`-to-caller-`STORE`
+boundary therefore settles the published child; process state cannot report
+no-launch or closure-proved while that child exists. If closure remains
+unproved, the retained resources include both the runtime lease and live
+executable custody, and typed recovery evidence names the protected property as
+process ownership and closure.
+The publisher is an explicit result-owner contract implemented by the real
+no-child launcher; it does not replace the result constructor or copy function
+globals. The launcher owns internal termination until that owner holds the exact
+bound-leader object. After exact prepublication, only the caller settles the
+leader, and the wrapper idempotently finishes caller publication before
+propagating an interruption. Thus no path can reap internally and then ask the
+caller to settle the same leader.
+Before `fork`, the launcher publishes a caller-visible receipt that owns both
+control-pipe descriptors and records that child creation may have started. The
+child writes a fixed-format exact leader-PID receipt before the helper may
+return, and the parent requires that PID to equal the `fork` result. An
+interruption at the `fork` result store or at the helper return/unpack boundary
+therefore terminates and reaps that exact child, or returns typed unproven
+closure evidence with the receipt still owned. Exception type alone cannot
+prove fork failure: an asynchronous `OSError` delivered after the parent
+at-fork callback remains a successful-fork settlement case. Before each
+control-pipe close,
+the descriptor slot publishes `close-outcome-unproven` while retaining the
+integer and receipt state. A returned close publishes `closed`; an
+interrupted or otherwise ambiguous result is inspected once, retained as typed
+evidence, and never retried, so a reused integer cannot close an unrelated open
+file description.
+Reviewer and auth-refresh lifecycle publication records the exact process as a
+close obligation before invoking `lifecycle.launched()`. Finalization invokes
+`lifecycle.closed()` only after process closure is proved, including when the
+launch callback returned but its caller-local store or lifecycle call result was
+interrupted. An ordinary or asynchronous `lifecycle.closed()` failure enters the
+same typed retention boundary before cleanup and retains the exact lease,
+executable custody, writable-root descriptors, process state, and source error.
+For an unproved closure, a typed result owner is published before the first
+retention operation. That closure recovery owner then holds the exact lease,
+executable custody, and source error before detailed evidence construction. The
+typed exception publishes itself to that owner before its constructor returns
+and before runtime lease retention starts. An interruption inside `retain` or at
+the instruction after its `CALL` is recorded by the same owner; a one-shot
+interruption is recovered before evidence publication, with the exact lease and
+custody retained once. The owner likewise repairs an interrupted
+constructor-result or evidence-attachment boundary to the same exact resource
+and evidence sets before the error escapes.
+
+Runtime and snapshot cleanup operate relative to held parent descriptors.
+Runtime lease allocation publishes pending custody containing the random name
+and held parent/container identity before `mkdir`. An interruption at the
+`mkdir` syscall-result boundary either proves the name absent and rolls back, or
+retains live parent/container descriptors, the observed child identity when
+readable, and typed object-identity/access-policy evidence. It never silently
+forgets a directory that the syscall may have created.
+After manifest publication, removal revalidates the exact public child against
+its held root descriptor, moves it to an unpredictable sibling name with
+parent-relative `rename`, and syncs the held parent. It then revalidates the
+quarantine path, root descriptor, object identity, access policy, and public-name
+absence before any recursive mutation. Recursive deletion stays relative to the
+held root descriptor; only the final empty-root removal resolves the quarantine
+name again. A public-name replacement is preserved and an observed swap retains
+both objects as recovery evidence. Device, inode, type, generation, size and
+digest, plus owner, group, mode, flags, ACL, and xattr evidence protect the
+selected properties. Process evidence protects ownership and closure; device,
+inode, type, and generation protect object identity; size and digest protect
+content stability; owner, group, mode, flags, ACL, and xattrs protect access
+policy. Timestamp, link-count, and unrelated child-entry churn do not establish
+mutation of any selected property. Portable POSIX still cannot make either
+`rename` or `rmdir` conditional on inode identity, so a non-cooperative same-UID
+process that discovers and races the private quarantine namespace remains
+inside the documented host TCB.
+
+Once a root rename succeeds, every later parent sync, parent-custody,
+quarantine identity/access-policy, public-name, recursive-deletion, deadline,
+and final-removal failure keeps the original exception object and traceback
+while attaching typed `QuarantinedRootRecoveryEvidence`. Each record binds the
+failure stage, held parent FD, held root FD, original raw name, exact
+unpredictable quarantine raw name, parent identity, and expected root identity.
+`quarantined_root_recovery_evidence(error)` follows the preserved
+cause/context chain and returns every such record. A higher-level retained
+runtime exception also copies those records into its recovery-evidence list, so
+recovery never depends only on the stale public name after a completed rename.
+The caller prepublishes a recovery owner with that random name and parent/root
+identity before `rename`; both the syscall-result interruption window and the
+callee-return-to-caller-`STORE` interruption window preserve the same typed
+evidence and live descriptors.
+When a record names a manifest-owned root FD, or the manifest result owner
+still holds a live or close-ambiguous descriptor, ownership of that manifest is
+transferred into the retained-resource set instead of closing it in
+finalization. The recovery descriptor therefore remains valid until the
+retention owner explicitly closes it.
+Runtime and generated-schema cleanup publish the custodied manifest before the
+manifest `CALL`-to-`STORE` boundary and the deletion result owner before its
+corresponding return/store boundary.
+Any later cleanup or publication failure transfers a live or close-ambiguous
+manifest/root FD into typed retention evidence, preserves every completed
+per-root deletion proof, and prevents the cleanup frame from retrying an
+evidence-owned descriptor close.
+The schema work-root and output anchors use the same explicit result-owner
+handoff, so a callee-return-to-caller-`STORE` interruption leaves the exact
+anchor reachable for cleanup or typed retention. Directory creation publishes
+the candidate name and an explicit `mkdir-outcome-unproven` state before the
+syscall; later states distinguish created, durable, and descriptor-bound
+custody. Each root deletion arms a dedicated outcome before `rmdir`, publishes
+`remove-outcome-unproven` before the syscall, and completes that root's exact
+bounded absence proof before returning to the aggregate loop. The aggregate
+proof is built only from all completed root proofs. A later root-loop,
+manifest-removal, parent-sync, descriptor-close, or result-store failure
+therefore preserves every already-completed root proof instead of claiming that
+the corresponding deleted tree remains.
+Its typed retention error is preconstructed, and
+`CustodiedManifestResultOwner.retained` becomes true only after the exact
+manifest is reachable from the retained-resource list on its error. `preserves`
+rechecks that reachability rather than trusting a boolean alone. Once retention
+publishes, interruption before any caller-local assignment cannot close the
+retained manifest or replace the original cause and quarantine evidence.
+`CustodiedManifest.close()` protects descriptor object identity and close
+ownership. Before each close syscall the slot publishes
+`close-outcome-unproven`, stops exposing the integer through `root_fds`, and
+retains the integer plus expected identity as evidence. If the close result is
+interrupted or otherwise ambiguous, recovery records whether the integer is
+missing, still names the expected object, names a different reused object, or
+cannot be inspected, but never retries the close. This prevents a later retry
+from closing an unrelated object that reused the same integer. Path-anchor and
+retained generated-schema descriptor owners use the same publish-before-close,
+retain-evidence, no-retry rule.
+
 The foreground compatibility command likewise prints only the raw helper artifact and does not emit a machine envelope. Its command surface is unconditionally ineligible for named-lane counting. Automation that needs machine-readable contract metadata must use `stateful status`; it must never ingest foreground stdout or `stateful final` as named-review evidence.
 
 Model verification normalizes punctuation only and then requires exact equality. A requested `gpt-5.5` never accepts `gpt-5.5-mini`, `gpt-5.5-codex`, or any other suffix as the same model.

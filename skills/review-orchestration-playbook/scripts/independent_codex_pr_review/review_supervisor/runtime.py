@@ -1075,7 +1075,7 @@ def _spawn_internal(
     require_direct_process_closure_proven()
     devnull = _open_devnull()
     try:
-        argv = (sys.executable, str(entrypoint), mode, *arguments)
+        argv = (sys.executable, "-B", str(entrypoint), mode, *arguments)
         try:
             return fork_exec(
                 argv,

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import inspect
 import json
 import math
+import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -82,6 +85,12 @@ REPOSITORY_POLICY_SCOPE_BY_PROFILE = {
     "canonical": pathlib.Path("."),
     "private": pathlib.Path("personal_codex"),
 }
+
+
+def _has_python_shebang(path: pathlib.Path) -> bool:
+    with path.open("rb") as handle:
+        first_line = handle.readline(256)
+    return first_line.startswith(b"#!") and b"python" in first_line.lower()
 
 
 def _ci_contract_context(skill_root: pathlib.Path) -> tuple[pathlib.Path, str]:
@@ -1609,6 +1618,9 @@ class RepositoryContractTest(unittest.TestCase):
         pr_readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
             encoding="utf-8"
         )
+        helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
+            encoding="utf-8"
+        )
         for runner in (live_runner, deterministic_runner):
             self.assertIn("result.skipped,", runner)
             self.assertIn("result.wasSuccessful()", runner)
@@ -1619,15 +1631,34 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("CodexExecutableAuthenticationTests", live_runner)
         self.assertIn("REQUIRE_LIVE_NO_CHILD_PROFILE_ENV", live_runner)
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
-        self.assertIn("expected_count != 7", live_runner)
+        self.assertIn("expected_count != 9", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 391", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 514", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
         self.assertIn("if duplicate_keys:", deterministic_runner)
         self.assertIn("expected_discovered_count", deterministic_runner)
         self.assertIn("_test_key", deterministic_runner)
+        for contract in (
+            "return-before-ownership publisher",
+            "launch `CALL`-to-caller-`STORE`",
+            "pending custody containing the random name",
+            "`mkdir` syscall-result boundary",
+            "callee-return-to-caller-`STORE` interruption window",
+            "manifest `CALL`-to-`STORE` boundary",
+            "executable custody, and typed recovery evidence",
+            "Process evidence protects ownership and closure",
+            "Timestamp, link-count, and unrelated child-entry churn",
+            "explicit result-owner contract implemented by the real",
+            "only the caller settles the",
+            "closure recovery owner then holds the exact lease",
+            "`CustodiedManifestResultOwner.retained` becomes true only after",
+            "protects descriptor object identity and close",
+            "different reused object",
+            "never retries the close",
+        ):
+            self.assertIn(contract, helper_contract)
         for contract in (
             'platform.machine() != "arm64"',
             "_matches_hosted_fail_closed_observations(evidence)",
@@ -1640,7 +1671,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("sandbox_apply", hosted_probe)
         for requirement in (
             "operator-enforced exact-head gate",
-            "seven tests run, zero skips",
+            "nine tests run, zero skips",
             "Any push invalidates that evidence",
             "Hosted CI's blocker-signature probe is not a substitute",
             "tests.run_required_no_child_profile",
@@ -5635,6 +5666,122 @@ class RepositoryContractTest(unittest.TestCase):
             helper_contract,
         )
         self.assertNotIn("render_success_envelope", cli_source)
+
+    def test_installed_bundle_entrypoints_do_not_create_bytecode(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="review-installed-no-bytecode-"
+        ) as temporary:
+            copied_skill = pathlib.Path(temporary) / "review-orchestration-playbook"
+            shutil.copytree(
+                SKILL_ROOT,
+                copied_skill,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            )
+            copied_scripts = copied_skill / "scripts"
+            environment = os.environ.copy()
+            environment.pop("PYTHONDONTWRITEBYTECODE", None)
+            environment.pop("PYTHONPYCACHEPREFIX", None)
+            environment.pop("PYTHONPATH", None)
+            entrypoints = {
+                copied_scripts / "isolated_review": 0,
+                copied_scripts / "named_claude_preflight": 2,
+                copied_scripts / "validate_claude_stream.py": 3,
+                copied_scripts
+                / "independent_codex_pr_review"
+                / "independent-codex-pr-review": 0,
+            }
+            discovered_entrypoints = {
+                path
+                for path in copied_scripts.rglob("*")
+                if path.is_file() and _has_python_shebang(path)
+            }
+            self.assertEqual(discovered_entrypoints, set(entrypoints))
+
+            for entrypoint, expected_returncode in entrypoints.items():
+                with self.subTest(entrypoint=entrypoint.name):
+                    completed = subprocess.run(
+                        (sys.executable, str(entrypoint), "--help"),
+                        cwd=copied_skill,
+                        env=environment,
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=30,
+                    )
+                    self.assertEqual(
+                        completed.returncode,
+                        expected_returncode,
+                        completed.stderr,
+                    )
+                    bytecode = sorted(
+                        path.relative_to(copied_skill)
+                        for path in copied_skill.rglob("*")
+                        if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}
+                    )
+                    self.assertEqual(bytecode, [])
+
+            import_probe = (
+                "import sys;"
+                f"sys.path.insert(0, {str(copied_scripts)!r});"
+                "import review_runtime;"
+                "sys.path.insert(0, "
+                f"{str(copied_scripts / 'independent_codex_pr_review')!r});"
+                "import review_supervisor"
+            )
+            imported = subprocess.run(
+                (sys.executable, "-B", "-c", import_probe),
+                cwd=copied_skill,
+                env=environment,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(imported.returncode, 0, imported.stderr)
+
+            bytecode = sorted(
+                path.relative_to(copied_skill)
+                for path in copied_skill.rglob("*")
+                if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}
+            )
+            self.assertEqual(bytecode, [])
+
+    def test_installed_bundle_python_child_launchers_pass_no_bytecode(self) -> None:
+        launch_vectors: list[tuple[pathlib.Path, int, str]] = []
+        production_sources = [
+            path
+            for path in SCRIPTS.rglob("*")
+            if path.is_file()
+            and "tests" not in path.relative_to(SCRIPTS).parts
+            and (path.suffix == ".py" or _has_python_shebang(path))
+        ]
+        for source_path in sorted(production_sources):
+            source = source_path.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(source_path))
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.List, ast.Tuple)) or len(node.elts) < 2:
+                    continue
+                first = ast.unparse(node.elts[0])
+                if "sys.executable" not in first:
+                    continue
+                launch_vectors.append((source_path, node.lineno, first))
+                leading_flags: list[str] = []
+                for item in node.elts[1:]:
+                    if not (
+                        isinstance(item, ast.Constant)
+                        and isinstance(item.value, str)
+                        and item.value.startswith("-")
+                    ):
+                        break
+                    leading_flags.append(item.value)
+                self.assertIn(
+                    "-B",
+                    leading_flags,
+                    f"{source_path}:{node.lineno} must pass -B",
+                )
+        self.assertGreaterEqual(len(launch_vectors), 9)
 
     def test_review_prompts_do_not_use_unbounded_only_matching_samples(self) -> None:
         forbidden = "rg -o --max-count 80"

@@ -522,6 +522,7 @@ def _spawn_attempt_supervisor(
     try:
         argv = (
             sys.executable,
+            "-B",
             str(entrypoint),
             "_attempt-supervisor",
             "--entrypoint",
@@ -618,6 +619,7 @@ def _acquire_source_custody_via_helper(
     try:
         argv = (
             sys.executable,
+            "-B",
             str(entrypoint),
             "_custody-helper",
             "--control-fd",

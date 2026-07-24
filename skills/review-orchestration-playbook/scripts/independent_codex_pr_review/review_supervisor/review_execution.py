@@ -6,12 +6,11 @@ import os
 import pathlib
 import pwd
 import secrets
-import shutil
 import signal
 import sys
 import time
-from dataclasses import dataclass, replace
-from typing import Any, Callable, Protocol
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Protocol, cast
 
 from .appserver_protocol import (
     APP_SERVER_NO_EXECUTION_CONFIG_ARGS,
@@ -36,10 +35,12 @@ from .auth_refresh import (
 )
 from .codex_executable import (
     CodexExecutableCustody,
+    CodexExecutableRetentionRequired,
     ExecutableExclusionRoots,
     SnapshotExecTarget,
     SnapshotProtectionEvidence,
     authenticate_codex_executable,
+    launch_no_child_process_with_result_publisher,
     verify_macos_filesystem_metadata,
 )
 from .direct_gate import (
@@ -52,6 +53,7 @@ from .direct_gate import (
     run_bounded_appserver_process,
 )
 from .errors import UnprovenDirectHelperClosure
+from .models import Identity
 from .no_child_profile import (
     LaunchedNoChildProcess,
     PreparedNoChildProfile,
@@ -61,8 +63,21 @@ from .no_child_profile import (
     prepare_custodied_snapshot_no_child_profile,
 )
 from .secureio import (
+    directory_identities_match,
+    identity_from_stat,
     open_absolute_directory_chain,
     validate_private_directory_fd,
+)
+from .recovery_cleanup import (
+    CustodiedDeletionResultOwner,
+    CustodiedManifestResultOwner,
+    QuarantinedRootRecoveryEvidence,
+    RootSpec,
+    build_custodied_manifest,
+    delete_custodied_roots,
+    quarantine_and_remove_empty_root,
+    quarantined_root_recovery_evidence,
+    remove_published_manifest,
 )
 
 
@@ -79,6 +94,9 @@ _APP_SERVER_ARGUMENTS = (
 )
 _PROCESS_CLEANUP_SECONDS = 5.0
 _PROCESS_TERM_GRACE_SECONDS = 0.25
+_RUNTIME_CLEANUP_SECONDS = 30.0
+_RUNTIME_CLEANUP_ENTRY_CAP = 100_000
+_RUNTIME_CLEANUP_MANIFEST_BYTES = 16 * 1024 * 1024
 
 
 class ProcessLifecycle(Protocol):
@@ -89,6 +107,29 @@ class ProcessLifecycle(Protocol):
     def closed(self, stage: str, exit_code: int) -> None: ...
 
 
+@dataclass(slots=True)
+class _LifecycleLaunchPublication:
+    lifecycle: ProcessLifecycle
+    stage: str
+    process: LaunchedNoChildProcess | None = None
+
+    def publish(self, process: LaunchedNoChildProcess) -> None:
+        if self.process is process:
+            return
+        if self.process is not None:
+            raise ValueError("lifecycle launch publication was rebound")
+        # Publish the close obligation before the durable lifecycle call. If the
+        # call returns and delivery is interrupted, the finalizer must still close
+        # that exact process. A failure before durable publication is conservative:
+        # closed() will fail rather than silently leaving a possible launch open.
+        self.process = process
+        self.lifecycle.launched(self.stage, process)
+
+    @property
+    def close_required(self) -> bool:
+        return self.process is not None
+
+
 @dataclass(frozen=True, slots=True)
 class AuthenticatedReviewResult:
     process: AppServerProcessResult
@@ -97,71 +138,645 @@ class AuthenticatedReviewResult:
     observed_runtime: dict[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class _RuntimeRecoveryEvidence:
+    stage: str
+    parent_path: str
+    entry_name: str
+    parent_fd: int
+    directory_fd: int | None
+    parent_identity: Identity
+    directory_identity: Identity | None
+    reason: str
+    protected_property: str = "object-identity-and-access-policy"
+
+
+@dataclass(frozen=True, slots=True)
+class AuthenticatedReviewClosureRecoveryEvidence:
+    stage: str
+    protected_property: str
+    process_id: int | None
+    process_group_id: int | None
+    profile_sha256: str | None
+    leader_reaped: bool
+    process_group_empty: bool
+    pipes_closed: bool
+    executable_custody_retained: bool
+    runtime_lease_retained: bool
+    writable_root_descriptors_retained: bool
+    closure_publication_proven: bool
+    reason: str
+
+
+class AuthenticatedReviewClosureUnproven(
+    CodexExecutableRetentionRequired,
+    UnprovenDirectHelperClosure,
+):
+    def __init__(
+        self,
+        message: str,
+        *,
+        evidence: AuthenticatedReviewClosureRecoveryEvidence | None,
+        result_owner: _AuthenticatedReviewClosureRetentionOwner | None = None,
+    ) -> None:
+        self.evidence = evidence
+        super().__init__(
+            message,
+            code="authenticated-review-process-closure-unproven",
+        )
+        if result_owner is not None:
+            result_owner.publish_error(self)
+
+
+@dataclass(slots=True)
+class _AuthenticatedReviewClosureRetentionResultOwner:
+    owner: _AuthenticatedReviewClosureRetentionOwner | None = None
+
+    def publish(self, owner: _AuthenticatedReviewClosureRetentionOwner) -> None:
+        if self.owner is not None and self.owner is not owner:
+            raise ValueError("closure retention owner was published more than once")
+        self.owner = owner
+
+
+@dataclass(slots=True)
+class _AuthenticatedReviewClosureRetentionOwner:
+    custody: CodexExecutableCustody | None
+    lease: _RuntimeLease
+    source_error: UnprovenDirectHelperClosure | None
+    writable_roots: _HeldWritableRoots | None = None
+    retained_error: AuthenticatedReviewClosureUnproven | None = None
+    lease_retained: bool = False
+    evidence: AuthenticatedReviewClosureRecoveryEvidence | None = None
+    evidence_attached: bool = False
+    publication_errors: list[BaseException] = field(default_factory=list)
+    result_owner: _AuthenticatedReviewClosureRetentionResultOwner | None = field(
+        default=None,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        if self.result_owner is not None:
+            self.result_owner.publish(self)
+
+    def matches(
+        self,
+        *,
+        custody: CodexExecutableCustody | None,
+        lease: _RuntimeLease,
+        source_error: UnprovenDirectHelperClosure | None,
+        writable_roots: _HeldWritableRoots | None,
+    ) -> bool:
+        return (
+            self.custody is custody
+            and self.lease is lease
+            and self.source_error is source_error
+            and self.writable_roots is writable_roots
+        )
+
+    def record_publication_error(self, error: BaseException) -> None:
+        if not any(existing is error for existing in self.publication_errors):
+            self.publication_errors.append(error)
+
+    def _exact_resources(self) -> list[object]:
+        resources: list[object] = []
+        if isinstance(self.source_error, CodexExecutableRetentionRequired):
+            resources.extend(self.source_error.retained_resources)
+        for resource in (self.custody, self.writable_roots, self.lease):
+            if resource is not None and not any(
+                existing is resource for existing in resources
+            ):
+                resources.append(resource)
+        return resources
+
+    def publish_error(self, error: AuthenticatedReviewClosureUnproven) -> None:
+        if self.retained_error is not None and self.retained_error is not error:
+            raise ValueError("closure retention error was published more than once")
+        error.retained_resources = self._exact_resources()
+        self.retained_error = error
+
+    def ensure_error(self) -> AuthenticatedReviewClosureUnproven:
+        if self.retained_error is None:
+            AuthenticatedReviewClosureUnproven(
+                "authenticated review closure publication is unproven; resource "
+                "custody and runtime recovery state were retained",
+                evidence=None,
+                result_owner=self,
+            )
+        retained = self.retained_error
+        if retained is None:
+            raise RuntimeError("closure retention error publication was incomplete")
+        return retained
+
+    def publish_evidence(
+        self,
+        evidence: AuthenticatedReviewClosureRecoveryEvidence,
+    ) -> None:
+        self.evidence = evidence
+        if self.retained_error is not None:
+            self.retained_error.evidence = evidence
+
+    def finish_publication(self) -> AuthenticatedReviewClosureUnproven:
+        retained = self.retained_error
+        if retained is None:
+            raise RuntimeError("closure retention error was not published")
+        retained.retained_resources = self._exact_resources()
+        evidence_records = (
+            list(self.source_error.recovery_evidence)
+            if isinstance(self.source_error, CodexExecutableRetentionRequired)
+            else []
+        )
+        if self.evidence is not None and self.evidence not in evidence_records:
+            evidence_records.append(self.evidence)
+        retained.recovery_evidence = evidence_records
+        retained.evidence = self.evidence
+        return retained
+
+
+@dataclass(slots=True)
+class _RuntimeChildRecovery:
+    parent_fd: int
+    directory_fd: int | None
+    path: pathlib.Path
+
+    def close_descriptors_for_recovery(self) -> None:
+        if self.directory_fd is not None:
+            try:
+                os.close(self.directory_fd)
+            except OSError:
+                pass
+
+
+@dataclass(slots=True)
+class _RuntimeAllocationRecovery:
+    parent_fd: int
+    container_fd: int
+    directory_fd: int | None
+    container: pathlib.Path
+    root: pathlib.Path
+    parent_identity: Identity
+    container_identity: Identity
+    directory_identity: Identity | None = None
+    entry_state: str = "mkdir-pending"
+    retained: bool = False
+
+    def close_descriptors_for_recovery(self) -> None:
+        descriptors = (
+            self.directory_fd,
+            self.container_fd,
+            self.parent_fd,
+        )
+        closed: set[int] = set()
+        for descriptor in descriptors:
+            if descriptor is None:
+                continue
+            if descriptor in closed:
+                continue
+            closed.add(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _pending_runtime_allocation_retention(
+    pending: _RuntimeAllocationRecovery,
+    *,
+    trigger: BaseException,
+) -> CodexExecutableRetentionRequired | None:
+    raw_name = os.fsencode(pending.root.name)
+    observation_error: BaseException | None = None
+    try:
+        path_identity = identity_from_stat(
+            os.stat(
+                raw_name,
+                dir_fd=pending.container_fd,
+                follow_symlinks=False,
+            )
+        )
+    except FileNotFoundError:
+        return None
+    except BaseException as error:
+        path_identity = None
+        observation_error = error
+    if path_identity is not None:
+        try:
+            pending.directory_fd = os.open(
+                raw_name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=pending.container_fd,
+            )
+            descriptor_identity = validate_private_directory_fd(
+                pending.directory_fd,
+                pending.root,
+            )
+            current_identity = identity_from_stat(
+                os.stat(
+                    raw_name,
+                    dir_fd=pending.container_fd,
+                    follow_symlinks=False,
+                )
+            )
+            if not directory_identities_match(
+                path_identity,
+                descriptor_identity,
+            ) or not directory_identities_match(
+                descriptor_identity,
+                current_identity,
+            ):
+                raise RuntimeError(
+                    "pending runtime allocation identity changed during recovery"
+                )
+            pending.directory_identity = descriptor_identity
+            pending.entry_state = "present-untransferred"
+        except BaseException as error:
+            observation_error = error
+            pending.entry_state = "presence-observed-custody-incomplete"
+
+    pending.retained = True
+    reason = f"trigger={type(trigger).__name__}: {trigger}"
+    if observation_error is not None:
+        reason += (
+            f"; observation={type(observation_error).__name__}: {observation_error}"
+        )
+    retained = CodexExecutableRetentionRequired(
+        "runtime lease mkdir result was interrupted before allocation ownership "
+        "could transfer; pending allocation custody was retained",
+        code="runtime-lease-allocation-pending",
+    )
+    retained.retain_resource(pending)
+    retained.retain_recovery_evidence(
+        _RuntimeRecoveryEvidence(
+            stage="runtime-lease-allocation-pending",
+            parent_path=str(pending.container),
+            entry_name=pending.root.name,
+            parent_fd=pending.container_fd,
+            directory_fd=pending.directory_fd,
+            parent_identity=pending.container_identity,
+            directory_identity=pending.directory_identity,
+            reason=reason,
+        )
+    )
+    return retained
+
+
 @dataclass(slots=True)
 class _RuntimeLease:
+    container_parent_fd: int
+    container_parent_identity: Identity
     container: pathlib.Path
     container_fd: int
-    container_identity: tuple[int, int, int, int, int]
+    container_identity: Identity
     root: pathlib.Path
     root_fd: int
-    identity: tuple[int, int, int, int, int]
+    identity: Identity
     retained: bool = False
+
+    def close_descriptors_for_recovery(self) -> None:
+        for descriptor in (
+            self.root_fd,
+            self.container_fd,
+            self.container_parent_fd,
+        ):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
     def make_directory(self, name: str) -> pathlib.Path:
         if not name or name in {".", ".."} or "/" in name or "\x00" in name:
             raise ValueError("runtime child name is invalid")
         path = self.root / name
         raw_name = os.fsencode(name)
-        os.mkdir(raw_name, 0o700, dir_fd=self.root_fd)
-        os.fsync(self.root_fd)
-        child_fd = os.open(
-            raw_name,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            dir_fd=self.root_fd,
-        )
+        child_fd: int | None = None
+        creation_identity: Identity | None = None
+        created = False
         try:
-            validate_private_directory_fd(child_fd, path)
+            os.mkdir(raw_name, 0o700, dir_fd=self.root_fd)
+            created = True
+            creation_identity = identity_from_stat(
+                os.stat(raw_name, dir_fd=self.root_fd, follow_symlinks=False)
+            )
+            os.fsync(self.root_fd)
+            child_fd = os.open(
+                raw_name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=self.root_fd,
+            )
+            descriptor_identity = validate_private_directory_fd(child_fd, path)
+            path_identity = identity_from_stat(
+                os.stat(raw_name, dir_fd=self.root_fd, follow_symlinks=False)
+            )
+            if not directory_identities_match(
+                descriptor_identity,
+                creation_identity,
+            ) or not directory_identities_match(
+                path_identity,
+                descriptor_identity,
+            ):
+                raise RuntimeError("runtime child identity changed during creation")
+            _require_empty_directory_fd(child_fd, label="runtime child")
+            return path
+        except BaseException as error:
+            if not created:
+                raise
+            rollback_fd = child_fd
+            try:
+                if creation_identity is None:
+                    raise RuntimeError("runtime child creation identity is unavailable")
+                if rollback_fd is None:
+                    rollback_fd = os.open(
+                        raw_name,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        dir_fd=self.root_fd,
+                    )
+                quarantine_and_remove_empty_root(
+                    RootSpec(
+                        label="authenticated-review-runtime-child",
+                        parent_fd=self.root_fd,
+                        parent_identity=self.identity,
+                        name=raw_name,
+                        expected_identity=creation_identity,
+                        private_metadata=True,
+                    ),
+                    rollback_fd,
+                    deadline=time.monotonic() + _RUNTIME_CLEANUP_SECONDS,
+                )
+            except BaseException as rollback_error:
+                self.retained = True
+                recovery = _RuntimeChildRecovery(
+                    parent_fd=self.root_fd,
+                    directory_fd=rollback_fd,
+                    path=path,
+                )
+                rollback_fd = None
+                retained = CodexExecutableRetentionRequired(
+                    "runtime child creation failed and descriptor-bound rollback "
+                    "could not be proved; the runtime lease and child custody were "
+                    "retained",
+                    code="runtime-child-creation-retained",
+                )
+                retained.retain_resource(self)
+                retained.retain_resource(recovery)
+                retained.retain_recovery_evidence(
+                    _RuntimeRecoveryEvidence(
+                        stage="runtime-child-creation",
+                        parent_path=str(self.root),
+                        entry_name=name,
+                        parent_fd=self.root_fd,
+                        directory_fd=recovery.directory_fd,
+                        parent_identity=self.identity,
+                        directory_identity=creation_identity,
+                        reason=(
+                            f"trigger={type(error).__name__}: {error}; "
+                            f"rollback={type(rollback_error).__name__}: "
+                            f"{rollback_error}"
+                        ),
+                    )
+                )
+                _retain_quarantined_root_recovery_evidence(
+                    retained,
+                    rollback_error,
+                )
+                raise retained from rollback_error
+            finally:
+                if rollback_fd is not None:
+                    os.close(rollback_fd)
+                child_fd = None
+            raise
         finally:
-            os.close(child_fd)
-        _require_empty_directory(path, label="runtime child")
-        return path
+            if child_fd is not None:
+                os.close(child_fd)
 
     def retain(self) -> None:
         self.retained = True
 
     def cleanup(self) -> None:
+        manifest = None
+        manifest_owner = CustodiedManifestResultOwner()
+        deletion_owner = CustodiedDeletionResultOwner()
+        retained = CodexExecutableRetentionRequired(
+            "runtime cleanup could not prove descriptor-bound deletion; "
+            "the runtime lease and recovery custody were retained",
+            code="runtime-cleanup-retained",
+        )
         try:
             if self.retained:
                 return
-            descriptor = os.fstat(self.root_fd)
-            current = os.lstat(self.root)
-            container_descriptor = os.fstat(self.container_fd)
-            container_current = os.lstat(self.container)
+            descriptor = identity_from_stat(os.fstat(self.root_fd))
+            current = identity_from_stat(
+                os.stat(
+                    os.fsencode(self.root.name),
+                    dir_fd=self.container_fd,
+                    follow_symlinks=False,
+                )
+            )
+            container_descriptor = validate_private_directory_fd(
+                self.container_fd,
+                self.container,
+            )
+            container_current = identity_from_stat(
+                os.stat(
+                    os.fsencode(self.container.name),
+                    dir_fd=self.container_parent_fd,
+                    follow_symlinks=False,
+                )
+            )
+            parent_descriptor = identity_from_stat(os.fstat(self.container_parent_fd))
             if (
-                _directory_identity(descriptor) != self.identity
-                or _directory_identity(current) != self.identity
-                or _directory_identity(container_descriptor) != self.container_identity
-                or _directory_identity(container_current) != self.container_identity
+                not directory_identities_match(descriptor, self.identity)
+                or not directory_identities_match(current, self.identity)
+                or not directory_identities_match(
+                    container_descriptor,
+                    self.container_identity,
+                )
+                or not directory_identities_match(
+                    container_current,
+                    self.container_identity,
+                )
+                or not directory_identities_match(
+                    parent_descriptor,
+                    self.container_parent_identity,
+                )
             ):
                 self.retained = True
                 raise RuntimeError(
                     "fresh runtime identity changed; suspicious content was retained"
                 )
-            shutil.rmtree(self.root)
-            _require_empty_directory(self.container, label="runtime root")
-            os.rmdir(self.container)
-        except BaseException:
+            manifest_path = self.container / (
+                f".{self.root.name}.cleanup-{secrets.token_hex(16)}.manifest"
+            )
+            deadline = time.monotonic() + _RUNTIME_CLEANUP_SECONDS
+            manifest = build_custodied_manifest(
+                roots=(
+                    RootSpec(
+                        label="authenticated-review-runtime",
+                        parent_fd=self.container_fd,
+                        parent_identity=self.container_identity,
+                        name=os.fsencode(self.root.name),
+                        expected_identity=self.identity,
+                        private_metadata=True,
+                    ),
+                ),
+                manifest_path=manifest_path,
+                entry_cap=_RUNTIME_CLEANUP_ENTRY_CAP,
+                payload_cap=_RUNTIME_CLEANUP_MANIFEST_BYTES,
+                deadline=deadline,
+                result_owner=manifest_owner,
+            )
+            manifest_owner.transfer(manifest)
+            deletion_proof = delete_custodied_roots(
+                manifest,
+                deadline=deadline,
+                result_owner=deletion_owner,
+            )
+            deletion_owner.transfer(deletion_proof)
+            manifest.close()
+            manifest_seal = manifest.seal
+            manifest = None
+            remove_published_manifest(manifest_seal)
+            _require_empty_directory_fd(self.container_fd, label="runtime root")
+            parent_descriptor = identity_from_stat(os.fstat(self.container_parent_fd))
+            container_descriptor = validate_private_directory_fd(
+                self.container_fd,
+                self.container,
+            )
+            container_current = identity_from_stat(
+                os.stat(
+                    os.fsencode(self.container.name),
+                    dir_fd=self.container_parent_fd,
+                    follow_symlinks=False,
+                )
+            )
+            if (
+                not directory_identities_match(
+                    parent_descriptor,
+                    self.container_parent_identity,
+                )
+                or not directory_identities_match(
+                    container_descriptor,
+                    self.container_identity,
+                )
+                or not directory_identities_match(
+                    container_current,
+                    self.container_identity,
+                )
+            ):
+                raise RuntimeError(
+                    "runtime container identity changed before removal; "
+                    "suspicious content was retained"
+                )
+            quarantine_and_remove_empty_root(
+                RootSpec(
+                    label="authenticated-review-runtime-container",
+                    parent_fd=self.container_parent_fd,
+                    parent_identity=self.container_parent_identity,
+                    name=os.fsencode(self.container.name),
+                    expected_identity=self.container_identity,
+                    private_metadata=True,
+                ),
+                self.container_fd,
+                deadline=deadline,
+            )
+        except BaseException as error:
             self.retained = True
-            raise
+            setattr(retained, "source_cleanup_error", error)
+            retained.retain_resource(self)
+            retained.retain_recovery_evidence(
+                _RuntimeRecoveryEvidence(
+                    stage="runtime-lease-cleanup",
+                    parent_path=str(self.container),
+                    entry_name=self.root.name,
+                    parent_fd=self.container_fd,
+                    directory_fd=self.root_fd,
+                    parent_identity=self.container_identity,
+                    directory_identity=self.identity,
+                    reason=f"{type(error).__name__}: {error}",
+                )
+            )
+            close_evidence = getattr(
+                error,
+                "custodied_manifest_close_evidence",
+                None,
+            )
+            if (
+                close_evidence is not None
+                and close_evidence not in retained.recovery_evidence
+            ):
+                retained.retain_recovery_evidence(close_evidence)
+            source_deletion_owner = getattr(
+                error,
+                "custodied_deletion_result_owner",
+                None,
+            )
+            if source_deletion_owner is not None:
+                if source_deletion_owner is not deletion_owner:
+                    retained.add_note(
+                        "runtime cleanup received a deletion result owner that "
+                        "did not match the transaction owner"
+                    )
+                else:
+                    setattr(
+                        retained,
+                        "custodied_deletion_result_owner",
+                        deletion_owner,
+                    )
+            if deletion_owner.proof is not None:
+                completed_proof = deletion_owner.finish()
+                setattr(
+                    retained,
+                    "custodied_deletion_result_owner",
+                    deletion_owner,
+                )
+                setattr(retained, "completed_deletion_proof", completed_proof)
+            elif deletion_owner.root_outcomes:
+                setattr(
+                    retained,
+                    "custodied_deletion_result_owner",
+                    deletion_owner,
+                )
+                setattr(
+                    retained,
+                    "completed_root_deletion_proofs",
+                    tuple(
+                        outcome.proof
+                        for outcome in deletion_owner.root_outcomes
+                        if outcome.state == "complete" and outcome.proof is not None
+                    ),
+                )
+            _retain_quarantined_root_recovery_evidence(
+                retained,
+                error,
+            )
+            retained_manifest = manifest_owner.manifest
+            if retained_manifest is not None and (
+                manifest is not None
+                or retained_manifest.root_fds
+                or retained_manifest.close_evidence
+            ):
+                try:
+                    manifest_owner.retain(retained)
+                    manifest = None
+                except BaseException as publication_error:
+                    if not manifest_owner.retained:
+                        manifest_owner.retain(retained)
+                    manifest_owner.finish_retention()
+                    manifest = None
+                    setattr(
+                        retained,
+                        "retention_publication_errors",
+                        (publication_error,),
+                    )
+                    retained.add_note(
+                        "runtime manifest retention publication recovered after "
+                        "interruption: "
+                        f"{type(publication_error).__name__}: {publication_error}"
+                    )
+            raise retained from error
         finally:
-            try:
-                os.close(self.root_fd)
-            except OSError:
-                pass
-            try:
-                os.close(self.container_fd)
-            except OSError:
-                pass
+            if manifest is not None and not manifest_owner.preserves(manifest):
+                manifest.close()
+            if not self.retained:
+                self.close_descriptors_for_recovery()
 
 
 @dataclass(slots=True)
@@ -175,6 +790,291 @@ class _HeldWritableRoots:
                 os.close(descriptor)
             except OSError:
                 pass
+
+
+def _raise_finalization_errors(
+    errors: list[BaseException],
+    *,
+    lease: _RuntimeLease,
+) -> None:
+    evidence = tuple(errors)
+    for error in errors:
+        if isinstance(error, CodexExecutableRetentionRequired):
+            if not any(resource is lease for resource in error.retained_resources):
+                error.retain_resource(lease)
+            setattr(error, "finalization_errors", evidence)
+            raise error
+    failure = RuntimeError("custodied process finalization was inconclusive")
+    setattr(failure, "finalization_errors", evidence)
+    raise failure from errors[0]
+
+
+def _retain_quarantined_root_recovery_evidence(
+    retained: CodexExecutableRetentionRequired,
+    error: BaseException,
+) -> tuple[QuarantinedRootRecoveryEvidence, ...]:
+    evidence_records = quarantined_root_recovery_evidence(error)
+    for evidence in evidence_records:
+        if evidence not in retained.recovery_evidence:
+            retained.retain_recovery_evidence(evidence)
+    return evidence_records
+
+
+def _attach_finalization_errors(
+    primary: UnprovenDirectHelperClosure,
+    finalization_error: BaseException,
+) -> None:
+    evidence = getattr(finalization_error, "finalization_errors", None)
+    if not isinstance(evidence, tuple) or not all(
+        isinstance(error, BaseException) for error in evidence
+    ):
+        evidence = (finalization_error,)
+    existing = getattr(primary, "finalization_errors", ())
+    if not isinstance(existing, tuple) or not all(
+        isinstance(error, BaseException) for error in existing
+    ):
+        existing = ()
+    combined = (*existing, *evidence)
+    setattr(primary, "finalization_errors", combined)
+    summary = "; ".join(f"{type(error).__name__}: {error}" for error in evidence)
+    primary.add_note(f"custodied process finalization evidence: {summary}")
+
+
+def _prepare_retained_unproven_closure_publication(
+    *,
+    owner: _AuthenticatedReviewClosureRetentionOwner,
+    stage: str,
+    state: ProcessCustodyState,
+    finalization_errors: tuple[BaseException, ...],
+) -> tuple[BaseException, ...]:
+    owner.ensure_error()
+    owner.lease.retain()
+    owner.lease_retained = True
+
+    source_finalization_errors = (
+        getattr(owner.source_error, "finalization_errors", ())
+        if owner.source_error is not None
+        else ()
+    )
+    if not isinstance(source_finalization_errors, tuple) or not all(
+        isinstance(error, BaseException) for error in source_finalization_errors
+    ):
+        source_finalization_errors = ()
+    combined_errors: list[BaseException] = []
+    for error in (*source_finalization_errors, *finalization_errors):
+        if not any(existing is error for existing in combined_errors):
+            combined_errors.append(error)
+    combined_finalization_errors = tuple(combined_errors)
+    reason_parts = [
+        (
+            f"source={type(owner.source_error).__name__}: {owner.source_error}"
+            if owner.source_error is not None
+            else (
+                "source=lifecycle closure publication was not proved"
+                if _closure_proven(state)
+                else "source=local process settlement did not prove closure"
+            )
+        )
+    ]
+    reason_parts.extend(
+        f"finalization={type(error).__name__}: {error}"
+        for error in combined_finalization_errors
+    )
+    owner.publish_evidence(
+        AuthenticatedReviewClosureRecoveryEvidence(
+            stage=stage,
+            protected_property="resource-ownership-and-closure-publication",
+            process_id=state.process_id,
+            process_group_id=state.process_group_id,
+            profile_sha256=state.profile_sha256,
+            leader_reaped=state.leader_reaped,
+            process_group_empty=state.process_group_empty,
+            pipes_closed=state.pipes_closed,
+            executable_custody_retained=owner.custody is not None,
+            runtime_lease_retained=owner.lease_retained,
+            writable_root_descriptors_retained=owner.writable_roots is not None,
+            closure_publication_proven=False,
+            reason="; ".join(reason_parts),
+        )
+    )
+    owner.evidence_attached = True
+    return combined_finalization_errors
+
+
+def _add_note_once(error: BaseException, note: str) -> None:
+    notes = getattr(error, "__notes__", ())
+    if not isinstance(notes, list) or note not in notes:
+        error.add_note(note)
+
+
+def _annotate_retained_unproven_closure(
+    *,
+    owner: _AuthenticatedReviewClosureRetentionOwner,
+    retained: AuthenticatedReviewClosureUnproven,
+    combined_finalization_errors: tuple[BaseException, ...],
+) -> None:
+    source_error = owner.source_error
+    if source_error is not None:
+        setattr(retained, "source_closure_error", source_error)
+        _add_note_once(
+            retained,
+            "source unproven-closure evidence: "
+            f"{type(source_error).__name__}: {source_error}",
+        )
+    if combined_finalization_errors:
+        setattr(retained, "finalization_errors", combined_finalization_errors)
+        _add_note_once(
+            retained,
+            "custodied process finalization evidence: "
+            + "; ".join(
+                f"{type(error).__name__}: {error}"
+                for error in combined_finalization_errors
+            ),
+        )
+    if owner.publication_errors:
+        publication_errors = tuple(owner.publication_errors)
+        setattr(retained, "retention_publication_errors", publication_errors)
+        _add_note_once(
+            retained,
+            "closure retention publication recovered after interruption: "
+            + "; ".join(
+                f"{type(error).__name__}: {error}" for error in publication_errors
+            ),
+        )
+
+
+def _retained_unproven_closure(
+    *,
+    stage: str,
+    custody: CodexExecutableCustody | None,
+    lease: _RuntimeLease,
+    state: ProcessCustodyState,
+    source_error: UnprovenDirectHelperClosure | None,
+    writable_roots: _HeldWritableRoots | None = None,
+    finalization_errors: tuple[BaseException, ...] = (),
+    result_owner: _AuthenticatedReviewClosureRetentionOwner | None = None,
+) -> AuthenticatedReviewClosureUnproven:
+    owner = result_owner or _AuthenticatedReviewClosureRetentionOwner(
+        custody=custody,
+        lease=lease,
+        source_error=source_error,
+        writable_roots=writable_roots,
+    )
+    if not owner.matches(
+        custody=custody,
+        lease=lease,
+        source_error=source_error,
+        writable_roots=writable_roots,
+    ):
+        raise ValueError("closure retention result owner was rebound")
+    try:
+        combined_finalization_errors = _prepare_retained_unproven_closure_publication(
+            owner=owner,
+            stage=stage,
+            state=state,
+            finalization_errors=finalization_errors,
+        )
+        retained = owner.finish_publication()
+        _annotate_retained_unproven_closure(
+            owner=owner,
+            retained=retained,
+            combined_finalization_errors=combined_finalization_errors,
+        )
+        return retained
+    except BaseException as error:
+        owner.record_publication_error(error)
+        combined_finalization_errors = _prepare_retained_unproven_closure_publication(
+            owner=owner,
+            stage=stage,
+            state=state,
+            finalization_errors=finalization_errors,
+        )
+        retained = owner.finish_publication()
+        _annotate_retained_unproven_closure(
+            owner=owner,
+            retained=retained,
+            combined_finalization_errors=combined_finalization_errors,
+        )
+        return retained
+
+
+def _raise_retained_unproven_closure(
+    *,
+    stage: str,
+    custody: CodexExecutableCustody | None,
+    lease: _RuntimeLease,
+    state: ProcessCustodyState,
+    source_error: UnprovenDirectHelperClosure | None,
+    writable_roots: _HeldWritableRoots | None = None,
+    finalization_errors: tuple[BaseException, ...] = (),
+) -> None:
+    construction_errors: list[BaseException] = []
+    owner_result: _AuthenticatedReviewClosureRetentionResultOwner | None = None
+    try:
+        owner_result = _AuthenticatedReviewClosureRetentionResultOwner()
+    except BaseException as error:
+        construction_errors.append(error)
+        owner_result = _AuthenticatedReviewClosureRetentionResultOwner()
+
+    owner: _AuthenticatedReviewClosureRetentionOwner | None = None
+    try:
+        owner = _AuthenticatedReviewClosureRetentionOwner(
+            custody=custody,
+            lease=lease,
+            source_error=source_error,
+            writable_roots=writable_roots,
+            publication_errors=construction_errors,
+            result_owner=owner_result,
+        )
+    except BaseException as error:
+        construction_errors.append(error)
+        owner = owner_result.owner
+        if owner is None:
+            owner = _AuthenticatedReviewClosureRetentionOwner(
+                custody=custody,
+                lease=lease,
+                source_error=source_error,
+                writable_roots=writable_roots,
+                publication_errors=construction_errors,
+                result_owner=owner_result,
+            )
+
+    try:
+        owner.ensure_error()
+        retained = _retained_unproven_closure(
+            stage=stage,
+            custody=custody,
+            lease=lease,
+            state=state,
+            source_error=source_error,
+            writable_roots=writable_roots,
+            finalization_errors=finalization_errors,
+            result_owner=owner,
+        )
+        if retained is source_error:
+            raise retained
+        raise retained from source_error
+    except AuthenticatedReviewClosureUnproven as error:
+        if error is owner.retained_error:
+            raise
+        publication_error: BaseException = error
+    except BaseException as error:
+        publication_error = error
+
+    owner.record_publication_error(publication_error)
+    retained = _retained_unproven_closure(
+        stage=stage,
+        custody=custody,
+        lease=lease,
+        state=state,
+        source_error=source_error,
+        writable_roots=writable_roots,
+        finalization_errors=finalization_errors,
+        result_owner=owner,
+    )
+    if retained is source_error:
+        raise retained
+    raise retained from source_error
 
 
 @dataclass(slots=True)
@@ -202,12 +1102,14 @@ class _RefreshLaunchCapability(ManagedAuthRefreshLaunchCapability):
             identity=ManagedAuthSnapshotIdentity.from_stat(descriptor),
         )
         self._launch = launch
-        self._lifecycle = lifecycle
+        self._lifecycle_publication = _LifecycleLaunchPublication(
+            lifecycle=lifecycle,
+            stage="auth-refresh",
+        )
         self._expected_cwd = expected_cwd
         self._expected_environment = dict(expected_environment)
         self.process_state = ProcessCustodyState()
         self.launched_process: LaunchedNoChildProcess | None = None
-        self.lifecycle_launched = False
         self.closure_receipt: ManagedAuthRefreshClosureReceipt | None = None
         self._consumed = False
 
@@ -218,6 +1120,41 @@ class _RefreshLaunchCapability(ManagedAuthRefreshLaunchCapability):
     @property
     def profile_sha256(self) -> str:
         return self._launch.profile_sha256
+
+    @property
+    def lifecycle_launched(self) -> bool:
+        return self._lifecycle_publication.close_required
+
+    def publish(self, launched: object) -> None:
+        if self.launched_process is not None and self.launched_process is launched:
+            published = self.launched_process
+        elif self.launched_process is not None:
+            raise RuntimeError("managed-auth launch custody was published twice")
+        else:
+            published = cast(LaunchedNoChildProcess, launched)
+            self.launched_process = published
+        _record_launch(self.process_state, published)
+        self.process_state.leader_reaped = False
+        self.process_state.process_group_empty = False
+        self.process_state.pipes_closed = False
+        self.process_state.exit_code = None
+
+    def owns(self, launched: object) -> bool:
+        published = self.launched_process
+        return (
+            published is launched
+            and published is not None
+            and self.process_state.process_id == published.pid
+            and self.process_state.process_group_id == published.pgid
+            and self.process_state.profile_sha256 == published.profile_sha256
+            and not self.process_state.leader_reaped
+            and not self.process_state.process_group_empty
+            and not self.process_state.pipes_closed
+            and self.process_state.exit_code is None
+        )
+
+    def _publish_launched(self, launched: object) -> None:
+        self.publish(launched)
 
     def launch(
         self,
@@ -238,19 +1175,22 @@ class _RefreshLaunchCapability(ManagedAuthRefreshLaunchCapability):
 
         launched: LaunchedNoChildProcess | None = None
         try:
-            launched = launch_prepared_no_child_process(
+            launched = launch_no_child_process_with_result_publisher(
+                launch_prepared_no_child_process,
                 self._launch.prepared,
                 (str(self._launch.custody.snapshot_path), *request.arguments),
+                result_owner=self,
                 cwd=request.cwd,
                 environment=request.environment,
                 stdin_fd=request.stdin_fd,
                 stdout_fd=request.stdout_fd,
                 stderr_fd=request.stderr_fd,
             )
-            self.launched_process = launched
-            _record_launch(self.process_state, launched)
-            self._lifecycle.launched("auth-refresh", launched)
-            self.lifecycle_launched = True
+            if not self.owns(launched):
+                raise RuntimeError(
+                    "managed-auth launch custody transfer is inconsistent"
+                )
+            self._lifecycle_publication.publish(launched)
             self._launch.custody.parent_revalidate_after_exec_handoff(
                 self._launch.target,
                 process_id=launched.pid,
@@ -264,13 +1204,19 @@ class _RefreshLaunchCapability(ManagedAuthRefreshLaunchCapability):
                 snapshot=self.authenticated_snapshot,
                 profile_sha256=launched.profile_sha256,
             )
-        except BaseException:
-            if launched is not None:
-                _settle_launched_process(
-                    self.process_state,
-                    launched,
-                    pipes_closed=False,
-                )
+        except BaseException as error:
+            owned_launch = self.launched_process
+            if owned_launch is not None:
+                try:
+                    _settle_launched_process(
+                        self.process_state,
+                        owned_launch,
+                        pipes_closed=False,
+                    )
+                except BaseException as finalization_error:
+                    if not isinstance(error, UnprovenDirectHelperClosure):
+                        raise
+                    _attach_finalization_errors(error, finalization_error)
             raise
 
     def record_closure(
@@ -420,6 +1366,11 @@ def run_authenticated_review(
             auth_refresh=refresh_evidence,
             observed_runtime=observed_runtime,
         )
+    except CodexExecutableRetentionRequired as error:
+        lease.retain()
+        if not any(resource is lease for resource in error.retained_resources):
+            error.retain_resource(lease)
+        raise
     finally:
         lease.cleanup()
 
@@ -448,7 +1399,7 @@ def _run_auth_refresh(
     launch: _PreparedCustodiedLaunch | None = None
     capability: _RefreshLaunchCapability | None = None
     completed = False
-    direct_helper_closure_unproven = False
+    direct_helper_closure_error: UnprovenDirectHelperClosure | None = None
     schema_work_root = (
         lease.make_directory("auth-refresh-schema-work")
         if aggregate_schema_path is None
@@ -503,8 +1454,8 @@ def _run_auth_refresh(
             raise RuntimeError("managed-auth refresh returned incomplete evidence")
         completed = True
         return result
-    except UnprovenDirectHelperClosure:
-        direct_helper_closure_unproven = True
+    except UnprovenDirectHelperClosure as error:
+        direct_helper_closure_error = error
         raise
     finally:
         if capability is not None:
@@ -520,19 +1471,29 @@ def _run_auth_refresh(
         lifecycle_launched = (
             capability.lifecycle_launched if capability is not None else False
         )
-        _finalize_custodied_stage(
-            stage="auth-refresh",
-            custody=custody,
-            writable_roots=launch.writable_roots if launch is not None else None,
-            handoff_token=launch.handoff_token if launch is not None else None,
-            state=state,
-            launched=launched,
-            lifecycle=lifecycle,
-            lifecycle_launched=lifecycle_launched,
-            completed=completed,
-            lease=lease,
-            direct_helper_closure_unproven=direct_helper_closure_unproven,
-        )
+        try:
+            _finalize_custodied_stage(
+                stage="auth-refresh",
+                custody=custody,
+                writable_roots=launch.writable_roots if launch is not None else None,
+                handoff_token=launch.handoff_token if launch is not None else None,
+                state=state,
+                launched=launched,
+                lifecycle=lifecycle,
+                lifecycle_launched=lifecycle_launched,
+                completed=completed,
+                lease=lease,
+                direct_helper_closure_error=direct_helper_closure_error,
+            )
+        except BaseException as finalization_error:
+            if direct_helper_closure_error is None:
+                raise
+            if isinstance(finalization_error, CodexExecutableRetentionRequired):
+                raise
+            _attach_finalization_errors(
+                direct_helper_closure_error,
+                finalization_error,
+            )
 
 
 def _run_review(
@@ -559,11 +1520,14 @@ def _run_review(
     launch: _PreparedCustodiedLaunch | None = None
     launched: LaunchedNoChildProcess | None = None
     state = ProcessCustodyState()
-    lifecycle_launched = False
+    lifecycle_publication = _LifecycleLaunchPublication(
+        lifecycle=lifecycle,
+        stage="reviewer",
+    )
     completed = False
     result: AppServerProcessResult | None = None
     process_boundary_entered = False
-    direct_helper_closure_unproven = False
+    direct_helper_closure_error: UnprovenDirectHelperClosure | None = None
     auth_checks = {"launch": False, "serialization": False}
     schema_work_root = (
         lease.make_directory("review-schema-work")
@@ -598,10 +1562,9 @@ def _run_review(
         )
 
         def on_launch(process: LaunchedNoChildProcess) -> None:
-            nonlocal launched, lifecycle_launched
+            nonlocal launched
             launched = process
-            lifecycle.launched("reviewer", process)
-            lifecycle_launched = True
+            lifecycle_publication.publish(process)
             launch.custody.parent_revalidate_after_exec_handoff(
                 launch.target,
                 process_id=process.pid,
@@ -641,25 +1604,36 @@ def _run_review(
             )
         completed = True
         return result, state, auth_checks
-    except UnprovenDirectHelperClosure:
-        direct_helper_closure_unproven = True
+    except UnprovenDirectHelperClosure as error:
+        direct_helper_closure_error = error
         raise
     finally:
         if not process_boundary_entered:
             state.pipes_closed = True
-        _finalize_custodied_stage(
-            stage="reviewer",
-            custody=custody,
-            writable_roots=launch.writable_roots if launch is not None else None,
-            handoff_token=launch.handoff_token if launch is not None else None,
-            state=state,
-            launched=launched,
-            lifecycle=lifecycle,
-            lifecycle_launched=lifecycle_launched,
-            completed=completed,
-            lease=lease,
-            direct_helper_closure_unproven=direct_helper_closure_unproven,
-        )
+        try:
+            _finalize_custodied_stage(
+                stage="reviewer",
+                custody=custody,
+                writable_roots=launch.writable_roots if launch is not None else None,
+                handoff_token=launch.handoff_token if launch is not None else None,
+                state=state,
+                launched=launched,
+                lifecycle=lifecycle,
+                lifecycle_launched=lifecycle_publication.close_required,
+                completed=completed,
+                lease=lease,
+                direct_helper_closure_error=direct_helper_closure_error,
+            )
+        except BaseException as finalization_error:
+            if direct_helper_closure_error is None:
+                raise
+            if isinstance(finalization_error, CodexExecutableRetentionRequired):
+                raise
+            # The pending typed closure remains primary after this finally block.
+            _attach_finalization_errors(
+                direct_helper_closure_error,
+                finalization_error,
+            )
 
 
 def _prepare_custodied_launch(
@@ -733,7 +1707,7 @@ def _finalize_custodied_stage(
     lifecycle_launched: bool,
     completed: bool,
     lease: _RuntimeLease,
-    direct_helper_closure_unproven: bool = False,
+    direct_helper_closure_error: UnprovenDirectHelperClosure | None = None,
 ) -> None:
     errors: list[BaseException] = []
     try:
@@ -747,25 +1721,37 @@ def _finalize_custodied_stage(
         errors.append(error)
 
     closure_proven = _closure_proven(state)
-    if direct_helper_closure_unproven:
-        lease.retain()
-        if writable_roots is not None:
-            writable_roots.close()
-        if errors:
-            raise RuntimeError(
-                "custodied process finalization was inconclusive"
-            ) from errors[0]
-        return
+    if direct_helper_closure_error is not None or (
+        custody is not None and not closure_proven
+    ):
+        _raise_retained_unproven_closure(
+            stage=stage,
+            custody=custody,
+            lease=lease,
+            state=state,
+            source_error=direct_helper_closure_error,
+            writable_roots=writable_roots,
+            finalization_errors=tuple(errors),
+        )
     if lifecycle_launched and closure_proven and state.exit_code is not None:
         try:
             lifecycle.closed(stage, exit_code=state.exit_code)
-        except UnprovenDirectHelperClosure:
-            lease.retain()
-            if writable_roots is not None:
-                writable_roots.close()
-            raise
         except BaseException as error:
-            errors.append(error)
+            source_error = (
+                error if isinstance(error, UnprovenDirectHelperClosure) else None
+            )
+            finalization_errors = (
+                tuple(errors) if source_error is not None else (*errors, error)
+            )
+            _raise_retained_unproven_closure(
+                stage=stage,
+                custody=custody,
+                lease=lease,
+                state=state,
+                source_error=source_error,
+                writable_roots=writable_roots,
+                finalization_errors=finalization_errors,
+            )
 
     if custody is not None:
         if closure_proven:
@@ -792,9 +1778,7 @@ def _finalize_custodied_stage(
     if writable_roots is not None:
         writable_roots.close()
     if errors:
-        raise RuntimeError(
-            "custodied process finalization was inconclusive"
-        ) from errors[0]
+        _raise_finalization_errors(errors, lease=lease)
 
 
 def _settle_launched_process(
@@ -1012,6 +1996,12 @@ def _require_empty_directory(path: pathlib.Path, *, label: str) -> None:
             raise ValueError(f"{label} must be empty")
 
 
+def _require_empty_directory_fd(directory_fd: int, *, label: str) -> None:
+    with os.scandir(directory_fd) as entries:
+        if next(entries, None) is not None:
+            raise ValueError(f"{label} must be empty")
+
+
 def _ensure_runtime_root(path: pathlib.Path) -> None:
     value = _canonical_absolute_path(path, label="runtime root")
     fd, _ = open_absolute_directory_chain(
@@ -1024,50 +2014,197 @@ def _ensure_runtime_root(path: pathlib.Path) -> None:
 
 def _allocate_runtime_lease(runtime_root: pathlib.Path) -> _RuntimeLease:
     _ensure_runtime_root(runtime_root)
-    _require_empty_directory(runtime_root, label="runtime root")
-    container_descriptor = _open_read_only_directory(runtime_root)
+    parent_descriptor, parent_identity = open_absolute_directory_chain(
+        runtime_root.parent
+    )
+    container_descriptor: int | None = None
     try:
+        container_descriptor = os.open(
+            os.fsencode(runtime_root.name),
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_descriptor,
+        )
+        container_identity = validate_private_directory_fd(
+            container_descriptor,
+            runtime_root,
+        )
+        container_path_identity = identity_from_stat(
+            os.stat(
+                os.fsencode(runtime_root.name),
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        )
+        if not directory_identities_match(
+            container_identity,
+            container_path_identity,
+        ):
+            raise OSError("runtime root identity changed while opening")
+        _require_empty_directory_fd(container_descriptor, label="runtime root")
         for _ in range(64):
             root = runtime_root / (
                 f"{_RUNTIME_LEASE_PREFIX}"
                 f"{secrets.token_hex(_RUNTIME_LEASE_TOKEN_BYTES)}"
             )
             raw_name = os.fsencode(root.name)
-            try:
-                os.mkdir(raw_name, 0o700, dir_fd=container_descriptor)
-            except FileExistsError:
-                continue
-            os.fsync(container_descriptor)
-            descriptor = os.open(
-                raw_name,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                dir_fd=container_descriptor,
-            )
-            validate_private_directory_fd(descriptor, root)
-            _require_empty_directory(root, label="fresh runtime")
-            return _RuntimeLease(
-                container=runtime_root,
+            descriptor: int | None = None
+            creation_identity: Identity | None = None
+            pending = _RuntimeAllocationRecovery(
+                parent_fd=parent_descriptor,
                 container_fd=container_descriptor,
-                container_identity=_directory_identity(os.fstat(container_descriptor)),
+                directory_fd=None,
+                container=runtime_root,
                 root=root,
-                root_fd=descriptor,
-                identity=_directory_identity(os.fstat(descriptor)),
+                parent_identity=parent_identity,
+                container_identity=container_identity,
             )
+            try:
+                try:
+                    os.mkdir(raw_name, 0o700, dir_fd=container_descriptor)
+                except FileExistsError:
+                    continue
+                # Keep the syscall return and the first durable ownership
+                # marker inside one exception region. An asynchronous
+                # interruption may arrive after mkdir succeeds but before the
+                # next Python assignment executes.
+                pending.entry_state = "mkdir-returned"
+            except BaseException as error:
+                retained = _pending_runtime_allocation_retention(
+                    pending,
+                    trigger=error,
+                )
+                if retained is not None:
+                    parent_descriptor = -1
+                    container_descriptor = None
+                    raise retained from error
+                raise
+            try:
+                creation_identity = identity_from_stat(
+                    os.stat(
+                        raw_name,
+                        dir_fd=container_descriptor,
+                        follow_symlinks=False,
+                    )
+                )
+                pending.directory_identity = creation_identity
+                os.fsync(container_descriptor)
+                descriptor = os.open(
+                    raw_name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=container_descriptor,
+                )
+                pending.directory_fd = descriptor
+                descriptor_identity = validate_private_directory_fd(
+                    descriptor,
+                    root,
+                )
+                path_identity = identity_from_stat(
+                    os.stat(
+                        raw_name,
+                        dir_fd=container_descriptor,
+                        follow_symlinks=False,
+                    )
+                )
+                if not directory_identities_match(
+                    descriptor_identity,
+                    creation_identity,
+                ) or not directory_identities_match(
+                    path_identity,
+                    descriptor_identity,
+                ):
+                    raise RuntimeError(
+                        "fresh runtime identity changed during allocation"
+                    )
+                _require_empty_directory_fd(descriptor, label="fresh runtime")
+                return _RuntimeLease(
+                    container_parent_fd=parent_descriptor,
+                    container_parent_identity=parent_identity,
+                    container=runtime_root,
+                    container_fd=container_descriptor,
+                    container_identity=container_identity,
+                    root=root,
+                    root_fd=descriptor,
+                    identity=descriptor_identity,
+                )
+            except BaseException as error:
+                rollback_fd = descriptor
+                try:
+                    if creation_identity is None:
+                        raise RuntimeError(
+                            "fresh runtime creation identity is unavailable"
+                        )
+                    if rollback_fd is None:
+                        rollback_fd = os.open(
+                            raw_name,
+                            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                            dir_fd=container_descriptor,
+                        )
+                        pending.directory_fd = rollback_fd
+                    quarantine_and_remove_empty_root(
+                        RootSpec(
+                            label="authenticated-review-runtime-allocation",
+                            parent_fd=container_descriptor,
+                            parent_identity=container_identity,
+                            name=raw_name,
+                            expected_identity=creation_identity,
+                            private_metadata=True,
+                        ),
+                        rollback_fd,
+                        deadline=time.monotonic() + _RUNTIME_CLEANUP_SECONDS,
+                    )
+                except BaseException as rollback_error:
+                    recovery = pending
+                    recovery.directory_fd = rollback_fd
+                    recovery.directory_identity = creation_identity
+                    recovery.entry_state = "rollback-unproven"
+                    recovery.retained = True
+                    parent_descriptor = -1
+                    container_descriptor = None
+                    descriptor = None
+                    rollback_fd = None
+                    retained = CodexExecutableRetentionRequired(
+                        "runtime lease allocation failed and descriptor-bound "
+                        "rollback could not be proved; allocation custody and "
+                        "recovery evidence were retained",
+                        code="runtime-lease-allocation-retained",
+                    )
+                    retained.retain_resource(recovery)
+                    retained.retain_recovery_evidence(
+                        _RuntimeRecoveryEvidence(
+                            stage="runtime-lease-allocation",
+                            parent_path=str(runtime_root),
+                            entry_name=root.name,
+                            parent_fd=recovery.container_fd,
+                            directory_fd=recovery.directory_fd,
+                            parent_identity=container_identity,
+                            directory_identity=creation_identity,
+                            reason=(
+                                f"trigger={type(error).__name__}: {error}; "
+                                f"rollback={type(rollback_error).__name__}: "
+                                f"{rollback_error}"
+                            ),
+                        )
+                    )
+                    _retain_quarantined_root_recovery_evidence(
+                        retained,
+                        rollback_error,
+                    )
+                    raise retained from rollback_error
+                finally:
+                    if rollback_fd is not None:
+                        os.close(rollback_fd)
+                    descriptor = None
+                raise
     except BaseException:
-        os.close(container_descriptor)
+        if container_descriptor is not None:
+            os.close(container_descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
         raise
+    assert container_descriptor is not None
     os.close(container_descriptor)
+    os.close(parent_descriptor)
     raise FileExistsError("cannot allocate a fresh authenticated-review runtime")
-
-
-def _directory_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
-    return (
-        value.st_dev,
-        value.st_ino,
-        value.st_mode,
-        value.st_uid,
-        value.st_gid,
-    )
 
 
 def _refresh_environment(

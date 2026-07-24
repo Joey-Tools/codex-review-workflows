@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import contextlib
+import dis
 import errno
 import hashlib
+import io
 import json
 import os
 import pathlib
@@ -14,7 +16,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from collections.abc import Callable
 from dataclasses import replace
 from unittest import mock
 
@@ -43,6 +47,57 @@ GITHUB_HOSTED_RUNTIME_PIN = profile.RuntimePin(
         "d1ee30dbde955aaa75c7f801fdfea4df05b10129454d7982eb6453f771436d42"
     ),
 )
+
+
+class _SyntheticProbeProcess:
+    def __init__(
+        self,
+        *,
+        pid: int,
+        communicate_error: BaseException,
+        wait_error: BaseException | None = None,
+    ) -> None:
+        self.pid = pid
+        self.returncode: int | None = None
+        self.stdout = io.BytesIO()
+        self.stderr = io.BytesIO()
+        self.communicate_error = communicate_error
+        self.wait_error = wait_error
+        self.wait_calls = 0
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls += 1
+        if self.wait_error is not None:
+            raise self.wait_error
+        self.returncode = -signal.SIGKILL
+        return self.returncode
+
+    def communicate(
+        self,
+        input: bytes | None = None,
+        timeout: float | None = None,
+    ) -> tuple[bytes, bytes]:
+        raise self.communicate_error
+
+
+class _InterruptingLaunchResultOwner:
+    def __init__(self) -> None:
+        self.launched: profile.LaunchedNoChildProcess | None = None
+        self.owns_calls = 0
+
+    def publish(self, launched: profile.LaunchedNoChildProcess) -> None:
+        self.launched = launched
+
+    def owns(self, launched: profile.LaunchedNoChildProcess) -> bool:
+        self.owns_calls += 1
+        self_identity_matches = self.launched is launched
+        raise KeyboardInterrupt(
+            "injected result-owner ownership query "
+            f"{self.owns_calls}; identity_matches={self_identity_matches}"
+        )
 
 
 def _sha256(path: pathlib.Path) -> str:
@@ -171,6 +226,184 @@ def _close_owner_snapshot_attestation(
 ) -> None:
     os.close(attestation.executable_fd)
     os.close(attestation.directory_fd)
+
+
+def _synthetic_probe_identities() -> tuple[
+    profile.ExecutableIdentity, profile.ExecutableIdentity
+]:
+    probe = profile.ExecutableIdentity(
+        path="/synthetic/python3.13",
+        device=1,
+        inode=2,
+        mode=stat.S_IFREG | 0o555,
+        uid=0,
+        gid=0,
+        size=4,
+        mtime_ns=1,
+        ctime_ns=1,
+        sha256="a" * 64,
+    )
+    return (
+        probe,
+        replace(
+            probe,
+            path="/synthetic/true",
+            inode=3,
+            sha256="b" * 64,
+        ),
+    )
+
+
+def _synthetic_probe_attestation(
+    executable: profile.ExecutableIdentity,
+) -> profile.PathExecutedExecutableAttestation:
+    return profile.PathExecutedExecutableAttestation(
+        executable=executable,
+        components=(),
+    )
+
+
+def _publish_synthetic_probe_process(
+    process: _SyntheticProbeProcess,
+) -> Callable[..., _SyntheticProbeProcess]:
+    def spawn(
+        owner: profile._ProbePopenOwner,
+        *_args: object,
+        **_kwargs: object,
+    ) -> _SyntheticProbeProcess:
+        owner.process = process
+        owner.ownership_published = True
+        owner.popen_call_started = True
+        owner.popen_call_completed = True
+        return process
+
+    return spawn
+
+
+def _publish_synthetic_launch_receipt(
+    *,
+    pid: int,
+    error_read: int,
+    error_write: int,
+) -> Callable[[profile._NoChildLaunchReceiptOwner], tuple[int, int, int]]:
+    def fork(
+        owner: profile._NoChildLaunchReceiptOwner,
+    ) -> tuple[int, int, int]:
+        receipt = profile._NoChildLaunchReceipt(
+            creator_pid=os.getpid(),
+            error_read_fd=error_read,
+            error_write_fd=error_write,
+            fork_call_started=True,
+            fork_call_completed=True,
+            returned_pid=pid,
+            leader_pid=pid,
+            leader_receipt_received=True,
+        )
+        owner.publish(receipt)
+        return pid, error_read, error_write
+
+    return fork
+
+
+def _publish_synthetic_pipe_receipt(
+    *,
+    error_read: int,
+    error_write: int,
+) -> Callable[
+    [profile._NoChildLaunchReceiptOwner],
+    profile._NoChildLaunchReceipt,
+]:
+    def open_pipe(
+        owner: profile._NoChildLaunchReceiptOwner,
+    ) -> profile._NoChildLaunchReceipt:
+        receipt = profile._NoChildLaunchReceipt(
+            creator_pid=os.getpid(),
+            error_read_fd=error_read,
+            error_write_fd=error_write,
+            pipe_call_started=True,
+            pipe_call_completed=True,
+        )
+        owner.publish(receipt)
+        return receipt
+
+    return open_pipe
+
+
+def _hold_synthetic_launch_child(*_args: object, **_kwargs: object) -> None:
+    os.setsid()
+    while True:
+        signal.pause()
+
+
+def _synthetic_prepared_launch() -> profile.PreparedNoChildProfile:
+    executable = profile.ExecutableIdentity(
+        path="/synthetic/app-server",
+        device=1,
+        inode=2,
+        mode=stat.S_IFREG | 0o555,
+        uid=os.getuid(),
+        gid=os.getgid(),
+        size=4,
+        mtime_ns=1,
+        ctime_ns=1,
+        sha256="a" * 64,
+    )
+    return profile.PreparedNoChildProfile(
+        executable=executable,
+        expected_sha256=executable.sha256,
+        seatbelt_profile="(version 1)\n",
+        evidence=mock.sentinel.compatibility,
+    )
+
+
+def _call_followup_offset(
+    function: Callable[..., object],
+    *,
+    called_name: str,
+    following_opname: str,
+    following_argval: object | None = None,
+) -> int:
+    instructions = list(dis.get_instructions(function))
+    matches: list[int] = []
+    for index, instruction in enumerate(instructions):
+        if instruction.argval != called_name:
+            continue
+        for candidate_index in range(index + 1, len(instructions) - 1):
+            if not instructions[candidate_index].opname.startswith("CALL"):
+                continue
+            following = instructions[candidate_index + 1]
+            if following.opname == following_opname and (
+                following_argval is None or following.argval == following_argval
+            ):
+                matches.append(following.offset)
+            break
+    if len(matches) != 1:
+        raise AssertionError(
+            f"expected one {called_name} CALL->{following_opname}, got {matches}"
+        )
+    return matches[0]
+
+
+def _successful_preexec_state(pid: int) -> bytes:
+    return json.dumps(
+        {
+            "ok": True,
+            "setsid_succeeded": True,
+            "pid": pid,
+            "process_group": pid,
+            "session_id": pid,
+            "nproc_soft": 1,
+            "nproc_hard": 1,
+            "error_number": None,
+            "detail": "",
+        },
+        sort_keys=True,
+    ).encode("ascii")
+
+
+def _write_synthetic_macho(path: pathlib.Path, *, alternate: bool = False) -> None:
+    path.write_bytes(b"\xca\xfe\xba\xbe" if alternate else b"\xcf\xfa\xed\xfe")
+    path.chmod(0o755)
 
 
 _SECURE_PROFILE_WORKER = r"""
@@ -864,8 +1097,59 @@ class NoChildProfileUnitTests(unittest.TestCase):
                 os.close(alias_fd)
                 _close_owner_snapshot_attestation(attestation)
 
+    def test_snapshot_launch_revalidation_checks_current_single_link_policy(
+        self,
+    ) -> None:
+        test_root = pathlib.Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory(
+            prefix=".snapshot-link-policy-",
+            dir=test_root,
+        ) as temporary:
+            root = pathlib.Path(temporary).resolve(strict=True)
+            root.chmod(0o700)
+            source = root / "source"
+            _write_synthetic_macho(source)
+            attestation = _build_owner_snapshot_attestation(
+                root,
+                source=source,
+            )
+            snapshot_path = pathlib.Path(attestation.snapshot.executable_path)
+            alias_path = snapshot_path.with_name("codex-hard-link")
+            try:
+                with (
+                    mock.patch.object(
+                        profile,
+                        "probe_compatibility",
+                        return_value=mock.sentinel.compatibility,
+                    ),
+                    mock.patch.object(profile, "require_compatible"),
+                ):
+                    prepared = profile.prepare_custodied_snapshot_no_child_profile(
+                        attestation,
+                        writable_roots=(),
+                    )
+                expected_identity = attestation.snapshot.executable_identity
+                self.assertEqual(
+                    expected_identity.file_protected_key(),
+                    replace(
+                        expected_identity,
+                        link_count=expected_identity.link_count + 1,
+                    ).file_protected_key(),
+                )
+                os.link(snapshot_path, alias_path)
+                self.assertEqual(os.stat(snapshot_path).st_nlink, 2)
+                with self.assertRaisesRegex(
+                    profile.ExecutableAuthenticationError,
+                    "access policy has an unsafe hard-link count",
+                ):
+                    profile._revalidate_prepared_profile(prepared)
+            finally:
+                alias_path.unlink(missing_ok=True)
+                _close_owner_snapshot_attestation(attestation)
+
     def test_error_pipe_setup_failure_closes_every_created_descriptor(self) -> None:
         error_read, error_write = os.pipe()
+        owner = profile._NoChildLaunchReceiptOwner()
         with (
             mock.patch.object(
                 profile.os,
@@ -879,21 +1163,157 @@ class NoChildProfileUnitTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(OSError, "injected cloexec failure"),
         ):
-            profile._open_launch_error_pipe()
+            profile._open_launch_error_pipe(owner)
 
+        self.assertTrue(owner.require_receipt().control_pipes_closed)
         for descriptor in (error_read, error_write):
             with self.subTest(descriptor=descriptor):
                 with self.assertRaises(OSError) as raised:
                     os.fstat(descriptor)
                 self.assertEqual(raised.exception.errno, errno.EBADF)
 
+    def test_error_pipe_creation_failure_proves_no_descriptors_created(self) -> None:
+        owner = profile._NoChildLaunchReceiptOwner()
+        with (
+            mock.patch.object(
+                profile.os,
+                "pipe",
+                side_effect=OSError(errno.EMFILE, "injected pipe creation failure"),
+            ),
+            self.assertRaisesRegex(OSError, "injected pipe creation failure"),
+        ):
+            profile._open_launch_error_pipe(owner)
+
+        receipt = owner.require_receipt()
+        self.assertTrue(receipt.pipe_call_started)
+        self.assertFalse(receipt.pipe_call_completed)
+        self.assertTrue(receipt.pipe_failure_proven)
+        self.assertTrue(receipt.control_pipes_closed)
+        self.assertEqual(receipt.error_read_fd, -1)
+        self.assertEqual(receipt.error_write_fd, -1)
+        self.assertEqual(receipt.error_read_close_outcome, "not-created")
+        self.assertEqual(receipt.error_write_close_outcome, "not-created")
+
+    def test_error_pipe_worker_preowns_receipt_before_pipe_result(self) -> None:
+        owner = profile._NoChildLaunchReceiptOwner()
+        caller_thread = threading.get_ident()
+        opened_descriptors: list[int] = []
+        original_pipe = os.pipe
+
+        def open_pipe() -> tuple[int, int]:
+            self.assertNotEqual(threading.get_ident(), caller_thread)
+            receipt = owner.require_receipt()
+            self.assertTrue(receipt.pipe_call_started)
+            self.assertFalse(receipt.pipe_call_completed)
+            self.assertEqual(receipt.error_read_fd, -1)
+            self.assertEqual(receipt.error_write_fd, -1)
+            self.assertEqual(receipt.error_read_close_outcome, "not-created")
+            self.assertEqual(receipt.error_write_close_outcome, "not-created")
+            result = original_pipe()
+            opened_descriptors.extend(result)
+            return result
+
+        receipt: profile._NoChildLaunchReceipt | None = None
+        try:
+            with mock.patch.object(profile.os, "pipe", side_effect=open_pipe):
+                receipt = profile._open_launch_error_pipe(owner)
+            self.assertTrue(receipt.pipe_call_completed)
+            self.assertTrue(owner.owns(receipt))
+            self.assertEqual(
+                (receipt.error_read_fd, receipt.error_write_fd),
+                tuple(opened_descriptors),
+            )
+        finally:
+            if receipt is not None:
+                receipt.close_error_read([])
+                receipt.close_error_write([])
+            for descriptor in opened_descriptors:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    def test_error_pipe_return_store_interrupt_closes_prepublished_fds(
+        self,
+    ) -> None:
+        target_offset = _call_followup_offset(
+            profile._fork_with_launch_error_pipe,
+            called_name="_open_launch_error_pipe",
+            following_opname="STORE_FAST",
+            following_argval="receipt",
+        )
+        prepared = _synthetic_prepared_launch()
+        parent_pid = os.getpid()
+        interruption = SystemExit("injected pipe return-to-receipt-store interrupt")
+        armed = True
+        opened_descriptors: list[int] = []
+        original_pipe = os.pipe
+
+        def open_pipe() -> tuple[int, int]:
+            result = original_pipe()
+            opened_descriptors.extend(result)
+            return result
+
+        def trace(frame, event, _arg):
+            nonlocal armed
+            if os.getpid() != parent_pid:
+                return None
+            if frame.f_code is profile._fork_with_launch_error_pipe.__code__:
+                frame.f_trace_opcodes = True
+                if event == "opcode" and armed and frame.f_lasti == target_offset:
+                    armed = False
+                    raise interruption
+            return trace
+
+        previous_trace = sys.gettrace()
+        try:
+            with (
+                mock.patch.object(profile, "require_compatible"),
+                mock.patch.object(profile, "_require_live_runtime"),
+                mock.patch.object(profile, "_revalidate_prepared_profile"),
+                mock.patch.object(profile, "prove_exec_budget"),
+                mock.patch.object(profile.os, "pipe", side_effect=open_pipe),
+                mock.patch.object(profile.os, "fork") as fork,
+            ):
+                sys.settrace(trace)
+                try:
+                    with self.assertRaises(SystemExit) as caught:
+                        profile.launch_prepared_no_child_process(
+                            prepared,
+                            [prepared.executable.path],
+                            cwd="/",
+                            environment={},
+                        )
+                finally:
+                    sys.settrace(previous_trace)
+
+            self.assertIs(caught.exception, interruption)
+            self.assertFalse(armed)
+            fork.assert_not_called()
+            self.assertEqual(len(opened_descriptors), 2)
+            for descriptor in opened_descriptors:
+                with self.assertRaises(OSError) as descriptor_error:
+                    os.fstat(descriptor)
+                self.assertEqual(descriptor_error.exception.errno, errno.EBADF)
+        finally:
+            sys.settrace(previous_trace)
+            for descriptor in opened_descriptors:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
     def test_fork_failure_closes_both_error_pipe_descriptors(self) -> None:
         error_read, error_write = os.pipe()
+        owner = profile._NoChildLaunchReceiptOwner()
         with (
             mock.patch.object(
                 profile,
                 "_open_launch_error_pipe",
-                return_value=(error_read, error_write),
+                side_effect=_publish_synthetic_pipe_receipt(
+                    error_read=error_read,
+                    error_write=error_write,
+                ),
             ),
             mock.patch.object(
                 profile.os,
@@ -902,19 +1322,1378 @@ class NoChildProfileUnitTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(OSError, "injected fork failure"),
         ):
-            profile._fork_with_launch_error_pipe()
+            profile._fork_with_launch_error_pipe(owner)
 
+        self.assertIsNotNone(owner.receipt)
+        assert owner.receipt is not None
+        self.assertTrue(owner.receipt.fork_failure_proven)
+        self.assertTrue(owner.receipt.control_pipes_closed)
         for descriptor in (error_read, error_write):
             with self.subTest(descriptor=descriptor):
                 with self.assertRaises(OSError) as raised:
                     os.fstat(descriptor)
                 self.assertEqual(raised.exception.errno, errno.EBADF)
 
+    def _assert_launch_opcode_interrupt_closes_exact_child(
+        self,
+        *,
+        target_code: object,
+        target_offset: int,
+        interruption: BaseException,
+    ) -> None:
+        prepared = _synthetic_prepared_launch()
+        error_read, error_write = os.pipe()
+        parent_pid = os.getpid()
+        armed = True
+        settled_pids: list[int] = []
+        receipts: list[profile._NoChildLaunchReceipt] = []
+        real_terminate_and_reap = profile._terminate_and_reap
+        publish_pipe_receipt = _publish_synthetic_pipe_receipt(
+            error_read=error_read,
+            error_write=error_write,
+        )
+
+        def terminate_and_reap(pid: int) -> None:
+            settled_pids.append(pid)
+            real_terminate_and_reap(pid)
+
+        def open_pipe(
+            owner: profile._NoChildLaunchReceiptOwner,
+        ) -> profile._NoChildLaunchReceipt:
+            receipt = publish_pipe_receipt(owner)
+            receipts.append(receipt)
+            return receipt
+
+        def trace(frame, event, _arg):
+            nonlocal armed
+            if os.getpid() != parent_pid:
+                return None
+            if frame.f_code is target_code:
+                frame.f_trace_opcodes = True
+                if event == "opcode" and armed and frame.f_lasti == target_offset:
+                    armed = False
+                    raise interruption
+            return trace
+
+        previous_trace = sys.gettrace()
+        leader_pid: int | None = None
+        try:
+            with (
+                mock.patch.object(profile, "require_compatible"),
+                mock.patch.object(profile, "_require_live_runtime"),
+                mock.patch.object(profile, "_revalidate_prepared_profile"),
+                mock.patch.object(profile, "prove_exec_budget"),
+                mock.patch.object(
+                    profile,
+                    "_open_launch_error_pipe",
+                    side_effect=open_pipe,
+                ),
+                mock.patch.object(
+                    profile,
+                    "_launch_child",
+                    new=_hold_synthetic_launch_child,
+                ),
+                mock.patch.object(
+                    profile,
+                    "_terminate_and_reap",
+                    side_effect=terminate_and_reap,
+                ),
+            ):
+                sys.settrace(trace)
+                try:
+                    with self.assertRaises(type(interruption)) as caught:
+                        profile.launch_prepared_no_child_process(
+                            prepared,
+                            [prepared.executable.path],
+                            cwd="/",
+                            environment={},
+                        )
+                finally:
+                    sys.settrace(previous_trace)
+
+            self.assertIs(caught.exception, interruption)
+            self.assertFalse(armed)
+            self.assertEqual(len(receipts), 1)
+            self.assertTrue(receipts[0].fork_call_completed)
+            self.assertFalse(receipts[0].fork_failure_proven)
+            self.assertTrue(receipts[0].leader_receipt_received)
+            self.assertEqual(len(settled_pids), 1)
+            leader_pid = settled_pids[0]
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(leader_pid, os.WNOHANG)
+            with self.assertRaises(ProcessLookupError):
+                os.killpg(leader_pid, 0)
+            for descriptor in (error_read, error_write):
+                with self.assertRaises(OSError) as descriptor_error:
+                    os.fstat(descriptor)
+                self.assertEqual(descriptor_error.exception.errno, errno.EBADF)
+        finally:
+            sys.settrace(previous_trace)
+            if leader_pid is not None:
+                try:
+                    os.killpg(leader_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    try:
+                        os.kill(leader_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                try:
+                    os.waitpid(leader_pid, 0)
+                except ChildProcessError:
+                    pass
+            for descriptor in (error_read, error_write):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    def test_fork_call_to_pid_store_interrupt_closes_exact_child(self) -> None:
+        target_offset = _call_followup_offset(
+            profile._fork_with_launch_error_pipe,
+            called_name="fork",
+            following_opname="STORE_FAST",
+            following_argval="pid",
+        )
+        self._assert_launch_opcode_interrupt_closes_exact_child(
+            target_code=profile._fork_with_launch_error_pipe.__code__,
+            target_offset=target_offset,
+            interruption=SystemExit("injected fork CALL-to-pid-STORE interruption"),
+        )
+
+    def test_fork_call_to_pid_store_oserror_settles_exact_child(self) -> None:
+        target_offset = _call_followup_offset(
+            profile._fork_with_launch_error_pipe,
+            called_name="fork",
+            following_opname="STORE_FAST",
+            following_argval="pid",
+        )
+        self._assert_launch_opcode_interrupt_closes_exact_child(
+            target_code=profile._fork_with_launch_error_pipe.__code__,
+            target_offset=target_offset,
+            interruption=OSError(
+                errno.EINTR,
+                "injected post-return fork OSError",
+            ),
+        )
+
+    def test_launch_receipt_ambiguous_close_never_closes_reused_fd(self) -> None:
+        error_read, error_write = os.pipe()
+        receipt = profile._NoChildLaunchReceipt(
+            creator_pid=os.getpid(),
+            error_read_fd=error_read,
+            error_write_fd=error_write,
+        )
+        original_close = os.close
+
+        def close_then_interrupt(descriptor: int) -> None:
+            self.assertEqual(receipt.error_read_fd, descriptor)
+            self.assertEqual(
+                receipt.error_read_close_outcome,
+                "close-outcome-unproven",
+            )
+            original_close(descriptor)
+            raise KeyboardInterrupt("injected close-result interruption")
+
+        try:
+            with (
+                mock.patch.object(
+                    profile.os,
+                    "close",
+                    side_effect=close_then_interrupt,
+                ),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                receipt.close_error_read()
+
+            self.assertEqual(receipt.error_read_fd, error_read)
+            self.assertEqual(
+                receipt.error_read_close_outcome,
+                "close-outcome-unproven",
+            )
+            replacement_fd = os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+            if replacement_fd != error_read:
+                os.dup2(replacement_fd, error_read)
+                os.close(replacement_fd)
+                replacement_fd = error_read
+            try:
+                failures: list[str] = []
+                with mock.patch.object(profile.os, "close") as retry_close:
+                    self.assertFalse(receipt.close_error_read(failures))
+                retry_close.assert_not_called()
+                self.assertEqual(failures, [])
+                os.fstat(replacement_fd)
+            finally:
+                os.close(replacement_fd)
+        finally:
+            receipt.close_error_write([])
+
+    def test_ambiguous_pipe_close_publishes_typed_descriptor_retention(
+        self,
+    ) -> None:
+        prepared = _synthetic_prepared_launch()
+        error_read, error_write = os.pipe()
+        receipt = profile._NoChildLaunchReceipt(
+            creator_pid=os.getpid(),
+            error_read_fd=error_read,
+            error_write_fd=error_write,
+        )
+        owner = profile._NoChildLaunchReceiptOwner()
+        owner.publish(receipt)
+        original_close = os.close
+
+        def close_with_ambiguous_read(descriptor: int) -> None:
+            original_close(descriptor)
+            if descriptor == error_read:
+                raise KeyboardInterrupt("injected close-result interruption")
+
+        try:
+            with (
+                mock.patch.object(
+                    profile.os,
+                    "close",
+                    side_effect=close_with_ambiguous_read,
+                ),
+                self.assertRaises(profile.NoChildLaunchClosureUnproven) as caught,
+            ):
+                profile._settle_owned_launch_after_base_exception(
+                    owner,
+                    prepared=prepared,
+                    exec_acknowledged=False,
+                    leader_binding_complete=False,
+                    trigger=RuntimeError("synthetic pre-fork failure"),
+                )
+
+            self.assertFalse(caught.exception.evidence.control_pipes_closed)
+            self.assertEqual(receipt.error_read_fd, error_read)
+            self.assertEqual(
+                receipt.error_read_close_outcome,
+                "close-outcome-unproven",
+            )
+            self.assertIn(error_read, caught.exception.retained_resources)
+            self.assertIn(receipt, caught.exception.retained_resources)
+            self.assertIn(owner, caught.exception.retained_resources)
+        finally:
+            for descriptor in (error_read, error_write):
+                try:
+                    original_close(descriptor)
+                except OSError:
+                    pass
+
+    def test_launch_helper_return_to_unpack_interrupt_closes_exact_child(
+        self,
+    ) -> None:
+        target_offset = _call_followup_offset(
+            profile.launch_prepared_no_child_process,
+            called_name="_fork_with_launch_error_pipe",
+            following_opname="UNPACK_SEQUENCE",
+        )
+        self._assert_launch_opcode_interrupt_closes_exact_child(
+            target_code=profile.launch_prepared_no_child_process.__code__,
+            target_offset=target_offset,
+            interruption=SystemExit(
+                "injected launch helper return-to-UNPACK interruption"
+            ),
+        )
+
+    def test_probe_pipe_setup_rolls_back_every_partial_initialization(self) -> None:
+        release_pair = os.pipe()
+        with (
+            mock.patch.object(
+                profile.os,
+                "pipe",
+                side_effect=(
+                    release_pair,
+                    OSError(errno.EMFILE, "injected second pipe failure"),
+                ),
+            ),
+            self.assertRaisesRegex(OSError, "injected second pipe failure"),
+        ):
+            profile._open_probe_control_pipes()
+        for descriptor in release_pair:
+            with self.assertRaises(OSError) as raised:
+                os.fstat(descriptor)
+            self.assertEqual(raised.exception.errno, errno.EBADF)
+
+        release_pair = os.pipe()
+        status_pair = os.pipe()
+        real_set_inheritable = os.set_inheritable
+        calls = 0
+
+        def fail_third_set_inheritable(descriptor: int, inheritable: bool) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise OSError(errno.EIO, "injected probe cloexec failure")
+            real_set_inheritable(descriptor, inheritable)
+
+        with (
+            mock.patch.object(
+                profile.os,
+                "pipe",
+                side_effect=(release_pair, status_pair),
+            ),
+            mock.patch.object(
+                profile.os,
+                "set_inheritable",
+                side_effect=fail_third_set_inheritable,
+            ),
+            self.assertRaisesRegex(OSError, "injected probe cloexec failure"),
+        ):
+            profile._open_probe_control_pipes()
+        for descriptor in (*release_pair, *status_pair):
+            with self.assertRaises(OSError) as raised:
+                os.fstat(descriptor)
+            self.assertEqual(raised.exception.errno, errno.EBADF)
+
+    def test_probe_ambiguous_control_close_never_retries_reused_fd(self) -> None:
+        release_read, release_write = os.pipe()
+        control_descriptors = profile._ProbeControlDescriptorOwner.from_role_pairs(
+            (
+                ("release-read", release_read),
+                ("release-write", release_write),
+            )
+        )
+        original_close = os.close
+        replacement_fd: int | None = None
+
+        def close_reuse_then_interrupt(descriptor: int) -> None:
+            nonlocal replacement_fd
+            self.assertEqual(descriptor, release_read)
+            self.assertEqual(
+                control_descriptors.close_outcomes[descriptor],
+                "close-outcome-unproven",
+            )
+            original_close(descriptor)
+            opened = os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+            if opened != descriptor:
+                os.dup2(opened, descriptor, inheritable=False)
+                original_close(opened)
+            replacement_fd = descriptor
+            raise OSError(
+                errno.EINTR,
+                "injected post-close OSError after immediate FD reuse",
+            )
+
+        try:
+            with (
+                mock.patch.object(
+                    profile.os,
+                    "close",
+                    side_effect=close_reuse_then_interrupt,
+                ),
+                self.assertRaisesRegex(
+                    OSError,
+                    "injected post-close OSError",
+                ),
+            ):
+                control_descriptors.close_descriptor(release_read)
+
+            self.assertEqual(replacement_fd, release_read)
+            self.assertEqual(
+                control_descriptors.close_outcomes[release_read],
+                "close-outcome-unproven",
+            )
+            close_calls: list[int] = []
+
+            def close_remaining(descriptor: int) -> None:
+                close_calls.append(descriptor)
+                original_close(descriptor)
+
+            failures: list[str] = []
+            with mock.patch.object(
+                profile.os,
+                "close",
+                side_effect=close_remaining,
+            ):
+                self.assertFalse(
+                    profile._close_probe_control_descriptors(
+                        control_descriptors,
+                        failures,
+                    )
+                )
+            self.assertNotIn(release_read, close_calls)
+            self.assertIn("close-outcome-unproven", ";".join(failures))
+            os.fstat(release_read)
+
+            popen_owner = profile._ProbePopenOwner()
+            with (
+                mock.patch.object(profile.os, "close") as retry_close,
+                self.assertRaises(profile.NoChildProbeSpawnOwnershipUnproven) as caught,
+            ):
+                profile._raise_probe_spawn_ownership_unproven(
+                    popen_owner,
+                    control_descriptors=control_descriptors,
+                    cause=RuntimeError("synthetic cleanup transition"),
+                    detail="exercise typed ambiguous descriptor retention",
+                )
+            retry_close.assert_not_called()
+            evidence = caught.exception.evidence
+            self.assertFalse(evidence.control_pipes_closed)
+            close_evidence = {
+                item.role: item for item in evidence.control_descriptor_close_evidence
+            }
+            self.assertEqual(
+                close_evidence["release-read"].outcome,
+                "close-outcome-unproven",
+            )
+            self.assertEqual(
+                close_evidence["release-write"].outcome,
+                "closed",
+            )
+            self.assertIn(
+                control_descriptors,
+                caught.exception.retained_resources,
+            )
+            self.assertNotIn(
+                release_read,
+                caught.exception.retained_resources,
+            )
+            self.assertIn(evidence, caught.exception.recovery_evidence)
+            os.fstat(release_read)
+        finally:
+            for descriptor in (release_read, release_write):
+                try:
+                    original_close(descriptor)
+                except OSError:
+                    pass
+
+    def test_probe_worker_uses_isolated_python_and_closed_launch_context(
+        self,
+    ) -> None:
+        probe, alternate = _synthetic_probe_identities()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"PROBE_IMPORT_SHADOW": "must-not-cross"},
+                clear=False,
+            ),
+            mock.patch.object(
+                profile,
+                "_spawn_owned_probe_process",
+                side_effect=OSError(errno.ENOEXEC, "synthetic launch stop"),
+            ) as popen,
+            mock.patch.object(
+                profile,
+                "_revalidate_path_executed_executable",
+                return_value=probe,
+            ),
+            mock.patch.object(
+                profile,
+                "_read_executable_identity",
+                return_value=alternate,
+            ),
+            mock.patch.object(profile, "_read_bounded_pipe", return_value=b""),
+        ):
+            observation = profile._run_probe_case(
+                layer="rlimit",
+                action="baseline",
+                probe_executable_attestation=_synthetic_probe_attestation(probe),
+                alternate_executable=alternate,
+                profile="(version 1)\n",
+                python_home="/synthetic/python-home",
+            )
+
+        self.assertEqual(observation.outcome, "ambiguous")
+        argv = popen.call_args.args[1]
+        self.assertEqual(argv[:5], [probe.path, "-I", "-B", "-S", "-c"])
+        self.assertEqual(popen.call_args.kwargs["cwd"], "/")
+        self.assertEqual(
+            popen.call_args.kwargs["env"],
+            {
+                "HOME": "/var/empty",
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin",
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONHOME": "/synthetic/python-home",
+                "PYTHONNOUSERSITE": "1",
+            },
+        )
+
+    def test_probe_base_exception_terminates_reaps_and_closes_every_pipe(
+        self,
+    ) -> None:
+        probe, alternate = _synthetic_probe_identities()
+        release_read, release_write = os.pipe()
+        status_read, status_write = os.pipe()
+        descriptors = (release_read, release_write, status_read, status_write)
+        process = _SyntheticProbeProcess(
+            pid=424240,
+            communicate_error=KeyboardInterrupt("injected probe interrupt"),
+        )
+
+        def kill_process_group(process_group: int, signal_number: int) -> None:
+            self.assertEqual(process_group, process.pid)
+            if signal_number == 0:
+                raise ProcessLookupError(errno.ESRCH, "synthetic empty group")
+            self.assertEqual(signal_number, signal.SIGKILL)
+
+        with (
+            mock.patch.object(
+                profile,
+                "_open_probe_control_pipes",
+                return_value=descriptors,
+            ),
+            mock.patch.object(
+                profile,
+                "_read_executable_identity",
+                return_value=alternate,
+            ),
+            mock.patch.object(
+                profile,
+                "_revalidate_path_executed_executable",
+                return_value=probe,
+            ),
+            mock.patch.object(
+                profile,
+                "_spawn_owned_probe_process",
+                side_effect=_publish_synthetic_probe_process(process),
+            ),
+            mock.patch.object(
+                profile,
+                "_read_bounded_pipe",
+                return_value=_successful_preexec_state(process.pid),
+            ),
+            mock.patch.object(profile.os, "getpgid", return_value=process.pid),
+            mock.patch.object(profile.os, "getsid", return_value=process.pid),
+            mock.patch.object(
+                profile,
+                "process_start_identity",
+                return_value="synthetic-start",
+            ),
+            mock.patch.object(profile.os, "write", return_value=1),
+            mock.patch.object(
+                profile.os,
+                "killpg",
+                side_effect=kill_process_group,
+            ) as killpg,
+            self.assertRaisesRegex(
+                KeyboardInterrupt,
+                "injected probe interrupt",
+            ),
+        ):
+            profile._run_probe_case(
+                layer="rlimit",
+                action="baseline",
+                probe_executable_attestation=_synthetic_probe_attestation(probe),
+                alternate_executable=alternate,
+                profile="(version 1)\n",
+                python_home="/synthetic/python-home",
+            )
+
+        self.assertEqual(process.wait_calls, 1)
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
+        self.assertEqual(
+            killpg.call_args_list,
+            [
+                mock.call(process.pid, signal.SIGKILL),
+                mock.call(process.pid, 0),
+            ],
+        )
+        for descriptor in descriptors:
+            with self.assertRaises(OSError) as caught:
+                os.fstat(descriptor)
+            self.assertEqual(caught.exception.errno, errno.EBADF)
+
+    def test_probe_first_exec_revalidation_failure_prevents_popen(
+        self,
+    ) -> None:
+        probe, alternate = _synthetic_probe_identities()
+        release_read, release_write = os.pipe()
+        status_read, status_write = os.pipe()
+        descriptors = (release_read, release_write, status_read, status_write)
+        revalidation_error = profile.ExecutableAuthenticationError(
+            "synthetic immediate pre-exec attestation failure"
+        )
+        with (
+            mock.patch.object(
+                profile,
+                "_open_probe_control_pipes",
+                return_value=descriptors,
+            ),
+            mock.patch.object(
+                profile,
+                "_revalidate_path_executed_executable",
+                side_effect=(probe, revalidation_error),
+            ) as revalidate,
+            mock.patch.object(
+                profile,
+                "_read_executable_identity",
+                return_value=alternate,
+            ),
+            mock.patch.object(
+                profile,
+                "_spawn_owned_probe_process",
+            ) as spawn_probe,
+            self.assertRaisesRegex(
+                profile.ExecutableAuthenticationError,
+                "immediate pre-exec attestation failure",
+            ),
+        ):
+            profile._run_probe_case(
+                layer="rlimit",
+                action="baseline",
+                probe_executable_attestation=_synthetic_probe_attestation(probe),
+                alternate_executable=alternate,
+                profile="(version 1)\n",
+                python_home="/synthetic/python-home",
+            )
+
+        self.assertEqual(revalidate.call_count, 2)
+        spawn_probe.assert_not_called()
+        for descriptor in descriptors:
+            with self.assertRaises(OSError) as descriptor_error:
+                os.fstat(descriptor)
+            self.assertEqual(descriptor_error.exception.errno, errno.EBADF)
+
+    def test_probe_popen_result_store_interrupt_uses_published_owner(
+        self,
+    ) -> None:
+        instructions = list(dis.get_instructions(profile._run_probe_case))
+        result_store_offsets: set[int] = set()
+        for index, instruction in enumerate(instructions):
+            if instruction.argval != "_spawn_owned_probe_process":
+                continue
+            for candidate_index in range(index + 1, len(instructions) - 1):
+                if not instructions[candidate_index].opname.startswith("CALL"):
+                    continue
+                result_store = instructions[candidate_index + 1]
+                if (
+                    result_store.opname in {"STORE_FAST", "STORE_DEREF"}
+                    and result_store.argval == "process"
+                ):
+                    result_store_offsets.add(result_store.offset)
+                break
+        self.assertEqual(len(result_store_offsets), 1)
+
+        probe, alternate = _synthetic_probe_identities()
+        release_read, release_write = os.pipe()
+        status_read, status_write = os.pipe()
+        descriptors = (release_read, release_write, status_read, status_write)
+        process = _SyntheticProbeProcess(
+            pid=424242,
+            communicate_error=AssertionError("communicate must not run"),
+        )
+        interruption = SystemExit("injected Popen result-store interruption")
+        armed = True
+
+        def trace(frame, event, _arg):
+            nonlocal armed
+            if frame.f_code is profile._run_probe_case.__code__:
+                frame.f_trace_opcodes = True
+                if (
+                    event == "opcode"
+                    and armed
+                    and frame.f_lasti in result_store_offsets
+                ):
+                    armed = False
+                    raise interruption
+            return trace
+
+        previous_trace = sys.gettrace()
+        with (
+            mock.patch.object(
+                profile,
+                "_open_probe_control_pipes",
+                return_value=descriptors,
+            ),
+            mock.patch.object(
+                profile,
+                "_revalidate_path_executed_executable",
+                return_value=probe,
+            ),
+            mock.patch.object(
+                profile,
+                "_read_executable_identity",
+                return_value=alternate,
+            ),
+            mock.patch.object(
+                profile,
+                "_spawn_owned_probe_process",
+                side_effect=_publish_synthetic_probe_process(process),
+            ),
+            mock.patch.object(profile.os, "kill") as kill,
+        ):
+            sys.settrace(trace)
+            try:
+                with self.assertRaises(SystemExit) as caught:
+                    profile._run_probe_case(
+                        layer="rlimit",
+                        action="baseline",
+                        probe_executable_attestation=_synthetic_probe_attestation(
+                            probe
+                        ),
+                        alternate_executable=alternate,
+                        profile="(version 1)\n",
+                        python_home="/synthetic/python-home",
+                    )
+            finally:
+                sys.settrace(previous_trace)
+
+        self.assertIs(caught.exception, interruption)
+        self.assertFalse(armed)
+        kill.assert_called_once_with(process.pid, signal.SIGKILL)
+        self.assertEqual(process.wait_calls, 1)
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
+        for descriptor in descriptors:
+            with self.assertRaises(OSError) as descriptor_error:
+                os.fstat(descriptor)
+            self.assertEqual(descriptor_error.exception.errno, errno.EBADF)
+
+    def test_probe_popen_interrupt_without_pid_returns_typed_retention(
+        self,
+    ) -> None:
+        class PartialProbeProcess:
+            def __init__(self) -> None:
+                self.stdout = io.BytesIO()
+                self.stderr = io.BytesIO()
+
+        probe, alternate = _synthetic_probe_identities()
+        release_read, release_write = os.pipe()
+        status_read, status_write = os.pipe()
+        descriptors = (release_read, release_write, status_read, status_write)
+        partial_process = PartialProbeProcess()
+        interruption = KeyboardInterrupt("injected Popen initialization interrupt")
+
+        def interrupt_spawn(
+            owner: profile._ProbePopenOwner,
+            *_args: object,
+            **_kwargs: object,
+        ) -> None:
+            owner.process = partial_process  # type: ignore[assignment]
+            owner.ownership_published = True
+            owner.popen_call_started = True
+            raise interruption
+
+        with (
+            mock.patch.object(
+                profile,
+                "_open_probe_control_pipes",
+                return_value=descriptors,
+            ),
+            mock.patch.object(
+                profile,
+                "_revalidate_path_executed_executable",
+                return_value=probe,
+            ),
+            mock.patch.object(
+                profile,
+                "_read_executable_identity",
+                return_value=alternate,
+            ),
+            mock.patch.object(
+                profile,
+                "_spawn_owned_probe_process",
+                side_effect=interrupt_spawn,
+            ),
+            self.assertRaises(profile.NoChildProbeSpawnOwnershipUnproven) as caught,
+        ):
+            profile._run_probe_case(
+                layer="rlimit",
+                action="baseline",
+                probe_executable_attestation=_synthetic_probe_attestation(probe),
+                alternate_executable=alternate,
+                profile="(version 1)\n",
+                python_home="/synthetic/python-home",
+            )
+
+        evidence = caught.exception.evidence
+        self.assertTrue(evidence.popen_call_started)
+        self.assertFalse(evidence.popen_call_completed)
+        self.assertTrue(evidence.ownership_published)
+        self.assertIsNone(evidence.leader_pid)
+        self.assertTrue(evidence.control_pipes_closed)
+        self.assertTrue(evidence.output_pipes_closed)
+        self.assertIn(partial_process, caught.exception.retained_resources)
+        self.assertIn(evidence, caught.exception.recovery_evidence)
+        self.assertTrue(partial_process.stdout.closed)
+        self.assertTrue(partial_process.stderr.closed)
+        for descriptor in descriptors:
+            with self.assertRaises(OSError) as descriptor_error:
+                os.fstat(descriptor)
+            self.assertEqual(descriptor_error.exception.errno, errno.EBADF)
+
+    def test_probe_unreaped_worker_returns_typed_retained_evidence(
+        self,
+    ) -> None:
+        probe, alternate = _synthetic_probe_identities()
+        release_read, release_write = os.pipe()
+        status_read, status_write = os.pipe()
+        descriptors = (release_read, release_write, status_read, status_write)
+        process = _SyntheticProbeProcess(
+            pid=424241,
+            communicate_error=KeyboardInterrupt("injected probe interrupt"),
+            wait_error=subprocess.TimeoutExpired("synthetic-probe", 1.0),
+        )
+        with (
+            mock.patch.object(
+                profile,
+                "_open_probe_control_pipes",
+                return_value=descriptors,
+            ),
+            mock.patch.object(
+                profile,
+                "_read_executable_identity",
+                return_value=alternate,
+            ),
+            mock.patch.object(
+                profile,
+                "_revalidate_path_executed_executable",
+                return_value=probe,
+            ),
+            mock.patch.object(
+                profile,
+                "_spawn_owned_probe_process",
+                side_effect=_publish_synthetic_probe_process(process),
+            ),
+            mock.patch.object(
+                profile,
+                "_read_bounded_pipe",
+                return_value=_successful_preexec_state(process.pid),
+            ),
+            mock.patch.object(profile.os, "getpgid", return_value=process.pid),
+            mock.patch.object(profile.os, "getsid", return_value=process.pid),
+            mock.patch.object(
+                profile,
+                "process_start_identity",
+                return_value="synthetic-start",
+            ),
+            mock.patch.object(profile.os, "write", return_value=1),
+            mock.patch.object(profile.os, "killpg") as killpg,
+            self.assertRaises(profile.NoChildProbeClosureUnproven) as caught,
+        ):
+            profile._run_probe_case(
+                layer="rlimit",
+                action="baseline",
+                probe_executable_attestation=_synthetic_probe_attestation(probe),
+                alternate_executable=alternate,
+                profile="(version 1)\n",
+                python_home="/synthetic/python-home",
+            )
+
+        evidence = caught.exception.evidence
+        self.assertTrue(evidence.worker_release_attempted)
+        self.assertTrue(evidence.worker_released)
+        self.assertFalse(evidence.communicate_completed)
+        self.assertTrue(evidence.leader_binding_complete)
+        self.assertTrue(evidence.process_group_bound)
+        self.assertFalse(evidence.leader_reaped)
+        self.assertFalse(evidence.process_group_empty)
+        self.assertTrue(evidence.control_pipes_closed)
+        self.assertTrue(evidence.output_pipes_closed)
+        self.assertIn(process, caught.exception.retained_resources)
+        self.assertIn(evidence, caught.exception.recovery_evidence)
+        killpg.assert_called_once_with(process.pid, signal.SIGKILL)
+        for descriptor in descriptors:
+            with self.assertRaises(OSError) as descriptor_error:
+                os.fstat(descriptor)
+            self.assertEqual(descriptor_error.exception.errno, errno.EBADF)
+
+    def test_post_acknowledgement_interrupt_terminates_and_reaps(self) -> None:
+        executable = profile.ExecutableIdentity(
+            path="/synthetic/app-server",
+            device=1,
+            inode=2,
+            mode=stat.S_IFREG | 0o555,
+            uid=0,
+            gid=0,
+            size=4,
+            mtime_ns=1,
+            ctime_ns=1,
+            sha256="a" * 64,
+        )
+        prepared = profile.PreparedNoChildProfile(
+            executable=executable,
+            expected_sha256=executable.sha256,
+            seatbelt_profile="(version 1)\n",
+            evidence=mock.sentinel.compatibility,
+        )
+        error_read, error_write = os.pipe()
+        with (
+            mock.patch.object(profile, "require_compatible"),
+            mock.patch.object(profile, "_require_live_runtime"),
+            mock.patch.object(profile, "_revalidate_prepared_profile"),
+            mock.patch.object(
+                profile,
+                "_fork_with_launch_error_pipe",
+                side_effect=_publish_synthetic_launch_receipt(
+                    pid=424242,
+                    error_read=error_read,
+                    error_write=error_write,
+                ),
+            ),
+            mock.patch.object(
+                profile.resource,
+                "getrlimit",
+                side_effect=((1, 1), KeyboardInterrupt("injected setup interrupt")),
+            ),
+            mock.patch.object(profile, "_terminate_and_reap") as terminate,
+            self.assertRaisesRegex(KeyboardInterrupt, "injected setup interrupt"),
+        ):
+            profile.launch_prepared_no_child_process(
+                prepared,
+                [executable.path],
+                cwd="/",
+            )
+        terminate.assert_called_once_with(424242)
+
+    def test_binding_interrupt_terminates_and_reaps_or_retains_evidence(self) -> None:
+        executable = profile.ExecutableIdentity(
+            path="/synthetic/app-server",
+            device=1,
+            inode=2,
+            mode=stat.S_IFREG | 0o555,
+            uid=0,
+            gid=0,
+            size=4,
+            mtime_ns=1,
+            ctime_ns=1,
+            sha256="a" * 64,
+        )
+        prepared = profile.PreparedNoChildProfile(
+            executable=executable,
+            expected_sha256=executable.sha256,
+            seatbelt_profile="(version 1)\n",
+            evidence=mock.sentinel.compatibility,
+        )
+        error_read, error_write = os.pipe()
+        with (
+            mock.patch.object(profile, "require_compatible"),
+            mock.patch.object(profile, "_require_live_runtime"),
+            mock.patch.object(profile, "_revalidate_prepared_profile"),
+            mock.patch.object(
+                profile,
+                "_fork_with_launch_error_pipe",
+                side_effect=_publish_synthetic_launch_receipt(
+                    pid=424243,
+                    error_read=error_read,
+                    error_write=error_write,
+                ),
+            ),
+            mock.patch.object(profile.resource, "getrlimit", return_value=(1, 1)),
+            mock.patch.object(profile.os, "getpgid", return_value=424243),
+            mock.patch.object(profile.os, "getsid", return_value=424243),
+            mock.patch.object(
+                profile,
+                "process_start_identity",
+                side_effect=KeyboardInterrupt("injected binding interrupt"),
+            ),
+            mock.patch.object(
+                profile,
+                "_terminate_and_reap",
+                side_effect=OSError(errno.EIO, "injected reap failure"),
+            ),
+            self.assertRaises(profile.NoChildLaunchClosureUnproven) as caught,
+        ):
+            profile.launch_prepared_no_child_process(
+                prepared,
+                [executable.path],
+                cwd="/",
+            )
+        self.assertTrue(caught.exception.evidence.exec_acknowledged)
+        self.assertTrue(caught.exception.evidence.fork_call_started)
+        self.assertTrue(caught.exception.evidence.fork_call_completed)
+        self.assertTrue(caught.exception.evidence.pipe_ownership_published)
+        self.assertTrue(caught.exception.evidence.leader_receipt_received)
+        self.assertFalse(caught.exception.evidence.leader_binding_complete)
+        self.assertFalse(caught.exception.evidence.leader_reaped)
+        self.assertFalse(caught.exception.evidence.process_group_empty)
+        self.assertTrue(caught.exception.evidence.control_pipes_closed)
+        self.assertIn(prepared, caught.exception.retained_resources)
+        self.assertIn(
+            caught.exception.evidence,
+            caught.exception.recovery_evidence,
+        )
+
+    def test_result_owner_query_interrupt_still_settles_bound_child(self) -> None:
+        prepared = _synthetic_prepared_launch()
+        error_read, error_write = os.pipe()
+        result_owner = _InterruptingLaunchResultOwner()
+        with (
+            mock.patch.object(profile, "require_compatible"),
+            mock.patch.object(profile, "_require_live_runtime"),
+            mock.patch.object(profile, "_revalidate_prepared_profile"),
+            mock.patch.object(profile, "prove_exec_budget"),
+            mock.patch.object(
+                profile,
+                "_fork_with_launch_error_pipe",
+                side_effect=_publish_synthetic_launch_receipt(
+                    pid=424244,
+                    error_read=error_read,
+                    error_write=error_write,
+                ),
+            ),
+            mock.patch.object(profile.resource, "getrlimit", return_value=(1, 1)),
+            mock.patch.object(profile.os, "getpgid", return_value=424244),
+            mock.patch.object(profile.os, "getsid", return_value=424244),
+            mock.patch.object(
+                profile,
+                "process_start_identity",
+                return_value="synthetic-start",
+            ),
+            mock.patch.object(profile, "_terminate_and_reap") as terminate,
+            self.assertRaisesRegex(
+                KeyboardInterrupt,
+                "ownership query 1",
+            ),
+        ):
+            profile.launch_prepared_no_child_process(
+                prepared,
+                [prepared.executable.path],
+                cwd="/",
+                environment={},
+                result_owner=result_owner,
+            )
+
+        self.assertEqual(result_owner.owns_calls, 2)
+        self.assertIsNotNone(result_owner.launched)
+        terminate.assert_called_once_with(424244)
+        for descriptor in (error_read, error_write):
+            with self.assertRaises(OSError) as descriptor_error:
+                os.fstat(descriptor)
+            self.assertEqual(descriptor_error.exception.errno, errno.EBADF)
+
+    def test_result_owner_query_interrupt_retains_failed_settlement(self) -> None:
+        prepared = _synthetic_prepared_launch()
+        error_read, error_write = os.pipe()
+        result_owner = _InterruptingLaunchResultOwner()
+        with (
+            mock.patch.object(profile, "require_compatible"),
+            mock.patch.object(profile, "_require_live_runtime"),
+            mock.patch.object(profile, "_revalidate_prepared_profile"),
+            mock.patch.object(profile, "prove_exec_budget"),
+            mock.patch.object(
+                profile,
+                "_fork_with_launch_error_pipe",
+                side_effect=_publish_synthetic_launch_receipt(
+                    pid=424245,
+                    error_read=error_read,
+                    error_write=error_write,
+                ),
+            ),
+            mock.patch.object(profile.resource, "getrlimit", return_value=(1, 1)),
+            mock.patch.object(profile.os, "getpgid", return_value=424245),
+            mock.patch.object(profile.os, "getsid", return_value=424245),
+            mock.patch.object(
+                profile,
+                "process_start_identity",
+                return_value="synthetic-start",
+            ),
+            mock.patch.object(
+                profile,
+                "_terminate_and_reap",
+                side_effect=OSError(errno.EIO, "injected settlement failure"),
+            ) as terminate,
+            self.assertRaises(profile.NoChildLaunchClosureUnproven) as caught,
+        ):
+            profile.launch_prepared_no_child_process(
+                prepared,
+                [prepared.executable.path],
+                cwd="/",
+                environment={},
+                result_owner=result_owner,
+            )
+
+        self.assertEqual(result_owner.owns_calls, 2)
+        terminate.assert_called_once_with(424245)
+        self.assertIn(
+            "result-owner-ownership-query:KeyboardInterrupt",
+            caught.exception.evidence.reason,
+        )
+        self.assertFalse(caught.exception.evidence.leader_reaped)
+        self.assertFalse(caught.exception.evidence.process_group_empty)
+        self.assertIn(result_owner, caught.exception.retained_resources)
+        self.assertIn(result_owner.launched, caught.exception.retained_resources)
+        for descriptor in (error_read, error_write):
+            with self.assertRaises(OSError) as descriptor_error:
+                os.fstat(descriptor)
+            self.assertEqual(descriptor_error.exception.errno, errno.EBADF)
+
+    def test_live_runtime_uses_only_executable_protected_properties(self) -> None:
+        runtime = profile.RuntimeFingerprint(
+            platform="darwin",
+            system="Darwin",
+            macos_product_version="26.5.2",
+            macos_build_version="25F84",
+            darwin_release="25.5.0",
+            python_version=(3, 13, 0),
+            python_executable="/synthetic/python3.13",
+            effective_uid=501,
+        )
+        sandbox = profile.ExecutableIdentity(
+            path=str(profile.SANDBOX_EXEC),
+            device=1,
+            inode=2,
+            mode=stat.S_IFREG | 0o555,
+            uid=0,
+            gid=0,
+            size=4,
+            mtime_ns=1,
+            ctime_ns=1,
+            sha256="a" * 64,
+        )
+        probe = replace(sandbox, path="/synthetic/python3.13", inode=3)
+        alternate = replace(
+            sandbox,
+            path="/synthetic/true",
+            inode=4,
+            sha256="b" * 64,
+        )
+        evidence = profile.CompatibilityEvidence(
+            schema_version=profile.EVIDENCE_SCHEMA_VERSION,
+            runtime_pin=profile.PINNED_RUNTIME,
+            runtime=runtime,
+            sandbox_exec=sandbox,
+            probe_executable=probe,
+            alternate_executable=alternate,
+            seatbelt_profile_sha256="c" * 64,
+            parent_nproc_before=(1, 1),
+            parent_nproc_after=(1, 1),
+            observations=(),
+            blockers=(),
+        )
+
+        def identities(
+            probe_override: profile.ExecutableIdentity,
+        ) -> object:
+            values = {
+                sandbox.path: replace(sandbox, mtime_ns=9, ctime_ns=10),
+                probe.path: probe_override,
+                alternate.path: replace(alternate, mtime_ns=11, ctime_ns=12),
+            }
+            return mock.patch.object(
+                profile,
+                "_read_executable_identity",
+                side_effect=lambda path: values[str(path)],
+            )
+
+        with (
+            mock.patch.object(profile, "_runtime_fingerprint", return_value=runtime),
+            identities(replace(probe, mtime_ns=7, ctime_ns=8)),
+        ):
+            profile._require_live_runtime(evidence)
+
+        for label, changed in (
+            ("object", replace(probe, inode=99)),
+            ("object-generation", replace(probe, generation=7)),
+            ("content", replace(probe, sha256="d" * 64)),
+            ("access-policy", replace(probe, mode=stat.S_IFREG | 0o500)),
+            (
+                "access-flags",
+                replace(probe, flags=getattr(stat, "UF_IMMUTABLE", 2)),
+            ),
+        ):
+            with (
+                self.subTest(label=label),
+                mock.patch.object(
+                    profile,
+                    "_runtime_fingerprint",
+                    return_value=runtime,
+                ),
+                identities(changed),
+                self.assertRaises(profile.NoChildProfileUnavailable) as caught,
+            ):
+                profile._require_live_runtime(evidence)
+            self.assertIn(
+                "probe-executable-changed-after-probe",
+                caught.exception.evidence.blockers,
+            )
+
     def test_dynamic_loader_environment_injection_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "dynamic-loader"):
             profile._validated_environment(
                 {"DYLD_INSERT_LIBRARIES": "/synthetic/injected.dylib"}
             )
+
+    def test_sandboxed_python_preparation_binds_path_execution_attestation(
+        self,
+    ) -> None:
+        sandbox_exec = profile.ExecutableIdentity(
+            path=str(profile.SANDBOX_EXEC),
+            device=1,
+            inode=2,
+            mode=stat.S_IFREG | 0o555,
+            uid=0,
+            gid=0,
+            size=4,
+            mtime_ns=1,
+            ctime_ns=1,
+            sha256="a" * 64,
+        )
+        target = replace(
+            sandbox_exec,
+            path=str(pathlib.Path("/usr/bin/true").resolve(strict=True)),
+            inode=3,
+            uid=os.geteuid(),
+            sha256="b" * 64,
+        )
+        target_attestation = profile.PathExecutedExecutableAttestation(
+            executable=target,
+            components=(),
+        )
+        evidence = mock.Mock()
+        evidence.runtime_pin.sandbox_exec_sha256 = sandbox_exec.sha256
+        with (
+            mock.patch.object(
+                profile,
+                "probe_compatibility",
+                return_value=evidence,
+            ),
+            mock.patch.object(profile, "require_compatible"),
+            mock.patch.object(
+                profile,
+                "authenticate_executable",
+                return_value=sandbox_exec,
+            ) as authenticate_loader,
+            mock.patch.object(
+                profile,
+                "python_runtime_executable",
+                return_value=pathlib.Path(target.path),
+            ),
+            mock.patch.object(
+                profile,
+                "_authenticate_path_executed_executable",
+                return_value=target_attestation,
+            ) as authenticate_target,
+        ):
+            prepared = profile.prepare_sandboxed_python_no_child_profile(
+                additional_seatbelt_rules="(deny file-write*)",
+            )
+
+        authenticate_loader.assert_called_once_with(
+            profile.SANDBOX_EXEC,
+            expected_sha256=sandbox_exec.sha256,
+        )
+        authenticate_target.assert_called_once_with(pathlib.Path(target.path))
+        self.assertEqual(prepared.sandboxed_target, target)
+        self.assertIs(
+            prepared.sandboxed_target_attestation,
+            target_attestation,
+        )
+        with (
+            mock.patch.object(
+                profile,
+                "authenticate_executable",
+                return_value=sandbox_exec,
+            ),
+            self.assertRaisesRegex(
+                profile.NoChildProfileError,
+                "missing its path-execution attestation",
+            ),
+        ):
+            profile._revalidate_prepared_profile(
+                replace(prepared, sandboxed_target_attestation=None)
+            )
+
+    def test_path_executed_target_rejects_untrusted_owner_or_writer(
+        self,
+    ) -> None:
+        clear_metadata = ExtendedMetadataEvidence(0, (), False)
+        test_root = pathlib.Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory(
+            prefix=".path-target-policy-",
+            dir=test_root,
+        ) as temporary:
+            root = pathlib.Path(temporary).resolve(strict=True)
+            root.chmod(0o700)
+            unsafe = root / "unsafe"
+            unsafe.mkdir(mode=0o755)
+            target = unsafe / "python3.13"
+            _write_synthetic_macho(target)
+            unsafe.chmod(0o777)
+            try:
+                with (
+                    mock.patch.object(
+                        profile,
+                        "verify_macos_filesystem_metadata",
+                        return_value=clear_metadata,
+                    ),
+                    self.assertRaisesRegex(
+                        profile.ExecutableAuthenticationError,
+                        "access policy permits an untrusted writer",
+                    ),
+                ):
+                    profile._authenticate_path_executed_executable(target)
+            finally:
+                unsafe.chmod(0o755)
+
+        with tempfile.TemporaryDirectory(
+            prefix=".path-target-owner-",
+            dir=test_root,
+        ) as temporary:
+            root = pathlib.Path(temporary).resolve(strict=True)
+            root.chmod(0o700)
+            target = root / "python3.13"
+            _write_synthetic_macho(target)
+            with (
+                mock.patch.object(
+                    profile,
+                    "verify_macos_filesystem_metadata",
+                    return_value=clear_metadata,
+                ),
+                mock.patch.object(
+                    profile.os,
+                    "geteuid",
+                    return_value=os.geteuid() + 1,
+                ),
+                self.assertRaisesRegex(
+                    profile.ExecutableAuthenticationError,
+                    "access policy has an untrusted owner",
+                ),
+            ):
+                profile._authenticate_path_executed_executable(target)
+
+    def test_path_target_revalidation_distinguishes_protected_properties(
+        self,
+    ) -> None:
+        clear_metadata = ExtendedMetadataEvidence(0, (), False)
+        test_root = pathlib.Path(__file__).resolve().parent
+        cases = (
+            (
+                "object-identity",
+                "object identity changed after preparation",
+            ),
+            ("content", "content changed after preparation"),
+            ("access-policy", "access policy"),
+        )
+        for mutation, message in cases:
+            with (
+                self.subTest(mutation=mutation),
+                tempfile.TemporaryDirectory(
+                    prefix=f".path-target-{mutation}-",
+                    dir=test_root,
+                ) as temporary,
+            ):
+                root = pathlib.Path(temporary).resolve(strict=True)
+                root.chmod(0o700)
+                runtime = root / "runtime"
+                runtime.mkdir(mode=0o755)
+                target = runtime / "python3.13"
+                _write_synthetic_macho(target)
+                with mock.patch.object(
+                    profile,
+                    "verify_macos_filesystem_metadata",
+                    return_value=clear_metadata,
+                ):
+                    attestation = profile._authenticate_path_executed_executable(target)
+                    if mutation == "object-identity":
+                        replacement = runtime / "replacement"
+                        _write_synthetic_macho(replacement)
+                        os.replace(replacement, target)
+                    elif mutation == "content":
+                        _write_synthetic_macho(target, alternate=True)
+                    else:
+                        runtime.chmod(0o775)
+                    try:
+                        with self.assertRaisesRegex(
+                            profile.ExecutableAuthenticationError,
+                            message,
+                        ):
+                            profile._revalidate_path_executed_executable(attestation)
+                    finally:
+                        runtime.chmod(0o755)
 
     def test_launch_budgets_exact_sandbox_argv_before_fork(self) -> None:
         executable = profile.ExecutableIdentity(
@@ -964,6 +2743,70 @@ class NoChildProfileUnitTests(unittest.TestCase):
         budget.assert_called_once_with(expected_argv, environment=environment)
         fork.assert_not_called()
 
+    def test_sandboxed_python_target_uses_one_authenticated_sandbox_wrapper(
+        self,
+    ) -> None:
+        sandbox_exec = profile.ExecutableIdentity(
+            path=str(profile.SANDBOX_EXEC),
+            device=1,
+            inode=2,
+            mode=0o100755,
+            uid=0,
+            gid=0,
+            size=4,
+            mtime_ns=1,
+            ctime_ns=1,
+            sha256="a" * 64,
+        )
+        target = profile.ExecutableIdentity(
+            path="/synthetic/python3.13",
+            device=3,
+            inode=4,
+            mode=0o100755,
+            uid=os.getuid(),
+            gid=os.getgid(),
+            size=4,
+            mtime_ns=1,
+            ctime_ns=1,
+            sha256="b" * 64,
+        )
+        prepared = profile.PreparedNoChildProfile(
+            executable=sandbox_exec,
+            expected_sha256=sandbox_exec.sha256,
+            seatbelt_profile="(version 1)\n(deny process-fork)\n",
+            evidence=mock.sentinel.compatibility,
+            sandboxed_target=target,
+        )
+        environment = {"PATH": "/usr/bin", "LANG": "C"}
+        expected_argv = (
+            str(profile.SANDBOX_EXEC),
+            "-p",
+            prepared.seatbelt_profile,
+            target.path,
+            "-I",
+            "-S",
+        )
+        with (
+            mock.patch.object(profile, "require_compatible"),
+            mock.patch.object(profile, "_require_live_runtime"),
+            mock.patch.object(profile, "_revalidate_prepared_profile"),
+            mock.patch.object(
+                profile,
+                "prove_exec_budget",
+                side_effect=ValueError("synthetic exec budget overflow"),
+            ) as budget,
+            mock.patch.object(profile, "_fork_with_launch_error_pipe") as fork,
+            self.assertRaisesRegex(ValueError, "exec budget overflow"),
+        ):
+            profile.launch_prepared_no_child_process(
+                prepared,
+                [target.path, "-I", "-S"],
+                cwd="/",
+                environment=environment,
+            )
+        budget.assert_called_once_with(expected_argv, environment=environment)
+        fork.assert_not_called()
+
     def test_unsupported_platform_blocks_without_starting_probe_children(
         self,
     ) -> None:
@@ -994,7 +2837,6 @@ class NoChildProfileUnitTests(unittest.TestCase):
             "unsupported-platform",
             raised.exception.evidence.blockers,
         )
-
         synthetic_identity = profile.ExecutableIdentity(
             path="/synthetic/app-server",
             device=1,
@@ -1023,6 +2865,70 @@ class NoChildProfileUnitTests(unittest.TestCase):
                 cwd="/",
             )
         fork.assert_not_called()
+
+    def test_probe_attestation_failure_precedes_first_compatibility_exec(
+        self,
+    ) -> None:
+        probe_path = pathlib.Path("/synthetic/python3.13")
+        runtime = profile.RuntimeFingerprint(
+            platform="darwin",
+            system="Darwin",
+            macos_product_version=profile.PINNED_RUNTIME.macos_product_version,
+            macos_build_version=profile.PINNED_RUNTIME.macos_build_version,
+            darwin_release=profile.PINNED_RUNTIME.darwin_release,
+            python_version=(3, 13, 0),
+            python_executable=str(probe_path),
+            effective_uid=501,
+        )
+        sandbox_exec = profile.ExecutableIdentity(
+            path=str(profile.SANDBOX_EXEC),
+            device=1,
+            inode=2,
+            mode=stat.S_IFREG | 0o555,
+            uid=0,
+            gid=0,
+            size=4,
+            mtime_ns=1,
+            ctime_ns=1,
+            sha256=profile.PINNED_RUNTIME.sandbox_exec_sha256,
+        )
+        attestation_error = profile.ExecutableAuthenticationError(
+            "synthetic path access policy failure"
+        )
+        with (
+            mock.patch.object(profile, "_runtime_fingerprint", return_value=runtime),
+            mock.patch.object(
+                profile,
+                "_read_executable_identity",
+                return_value=sandbox_exec,
+            ),
+            mock.patch.object(
+                profile,
+                "_authenticate_path_executed_executable",
+                side_effect=attestation_error,
+            ) as authenticate_path,
+            mock.patch.object(profile, "_run_probe_case") as run_probe,
+            mock.patch.object(
+                profile,
+                "_spawn_owned_probe_process",
+            ) as spawn_probe,
+        ):
+            evidence = profile.probe_compatibility(
+                probe_executable_path=probe_path,
+            )
+
+        authenticate_path.assert_called_once_with(probe_path)
+        run_probe.assert_not_called()
+        spawn_probe.assert_not_called()
+        self.assertIsNone(evidence.probe_executable)
+        self.assertTrue(
+            any(
+                blocker.startswith(
+                    "probe-setup-failed:synthetic path access policy failure"
+                )
+                for blocker in evidence.blockers
+            )
+        )
 
     def test_ambiguous_observation_cannot_be_hidden_by_empty_blockers(self) -> None:
         runtime = profile.RuntimeFingerprint(

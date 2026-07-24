@@ -74,7 +74,7 @@ matches the production runtime pin after the final commit exists:
 CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE=1 PYTHONDONTWRITEBYTECODE=1 /opt/homebrew/bin/python3.13 -m tests.run_required_no_child_profile
 ```
 
-Record the exact `head_sha`, seven tests run, zero skips, and terminal result in
+Record the exact `head_sha`, nine tests run, zero skips, and terminal result in
 the PR delivery evidence. Any push invalidates that evidence. Missing, skipped,
 old-head, sandbox-blocked, or nonmatching-host evidence blocks merge-readiness;
 Hosted CI's blocker-signature probe is not a substitute.

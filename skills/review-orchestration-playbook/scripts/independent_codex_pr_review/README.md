@@ -69,7 +69,7 @@ prompt 或 worktree，也不会启动 Codex。Codex 的签名、版本、schema�
 auth generation 仍由 `run` 在任何 model request 之前完成验证。
 
 ```bash
-python3.13 "$SUPERVISOR" preflight \
+python3.13 -B "$SUPERVISOR" preflight \
   --helper-state "$HELPER_STATE" \
   --repo "$REPO" \
   --base "$BASE_SHA" \
@@ -82,7 +82,7 @@ python3.13 "$SUPERVISOR" preflight \
 只有 preflight 返回一行 `{"status":"ready",...}` 后才运行 reviewer：
 
 ```bash
-python3.13 "$SUPERVISOR" run \
+python3.13 -B "$SUPERVISOR" run \
   --helper-state "$HELPER_STATE" \
   --repo "$REPO" \
   --base "$BASE_SHA" \
@@ -98,11 +98,11 @@ final artifact；不要把 stdout/stderr JSONL、tail 或 keepalive 当成 findi
 ```bash
 ATTEMPT_DIR=<attempt_dir-from-run-json>
 
-python3.13 "$SUPERVISOR" status \
+python3.13 -B "$SUPERVISOR" status \
   --retention-root "$RETENTION" \
   --attempt-dir "$ATTEMPT_DIR"
 
-python3.13 "$SUPERVISOR" final \
+python3.13 -B "$SUPERVISOR" final \
   --retention-root "$RETENTION" \
   --attempt-dir "$ATTEMPT_DIR"
 ```
@@ -131,7 +131,7 @@ $HELPER stateful cleanup --state-dir "$HELPER_STATE"
 先读取 durable state：
 
 ```bash
-python3.13 "$SUPERVISOR" status \
+python3.13 -B "$SUPERVISOR" status \
   --retention-root "$RETENTION" \
   --attempt-dir "$ATTEMPT_DIR"
 ```
@@ -141,7 +141,7 @@ python3.13 "$SUPERVISOR" status \
 owner。记录的 boot ID 与当前 boot ID 不同时，运行：
 
 ```bash
-python3.13 "$SUPERVISOR" recover \
+python3.13 -B "$SUPERVISOR" recover \
   --retention-root "$RETENTION" \
   --attempt-dir "$ATTEMPT_DIR"
 ```
@@ -167,14 +167,14 @@ terminal status 或年龄本身不会释放 evidence。parent 确认已经消费
 `resolved`；receiver 已确认接管且本地副本可回收时记录 `handoff-complete`：
 
 ```bash
-python3.13 "$SUPERVISOR" release \
+python3.13 -B "$SUPERVISOR" release \
   --retention-root "$RETENTION" \
   --attempt-dir "$ATTEMPT_DIR" \
   --reason resolved
 ```
 
 ```bash
-python3.13 "$SUPERVISOR" release \
+python3.13 -B "$SUPERVISOR" release \
   --retention-root "$RETENTION" \
   --attempt-dir "$ATTEMPT_DIR" \
   --reason handoff-complete
@@ -184,7 +184,7 @@ python3.13 "$SUPERVISOR" release \
 released 时，才可回收整个 attempt：
 
 ```bash
-python3.13 "$SUPERVISOR" cleanup \
+python3.13 -B "$SUPERVISOR" cleanup \
   --retention-root "$RETENTION" \
   --attempt-dir "$ATTEMPT_DIR"
 ```
@@ -264,20 +264,19 @@ fixtures/runtime，创建 disposable local Git repositories；不启动 Codex、
 不读取认证配置：
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 /opt/homebrew/bin/python3.13 -m compileall -q review_supervisor independent-codex-pr-review
-PYTHONDONTWRITEBYTECODE=1 /opt/homebrew/bin/python3.13 -m tests.run_required_deterministic_supervisor
-CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE=1 PYTHONDONTWRITEBYTECODE=1 /opt/homebrew/bin/python3.13 -m tests.run_required_no_child_profile
-/opt/homebrew/bin/python3.13 independent-codex-pr-review --help
+/opt/homebrew/bin/python3.13 -B -m tests.run_required_deterministic_supervisor
+CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE=1 /opt/homebrew/bin/python3.13 -B -m tests.run_required_no_child_profile
+/opt/homebrew/bin/python3.13 -B independent-codex-pr-review --help
 ```
 
-第二条命令是跨 Hosted Runner 的确定性零跳过测试；第三条命令只允许在匹配生产 pin、
-且没有外层 Seatbelt 的受信任 Mac 上运行，七项测试必须全部执行并通过。GitHub Hosted
+第一条命令是跨 Hosted Runner 的确定性零跳过测试；第二条命令只允许在匹配生产 pin、
+且没有外层 Seatbelt 的受信任 Mac 上运行，九项测试必须全部执行并通过。GitHub Hosted
 `macos-26` 自身位于外层 Seatbelt 中，不能产生生产等价的 live isolation evidence；CI
-因此只验证该环境以已审阅的 blocker signature 失败关闭，并把真实七项 live suite 保留为
+因此只验证该环境以已审阅的 blocker signature 失败关闭，并把真实九项 live suite 保留为
 涉及隔离边界变更时的本机交付门。若 Hosted 环境不再呈现该 signature，CI 会失败并要求
 重新审阅架构，不能把环境指纹相同解释为生产能力证明。
 
 这个 live gate 是合并前由交付操作者执行的 exact-head procedure，不是 GitHub check、
 branch-protection status 或 cryptographic attestation。最终 commit 产生后，PR delivery
-evidence 必须记录对应 `head_sha`、7 tests、0 skips 和 terminal result；任何后续 push 都会
+evidence 必须记录对应 `head_sha`、9 tests、0 skips 和 terminal result；任何后续 push 都会
 使证据失效。缺少该证据时，涉及 Darwin isolation boundary 的变更不能报告 merge-ready。

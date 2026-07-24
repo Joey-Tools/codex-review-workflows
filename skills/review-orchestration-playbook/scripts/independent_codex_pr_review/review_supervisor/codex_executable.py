@@ -10,19 +10,28 @@ import pwd
 import re
 import secrets
 import selectors
-import shutil
 import signal
 import stat
-import subprocess
 import sys
-import tempfile
 import time
 import unicodedata
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Never, Protocol, TypeVar
 
-from .errors import SupervisorError
+from .errors import SupervisorError, UnprovenDirectHelperClosure
+from .models import Identity
+from .process import process_start_identity, reap, terminal_status, wait_terminal
+from .recovery_cleanup import (
+    CustodiedDeletionResultOwner,
+    CustodiedManifestResultOwner,
+    RootSpec,
+    build_custodied_manifest,
+    delete_custodied_roots,
+    quarantine_and_remove_empty_root,
+    quarantined_root_recovery_evidence,
+    remove_published_manifest,
+)
 
 
 EXPECTED_CODEX_SHA256 = (
@@ -61,6 +70,15 @@ SNAPSHOT_DIRECTORY_MODE = 0o700
 SNAPSHOT_BUILD_MODE = 0o600
 SNAPSHOT_EXECUTABLE_MODE = 0o500
 SNAPSHOT_NAME_ATTEMPTS = 8
+SNAPSHOT_QUARANTINE_PREFIX = ".codex-executable-quarantine-"
+SNAPSHOT_QUARANTINE_NAME_ATTEMPTS = 64
+SNAPSHOT_CLEANUP_ENTRY_CAP = 4096
+SCHEMA_DIRECTORY_PREFIX = "codex-schema-"
+SCHEMA_DIRECTORY_NAME_ATTEMPTS = 8
+SCHEMA_CLEANUP_ENTRY_CAP = 4096
+SCHEMA_CLEANUP_MANIFEST_BYTES = 1024 * 1024
+SCHEMA_CLEANUP_SECONDS = 30.0
+SNAPSHOT_CLEANUP_SECONDS = 30.0
 REQUIRED_SNAPSHOT_DENIALS = (
     "filesystem-write-default",
     "write",
@@ -118,6 +136,33 @@ class CodexExecutableExecutionUnsupported(CodexExecutableError):
 class CodexExecutableCustodyStale(CodexExecutableError):
     def __init__(self, message: str) -> None:
         super().__init__(message, code="codex-snapshot-custody-stale")
+
+
+class CodexExecutableRetentionRequired(CodexExecutableError):
+    def __init__(self, message: str, *, code: str) -> None:
+        self.retained_resources: list[object] = []
+        self.recovery_evidence: list[object] = []
+        super().__init__(message, code=code)
+
+    def retain_resource(self, resource: object) -> None:
+        self.retained_resources.append(resource)
+
+    def retain_recovery_evidence(self, evidence: object) -> None:
+        self.recovery_evidence.append(evidence)
+
+
+class PreflightProcessClosureUnproven(
+    CodexExecutableRetentionRequired,
+    UnprovenDirectHelperClosure,
+):
+    def __init__(
+        self,
+        message: str,
+        *,
+        evidence: PreflightProcessClosureEvidence,
+    ) -> None:
+        self.evidence = evidence
+        super().__init__(message, code="preflight-process-closure-unproven")
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,21 +246,43 @@ class NodeIdentity:
             generation=getattr(value, "st_gen", 0),
         )
 
-    def directory_object_key(self) -> tuple[int, int, int, int, int, int, int]:
+    def object_identity_key(self) -> tuple[int, int, int, int]:
         return (
             self.device,
             self.inode,
-            self.mode,
-            self.uid,
-            self.gid,
-            self.flags,
+            stat.S_IFMT(self.mode),
             self.generation,
         )
 
-    def directory_metadata_key(
+    def access_policy_key(self) -> tuple[int, int, int, int]:
+        return (
+            self.uid,
+            self.gid,
+            stat.S_IMODE(self.mode),
+            self.flags,
+        )
+
+    def directory_object_key(
         self,
     ) -> tuple[int, int, int, int, int, int, int, int]:
-        return (*self.directory_object_key(), self.ctime_ns)
+        """Return the directory properties protected across revalidation.
+
+        Directory entry churn may change size, link count, and timestamps without
+        replacing the directory or weakening its access policy.
+        """
+
+        return (*self.object_identity_key(), *self.access_policy_key())
+
+    def file_protected_key(
+        self,
+    ) -> tuple[int, int, int, int, int, int, int, int, int]:
+        """Return file object identity, access policy, and content length."""
+
+        return (
+            *self.object_identity_key(),
+            *self.access_policy_key(),
+            self.size,
+        )
 
     def to_json(self) -> dict[str, int]:
         return asdict(self)
@@ -229,7 +296,9 @@ def _same_node_for_kind(
 ) -> bool:
     if kind == "directory":
         return left.directory_object_key() == right.directory_object_key()
-    return left == right
+    if kind == "file":
+        return left.file_protected_key() == right.file_protected_key()
+    raise ValueError(f"unsupported node kind: {kind}")
 
 
 def _same_node_during_metadata_inspection(
@@ -238,9 +307,7 @@ def _same_node_during_metadata_inspection(
     *,
     kind: str,
 ) -> bool:
-    if kind == "directory":
-        return left.directory_metadata_key() == right.directory_metadata_key()
-    return left == right
+    return _same_node_for_kind(left, right, kind=kind)
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,11 +351,29 @@ class PathComponentEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class PreflightProcessClosureEvidence:
+    leader_pid: int | None
+    leader_pgid: int | None
+    leader_session_id: int | None
+    leader_start_identity: str | None
+    profile_sha256: str | None
+    leader_reaped: bool
+    stdio_closed: bool
+    authenticated_no_child_profile: bool
+    permitted_process_closure_proven: bool
+    process_group_emptiness_used_as_descendant_proof: bool
+    reason: str
+    launch_receipt_published: bool = True
+    runtime_descriptors_retained: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class CommandResult:
     argv: tuple[str, ...]
     returncode: int
     stdout: bytes
     stderr: bytes
+    process_closure: PreflightProcessClosureEvidence | None = None
 
 
 class CommandRunner(Protocol):
@@ -320,6 +405,7 @@ class CommandEvidence:
     stdout_sha256: str
     stderr_size: int
     stderr_sha256: str
+    process_closure: PreflightProcessClosureEvidence | None
 
     @classmethod
     def from_result(
@@ -338,6 +424,7 @@ class CommandEvidence:
             stdout_sha256=hashlib.sha256(result.stdout).hexdigest(),
             stderr_size=len(result.stderr),
             stderr_sha256=hashlib.sha256(result.stderr).hexdigest(),
+            process_closure=result.process_closure,
         )
 
 
@@ -555,10 +642,47 @@ class _PathAnchor:
     leaf_kind: str
     require_executable: bool
     filesystem_metadata_verifier: FilesystemMetadataVerifier | None
+    expected_content_size: int | None = None
+    expected_content_sha256: str | None = None
+    content_max_bytes: int | None = None
 
     @property
     def identity(self) -> NodeIdentity:
         return self.components[-1].identity
+
+
+@dataclass(slots=True)
+class _PathAnchorResultOwner:
+    anchor: _PathAnchor | None = None
+    close_outcome: str = "not-started"
+    close_error: BaseException | None = None
+
+    def publish(self, anchor: _PathAnchor) -> None:
+        if self.anchor is not None and self.anchor is not anchor:
+            raise ValueError("path-anchor result owner was rebound")
+        self.anchor = anchor
+
+    def owns(self, anchor: _PathAnchor) -> bool:
+        return self.anchor is anchor
+
+    def close(self) -> None:
+        anchor = self.anchor
+        if anchor is None:
+            return
+        if self.close_outcome == "unproven":
+            return
+        try:
+            # Publish ambiguity before entering close. An asynchronous exception
+            # may arrive before the syscall or after a successful close, and
+            # either case makes retry unsafe because the integer may be reused.
+            self.close_outcome = "unproven"
+            os.close(anchor.fd)
+        except BaseException as error:
+            self.close_error = error
+            setattr(error, "path_anchor_close_result_owner", self)
+            raise
+        self.anchor = None
+        self.close_outcome = "closed"
 
 
 @dataclass(slots=True)
@@ -568,6 +692,702 @@ class _StagedSnapshot:
     directory_anchor: _PathAnchor
     file_anchor: _PathAnchor
     evidence: SnapshotEvidence
+
+
+@dataclass(frozen=True, slots=True)
+class NewSnapshotRollbackRecoveryEvidence:
+    stage: str
+    operation: str
+    failure_kind: str
+    protected_property: str
+    parent_path: str
+    public_name: str
+    quarantine_name: str | None
+    entry_state: str
+    entry_state_source: str
+    parent_fd: int
+    directory_fd: int | None
+    file_fd: int | None
+    parent_identity: NodeIdentity
+    directory_identity: NodeIdentity
+    file_identity: NodeIdentity | None
+    reason: str
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "stage": self.stage,
+            "operation": self.operation,
+            "failure_kind": self.failure_kind,
+            "protected_property": self.protected_property,
+            "parent_path": self.parent_path,
+            "public_name": self.public_name,
+            "quarantine_name": self.quarantine_name,
+            "entry_state": self.entry_state,
+            "entry_state_source": self.entry_state_source,
+            "parent_fd": self.parent_fd,
+            "directory_fd": self.directory_fd,
+            "file_fd": self.file_fd,
+            "parent_identity": self.parent_identity.to_json(),
+            "directory_identity": self.directory_identity.to_json(),
+            "file_identity": (
+                self.file_identity.to_json() if self.file_identity is not None else None
+            ),
+            "reason": self.reason,
+        }
+
+
+@dataclass(slots=True)
+class _RetainedNewSnapshot:
+    parent_path: pathlib.Path
+    public_name: str
+    parent_fd: int
+    directory_fd: int | None
+    file_fd: int | None
+    parent_identity: NodeIdentity
+    directory_identity: NodeIdentity
+    file_identity: NodeIdentity | None
+    quarantine_name: str | None = None
+    entry_state: str = "public"
+    entry_state_source: str = "published-state"
+
+    def close_descriptors_for_recovery(self) -> None:
+        descriptors = (
+            self.file_fd,
+            self.directory_fd,
+            self.parent_fd,
+        )
+        closed: set[int] = set()
+        for descriptor in descriptors:
+            if descriptor is None or descriptor in closed:
+                continue
+            closed.add(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                if error.errno != errno.EBADF:
+                    raise
+
+    def recovery_evidence(
+        self,
+        *,
+        operation: str,
+        failure_kind: str,
+        protected_property: str,
+        reason: str,
+    ) -> NewSnapshotRollbackRecoveryEvidence:
+        return NewSnapshotRollbackRecoveryEvidence(
+            stage="new-snapshot-rollback",
+            operation=operation,
+            failure_kind=failure_kind,
+            protected_property=protected_property,
+            parent_path=str(self.parent_path),
+            public_name=self.public_name,
+            quarantine_name=self.quarantine_name,
+            entry_state=self.entry_state,
+            entry_state_source=self.entry_state_source,
+            parent_fd=self.parent_fd,
+            directory_fd=self.directory_fd,
+            file_fd=self.file_fd,
+            parent_identity=self.parent_identity,
+            directory_identity=self.directory_identity,
+            file_identity=self.file_identity,
+            reason=reason,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class NewSnapshotCreationRecoveryEvidence:
+    stage: str
+    operation: str
+    cleanup_operation: str
+    parent_path: str
+    directory_name: str
+    entry_state: str
+    protected_property: str
+    parent_fd: int
+    parent_fd_retained: bool
+    parent_identity: NodeIdentity
+    directory_identity: NodeIdentity | None
+    directory_removed: bool
+    parent_fsynced: bool
+    reason: str
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "stage": self.stage,
+            "operation": self.operation,
+            "cleanup_operation": self.cleanup_operation,
+            "parent_path": self.parent_path,
+            "directory_name": self.directory_name,
+            "entry_state": self.entry_state,
+            "protected_property": self.protected_property,
+            "parent_fd": self.parent_fd,
+            "parent_fd_retained": self.parent_fd_retained,
+            "parent_identity": self.parent_identity.to_json(),
+            "directory_identity": (
+                self.directory_identity.to_json()
+                if self.directory_identity is not None
+                else None
+            ),
+            "directory_removed": self.directory_removed,
+            "parent_fsynced": self.parent_fsynced,
+            "reason": self.reason,
+        }
+
+
+@dataclass(slots=True)
+class _PendingNewSnapshotDirectory:
+    parent_path: pathlib.Path
+    parent_fd: int
+    parent_identity: NodeIdentity
+    directory_name: str | None = None
+    directory_identity: NodeIdentity | None = None
+    operation: str = "idle"
+    cleanup_operation: str = "not-started"
+    entry_state: str = "idle"
+    directory_removed: bool = False
+    parent_fsynced: bool = False
+    retained: bool = False
+
+    @property
+    def published(self) -> bool:
+        return (
+            self.entry_state == "published"
+            and self.directory_name is not None
+            and self.directory_identity is not None
+        )
+
+    def begin(self, directory_name: str) -> None:
+        self.directory_name = directory_name
+        self.directory_identity = None
+        self.operation = "mkdir-directory"
+        self.cleanup_operation = "not-started"
+        self.entry_state = "mkdir-pending"
+        self.directory_removed = False
+        self.parent_fsynced = False
+        self.retained = False
+
+    def clear_collision(self) -> None:
+        self.directory_name = None
+        self.directory_identity = None
+        self.operation = "idle"
+        self.cleanup_operation = "not-started"
+        self.entry_state = "idle"
+
+    def close_descriptors_for_recovery(self) -> None:
+        try:
+            os.close(self.parent_fd)
+        except OSError as error:
+            if error.errno != errno.EBADF:
+                raise
+
+    def recovery_evidence(
+        self,
+        *,
+        operation: str,
+        reason: str,
+    ) -> NewSnapshotCreationRecoveryEvidence:
+        if self.directory_name is None:
+            raise ValueError("snapshot creation recovery lacks its random name")
+        return NewSnapshotCreationRecoveryEvidence(
+            stage="new-snapshot-creation",
+            operation=operation,
+            cleanup_operation=self.cleanup_operation,
+            parent_path=str(self.parent_path),
+            directory_name=self.directory_name,
+            entry_state=self.entry_state,
+            protected_property="unpublished-name-absence",
+            parent_fd=self.parent_fd,
+            parent_fd_retained=self.retained,
+            parent_identity=self.parent_identity,
+            directory_identity=self.directory_identity,
+            directory_removed=self.directory_removed,
+            parent_fsynced=self.parent_fsynced,
+            reason=reason,
+        )
+
+
+class CodexExecutableSnapshotCreationAborted(CodexExecutableError):
+    def __init__(self, evidence: NewSnapshotCreationRecoveryEvidence) -> None:
+        self.evidence = evidence
+        super().__init__(
+            "new snapshot directory creation was interrupted and rolled back",
+            code="new-snapshot-creation-aborted",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CodexExecutableRecoveryEvidence:
+    stage: str
+    parent_path: str
+    entry_name: str
+    entry_path: str
+    parent_fd: int | None
+    directory_fd: int | None
+    executable_fd: int | None
+    parent_identity: NodeIdentity
+    directory_identity: NodeIdentity | None
+    executable_identity: NodeIdentity | None
+    reason: str
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "stage": self.stage,
+            "parent_path": self.parent_path,
+            "entry_name": self.entry_name,
+            "entry_path": self.entry_path,
+            "parent_fd": self.parent_fd,
+            "directory_fd": self.directory_fd,
+            "executable_fd": self.executable_fd,
+            "parent_identity": self.parent_identity.to_json(),
+            "directory_identity": (
+                self.directory_identity.to_json()
+                if self.directory_identity is not None
+                else None
+            ),
+            "executable_identity": (
+                self.executable_identity.to_json()
+                if self.executable_identity is not None
+                else None
+            ),
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class GeneratedSchemaDeletionRecoveryEvidence:
+    stage: str
+    manifest_sha256: str
+    manifest_record_count: int
+    removed_entries: int
+    roots: tuple[dict[str, Any], ...]
+    parent_fsync_complete: bool
+    exact_names_absent: bool
+    reason: str
+
+    @classmethod
+    def from_proof(
+        cls,
+        proof: dict[str, Any],
+        *,
+        reason: str,
+    ) -> GeneratedSchemaDeletionRecoveryEvidence:
+        return cls(
+            stage="generated-schema-deletion-complete",
+            manifest_sha256=str(proof["manifest_sha256"]),
+            manifest_record_count=int(proof["manifest_record_count"]),
+            removed_entries=int(proof["removed_entries"]),
+            roots=tuple(dict(root) for root in proof["roots"]),
+            parent_fsync_complete=bool(proof["parent_fsync_complete"]),
+            exact_names_absent=bool(proof["exact_names_absent"]),
+            reason=reason,
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "stage": self.stage,
+            "manifest_sha256": self.manifest_sha256,
+            "manifest_record_count": self.manifest_record_count,
+            "removed_entries": self.removed_entries,
+            "roots": [dict(root) for root in self.roots],
+            "parent_fsync_complete": self.parent_fsync_complete,
+            "exact_names_absent": self.exact_names_absent,
+            "reason": self.reason,
+        }
+
+
+@dataclass(slots=True)
+class _RetainedGeneratedSchema:
+    work_root: _PathAnchor
+    output_name: str
+    output_anchor: _PathAnchor | None
+    creation_outcome: str
+    _work_root_fd: int | None = field(init=False)
+    _output_fd: int | None = field(init=False)
+    _descriptor_close_outcomes: dict[str, str] = field(init=False)
+    _descriptor_close_errors: dict[str, BaseException] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self._work_root_fd = self.work_root.fd
+        self._output_fd = (
+            self.output_anchor.fd if self.output_anchor is not None else None
+        )
+        self._descriptor_close_outcomes = {
+            "_output_fd": "owned" if self._output_fd is not None else "absent",
+            "_work_root_fd": "owned",
+        }
+        self._descriptor_close_errors = {}
+
+    def close_descriptors_for_recovery(self) -> None:
+        for slot in ("_output_fd", "_work_root_fd"):
+            descriptor = getattr(self, slot)
+            if descriptor is None:
+                continue
+            if self._descriptor_close_outcomes[slot] == "unproven":
+                continue
+            try:
+                # Keep the descriptor number as recovery evidence, but publish
+                # an unproven result before close so a retry cannot close a
+                # reused file description after an asynchronous interruption.
+                self._descriptor_close_outcomes[slot] = "unproven"
+                os.close(descriptor)
+            except BaseException as error:
+                self._descriptor_close_errors[slot] = error
+                setattr(error, "retained_generated_schema_close_owner", self)
+                if isinstance(error, OSError) and error.errno == errno.EBADF:
+                    self._descriptor_close_outcomes[slot] = "closed-or-missing"
+                    setattr(self, slot, None)
+                    continue
+                raise
+            self._descriptor_close_outcomes[slot] = "closed"
+            setattr(self, slot, None)
+
+
+@dataclass(slots=True)
+class _GeneratedSchemaRetentionOwner:
+    retained: _RetainedGeneratedSchema
+    evidence: CodexExecutableRecoveryEvidence
+    publication_errors: list[BaseException] = field(default_factory=list)
+    resource_published: bool = False
+    evidence_published: bool = False
+
+    def _observe_publication(
+        self,
+        error: CodexExecutableRetentionRequired,
+    ) -> None:
+        self.resource_published = any(
+            resource is self.retained for resource in error.retained_resources
+        )
+        self.evidence_published = any(
+            evidence is self.evidence for evidence in error.recovery_evidence
+        )
+
+    def publish(self, error: CodexExecutableRetentionRequired) -> None:
+        self._observe_publication(error)
+        if not self.resource_published:
+            try:
+                error.retain_resource(self.retained)
+            finally:
+                self._observe_publication(error)
+        if not self.evidence_published:
+            try:
+                error.retain_recovery_evidence(self.evidence)
+            finally:
+                self._observe_publication(error)
+
+    def finish_publication(
+        self,
+        error: CodexExecutableRetentionRequired,
+    ) -> None:
+        try:
+            self.publish(error)
+        except BaseException as publication_error:
+            self.publication_errors.append(publication_error)
+            self.publish(error)
+        if not self.resource_published or not self.evidence_published:
+            raise RuntimeError("generated-schema retention publication is incomplete")
+        if self.publication_errors:
+            errors = tuple(self.publication_errors)
+            setattr(error, "retention_publication_errors", errors)
+            error.add_note(
+                "generated-schema retention publication recovered after "
+                "interruption: "
+                + "; ".join(f"{type(item).__name__}: {item}" for item in errors)
+            )
+
+
+@dataclass(slots=True)
+class _GeneratedSchemaRetentionResultOwner:
+    owner: _GeneratedSchemaRetentionOwner | None = None
+
+    def publish(self, owner: _GeneratedSchemaRetentionOwner) -> None:
+        if self.owner is not None and self.owner is not owner:
+            raise ValueError("generated-schema retention result owner was rebound")
+        self.owner = owner
+
+
+def _finish_generated_schema_retention(
+    error: CodexExecutableRetentionRequired,
+    owner: _GeneratedSchemaRetentionOwner,
+) -> None:
+    try:
+        owner.finish_publication(error)
+    except BaseException as publication_error:
+        # Recover the resource/evidence publication before recording the
+        # interruption. Once the retained resource is reachable from ``error``,
+        # a later caller-store interruption cannot authorize destructive
+        # cleanup in the surrounding ``finally``.
+        owner.finish_publication(error)
+        owner.publication_errors.append(publication_error)
+        owner.finish_publication(error)
+
+
+PreflightLaunchReceipt = tuple[object, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class PreflightLaunchRetentionEvidence:
+    stage: str
+    ownership_state: str
+    receipt_published: bool
+    receipt_transferred: bool
+    descriptor_fds: tuple[int, ...]
+    descriptor_close_outcomes: tuple[tuple[int, str], ...]
+    process_closure: PreflightProcessClosureEvidence
+    reason: str
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "stage": self.stage,
+            "ownership_state": self.ownership_state,
+            "receipt_published": self.receipt_published,
+            "receipt_transferred": self.receipt_transferred,
+            "descriptor_fds": list(self.descriptor_fds),
+            "descriptor_close_outcomes": [
+                {"descriptor": descriptor, "outcome": outcome}
+                for descriptor, outcome in self.descriptor_close_outcomes
+            ],
+            "process_closure": asdict(self.process_closure),
+            "reason": self.reason,
+        }
+
+
+@dataclass(slots=True)
+class _PreflightLaunchOwnership:
+    prepared: object
+    state: str = "allocating"
+    launched: object | None = None
+    receipt: PreflightLaunchReceipt | None = None
+    descriptors: set[int] = field(default_factory=set)
+    descriptor_close_outcomes: dict[int, str] = field(default_factory=dict)
+    descriptor_close_errors: dict[int, BaseException] = field(default_factory=dict)
+    transferred: bool = False
+    closure_proven: bool = False
+
+    @property
+    def may_have_launched(self) -> bool:
+        return self.state not in {"allocating", "closed"}
+
+    def track_descriptors(self, *descriptors: int) -> None:
+        if any(
+            type(descriptor) is not int or descriptor < 0 for descriptor in descriptors
+        ):
+            raise ValueError("preflight launch descriptor is malformed")
+        for descriptor in descriptors:
+            if descriptor in self.descriptors:
+                raise ValueError(
+                    "preflight launch descriptor was tracked more than once"
+                )
+            self.descriptors.add(descriptor)
+            self.descriptor_close_outcomes[descriptor] = "owned"
+            self.descriptor_close_errors.pop(descriptor, None)
+
+    def arm_launch(self) -> None:
+        if self.state != "allocating":
+            raise ValueError("preflight launch ownership was already armed")
+        self.state = "launch-may-have-started"
+
+    def publish_launched(self, launched: object) -> None:
+        if self.launched is launched:
+            if self.state == "launch-may-have-started":
+                self.state = "leader-bound"
+            elif self.state not in {
+                "leader-bound",
+                "receipt-published",
+                "caller-owned",
+                "closure-proven",
+                "retained",
+            }:
+                raise ValueError("preflight launched-process publication is incomplete")
+            return
+        if self.state != "launch-may-have-started" or self.launched is not None:
+            raise ValueError("preflight launched-process ownership is inconsistent")
+        self.launched = launched
+        self.state = "leader-bound"
+
+    def publish(self, launched: object) -> None:
+        self.publish_launched(launched)
+
+    def owns(self, launched: object) -> bool:
+        return self.launched is launched and self.state in {
+            "leader-bound",
+            "receipt-published",
+            "caller-owned",
+            "closure-proven",
+            "retained",
+        }
+
+    def publish_receipt(self, receipt: PreflightLaunchReceipt) -> None:
+        if (
+            self.state != "leader-bound"
+            or self.launched is not receipt[0]
+            or self.receipt is not None
+        ):
+            raise ValueError("preflight launch receipt publication is inconsistent")
+        self.receipt = receipt
+        self.state = "receipt-published"
+
+    def transfer_receipt(self, receipt: PreflightLaunchReceipt) -> None:
+        if (
+            self.receipt is not receipt
+            or self.state != "receipt-published"
+            or self.transferred
+        ):
+            raise ValueError("preflight launch receipt transfer is inconsistent")
+        self.transferred = True
+        self.state = "caller-owned"
+
+    def close_descriptor(self, descriptor: int) -> BaseException | None:
+        if descriptor not in self.descriptors:
+            return None
+        outcome = self.descriptor_close_outcomes.get(descriptor)
+        if outcome == "close-outcome-unproven":
+            return self.descriptor_close_errors.get(descriptor) or ChildProcessError(
+                f"preflight descriptor {descriptor} close outcome remains unproven"
+            )
+        if outcome != "owned":
+            return ChildProcessError(
+                f"preflight descriptor {descriptor} has invalid close outcome {outcome}"
+            )
+        self.descriptor_close_outcomes[descriptor] = "close-outcome-unproven"
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            if error.errno == errno.EBADF:
+                self.descriptor_close_outcomes[descriptor] = "missing"
+                self.descriptor_close_errors.pop(descriptor, None)
+                self.descriptors.discard(descriptor)
+                return None
+            self.descriptor_close_errors[descriptor] = error
+            return error
+        except BaseException as error:
+            self.descriptor_close_errors[descriptor] = error
+            return error
+        self.descriptor_close_outcomes[descriptor] = "closed"
+        self.descriptor_close_errors.pop(descriptor, None)
+        self.descriptors.discard(descriptor)
+        return None
+
+    def mark_closure_proven(self) -> None:
+        self.closure_proven = True
+        self.state = "closure-proven"
+
+    def mark_retained(self) -> None:
+        self.state = "retained"
+
+    def mark_closed(self) -> None:
+        if self.descriptors:
+            raise ValueError("preflight launch descriptors remain open")
+        self.state = "closed"
+
+    def close_descriptors_for_recovery(self) -> None:
+        failures: list[BaseException] = []
+        for descriptor in tuple(self.descriptors):
+            error = self.close_descriptor(descriptor)
+            if error is not None:
+                failures.append(error)
+        if failures:
+            raise failures[0]
+
+
+@dataclass(slots=True)
+class _NoChildLaunchResultOwner:
+    external_owner: _CallerNoChildLaunchResultOwner
+    launched: object | None = None
+    publication_complete: bool = False
+
+    def publish(self, launched: object) -> None:
+        if self.launched is None:
+            self.launched = launched
+        elif self.launched is not launched:
+            raise ValueError("no-child launch result owner was rebound")
+        self.finish_publication()
+
+    def owns(self, launched: object) -> bool:
+        return self.launched is launched
+
+    def finish_publication(self) -> None:
+        if self.launched is None:
+            raise ValueError("no-child launch result is unavailable")
+        if self.external_owner.owns(self.launched):
+            self.publication_complete = True
+            return
+        try:
+            self.external_owner.publish(self.launched)
+        finally:
+            if self.external_owner.owns(self.launched):
+                self.publication_complete = True
+        if not self.publication_complete:
+            raise ValueError("external no-child launch owner is incomplete")
+
+
+class _CallerNoChildLaunchResultOwner(Protocol):
+    def publish(self, launched: object) -> None: ...
+
+    def owns(self, launched: object) -> bool: ...
+
+
+def launch_no_child_process_with_result_publisher(
+    launch_function: Callable[..., object],
+    prepared: object,
+    argv: tuple[str, ...],
+    *,
+    result_owner: _CallerNoChildLaunchResultOwner,
+    cwd: str,
+    environment: dict[str, str],
+    stdin_fd: int,
+    stdout_fd: int,
+    stderr_fd: int,
+) -> object:
+    """Publish one real-launcher result and recover callback publication."""
+
+    publication_owner = _NoChildLaunchResultOwner(external_owner=result_owner)
+    try:
+        launched = launch_function(
+            prepared,
+            argv,
+            cwd=cwd,
+            environment=environment,
+            stdin_fd=stdin_fd,
+            stdout_fd=stdout_fd,
+            stderr_fd=stderr_fd,
+            result_owner=publication_owner,
+        )
+    except BaseException:
+        if publication_owner.launched is not None:
+            publication_owner.finish_publication()
+        raise
+    if not publication_owner.owns(launched):
+        raise ValueError("no-child launcher returned an unpublished result")
+    publication_owner.finish_publication()
+    if not result_owner.owns(launched):
+        raise ValueError("external no-child launch owner is incomplete")
+    return launched
+
+
+def _launch_no_child_process_with_ownership(
+    launch_function: Callable[..., object],
+    prepared: object,
+    argv: tuple[str, ...],
+    *,
+    ownership: _PreflightLaunchOwnership,
+    cwd: str,
+    environment: dict[str, str],
+    stdin_fd: int,
+    stdout_fd: int,
+    stderr_fd: int,
+) -> object:
+    return launch_no_child_process_with_result_publisher(
+        launch_function,
+        prepared,
+        argv,
+        result_owner=ownership,
+        cwd=cwd,
+        environment=environment,
+        stdin_fd=stdin_fd,
+        stdout_fd=stdout_fd,
+        stderr_fd=stderr_fd,
+    )
 
 
 T = TypeVar("T")
@@ -1051,6 +1871,7 @@ def _validate_node(
     owner_uid: int,
     root: bool = False,
     require_executable: bool = False,
+    require_single_link: bool = True,
 ) -> None:
     mode = identity.mode
     if root:
@@ -1073,7 +1894,7 @@ def _validate_node(
         return
     if kind != "file" or not stat.S_ISREG(mode):
         raise ValueError(f"path leaf is not a regular file: {path}")
-    if identity.link_count != 1:
+    if require_single_link and identity.link_count != 1:
         raise ValueError(f"path leaf has an unsafe hard-link count: {path}")
     if require_executable and not mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
         raise ValueError(f"path leaf is not executable: {path}")
@@ -1107,7 +1928,9 @@ def _open_path_anchor(
     owner_uid: int,
     leaf_kind: str,
     require_executable: bool,
+    require_single_link: bool = True,
     filesystem_metadata_verifier: FilesystemMetadataVerifier | None = None,
+    result_owner: _PathAnchorResultOwner | None = None,
 ) -> _PathAnchor:
     parts = path.parts[1:]
     root_before = NodeIdentity.from_stat(os.stat("/", follow_symlinks=False))
@@ -1122,6 +1945,7 @@ def _open_path_anchor(
         "/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
     )
     evidence: list[PathComponentEvidence] = []
+    anchor: _PathAnchor | None = None
     try:
         root_descriptor = NodeIdentity.from_stat(os.fstat(current_fd))
         root_after = NodeIdentity.from_stat(os.stat("/", follow_symlinks=False))
@@ -1173,6 +1997,7 @@ def _open_path_anchor(
                 kind=kind,
                 owner_uid=owner_uid,
                 require_executable=final and require_executable,
+                require_single_link=not final or require_single_link,
             )
             flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
             if kind == "directory":
@@ -1191,6 +2016,7 @@ def _open_path_anchor(
                     kind=kind,
                     owner_uid=owner_uid,
                     require_executable=final and require_executable,
+                    require_single_link=not final or require_single_link,
                 )
                 if not _same_node_for_kind(
                     before,
@@ -1238,7 +2064,7 @@ def _open_path_anchor(
             )
         if not parts or not evidence or evidence[-1].kind != leaf_kind:
             raise ValueError("path does not identify the required leaf type")
-        return _PathAnchor(
+        anchor = _PathAnchor(
             path=path,
             fd=current_fd,
             components=tuple(evidence),
@@ -1247,8 +2073,12 @@ def _open_path_anchor(
             require_executable=require_executable,
             filesystem_metadata_verifier=filesystem_metadata_verifier,
         )
+        if result_owner is not None:
+            result_owner.publish(anchor)
+        return anchor
     except BaseException:
-        os.close(current_fd)
+        if anchor is None or result_owner is None or not result_owner.owns(anchor):
+            os.close(current_fd)
         raise
 
 
@@ -1272,32 +2102,76 @@ def _path_components_match(
 
 
 def _assert_anchor_stable(anchor: _PathAnchor) -> NodeIdentity:
-    descriptor_before = NodeIdentity.from_stat(os.fstat(anchor.fd))
+    try:
+        descriptor_before = NodeIdentity.from_stat(os.fstat(anchor.fd))
+    except OSError as error:
+        raise OSError(
+            error.errno,
+            "held descriptor could not be revalidated",
+        ) from error
     if not _same_node_for_kind(
         descriptor_before,
         anchor.identity,
         kind=anchor.leaf_kind,
     ):
         raise ValueError("held executable identity changed")
-    current = _open_path_anchor(
-        anchor.path,
-        owner_uid=anchor.owner_uid,
-        leaf_kind=anchor.leaf_kind,
-        require_executable=anchor.require_executable,
-        filesystem_metadata_verifier=anchor.filesystem_metadata_verifier,
-    )
+    try:
+        current = _open_path_anchor(
+            anchor.path,
+            owner_uid=anchor.owner_uid,
+            leaf_kind=anchor.leaf_kind,
+            require_executable=anchor.require_executable,
+            require_single_link=False,
+            filesystem_metadata_verifier=anchor.filesystem_metadata_verifier,
+        )
+    except FileNotFoundError as error:
+        raise ValueError("no-follow path is missing during revalidation") from error
+    except OSError as error:
+        raise OSError(
+            error.errno,
+            "no-follow path could not be revalidated",
+        ) from error
     try:
         if not _path_components_match(anchor.components, current.components):
             raise ValueError("no-follow path identity changed")
     finally:
         os.close(current.fd)
-    descriptor_after = NodeIdentity.from_stat(os.fstat(anchor.fd))
+    try:
+        descriptor_after = NodeIdentity.from_stat(os.fstat(anchor.fd))
+    except OSError as error:
+        raise OSError(
+            error.errno,
+            "held descriptor could not be revalidated after path inspection",
+        ) from error
     if not _same_node_for_kind(
         descriptor_before,
         descriptor_after,
         kind=anchor.leaf_kind,
     ):
         raise ValueError("held executable identity raced with path revalidation")
+    if anchor.expected_content_sha256 is not None:
+        if (
+            anchor.leaf_kind != "file"
+            or anchor.expected_content_size is None
+            or anchor.content_max_bytes is None
+        ):
+            raise ValueError("held content authentication state is malformed")
+        digest = _sha256_fd(
+            anchor.fd,
+            expected_size=anchor.expected_content_size,
+            max_bytes=anchor.content_max_bytes,
+        )
+        content_after = NodeIdentity.from_stat(os.fstat(anchor.fd))
+        if (
+            not _same_node_for_kind(
+                descriptor_after,
+                content_after,
+                kind="file",
+            )
+            or digest != anchor.expected_content_sha256
+        ):
+            raise ValueError("held executable content changed")
+        descriptor_after = content_after
     return descriptor_after
 
 
@@ -1313,6 +2187,7 @@ def _assert_directory_object_stable(anchor: _PathAnchor) -> NodeIdentity:
         owner_uid=anchor.owner_uid,
         leaf_kind="directory",
         require_executable=False,
+        require_single_link=False,
         filesystem_metadata_verifier=anchor.filesystem_metadata_verifier,
     )
     try:
@@ -1354,7 +2229,12 @@ def _snapshot_components_match(
             leaf_kind == "file" and index == len(expected) - 2
         ) or (leaf_kind == "directory" and is_leaf)
         if (is_leaf and leaf_kind == "file") or is_snapshot_directory:
-            if left.identity != right.identity:
+            comparison_kind = "file" if is_leaf and leaf_kind == "file" else "directory"
+            if not _same_node_for_kind(
+                left.identity,
+                right.identity,
+                kind=comparison_kind,
+            ):
                 return False
         elif (
             left.identity.directory_object_key()
@@ -1372,27 +2252,36 @@ def _assert_snapshot_stable(
 ) -> NodeIdentity:
     directory_before = NodeIdentity.from_stat(os.fstat(directory_anchor.fd))
     file_before = NodeIdentity.from_stat(os.fstat(file_anchor.fd))
-    if (
-        directory_before != directory_anchor.identity
-        or file_before != file_anchor.identity
+    if not _same_node_for_kind(
+        directory_before,
+        directory_anchor.identity,
+        kind="directory",
+    ) or not _same_node_for_kind(
+        file_before,
+        file_anchor.identity,
+        kind="file",
     ):
         raise ValueError("held snapshot descriptor identity changed")
 
-    current_directory = _open_path_anchor(
-        directory_anchor.path,
-        owner_uid=directory_anchor.owner_uid,
-        leaf_kind="directory",
-        require_executable=False,
-        filesystem_metadata_verifier=directory_anchor.filesystem_metadata_verifier,
-    )
-    current_file = _open_path_anchor(
-        file_anchor.path,
-        owner_uid=file_anchor.owner_uid,
-        leaf_kind="file",
-        require_executable=True,
-        filesystem_metadata_verifier=file_anchor.filesystem_metadata_verifier,
-    )
+    current_directory: _PathAnchor | None = None
+    current_file: _PathAnchor | None = None
     try:
+        current_directory = _open_path_anchor(
+            directory_anchor.path,
+            owner_uid=directory_anchor.owner_uid,
+            leaf_kind="directory",
+            require_executable=False,
+            filesystem_metadata_verifier=(
+                directory_anchor.filesystem_metadata_verifier
+            ),
+        )
+        current_file = _open_path_anchor(
+            file_anchor.path,
+            owner_uid=file_anchor.owner_uid,
+            leaf_kind="file",
+            require_executable=True,
+            filesystem_metadata_verifier=file_anchor.filesystem_metadata_verifier,
+        )
         if not _snapshot_components_match(
             directory_anchor.components,
             current_directory.components,
@@ -1406,16 +2295,44 @@ def _assert_snapshot_stable(
         ):
             raise ValueError("snapshot executable path identity changed")
     finally:
-        os.close(current_file.fd)
-        os.close(current_directory.fd)
+        if current_file is not None:
+            os.close(current_file.fd)
+        if current_directory is not None:
+            os.close(current_directory.fd)
 
     names = os.listdir(directory_anchor.fd)
     if names != [SNAPSHOT_FILE_NAME]:
         raise ValueError("snapshot directory entry set changed")
     directory_after = NodeIdentity.from_stat(os.fstat(directory_anchor.fd))
     file_after = NodeIdentity.from_stat(os.fstat(file_anchor.fd))
-    if directory_before != directory_after or file_before != file_after:
+    if not _same_node_for_kind(
+        directory_before,
+        directory_after,
+        kind="directory",
+    ) or not _same_node_for_kind(
+        file_before,
+        file_after,
+        kind="file",
+    ):
         raise ValueError("snapshot descriptor identity raced with revalidation")
+    if file_anchor.expected_content_sha256 is not None:
+        if (
+            file_anchor.expected_content_size is None
+            or file_anchor.content_max_bytes is None
+        ):
+            raise ValueError("snapshot content authentication state is malformed")
+        digest = _sha256_fd(
+            file_anchor.fd,
+            expected_size=file_anchor.expected_content_size,
+            max_bytes=file_anchor.content_max_bytes,
+        )
+        file_after_hash = NodeIdentity.from_stat(os.fstat(file_anchor.fd))
+        if (
+            not _same_node_for_kind(file_after, file_after_hash, kind="file")
+            or digest != file_anchor.expected_content_sha256
+        ):
+            raise ValueError("snapshot executable content changed")
+        file_after = file_after_hash
     return file_after
 
 
@@ -1505,13 +2422,10 @@ def _refresh_directory_anchor(
     )
     try:
         held = NodeIdentity.from_stat(os.fstat(anchor.fd))
-        if held != fresh.identity:
+        if not _same_node_for_kind(held, fresh.identity, kind="directory"):
             raise ValueError("held directory differs from its refreshed path identity")
-        same_object = (held.device, held.inode, held.uid, held.gid) == (
-            anchor.identity.device,
-            anchor.identity.inode,
-            anchor.identity.uid,
-            anchor.identity.gid,
+        same_object = (
+            held.object_identity_key() == anchor.identity.object_identity_key()
         )
         if not same_object or (
             not allow_controlled_mode_change
@@ -1524,9 +2438,262 @@ def _refresh_directory_anchor(
         os.close(fresh.fd)
 
 
+class _SnapshotRollbackRevalidationError(ValueError):
+    def __init__(self, message: str, *, protected_property: str) -> None:
+        self.protected_property = protected_property
+        super().__init__(message)
+
+
+def _require_rollback_node(
+    actual: NodeIdentity,
+    expected: NodeIdentity,
+    *,
+    label: str,
+) -> None:
+    if actual.object_identity_key() != expected.object_identity_key():
+        raise _SnapshotRollbackRevalidationError(
+            f"snapshot rollback refused changed {label} object identity",
+            protected_property="object-identity",
+        )
+    if actual.access_policy_key() != expected.access_policy_key():
+        raise _SnapshotRollbackRevalidationError(
+            f"snapshot rollback refused changed {label} access policy",
+            protected_property="access-policy",
+        )
+
+
+def _snapshot_rollback_failure_classification(
+    error: BaseException,
+    *,
+    operation: str,
+    entry_state: str,
+) -> tuple[str, str]:
+    if isinstance(error, _SnapshotRollbackRevalidationError):
+        return "revalidation-mismatch", error.protected_property
+    if (operation == "rename-to-quarantine" and entry_state == "quarantined") or (
+        operation == "remove-quarantine" and entry_state == "removed-unfsynced"
+    ):
+        return "durability-unproven", "durability"
+    if operation.endswith("-fsync"):
+        return "durability-unproven", "durability"
+    if isinstance(error, FileNotFoundError):
+        return "entry-missing", "object-identity"
+    if isinstance(error, OSError) and operation.startswith("revalidate-"):
+        return "revalidation-unavailable", "availability"
+    return "operation-failed", "rollback-completion"
+
+
+def _abort_unpublished_snapshot_creation(
+    creation: _PendingNewSnapshotDirectory,
+    *,
+    operation: str,
+    trigger: BaseException,
+) -> Never:
+    if creation.directory_name is None:
+        raise ValueError("snapshot creation abort lacks its random name") from trigger
+    try:
+        creation.cleanup_operation = "remove-unpublished-directory"
+        creation.entry_state = "removal-pending"
+        try:
+            os.rmdir(
+                os.fsencode(creation.directory_name),
+                dir_fd=creation.parent_fd,
+            )
+        except FileNotFoundError:
+            creation.entry_state = "absent-unfsynced"
+        else:
+            creation.directory_removed = True
+            creation.entry_state = "removed-unfsynced"
+
+        creation.cleanup_operation = "creation-parent-fsync"
+        os.fsync(creation.parent_fd)
+        creation.parent_fsynced = True
+
+        creation.cleanup_operation = "revalidate-creation-parent"
+        _require_rollback_node(
+            NodeIdentity.from_stat(os.fstat(creation.parent_fd)),
+            creation.parent_identity,
+            label="snapshot creation parent",
+        )
+        creation.cleanup_operation = "revalidate-creation-name-absent"
+        try:
+            os.stat(
+                os.fsencode(creation.directory_name),
+                dir_fd=creation.parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise _SnapshotRollbackRevalidationError(
+                "snapshot creation rollback name remains published",
+                protected_property="object-identity",
+            )
+        creation.entry_state = "removed" if creation.directory_removed else "absent"
+        creation.cleanup_operation = "complete"
+    except BaseException as cleanup_error:
+        creation.retained = True
+        retained = CodexExecutableRetentionRequired(
+            "new snapshot directory creation could not prove rollback; "
+            "the parent descriptor and exact random name were retained",
+            code="new-snapshot-creation-retained",
+        )
+        retained.retain_resource(creation)
+        retained.retain_recovery_evidence(
+            creation.recovery_evidence(
+                operation=operation,
+                reason=(
+                    f"trigger={type(trigger).__name__}: {trigger}; "
+                    f"cleanup={type(cleanup_error).__name__}: {cleanup_error}"
+                ),
+            )
+        )
+        raise retained from cleanup_error
+
+    evidence = creation.recovery_evidence(
+        operation=operation,
+        reason=f"{type(trigger).__name__}: {trigger}",
+    )
+    raise CodexExecutableSnapshotCreationAborted(evidence) from trigger
+
+
+def _create_and_publish_snapshot_directory(
+    creation: _PendingNewSnapshotDirectory,
+    directory_name: str,
+    *,
+    owner_uid: int,
+) -> bool:
+    creation.begin(directory_name)
+    try:
+        os.mkdir(
+            os.fsencode(directory_name),
+            SNAPSHOT_DIRECTORY_MODE,
+            dir_fd=creation.parent_fd,
+        )
+        creation.entry_state = "created-unidentified"
+        creation.operation = "capture-directory-identity"
+        identity = NodeIdentity.from_stat(
+            os.stat(
+                os.fsencode(directory_name),
+                dir_fd=creation.parent_fd,
+                follow_symlinks=False,
+            )
+        )
+        creation.directory_identity = identity
+        creation.operation = "validate-directory-identity"
+        _validate_node(
+            identity,
+            path=creation.parent_path / directory_name,
+            kind="directory",
+            owner_uid=owner_uid,
+        )
+        creation.entry_state = "published"
+        creation.operation = "published"
+        return True
+    except FileExistsError as error:
+        if creation.entry_state == "mkdir-pending":
+            creation.clear_collision()
+            return False
+        _abort_unpublished_snapshot_creation(
+            creation,
+            operation=creation.operation,
+            trigger=error,
+        )
+    except BaseException as error:
+        _abort_unpublished_snapshot_creation(
+            creation,
+            operation=creation.operation,
+            trigger=error,
+        )
+
+
+def _refresh_snapshot_rollback_entry_state(
+    retained: _RetainedNewSnapshot,
+) -> None:
+    directory_fd = retained.directory_fd
+    quarantine_name = retained.quarantine_name
+    if directory_fd is None or quarantine_name is None:
+        retained.entry_state = "entry-state-unavailable"
+        retained.entry_state_source = "missing-recovery-anchor"
+        return
+    try:
+        held = NodeIdentity.from_stat(os.fstat(directory_fd))
+    except BaseException:
+        retained.entry_state = "entry-state-unavailable"
+        retained.entry_state_source = "descriptor-revalidation-unavailable"
+        return
+
+    def observe(name: str) -> tuple[str, NodeIdentity | None]:
+        try:
+            identity = NodeIdentity.from_stat(
+                os.stat(
+                    os.fsencode(name),
+                    dir_fd=retained.parent_fd,
+                    follow_symlinks=False,
+                )
+            )
+        except FileNotFoundError:
+            return "missing", None
+        except BaseException:
+            return "unavailable", None
+        if identity.object_identity_key() != held.object_identity_key():
+            return "mismatch", identity
+        if identity.access_policy_key() != held.access_policy_key():
+            return "access-policy-mismatch", identity
+        return "held-object", identity
+
+    public_state, _ = observe(retained.public_name)
+    quarantine_state, _ = observe(quarantine_name)
+    if public_state == "held-object" and quarantine_state == "missing":
+        entry_state = "public-empty"
+    elif public_state == "missing" and quarantine_state == "held-object":
+        entry_state = "quarantined"
+    elif public_state == "missing" and quarantine_state == "missing":
+        try:
+            parent_names = os.listdir(retained.parent_fd)
+            if len(parent_names) > SNAPSHOT_CLEANUP_ENTRY_CAP:
+                raise ValueError(
+                    "snapshot parent exceeds the bounded recovery entry cap"
+                )
+            matching_alias = False
+            for name in parent_names:
+                try:
+                    candidate = NodeIdentity.from_stat(
+                        os.stat(
+                            os.fsencode(name),
+                            dir_fd=retained.parent_fd,
+                            follow_symlinks=False,
+                        )
+                    )
+                except FileNotFoundError:
+                    continue
+                if candidate.object_identity_key() == held.object_identity_key():
+                    matching_alias = True
+                    break
+        except BaseException:
+            entry_state = "entry-state-unavailable"
+        else:
+            entry_state = (
+                "entry-state-conflict" if matching_alias else "removed-unfsynced"
+            )
+    elif "unavailable" in {public_state, quarantine_state}:
+        entry_state = "entry-state-unavailable"
+    elif any(
+        state in {"mismatch", "access-policy-mismatch"}
+        for state in (public_state, quarantine_state)
+    ):
+        entry_state = "entry-identity-mismatch"
+    else:
+        entry_state = "entry-state-conflict"
+    retained.entry_state = entry_state
+    retained.entry_state_source = "descriptor-bound-revalidation"
+
+
 def _rollback_new_snapshot(
     *,
+    parent_path: pathlib.Path,
     parent_fd: int,
+    parent_identity: NodeIdentity,
     directory_name: str,
     directory_fd: int | None,
     directory_identity: NodeIdentity,
@@ -1534,16 +2701,37 @@ def _rollback_new_snapshot(
     file_fd: int | None,
     file_identity: NodeIdentity | None,
 ) -> None:
-    opened_for_rollback = False
-    if directory_fd is None:
-        directory_fd = os.open(
-            os.fsencode(directory_name),
-            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            dir_fd=parent_fd,
-        )
-        opened_for_rollback = True
+    retained = _RetainedNewSnapshot(
+        parent_path=parent_path,
+        public_name=directory_name,
+        parent_fd=parent_fd,
+        directory_fd=directory_fd,
+        file_fd=file_fd,
+        parent_identity=parent_identity,
+        directory_identity=directory_identity,
+        file_identity=file_identity,
+    )
+    opened_file = False
+    operation = "revalidate-parent-before-rollback"
+    deadline = time.monotonic() + SNAPSHOT_CLEANUP_SECONDS
     try:
-        held_directory = NodeIdentity.from_stat(os.fstat(directory_fd))
+        _require_rollback_node(
+            NodeIdentity.from_stat(os.fstat(parent_fd)),
+            parent_identity,
+            label="parent",
+        )
+        operation = "open-directory-for-rollback"
+        if retained.directory_fd is None:
+            retained.directory_fd = os.open(
+                os.fsencode(directory_name),
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+        directory_descriptor = retained.directory_fd
+        assert directory_descriptor is not None
+
+        operation = "revalidate-public-directory"
+        held_directory = NodeIdentity.from_stat(os.fstat(directory_descriptor))
         path_directory = NodeIdentity.from_stat(
             os.stat(
                 os.fsencode(directory_name),
@@ -1551,38 +2739,248 @@ def _rollback_new_snapshot(
                 follow_symlinks=False,
             )
         )
-        expected_directory = (
-            held_directory if not opened_for_rollback else directory_identity
+        _require_rollback_node(
+            held_directory,
+            directory_identity,
+            label="directory descriptor",
         )
-        if held_directory != expected_directory or path_directory != held_directory:
-            raise ValueError("snapshot rollback refused a replaced directory path")
+        _require_rollback_node(
+            path_directory,
+            held_directory,
+            label="directory path",
+        )
 
+        operation = "revalidate-directory-entry-set"
         expected_names = [SNAPSHOT_FILE_NAME] if file_created else []
-        if os.listdir(directory_fd) != expected_names:
-            raise ValueError("snapshot rollback refused an unexpected directory entry")
-        if file_created:
-            held_file = (
-                NodeIdentity.from_stat(os.fstat(file_fd))
-                if file_fd is not None
-                else file_identity
+        if os.listdir(directory_descriptor) != expected_names:
+            raise _SnapshotRollbackRevalidationError(
+                "snapshot rollback refused an unexpected directory entry set",
+                protected_property="object-identity",
             )
-            if held_file is None:
-                raise ValueError("snapshot rollback lacks the created file identity")
+        if file_created:
+            if retained.file_identity is None:
+                raise _SnapshotRollbackRevalidationError(
+                    "snapshot rollback lacks the created file identity",
+                    protected_property="object-identity",
+                )
+            operation = "open-file-for-rollback"
+            if retained.file_fd is None:
+                retained.file_fd = os.open(
+                    os.fsencode(SNAPSHOT_FILE_NAME),
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    dir_fd=directory_descriptor,
+                )
+                opened_file = True
+            file_descriptor = retained.file_fd
+            assert file_descriptor is not None
+
+            operation = "revalidate-created-file"
+            held_file = NodeIdentity.from_stat(os.fstat(file_descriptor))
             path_file = NodeIdentity.from_stat(
                 os.stat(
                     os.fsencode(SNAPSHOT_FILE_NAME),
-                    dir_fd=directory_fd,
+                    dir_fd=directory_descriptor,
                     follow_symlinks=False,
                 )
             )
-            if path_file != held_file:
-                raise ValueError("snapshot rollback refused a replaced file path")
-            os.unlink(os.fsencode(SNAPSHOT_FILE_NAME), dir_fd=directory_fd)
-            os.fsync(directory_fd)
-        os.rmdir(os.fsencode(directory_name), dir_fd=parent_fd)
+            # Rollback protects the created object's identity and access policy.
+            # Its bytes are intentionally irrelevant because the object is deleted.
+            _require_rollback_node(
+                held_file,
+                retained.file_identity,
+                label="file descriptor",
+            )
+            _require_rollback_node(
+                path_file,
+                held_file,
+                label="file path",
+            )
+            operation = "unlink-created-file"
+            os.unlink(
+                os.fsencode(SNAPSHOT_FILE_NAME),
+                dir_fd=directory_descriptor,
+            )
+            retained.entry_state = "public-empty"
+            retained.entry_state_source = "published-state"
+            operation = "directory-fsync"
+            os.fsync(directory_descriptor)
+
+        operation = "allocate-quarantine-name"
+        for _ in range(SNAPSHOT_QUARANTINE_NAME_ATTEMPTS):
+            candidate = SNAPSHOT_QUARANTINE_PREFIX + secrets.token_hex(16)
+            try:
+                os.stat(
+                    os.fsencode(candidate),
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                retained.quarantine_name = candidate
+                break
+        if retained.quarantine_name is None:
+            raise FileExistsError(
+                "cannot allocate a fresh snapshot rollback quarantine name"
+            )
+
+        if time.monotonic() >= deadline:
+            raise TimeoutError("snapshot rollback quarantine deadline expired")
+        operation = "rename-to-quarantine"
+        retained.entry_state = "rename-pending"
+        retained.entry_state_source = "prepublished-transition"
+        os.rename(
+            os.fsencode(directory_name),
+            os.fsencode(retained.quarantine_name),
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        retained.entry_state = "quarantined"
+        retained.entry_state_source = "published-state"
+        operation = "quarantine-parent-fsync"
         os.fsync(parent_fd)
-    finally:
-        os.close(directory_fd)
+
+        operation = "revalidate-quarantined-directory"
+        _require_rollback_node(
+            NodeIdentity.from_stat(os.fstat(parent_fd)),
+            parent_identity,
+            label="parent",
+        )
+        _require_rollback_node(
+            NodeIdentity.from_stat(os.fstat(directory_descriptor)),
+            directory_identity,
+            label="quarantined directory descriptor",
+        )
+        quarantined = NodeIdentity.from_stat(
+            os.stat(
+                os.fsencode(retained.quarantine_name),
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        )
+        _require_rollback_node(
+            quarantined,
+            directory_identity,
+            label="quarantine path",
+        )
+        try:
+            os.stat(
+                os.fsencode(directory_name),
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise _SnapshotRollbackRevalidationError(
+                "snapshot rollback public name was replaced after quarantine",
+                protected_property="object-identity",
+            )
+
+        if time.monotonic() >= deadline:
+            raise TimeoutError("snapshot rollback removal deadline expired")
+        operation = "remove-quarantine"
+        retained.entry_state = "removal-pending"
+        retained.entry_state_source = "prepublished-transition"
+        os.rmdir(os.fsencode(retained.quarantine_name), dir_fd=parent_fd)
+        retained.entry_state = "removed-unfsynced"
+        retained.entry_state_source = "published-state"
+        operation = "removal-parent-fsync"
+        os.fsync(parent_fd)
+
+        operation = "revalidate-removed-names"
+        _require_rollback_node(
+            NodeIdentity.from_stat(os.fstat(parent_fd)),
+            parent_identity,
+            label="parent",
+        )
+        for name in (directory_name, retained.quarantine_name):
+            try:
+                os.stat(
+                    os.fsencode(name),
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            raise _SnapshotRollbackRevalidationError(
+                "snapshot rollback name remains after removal",
+                protected_property="object-identity",
+            )
+        retained.entry_state = "removed"
+        retained.entry_state_source = "published-state"
+    except BaseException as error:
+        state_refresh_error: BaseException | None = None
+        if retained.entry_state in {"rename-pending", "removal-pending"}:
+            try:
+                _refresh_snapshot_rollback_entry_state(retained)
+            except BaseException as refresh_error:
+                state_refresh_error = refresh_error
+        failure_kind, protected_property = _snapshot_rollback_failure_classification(
+            error,
+            operation=operation,
+            entry_state=retained.entry_state,
+        )
+        retention = CodexExecutableRetentionRequired(
+            "new snapshot rollback could not prove descriptor-bound deletion; "
+            "custody and the exact recovery names were retained",
+            code="new-snapshot-rollback-retained",
+        )
+        retention.retain_resource(retained)
+        retention.retain_recovery_evidence(
+            retained.recovery_evidence(
+                operation=operation,
+                failure_kind=failure_kind,
+                protected_property=protected_property,
+                reason=(
+                    f"{type(error).__name__}: {error}"
+                    + (
+                        "; state-refresh="
+                        f"{type(state_refresh_error).__name__}: "
+                        f"{state_refresh_error}"
+                        if state_refresh_error is not None
+                        else ""
+                    )
+                ),
+            )
+        )
+        raise retention from error
+    else:
+        close_error: BaseException | None = None
+        descriptors = ((("file_fd", retained.file_fd),) if opened_file else ()) + (
+            ("directory_fd", retained.directory_fd),
+        )
+        for attribute, descriptor in descriptors:
+            if descriptor is None:
+                continue
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                close_error = error
+                break
+            else:
+                setattr(retained, attribute, None)
+        if close_error is not None:
+            failure_kind, protected_property = (
+                _snapshot_rollback_failure_classification(
+                    close_error,
+                    operation="close-rollback-custody",
+                    entry_state=retained.entry_state,
+                )
+            )
+            retention = CodexExecutableRetentionRequired(
+                "new snapshot rollback removed its names but descriptor closure "
+                "could not be proven; custody evidence was retained",
+                code="new-snapshot-rollback-descriptor-retained",
+            )
+            retention.retain_resource(retained)
+            retention.retain_recovery_evidence(
+                retained.recovery_evidence(
+                    operation="close-rollback-custody",
+                    failure_kind=failure_kind,
+                    protected_property=protected_property,
+                    reason=f"{type(close_error).__name__}: {close_error}",
+                )
+            )
+            raise retention from close_error
 
 
 def _stage_snapshot(
@@ -1603,13 +3001,18 @@ def _stage_snapshot(
         require_executable=False,
         filesystem_metadata_verifier=filesystem_metadata_verifier,
     )
+    creation = _PendingNewSnapshotDirectory(
+        parent_path=parent_path,
+        parent_fd=parent_anchor.fd,
+        parent_identity=parent_anchor.identity,
+    )
     directory_name: str | None = None
-    directory_creation_identity: NodeIdentity | None = None
     directory_anchor: _PathAnchor | None = None
     build_fd: int | None = None
     rollback_file_identity: NodeIdentity | None = None
     file_created = False
     staged = False
+    parent_retained = False
     try:
         if (
             parent_anchor.identity.uid != owner_uid
@@ -1618,31 +3021,20 @@ def _stage_snapshot(
             raise ValueError("snapshot parent must be supervisor-owned mode 0700")
         for _ in range(SNAPSHOT_NAME_ATTEMPTS):
             candidate = SNAPSHOT_DIRECTORY_PREFIX + secrets.token_hex(16)
-            try:
-                os.mkdir(
-                    os.fsencode(candidate),
-                    SNAPSHOT_DIRECTORY_MODE,
-                    dir_fd=parent_anchor.fd,
-                )
-            except FileExistsError:
-                continue
-            directory_name = candidate
-            directory_creation_identity = NodeIdentity.from_stat(
-                os.stat(
-                    os.fsencode(candidate),
-                    dir_fd=parent_anchor.fd,
-                    follow_symlinks=False,
-                )
-            )
-            _validate_node(
-                directory_creation_identity,
-                path=parent_path / candidate,
-                kind="directory",
+            if _create_and_publish_snapshot_directory(
+                creation,
+                candidate,
                 owner_uid=owner_uid,
-            )
-            break
-        if directory_name is None:
+            ):
+                break
+        if not creation.published:
             raise FileExistsError("cannot allocate a fresh snapshot directory")
+        directory_name = creation.directory_name
+        if directory_name is None or creation.directory_identity is None:
+            raise CodexExecutableError(
+                "snapshot directory ownership publication is malformed",
+                code="new-snapshot-creation-ownership-invalid",
+            )
         os.fsync(parent_anchor.fd)
         directory_path = parent_path / directory_name
         directory_anchor = _open_path_anchor(
@@ -1677,6 +3069,7 @@ def _stage_snapshot(
         file_created = True
         os.fchmod(build_fd, SNAPSHOT_BUILD_MODE)
         build_identity = NodeIdentity.from_stat(os.fstat(build_fd))
+        rollback_file_identity = build_identity
         _validate_node(
             build_identity,
             path=directory_path / SNAPSHOT_FILE_NAME,
@@ -1765,7 +3158,11 @@ def _stage_snapshot(
             filesystem_metadata_verifier=filesystem_metadata_verifier,
         )
         try:
-            if file_anchor.identity != sealed_identity:
+            if not _same_node_for_kind(
+                file_anchor.identity,
+                sealed_identity,
+                kind="file",
+            ):
                 raise ValueError("reopened snapshot identity differs from its seal")
             reopened_digest = _sha256_fd(
                 file_anchor.fd,
@@ -1774,6 +3171,9 @@ def _stage_snapshot(
             )
             if reopened_digest != policy.expected_sha256:
                 raise ValueError("reopened snapshot digest differs from its pin")
+            file_anchor.expected_content_size = file_anchor.identity.size
+            file_anchor.expected_content_sha256 = reopened_digest
+            file_anchor.content_max_bytes = policy.max_executable_bytes
             _assert_snapshot_stable(directory_anchor, file_anchor)
             directory_metadata = directory_anchor.components[-1].extended_metadata
             executable_metadata = file_anchor.components[-1].extended_metadata
@@ -1821,27 +3221,64 @@ def _stage_snapshot(
             raise
     finally:
         try:
-            if not staged and directory_name is not None:
-                assert directory_creation_identity is not None
+            if creation.retained:
+                parent_retained = True
+            elif not staged and creation.published:
+                rollback_name = creation.directory_name
+                rollback_identity = creation.directory_identity
+                if rollback_name is None or rollback_identity is None:
+                    raise CodexExecutableError(
+                        "published snapshot creation ownership is malformed",
+                        code="new-snapshot-creation-ownership-invalid",
+                    )
                 rollback_directory_fd = (
                     directory_anchor.fd if directory_anchor else None
                 )
-                directory_anchor = None
-                _rollback_new_snapshot(
-                    parent_fd=parent_anchor.fd,
-                    directory_name=directory_name,
-                    directory_fd=rollback_directory_fd,
-                    directory_identity=directory_creation_identity,
-                    file_created=file_created,
-                    file_fd=build_fd,
-                    file_identity=rollback_file_identity,
-                )
+                try:
+                    _rollback_new_snapshot(
+                        parent_path=parent_path,
+                        parent_fd=parent_anchor.fd,
+                        parent_identity=parent_anchor.identity,
+                        directory_name=rollback_name,
+                        directory_fd=rollback_directory_fd,
+                        directory_identity=rollback_identity,
+                        file_created=file_created,
+                        file_fd=build_fd,
+                        file_identity=rollback_file_identity,
+                    )
+                except CodexExecutableRetentionRequired as error:
+                    retained = next(
+                        (
+                            resource
+                            for resource in error.retained_resources
+                            if isinstance(resource, _RetainedNewSnapshot)
+                            and resource.parent_fd == parent_anchor.fd
+                        ),
+                        None,
+                    )
+                    if retained is not None:
+                        parent_retained = True
+                        directory_anchor = None
+                        if retained.file_fd == build_fd:
+                            build_fd = None
+                    raise
+                else:
+                    directory_anchor = None
         finally:
             if build_fd is not None:
-                os.close(build_fd)
+                try:
+                    os.close(build_fd)
+                except OSError as error:
+                    if error.errno != errno.EBADF:
+                        raise
             if directory_anchor is not None:
-                os.close(directory_anchor.fd)
-            os.close(parent_anchor.fd)
+                try:
+                    os.close(directory_anchor.fd)
+                except OSError as error:
+                    if error.errno != errno.EBADF:
+                        raise
+            if not parent_retained:
+                os.close(parent_anchor.fd)
 
 
 def _destroy_staged_snapshot(
@@ -1877,7 +3314,11 @@ def _destroy_staged_snapshot(
         held_directory_identity = NodeIdentity.from_stat(
             os.fstat(staged.directory_anchor.fd)
         )
-        if directory_path_identity != held_directory_identity:
+        if not _same_node_for_kind(
+            directory_path_identity,
+            held_directory_identity,
+            kind="directory",
+        ):
             raise ValueError("snapshot directory path changed before cleanup")
         file_path_identity = NodeIdentity.from_stat(
             os.stat(
@@ -1887,9 +3328,14 @@ def _destroy_staged_snapshot(
             )
         )
         held_file_identity = NodeIdentity.from_stat(os.fstat(staged.file_anchor.fd))
-        if (
-            file_path_identity != held_file_identity
-            or held_file_identity != staged.evidence.executable_identity
+        if not _same_node_for_kind(
+            file_path_identity,
+            held_file_identity,
+            kind="file",
+        ) or not _same_node_for_kind(
+            held_file_identity,
+            staged.evidence.executable_identity,
+            kind="file",
         ):
             raise ValueError("snapshot executable path changed before cleanup")
         os.unlink(
@@ -1897,8 +3343,18 @@ def _destroy_staged_snapshot(
             dir_fd=staged.directory_anchor.fd,
         )
         os.fsync(staged.directory_anchor.fd)
-        os.rmdir(os.fsencode(staged.directory_name), dir_fd=parent.fd)
-        os.fsync(parent.fd)
+        quarantine_and_remove_empty_root(
+            RootSpec(
+                label="staged-snapshot",
+                parent_fd=parent.fd,
+                parent_identity=_cleanup_identity(parent.identity),
+                name=os.fsencode(staged.directory_name),
+                expected_identity=_cleanup_identity(held_directory_identity),
+                private_metadata=True,
+            ),
+            staged.directory_anchor.fd,
+            deadline=time.monotonic() + SNAPSHOT_CLEANUP_SECONDS,
+        )
     finally:
         os.close(parent.fd)
 
@@ -1912,16 +3368,431 @@ def _close_staged_snapshot_fds(staged: _StagedSnapshot) -> None:
                 raise
 
 
-def _kill_command(process: subprocess.Popen[bytes]) -> None:
+def _snapshot_recovery_evidence(
+    staged: _StagedSnapshot,
+    *,
+    stage: str,
+    reason: str,
+) -> CodexExecutableRecoveryEvidence:
+    return CodexExecutableRecoveryEvidence(
+        stage=stage,
+        parent_path=str(staged.parent_path),
+        entry_name=staged.directory_name,
+        entry_path=str(staged.directory_anchor.path),
+        parent_fd=None,
+        directory_fd=staged.directory_anchor.fd,
+        executable_fd=staged.file_anchor.fd,
+        parent_identity=staged.evidence.parent_identity,
+        directory_identity=staged.evidence.directory_identity,
+        executable_identity=staged.evidence.executable_identity,
+        reason=reason,
+    )
+
+
+def _retain_snapshot(
+    error: CodexExecutableRetentionRequired,
+    staged: _StagedSnapshot,
+    *,
+    stage: str,
+    reason: str,
+) -> None:
+    error.retain_resource(staged)
+    error.retain_recovery_evidence(
+        _snapshot_recovery_evidence(
+            staged,
+            stage=stage,
+            reason=reason,
+        )
+    )
+
+
+def _hash_root_protected_executable(path: pathlib.Path) -> str:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+    )
     try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+        before = NodeIdentity.from_stat(os.fstat(descriptor))
+        if (
+            not stat.S_ISREG(before.mode)
+            or not before.mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            or before.size <= 0
+            or before.size > MAX_CODEX_EXECUTABLE_BYTES
+        ):
+            raise ValueError("preflight executable metadata is outside policy")
+        digest = _sha256_fd(
+            descriptor,
+            expected_size=before.size,
+            max_bytes=MAX_CODEX_EXECUTABLE_BYTES,
+        )
+        after = NodeIdentity.from_stat(os.fstat(descriptor))
+        path_after = NodeIdentity.from_stat(os.stat(path, follow_symlinks=False))
+        if not _same_node_for_kind(
+            before, after, kind="file"
+        ) or not _same_node_for_kind(after, path_after, kind="file"):
+            raise ValueError(
+                "preflight executable changed while its digest was authenticated"
+            )
+        return digest
+    finally:
+        os.close(descriptor)
+
+
+def _prepare_root_protected_no_child_profile(executable: pathlib.Path) -> object:
+    from .no_child_profile import prepare_no_child_profile
+
+    digest = _hash_root_protected_executable(executable)
+    return prepare_no_child_profile(
+        executable,
+        expected_sha256=digest,
+    )
+
+
+def _preflight_closure_evidence(
+    launched: object,
+    *,
+    leader_reaped: bool,
+    stdio_closed: bool,
+    closure_proven: bool,
+    reason: str,
+) -> PreflightProcessClosureEvidence:
+    return PreflightProcessClosureEvidence(
+        leader_pid=launched.pid,
+        leader_pgid=launched.pgid,
+        leader_session_id=launched.session_id,
+        leader_start_identity=launched.start_identity,
+        profile_sha256=launched.profile_sha256,
+        leader_reaped=leader_reaped,
+        stdio_closed=stdio_closed,
+        authenticated_no_child_profile=True,
+        permitted_process_closure_proven=closure_proven,
+        process_group_emptiness_used_as_descendant_proof=False,
+        reason=reason,
+    )
+
+
+def _unknown_preflight_closure_evidence(
+    ownership: _PreflightLaunchOwnership,
+    *,
+    reason: str,
+) -> PreflightProcessClosureEvidence:
+    profile = getattr(ownership.prepared, "seatbelt_profile", None)
+    profile_sha256 = (
+        hashlib.sha256(profile.encode("utf-8")).hexdigest()
+        if isinstance(profile, str)
+        else None
+    )
+    return PreflightProcessClosureEvidence(
+        leader_pid=None,
+        leader_pgid=None,
+        leader_session_id=None,
+        leader_start_identity=None,
+        profile_sha256=profile_sha256,
+        leader_reaped=False,
+        stdio_closed=False,
+        authenticated_no_child_profile=True,
+        permitted_process_closure_proven=False,
+        process_group_emptiness_used_as_descendant_proof=False,
+        reason=reason,
+        launch_receipt_published=False,
+        runtime_descriptors_retained=True,
+    )
+
+
+def _retain_preflight_launch(
+    error: CodexExecutableRetentionRequired,
+    ownership: _PreflightLaunchOwnership,
+    *,
+    closure: PreflightProcessClosureEvidence,
+    reason: str,
+) -> None:
+    if any(resource is ownership for resource in error.retained_resources):
+        return
+    recovery = PreflightLaunchRetentionEvidence(
+        stage="preflight-launch",
+        ownership_state=ownership.state,
+        receipt_published=ownership.receipt is not None,
+        receipt_transferred=ownership.transferred,
+        descriptor_fds=tuple(sorted(ownership.descriptors)),
+        descriptor_close_outcomes=tuple(
+            sorted(ownership.descriptor_close_outcomes.items())
+        ),
+        process_closure=closure,
+        reason=reason,
+    )
+    ownership.mark_retained()
+    error.retain_resource(ownership)
+    error.retain_recovery_evidence(recovery)
+
+
+def _close_preflight_launch_descriptors(
+    ownership: _PreflightLaunchOwnership,
+) -> tuple[BaseException, ...]:
+    failures: list[BaseException] = []
+    for descriptor in tuple(ownership.descriptors):
+        error = ownership.close_descriptor(descriptor)
+        if error is not None:
+            failures.append(error)
+    return tuple(failures)
+
+
+def _require_bound_preflight_leader(launched: object) -> None:
+    if (
+        type(launched.pid) is not int
+        or launched.pid <= 1
+        or launched.pgid != launched.pid
+        or launched.session_id != launched.pid
+        or not isinstance(launched.start_identity, str)
+        or not launched.start_identity
+    ):
+        raise ChildProcessError("preflight leader binding is malformed")
+    if terminal_status(launched.pid) is not None:
+        return
     try:
-        process.wait(timeout=2.0)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=2.0)
+        current_pgid = os.getpgid(launched.pid)
+        current_session = os.getsid(launched.pid)
+        current_start = process_start_identity(launched.pid)
+    except (OSError, ValueError) as error:
+        if terminal_status(launched.pid) is not None:
+            return
+        raise ChildProcessError(
+            "preflight leader identity could not be revalidated"
+        ) from error
+    if (
+        current_pgid != launched.pgid
+        or current_session != launched.session_id
+        or current_start != launched.start_identity
+    ):
+        raise ChildProcessError("preflight leader identity changed")
+
+
+def _terminate_and_reap_preflight(
+    launched: object,
+    *,
+    deadline: float,
+) -> int:
+    _require_bound_preflight_leader(launched)
+    if terminal_status(launched.pid) is None:
+        try:
+            os.kill(launched.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    wait_terminal(launched.pid, deadline=deadline)
+    return reap(launched.pid, deadline=deadline)
+
+
+def _launch_prepared_bounded_command(
+    prepared: object,
+    argv: tuple[str, ...],
+    *,
+    ownership: _PreflightLaunchOwnership,
+) -> PreflightLaunchReceipt:
+    from .no_child_profile import (
+        PreparedNoChildProfile,
+        launch_prepared_no_child_process,
+    )
+
+    if not isinstance(prepared, PreparedNoChildProfile):
+        raise ValueError("bounded command no-child launch authority is malformed")
+    if ownership.prepared is not prepared or ownership.state != "allocating":
+        raise ValueError("bounded command launch ownership is malformed")
+    launched: object | None = None
+    try:
+        stdout_read, stdout_write = os.pipe()
+        ownership.track_descriptors(stdout_read, stdout_write)
+        stderr_read, stderr_write = os.pipe()
+        ownership.track_descriptors(stderr_read, stderr_write)
+        devnull = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+        ownership.track_descriptors(devnull)
+        for descriptor in (
+            stdout_read,
+            stdout_write,
+            stderr_read,
+            stderr_write,
+        ):
+            os.set_inheritable(descriptor, False)
+        ownership.arm_launch()
+        launched = _launch_no_child_process_with_ownership(
+            launch_prepared_no_child_process,
+            prepared,
+            argv,
+            ownership=ownership,
+            cwd="/",
+            environment={
+                "HOME": "/var/empty",
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin",
+            },
+            stdin_fd=devnull,
+            stdout_fd=stdout_write,
+            stderr_fd=stderr_write,
+        )
+        if ownership.launched is not launched:
+            raise ChildProcessError(
+                "no-child launch result was not atomically published"
+            )
+        for descriptor in (devnull, stdout_write, stderr_write):
+            close_error = ownership.close_descriptor(descriptor)
+            if close_error is not None:
+                raise close_error
+        receipt = (launched, stdout_read, stderr_read)
+        ownership.publish_receipt(receipt)
+        return receipt
+    except BaseException as primary_error:
+        bound_leader = launched if launched is not None else ownership.launched
+        if isinstance(primary_error, CodexExecutableRetentionRequired):
+            closure = (
+                _preflight_closure_evidence(
+                    bound_leader,
+                    leader_reaped=False,
+                    stdio_closed=False,
+                    closure_proven=False,
+                    reason=(
+                        "the preflight launch returned retained state before "
+                        "process closure could be proven"
+                    ),
+                )
+                if bound_leader is not None
+                else _unknown_preflight_closure_evidence(
+                    ownership,
+                    reason=(
+                        "the no-child launcher retained controls without "
+                        "publishing a bound leader receipt"
+                    ),
+                )
+            )
+            _retain_preflight_launch(
+                primary_error,
+                ownership,
+                closure=closure,
+                reason=f"{type(primary_error).__name__}: {primary_error}",
+            )
+            raise
+        if bound_leader is None and ownership.may_have_launched:
+            closure = _unknown_preflight_closure_evidence(
+                ownership,
+                reason=(
+                    "the no-child launcher may have returned successfully, but "
+                    "its bound leader receipt was interrupted before publication"
+                ),
+            )
+            retained = PreflightProcessClosureUnproven(
+                "preflight process ownership is unknown after an interrupted "
+                "launch return; controls and runtime resources must be retained",
+                evidence=closure,
+            )
+            _retain_preflight_launch(
+                retained,
+                ownership,
+                closure=closure,
+                reason=f"{type(primary_error).__name__}: {primary_error}",
+            )
+            raise retained from primary_error
+
+        closure: PreflightProcessClosureEvidence | None = None
+        cleanup_error: BaseException | None = None
+        if bound_leader is not None:
+            try:
+                _terminate_and_reap_preflight(
+                    bound_leader,
+                    deadline=time.monotonic() + 5.0,
+                )
+            except BaseException as error:
+                cleanup_error = error
+            else:
+                ownership.mark_closure_proven()
+                evidence = _preflight_closure_evidence(
+                    bound_leader,
+                    leader_reaped=True,
+                    stdio_closed=False,
+                    closure_proven=True,
+                    reason=(
+                        "preflight launch plumbing failed after leader binding; "
+                        "the leader was terminated and reaped before descriptor "
+                        "cleanup"
+                    ),
+                )
+                closure = evidence
+        if cleanup_error is not None:
+            assert bound_leader is not None
+            closure = _preflight_closure_evidence(
+                bound_leader,
+                leader_reaped=False,
+                stdio_closed=False,
+                closure_proven=False,
+                reason=(
+                    "preflight launch plumbing failed and the bound leader "
+                    "could not be reaped"
+                ),
+            )
+            retained = PreflightProcessClosureUnproven(
+                "preflight process closure is unproven after launch setup "
+                "failed; controls and runtime resources must be retained",
+                evidence=closure,
+            )
+            _retain_preflight_launch(
+                retained,
+                ownership,
+                closure=closure,
+                reason=(
+                    f"primary={type(primary_error).__name__}: {primary_error}; "
+                    f"cleanup={type(cleanup_error).__name__}: {cleanup_error}"
+                ),
+            )
+            raise retained from cleanup_error
+
+        descriptor_errors = _close_preflight_launch_descriptors(ownership)
+        if descriptor_errors:
+            if closure is None:
+                closure = _unknown_preflight_closure_evidence(
+                    ownership,
+                    reason=(
+                        "launch failed before process creation, but descriptor "
+                        "closure was interrupted"
+                    ),
+                )
+            else:
+                closure = PreflightProcessClosureEvidence(
+                    leader_pid=closure.leader_pid,
+                    leader_pgid=closure.leader_pgid,
+                    leader_session_id=closure.leader_session_id,
+                    leader_start_identity=closure.leader_start_identity,
+                    profile_sha256=closure.profile_sha256,
+                    leader_reaped=closure.leader_reaped,
+                    stdio_closed=False,
+                    authenticated_no_child_profile=(
+                        closure.authenticated_no_child_profile
+                    ),
+                    permitted_process_closure_proven=(
+                        closure.permitted_process_closure_proven
+                    ),
+                    process_group_emptiness_used_as_descendant_proof=False,
+                    reason=(
+                        "the bound leader was reaped before descriptor cleanup, "
+                        "but one or more launch descriptors remain retained"
+                    ),
+                    launch_receipt_published=ownership.receipt is not None,
+                    runtime_descriptors_retained=True,
+                )
+            retained = CodexExecutableRetentionRequired(
+                "preflight launch descriptor cleanup was interrupted after "
+                "process settlement; runtime resources were retained",
+                code="preflight-runtime-resources-retained",
+            )
+            _retain_preflight_launch(
+                retained,
+                ownership,
+                closure=closure,
+                reason=(
+                    f"primary={type(primary_error).__name__}: {primary_error}; "
+                    f"descriptor={type(descriptor_errors[0]).__name__}: "
+                    f"{descriptor_errors[0]}"
+                ),
+            )
+            raise retained from descriptor_errors[0]
+        ownership.mark_closed()
+        raise
 
 
 def run_bounded_command(
@@ -1929,6 +3800,7 @@ def run_bounded_command(
     *,
     timeout_seconds: float,
     max_output_bytes: int,
+    _prepared_no_child_profile: object | None = None,
 ) -> CommandResult:
     _require_python_313()
     if (
@@ -1941,35 +3813,49 @@ def run_bounded_command(
         )
     if timeout_seconds <= 0 or max_output_bytes <= 0:
         raise ValueError("bounded command limits must be positive")
-    process = subprocess.Popen(
-        argv,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        cwd="/",
-        env={
-            "HOME": "/var/empty",
-            "LANG": "C",
-            "LC_ALL": "C",
-            "PATH": "/usr/bin:/bin",
-        },
-        close_fds=True,
-        start_new_session=True,
+    prepared = (
+        _prepare_root_protected_no_child_profile(pathlib.Path(argv[0]))
+        if _prepared_no_child_profile is None
+        else _prepared_no_child_profile
     )
-    assert process.stdout is not None
-    assert process.stderr is not None
-    stdout_fd = process.stdout.fileno()
-    stderr_fd = process.stderr.fileno()
-    streams = {
-        stdout_fd: bytearray(),
-        stderr_fd: bytearray(),
-    }
-    selector = selectors.DefaultSelector()
-    for descriptor in streams:
-        selector.register(descriptor, selectors.EVENT_READ)
-    deadline = time.monotonic() + timeout_seconds
+    launch_ownership = _PreflightLaunchOwnership(prepared)
+    launch_receipt: PreflightLaunchReceipt | None = None
+    launched: object | None = None
+    stdout_fd = -1
+    stderr_fd = -1
+    streams: dict[int, bytearray] = {}
+    deadline = 0.0
     total = 0
+    returncode: int | None = None
+    closure: PreflightProcessClosureEvidence | None = None
+    selector: selectors.BaseSelector | None = None
+    leader_reaped = False
+    retain_runtime_resources = False
+
+    def streams_are_drained() -> bool:
+        if selector is None:
+            return False
+        try:
+            return not selector.get_map()
+        except BaseException:
+            return False
+
     try:
+        launch_receipt = _launch_prepared_bounded_command(
+            prepared,
+            argv,
+            ownership=launch_ownership,
+        )
+        launch_ownership.transfer_receipt(launch_receipt)
+        launched, stdout_fd, stderr_fd = launch_receipt
+        streams = {
+            stdout_fd: bytearray(),
+            stderr_fd: bytearray(),
+        }
+        deadline = time.monotonic() + timeout_seconds
+        selector = selectors.DefaultSelector()
+        for descriptor in streams:
+            selector.register(descriptor, selectors.EVENT_READ)
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1992,19 +3878,198 @@ def run_bounded_command(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError(f"command exceeded {timeout_seconds} seconds")
-        returncode = process.wait(timeout=remaining)
-    except BaseException:
-        _kill_command(process)
+        wait_terminal(launched.pid, deadline=deadline)
+        returncode = reap(launched.pid, deadline=deadline)
+        leader_reaped = True
+        launch_ownership.mark_closure_proven()
+        closure = _preflight_closure_evidence(
+            launched,
+            leader_reaped=True,
+            stdio_closed=True,
+            closure_proven=True,
+            reason=(
+                "authenticated no-child profile permitted only the bound leader; "
+                "the leader was reaped after both output streams reached EOF"
+            ),
+        )
+    except BaseException as primary_error:
+        if launch_receipt is None and launch_ownership.receipt is not None:
+            launch_receipt = launch_ownership.receipt
+        if launch_receipt is not None and launched is None:
+            launched, stdout_fd, stderr_fd = launch_receipt
+        if isinstance(primary_error, CodexExecutableRetentionRequired):
+            retain_runtime_resources = True
+            if not any(
+                resource is launch_ownership
+                for resource in primary_error.retained_resources
+            ):
+                evidence = (
+                    _preflight_closure_evidence(
+                        launched,
+                        leader_reaped=False,
+                        stdio_closed=False,
+                        closure_proven=False,
+                        reason=(
+                            "preflight launch retention reached the bounded "
+                            "command boundary before process closure was proven"
+                        ),
+                    )
+                    if launched is not None
+                    else _unknown_preflight_closure_evidence(
+                        launch_ownership,
+                        reason=(
+                            "preflight launch retention reached the bounded "
+                            "command boundary without a bound leader receipt"
+                        ),
+                    )
+                )
+                _retain_preflight_launch(
+                    primary_error,
+                    launch_ownership,
+                    closure=evidence,
+                    reason=f"{type(primary_error).__name__}: {primary_error}",
+                )
+            raise
+        if launch_receipt is None or launched is None:
+            if launch_ownership.may_have_launched:
+                evidence = _unknown_preflight_closure_evidence(
+                    launch_ownership,
+                    reason=(
+                        "bounded command launch may have succeeded without an "
+                        "atomically published leader receipt"
+                    ),
+                )
+                retained = PreflightProcessClosureUnproven(
+                    "bounded command process ownership is unknown; controls and "
+                    "runtime resources must be retained",
+                    evidence=evidence,
+                )
+                _retain_preflight_launch(
+                    retained,
+                    launch_ownership,
+                    closure=evidence,
+                    reason=f"{type(primary_error).__name__}: {primary_error}",
+                )
+                retain_runtime_resources = True
+                raise retained from primary_error
+            raise
+        if leader_reaped:
+            raise
+        cleanup_error: BaseException | None = None
+        try:
+            returncode = _terminate_and_reap_preflight(
+                launched,
+                deadline=time.monotonic() + 5.0,
+            )
+            leader_reaped = True
+            launch_ownership.mark_closure_proven()
+            closure = _preflight_closure_evidence(
+                launched,
+                leader_reaped=True,
+                stdio_closed=streams_are_drained(),
+                closure_proven=True,
+                reason=(
+                    "authenticated no-child profile permitted only the bound "
+                    "leader; the aborted leader was terminated and reaped"
+                ),
+            )
+        except BaseException as caught:
+            cleanup_error = caught
+        if cleanup_error is not None:
+            evidence = _preflight_closure_evidence(
+                launched,
+                leader_reaped=False,
+                stdio_closed=streams_are_drained(),
+                closure_proven=False,
+                reason=(
+                    "the bound preflight leader could not be reaped; no process-"
+                    "group emptiness claim was used"
+                ),
+            )
+            retained = PreflightProcessClosureUnproven(
+                "preflight process closure is unproven; authenticated controls "
+                "and runtime resources must be retained",
+                evidence=evidence,
+            )
+            _retain_preflight_launch(
+                retained,
+                launch_ownership,
+                closure=evidence,
+                reason=(
+                    f"primary={type(primary_error).__name__}: {primary_error}; "
+                    f"cleanup={type(cleanup_error).__name__}: {cleanup_error}"
+                ),
+            )
+            retain_runtime_resources = True
+            raise retained from cleanup_error
         raise
     finally:
-        selector.close()
-        process.stdout.close()
-        process.stderr.close()
+        close_errors: list[BaseException] = []
+        if not retain_runtime_resources and selector is not None:
+            try:
+                selector.close()
+            except BaseException as error:
+                close_errors.append(error)
+        if not retain_runtime_resources:
+            close_errors.extend(_close_preflight_launch_descriptors(launch_ownership))
+        if close_errors:
+            retained_closure = (
+                closure
+                if closure is not None
+                else _unknown_preflight_closure_evidence(
+                    launch_ownership,
+                    reason=(
+                        "preflight runtime cleanup was interrupted after the "
+                        "bounded command body exited"
+                    ),
+                )
+            )
+            retained_closure = PreflightProcessClosureEvidence(
+                leader_pid=retained_closure.leader_pid,
+                leader_pgid=retained_closure.leader_pgid,
+                leader_session_id=retained_closure.leader_session_id,
+                leader_start_identity=retained_closure.leader_start_identity,
+                profile_sha256=retained_closure.profile_sha256,
+                leader_reaped=retained_closure.leader_reaped,
+                stdio_closed=False,
+                authenticated_no_child_profile=(
+                    retained_closure.authenticated_no_child_profile
+                ),
+                permitted_process_closure_proven=(
+                    retained_closure.permitted_process_closure_proven
+                ),
+                process_group_emptiness_used_as_descendant_proof=False,
+                reason=(
+                    "process settlement completed before runtime cleanup, but "
+                    "selector or descriptor closure remains unproven"
+                ),
+                launch_receipt_published=launch_ownership.receipt is not None,
+                runtime_descriptors_retained=True,
+            )
+            retained = CodexExecutableRetentionRequired(
+                "preflight runtime cleanup could not prove resource closure; "
+                "recovery evidence was retained",
+                code="preflight-runtime-resources-retained",
+            )
+            if selector is not None:
+                retained.retain_resource(selector)
+            _retain_preflight_launch(
+                retained,
+                launch_ownership,
+                closure=retained_closure,
+                reason=(f"{type(close_errors[0]).__name__}: {close_errors[0]}"),
+            )
+            raise retained from close_errors[0]
+        if not retain_runtime_resources and not launch_ownership.descriptors:
+            launch_ownership.mark_closed()
+    assert returncode is not None
+    assert closure is not None
     return CommandResult(
         argv=argv,
         returncode=returncode,
         stdout=bytes(streams[stdout_fd]),
         stderr=bytes(streams[stderr_fd]),
+        process_closure=closure,
     )
 
 
@@ -2013,6 +4078,7 @@ def _validate_command_result(
     *,
     argv: tuple[str, ...],
     max_output_bytes: int,
+    require_process_closure: bool,
 ) -> None:
     if not isinstance(result, CommandResult) or result.argv != argv:
         raise ValueError("command runner returned evidence for a different argv")
@@ -2022,6 +4088,29 @@ def _validate_command_result(
         raise ValueError("command runner returned non-byte output")
     if len(result.stdout) + len(result.stderr) > max_output_bytes:
         raise ValueError("command runner exceeded the requested output bound")
+    closure = result.process_closure
+    if closure is None:
+        if require_process_closure:
+            raise ValueError("external command runner omitted process-closure evidence")
+        return
+    if (
+        not isinstance(closure, PreflightProcessClosureEvidence)
+        or type(closure.leader_pid) is not int
+        or closure.leader_pid <= 1
+        or closure.leader_pgid != closure.leader_pid
+        or closure.leader_session_id != closure.leader_pid
+        or not isinstance(closure.leader_start_identity, str)
+        or not closure.leader_start_identity
+        or HEX_SHA256.fullmatch(closure.profile_sha256) is None
+        or closure.leader_reaped is not True
+        or closure.stdio_closed is not True
+        or closure.authenticated_no_child_profile is not True
+        or closure.permitted_process_closure_proven is not True
+        or closure.process_group_emptiness_used_as_descendant_proof is not False
+        or not isinstance(closure.reason, str)
+        or not closure.reason
+    ):
+        raise ValueError("command runner returned malformed process-closure evidence")
 
 
 def _invoke_guarded(
@@ -2035,21 +4124,32 @@ def _invoke_guarded(
     command_runner: CommandRunner,
     additional_guard: Callable[[], object] | None = None,
     staged_snapshot: _StagedSnapshot | None = None,
+    prepared_no_child_profile: object | None = None,
 ) -> CommandResult:
     def invoke() -> CommandResult:
         if additional_guard is not None:
             additional_guard()
-        result = command_runner(
-            argv,
-            timeout_seconds=timeout_seconds,
-            max_output_bytes=max_output_bytes,
-        )
+        default_runner = command_runner is run_bounded_command
+        if default_runner:
+            result = run_bounded_command(
+                argv,
+                timeout_seconds=timeout_seconds,
+                max_output_bytes=max_output_bytes,
+                _prepared_no_child_profile=prepared_no_child_profile,
+            )
+        else:
+            result = command_runner(
+                argv,
+                timeout_seconds=timeout_seconds,
+                max_output_bytes=max_output_bytes,
+            )
         if additional_guard is not None:
             additional_guard()
         _validate_command_result(
             result,
             argv=argv,
             max_output_bytes=max_output_bytes,
+            require_process_closure=default_runner,
         )
         return result
 
@@ -2093,6 +4193,7 @@ def _authenticate_signature(
     policy: CodexExecutablePolicy,
     label_prefix: str,
     staged_snapshot: _StagedSnapshot | None = None,
+    prepared_no_child_profile: object | None = None,
 ) -> SignatureEvidence:
     path = str(anchor.path)
     verify_argv = (
@@ -2112,6 +4213,7 @@ def _authenticate_signature(
         max_output_bytes=MAX_CODESIGN_OUTPUT_BYTES,
         command_runner=command_runner,
         staged_snapshot=staged_snapshot,
+        prepared_no_child_profile=prepared_no_child_profile,
     )
     if verified.returncode != 0:
         raise ValueError(f"{label_prefix} codesign strict verification failed")
@@ -2132,6 +4234,7 @@ def _authenticate_signature(
         max_output_bytes=MAX_CODESIGN_OUTPUT_BYTES,
         command_runner=command_runner,
         staged_snapshot=staged_snapshot,
+        prepared_no_child_profile=prepared_no_child_profile,
     )
     if metadata_result.returncode != 0:
         raise ValueError(f"{label_prefix} codesign metadata query failed")
@@ -2215,7 +4318,7 @@ def _hash_provided_schema(
             max_bytes=policy.max_schema_bytes,
         )
         after = _assert_anchor_stable(anchor)
-        if before != after:
+        if not _same_node_for_kind(before, after, kind="file"):
             raise ValueError("aggregate schema identity changed while hashing")
         return SchemaEvidence("provided", before.size, digest, None)
     finally:
@@ -2249,18 +4352,201 @@ def _open_generated_schema_at(
         after_open = NodeIdentity.from_stat(
             os.stat(name, dir_fd=output_fd, follow_symlinks=False)
         )
-        if before != descriptor or descriptor != after_open:
+        if not _same_node_for_kind(
+            before,
+            descriptor,
+            kind="file",
+        ) or not _same_node_for_kind(
+            descriptor,
+            after_open,
+            kind="file",
+        ):
             raise ValueError("generated aggregate schema raced while opening")
         digest = _sha256_fd(fd, expected_size=descriptor.size, max_bytes=max_bytes)
         after_hash = NodeIdentity.from_stat(os.fstat(fd))
         path_after_hash = NodeIdentity.from_stat(
             os.stat(name, dir_fd=output_fd, follow_symlinks=False)
         )
-        if descriptor != after_hash or after_hash != path_after_hash:
+        if not _same_node_for_kind(
+            descriptor,
+            after_hash,
+            kind="file",
+        ) or not _same_node_for_kind(
+            after_hash,
+            path_after_hash,
+            kind="file",
+        ):
             raise ValueError("generated aggregate schema raced while hashing")
         return descriptor.size, digest
     finally:
         os.close(fd)
+
+
+def _cleanup_identity(identity: NodeIdentity) -> Identity:
+    return Identity(
+        device=identity.device,
+        inode=identity.inode,
+        mode=identity.mode,
+        link_count=identity.link_count,
+        uid=identity.uid,
+        size=identity.size,
+    )
+
+
+def _generated_schema_recovery_evidence(
+    *,
+    work_root: _PathAnchor,
+    output_name: str,
+    output_anchor: _PathAnchor | None,
+    creation_outcome: str,
+    reason: str,
+) -> CodexExecutableRecoveryEvidence:
+    return CodexExecutableRecoveryEvidence(
+        stage="generated-schema",
+        parent_path=str(work_root.path),
+        entry_name=output_name,
+        entry_path=str(work_root.path / output_name),
+        parent_fd=work_root.fd,
+        directory_fd=output_anchor.fd if output_anchor is not None else None,
+        executable_fd=None,
+        parent_identity=work_root.identity,
+        directory_identity=output_anchor.identity
+        if output_anchor is not None
+        else None,
+        executable_identity=None,
+        reason=f"{reason}; creation_outcome={creation_outcome}",
+    )
+
+
+def _generated_schema_retention_owner(
+    error: CodexExecutableRetentionRequired,
+    *,
+    work_root: _PathAnchor,
+    output_name: str,
+    output_anchor: _PathAnchor | None,
+    creation_outcome: str,
+    publication_errors: list[BaseException] | None = None,
+    result_owner: _GeneratedSchemaRetentionResultOwner | None = None,
+) -> _GeneratedSchemaRetentionOwner:
+    retained = _RetainedGeneratedSchema(
+        work_root=work_root,
+        output_name=output_name,
+        output_anchor=output_anchor,
+        creation_outcome=creation_outcome,
+    )
+    owner = _GeneratedSchemaRetentionOwner(
+        retained=retained,
+        evidence=_generated_schema_recovery_evidence(
+            work_root=work_root,
+            output_name=output_name,
+            output_anchor=output_anchor,
+            creation_outcome=creation_outcome,
+            reason=error.failure.code,
+        ),
+        publication_errors=(
+            publication_errors if publication_errors is not None else []
+        ),
+    )
+    if result_owner is not None:
+        result_owner.publish(owner)
+    return owner
+
+
+def _destroy_generated_schema_directory(
+    *,
+    work_root: _PathAnchor,
+    output_anchor: _PathAnchor,
+    output_name: str,
+) -> None:
+    manifest_path = work_root.path / (
+        f".{output_name}.cleanup-{secrets.token_hex(16)}.manifest"
+    )
+    deadline = time.monotonic() + SCHEMA_CLEANUP_SECONDS
+    manifest = None
+    manifest_owner = CustodiedManifestResultOwner()
+    retained = CodexExecutableRetentionRequired(
+        "generated schema cleanup transaction did not complete; "
+        "descriptor-bound cleanup state and any completed deletion proof "
+        "were retained",
+        code="generated-schema-cleanup-retained",
+    )
+    deletion_owner = CustodiedDeletionResultOwner()
+    deletion_proof: dict[str, Any] | None = None
+    try:
+        manifest = build_custodied_manifest(
+            roots=(
+                RootSpec(
+                    label="generated-schema",
+                    parent_fd=work_root.fd,
+                    parent_identity=_cleanup_identity(work_root.identity),
+                    name=os.fsencode(output_name),
+                    expected_identity=_cleanup_identity(output_anchor.identity),
+                    private_metadata=True,
+                ),
+            ),
+            manifest_path=manifest_path,
+            entry_cap=SCHEMA_CLEANUP_ENTRY_CAP,
+            payload_cap=SCHEMA_CLEANUP_MANIFEST_BYTES,
+            deadline=deadline,
+            result_owner=manifest_owner,
+        )
+        manifest_owner.transfer(manifest)
+        deletion_proof = delete_custodied_roots(
+            manifest,
+            deadline=deadline,
+            result_owner=deletion_owner,
+        )
+        deletion_owner.transfer(deletion_proof)
+        remove_published_manifest(manifest.seal)
+        os.fsync(work_root.fd)
+        manifest.close()
+        manifest = None
+    except BaseException as error:
+        setattr(retained, "source_cleanup_error", error)
+        if deletion_owner.proof is not None:
+            deletion_proof = deletion_owner.finish()
+            setattr(retained, "completed_deletion_proof", deletion_proof)
+            retained.retain_recovery_evidence(
+                GeneratedSchemaDeletionRecoveryEvidence.from_proof(
+                    deletion_proof,
+                    reason=(
+                        "schema tree deletion completed before the remaining "
+                        "cleanup publication transaction failed"
+                    ),
+                )
+            )
+        if manifest_owner.manifest is not None:
+            try:
+                retained_manifest = manifest_owner.retain(retained)
+                if retained_manifest is not manifest_owner.manifest:
+                    raise RuntimeError(
+                        "generated-schema manifest retention is inconsistent"
+                    )
+                for evidence in quarantined_root_recovery_evidence(error):
+                    if evidence not in retained.recovery_evidence:
+                        retained.retain_recovery_evidence(evidence)
+                manifest = None
+            except BaseException as publication_error:
+                if not manifest_owner.retained:
+                    manifest_owner.retain(retained)
+                manifest_owner.finish_retention()
+                for evidence in quarantined_root_recovery_evidence(error):
+                    if evidence not in retained.recovery_evidence:
+                        retained.retain_recovery_evidence(evidence)
+                setattr(
+                    retained,
+                    "retention_publication_errors",
+                    (publication_error,),
+                )
+                retained.add_note(
+                    "generated-schema manifest retention publication recovered "
+                    "after interruption: "
+                    f"{type(publication_error).__name__}: {publication_error}"
+                )
+        raise retained from error
+    finally:
+        if manifest is not None and not manifest_owner.preserves(manifest):
+            manifest.close()
 
 
 def _generate_schema(
@@ -2272,31 +4558,73 @@ def _generate_schema(
     owner_uid: int,
     policy: CodexExecutablePolicy,
     staged_snapshot: _StagedSnapshot | None = None,
+    prepared_no_child_profile_factory: (
+        Callable[[tuple[object, ...]], object] | None
+    ) = None,
 ) -> SchemaEvidence:
     work_root_path = _canonical_absolute_path(
         schema_work_root, label="schema work root"
     )
-    work_root = _open_path_anchor(
-        work_root_path,
-        owner_uid=owner_uid,
-        leaf_kind="directory",
-        require_executable=False,
-    )
+    work_root_owner = _PathAnchorResultOwner()
+    output_anchor_owner = _PathAnchorResultOwner()
+    work_root: _PathAnchor | None = None
+    output_name: str | None = None
     output_path: pathlib.Path | None = None
     output_anchor: _PathAnchor | None = None
+    output_creation_outcome = "not-started"
+    retention_owner: _GeneratedSchemaRetentionOwner | None = None
     try:
-        _assert_directory_object_stable(work_root)
-        output_path = pathlib.Path(
-            tempfile.mkdtemp(prefix="codex-schema-", dir=work_root_path)
+        work_root = _open_path_anchor(
+            work_root_path,
+            owner_uid=owner_uid,
+            leaf_kind="directory",
+            require_executable=False,
+            result_owner=work_root_owner,
         )
-        os.chmod(output_path, 0o700, follow_symlinks=False)
+        _assert_directory_object_stable(work_root)
+        for _ in range(SCHEMA_DIRECTORY_NAME_ATTEMPTS):
+            candidate = SCHEMA_DIRECTORY_PREFIX + secrets.token_hex(16)
+            output_name = candidate
+            output_path = work_root_path / candidate
+            output_creation_outcome = "mkdir-outcome-unproven"
+            try:
+                os.mkdir(
+                    os.fsencode(candidate),
+                    0o700,
+                    dir_fd=work_root.fd,
+                )
+            except FileExistsError:
+                output_creation_outcome = "collision"
+                output_name = None
+                output_path = None
+                continue
+            output_creation_outcome = "created"
+            os.fsync(work_root.fd)
+            output_creation_outcome = "created-durable"
+            break
+        if output_name is None or output_path is None:
+            raise FileExistsError("cannot allocate a fresh generated-schema directory")
         _assert_directory_object_stable(work_root)
         output_anchor = _open_path_anchor(
             output_path,
             owner_uid=owner_uid,
             leaf_kind="directory",
             require_executable=False,
+            result_owner=output_anchor_owner,
         )
+        output_creation_outcome = "descriptor-bound"
+        prepared_no_child_profile = None
+        if prepared_no_child_profile_factory is not None:
+            from .no_child_profile import attest_writable_root
+
+            prepared_no_child_profile = prepared_no_child_profile_factory(
+                (
+                    attest_writable_root(
+                        output_path,
+                        directory_fd=output_anchor.fd,
+                    ),
+                )
+            )
         argv = (
             str(source_anchor.path),
             "app-server",
@@ -2314,6 +4642,7 @@ def _generate_schema(
             command_runner=command_runner,
             additional_guard=lambda: _assert_directory_object_stable(output_anchor),
             staged_snapshot=staged_snapshot,
+            prepared_no_child_profile=prepared_no_child_profile,
         )
         if generated.returncode != 0 or not _probe_stderr_is_expected(generated.stderr):
             raise ValueError("Codex app-server schema generation failed")
@@ -2332,12 +4661,120 @@ def _generate_schema(
                 max_output_bytes=MAX_SCHEMA_COMMAND_OUTPUT_BYTES,
             ),
         )
+    except CodexExecutableRetentionRequired as error:
+        retained_work_root = work_root_owner.anchor
+        retained_output_anchor = output_anchor_owner.anchor
+        if (
+            output_name is not None
+            and output_creation_outcome
+            not in {
+                "not-started",
+                "collision",
+            }
+            and retained_work_root is not None
+        ):
+            owner_construction_errors: list[BaseException] = []
+            owner_result = _GeneratedSchemaRetentionResultOwner()
+            try:
+                retention_owner = _generated_schema_retention_owner(
+                    error,
+                    work_root=retained_work_root,
+                    output_name=output_name,
+                    output_anchor=retained_output_anchor,
+                    creation_outcome=output_creation_outcome,
+                    publication_errors=owner_construction_errors,
+                    result_owner=owner_result,
+                )
+            except BaseException as construction_error:
+                owner_construction_errors.append(construction_error)
+                retention_owner = owner_result.owner
+                if retention_owner is None:
+                    retention_owner = _generated_schema_retention_owner(
+                        error,
+                        work_root=retained_work_root,
+                        output_name=output_name,
+                        output_anchor=retained_output_anchor,
+                        creation_outcome=output_creation_outcome,
+                        publication_errors=owner_construction_errors,
+                        result_owner=owner_result,
+                    )
+            try:
+                _finish_generated_schema_retention(error, retention_owner)
+            except BaseException as publication_error:
+                _finish_generated_schema_retention(error, retention_owner)
+                retention_owner.publication_errors.append(publication_error)
+                retention_owner.finish_publication(error)
+        raise
     finally:
-        if output_anchor is not None:
-            os.close(output_anchor.fd)
-        os.close(work_root.fd)
-        if output_path is not None:
-            shutil.rmtree(output_path)
+        retained = retention_owner is not None and retention_owner.resource_published
+        if not retained:
+            retained_work_root = work_root_owner.anchor
+            retained_output_anchor = output_anchor_owner.anchor
+            cleanup_error: BaseException | None = None
+            try:
+                if (
+                    retained_work_root is not None
+                    and retained_output_anchor is not None
+                    and output_name is not None
+                ):
+                    _destroy_generated_schema_directory(
+                        work_root=retained_work_root,
+                        output_anchor=retained_output_anchor,
+                        output_name=output_name,
+                    )
+                elif (
+                    retained_work_root is not None
+                    and output_name is not None
+                    and output_creation_outcome not in {"not-started", "collision"}
+                ):
+                    cleanup_error = CodexExecutableRetentionRequired(
+                        "generated schema directory creation may have completed "
+                        "without descriptor custody; the parent descriptor and "
+                        "candidate name were retained",
+                        code="generated-schema-custody-unavailable",
+                    )
+            except BaseException as error:
+                cleanup_error = error
+            if isinstance(cleanup_error, CodexExecutableRetentionRequired):
+                assert retained_work_root is not None
+                assert output_name is not None
+                owner_construction_errors = []
+                owner_result = _GeneratedSchemaRetentionResultOwner()
+                try:
+                    retention_owner = _generated_schema_retention_owner(
+                        cleanup_error,
+                        work_root=retained_work_root,
+                        output_name=output_name,
+                        output_anchor=retained_output_anchor,
+                        creation_outcome=output_creation_outcome,
+                        publication_errors=owner_construction_errors,
+                        result_owner=owner_result,
+                    )
+                except BaseException as construction_error:
+                    owner_construction_errors.append(construction_error)
+                    retention_owner = owner_result.owner
+                    if retention_owner is None:
+                        retention_owner = _generated_schema_retention_owner(
+                            cleanup_error,
+                            work_root=retained_work_root,
+                            output_name=output_name,
+                            output_anchor=retained_output_anchor,
+                            creation_outcome=output_creation_outcome,
+                            publication_errors=owner_construction_errors,
+                            result_owner=owner_result,
+                        )
+                try:
+                    _finish_generated_schema_retention(cleanup_error, retention_owner)
+                except BaseException as publication_error:
+                    _finish_generated_schema_retention(cleanup_error, retention_owner)
+                    retention_owner.publication_errors.append(publication_error)
+                    retention_owner.finish_publication(cleanup_error)
+                retained = retention_owner.resource_published
+            if not retained:
+                output_anchor_owner.close()
+                work_root_owner.close()
+            if cleanup_error is not None:
+                raise cleanup_error
 
 
 def _fd_execution_evidence() -> FdExecutionEvidence:
@@ -2349,6 +4786,37 @@ def _fd_execution_evidence() -> FdExecutionEvidence:
             "the authenticated source pathname is forbidden and launch is "
             "permitted only from the revalidated private snapshot pathname"
         ),
+    )
+
+
+def _prepare_snapshot_preflight_profile(
+    staged: _StagedSnapshot,
+    *,
+    policy: CodexExecutablePolicy,
+    writable_roots: tuple[object, ...] = (),
+) -> object:
+    from .no_child_profile import (
+        WritableRootAttestation,
+        prepare_custodied_snapshot_no_child_profile,
+    )
+
+    if any(not isinstance(root, WritableRootAttestation) for root in writable_roots):
+        raise ValueError("snapshot preflight writable-root authority is malformed")
+    revalidation = _revalidate_staged_snapshot(
+        staged,
+        policy=policy,
+        label="preflight-profile-snapshot-sha256",
+    )
+    attestation = OwnerSnapshotLaunchAttestation(
+        executable_fd=staged.file_anchor.fd,
+        directory_fd=staged.directory_anchor.fd,
+        snapshot=staged.evidence,
+        expected_sha256=policy.expected_sha256,
+        revalidation=revalidation,
+    )
+    return prepare_custodied_snapshot_no_child_profile(
+        attestation,
+        writable_roots=writable_roots,
     )
 
 
@@ -2371,8 +4839,16 @@ def _revalidate_staged_snapshot(
     )
     operation = operations[0]
     if (
-        operation.before != staged.evidence.executable_identity
-        or operation.after != staged.evidence.executable_identity
+        not _same_node_for_kind(
+            operation.before,
+            staged.evidence.executable_identity,
+            kind="file",
+        )
+        or not _same_node_for_kind(
+            operation.after,
+            staged.evidence.executable_identity,
+            kind="file",
+        )
         or digest != staged.evidence.copy.sha256
         or digest != policy.expected_sha256
     ):
@@ -2590,7 +5066,11 @@ class CodexExecutableCustody:
         revalidation = self.revalidate()
         try:
             inconsistent = (
-                revalidation.identity != self.evidence.snapshot.executable_identity
+                not _same_node_for_kind(
+                    revalidation.identity,
+                    self.evidence.snapshot.executable_identity,
+                    kind="file",
+                )
                 or revalidation.sha256 != self.evidence.sha256
                 or os.get_inheritable(self.executable_fd)
                 or os.get_inheritable(self.directory_fd)
@@ -2664,17 +5144,32 @@ class CodexExecutableCustody:
             or not secrets.compare_digest(handoff.token, self._handoff_token)
             or handoff.phase != phase
             or handoff.snapshot_path != str(self._staged.file_anchor.path)
-            or handoff.identity != self._staged.evidence.executable_identity
+            or not _same_node_for_kind(
+                handoff.identity,
+                self._staged.evidence.executable_identity,
+                kind="file",
+            )
             or handoff.sha256 != self._policy.expected_sha256
-            or handoff.revalidation.identity
-            != self._staged.evidence.executable_identity
+            or not _same_node_for_kind(
+                handoff.revalidation.identity,
+                self._staged.evidence.executable_identity,
+                kind="file",
+            )
             or handoff.revalidation.sha256 != self._policy.expected_sha256
             or handoff.revalidation.fd_execution != _fd_execution_evidence()
             or not handoff.identity_operations
             or handoff.identity_operations[-1] != handoff.revalidation.operation
             or any(
-                operation.before != self._staged.evidence.executable_identity
-                or operation.after != self._staged.evidence.executable_identity
+                not _same_node_for_kind(
+                    operation.before,
+                    self._staged.evidence.executable_identity,
+                    kind="file",
+                )
+                or not _same_node_for_kind(
+                    operation.after,
+                    self._staged.evidence.executable_identity,
+                    kind="file",
+                )
                 for operation in handoff.identity_operations
             )
         ):
@@ -2844,23 +5339,29 @@ class CodexExecutableCustody:
             raise CodexExecutableCustodyStale(
                 "snapshot cleanup requires verified process quiescence"
             )
-        cleanup_error: Exception | None = None
         try:
             _destroy_staged_snapshot(self._staged, require_stable=True)
-        except Exception as error:
-            cleanup_error = error
+        except BaseException as error:
             self._retained_snapshot = True
             self._stale_reason = str(error)
-        finally:
-            try:
-                _close_staged_snapshot_fds(self._staged)
-            finally:
-                self._closed = True
-                self._phase = "stale-retained" if cleanup_error else "cleaned"
-        if cleanup_error is not None:
-            raise CodexExecutableCustodyStale(
-                "snapshot changed before cleanup; suspicious paths were retained"
-            ) from cleanup_error
+            self._closed = True
+            self._phase = "stale-retained"
+            retained = CodexExecutableRetentionRequired(
+                "snapshot cleanup could not prove descriptor-bound deletion; "
+                "the custody descriptors and suspicious paths were retained",
+                code="snapshot-cleanup-retained",
+            )
+            retained.retain_resource(self)
+            _retain_snapshot(
+                retained,
+                self._staged,
+                stage="snapshot-cleanup",
+                reason=f"{type(error).__name__}: {error}",
+            )
+            raise retained from error
+        _close_staged_snapshot_fds(self._staged)
+        self._closed = True
+        self._phase = "cleaned"
 
     def close(self) -> None:
         self.cleanup()
@@ -2940,6 +5441,14 @@ def authenticate_codex_executable(
             raise ValueError(
                 "Codex executable SHA-256 does not match the pinned digest"
             )
+        source_anchor.expected_content_size = source_identity.size
+        source_anchor.expected_content_sha256 = digest
+        source_anchor.content_max_bytes = policy.max_executable_bytes
+        codesign_no_child_profile = (
+            _prepare_root_protected_no_child_profile(pathlib.Path(CODESIGN_PATH))
+            if command_runner is run_bounded_command
+            else None
+        )
         source_signature = _authenticate_signature(
             anchor=source_anchor,
             operations=operations,
@@ -2947,6 +5456,7 @@ def authenticate_codex_executable(
             metadata_verifier=metadata_verifier,
             policy=policy,
             label_prefix="source",
+            prepared_no_child_profile=codesign_no_child_profile,
         )
 
         staged = _stage_snapshot(
@@ -2963,10 +5473,22 @@ def authenticate_codex_executable(
         ):
             raise ValueError("snapshot custody FDs are unexpectedly inheritable")
         final_source_identity = _assert_anchor_stable(source_anchor)
-        if final_source_identity != source_identity:
+        if not _same_node_for_kind(
+            final_source_identity,
+            source_identity,
+            kind="file",
+        ):
             raise ValueError("source identity changed before its custody ended")
         os.close(source_anchor.fd)
         source_anchor = None
+        snapshot_no_child_profile = (
+            _prepare_snapshot_preflight_profile(
+                staged,
+                policy=policy,
+            )
+            if command_runner is run_bounded_command
+            else None
+        )
 
         snapshot_signature = _authenticate_signature(
             anchor=staged.file_anchor,
@@ -2976,6 +5498,7 @@ def authenticate_codex_executable(
             policy=policy,
             label_prefix="snapshot",
             staged_snapshot=staged,
+            prepared_no_child_profile=codesign_no_child_profile,
         )
         snapshot_text = str(staged.file_anchor.path)
         version_argv = (snapshot_text, "--version")
@@ -2988,6 +5511,7 @@ def authenticate_codex_executable(
             max_output_bytes=MAX_VERSION_OUTPUT_BYTES,
             command_runner=command_runner,
             staged_snapshot=staged,
+            prepared_no_child_profile=snapshot_no_child_profile,
         )
         version = _parse_version(version_result, policy.expected_version)
 
@@ -3001,6 +5525,7 @@ def authenticate_codex_executable(
             max_output_bytes=MAX_HELP_OUTPUT_BYTES,
             command_runner=command_runner,
             staged_snapshot=staged,
+            prepared_no_child_profile=snapshot_no_child_profile,
         )
         stdio, strict_config = _parse_help(help_result)
 
@@ -3020,6 +5545,17 @@ def authenticate_codex_executable(
                 owner_uid=trusted_uid,
                 policy=policy,
                 staged_snapshot=staged,
+                prepared_no_child_profile_factory=(
+                    (
+                        lambda writable_roots: _prepare_snapshot_preflight_profile(
+                            staged,
+                            policy=policy,
+                            writable_roots=writable_roots,
+                        )
+                    )
+                    if command_runner is run_bounded_command
+                    else None
+                ),
             )
         if schema.sha256 != policy.expected_schema_sha256:
             raise ValueError("app-server aggregate schema digest does not match")
@@ -3085,24 +5621,46 @@ def authenticate_codex_executable(
         )
         staged = None
         return custody
-    except Exception as error:
-        rollback_error: Exception | None = None
+    except BaseException as error:
         if staged is not None:
-            try:
-                _destroy_staged_snapshot(staged, require_stable=True)
-            except Exception as caught:
-                rollback_error = caught
-            finally:
-                _close_staged_snapshot_fds(staged)
+            if isinstance(error, CodexExecutableRetentionRequired):
+                _retain_snapshot(
+                    error,
+                    staged,
+                    stage="authentication-retention",
+                    reason=error.failure.code,
+                )
                 staged = None
-        if rollback_error is not None:
-            raise CodexExecutableError(
-                "authentication failed and private snapshot rollback was refused: "
-                f"{rollback_error}"
-            ) from error
+            else:
+                try:
+                    _destroy_staged_snapshot(staged, require_stable=True)
+                except BaseException as rollback_error:
+                    retained = CodexExecutableRetentionRequired(
+                        "authentication failed and private snapshot rollback could "
+                        "not prove deletion; custody and recovery evidence were "
+                        "retained",
+                        code="snapshot-authentication-rollback-retained",
+                    )
+                    _retain_snapshot(
+                        retained,
+                        staged,
+                        stage="authentication-rollback",
+                        reason=(
+                            f"trigger={type(error).__name__}: {error}; "
+                            f"rollback={type(rollback_error).__name__}: "
+                            f"{rollback_error}"
+                        ),
+                    )
+                    staged = None
+                    raise retained from rollback_error
+                else:
+                    _close_staged_snapshot_fds(staged)
+                    staged = None
         if isinstance(error, CodexExecutableError):
             raise
-        raise CodexExecutableError(str(error)) from error
+        if isinstance(error, Exception):
+            raise CodexExecutableError(str(error)) from error
+        raise
     finally:
         if source_anchor is not None:
             os.close(source_anchor.fd)

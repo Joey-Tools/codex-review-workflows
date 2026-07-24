@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import pathlib
+import sys
 
-from review_supervisor.cli import main
+sys.dont_write_bytecode = True
+
+from review_supervisor.cli import main  # noqa: E402
 
 
 if __name__ == "__main__":

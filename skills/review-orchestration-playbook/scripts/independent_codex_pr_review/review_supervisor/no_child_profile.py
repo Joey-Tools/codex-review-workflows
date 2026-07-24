@@ -12,13 +12,16 @@ import resource
 import select
 import signal
 import stat
+import struct
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass, replace
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 from .codex_executable import (
+    CodexExecutableRetentionRequired,
     ExecutableRevalidationEvidence,
     ExtendedMetadataEvidence,
     FdExecutionEvidence,
@@ -45,6 +48,8 @@ PROBE_TIMEOUT_SECONDS = 5.0
 PROBE_DETAIL_OUTER_SEATBELT_DENIED = "nested-seatbelt-denied-by-outer-sandbox"
 PROBE_DETAIL_LEADER_EXITED_BEFORE_BINDING = "probe-leader-exited-before-binding"
 PROBE_DETAIL_KILLED_BEFORE_EVIDENCE = "probe-killed-before-evidence"
+_LAUNCH_LEADER_RECEIPT_MAGIC = b"NCLPID1\0"
+_LAUNCH_LEADER_RECEIPT = struct.Struct("!8sQ")
 
 
 @dataclass(frozen=True)
@@ -101,9 +106,36 @@ class ExecutableIdentity:
     mtime_ns: int
     ctime_ns: int
     sha256: str
+    flags: int = 0
+    generation: int = 0
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
+
+    def object_identity_key(self) -> tuple[int, int, int, int]:
+        return (
+            self.device,
+            self.inode,
+            stat.S_IFMT(self.mode),
+            self.generation,
+        )
+
+    def content_key(self) -> tuple[int, str]:
+        return (self.size, self.sha256)
+
+    def access_policy_key(self) -> tuple[int, int, int, int]:
+        return (
+            self.uid,
+            self.gid,
+            stat.S_IMODE(self.mode),
+            self.flags,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PathExecutedExecutableAttestation:
+    executable: ExecutableIdentity
+    components: tuple[PathComponentEvidence, ...]
 
 
 @dataclass(frozen=True)
@@ -204,6 +236,94 @@ class ExecutableAuthenticationError(NoChildProfileError):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class NoChildLaunchClosureEvidence:
+    leader_pid: int | None
+    fork_call_started: bool
+    fork_call_completed: bool
+    pipe_ownership_published: bool
+    leader_receipt_received: bool
+    exec_acknowledged: bool
+    leader_binding_complete: bool
+    leader_reaped: bool
+    process_group_empty: bool
+    control_pipes_closed: bool
+    reason: str
+
+
+class NoChildLaunchClosureUnproven(CodexExecutableRetentionRequired):
+    def __init__(self, *, evidence: NoChildLaunchClosureEvidence) -> None:
+        self.evidence = evidence
+        super().__init__(
+            "no-child launch failed after fork and exact leader, process-group, "
+            "or control-pipe closure could not be proved; launch controls must "
+            "be retained",
+            code="no-child-launch-closure-unproven",
+        )
+        self.retain_recovery_evidence(evidence)
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeControlDescriptorCloseEvidence:
+    role: str
+    descriptor: int
+    outcome: str
+
+
+@dataclass(frozen=True, slots=True)
+class NoChildProbeClosureEvidence:
+    leader_pid: int
+    worker_release_attempted: bool
+    worker_released: bool
+    communicate_completed: bool
+    leader_binding_complete: bool
+    process_group_bound: bool
+    leader_reaped: bool
+    process_group_empty: bool
+    control_pipes_closed: bool
+    output_pipes_closed: bool
+    control_descriptor_close_evidence: tuple[
+        ProbeControlDescriptorCloseEvidence,
+        ...,
+    ]
+    reason: str
+
+
+class NoChildProbeClosureUnproven(CodexExecutableRetentionRequired):
+    def __init__(self, *, evidence: NoChildProbeClosureEvidence) -> None:
+        self.evidence = evidence
+        super().__init__(
+            "no-child compatibility probe cleanup could not prove worker and "
+            "pipe closure; probe controls must be retained",
+            code="no-child-probe-closure-unproven",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class NoChildProbeSpawnOwnershipEvidence:
+    popen_call_started: bool
+    popen_call_completed: bool
+    ownership_published: bool
+    leader_pid: int | None
+    control_pipes_closed: bool
+    output_pipes_closed: bool
+    control_descriptor_close_evidence: tuple[
+        ProbeControlDescriptorCloseEvidence,
+        ...,
+    ]
+    reason: str
+
+
+class NoChildProbeSpawnOwnershipUnproven(CodexExecutableRetentionRequired):
+    def __init__(self, *, evidence: NoChildProbeSpawnOwnershipEvidence) -> None:
+        self.evidence = evidence
+        super().__init__(
+            "no-child compatibility probe spawn ownership could not be "
+            "proved; probe controls must be retained",
+            code="no-child-probe-spawn-ownership-unproven",
+        )
+
+
 @dataclass(frozen=True)
 class PreparedNoChildProfile:
     executable: ExecutableIdentity
@@ -213,6 +333,8 @@ class PreparedNoChildProfile:
     additional_seatbelt_rules: str = ""
     owner_snapshot_attestation: OwnerSnapshotLaunchAttestation | None = None
     writable_roots: tuple[WritableRootAttestation, ...] = ()
+    sandboxed_target: ExecutableIdentity | None = None
+    sandboxed_target_attestation: PathExecutedExecutableAttestation | None = None
 
 
 @dataclass(frozen=True)
@@ -242,6 +364,14 @@ class LaunchedNoChildProcess:
     evidence: CompatibilityEvidence
     parent_nproc_before: tuple[int, int]
     parent_nproc_after: tuple[int, int]
+
+
+class NoChildLaunchResultOwner(Protocol):
+    """Caller-side ownership publisher for one exact bound leader result."""
+
+    def publish(self, launched: LaunchedNoChildProcess) -> None: ...
+
+    def owns(self, launched: LaunchedNoChildProcess) -> bool: ...
 
 
 _MACHO_MAGICS = {
@@ -459,6 +589,33 @@ def python_runtime_executable() -> pathlib.Path:
     return pathlib.Path(sys.executable).resolve(strict=True)
 
 
+def _stat_executable_protected_key(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        stat.S_IFMT(value.st_mode),
+        getattr(value, "st_gen", 0),
+        value.st_uid,
+        value.st_gid,
+        stat.S_IMODE(value.st_mode),
+        getattr(value, "st_flags", 0),
+        value.st_size,
+    )
+
+
+def _read_fd_digest_and_magic(descriptor: int) -> tuple[str, bytes]:
+    digest = hashlib.sha256()
+    magic = b""
+    while True:
+        chunk = os.read(descriptor, 1 << 20)
+        if not chunk:
+            break
+        if len(magic) < 4:
+            magic = (magic + chunk)[:4]
+        digest.update(chunk)
+    return digest.hexdigest(), magic
+
+
 def _read_executable_identity(
     path: os.PathLike[str] | str,
 ) -> ExecutableIdentity:
@@ -479,44 +636,31 @@ def _read_executable_identity(
             raise ExecutableAuthenticationError("executable size is outside policy")
         if before.st_mode & 0o111 == 0:
             raise ExecutableAuthenticationError("executable has no execute mode bit")
-        digest = hashlib.sha256()
-        magic = b""
-        while True:
-            chunk = os.read(descriptor, 1 << 20)
-            if not chunk:
-                break
-            if len(magic) < 4:
-                magic = (magic + chunk)[:4]
-            digest.update(chunk)
+        first_digest, first_magic = _read_fd_digest_and_magic(descriptor)
+        middle = os.fstat(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        second_digest, second_magic = _read_fd_digest_and_magic(descriptor)
         after = os.fstat(descriptor)
-        if (
-            before.st_dev,
-            before.st_ino,
-            before.st_mode,
-            before.st_uid,
-            before.st_gid,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        ) != (
-            after.st_dev,
-            after.st_ino,
-            after.st_mode,
-            after.st_uid,
-            after.st_gid,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
+        if not (
+            _stat_executable_protected_key(before)
+            == _stat_executable_protected_key(middle)
+            == _stat_executable_protected_key(after)
         ):
             raise ExecutableAuthenticationError(
                 "executable metadata changed while it was authenticated"
             )
+        if first_digest != second_digest or first_magic != second_magic:
+            raise ExecutableAuthenticationError(
+                "executable content changed while it was authenticated"
+            )
         current = os.stat(canonical, follow_symlinks=False)
-        if (current.st_dev, current.st_ino) != (after.st_dev, after.st_ino):
+        if _stat_executable_protected_key(current) != _stat_executable_protected_key(
+            after
+        ):
             raise ExecutableAuthenticationError(
                 "executable path changed while it was authenticated"
             )
-        if magic not in _MACHO_MAGICS:
+        if second_magic not in _MACHO_MAGICS:
             raise ExecutableAuthenticationError(
                 "only a native Mach-O executable can be the authenticated target"
             )
@@ -530,7 +674,9 @@ def _read_executable_identity(
             size=after.st_size,
             mtime_ns=after.st_mtime_ns,
             ctime_ns=after.st_ctime_ns,
-            sha256=digest.hexdigest(),
+            sha256=second_digest,
+            flags=getattr(after, "st_flags", 0),
+            generation=getattr(after, "st_gen", 0),
         )
     finally:
         os.close(descriptor)
@@ -557,6 +703,444 @@ def _fd_digest_and_magic(fd: int, *, size: int) -> tuple[str, bytes]:
             "custodied snapshot exceeds its attested size"
         )
     return digest.hexdigest(), magic
+
+
+def _path_execution_access_policy_key(
+    identity: NodeIdentity,
+    *,
+    kind: str,
+) -> tuple[int | None, ...]:
+    link_count = identity.link_count if kind == "file" else None
+    return (*identity.access_policy_key(), link_count)
+
+
+def _require_safe_path_execution_component(
+    *,
+    path: pathlib.Path,
+    kind: str,
+    identity: NodeIdentity,
+    filesystem_metadata: ExtendedMetadataEvidence,
+    trusted_uid: int,
+) -> None:
+    if not isinstance(filesystem_metadata, ExtendedMetadataEvidence):
+        raise ExecutableAuthenticationError(
+            "path-executed target access-policy evidence is malformed"
+        )
+    if path == pathlib.Path("/"):
+        if identity.uid != 0:
+            raise ExecutableAuthenticationError(
+                "path-executed target filesystem-root access policy has an "
+                "untrusted owner"
+            )
+    elif identity.uid not in {0, trusted_uid}:
+        raise ExecutableAuthenticationError(
+            "path-executed target component access policy has an untrusted "
+            f"owner: {path}"
+        )
+    if identity.mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise ExecutableAuthenticationError(
+            "path-executed target component access policy permits an "
+            f"untrusted writer: {path}"
+        )
+    if identity.mode & (stat.S_ISUID | stat.S_ISGID):
+        raise ExecutableAuthenticationError(
+            f"path-executed target component has set-id permission: {path}"
+        )
+    if kind == "directory":
+        if not stat.S_ISDIR(identity.mode):
+            raise ExecutableAuthenticationError(
+                f"path-executed target ancestor is not a directory: {path}"
+            )
+        return
+    if kind != "file" or not stat.S_ISREG(identity.mode):
+        raise ExecutableAuthenticationError(
+            "path-executed target is not a regular file"
+        )
+    if identity.link_count != 1:
+        raise ExecutableAuthenticationError(
+            "path-executed target access policy has an unsafe hard-link count"
+        )
+    if identity.mode & 0o111 == 0:
+        raise ExecutableAuthenticationError(
+            "path-executed target has no execute mode bit"
+        )
+
+
+def _inspect_path_execution_component(
+    descriptor: int,
+    *,
+    path: pathlib.Path,
+    kind: str,
+    trusted_uid: int,
+) -> tuple[PathComponentEvidence, ExecutableIdentity | None]:
+    try:
+        before = NodeIdentity.from_stat(os.fstat(descriptor))
+        path_before = NodeIdentity.from_stat(os.stat(path, follow_symlinks=False))
+    except OSError as error:
+        raise ExecutableAuthenticationError(
+            f"cannot bind path-executed target component: {error}"
+        ) from error
+    if before.object_identity_key() != path_before.object_identity_key():
+        raise ExecutableAuthenticationError(
+            f"path-executed target component object identity raced: {path}"
+        )
+    if _path_execution_access_policy_key(
+        before,
+        kind=kind,
+    ) != _path_execution_access_policy_key(path_before, kind=kind):
+        raise ExecutableAuthenticationError(
+            f"path-executed target component access policy raced: {path}"
+        )
+    try:
+        filesystem_metadata = verify_macos_filesystem_metadata(
+            descriptor,
+            path,
+            kind,
+        )
+    except (OSError, ValueError) as error:
+        raise ExecutableAuthenticationError(
+            f"path-executed target access policy is unsafe: {path}: {error}"
+        ) from error
+    try:
+        middle = NodeIdentity.from_stat(os.fstat(descriptor))
+        first_digest: str | None = None
+        first_magic: bytes | None = None
+        second_digest: str | None = None
+        second_magic: bytes | None = None
+        if kind == "file":
+            first_digest, first_magic = _fd_digest_and_magic(
+                descriptor,
+                size=middle.size,
+            )
+            digest_middle = NodeIdentity.from_stat(os.fstat(descriptor))
+            second_digest, second_magic = _fd_digest_and_magic(
+                descriptor,
+                size=digest_middle.size,
+            )
+        else:
+            digest_middle = middle
+        after = NodeIdentity.from_stat(os.fstat(descriptor))
+        path_after = NodeIdentity.from_stat(os.stat(path, follow_symlinks=False))
+    except ExecutableAuthenticationError as error:
+        raise ExecutableAuthenticationError(
+            f"path-executed target content could not be stabilized: {path}: {error}"
+        ) from error
+    except OSError as error:
+        raise ExecutableAuthenticationError(
+            f"cannot revalidate path-executed target component: {path}: {error}"
+        ) from error
+    identities = (before, path_before, middle, digest_middle, after, path_after)
+    object_keys = {identity.object_identity_key() for identity in identities}
+    if len(object_keys) != 1:
+        raise ExecutableAuthenticationError(
+            f"path-executed target component object identity changed: {path}"
+        )
+    access_policy_keys = {
+        _path_execution_access_policy_key(identity, kind=kind)
+        for identity in identities
+    }
+    if len(access_policy_keys) != 1:
+        raise ExecutableAuthenticationError(
+            f"path-executed target component access policy changed: {path}"
+        )
+    _require_safe_path_execution_component(
+        path=path,
+        kind=kind,
+        identity=after,
+        filesystem_metadata=filesystem_metadata,
+        trusted_uid=trusted_uid,
+    )
+    evidence = PathComponentEvidence(
+        path=str(path),
+        kind=kind,
+        identity=after,
+        extended_metadata=filesystem_metadata,
+    )
+    if kind == "directory":
+        return evidence, None
+    sizes = {identity.size for identity in identities}
+    if (
+        len(sizes) != 1
+        or first_digest is None
+        or second_digest is None
+        or first_digest != second_digest
+        or first_magic is None
+        or second_magic is None
+        or first_magic != second_magic
+    ):
+        raise ExecutableAuthenticationError(
+            f"path-executed target content changed during authentication: {path}"
+        )
+    if second_magic not in _MACHO_MAGICS:
+        raise ExecutableAuthenticationError(
+            "path-executed target is not a native Mach-O executable"
+        )
+    return evidence, ExecutableIdentity(
+        path=str(path),
+        device=after.device,
+        inode=after.inode,
+        mode=after.mode,
+        uid=after.uid,
+        gid=after.gid,
+        size=after.size,
+        mtime_ns=after.mtime_ns,
+        ctime_ns=after.ctime_ns,
+        sha256=second_digest,
+        flags=after.flags,
+        generation=after.generation,
+    )
+
+
+def _require_path_execution_attestation_consistent(
+    attestation: PathExecutedExecutableAttestation,
+) -> None:
+    if not isinstance(attestation, PathExecutedExecutableAttestation):
+        raise ExecutableAuthenticationError(
+            "path-executed target attestation is malformed"
+        )
+    executable = attestation.executable
+    if (
+        not isinstance(executable, ExecutableIdentity)
+        or not isinstance(attestation.components, tuple)
+        or any(
+            not isinstance(component, PathComponentEvidence)
+            for component in attestation.components
+        )
+    ):
+        raise ExecutableAuthenticationError(
+            "path-executed target attestation is malformed"
+        )
+    path = pathlib.Path(executable.path)
+    if not path.is_absolute() or not attestation.components:
+        raise ExecutableAuthenticationError(
+            "path-executed target attestation is malformed"
+        )
+    expected_paths: list[str] = ["/"]
+    current = pathlib.Path("/")
+    for component in path.parts[1:]:
+        current /= component
+        expected_paths.append(str(current))
+    expected_kinds = [
+        "file" if index == len(expected_paths) - 1 else "directory"
+        for index in range(len(expected_paths))
+    ]
+    observed_paths = [component.path for component in attestation.components]
+    observed_kinds = [component.kind for component in attestation.components]
+    if observed_paths != expected_paths or observed_kinds != expected_kinds:
+        raise ExecutableAuthenticationError(
+            "path-executed target path binding is malformed"
+        )
+    trusted_uid = os.geteuid()
+    for component in attestation.components:
+        _require_safe_path_execution_component(
+            path=pathlib.Path(component.path),
+            kind=component.kind,
+            identity=component.identity,
+            filesystem_metadata=component.extended_metadata,
+            trusted_uid=trusted_uid,
+        )
+    leaf = attestation.components[-1].identity
+    if executable.object_identity_key() != leaf.object_identity_key():
+        raise ExecutableAuthenticationError(
+            "path-executed target attestation object identity is inconsistent"
+        )
+    if executable.content_key()[0] != leaf.size:
+        raise ExecutableAuthenticationError(
+            "path-executed target attestation content length is inconsistent"
+        )
+    if executable.access_policy_key() != leaf.access_policy_key():
+        raise ExecutableAuthenticationError(
+            "path-executed target attestation access policy is inconsistent"
+        )
+    _validate_digest(executable.sha256)
+
+
+def _authenticate_path_executed_executable(
+    path: os.PathLike[str] | str,
+) -> PathExecutedExecutableAttestation:
+    """Bind a path execution to one object, content digest, and access policy.
+
+    Root and the effective UID are the trusted subjects. Group/world write
+    permission, untrusted ownership, extended ACLs, and unsafe hard links are
+    rejected before descending through each component, so an untrusted subject
+    cannot replace the target in the revalidation-to-exec window.
+    """
+
+    if os.geteuid() == 0:
+        raise ExecutableAuthenticationError(
+            "root execution is outside the no-child-process threat model"
+        )
+    canonical = _canonical_absolute_path(path)
+    if not canonical.parts[1:] or len(canonical.parts) > 128:
+        raise ExecutableAuthenticationError(
+            "path-executed target component count is outside policy"
+        )
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+    )
+    file_flags = (
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptors: list[int] = []
+    components: list[PathComponentEvidence] = []
+    executable: ExecutableIdentity | None = None
+    trusted_uid = os.geteuid()
+    try:
+        descriptors.append(os.open("/", directory_flags))
+        root_evidence, _ = _inspect_path_execution_component(
+            descriptors[-1],
+            path=pathlib.Path("/"),
+            kind="directory",
+            trusted_uid=trusted_uid,
+        )
+        components.append(root_evidence)
+        current = pathlib.Path("/")
+        parts = canonical.parts[1:]
+        for index, component in enumerate(parts):
+            current /= component
+            leaf = index == len(parts) - 1
+            flags = file_flags if leaf else directory_flags
+            descriptors.append(
+                os.open(
+                    os.fsencode(component),
+                    flags,
+                    dir_fd=descriptors[-1],
+                )
+            )
+            evidence, observed_executable = _inspect_path_execution_component(
+                descriptors[-1],
+                path=current,
+                kind="file" if leaf else "directory",
+                trusted_uid=trusted_uid,
+            )
+            components.append(evidence)
+            if observed_executable is not None:
+                executable = observed_executable
+        if executable is None:
+            raise ExecutableAuthenticationError(
+                "path-executed target did not resolve to an executable"
+            )
+        for component in components:
+            try:
+                visible = NodeIdentity.from_stat(
+                    os.stat(component.path, follow_symlinks=False)
+                )
+            except OSError as error:
+                raise ExecutableAuthenticationError(
+                    "path-executed target path binding became unreadable: "
+                    f"{component.path}: {error}"
+                ) from error
+            if (
+                visible.object_identity_key()
+                != component.identity.object_identity_key()
+            ):
+                raise ExecutableAuthenticationError(
+                    "path-executed target path object identity changed: "
+                    f"{component.path}"
+                )
+            if _path_execution_access_policy_key(
+                visible,
+                kind=component.kind,
+            ) != _path_execution_access_policy_key(
+                component.identity,
+                kind=component.kind,
+            ):
+                raise ExecutableAuthenticationError(
+                    f"path-executed target path access policy changed: {component.path}"
+                )
+            if component.kind == "file" and visible.size != executable.size:
+                raise ExecutableAuthenticationError(
+                    "path-executed target path content length changed"
+                )
+        attestation = PathExecutedExecutableAttestation(
+            executable=executable,
+            components=tuple(components),
+        )
+        _require_path_execution_attestation_consistent(attestation)
+        return attestation
+    except ExecutableAuthenticationError:
+        raise
+    except OSError as error:
+        raise ExecutableAuthenticationError(
+            f"cannot authenticate path-executed target: {error}"
+        ) from error
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _require_same_path_execution_attestation(
+    expected: PathExecutedExecutableAttestation,
+    current: PathExecutedExecutableAttestation,
+) -> None:
+    _require_path_execution_attestation_consistent(expected)
+    _require_path_execution_attestation_consistent(current)
+    expected_components = expected.components
+    current_components = current.components
+    if expected.executable.path != current.executable.path or tuple(
+        (component.path, component.kind) for component in expected_components
+    ) != tuple((component.path, component.kind) for component in current_components):
+        raise ExecutableAuthenticationError(
+            "path-executed target path binding changed after preparation"
+        )
+    if expected.executable.object_identity_key() != (
+        current.executable.object_identity_key()
+    ) or any(
+        left.identity.object_identity_key() != right.identity.object_identity_key()
+        for left, right in zip(
+            expected_components,
+            current_components,
+            strict=True,
+        )
+    ):
+        raise ExecutableAuthenticationError(
+            "path-executed target object identity changed after preparation"
+        )
+    if expected.executable.content_key() != current.executable.content_key():
+        raise ExecutableAuthenticationError(
+            "path-executed target content changed after preparation"
+        )
+    if expected.executable.access_policy_key() != (
+        current.executable.access_policy_key()
+    ) or any(
+        (
+            _path_execution_access_policy_key(
+                left.identity,
+                kind=left.kind,
+            ),
+            left.extended_metadata,
+        )
+        != (
+            _path_execution_access_policy_key(
+                right.identity,
+                kind=right.kind,
+            ),
+            right.extended_metadata,
+        )
+        for left, right in zip(
+            expected_components,
+            current_components,
+            strict=True,
+        )
+    ):
+        raise ExecutableAuthenticationError(
+            "path-executed target access policy changed after preparation"
+        )
+
+
+def _revalidate_path_executed_executable(
+    expected: PathExecutedExecutableAttestation,
+) -> ExecutableIdentity:
+    _require_path_execution_attestation_consistent(expected)
+    current = _authenticate_path_executed_executable(expected.executable.path)
+    _require_same_path_execution_attestation(expected, current)
+    return current.executable
 
 
 def _authenticate_owner_snapshot_attestation(
@@ -688,36 +1272,64 @@ def _authenticate_owner_snapshot_attestation(
     expected_directory = snapshot.directory_identity
     expected_executable = snapshot.executable_identity
     if not (
-        directory_before == directory_after == expected_directory
-        and directory_path_before == directory_path_after == expected_directory
+        directory_before.directory_object_key()
+        == directory_after.directory_object_key()
+        == expected_directory.directory_object_key()
+        and directory_path_before.directory_object_key()
+        == directory_path_after.directory_object_key()
+        == expected_directory.directory_object_key()
     ):
         raise ExecutableAuthenticationError(
             "custodied snapshot directory identity changed"
         )
+    current_executable_views = (
+        executable_before,
+        executable_after,
+        executable_path_before,
+        executable_path_after,
+        executable_at_before,
+        executable_at_after,
+    )
+    if any(identity.link_count != 1 for identity in current_executable_views):
+        raise ExecutableAuthenticationError(
+            "custodied snapshot executable access policy has an unsafe hard-link count"
+        )
     if not (
-        executable_before == executable_after == expected_executable
-        and executable_path_before == executable_path_after == expected_executable
-        and executable_at_before == executable_at_after == expected_executable
+        executable_before.file_protected_key()
+        == executable_after.file_protected_key()
+        == expected_executable.file_protected_key()
+        and executable_path_before.file_protected_key()
+        == executable_path_after.file_protected_key()
+        == expected_executable.file_protected_key()
+        and executable_at_before.file_protected_key()
+        == executable_at_after.file_protected_key()
+        == expected_executable.file_protected_key()
     ):
         raise ExecutableAuthenticationError(
             "custodied snapshot executable identity changed"
         )
     if (
         not snapshot.directory_components
-        or snapshot.directory_components[-1].identity != expected_directory
+        or snapshot.directory_components[-1].identity.directory_object_key()
+        != expected_directory.directory_object_key()
         or not snapshot.executable_components
-        or snapshot.executable_components[-1].identity != expected_executable
-        or snapshot.copy.destination_identity != expected_executable
+        or snapshot.executable_components[-1].identity.file_protected_key()
+        != expected_executable.file_protected_key()
+        or snapshot.copy.destination_identity.file_protected_key()
+        != expected_executable.file_protected_key()
         or snapshot.copy.size != expected_executable.size
         or snapshot.copy.sha256 != attestation.expected_sha256
         or snapshot.copy.max_bytes < snapshot.copy.size
         or not snapshot.copy.source_fd_only
         or not snapshot.copy.file_fsynced
         or not snapshot.copy.directory_fsynced
-        or attestation.revalidation.identity != expected_executable
+        or attestation.revalidation.identity.file_protected_key()
+        != expected_executable.file_protected_key()
         or attestation.revalidation.sha256 != attestation.expected_sha256
-        or attestation.revalidation.operation.before != expected_executable
-        or attestation.revalidation.operation.after != expected_executable
+        or attestation.revalidation.operation.before.file_protected_key()
+        != expected_executable.file_protected_key()
+        or attestation.revalidation.operation.after.file_protected_key()
+        != expected_executable.file_protected_key()
         or attestation.revalidation.fd_execution.supported
         or attestation.revalidation.fd_execution.mechanism != "unsupported-on-macos"
     ):
@@ -741,10 +1353,13 @@ def _authenticate_owner_snapshot_attestation(
         or not stat.S_ISREG(expected_executable.mode)
         or expected_executable.uid != os.geteuid()
         or stat.S_IMODE(expected_executable.mode) != 0o500
-        or expected_executable.link_count != 1
     ):
         raise ExecutableAuthenticationError(
             "custodied snapshot is not an owner-only 0700/0500 pair"
+        )
+    if expected_executable.link_count != 1:
+        raise ExecutableAuthenticationError(
+            "custodied snapshot attested access policy has an unsafe hard-link count"
         )
     if digest != attestation.expected_sha256:
         raise ExecutableAuthenticationError(
@@ -765,6 +1380,8 @@ def _authenticate_owner_snapshot_attestation(
         mtime_ns=expected_executable.mtime_ns,
         ctime_ns=expected_executable.ctime_ns,
         sha256=digest,
+        flags=expected_executable.flags,
+        generation=expected_executable.generation,
     )
 
 
@@ -984,6 +1601,21 @@ def authenticate_executable(
         raise ExecutableAuthenticationError("executable SHA-256 does not match the pin")
     _require_protected_path(identity)
     return identity
+
+
+def _executable_protected_key(identity: ExecutableIdentity) -> tuple[object, ...]:
+    return (
+        identity.path,
+        identity.object_identity_key(),
+        identity.content_key(),
+        identity.access_policy_key(),
+    )
+
+
+def _optional_executable_protected_key(
+    identity: ExecutableIdentity | None,
+) -> tuple[object, ...] | None:
+    return None if identity is None else _executable_protected_key(identity)
 
 
 def _sbpl_string(value: str) -> str:
@@ -1478,21 +2110,510 @@ def _leader_binding_error_detail(error: OSError | ValueError) -> str:
     return _bounded_text(f"cannot bind live leader identity: {error}")
 
 
+def _open_probe_control_pipes() -> tuple[int, int, int, int]:
+    descriptors: list[int] = []
+    try:
+        release_read, release_write = os.pipe()
+        descriptors.extend((release_read, release_write))
+        status_read, status_write = os.pipe()
+        descriptors.extend((status_read, status_write))
+        for descriptor in descriptors:
+            os.set_inheritable(descriptor, False)
+        return release_read, release_write, status_read, status_write
+    except BaseException:
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+
+
+def _probe_worker_environment(*, python_home: str) -> dict[str, str]:
+    return {
+        "HOME": "/var/empty",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONHOME": python_home,
+        "PYTHONNOUSERSITE": "1",
+    }
+
+
+@dataclass
+class _ProbePopenOwner:
+    process: subprocess.Popen[bytes] | None = None
+    popen_call_started: bool = False
+    popen_call_completed: bool = False
+    ownership_published: bool = False
+    popen_failure: BaseException | None = None
+
+
+@dataclass(slots=True)
+class _ProbeControlDescriptorOwner:
+    descriptors: set[int]
+    descriptor_roles: dict[int, str]
+    close_outcomes: dict[int, str]
+    close_errors: dict[int, BaseException]
+
+    @classmethod
+    def from_role_pairs(
+        cls,
+        role_pairs: Sequence[tuple[str, int]],
+    ) -> _ProbeControlDescriptorOwner:
+        descriptors: set[int] = set()
+        descriptor_roles: dict[int, str] = {}
+        for role, descriptor in role_pairs:
+            if not role or type(descriptor) is not int or descriptor < 0:
+                raise ValueError("probe control descriptor custody is malformed")
+            if descriptor in descriptors:
+                raise ValueError("probe control descriptor custody contains duplicates")
+            descriptors.add(descriptor)
+            descriptor_roles[descriptor] = role
+        return cls(
+            descriptors=descriptors,
+            descriptor_roles=descriptor_roles,
+            close_outcomes={descriptor: "owned" for descriptor in descriptors},
+            close_errors={},
+        )
+
+    @property
+    def control_pipes_closed(self) -> bool:
+        return not self.descriptors and all(
+            outcome in {"closed", "missing"} for outcome in self.close_outcomes.values()
+        )
+
+    def close_evidence(self) -> tuple[ProbeControlDescriptorCloseEvidence, ...]:
+        return tuple(
+            ProbeControlDescriptorCloseEvidence(
+                role=self.descriptor_roles[descriptor],
+                descriptor=descriptor,
+                outcome=self.close_outcomes[descriptor],
+            )
+            for descriptor in sorted(self.descriptor_roles)
+        )
+
+    def close_descriptor(
+        self,
+        descriptor: int,
+        failures: list[str] | None = None,
+    ) -> bool:
+        if descriptor not in self.descriptor_roles:
+            detail = f"close-fd-{descriptor}:descriptor-not-owned"
+            if failures is None:
+                raise ChildProcessError(detail)
+            failures.append(detail)
+            return False
+        outcome = self.close_outcomes[descriptor]
+        if outcome in {"closed", "missing"}:
+            self.descriptors.discard(descriptor)
+            return True
+        if outcome == "close-outcome-unproven":
+            if failures is not None:
+                failures.append(f"close-fd-{descriptor}:close-outcome-unproven")
+            return False
+        if outcome != "owned" or descriptor not in self.descriptors:
+            detail = f"close-fd-{descriptor}:invalid-close-state:{outcome}"
+            if failures is None:
+                raise ChildProcessError(detail)
+            failures.append(detail)
+            return False
+
+        # Publish uncertainty before close. If an exception is delivered after
+        # the syscall returned, this integer may already name a reused FD.
+        self.close_outcomes[descriptor] = "close-outcome-unproven"
+        try:
+            os.close(descriptor)
+        except BaseException as error:
+            self.close_errors[descriptor] = error
+            if failures is None:
+                try:
+                    setattr(error, "no_child_probe_control_descriptor_owner", self)
+                except BaseException:
+                    pass
+                raise
+            failures.append(
+                f"close-fd-{descriptor}:{type(error).__name__}:"
+                f"{_bounded_text(str(error), limit=128)}"
+            )
+            return False
+        self.close_outcomes[descriptor] = "closed"
+        self.close_errors.pop(descriptor, None)
+        self.descriptors.discard(descriptor)
+        return True
+
+    def close_all(self, failures: list[str]) -> bool:
+        for descriptor in tuple(self.descriptors):
+            self.close_descriptor(descriptor, failures)
+        return self.control_pipes_closed
+
+    def close_descriptors_for_recovery(self) -> None:
+        failures: list[str] = []
+        if not self.close_all(failures):
+            raise ChildProcessError(
+                "probe control descriptor closure remains unproven: "
+                + ";".join(failures)
+            )
+
+
+class _OwnedProbePopen(subprocess.Popen):
+    """Publish cleanup ownership before Popen can create a child."""
+
+    def __init__(
+        self,
+        owner: _ProbePopenOwner,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        owner.process = self
+        owner.ownership_published = True
+        owner.popen_call_started = True
+        try:
+            super().__init__(*args, **kwargs)
+        except (OSError, subprocess.SubprocessError) as error:
+            owner.popen_failure = error
+            raise
+        owner.popen_call_completed = True
+
+
+def _spawn_owned_probe_process(
+    owner: _ProbePopenOwner,
+    *args: Any,
+    **kwargs: Any,
+) -> subprocess.Popen[bytes]:
+    return _OwnedProbePopen(owner, *args, **kwargs)
+
+
+def _close_probe_control_descriptors(
+    owner: _ProbeControlDescriptorOwner,
+    failures: list[str],
+) -> bool:
+    return owner.close_all(failures)
+
+
+def _close_probe_output_pipes(
+    process: subprocess.Popen[bytes],
+    failures: list[str],
+) -> bool:
+    closed = True
+    for label in ("stdout", "stderr"):
+        try:
+            stream = getattr(process, label, None)
+        except BaseException as error:
+            failures.append(
+                f"inspect-{label}:{type(error).__name__}:"
+                f"{_bounded_text(str(error), limit=128)}"
+            )
+            closed = False
+            continue
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except BaseException as error:
+            failures.append(
+                f"close-{label}:{type(error).__name__}:"
+                f"{_bounded_text(str(error), limit=128)}"
+            )
+            closed = False
+            continue
+        try:
+            if not stream.closed:
+                failures.append(f"close-{label}:stream-remained-open")
+                closed = False
+        except BaseException as error:
+            failures.append(
+                f"inspect-{label}:{type(error).__name__}:"
+                f"{_bounded_text(str(error), limit=128)}"
+            )
+            closed = False
+    return closed
+
+
+def _probe_process_group_empty(
+    process_group: int,
+    *,
+    failures: list[str],
+) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return True
+    except BaseException as error:
+        failures.append(
+            f"inspect-process-group:{type(error).__name__}:"
+            f"{_bounded_text(str(error), limit=128)}"
+        )
+        return False
+    failures.append("inspect-process-group:group-remained-live")
+    return False
+
+
+def _cleanup_probe_after_popen(
+    process: subprocess.Popen[bytes],
+    *,
+    control_descriptors: _ProbeControlDescriptorOwner,
+    worker_release_attempted: bool,
+    worker_released: bool,
+    communicate_completed: bool,
+    leader_binding_complete: bool,
+    process_group_bound: bool,
+    trigger: BaseException,
+) -> NoChildProbeClosureEvidence:
+    failures = [
+        f"trigger:{type(trigger).__name__}:{_bounded_text(str(trigger), limit=128)}"
+    ]
+    completed_before_cleanup = False
+    try:
+        completed_before_cleanup = process.poll() is not None
+    except BaseException as error:
+        failures.append(
+            f"poll-leader:{type(error).__name__}:{_bounded_text(str(error), limit=128)}"
+        )
+    if not communicate_completed:
+        try:
+            if process_group_bound:
+                os.killpg(process.pid, signal.SIGKILL)
+            elif not completed_before_cleanup:
+                os.kill(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except BaseException as error:
+            failures.append(
+                f"terminate-worker:{type(error).__name__}:"
+                f"{_bounded_text(str(error), limit=128)}"
+            )
+    if not completed_before_cleanup:
+        try:
+            process.wait(timeout=PROBE_TIMEOUT_SECONDS)
+        except BaseException as error:
+            failures.append(
+                f"reap-leader:{type(error).__name__}:"
+                f"{_bounded_text(str(error), limit=128)}"
+            )
+    leader_reaped = process.returncode is not None
+    if communicate_completed:
+        process_group_empty = leader_reaped
+    elif leader_reaped and process_group_bound:
+        process_group_empty = _probe_process_group_empty(
+            process.pid,
+            failures=failures,
+        )
+    elif leader_reaped and not worker_release_attempted:
+        process_group_empty = True
+    else:
+        process_group_empty = False
+        failures.append("process-group-closure-unproven")
+    control_pipes_closed = _close_probe_control_descriptors(
+        control_descriptors,
+        failures,
+    )
+    output_pipes_closed = _close_probe_output_pipes(process, failures)
+    return NoChildProbeClosureEvidence(
+        leader_pid=process.pid,
+        worker_release_attempted=worker_release_attempted,
+        worker_released=worker_released,
+        communicate_completed=communicate_completed,
+        leader_binding_complete=leader_binding_complete,
+        process_group_bound=process_group_bound,
+        leader_reaped=leader_reaped,
+        process_group_empty=process_group_empty,
+        control_pipes_closed=control_pipes_closed,
+        output_pipes_closed=output_pipes_closed,
+        control_descriptor_close_evidence=control_descriptors.close_evidence(),
+        reason=";".join(failures)[:1024],
+    )
+
+
+def _raise_for_unproven_probe_closure(
+    evidence: NoChildProbeClosureEvidence,
+    *,
+    process: subprocess.Popen[bytes],
+    control_descriptors: _ProbeControlDescriptorOwner,
+    cause: BaseException,
+) -> None:
+    if (
+        evidence.leader_reaped
+        and evidence.process_group_empty
+        and evidence.control_pipes_closed
+        and evidence.output_pipes_closed
+    ):
+        return
+    retained = NoChildProbeClosureUnproven(evidence=evidence)
+    retained.retain_resource(process)
+    retained.retain_resource(control_descriptors)
+    if not evidence.output_pipes_closed:
+        for label in ("stdout", "stderr"):
+            try:
+                stream = getattr(process, label, None)
+            except BaseException:
+                continue
+            if stream is not None:
+                retained.retain_resource(stream)
+    retained.retain_recovery_evidence(evidence)
+    raise retained from cause
+
+
+def _probe_owner_leader_pid(owner: _ProbePopenOwner) -> int | None:
+    process = owner.process
+    if process is None:
+        return None
+    try:
+        pid = process.pid
+    except BaseException:
+        return None
+    if type(pid) is not int or pid <= 0:
+        return None
+    return pid
+
+
+def _raise_probe_spawn_ownership_unproven(
+    owner: _ProbePopenOwner,
+    *,
+    control_descriptors: _ProbeControlDescriptorOwner,
+    cause: BaseException,
+    detail: str,
+) -> None:
+    failures = [
+        f"trigger:{type(cause).__name__}:{_bounded_text(str(cause), limit=128)}",
+        detail,
+    ]
+    control_pipes_closed = _close_probe_control_descriptors(
+        control_descriptors,
+        failures,
+    )
+    process = owner.process
+    output_pipes_closed = (
+        True if process is None else _close_probe_output_pipes(process, failures)
+    )
+    evidence = NoChildProbeSpawnOwnershipEvidence(
+        popen_call_started=owner.popen_call_started,
+        popen_call_completed=owner.popen_call_completed,
+        ownership_published=owner.ownership_published,
+        leader_pid=_probe_owner_leader_pid(owner),
+        control_pipes_closed=control_pipes_closed,
+        output_pipes_closed=output_pipes_closed,
+        control_descriptor_close_evidence=control_descriptors.close_evidence(),
+        reason=";".join(failures)[:1024],
+    )
+    retained = NoChildProbeSpawnOwnershipUnproven(evidence=evidence)
+    retained.retain_resource(owner)
+    retained.retain_resource(control_descriptors)
+    if process is not None:
+        retained.retain_resource(process)
+        if not output_pipes_closed:
+            for label in ("stdout", "stderr"):
+                try:
+                    stream = getattr(process, label, None)
+                except BaseException:
+                    continue
+                if stream is not None:
+                    retained.retain_resource(stream)
+    retained.retain_recovery_evidence(evidence)
+    raise retained from cause
+
+
+def _settle_owned_probe_after_base_exception(
+    owner: _ProbePopenOwner,
+    *,
+    process: subprocess.Popen[bytes] | None,
+    control_descriptors: _ProbeControlDescriptorOwner,
+    worker_release_attempted: bool,
+    worker_released: bool,
+    communicate_completed: bool,
+    leader_binding_complete: bool,
+    process_group_bound: bool,
+    cause: BaseException,
+) -> None:
+    candidate = process if process is not None else owner.process
+    if candidate is not None and _probe_owner_leader_pid(owner) is not None:
+        closure = _cleanup_probe_after_popen(
+            candidate,
+            control_descriptors=control_descriptors,
+            worker_release_attempted=worker_release_attempted,
+            worker_released=worker_released,
+            communicate_completed=communicate_completed,
+            leader_binding_complete=leader_binding_complete,
+            process_group_bound=process_group_bound,
+            trigger=cause,
+        )
+        _raise_for_unproven_probe_closure(
+            closure,
+            process=candidate,
+            control_descriptors=control_descriptors,
+            cause=cause,
+        )
+        return
+    if owner.popen_call_started:
+        _raise_probe_spawn_ownership_unproven(
+            owner,
+            control_descriptors=control_descriptors,
+            cause=cause,
+            detail="popen-call-started-without-a-cleanup-capable-leader",
+        )
+    failures: list[str] = []
+    controls_closed = _close_probe_control_descriptors(
+        control_descriptors,
+        failures,
+    )
+    outputs_closed = (
+        True if candidate is None else _close_probe_output_pipes(candidate, failures)
+    )
+    if not controls_closed or not outputs_closed:
+        _raise_probe_spawn_ownership_unproven(
+            owner,
+            control_descriptors=control_descriptors,
+            cause=cause,
+            detail="pre-spawn-resources-could-not-be-closed",
+        )
+
+
 def _run_probe_case(
     *,
     layer: str,
     action: str,
-    probe_executable: ExecutableIdentity,
+    probe_executable_attestation: PathExecutedExecutableAttestation,
     alternate_executable: ExecutableIdentity,
     profile: str,
     python_home: str,
 ) -> ProbeObservation:
-    release_read, release_write = os.pipe()
-    status_read, status_write = os.pipe()
-    for descriptor in (release_read, release_write, status_read, status_write):
-        os.set_inheritable(descriptor, False)
+    probe_executable = probe_executable_attestation.executable
+    current_probe = _revalidate_path_executed_executable(probe_executable_attestation)
+    if _executable_protected_key(current_probe) != _executable_protected_key(
+        probe_executable
+    ):
+        raise ExecutableAuthenticationError(
+            "compatibility probe Python changed before launch"
+        )
+    current_alternate = _read_executable_identity(alternate_executable.path)
+    if _executable_protected_key(current_alternate) != _executable_protected_key(
+        alternate_executable
+    ):
+        raise ExecutableAuthenticationError(
+            "compatibility probe alternate executable changed before launch"
+        )
+    release_read, release_write, status_read, status_write = _open_probe_control_pipes()
+    control_descriptors = _ProbeControlDescriptorOwner.from_role_pairs(
+        (
+            ("release-read", release_read),
+            ("release-write", release_write),
+            ("status-read", status_read),
+            ("status-write", status_write),
+        )
+    )
+
+    def close_control(descriptor: int) -> None:
+        if not control_descriptors.close_descriptor(descriptor):
+            raise ChildProcessError(
+                f"probe control descriptor {descriptor} closure remains unproven"
+            )
+
     worker_argv = [
         probe_executable.path,
+        "-I",
+        "-B",
+        "-S",
         "-c",
         _PROBE_WORKER,
         action,
@@ -1502,13 +2623,7 @@ def _run_probe_case(
     argv = worker_argv
     if layer in {"seatbelt", "combined"}:
         argv = [str(SANDBOX_EXEC), "-p", profile, *worker_argv]
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith(("DYLD_", "LD_", "__XPC_DYLD_", "PYTHON"))
-    }
-    environment["PYTHONHOME"] = python_home
-    environment["PYTHONNOUSERSITE"] = "1"
+    environment = _probe_worker_environment(python_home=python_home)
     profile_sha256 = (
         hashlib.sha256(profile.encode("utf-8")).hexdigest()
         if layer in {"seatbelt", "combined"}
@@ -1519,213 +2634,343 @@ def _run_probe_case(
         status_write_fd=status_write,
         set_nproc_zero=layer in {"rlimit", "combined"},
     )
+    worker_release_attempted = False
+    worker_released = False
+    communicate_completed = False
+    leader_binding_complete = False
+    process_group_bound = False
+    child_process_group: int | None = None
+    child_session: int | None = None
+    child_start_identity: str | None = None
+    state: dict[str, Any] | None = None
     process: subprocess.Popen[bytes] | None = None
+    popen_owner = _ProbePopenOwner()
     try:
-        process = subprocess.Popen(
+        current_probe = _revalidate_path_executed_executable(
+            probe_executable_attestation
+        )
+        if _executable_protected_key(current_probe) != _executable_protected_key(
+            probe_executable
+        ):
+            raise ExecutableAuthenticationError(
+                "compatibility probe Python changed immediately before exec"
+            )
+        process = _spawn_owned_probe_process(
+            popen_owner,
             argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=environment,
+            cwd="/",
             close_fds=True,
             pass_fds=(release_read, status_write),
             preexec_fn=preexec_fn,
         )
     except (OSError, subprocess.SubprocessError) as error:
-        os.close(release_read)
-        os.close(release_write)
-        os.close(status_write)
+        try:
+            close_control(release_read)
+            close_control(release_write)
+            close_control(status_write)
+            try:
+                state_payload = _read_bounded_pipe(
+                    status_read,
+                    deadline=time.monotonic() + 0.5,
+                )
+                state = _parse_preexec_state(state_payload) if state_payload else None
+            except (OSError, TimeoutError, ValueError):
+                state = None
+            detail = "pre-exec leader setup failed"
+            if state is not None and state["detail"]:
+                detail += f": {state['detail']}"
+            return ProbeObservation(
+                layer=layer,
+                action=action,
+                outcome="ambiguous",
+                error_number=(
+                    state["error_number"]
+                    if state is not None
+                    else getattr(error, "errno", None)
+                ),
+                detail=_bounded_text(detail),
+                pre_exec_setsid_succeeded=(
+                    state["setsid_succeeded"] if state is not None else False
+                ),
+                pre_exec_pid=state["pid"] if state is not None else None,
+                pre_exec_process_group=(
+                    state["process_group"] if state is not None else None
+                ),
+                pre_exec_session=(state["session_id"] if state is not None else None),
+                pre_exec_nproc_soft=(
+                    state["nproc_soft"] if state is not None else None
+                ),
+                pre_exec_nproc_hard=(
+                    state["nproc_hard"] if state is not None else None
+                ),
+                nproc_soft=state["nproc_soft"] if state is not None else None,
+                nproc_hard=state["nproc_hard"] if state is not None else None,
+                profile_sha256=profile_sha256,
+            )
+        finally:
+            failures: list[str] = []
+            controls_closed = _close_probe_control_descriptors(
+                control_descriptors,
+                failures,
+            )
+            outputs_closed = (
+                True
+                if popen_owner.process is None
+                else _close_probe_output_pipes(popen_owner.process, failures)
+            )
+            if not controls_closed or not outputs_closed:
+                _raise_probe_spawn_ownership_unproven(
+                    popen_owner,
+                    control_descriptors=control_descriptors,
+                    cause=error,
+                    detail=(
+                        "popen-error-path-resources-could-not-be-closed:"
+                        + ";".join(failures)
+                    ),
+                )
+    except BaseException as error:
+        _settle_owned_probe_after_base_exception(
+            popen_owner,
+            process=process,
+            control_descriptors=control_descriptors,
+            worker_release_attempted=worker_release_attempted,
+            worker_released=worker_released,
+            communicate_completed=communicate_completed,
+            leader_binding_complete=leader_binding_complete,
+            process_group_bound=process_group_bound,
+            cause=error,
+        )
+        raise
+
+    try:
+        assert process is not None
+        close_control(release_read)
+        close_control(status_write)
         try:
             state_payload = _read_bounded_pipe(
                 status_read,
-                deadline=time.monotonic() + 0.5,
+                deadline=time.monotonic() + PROBE_TIMEOUT_SECONDS,
             )
-            state = _parse_preexec_state(state_payload) if state_payload else None
-        except (OSError, TimeoutError, ValueError):
-            state = None
+            state = _parse_preexec_state(state_payload)
+        except (OSError, TimeoutError, ValueError) as error:
+            state_error = _bounded_text(f"pre-exec state is ambiguous: {error}")
+        else:
+            state_error = "" if state["ok"] else _bounded_text(state["detail"])
+            process_group_bound = (
+                state["pid"] == process.pid
+                and state["process_group"] == process.pid
+                and state["session_id"] == process.pid
+            )
         finally:
-            os.close(status_read)
-        detail = "pre-exec leader setup failed"
-        if state is not None and state["detail"]:
-            detail += f": {state['detail']}"
-        return ProbeObservation(
+            close_control(status_read)
+
+        leader_error = ""
+        try:
+            child_process_group = os.getpgid(process.pid)
+            child_session = os.getsid(process.pid)
+            process_group_bound = process_group_bound or (
+                child_process_group == process.pid and child_session == process.pid
+            )
+            child_start_identity = process_start_identity(process.pid)
+            leader_binding_complete = (
+                child_process_group == process.pid
+                and child_session == process.pid
+                and bool(child_start_identity)
+            )
+        except (OSError, ValueError) as error:
+            leader_error = _leader_binding_error_detail(error)
+        try:
+            worker_release_attempted = True
+            written = os.write(release_write, b"G")
+            if written != 1:
+                raise OSError(errno.EIO, "probe release gate write was partial")
+            worker_released = True
+        except OSError as error:
+            if not leader_error:
+                leader_error = _bounded_text(f"cannot release probe worker: {error}")
+        finally:
+            close_control(release_write)
+
+        try:
+            stdout, stderr = process.communicate(timeout=PROBE_TIMEOUT_SECONDS)
+            communicate_completed = True
+        except subprocess.TimeoutExpired as error:
+            closure = _cleanup_probe_after_popen(
+                process,
+                control_descriptors=control_descriptors,
+                worker_release_attempted=worker_release_attempted,
+                worker_released=worker_released,
+                communicate_completed=communicate_completed,
+                leader_binding_complete=leader_binding_complete,
+                process_group_bound=process_group_bound,
+                trigger=error,
+            )
+            _raise_for_unproven_probe_closure(
+                closure,
+                process=process,
+                control_descriptors=control_descriptors,
+                cause=error,
+            )
+            return ProbeObservation(
+                layer=layer,
+                action=action,
+                outcome="ambiguous",
+                detail="probe deadline expired",
+                child_pid=process.pid,
+                child_process_group=child_process_group,
+                child_session=child_session,
+                child_start_identity=child_start_identity,
+                profile_sha256=profile_sha256,
+                pre_exec_setsid_succeeded=(
+                    state["setsid_succeeded"] if state is not None else None
+                ),
+                pre_exec_pid=state["pid"] if state is not None else None,
+                pre_exec_process_group=(
+                    state["process_group"] if state is not None else None
+                ),
+                pre_exec_session=(state["session_id"] if state is not None else None),
+                pre_exec_nproc_soft=(
+                    state["nproc_soft"] if state is not None else None
+                ),
+                pre_exec_nproc_hard=(
+                    state["nproc_hard"] if state is not None else None
+                ),
+                nproc_soft=state["nproc_soft"] if state is not None else None,
+                nproc_hard=state["nproc_hard"] if state is not None else None,
+            )
+        completed = subprocess.CompletedProcess(
+            argv,
+            process.returncode,
+            stdout,
+            stderr,
+        )
+        observation = _parse_probe_output(
             layer=layer,
             action=action,
-            outcome="ambiguous",
-            error_number=(
-                state["error_number"]
-                if state is not None
-                else getattr(error, "errno", None)
-            ),
-            detail=_bounded_text(detail),
-            pre_exec_setsid_succeeded=(
-                state["setsid_succeeded"] if state is not None else False
-            ),
-            pre_exec_pid=state["pid"] if state is not None else None,
-            pre_exec_process_group=(
-                state["process_group"] if state is not None else None
-            ),
-            pre_exec_session=state["session_id"] if state is not None else None,
-            pre_exec_nproc_soft=(state["nproc_soft"] if state is not None else None),
-            pre_exec_nproc_hard=(state["nproc_hard"] if state is not None else None),
-            nproc_soft=state["nproc_soft"] if state is not None else None,
-            nproc_hard=state["nproc_hard"] if state is not None else None,
-            profile_sha256=profile_sha256,
+            completed=completed,
         )
-
-    os.close(release_read)
-    os.close(status_write)
-    try:
-        state_payload = _read_bounded_pipe(
-            status_read,
-            deadline=time.monotonic() + PROBE_TIMEOUT_SECONDS,
+        if state_error or leader_error:
+            detail = state_error or leader_error
+            if (
+                not state_error
+                and leader_error == PROBE_DETAIL_LEADER_EXITED_BEFORE_BINDING
+                and observation.detail == PROBE_DETAIL_OUTER_SEATBELT_DENIED
+            ):
+                detail = PROBE_DETAIL_OUTER_SEATBELT_DENIED
+            result = replace(
+                observation,
+                outcome="ambiguous",
+                detail=detail,
+                child_pid=process.pid,
+                child_process_group=child_process_group,
+                child_session=child_session,
+                child_start_identity=child_start_identity,
+                profile_sha256=profile_sha256,
+                pre_exec_setsid_succeeded=(
+                    state["setsid_succeeded"] if state is not None else None
+                ),
+                pre_exec_pid=state["pid"] if state is not None else None,
+                pre_exec_process_group=(
+                    state["process_group"] if state is not None else None
+                ),
+                pre_exec_session=(state["session_id"] if state is not None else None),
+                pre_exec_nproc_soft=(
+                    state["nproc_soft"] if state is not None else None
+                ),
+                pre_exec_nproc_hard=(
+                    state["nproc_hard"] if state is not None else None
+                ),
+            )
+        else:
+            assert state is not None
+            worker_identity = (
+                observation.child_pid,
+                observation.child_process_group,
+                observation.child_session,
+            )
+            bound_identity = (process.pid, child_process_group, child_session)
+            pre_exec_identity = (
+                state["pid"],
+                state["process_group"],
+                state["session_id"],
+            )
+            if observation.child_pid is not None and (
+                worker_identity != bound_identity
+                or worker_identity != pre_exec_identity
+            ):
+                result = replace(
+                    observation,
+                    outcome="ambiguous",
+                    detail=("pre-exec, parent, and post-exec leader identities differ"),
+                    child_start_identity=child_start_identity,
+                    profile_sha256=profile_sha256,
+                    pre_exec_setsid_succeeded=state["setsid_succeeded"],
+                    pre_exec_pid=state["pid"],
+                    pre_exec_process_group=state["process_group"],
+                    pre_exec_session=state["session_id"],
+                    pre_exec_nproc_soft=state["nproc_soft"],
+                    pre_exec_nproc_hard=state["nproc_hard"],
+                )
+            else:
+                result = replace(
+                    observation,
+                    child_pid=process.pid,
+                    child_process_group=child_process_group,
+                    child_session=child_session,
+                    child_start_identity=child_start_identity,
+                    profile_sha256=profile_sha256,
+                    pre_exec_setsid_succeeded=state["setsid_succeeded"],
+                    pre_exec_pid=state["pid"],
+                    pre_exec_process_group=state["process_group"],
+                    pre_exec_session=state["session_id"],
+                    pre_exec_nproc_soft=state["nproc_soft"],
+                    pre_exec_nproc_hard=state["nproc_hard"],
+                    nproc_soft=(
+                        observation.nproc_soft
+                        if observation.nproc_soft is not None
+                        else state["nproc_soft"]
+                    ),
+                    nproc_hard=(
+                        observation.nproc_hard
+                        if observation.nproc_hard is not None
+                        else state["nproc_hard"]
+                    ),
+                )
+        close_failures: list[str] = []
+        controls_closed = _close_probe_control_descriptors(
+            control_descriptors,
+            close_failures,
         )
-        state = _parse_preexec_state(state_payload)
-    except (OSError, TimeoutError, ValueError) as error:
-        state = None
-        state_error = _bounded_text(f"pre-exec state is ambiguous: {error}")
-    else:
-        state_error = "" if state["ok"] else _bounded_text(state["detail"])
-    finally:
-        os.close(status_read)
-
-    leader_error = ""
-    child_process_group: int | None = None
-    child_session: int | None = None
-    child_start_identity: str | None = None
-    try:
-        child_process_group = os.getpgid(process.pid)
-        child_session = os.getsid(process.pid)
-        child_start_identity = process_start_identity(process.pid)
-    except (OSError, ValueError) as error:
-        leader_error = _leader_binding_error_detail(error)
-    try:
-        os.write(release_write, b"G")
-    except OSError as error:
-        if not leader_error:
-            leader_error = _bounded_text(f"cannot release probe worker: {error}")
-    finally:
-        os.close(release_write)
-
-    try:
-        stdout, stderr = process.communicate(timeout=PROBE_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        stdout, stderr = process.communicate()
-        return ProbeObservation(
-            layer=layer,
-            action=action,
-            outcome="ambiguous",
-            detail="probe deadline expired",
-            child_pid=process.pid,
-            child_process_group=child_process_group,
-            child_session=child_session,
-            child_start_identity=child_start_identity,
-            profile_sha256=profile_sha256,
-            pre_exec_setsid_succeeded=(
-                state["setsid_succeeded"] if state is not None else None
-            ),
-            pre_exec_pid=state["pid"] if state is not None else None,
-            pre_exec_process_group=(
-                state["process_group"] if state is not None else None
-            ),
-            pre_exec_session=state["session_id"] if state is not None else None,
-            pre_exec_nproc_soft=(state["nproc_soft"] if state is not None else None),
-            pre_exec_nproc_hard=(state["nproc_hard"] if state is not None else None),
-            nproc_soft=state["nproc_soft"] if state is not None else None,
-            nproc_hard=state["nproc_hard"] if state is not None else None,
+        outputs_closed = _close_probe_output_pipes(process, close_failures)
+        if not controls_closed or not outputs_closed:
+            raise NoChildProfileError(
+                "probe pipes could not be closed: " + ";".join(close_failures)
+            )
+        return result
+    except NoChildProbeClosureUnproven:
+        raise
+    except BaseException as error:
+        closure = _cleanup_probe_after_popen(
+            process,
+            control_descriptors=control_descriptors,
+            worker_release_attempted=worker_release_attempted,
+            worker_released=worker_released,
+            communicate_completed=communicate_completed,
+            leader_binding_complete=leader_binding_complete,
+            process_group_bound=process_group_bound,
+            trigger=error,
         )
-    completed = subprocess.CompletedProcess(
-        argv,
-        process.returncode,
-        stdout,
-        stderr,
-    )
-    observation = _parse_probe_output(
-        layer=layer,
-        action=action,
-        completed=completed,
-    )
-    if state_error or leader_error:
-        detail = state_error or leader_error
-        if (
-            not state_error
-            and leader_error == PROBE_DETAIL_LEADER_EXITED_BEFORE_BINDING
-            and observation.detail == PROBE_DETAIL_OUTER_SEATBELT_DENIED
-        ):
-            detail = PROBE_DETAIL_OUTER_SEATBELT_DENIED
-        return replace(
-            observation,
-            outcome="ambiguous",
-            detail=detail,
-            child_pid=process.pid,
-            child_process_group=child_process_group,
-            child_session=child_session,
-            child_start_identity=child_start_identity,
-            profile_sha256=profile_sha256,
-            pre_exec_setsid_succeeded=(
-                state["setsid_succeeded"] if state is not None else None
-            ),
-            pre_exec_pid=state["pid"] if state is not None else None,
-            pre_exec_process_group=(
-                state["process_group"] if state is not None else None
-            ),
-            pre_exec_session=state["session_id"] if state is not None else None,
-            pre_exec_nproc_soft=(state["nproc_soft"] if state is not None else None),
-            pre_exec_nproc_hard=(state["nproc_hard"] if state is not None else None),
+        _raise_for_unproven_probe_closure(
+            closure,
+            process=process,
+            control_descriptors=control_descriptors,
+            cause=error,
         )
-    assert state is not None
-    worker_identity = (
-        observation.child_pid,
-        observation.child_process_group,
-        observation.child_session,
-    )
-    bound_identity = (process.pid, child_process_group, child_session)
-    pre_exec_identity = (
-        state["pid"],
-        state["process_group"],
-        state["session_id"],
-    )
-    if observation.child_pid is not None and (
-        worker_identity != bound_identity or worker_identity != pre_exec_identity
-    ):
-        return replace(
-            observation,
-            outcome="ambiguous",
-            detail="pre-exec, parent, and post-exec leader identities differ",
-            child_start_identity=child_start_identity,
-            profile_sha256=profile_sha256,
-            pre_exec_setsid_succeeded=state["setsid_succeeded"],
-            pre_exec_pid=state["pid"],
-            pre_exec_process_group=state["process_group"],
-            pre_exec_session=state["session_id"],
-            pre_exec_nproc_soft=state["nproc_soft"],
-            pre_exec_nproc_hard=state["nproc_hard"],
-        )
-    return replace(
-        observation,
-        child_pid=process.pid,
-        child_process_group=child_process_group,
-        child_session=child_session,
-        child_start_identity=child_start_identity,
-        profile_sha256=profile_sha256,
-        pre_exec_setsid_succeeded=state["setsid_succeeded"],
-        pre_exec_pid=state["pid"],
-        pre_exec_process_group=state["process_group"],
-        pre_exec_session=state["session_id"],
-        pre_exec_nproc_soft=state["nproc_soft"],
-        pre_exec_nproc_hard=state["nproc_hard"],
-        nproc_soft=(
-            observation.nproc_soft
-            if observation.nproc_soft is not None
-            else state["nproc_soft"]
-        ),
-        nproc_hard=(
-            observation.nproc_hard
-            if observation.nproc_hard is not None
-            else state["nproc_hard"]
-        ),
-    )
+        raise
 
 
 def _runtime_blockers(
@@ -1888,6 +3133,7 @@ def probe_compatibility(
 ) -> CompatibilityEvidence:
     runtime = _runtime_fingerprint()
     sandbox_identity: ExecutableIdentity | None = None
+    probe_attestation: PathExecutedExecutableAttestation | None = None
     probe_identity: ExecutableIdentity | None = None
     alternate_identity: ExecutableIdentity | None = None
     profile: str | None = None
@@ -1918,7 +3164,8 @@ def probe_compatibility(
 
     try:
         probe_path = probe_executable_path or python_runtime_executable()
-        probe_identity = _read_executable_identity(probe_path)
+        probe_attestation = _authenticate_path_executed_executable(probe_path)
+        probe_identity = probe_attestation.executable
         alternate_identity = _read_executable_identity(alternate_executable_path)
         profile = build_seatbelt_profile(probe_identity.path)
         parent_before = resource.getrlimit(resource.RLIMIT_NPROC)
@@ -1929,15 +3176,19 @@ def probe_compatibility(
                     _run_probe_case(
                         layer=layer,
                         action=action,
-                        probe_executable=probe_identity,
+                        probe_executable_attestation=probe_attestation,
                         alternate_executable=alternate_identity,
                         profile=profile,
                         python_home=home,
                     )
                 )
-        if _read_executable_identity(probe_identity.path) != probe_identity:
+        if _executable_protected_key(
+            _revalidate_path_executed_executable(probe_attestation)
+        ) != _executable_protected_key(probe_identity):
             blockers.append("probe-executable-changed-during-probe")
-        if _read_executable_identity(alternate_identity.path) != alternate_identity:
+        if _executable_protected_key(
+            _read_executable_identity(alternate_identity.path)
+        ) != _executable_protected_key(alternate_identity):
             blockers.append("alternate-executable-changed-during-probe")
         parent_after = resource.getrlimit(resource.RLIMIT_NPROC)
     except (ExecutableAuthenticationError, OSError) as error:
@@ -2019,26 +3270,39 @@ def _require_live_runtime(evidence: CompatibilityEvidence) -> None:
         blockers.append("runtime-changed-after-probe")
     try:
         sandbox_exec = _read_executable_identity(SANDBOX_EXEC)
-    except ExecutableAuthenticationError:
+    except ExecutableAuthenticationError as error:
         sandbox_exec = None
-    if sandbox_exec != evidence.sandbox_exec:
+        sandbox_error = error
+    else:
+        sandbox_error = None
+    if sandbox_error is not None and evidence.sandbox_exec is not None:
+        blockers.append("sandbox-exec-revalidation-failed-after-probe")
+    elif _optional_executable_protected_key(
+        sandbox_exec
+    ) != _optional_executable_protected_key(evidence.sandbox_exec):
         blockers.append("sandbox-exec-changed-after-probe")
     if evidence.probe_executable is not None:
         try:
             probe_executable = _read_executable_identity(evidence.probe_executable.path)
         except ExecutableAuthenticationError:
-            probe_executable = None
-        if probe_executable != evidence.probe_executable:
-            blockers.append("probe-executable-changed-after-probe")
+            blockers.append("probe-executable-revalidation-failed-after-probe")
+        else:
+            if _executable_protected_key(probe_executable) != _executable_protected_key(
+                evidence.probe_executable
+            ):
+                blockers.append("probe-executable-changed-after-probe")
     if evidence.alternate_executable is not None:
         try:
             alternate_executable = _read_executable_identity(
                 evidence.alternate_executable.path
             )
         except ExecutableAuthenticationError:
-            alternate_executable = None
-        if alternate_executable != evidence.alternate_executable:
-            blockers.append("alternate-executable-changed-after-probe")
+            blockers.append("alternate-executable-revalidation-failed-after-probe")
+        else:
+            if _executable_protected_key(
+                alternate_executable
+            ) != _executable_protected_key(evidence.alternate_executable):
+                blockers.append("alternate-executable-changed-after-probe")
     if blockers:
         raise NoChildProfileUnavailable(
             replace(
@@ -2069,6 +3333,36 @@ def prepare_no_child_profile(
         ),
         evidence=evidence,
         additional_seatbelt_rules=additional_seatbelt_rules,
+    )
+
+
+def prepare_sandboxed_python_no_child_profile(
+    *,
+    additional_seatbelt_rules: str = "",
+) -> PreparedNoChildProfile:
+    """Prepare the current path-bound Python behind the sandbox loader."""
+
+    evidence = probe_compatibility()
+    require_compatible(evidence)
+    sandbox_exec = authenticate_executable(
+        SANDBOX_EXEC,
+        expected_sha256=evidence.runtime_pin.sandbox_exec_sha256,
+    )
+    target_attestation = _authenticate_path_executed_executable(
+        python_runtime_executable()
+    )
+    target = target_attestation.executable
+    return PreparedNoChildProfile(
+        executable=sandbox_exec,
+        expected_sha256=sandbox_exec.sha256,
+        seatbelt_profile=build_seatbelt_profile(
+            target.path,
+            additional_rules=additional_seatbelt_rules,
+        ),
+        evidence=evidence,
+        additional_seatbelt_rules=additional_seatbelt_rules,
+        sandboxed_target=target,
+        sandboxed_target_attestation=target_attestation,
     )
 
 
@@ -2145,15 +3439,52 @@ def _revalidate_prepared_profile(
             raise NoChildProfileError(
                 "ordinary executable profile contains writable-root authority"
             )
+        if (
+            prepared.sandboxed_target is None
+            and prepared.sandboxed_target_attestation is not None
+        ):
+            raise NoChildProfileError(
+                "ordinary executable profile contains path-executed target authority"
+            )
         current = authenticate_executable(
             prepared.executable.path,
             expected_sha256=prepared.expected_sha256,
         )
-        expected_profile = build_seatbelt_profile(
-            prepared.executable.path,
-            additional_rules=prepared.additional_seatbelt_rules,
-        )
+        if prepared.sandboxed_target is None:
+            expected_profile = build_seatbelt_profile(
+                prepared.executable.path,
+                additional_rules=prepared.additional_seatbelt_rules,
+            )
+        else:
+            if pathlib.Path(prepared.executable.path) != SANDBOX_EXEC:
+                raise NoChildProfileError(
+                    "sandboxed target does not use the authenticated sandbox loader"
+                )
+            target_attestation = prepared.sandboxed_target_attestation
+            if target_attestation is None:
+                raise NoChildProfileError(
+                    "sandboxed target is missing its path-execution attestation"
+                )
+            _require_path_execution_attestation_consistent(target_attestation)
+            if _executable_protected_key(
+                prepared.sandboxed_target
+            ) != _executable_protected_key(target_attestation.executable):
+                raise ExecutableAuthenticationError(
+                    "sandboxed target authority was modified after preparation"
+                )
+            target = _revalidate_path_executed_executable(target_attestation)
+            expected_profile = build_seatbelt_profile(
+                target.path,
+                additional_rules=prepared.additional_seatbelt_rules,
+            )
     else:
+        if (
+            prepared.sandboxed_target is not None
+            or prepared.sandboxed_target_attestation is not None
+        ):
+            raise NoChildProfileError(
+                "owner snapshot profile contains a sandboxed target"
+            )
         attestation = prepared.owner_snapshot_attestation
         if (
             prepared.expected_sha256 != attestation.expected_sha256
@@ -2171,7 +3502,9 @@ def _revalidate_prepared_profile(
             raise NoChildProfileError(
                 "prepared writable-root attestations were modified"
             )
-    if current != prepared.executable:
+    if _executable_protected_key(current) != _executable_protected_key(
+        prepared.executable
+    ):
         raise ExecutableAuthenticationError(
             "authenticated executable identity changed after preparation"
         )
@@ -2234,53 +3567,415 @@ def _launch_child(
         os._exit(127)
 
 
-def _close_fd_quietly(fd: int) -> None:
+@dataclass(slots=True)
+class _NoChildLaunchReceipt:
+    creator_pid: int
+    error_read_fd: int
+    error_write_fd: int
+    pipe_call_started: bool = False
+    pipe_call_completed: bool = False
+    pipe_failure_proven: bool = False
+    fork_call_started: bool = False
+    fork_call_completed: bool = False
+    fork_failure_proven: bool = False
+    returned_pid: int | None = None
+    leader_pid: int | None = None
+    child_receipt_attempted: bool = False
+    child_receipt_published: bool = False
+    child_receipt_error: BaseException | None = None
+    leader_receipt_received: bool = False
+    error_read_close_outcome: str = "owned"
+    error_write_close_outcome: str = "owned"
+
+    @property
+    def in_child_process(self) -> bool:
+        return os.getpid() != self.creator_pid
+
+    @property
+    def control_pipes_closed(self) -> bool:
+        if (
+            self.pipe_call_started
+            and not self.pipe_call_completed
+            and not self.pipe_failure_proven
+        ):
+            return False
+        closed_outcomes = {"closed", "missing", "not-created"}
+        return (
+            self.error_read_fd < 0
+            and self.error_write_fd < 0
+            and self.error_read_close_outcome in closed_outcomes
+            and self.error_write_close_outcome in closed_outcomes
+        )
+
+    def close_error_read(self, failures: list[str] | None = None) -> bool:
+        return self._close_descriptor("error_read_fd", failures)
+
+    def close_error_write(self, failures: list[str] | None = None) -> bool:
+        return self._close_descriptor("error_write_fd", failures)
+
+    def _close_descriptor(
+        self,
+        attribute: str,
+        failures: list[str] | None,
+    ) -> bool:
+        descriptor = getattr(self, attribute)
+        outcome_attribute = f"{attribute.removesuffix('_fd')}_close_outcome"
+        outcome = getattr(self, outcome_attribute)
+        if descriptor < 0:
+            return outcome in {"closed", "missing", "not-created"}
+        if outcome in {"closed", "missing"}:
+            setattr(self, attribute, -1)
+            return True
+        if outcome == "close-outcome-unproven":
+            return False
+        if outcome != "owned":
+            detail = f"close-fd-{descriptor}:invalid-close-state:{outcome}"
+            if failures is None:
+                raise ChildProcessError(detail)
+            failures.append(detail)
+            return False
+        # Keep the integer as descriptor evidence. An exception may arrive
+        # before or after the syscall, so publish uncertainty first and never
+        # retry this integer unless closure was proved.
+        setattr(self, outcome_attribute, "close-outcome-unproven")
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            if error.errno == errno.EBADF:
+                setattr(self, outcome_attribute, "missing")
+                setattr(self, attribute, -1)
+                return True
+            if failures is None:
+                setattr(error, "no_child_launch_receipt", self)
+                raise
+            failures.append(
+                f"close-fd-{descriptor}:{type(error).__name__}:"
+                f"{_bounded_text(str(error), limit=128)}"
+            )
+            return False
+        except BaseException as error:
+            if failures is None:
+                setattr(error, "no_child_launch_receipt", self)
+                raise
+            failures.append(
+                f"close-fd-{descriptor}:{type(error).__name__}:"
+                f"{_bounded_text(str(error), limit=128)}"
+            )
+            return False
+        setattr(self, outcome_attribute, "closed")
+        setattr(self, attribute, -1)
+        return True
+
+
+@dataclass(slots=True)
+class _NoChildLaunchReceiptOwner:
+    receipt: _NoChildLaunchReceipt | None = None
+    ownership_published: bool = False
+
+    def publish(self, receipt: _NoChildLaunchReceipt) -> None:
+        if self.receipt is None:
+            self.receipt = receipt
+        elif self.receipt is not receipt:
+            raise ValueError("no-child launch receipt owner was rebound")
+        self.ownership_published = True
+
+    def owns(self, receipt: _NoChildLaunchReceipt) -> bool:
+        return self.ownership_published and self.receipt is receipt
+
+    def require_receipt(self) -> _NoChildLaunchReceipt:
+        receipt = self.receipt
+        if receipt is None or not self.owns(receipt):
+            raise ChildProcessError("no-child launch receipt was not published")
+        return receipt
+
+
+@dataclass(slots=True)
+class _NoChildLaunchPipeWorker:
+    receipt: _NoChildLaunchReceipt
+    error: BaseException | None = None
+    completed: bool = False
+
+    def run(self) -> None:
+        try:
+            self.receipt.pipe_call_started = True
+            try:
+                pipe_result = os.pipe()
+            except OSError:
+                self.receipt.pipe_failure_proven = True
+                raise
+            self.receipt.error_read_fd = pipe_result[0]
+            self.receipt.error_write_fd = pipe_result[1]
+            self.receipt.error_read_close_outcome = "owned"
+            self.receipt.error_write_close_outcome = "owned"
+            self.receipt.pipe_call_completed = True
+            os.set_inheritable(self.receipt.error_read_fd, False)
+            os.set_inheritable(self.receipt.error_write_fd, False)
+        except BaseException as error:
+            self.error = error
+        finally:
+            self.completed = True
+
+
+def _finish_launch_pipe_worker(
+    worker_thread: threading.Thread,
+    *,
+    started: bool,
+) -> None:
+    if not started and worker_thread.ident is None:
+        return
+    while worker_thread.is_alive():
+        worker_thread.join()
+    worker_thread.join()
+
+
+def _close_launch_pipe_after_failure(
+    owner: _NoChildLaunchReceiptOwner,
+    trigger: BaseException,
+) -> None:
+    receipt = owner.receipt
+    if receipt is None:
+        return
+    failures: list[str] = []
+    receipt.close_error_read(failures)
+    receipt.close_error_write(failures)
+    if receipt.control_pipes_closed:
+        return
     try:
-        os.close(fd)
-    except OSError:
+        setattr(trigger, "no_child_launch_receipt_owner", owner)
+        setattr(trigger, "no_child_launch_pipe_close_failures", tuple(failures))
+    except BaseException:
         pass
 
 
-def _open_launch_error_pipe() -> tuple[int, int]:
-    error_read: int | None = None
-    error_write: int | None = None
+def _open_launch_error_pipe(
+    owner: _NoChildLaunchReceiptOwner,
+) -> _NoChildLaunchReceipt:
+    receipt = _NoChildLaunchReceipt(
+        creator_pid=os.getpid(),
+        error_read_fd=-1,
+        error_write_fd=-1,
+        error_read_close_outcome="not-created",
+        error_write_close_outcome="not-created",
+    )
+    owner.publish(receipt)
+    if not owner.owns(receipt):
+        raise ChildProcessError(
+            "no-child launch receipt owner did not retain the pending pipe"
+        )
+
+    worker = _NoChildLaunchPipeWorker(receipt=receipt)
+    worker_thread = threading.Thread(
+        target=worker.run,
+        name="no-child-launch-pipe",
+        daemon=False,
+    )
+    started = False
     try:
-        error_read, error_write = os.pipe()
-        os.set_inheritable(error_read, False)
-        os.set_inheritable(error_write, False)
-        return error_read, error_write
-    except BaseException:
-        if error_read is not None:
-            _close_fd_quietly(error_read)
-        if error_write is not None:
-            _close_fd_quietly(error_write)
+        worker_thread.start()
+        started = True
+        worker_thread.join()
+    except BaseException as trigger:
+        _finish_launch_pipe_worker(worker_thread, started=started)
+        _close_launch_pipe_after_failure(owner, trigger)
         raise
 
+    if not worker.completed:
+        error = ChildProcessError("no-child launch pipe worker did not complete")
+        _close_launch_pipe_after_failure(owner, error)
+        raise error
+    if worker.error is not None:
+        _close_launch_pipe_after_failure(owner, worker.error)
+        raise worker.error
+    if (
+        receipt.error_read_fd < 0
+        or receipt.error_write_fd < 0
+        or receipt.error_read_close_outcome != "owned"
+        or receipt.error_write_close_outcome != "owned"
+    ):
+        error = ChildProcessError(
+            "no-child launch pipe worker returned incomplete descriptor custody"
+        )
+        _close_launch_pipe_after_failure(owner, error)
+        raise error
+    return receipt
 
-def _fork_with_launch_error_pipe() -> tuple[int, int, int]:
-    error_read, error_write = _open_launch_error_pipe()
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise OSError(errno.EIO, "launch receipt write made no progress")
+        offset += written
+
+
+def _read_launch_leader_receipt(
+    descriptor: int,
+    *,
+    deadline: float,
+) -> int:
+    payload = bytearray()
+    while len(payload) < _LAUNCH_LEADER_RECEIPT.size:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("fork leader receipt deadline expired")
+        readable, _, _ = select.select(
+            [descriptor],
+            [],
+            [],
+            min(remaining, 0.1),
+        )
+        if not readable:
+            continue
+        chunk = os.read(descriptor, _LAUNCH_LEADER_RECEIPT.size - len(payload))
+        if not chunk:
+            raise ChildProcessError("fork leader receipt pipe closed early")
+        payload.extend(chunk)
+    magic, leader_pid = _LAUNCH_LEADER_RECEIPT.unpack(payload)
+    if magic != _LAUNCH_LEADER_RECEIPT_MAGIC or leader_pid <= 0:
+        raise ChildProcessError("fork leader receipt is invalid")
+    return leader_pid
+
+
+def _publish_child_launch_receipt(receipt: _NoChildLaunchReceipt) -> None:
+    leader_pid = os.getpid()
+    _write_all(
+        receipt.error_write_fd,
+        _LAUNCH_LEADER_RECEIPT.pack(
+            _LAUNCH_LEADER_RECEIPT_MAGIC,
+            leader_pid,
+        ),
+    )
+    receipt.leader_pid = leader_pid
+    receipt.child_receipt_published = True
+
+
+_FORK_RECEIPT_CONTEXT = threading.local()
+_FORK_RECEIPT_HOOK_LOCK = threading.Lock()
+_FORK_RECEIPT_HOOK_REGISTERED = False
+
+
+def _active_fork_receipt() -> _NoChildLaunchReceipt | None:
+    receipt = getattr(_FORK_RECEIPT_CONTEXT, "receipt", None)
+    return receipt if isinstance(receipt, _NoChildLaunchReceipt) else None
+
+
+def _after_receipted_fork_in_parent() -> None:
+    receipt = _active_fork_receipt()
+    if receipt is not None:
+        receipt.fork_call_completed = True
+
+
+def _after_receipted_fork_in_child() -> None:
+    receipt = _active_fork_receipt()
+    if receipt is None:
+        return
+    receipt.fork_call_completed = True
+    if receipt.child_receipt_attempted:
+        return
+    receipt.child_receipt_attempted = True
     try:
-        pid = os.fork()
-    except BaseException:
-        _close_fd_quietly(error_read)
-        _close_fd_quietly(error_write)
-        raise
+        _publish_child_launch_receipt(receipt)
+    except BaseException as error:
+        receipt.child_receipt_error = error
+
+
+def _ensure_receipted_fork_hooks() -> None:
+    global _FORK_RECEIPT_HOOK_REGISTERED
+
+    if _FORK_RECEIPT_HOOK_REGISTERED:
+        return
+    with _FORK_RECEIPT_HOOK_LOCK:
+        if _FORK_RECEIPT_HOOK_REGISTERED:
+            return
+        os.register_at_fork(
+            after_in_parent=_after_receipted_fork_in_parent,
+            after_in_child=_after_receipted_fork_in_child,
+        )
+        _FORK_RECEIPT_HOOK_REGISTERED = True
+
+
+def _clear_active_fork_receipt(receipt: _NoChildLaunchReceipt) -> None:
+    if _active_fork_receipt() is receipt:
+        del _FORK_RECEIPT_CONTEXT.receipt
+
+
+def _fork_with_launch_error_pipe(
+    owner: _NoChildLaunchReceiptOwner,
+) -> tuple[int, int, int]:
+    receipt = _open_launch_error_pipe(owner)
+    if not owner.owns(receipt):
+        raise ChildProcessError(
+            "no-child launch receipt owner did not retain the pipes"
+        )
+    error_read = receipt.error_read_fd
+    error_write = receipt.error_write_fd
+    _ensure_receipted_fork_hooks()
+    try:
+        _FORK_RECEIPT_CONTEXT.receipt = receipt
+        receipt.fork_call_started = True
+        try:
+            pid = os.fork()
+        except OSError:
+            if not receipt.fork_call_completed:
+                receipt.fork_failure_proven = True
+                failures = []
+                receipt.close_error_read(failures)
+                receipt.close_error_write(failures)
+            raise
+    finally:
+        _clear_active_fork_receipt(receipt)
+    receipt.fork_call_completed = True
     if pid < 0:
-        _close_fd_quietly(error_read)
-        _close_fd_quietly(error_write)
+        receipt.fork_failure_proven = True
+        failures = []
+        receipt.close_error_read(failures)
+        receipt.close_error_write(failures)
         raise OSError(errno.EAGAIN, "fork returned an invalid process identifier")
+    if pid == 0:
+        if receipt.child_receipt_error is not None:
+            _exit_child_launch_failure(error_write, receipt.child_receipt_error)
+        if not receipt.child_receipt_published:
+            receipt.child_receipt_attempted = True
+            _publish_child_launch_receipt(receipt)
+        return pid, error_read, error_write
+    receipt.returned_pid = pid
+    leader_pid = _read_launch_leader_receipt(
+        error_read,
+        deadline=time.monotonic() + PROBE_TIMEOUT_SECONDS,
+    )
+    receipt.leader_pid = leader_pid
+    receipt.leader_receipt_received = True
+    if leader_pid != pid:
+        raise ChildProcessError(
+            "fork returned a leader that does not match the child receipt"
+        )
     return pid, error_read, error_write
 
 
 def _terminate_and_reap(pid: int) -> None:
     try:
-        os.kill(pid, signal.SIGKILL)
+        os.killpg(pid, signal.SIGKILL)
     except ProcessLookupError:
-        pass
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    while True:
+        try:
+            reaped_pid, _ = os.waitpid(pid, 0)
+            break
+        except InterruptedError:
+            continue
+    if reaped_pid != pid:
+        raise ChildProcessError(
+            f"waitpid reaped {reaped_pid}, expected exact leader {pid}"
+        )
     try:
-        os.waitpid(pid, 0)
-    except ChildProcessError:
-        pass
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        return
+    raise ChildProcessError(f"process group {pid} remained live after leader reap")
 
 
 def _exit_child_launch_failure(error_write_fd: int, error: BaseException) -> None:
@@ -2294,6 +3989,99 @@ def _exit_child_launch_failure(error_write_fd: int, error: BaseException) -> Non
     os._exit(127)
 
 
+def _settle_owned_launch_after_base_exception(
+    owner: _NoChildLaunchReceiptOwner,
+    *,
+    prepared: PreparedNoChildProfile,
+    exec_acknowledged: bool,
+    leader_binding_complete: bool,
+    trigger: BaseException,
+    result_owner_query_error: BaseException | None = None,
+    uncertain_result_owner: NoChildLaunchResultOwner | None = None,
+    launched_result: LaunchedNoChildProcess | None = None,
+) -> None:
+    receipt = owner.receipt
+    if receipt is None:
+        return
+    failures = [
+        f"trigger:{type(trigger).__name__}:{_bounded_text(str(trigger), limit=128)}"
+    ]
+    if result_owner_query_error is not None:
+        failures.append(
+            "result-owner-ownership-query:"
+            f"{type(result_owner_query_error).__name__}:"
+            f"{_bounded_text(str(result_owner_query_error), limit=128)}"
+        )
+    may_have_child = receipt.fork_call_started and not receipt.fork_failure_proven
+    leader_pid = (
+        receipt.returned_pid
+        if receipt.returned_pid is not None and receipt.returned_pid > 0
+        else receipt.leader_pid
+    )
+    leader_reaped = not may_have_child
+    process_group_empty = not may_have_child
+
+    receipt.close_error_write(failures)
+    if may_have_child and leader_pid is None and receipt.error_read_fd >= 0:
+        try:
+            leader_pid = _read_launch_leader_receipt(
+                receipt.error_read_fd,
+                deadline=time.monotonic() + PROBE_TIMEOUT_SECONDS,
+            )
+        except BaseException as error:
+            failures.append(
+                f"recover-leader-receipt:{type(error).__name__}:"
+                f"{_bounded_text(str(error), limit=128)}"
+            )
+        else:
+            receipt.leader_pid = leader_pid
+            receipt.leader_receipt_received = True
+
+    if may_have_child and leader_pid is not None:
+        try:
+            _terminate_and_reap(leader_pid)
+        except BaseException as error:
+            failures.append(
+                f"terminate-reap-leader:{type(error).__name__}:"
+                f"{_bounded_text(str(error), limit=128)}"
+            )
+        else:
+            leader_reaped = True
+            process_group_empty = True
+
+    if not may_have_child or leader_pid is not None:
+        receipt.close_error_read(failures)
+    control_pipes_closed = receipt.control_pipes_closed
+    if leader_reaped and process_group_empty and control_pipes_closed:
+        return
+
+    evidence = NoChildLaunchClosureEvidence(
+        leader_pid=leader_pid,
+        fork_call_started=receipt.fork_call_started,
+        fork_call_completed=receipt.fork_call_completed,
+        pipe_ownership_published=owner.owns(receipt),
+        leader_receipt_received=receipt.leader_receipt_received,
+        exec_acknowledged=exec_acknowledged,
+        leader_binding_complete=leader_binding_complete,
+        leader_reaped=leader_reaped,
+        process_group_empty=process_group_empty,
+        control_pipes_closed=control_pipes_closed,
+        reason=";".join(failures)[:1024],
+    )
+    retained = NoChildLaunchClosureUnproven(evidence=evidence)
+    retained.retain_resource(prepared)
+    retained.retain_resource(owner)
+    retained.retain_resource(receipt)
+    if uncertain_result_owner is not None:
+        retained.retain_resource(uncertain_result_owner)
+    if launched_result is not None:
+        retained.retain_resource(launched_result)
+    for descriptor in (receipt.error_read_fd, receipt.error_write_fd):
+        if descriptor >= 0:
+            retained.retain_resource(descriptor)
+    raise retained from trigger
+
+
 def launch_prepared_no_child_process(
     prepared: PreparedNoChildProfile,
     argv: Sequence[str],
@@ -2304,6 +4092,7 @@ def launch_prepared_no_child_process(
     stdout_fd: int = 1,
     stderr_fd: int = 2,
     pass_fds: Sequence[int] = (),
+    result_owner: NoChildLaunchResultOwner | None = None,
 ) -> LaunchedNoChildProcess:
     """Launch one prepared target after parent and child-side revalidation.
 
@@ -2316,7 +4105,12 @@ def launch_prepared_no_child_process(
 
     require_compatible(prepared.evidence)
     _require_live_runtime(prepared.evidence)
-    if not argv or argv[0] != prepared.executable.path:
+    target = (
+        prepared.executable
+        if prepared.sandboxed_target is None
+        else prepared.sandboxed_target
+    )
+    if not argv or argv[0] != target.path:
         raise ValueError("argv[0] must be the exact authenticated executable path")
     if any(not isinstance(argument, str) or "\x00" in argument for argument in argv):
         raise ValueError("argv entries must be NUL-free strings")
@@ -2345,111 +4139,145 @@ def launch_prepared_no_child_process(
     )
     prove_exec_budget(sandbox_argv, environment=child_environment)
     parent_before = resource.getrlimit(resource.RLIMIT_NPROC)
-    pid, error_read, error_write = _fork_with_launch_error_pipe()
-    if pid == 0:
-        try:
-            os.close(error_read)
-        except BaseException as error:
-            _exit_child_launch_failure(error_write, error)
-        _launch_child(
-            prepared,
-            sandbox_argv,
-            cwd=pathlib.Path(cwd),
-            environment=child_environment,
-            stdin_fd=stdin_fd,
-            stdout_fd=stdout_fd,
-            stderr_fd=stderr_fd,
-            pass_fds=pass_fds,
-            error_write_fd=error_write,
+    launch_receipt_owner = _NoChildLaunchReceiptOwner()
+    exec_acknowledged = False
+    leader_binding_complete = False
+    launched_result: LaunchedNoChildProcess | None = None
+    try:
+        pid, error_read, error_write = _fork_with_launch_error_pipe(
+            launch_receipt_owner
         )
-        os._exit(127)
-
-    try:
-        os.close(error_write)
-    except BaseException:
-        _terminate_and_reap(pid)
-        _close_fd_quietly(error_read)
-        raise
-    try:
-        deadline = time.monotonic() + PROBE_TIMEOUT_SECONDS
-        payload = bytearray()
-        os.set_blocking(error_read, False)
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("sandbox-exec acknowledgement deadline expired")
-            readable, _, _ = select.select(
-                [error_read],
-                [],
-                [],
-                min(remaining, 0.1),
-            )
-            if not readable:
-                continue
-            chunk = os.read(error_read, 4096 - len(payload))
-            if not chunk:
-                break
-            payload.extend(chunk)
-            if len(payload) >= 4096:
-                raise ChildProcessError("launch failure record is oversized")
-        if payload:
-            os.waitpid(pid, 0)
+        launch_receipt = launch_receipt_owner.require_receipt()
+        if (
+            launch_receipt.error_read_fd != error_read
+            or launch_receipt.error_write_fd != error_write
+        ):
             raise ChildProcessError(
-                "no-child-process launch failed: " + payload.decode("utf-8", "replace")
+                "no-child launch helper returned pipes outside the receipt owner"
             )
-    except BaseException:
-        _terminate_and_reap(pid)
-        raise
-    finally:
-        os.close(error_read)
-    parent_after = resource.getrlimit(resource.RLIMIT_NPROC)
-    if parent_after != parent_before:
+        if pid == 0:
+            try:
+                launch_receipt.close_error_read()
+            except BaseException as error:
+                _exit_child_launch_failure(error_write, error)
+            _launch_child(
+                prepared,
+                sandbox_argv,
+                cwd=pathlib.Path(cwd),
+                environment=child_environment,
+                stdin_fd=stdin_fd,
+                stdout_fd=stdout_fd,
+                stderr_fd=stderr_fd,
+                pass_fds=pass_fds,
+                error_write_fd=error_write,
+            )
+            os._exit(127)
+        if (
+            launch_receipt.returned_pid != pid
+            or launch_receipt.leader_pid != pid
+            or not launch_receipt.leader_receipt_received
+        ):
+            raise ChildProcessError(
+                "no-child launch helper returned an unpublished leader"
+            )
         try:
-            os.kill(pid, 9)
-        except ProcessLookupError:
-            pass
-        os.waitpid(pid, 0)
-        raise NoChildProfileError("parent RLIMIT_NPROC changed during launch")
-    try:
-        pgid = os.getpgid(pid)
-        session_id = os.getsid(pid)
-        start_identity = process_start_identity(pid)
-    except (OSError, ValueError) as error:
+            launch_receipt.close_error_write()
+            deadline = time.monotonic() + PROBE_TIMEOUT_SECONDS
+            payload = bytearray()
+            os.set_blocking(launch_receipt.error_read_fd, False)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("sandbox-exec acknowledgement deadline expired")
+                readable, _, _ = select.select(
+                    [error_read],
+                    [],
+                    [],
+                    min(remaining, 0.1),
+                )
+                if not readable:
+                    continue
+                chunk = os.read(
+                    launch_receipt.error_read_fd,
+                    4096 - len(payload),
+                )
+                if not chunk:
+                    break
+                payload.extend(chunk)
+                if len(payload) >= 4096:
+                    raise ChildProcessError("launch failure record is oversized")
+            if payload:
+                raise ChildProcessError(
+                    "no-child-process launch failed: "
+                    + payload.decode("utf-8", "replace")
+                )
+            exec_acknowledged = True
+        finally:
+            launch_receipt.close_error_read()
+        parent_after = resource.getrlimit(resource.RLIMIT_NPROC)
+        if parent_after != parent_before:
+            raise NoChildProfileError("parent RLIMIT_NPROC changed during launch")
         try:
-            os.kill(pid, 9)
-        except ProcessLookupError:
-            pass
-        try:
-            os.waitpid(pid, 0)
-        except ChildProcessError:
-            pass
-        raise ChildProcessError(
-            f"cannot bind launched no-child-process leader: {error}"
-        ) from error
-    if pgid != pid or session_id != pid:
-        try:
-            os.kill(pid, 9)
-        except ProcessLookupError:
-            pass
-        try:
-            os.waitpid(pid, 0)
-        except ChildProcessError:
-            pass
-        raise ChildProcessError(
-            "launched process does not satisfy pid == pgid == session invariant"
+            pgid = os.getpgid(pid)
+            session_id = os.getsid(pid)
+            start_identity = process_start_identity(pid)
+        except (OSError, ValueError) as error:
+            raise ChildProcessError(
+                f"cannot bind launched no-child-process leader: {error}"
+            ) from error
+        leader_binding_complete = True
+        if pgid != pid or session_id != pid:
+            raise ChildProcessError(
+                "launched process does not satisfy pid == pgid == session invariant"
+            )
+        profile_sha256 = hashlib.sha256(
+            prepared.seatbelt_profile.encode("utf-8")
+        ).hexdigest()
+        launched_result = LaunchedNoChildProcess(
+            pid=pid,
+            pgid=pgid,
+            session_id=session_id,
+            start_identity=start_identity,
+            profile_sha256=profile_sha256,
+            passed_fd_numbers=tuple(range(3, 3 + len(pass_fds))),
+            executable=target,
+            evidence=prepared.evidence,
+            parent_nproc_before=parent_before,
+            parent_nproc_after=parent_after,
         )
-    profile_sha256 = hashlib.sha256(
-        prepared.seatbelt_profile.encode("utf-8")
-    ).hexdigest()
-    return LaunchedNoChildProcess(
-        pid=pid,
-        pgid=pgid,
-        session_id=session_id,
-        start_identity=start_identity,
-        profile_sha256=profile_sha256,
-        passed_fd_numbers=tuple(range(3, 3 + len(pass_fds))),
-        executable=prepared.executable,
-        evidence=prepared.evidence,
-        parent_nproc_before=parent_before,
-        parent_nproc_after=parent_after,
-    )
+        if result_owner is not None:
+            result_owner.publish(launched_result)
+            if not result_owner.owns(launched_result):
+                raise ChildProcessError(
+                    "no-child launch result owner did not retain the exact leader"
+                )
+        return launched_result
+    except BaseException as error:
+        launch_receipt = launch_receipt_owner.receipt
+        if launch_receipt is not None and launch_receipt.in_child_process:
+            if launch_receipt.error_write_fd >= 0:
+                _exit_child_launch_failure(
+                    launch_receipt.error_write_fd,
+                    error,
+                )
+            os._exit(127)
+        result_ownership_proved = False
+        result_owner_query_error: BaseException | None = None
+        if launched_result is not None and result_owner is not None:
+            try:
+                result_ownership_proved = result_owner.owns(launched_result)
+            except BaseException as query_error:
+                result_owner_query_error = query_error
+        if result_ownership_proved:
+            raise
+        _settle_owned_launch_after_base_exception(
+            launch_receipt_owner,
+            prepared=prepared,
+            exec_acknowledged=exec_acknowledged,
+            leader_binding_complete=leader_binding_complete,
+            trigger=error,
+            result_owner_query_error=result_owner_query_error,
+            uncertain_result_owner=result_owner,
+            launched_result=launched_result,
+        )
+        raise

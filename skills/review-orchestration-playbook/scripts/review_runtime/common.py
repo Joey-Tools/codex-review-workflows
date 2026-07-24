@@ -1190,6 +1190,7 @@ def _descriptor_cwd_command(
         launcher_command = (
             sys.executable,
             "-I",
+            "-B",
             "-S",
             str(launcher),
         )

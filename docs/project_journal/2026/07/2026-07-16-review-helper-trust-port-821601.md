@@ -1044,3 +1044,93 @@ metadata behavior.
   formatting, compileall with bytecode disabled, the repository contract
   assertion, and `git diff --check` pass. No local Python 3.10 run was
   performed.
+- The current-head formal Codex review of
+  `860fb175427ce3329bac3887bd123b228f452e14..290df232bb52326321f474747dbc0ed3398d5f14`
+  found three remaining trust-boundary gaps: preflight subprocesses did not
+  prove complete descendant closure, runtime/schema cleanup used pathname
+  recursion after custody, and executable/auth revalidation still treated
+  timestamp or directory-entry churn as mutation. The remediation routes every
+  compatibility, signature, version, help, and schema process through the
+  authenticated no-child launcher; Python workers use the revalidated absolute
+  interpreter with `-I -B -S`, a closed environment, and a fixed private
+  working directory. Every post-launch exception now either proves exact reap
+  and closure or retains the process receipt, writable output, snapshot
+  descriptors, runtime lease, and recovery custody.
+- Fresh focused audits then closed early selector and binding exceptions,
+  snapshot/runtime rollback leaks, access-token semantic drift, duplicate
+  ownership classification, cleanup ABA, and stale FD-number retry. External
+  ChatGPT auth revalidation reparses the exact committed source and binds token,
+  account, plan, expiry, content digest, object identity, and access policy as
+  separate properties. Runtime and snapshot deletion moves the exact child to a
+  held-parent quarantine name before revalidation and removal. The contract
+  explicitly retains the same-UID private-quarantine race as a POSIX host-TCB
+  limitation and promises zeroization only for mutable buffers, not immutable
+  Python parsing intermediates.
+- The fixed deterministic supervisor identity is 434 tests with SHA-256
+  `25a5286957939faae318bd606148339b05117ce0db1d55fe9de3b00a4fa161fe`;
+  all 434 passed in 174.967 seconds under Python 3.13.0. The required live
+  no-child set is 9 tests and passed in 10.499 seconds. Full Python 3.13.0
+  discovery ran 2,790 tests in 1,539.182 seconds with 6 expected platform
+  skips. Its two failures were the stale repository-contract counts introduced
+  by this same live/deterministic expansion and the documented nested Desktop
+  `sandbox-exec` denial. After updating the contract to 9 and 434, all 91
+  contract tests passed; the exact broker test passed outside the Desktop
+  sandbox in 3.108 seconds. Ruff lint, focused formatting for all 15 changed
+  Python files, the supervisor CLI, and `git diff --check` pass. Whole-scope
+  formatting still reports only two untouched pre-existing files. No local
+  Python 3.10 run was performed.
+- The current closure hardens preflight interpreter ancestry, launch ownership,
+  post-`Popen` interruption custody, executable snapshot rollback, quarantine
+  cleanup, and auth-refresh primary-failure preservation. The fixed
+  deterministic supervisor identity is now 462 tests with SHA-256
+  `13aca6cdf55d4b0de5b7cf67f499711705ac4b0422f0a5568aaa1f5d1cc16451`;
+  all 462 passed in 193.943 seconds under Python 3.13.0. All 91 repository
+  contract tests passed in 3.099 seconds, and the nine required live
+  no-child-profile tests passed outside the Desktop sandbox in 13.013 seconds.
+  Full Python 3.13.0 discovery ran 2,790 tests in 1,935.459 seconds with six
+  expected platform skips. Its only failure was the documented nested Desktop
+  `sandbox-exec` denial in
+  `test_claude_keychain_broker_serves_one_in_memory_value`; that exact test
+  passed outside the Desktop sandbox in 2.687 seconds. Ruff lint and focused
+  formatting pass for all 15 changed Python files, and `git diff --check`
+  passes. No local Python 3.10 run was performed.
+- The final descriptor-publication audit closed the remaining asynchronous
+  return/store and close-result windows. Control-pipe, path-anchor,
+  generated-schema, and custodied-manifest descriptor owners publish
+  `close-outcome-unproven` before `close`, retain the descriptor integer and
+  owner-specific receipt or object-identity evidence, and never retry an
+  ambiguous result. Manifest
+  retention becomes authoritative only after the exact manifest is reachable
+  from the typed error. Root deletion publishes a per-root
+  `remove-outcome-unproven` state before `rmdir` and completes each exact
+  durable-absence proof before the aggregate. Ordinary or asynchronous
+  `lifecycle.closed()` failure now enters typed retention before cleanup and
+  preserves the exact lease, executable custody, writable-root descriptors,
+  process state, and source error.
+- An externally reported installed-release drift was limited to runtime-created
+  CPython 3.13/3.14 bytecode beneath `review_runtime/__pycache__`; the existing
+  immutable release was not inspected, cleaned, overwritten, or reinstalled by
+  this workstream. Every shipped Python entrypoint now disables bytecode before
+  importing a local package, every internal Python child argv includes `-B`,
+  and copied-package regressions execute ordinary helper, reviewer, preflight,
+  validator, and package-import paths with ambient overrides removed and reject
+  any `__pycache__`, `.pyc`, or `.pyo` artifact.
+- The final follow-up closes five asynchronous ownership gaps. Parent at-fork
+  completion now remains authoritative when an `OSError` arrives after a
+  successful fork but before the caller stores the PID. Probe and preflight
+  descriptor owners publish an ambiguous close state before the syscall and
+  never retry a possibly reused descriptor integer. Runtime cleanup prepublishes
+  both manifest and deletion result owners, preserves complete or partial
+  per-root deletion proof, and retains a live or close-ambiguous manifest
+  without a second close from `finally`.
+- The fixed deterministic supervisor identity is 514 tests with SHA-256
+  `37a3e36e00e9891450d1b9d4f1b0a5092f598b3037c607b209fd4d38c2d41632`;
+  all 514 passed in 215.885 seconds under Python 3.13.0. The focused
+  executable/recovery/runtime set passed 155 tests with two expected platform
+  skips, all 49 no-child unit tests passed, and all 93 repository contract tests
+  passed. The required nine live no-child tests passed outside the Desktop
+  sandbox in 12.560 seconds. Full Python 3.13.0 discovery ran 2,792 tests in
+  1,818.564 seconds with six expected platform skips and no failures. Ruff lint
+  and formatting pass for all 25 changed Python or Python entrypoint files, and
+  `git diff --check` passes. The signed exact-head live rerun and formal named
+  lanes remain explicit delivery gates. No local Python 3.10 run was performed.

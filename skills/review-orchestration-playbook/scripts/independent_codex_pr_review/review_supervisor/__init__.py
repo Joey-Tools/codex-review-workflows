@@ -1,5 +1,9 @@
 """Independent Codex PR review supervisor."""
 
-from .constants import VERSION
+import sys
+
+sys.dont_write_bytecode = True
+
+from .constants import VERSION  # noqa: E402
 
 __all__ = ["VERSION"]

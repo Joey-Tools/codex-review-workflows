@@ -16,25 +16,27 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, BinaryIO, Mapping
 
-from review_runtime.claude_capabilities import (
+sys.dont_write_bytecode = True
+
+from review_runtime.claude_capabilities import (  # noqa: E402
     CLAUDE_REQUIRED_OPTIONS,
     ClaudeCapabilities,
 )
-from review_runtime.claude_linux import (
+from review_runtime.claude_linux import (  # noqa: E402
     SANDBOX_WORKSPACE as CLAUDE_LINUX_SANDBOX_WORKSPACE,
 )
-from review_runtime.claude_provenance import (
+from review_runtime.claude_provenance import (  # noqa: E402
     CLAUDE_RELEASE_KEY_FINGERPRINT,
     CLAUDE_SUPPORTED_PLATFORM_BINARIES,
     VerifiedClaudeExecutable,
     release_artifact_urls,
 )
-from review_runtime.claude_version_policy import (
+from review_runtime.claude_version_policy import (  # noqa: E402
     CLAUDE_COMPATIBILITY_SPEC,
     ClaudeVersionPolicyError,
     parse_compatible_release_version,
 )
-from review_runtime import claude_stream_contract
+from review_runtime import claude_stream_contract  # noqa: E402
 
 
 CLAUDE_CODE_VERSION_CONTRACT = {

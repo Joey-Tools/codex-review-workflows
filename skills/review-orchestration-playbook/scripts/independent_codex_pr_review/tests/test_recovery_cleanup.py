@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import dis
+import errno
 import os
 import pathlib
 import shutil
 import stat
+import sys
 import time
 import unittest
 from unittest import mock
 
 import review_supervisor.gitraw as gitraw
+import review_supervisor.recovery_cleanup as recovery_cleanup
 import review_supervisor.runtime as runtime
 
 from review_supervisor.constants import (
@@ -31,14 +35,24 @@ from review_supervisor.ledger import (
 )
 from review_supervisor.models import Identity
 from review_supervisor.recovery_cleanup import (
+    CustodiedDeletionResultOwner,
+    CustodiedManifestResultOwner,
+    CustodyLostError,
+    QuarantinedRootRecoveryEvidence,
     RootSpec,
     _KIND_DIRECTORY,
     _index_manifest_records,
     build_custodied_manifest,
     delete_custodied_roots,
+    quarantine_and_remove_empty_root,
+    quarantined_root_recovery_evidence,
 )
 from review_supervisor.runtime import _cleanup_worktree, _registration_json
-from review_supervisor.secureio import canonical_json, identity_from_stat
+from review_supervisor.secureio import (
+    canonical_json,
+    directory_identities_match,
+    identity_from_stat,
+)
 
 from tests.support import bind_attempt_state, owned_temporary_directory
 from tests.test_git_checkout import GIT, _build_repository
@@ -47,6 +61,38 @@ from tests.test_git_checkout import GIT, _build_repository
 ENTRYPOINT = (
     pathlib.Path(__file__).resolve().parent.parent / "independent-codex-pr-review"
 )
+
+
+def _call_followup_offset(
+    function: object,
+    *,
+    called_name: str,
+    following_opname: str,
+    following_argval: str | None = None,
+) -> int:
+    instructions = tuple(dis.get_instructions(function))
+    for index, instruction in enumerate(instructions):
+        if not instruction.opname.startswith("CALL"):
+            continue
+        prior = instructions[max(0, index - 64) : index]
+        if not any(candidate.argval == called_name for candidate in prior):
+            continue
+        following = instructions[index + 1]
+        if following.opname != following_opname:
+            continue
+        if following_argval is None or following.argval == following_argval:
+            return following.offset
+    raise AssertionError(
+        f"cannot find {called_name} CALL-to-{following_opname} boundary"
+    )
+
+
+def _instruction_after_offset(function: object, offset: int) -> int:
+    instructions = tuple(dis.get_instructions(function))
+    for index, instruction in enumerate(instructions[:-1]):
+        if instruction.offset == offset:
+            return instructions[index + 1].offset
+    raise AssertionError(f"cannot find instruction after offset {offset}")
 
 
 class _CountingRecord:
@@ -83,6 +129,642 @@ class _CountingRecords:
 
 
 class ManifestTraversalTests(unittest.TestCase):
+    def _build_empty_manifest(
+        self,
+        root: pathlib.Path,
+        *names: str,
+    ) -> tuple[recovery_cleanup.CustodiedManifest, int]:
+        parent = root / "parent"
+        parent.mkdir(mode=0o700)
+        control = root / "control"
+        control.mkdir(mode=0o700)
+        parent_fd = os.open(
+            parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        roots: list[RootSpec] = []
+        for name in names:
+            target = parent / name
+            target.mkdir(mode=0o700)
+            roots.append(
+                RootSpec(
+                    label=f"close-{name}",
+                    parent_fd=parent_fd,
+                    parent_identity=identity_from_stat(os.fstat(parent_fd)),
+                    name=os.fsencode(name),
+                    expected_identity=identity_from_stat(os.stat(target)),
+                )
+            )
+        manifest = build_custodied_manifest(
+            roots=tuple(roots),
+            manifest_path=control / "manifest.bin",
+            entry_cap=10,
+            payload_cap=4096,
+            deadline=time.monotonic() + 5.0,
+        )
+        return manifest, parent_fd
+
+    def test_manifest_close_partial_interrupt_retains_only_live_descriptors(
+        self,
+    ) -> None:
+        with owned_temporary_directory("manifest-close-partial-") as root:
+            manifest, parent_fd = self._build_empty_manifest(
+                root,
+                "first",
+                "second",
+            )
+            original_fds = tuple(manifest.root_fds)
+            close_discard_offset = _call_followup_offset(
+                recovery_cleanup.CustodiedManifest.close,
+                called_name="close",
+                following_opname="POP_TOP",
+            )
+            target_offset = _instruction_after_offset(
+                recovery_cleanup.CustodiedManifest.close,
+                close_discard_offset,
+            )
+            interruption = KeyboardInterrupt(
+                "injected partial manifest close interrupt"
+            )
+            injected = False
+
+            def interrupt_first_close(
+                frame: object,
+                event: str,
+                _argument: object,
+            ) -> object:
+                nonlocal injected
+                if (
+                    getattr(frame, "f_code", None)
+                    is recovery_cleanup.CustodiedManifest.close.__code__
+                ):
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                        and getattr(frame, "f_locals", {}).get("index") == 0
+                    ):
+                        injected = True
+                        raise interruption
+                return interrupt_first_close
+
+            previous_trace = sys.gettrace()
+            try:
+                sys.settrace(interrupt_first_close)
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    manifest.close()
+            finally:
+                sys.settrace(previous_trace)
+
+            try:
+                self.assertTrue(injected)
+                self.assertIs(caught.exception, interruption)
+                self.assertFalse(manifest._closed)
+                self.assertEqual(manifest.root_fds, [original_fds[1]])
+                with self.assertRaises(OSError) as first_closed:
+                    os.fstat(original_fds[0])
+                self.assertEqual(first_closed.exception.errno, errno.EBADF)
+                os.fstat(original_fds[1])
+                self.assertEqual(
+                    manifest.close_evidence[-1].state,
+                    "ownership-ambiguous-closed-or-missing",
+                )
+                self.assertEqual(
+                    manifest.close_evidence[-1].protected_property,
+                    "open-file-description-close-ownership",
+                )
+                manifest.close()
+                self.assertTrue(manifest._closed)
+                self.assertEqual(manifest.root_fds, [])
+                with self.assertRaises(OSError) as second_closed:
+                    os.fstat(original_fds[1])
+                self.assertEqual(second_closed.exception.errno, errno.EBADF)
+            finally:
+                if manifest.root_fds:
+                    manifest.close()
+                os.close(parent_fd)
+
+    def test_manifest_close_result_interrupt_never_closes_reused_descriptor(
+        self,
+    ) -> None:
+        with owned_temporary_directory("manifest-close-reused-") as root:
+            manifest, parent_fd = self._build_empty_manifest(root, "target")
+            original_fd = manifest.root_fds[0]
+            close_discard_offset = _call_followup_offset(
+                recovery_cleanup.CustodiedManifest.close,
+                called_name="close",
+                following_opname="POP_TOP",
+            )
+            target_offset = _instruction_after_offset(
+                recovery_cleanup.CustodiedManifest.close,
+                close_discard_offset,
+            )
+            interruption = KeyboardInterrupt(
+                "injected manifest close result interrupt with FD reuse"
+            )
+            injected = False
+            reused_fd: int | None = None
+
+            def interrupt_and_reuse(
+                frame: object,
+                event: str,
+                _argument: object,
+            ) -> object:
+                nonlocal injected, reused_fd
+                if (
+                    getattr(frame, "f_code", None)
+                    is recovery_cleanup.CustodiedManifest.close.__code__
+                ):
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        reused_fd = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+                        raise interruption
+                return interrupt_and_reuse
+
+            previous_trace = sys.gettrace()
+            try:
+                sys.settrace(interrupt_and_reuse)
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    manifest.close()
+            finally:
+                sys.settrace(previous_trace)
+
+            try:
+                self.assertTrue(injected)
+                self.assertIs(caught.exception, interruption)
+                self.assertEqual(reused_fd, original_fd)
+                self.assertEqual(manifest.root_fds, [])
+                self.assertFalse(manifest._closed)
+                self.assertEqual(
+                    manifest.close_evidence[-1].state,
+                    "ownership-ambiguous-identity-mismatch",
+                )
+                with self.assertRaisesRegex(
+                    CustodyLostError,
+                    "ownership-ambiguous-identity-mismatch",
+                ):
+                    manifest.close()
+                assert reused_fd is not None
+                os.fstat(reused_fd)
+            finally:
+                if reused_fd is not None:
+                    os.close(reused_fd)
+                os.close(parent_fd)
+
+    def test_manifest_close_result_interrupt_never_closes_same_root_reuse(
+        self,
+    ) -> None:
+        with owned_temporary_directory("manifest-close-same-root-reuse-") as root:
+            manifest, parent_fd = self._build_empty_manifest(root, "target")
+            original_fd = manifest.root_fds[0]
+            target = root / "parent" / "target"
+            close_discard_offset = _call_followup_offset(
+                recovery_cleanup.CustodiedManifest.close,
+                called_name="close",
+                following_opname="POP_TOP",
+            )
+            target_offset = _instruction_after_offset(
+                recovery_cleanup.CustodiedManifest.close,
+                close_discard_offset,
+            )
+            interruption = KeyboardInterrupt(
+                "injected manifest close result interrupt with same-root FD reuse"
+            )
+            injected = False
+            reused_fd: int | None = None
+
+            def interrupt_and_reopen_same_root(
+                frame: object,
+                event: str,
+                _argument: object,
+            ) -> object:
+                nonlocal injected, reused_fd
+                if (
+                    getattr(frame, "f_code", None)
+                    is recovery_cleanup.CustodiedManifest.close.__code__
+                ):
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        reused_fd = os.open(
+                            target,
+                            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        )
+                        raise interruption
+                return interrupt_and_reopen_same_root
+
+            previous_trace = sys.gettrace()
+            try:
+                sys.settrace(interrupt_and_reopen_same_root)
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    manifest.close()
+            finally:
+                sys.settrace(previous_trace)
+
+            try:
+                self.assertTrue(injected)
+                self.assertIs(caught.exception, interruption)
+                self.assertEqual(reused_fd, original_fd)
+                self.assertEqual(manifest.root_fds, [])
+                self.assertFalse(manifest._closed)
+                evidence = manifest.close_evidence[-1]
+                self.assertEqual(
+                    evidence.state,
+                    "ownership-ambiguous-live-same-object",
+                )
+                assert evidence.observed_identity is not None
+                self.assertTrue(
+                    directory_identities_match(
+                        evidence.observed_identity,
+                        evidence.expected_identity,
+                    )
+                )
+                assert reused_fd is not None
+                for _ in range(2):
+                    with self.assertRaisesRegex(
+                        CustodyLostError,
+                        "ownership-ambiguous-live-same-object",
+                    ):
+                        manifest.close()
+                    os.fstat(reused_fd)
+            finally:
+                if reused_fd is not None:
+                    os.close(reused_fd)
+                os.close(parent_fd)
+
+    def test_manifest_close_result_interrupt_records_unreadable_ambiguity(
+        self,
+    ) -> None:
+        with owned_temporary_directory("manifest-close-result-unreadable-") as root:
+            manifest, parent_fd = self._build_empty_manifest(root, "target")
+            descriptor = manifest.root_fds[0]
+            interruption = KeyboardInterrupt(
+                "injected manifest close call interrupt before close"
+            )
+            real_close = os.close
+            real_fstat = os.fstat
+            descriptor_fstat_calls = 0
+
+            def interrupt_close(candidate: int) -> None:
+                if candidate == descriptor:
+                    raise interruption
+                real_close(candidate)
+
+            def unreadable_after_close(candidate: int):
+                nonlocal descriptor_fstat_calls
+                if candidate == descriptor:
+                    descriptor_fstat_calls += 1
+                    if descriptor_fstat_calls > 1:
+                        raise OSError(
+                            errno.EIO,
+                            "injected post-close unreadable descriptor",
+                        )
+                return real_fstat(candidate)
+
+            try:
+                with (
+                    mock.patch.object(
+                        recovery_cleanup.os,
+                        "close",
+                        side_effect=interrupt_close,
+                    ),
+                    mock.patch.object(
+                        recovery_cleanup.os,
+                        "fstat",
+                        side_effect=unreadable_after_close,
+                    ),
+                    self.assertRaises(KeyboardInterrupt) as caught,
+                ):
+                    manifest.close()
+                self.assertIs(caught.exception, interruption)
+                self.assertEqual(manifest.root_fds, [])
+                self.assertEqual(
+                    manifest.close_evidence[-1].state,
+                    "ownership-ambiguous-unreadable",
+                )
+                with self.assertRaisesRegex(
+                    CustodyLostError,
+                    "ownership-ambiguous-unreadable",
+                ):
+                    manifest.close()
+                os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+                os.close(parent_fd)
+
+    def test_manifest_close_distinguishes_missing_and_unreadable_custody(
+        self,
+    ) -> None:
+        with self.subTest(state="missing"):
+            with owned_temporary_directory("manifest-close-missing-") as root:
+                manifest, parent_fd = self._build_empty_manifest(root, "target")
+                descriptor = manifest.root_fds[0]
+                os.close(descriptor)
+                try:
+                    with self.assertRaisesRegex(
+                        CustodyLostError,
+                        "missing-before-close",
+                    ):
+                        manifest.close()
+                    self.assertEqual(manifest.root_fds, [])
+                    self.assertFalse(manifest._closed)
+                    self.assertEqual(
+                        manifest.close_evidence[-1].state,
+                        "missing-before-close",
+                    )
+                finally:
+                    os.close(parent_fd)
+
+        with self.subTest(state="unreadable"):
+            with owned_temporary_directory("manifest-close-unreadable-") as root:
+                manifest, parent_fd = self._build_empty_manifest(root, "target")
+                descriptor = manifest.root_fds[0]
+                real_fstat = os.fstat
+
+                def unreadable(candidate: int):
+                    if candidate == descriptor:
+                        raise OSError(errno.EIO, "injected unreadable descriptor")
+                    return real_fstat(candidate)
+
+                try:
+                    with (
+                        mock.patch.object(
+                            recovery_cleanup.os,
+                            "fstat",
+                            side_effect=unreadable,
+                        ),
+                        self.assertRaisesRegex(
+                            CustodyLostError,
+                            "unreadable",
+                        ),
+                    ):
+                        manifest.close()
+                    self.assertEqual(manifest.root_fds, [])
+                    self.assertFalse(manifest._closed)
+                    self.assertEqual(
+                        manifest.close_evidence[-1].state,
+                        "unreadable",
+                    )
+                    with self.assertRaisesRegex(CustodyLostError, "unreadable"):
+                        manifest.close()
+                    os.fstat(descriptor)
+                finally:
+                    os.close(descriptor)
+                    os.close(parent_fd)
+
+    def test_delete_result_owner_recovers_call_to_store_interrupt(self) -> None:
+        with owned_temporary_directory("manifest-delete-result-owner-") as root:
+            manifest, parent_fd = self._build_empty_manifest(root, "target")
+            result_owner = CustodiedDeletionResultOwner()
+
+            def caller() -> dict[str, object]:
+                proof = delete_custodied_roots(
+                    manifest,
+                    result_owner=result_owner,
+                )
+                result_owner.transfer(proof)
+                return result_owner.finish()
+
+            target_offset = _call_followup_offset(
+                caller,
+                called_name="delete_custodied_roots",
+                following_opname="STORE_FAST",
+                following_argval="proof",
+            )
+            interruption = KeyboardInterrupt(
+                "injected deletion result CALL-to-STORE interrupt"
+            )
+            injected = False
+
+            def interrupt_result_store(
+                frame: object,
+                event: str,
+                _argument: object,
+            ) -> object:
+                nonlocal injected
+                if getattr(frame, "f_code", None) is caller.__code__:
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        raise interruption
+                return interrupt_result_store
+
+            previous_trace = sys.gettrace()
+            try:
+                sys.settrace(interrupt_result_store)
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    caller()
+            finally:
+                sys.settrace(previous_trace)
+
+            try:
+                self.assertTrue(injected)
+                self.assertIs(caught.exception, interruption)
+                self.assertIsNotNone(result_owner.proof)
+                self.assertFalse(result_owner.transferred)
+                self.assertFalse(result_owner.finished)
+                proof = result_owner.finish()
+                self.assertIs(proof, result_owner.proof)
+                self.assertIs(result_owner.finish(), proof)
+                self.assertIs(result_owner.transfer(proof), proof)
+                self.assertIs(result_owner.transfer(proof), proof)
+                self.assertTrue(result_owner.transferred)
+                self.assertTrue(result_owner.finished)
+                self.assertEqual(proof["manifest_sha256"], manifest.seal["sha256"])
+                self.assertEqual(
+                    proof["manifest_record_count"],
+                    manifest.seal["record_count"],
+                )
+                self.assertEqual(proof["removed_entries"], 1)
+                self.assertTrue(proof["parent_fsync_complete"])
+                self.assertTrue(proof["exact_names_absent"])
+                self.assertFalse((root / "parent" / "target").exists())
+            finally:
+                manifest.close()
+                os.close(parent_fd)
+
+    def test_root_deletion_proof_precedes_aggregate_publication(self) -> None:
+        with owned_temporary_directory("manifest-root-proof-owner-") as root:
+            manifest, parent_fd = self._build_empty_manifest(root, "target")
+            result_owner = CustodiedDeletionResultOwner()
+            target_offset = _call_followup_offset(
+                delete_custodied_roots,
+                called_name="_remove_quarantined_empty_root",
+                following_opname="POP_TOP",
+            )
+            interruption = KeyboardInterrupt(
+                "injected root deletion result interruption"
+            )
+            injected = False
+
+            def interrupt_after_root_proof(
+                frame: object,
+                event: str,
+                _argument: object,
+            ) -> object:
+                nonlocal injected
+                if getattr(frame, "f_code", None) is delete_custodied_roots.__code__:
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        raise interruption
+                return interrupt_after_root_proof
+
+            previous_trace = sys.gettrace()
+            try:
+                sys.settrace(interrupt_after_root_proof)
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    delete_custodied_roots(
+                        manifest,
+                        result_owner=result_owner,
+                    )
+            finally:
+                sys.settrace(previous_trace)
+
+            try:
+                self.assertTrue(injected)
+                self.assertIs(caught.exception, interruption)
+                self.assertFalse((root / "parent" / "target").exists())
+                self.assertIsNone(result_owner.proof)
+                self.assertEqual(len(result_owner.root_outcomes), 1)
+                outcome = result_owner.root_outcomes[0]
+                self.assertEqual(outcome.state, "complete")
+                self.assertIsNotNone(outcome.proof)
+                assert outcome.proof is not None
+                self.assertTrue(outcome.proof["exact_name_absent"])
+                self.assertTrue(outcome.proof["quarantine_name_absent"])
+            finally:
+                manifest.close()
+                os.close(parent_fd)
+
+    def test_second_root_early_failure_preserves_first_root_proof_owner(
+        self,
+    ) -> None:
+        with owned_temporary_directory("manifest-two-root-owner-") as root:
+            manifest, parent_fd = self._build_empty_manifest(
+                root,
+                "first",
+                "second",
+            )
+            result_owner = CustodiedDeletionResultOwner()
+            original_require = manifest.require_root_custody
+            second_root_checks = 0
+            injected = CustodyLostError("synthetic second-root early failure")
+
+            def fail_second_loop_check(index: int) -> None:
+                nonlocal second_root_checks
+                original_require(index)
+                if index == 1:
+                    second_root_checks += 1
+                    if second_root_checks == 2:
+                        raise injected
+
+            try:
+                with (
+                    mock.patch.object(
+                        manifest,
+                        "require_root_custody",
+                        side_effect=fail_second_loop_check,
+                    ),
+                    self.assertRaises(CustodyLostError) as caught,
+                ):
+                    delete_custodied_roots(
+                        manifest,
+                        result_owner=result_owner,
+                    )
+
+                self.assertIs(caught.exception, injected)
+                self.assertIs(
+                    caught.exception.custodied_deletion_result_owner,
+                    result_owner,
+                )
+                self.assertEqual(len(result_owner.root_outcomes), 1)
+                outcome = result_owner.root_outcomes[0]
+                self.assertEqual(outcome.root_index, 0)
+                self.assertEqual(outcome.state, "complete")
+                self.assertIsNotNone(outcome.proof)
+                self.assertFalse((root / "parent" / "first").exists())
+                self.assertTrue((root / "parent" / "second").is_dir())
+            finally:
+                manifest.close()
+                os.close(parent_fd)
+
+    def test_manifest_retention_call_to_store_keeps_error_owner(self) -> None:
+        with owned_temporary_directory("manifest-retention-owner-") as root:
+            manifest, parent_fd = self._build_empty_manifest(root, "target")
+            result_owner = CustodiedManifestResultOwner()
+            result_owner.publish(manifest)
+            retention_error = RuntimeError("synthetic retention")
+            retention_error.retained_resources = []
+
+            def caller() -> recovery_cleanup.CustodiedManifest:
+                retained_manifest = result_owner.retain(retention_error)
+                return retained_manifest
+
+            target_offset = _call_followup_offset(
+                caller,
+                called_name="retain",
+                following_opname="STORE_FAST",
+                following_argval="retained_manifest",
+            )
+            interruption = KeyboardInterrupt(
+                "injected manifest retention result interruption"
+            )
+            injected = False
+
+            def interrupt_result_store(
+                frame: object,
+                event: str,
+                _argument: object,
+            ) -> object:
+                nonlocal injected
+                if getattr(frame, "f_code", None) is caller.__code__:
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        raise interruption
+                return interrupt_result_store
+
+            previous_trace = sys.gettrace()
+            try:
+                sys.settrace(interrupt_result_store)
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    caller()
+            finally:
+                sys.settrace(previous_trace)
+
+            try:
+                self.assertTrue(injected)
+                self.assertIs(caught.exception, interruption)
+                self.assertTrue(result_owner.preserves(manifest))
+                self.assertIn(manifest, retention_error.retained_resources)
+                os.fstat(manifest.root_fds[0])
+            finally:
+                manifest.close()
+                os.close(parent_fd)
+
     def test_large_manifest_index_is_linear(self) -> None:
         child_count = 10_000
         counters = {"iterations": 0, "path_reads": 0}
@@ -118,7 +800,9 @@ class ManifestTraversalTests(unittest.TestCase):
         self.assertEqual(len(index[(0, b"")]), child_count)
         self.assertEqual(sum(len(children) for children in index.values()), child_count)
 
-    def test_delete_deadline_after_identity_check_changes_nothing(self) -> None:
+    def test_delete_deadline_after_quarantine_retains_tree_without_recursion(
+        self,
+    ) -> None:
         with owned_temporary_directory("manifest-deadline-") as root:
             parent = root / "parent"
             parent.mkdir(mode=0o700)
@@ -164,9 +848,663 @@ class ManifestTraversalTests(unittest.TestCase):
                     ):
                         with self.assertRaisesRegex(TimeoutError, "deadline expired"):
                             delete_custodied_roots(manifest)
-                self.assertTrue(target.is_dir())
-                self.assertEqual(payload.read_bytes(), b"retained\n")
+                self.assertFalse(target.exists())
+                quarantines = tuple(
+                    path
+                    for path in parent.iterdir()
+                    if path.name.startswith(".targeted-cleanup-quarantine-")
+                )
+                self.assertEqual(len(quarantines), 1)
+                self.assertEqual(
+                    (quarantines[0] / payload.name).read_bytes(),
+                    b"retained\n",
+                )
             finally:
+                os.close(parent_fd)
+
+    def test_delete_quarantines_root_before_recursive_deletion(self) -> None:
+        with owned_temporary_directory("manifest-quarantine-order-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+            target = parent / "target"
+            target.mkdir(mode=0o700)
+            nested = target / "nested"
+            nested.mkdir(mode=0o700)
+            payload = nested / "payload.txt"
+            payload.write_bytes(b"delete after quarantine\n")
+            payload.chmod(0o600)
+            control = root / "control"
+            control.mkdir(mode=0o700)
+            parent_fd = os.open(
+                parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            target_identity = identity_from_stat(os.stat(target))
+            try:
+                manifest = build_custodied_manifest(
+                    roots=(
+                        RootSpec(
+                            label="checkout",
+                            parent_fd=parent_fd,
+                            parent_identity=identity_from_stat(os.fstat(parent_fd)),
+                            name=b"target",
+                            expected_identity=target_identity,
+                        ),
+                    ),
+                    manifest_path=control / "manifest.bin",
+                    entry_cap=10,
+                    payload_cap=4096,
+                    deadline=time.monotonic() + 5.0,
+                )
+                real_delete = recovery_cleanup._delete_directory_contents
+                root_recursions = 0
+
+                def observe_quarantine_before_delete(**kwargs):
+                    nonlocal root_recursions
+                    if kwargs["prefix"] == b"":
+                        root_recursions += 1
+                        self.assertFalse(target.exists())
+                        quarantines = tuple(
+                            path
+                            for path in parent.iterdir()
+                            if path.name.startswith(".targeted-cleanup-quarantine-")
+                        )
+                        self.assertEqual(len(quarantines), 1)
+                        self.assertTrue(
+                            directory_identities_match(
+                                identity_from_stat(os.stat(quarantines[0])),
+                                target_identity,
+                            )
+                        )
+                        self.assertEqual(
+                            (quarantines[0] / nested.name / payload.name).read_bytes(),
+                            b"delete after quarantine\n",
+                        )
+                    return real_delete(**kwargs)
+
+                with (
+                    manifest,
+                    mock.patch.object(
+                        recovery_cleanup,
+                        "_delete_directory_contents",
+                        side_effect=observe_quarantine_before_delete,
+                    ),
+                ):
+                    proof = delete_custodied_roots(manifest)
+
+                self.assertEqual(root_recursions, 1)
+                self.assertEqual(
+                    proof["removed_entries"],
+                    proof["manifest_record_count"],
+                )
+                self.assertFalse(target.exists())
+                self.assertFalse(
+                    any(
+                        path.name.startswith(".targeted-cleanup-quarantine-")
+                        for path in parent.iterdir()
+                    )
+                )
+            finally:
+                os.close(parent_fd)
+
+    def test_quarantine_rename_result_interrupt_exposes_live_recovery_fds(
+        self,
+    ) -> None:
+        with owned_temporary_directory("cleanup-quarantine-rename-result-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+            target = parent / "target"
+            target.mkdir(mode=0o700)
+            parent_fd = os.open(
+                parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            target_fd = os.open(
+                target,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            target_identity = identity_from_stat(os.fstat(target_fd))
+            target_offset = _call_followup_offset(
+                recovery_cleanup._quarantine_custodied_root,
+                called_name="rename",
+                following_opname="POP_TOP",
+            )
+            interruption = KeyboardInterrupt(
+                "injected quarantine rename syscall-result interrupt"
+            )
+            injected = False
+
+            def interrupt_rename_result(
+                frame: object,
+                event: str,
+                _argument: object,
+            ) -> object:
+                nonlocal injected
+                if (
+                    getattr(frame, "f_code", None)
+                    is recovery_cleanup._quarantine_custodied_root.__code__
+                ):
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        raise interruption
+                return interrupt_rename_result
+
+            previous_trace = sys.gettrace()
+            try:
+                sys.settrace(interrupt_rename_result)
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    recovery_cleanup._quarantine_custodied_root(
+                        RootSpec(
+                            label="rename-result-regression",
+                            parent_fd=parent_fd,
+                            parent_identity=identity_from_stat(os.fstat(parent_fd)),
+                            name=b"target",
+                            expected_identity=target_identity,
+                        ),
+                        target_fd,
+                        deadline=time.monotonic() + 5.0,
+                    )
+            finally:
+                sys.settrace(previous_trace)
+
+            try:
+                self.assertTrue(injected)
+                self.assertIs(caught.exception, interruption)
+                evidence = quarantined_root_recovery_evidence(caught.exception)
+                self.assertEqual(len(evidence), 1)
+                self.assertEqual(evidence[0].stage, "rename-result-unproven")
+                self.assertEqual(
+                    evidence[0].protected_property,
+                    "object-identity-and-access-policy",
+                )
+                os.fstat(evidence[0].parent_fd)
+                os.fstat(evidence[0].root_fd)
+                self.assertFalse(target.exists())
+                self.assertTrue(
+                    (parent / os.fsdecode(evidence[0].quarantine_name)).is_dir()
+                )
+            finally:
+                os.close(target_fd)
+                os.close(parent_fd)
+
+    def test_quarantine_return_store_interrupt_preserves_prepublished_owner(
+        self,
+    ) -> None:
+        with owned_temporary_directory("cleanup-quarantine-return-store-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+            target = parent / "target"
+            target.mkdir(mode=0o700)
+            parent_fd = os.open(
+                parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            target_fd = os.open(
+                target,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            target_identity = identity_from_stat(os.fstat(target_fd))
+            target_offset = _call_followup_offset(
+                quarantine_and_remove_empty_root,
+                called_name="_quarantine_custodied_root",
+                following_opname="STORE_FAST",
+                following_argval="quarantine_name",
+            )
+            interruption = KeyboardInterrupt(
+                "injected quarantine return CALL-to-STORE interrupt"
+            )
+            injected = False
+
+            def interrupt_result_store(
+                frame: object,
+                event: str,
+                _argument: object,
+            ) -> object:
+                nonlocal injected
+                if (
+                    getattr(frame, "f_code", None)
+                    is quarantine_and_remove_empty_root.__code__
+                ):
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        raise interruption
+                return interrupt_result_store
+
+            previous_trace = sys.gettrace()
+            try:
+                sys.settrace(interrupt_result_store)
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    quarantine_and_remove_empty_root(
+                        RootSpec(
+                            label="return-store-regression",
+                            parent_fd=parent_fd,
+                            parent_identity=identity_from_stat(os.fstat(parent_fd)),
+                            name=b"target",
+                            expected_identity=target_identity,
+                        ),
+                        target_fd,
+                        deadline=time.monotonic() + 5.0,
+                    )
+            finally:
+                sys.settrace(previous_trace)
+
+            try:
+                self.assertTrue(injected)
+                self.assertIs(caught.exception, interruption)
+                evidence = quarantined_root_recovery_evidence(caught.exception)
+                self.assertEqual(len(evidence), 1)
+                self.assertEqual(
+                    evidence[0].stage,
+                    "quarantine-result-publication",
+                )
+                os.fstat(evidence[0].parent_fd)
+                os.fstat(evidence[0].root_fd)
+                self.assertFalse(target.exists())
+                self.assertTrue(
+                    (parent / os.fsdecode(evidence[0].quarantine_name)).is_dir()
+                )
+            finally:
+                os.close(target_fd)
+                os.close(parent_fd)
+
+    def test_post_rename_fsync_failure_exposes_quarantine_recovery(self) -> None:
+        with owned_temporary_directory("cleanup-quarantine-fsync-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+            target = parent / "target"
+            target.mkdir(mode=0o700)
+            parent_fd = os.open(
+                parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            target_fd = os.open(
+                target,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            target_identity = identity_from_stat(os.fstat(target_fd))
+            cause = RuntimeError("synthetic fsync cause")
+            injected = OSError("synthetic parent fsync failure")
+            injected.__cause__ = cause
+            try:
+                with (
+                    mock.patch.object(
+                        recovery_cleanup.os,
+                        "fsync",
+                        side_effect=injected,
+                    ),
+                    self.assertRaises(OSError) as caught,
+                ):
+                    recovery_cleanup._quarantine_custodied_root(
+                        RootSpec(
+                            label="fsync-regression",
+                            parent_fd=parent_fd,
+                            parent_identity=identity_from_stat(os.fstat(parent_fd)),
+                            name=b"target",
+                            expected_identity=target_identity,
+                        ),
+                        target_fd,
+                        deadline=time.monotonic() + 5.0,
+                    )
+
+                self.assertIs(caught.exception, injected)
+                self.assertIs(caught.exception.__cause__, cause)
+                evidence = quarantined_root_recovery_evidence(caught.exception)
+                self.assertEqual(len(evidence), 1)
+                self.assertIsInstance(
+                    evidence[0],
+                    QuarantinedRootRecoveryEvidence,
+                )
+                self.assertEqual(evidence[0].stage, "post-rename-parent-fsync")
+                self.assertEqual(evidence[0].parent_fd, parent_fd)
+                self.assertEqual(evidence[0].root_fd, target_fd)
+                self.assertEqual(evidence[0].original_name, b"target")
+                self.assertEqual(
+                    evidence[0].parent_identity,
+                    identity_from_stat(os.fstat(parent_fd)),
+                )
+                self.assertEqual(evidence[0].expected_identity, target_identity)
+                self.assertTrue(
+                    directory_identities_match(
+                        identity_from_stat(os.fstat(evidence[0].root_fd)),
+                        target_identity,
+                    )
+                )
+                quarantine = parent / os.fsdecode(evidence[0].quarantine_name)
+                self.assertFalse(target.exists())
+                self.assertTrue(
+                    directory_identities_match(
+                        identity_from_stat(os.stat(quarantine)),
+                        target_identity,
+                    )
+                )
+                wrapper = RuntimeError("synthetic retention wrapper")
+                wrapper.__cause__ = caught.exception
+                self.assertEqual(
+                    quarantined_root_recovery_evidence(wrapper),
+                    evidence,
+                )
+            finally:
+                os.close(target_fd)
+                os.close(parent_fd)
+
+    def test_post_rename_revalidation_failure_exposes_quarantine_recovery(
+        self,
+    ) -> None:
+        with owned_temporary_directory("cleanup-quarantine-revalidation-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+            target = parent / "target"
+            target.mkdir(mode=0o700)
+            parent_fd = os.open(
+                parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            target_fd = os.open(
+                target,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            target_identity = identity_from_stat(os.fstat(target_fd))
+            injected = CustodyLostError("synthetic quarantine revalidation failure")
+            real_descriptor_identity = recovery_cleanup._root_descriptor_identity
+            descriptor_checks = 0
+
+            def fail_post_rename_revalidation(*args, **kwargs):
+                nonlocal descriptor_checks
+                descriptor_checks += 1
+                if descriptor_checks == 2:
+                    raise injected
+                return real_descriptor_identity(*args, **kwargs)
+
+            try:
+                with (
+                    mock.patch.object(
+                        recovery_cleanup,
+                        "_root_descriptor_identity",
+                        side_effect=fail_post_rename_revalidation,
+                    ),
+                    self.assertRaises(CustodyLostError) as caught,
+                ):
+                    recovery_cleanup._quarantine_custodied_root(
+                        RootSpec(
+                            label="revalidation-regression",
+                            parent_fd=parent_fd,
+                            parent_identity=identity_from_stat(os.fstat(parent_fd)),
+                            name=b"target",
+                            expected_identity=target_identity,
+                        ),
+                        target_fd,
+                        deadline=time.monotonic() + 5.0,
+                    )
+
+                self.assertIs(caught.exception, injected)
+                evidence = quarantined_root_recovery_evidence(caught.exception)
+                self.assertEqual(len(evidence), 1)
+                self.assertEqual(
+                    evidence[0].stage,
+                    "post-rename-quarantine-revalidation",
+                )
+                self.assertEqual(evidence[0].parent_fd, parent_fd)
+                self.assertEqual(evidence[0].root_fd, target_fd)
+                self.assertEqual(evidence[0].original_name, b"target")
+                self.assertEqual(evidence[0].expected_identity, target_identity)
+                quarantine = parent / os.fsdecode(evidence[0].quarantine_name)
+                self.assertFalse(target.exists())
+                self.assertTrue(
+                    directory_identities_match(
+                        identity_from_stat(os.stat(quarantine)),
+                        target_identity,
+                    )
+                )
+            finally:
+                os.close(target_fd)
+                os.close(parent_fd)
+
+    def test_recursive_delete_failure_exposes_quarantine_recovery(self) -> None:
+        with owned_temporary_directory("cleanup-quarantine-recursive-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+            target = parent / "target"
+            target.mkdir(mode=0o700)
+            for name in ("first.txt", "second.txt"):
+                payload = target / name
+                payload.write_text(name, encoding="ascii")
+                payload.chmod(0o600)
+            control = root / "control"
+            control.mkdir(mode=0o700)
+            parent_fd = os.open(
+                parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            target_identity = identity_from_stat(os.stat(target))
+            manifest = build_custodied_manifest(
+                roots=(
+                    RootSpec(
+                        label="recursive-regression",
+                        parent_fd=parent_fd,
+                        parent_identity=identity_from_stat(os.fstat(parent_fd)),
+                        name=b"target",
+                        expected_identity=target_identity,
+                    ),
+                ),
+                manifest_path=control / "manifest.bin",
+                entry_cap=10,
+                payload_cap=4096,
+                deadline=time.monotonic() + 5.0,
+            )
+            real_unlink = recovery_cleanup.os.unlink
+            unlink_calls = 0
+            cause = RuntimeError("synthetic recursive cause")
+            injected = OSError("synthetic recursive deletion failure")
+            injected.__cause__ = cause
+
+            def fail_second_unlink(name: bytes, *, dir_fd: int) -> None:
+                nonlocal unlink_calls
+                unlink_calls += 1
+                if unlink_calls == 2:
+                    raise injected
+                real_unlink(name, dir_fd=dir_fd)
+
+            try:
+                with (
+                    mock.patch.object(
+                        recovery_cleanup.os,
+                        "unlink",
+                        side_effect=fail_second_unlink,
+                    ),
+                    self.assertRaises(OSError) as caught,
+                ):
+                    delete_custodied_roots(manifest)
+
+                self.assertIs(caught.exception, injected)
+                self.assertIs(caught.exception.__cause__, cause)
+                evidence = quarantined_root_recovery_evidence(caught.exception)
+                self.assertEqual(len(evidence), 1)
+                self.assertEqual(evidence[0].stage, "recursive-delete")
+                self.assertEqual(evidence[0].parent_fd, parent_fd)
+                self.assertEqual(evidence[0].root_fd, manifest.root_fds[0])
+                self.assertEqual(evidence[0].original_name, b"target")
+                self.assertEqual(evidence[0].expected_identity, target_identity)
+                os.fstat(evidence[0].root_fd)
+                quarantine = parent / os.fsdecode(evidence[0].quarantine_name)
+                self.assertFalse(target.exists())
+                self.assertEqual(len(tuple(quarantine.iterdir())), 1)
+            finally:
+                manifest.close()
+                os.close(parent_fd)
+
+    def test_quarantine_revalidation_retains_swapped_original_and_replacement(
+        self,
+    ) -> None:
+        with owned_temporary_directory("cleanup-quarantine-swap-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+            target = parent / "target"
+            target.mkdir(mode=0o700)
+            displaced = parent / "original-evidence"
+            replacement = parent / "replacement-stage"
+            replacement.mkdir(mode=0o700)
+            marker = replacement / "replacement.txt"
+            marker.write_text("replacement evidence", encoding="ascii")
+            parent_fd = os.open(
+                parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            target_fd = os.open(
+                target,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            original_identity = identity_from_stat(os.fstat(target_fd))
+            real_rename = os.rename
+            swapped = False
+
+            def swap_before_quarantine(
+                source: bytes,
+                destination: bytes,
+                *,
+                src_dir_fd: int,
+                dst_dir_fd: int,
+            ) -> None:
+                nonlocal swapped
+                if not swapped and source == b"target":
+                    swapped = True
+                    real_rename(target, displaced)
+                    real_rename(replacement, target)
+                real_rename(
+                    source,
+                    destination,
+                    src_dir_fd=src_dir_fd,
+                    dst_dir_fd=dst_dir_fd,
+                )
+
+            try:
+                with (
+                    mock.patch.object(
+                        recovery_cleanup.os,
+                        "rename",
+                        side_effect=swap_before_quarantine,
+                    ),
+                    self.assertRaisesRegex(
+                        CustodyLostError,
+                        "quarantined root changed",
+                    ),
+                ):
+                    quarantine_and_remove_empty_root(
+                        RootSpec(
+                            label="swap-regression",
+                            parent_fd=parent_fd,
+                            parent_identity=identity_from_stat(os.fstat(parent_fd)),
+                            name=b"target",
+                            expected_identity=original_identity,
+                        ),
+                        target_fd,
+                        deadline=time.monotonic() + 5.0,
+                    )
+
+                self.assertTrue(swapped)
+                self.assertEqual(
+                    identity_from_stat(os.stat(displaced)).inode,
+                    original_identity.inode,
+                )
+                quarantines = tuple(
+                    path
+                    for path in parent.iterdir()
+                    if path.name.startswith(".targeted-cleanup-quarantine-")
+                )
+                self.assertEqual(len(quarantines), 1)
+                self.assertEqual(
+                    (quarantines[0] / marker.name).read_text(encoding="ascii"),
+                    "replacement evidence",
+                )
+            finally:
+                os.close(target_fd)
+                os.close(parent_fd)
+
+    def test_quarantine_rmdir_aba_never_deletes_public_replacement(self) -> None:
+        with owned_temporary_directory("cleanup-quarantine-aba-") as root:
+            parent = root / "parent"
+            parent.mkdir(mode=0o700)
+            target = parent / "target"
+            target.mkdir(mode=0o700)
+            parent_fd = os.open(
+                parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            target_fd = os.open(
+                target,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            target_identity = identity_from_stat(os.fstat(target_fd))
+            real_rmdir = os.rmdir
+            injected = False
+
+            def replace_public_name(
+                name: bytes,
+                *,
+                dir_fd: int,
+            ) -> None:
+                nonlocal injected
+                if not injected and name.startswith(b".targeted-cleanup-quarantine-"):
+                    injected = True
+                    os.mkdir(b"target", 0o700, dir_fd=dir_fd)
+                    replacement_fd = os.open(
+                        b"target",
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        dir_fd=dir_fd,
+                    )
+                    try:
+                        marker_fd = os.open(
+                            b"replacement.txt",
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                            0o600,
+                            dir_fd=replacement_fd,
+                        )
+                        os.write(marker_fd, b"replacement evidence")
+                        os.close(marker_fd)
+                    finally:
+                        os.close(replacement_fd)
+                real_rmdir(name, dir_fd=dir_fd)
+
+            try:
+                with (
+                    mock.patch.object(
+                        recovery_cleanup.os,
+                        "rmdir",
+                        side_effect=replace_public_name,
+                    ),
+                    self.assertRaisesRegex(
+                        CustodyLostError,
+                        "replaced during quarantine removal",
+                    ),
+                ):
+                    quarantine_and_remove_empty_root(
+                        RootSpec(
+                            label="aba-regression",
+                            parent_fd=parent_fd,
+                            parent_identity=identity_from_stat(os.fstat(parent_fd)),
+                            name=b"target",
+                            expected_identity=target_identity,
+                        ),
+                        target_fd,
+                        deadline=time.monotonic() + 5.0,
+                    )
+
+                self.assertTrue(injected)
+                self.assertEqual(
+                    (target / "replacement.txt").read_text(encoding="ascii"),
+                    "replacement evidence",
+                )
+            finally:
+                os.close(target_fd)
                 os.close(parent_fd)
 
 

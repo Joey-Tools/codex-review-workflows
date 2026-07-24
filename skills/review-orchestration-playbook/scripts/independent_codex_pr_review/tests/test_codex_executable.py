@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import dis
 import errno
 import grp
 import hashlib
@@ -8,15 +9,19 @@ import json
 import os
 import pathlib
 import pwd
+import signal
 import stat
 import subprocess
 import sys
+import time
 import unittest
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from unittest import mock
 
 import review_supervisor.codex_executable as codex_executable
+import review_supervisor.recovery_cleanup as recovery_cleanup
 
 from review_supervisor.codex_executable import (
     AGGREGATE_SCHEMA_NAME,
@@ -27,9 +32,11 @@ from review_supervisor.codex_executable import (
     CodexExecutableError,
     CodexExecutableExecutionUnsupported,
     CodexExecutablePolicy,
+    CodexExecutableRetentionRequired,
     ExecutableExclusionRoots,
     ExtendedMetadataEvidence,
     NodeIdentity,
+    PreflightProcessClosureUnproven,
     ProcessQuiescenceEvidence,
     SNAPSHOT_DIRECTORY_PREFIX,
     SNAPSHOT_EXECUTABLE_MODE,
@@ -44,7 +51,12 @@ from review_supervisor.codex_executable import (
     authenticate_codex_executable,
     build_snapshot_seatbelt_policy,
     copy_executable_from_fd,
+    run_bounded_command,
     verify_macos_filesystem_metadata,
+)
+from review_supervisor.recovery_cleanup import (
+    CustodiedManifest,
+    QuarantinedRootRecoveryEvidence,
 )
 from tests.support import owned_temporary_directory
 
@@ -61,6 +73,7 @@ Options:
       --strict-config  Reject unknown configuration
 """
 CLEAR_METADATA = ExtendedMetadataEvidence(0, (), False)
+REQUIRE_LIVE_NO_CHILD_PROFILE_ENV = "CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE"
 
 
 def _sha256(value: bytes) -> str:
@@ -372,7 +385,887 @@ def _replace_snapshot_path(custody: CodexExecutableCustody) -> None:
     os.chmod(path, SNAPSHOT_EXECUTABLE_MODE)
 
 
+def _published_launch(
+    launched: object,
+    stdout_fd: int,
+    stderr_fd: int,
+) -> Callable[..., tuple[object, int, int]]:
+    def launch(
+        _prepared: object,
+        _argv: tuple[str, ...],
+        *,
+        ownership: codex_executable._PreflightLaunchOwnership,
+    ) -> tuple[object, int, int]:
+        ownership.track_descriptors(stdout_fd, stderr_fd)
+        ownership.arm_launch()
+        ownership.publish_launched(launched)
+        receipt = (launched, stdout_fd, stderr_fd)
+        ownership.publish_receipt(receipt)
+        return receipt
+
+    return launch
+
+
+def _call_result_store_offset(
+    function: Callable[..., object],
+    *,
+    called_name: str,
+    stored_name: str,
+) -> int:
+    instructions = tuple(dis.get_instructions(function))
+    for index, instruction in enumerate(instructions):
+        if not instruction.opname.startswith("CALL"):
+            continue
+        prior = instructions[max(0, index - 64) : index]
+        if not any(candidate.argval == called_name for candidate in prior):
+            continue
+        following = instructions[index + 1]
+        if (
+            following.opname in {"STORE_FAST", "STORE_DEREF"}
+            and following.argval == stored_name
+        ):
+            return following.offset
+    raise AssertionError(
+        f"missing {called_name} CALL-to-{stored_name} local-store boundary"
+    )
+
+
+def _call_result_next_opcode_offset(
+    function: Callable[..., object],
+    *,
+    called_name: str,
+) -> int:
+    instructions = tuple(dis.get_instructions(function))
+    for index, instruction in enumerate(instructions):
+        if not instruction.opname.startswith("CALL"):
+            continue
+        prior = instructions[max(0, index - 64) : index]
+        following = instructions[index + 1]
+        if (
+            any(candidate.argval == called_name for candidate in prior)
+            and following.opname == "POP_TOP"
+        ):
+            return following.offset
+    raise AssertionError(f"missing {called_name} CALL result boundary")
+
+
+def _call_opcode_offset(
+    function: Callable[..., object],
+    *,
+    called_name: str,
+) -> int:
+    instructions = tuple(dis.get_instructions(function))
+    for index, instruction in enumerate(instructions):
+        if not instruction.opname.startswith("CALL"):
+            continue
+        prior = instructions[max(0, index - 64) : index]
+        if any(candidate.argval == called_name for candidate in prior):
+            return instruction.offset
+    raise AssertionError(f"missing {called_name} CALL boundary")
+
+
+def _call_result_offset_with_argument(
+    function: Callable[..., object],
+    *,
+    called_name: str,
+    argument_name: str,
+    following_opname: str,
+    following_argval: str | None = None,
+) -> int:
+    instructions = tuple(dis.get_instructions(function))
+    for index, instruction in enumerate(instructions):
+        if not instruction.opname.startswith("CALL"):
+            continue
+        prior = instructions[max(0, index - 64) : index]
+        following = instructions[index + 1]
+        if (
+            any(candidate.argval == called_name for candidate in prior)
+            and any(candidate.argval == argument_name for candidate in prior[-16:])
+            and following.opname == following_opname
+            and (following_argval is None or following.argval == following_argval)
+        ):
+            return following.offset
+    raise AssertionError(f"missing {called_name}({argument_name}) CALL result boundary")
+
+
+def _instruction_after_offset(function: Callable[..., object], offset: int) -> int:
+    instructions = tuple(dis.get_instructions(function))
+    for index, instruction in enumerate(instructions[:-1]):
+        if instruction.offset == offset:
+            return instructions[index + 1].offset
+    raise AssertionError(f"missing instruction after offset {offset}")
+
+
 class CodexExecutableAuthenticationTests(unittest.TestCase):
+    def test_bounded_preflight_reports_explicit_unproven_closure(self) -> None:
+        stdout_read, stdout_write = os.pipe()
+        stderr_read, stderr_write = os.pipe()
+        os.close(stdout_write)
+        os.close(stderr_write)
+        launched = SimpleNamespace(
+            pid=424242,
+            pgid=424242,
+            session_id=424242,
+            start_identity="synthetic-start",
+            profile_sha256="a" * 64,
+        )
+        with (
+            mock.patch.object(
+                codex_executable,
+                "_prepare_root_protected_no_child_profile",
+                return_value=object(),
+            ),
+            mock.patch.object(
+                codex_executable,
+                "_launch_prepared_bounded_command",
+                side_effect=_published_launch(
+                    launched,
+                    stdout_read,
+                    stderr_read,
+                ),
+            ),
+            mock.patch.object(
+                codex_executable,
+                "wait_terminal",
+                side_effect=TimeoutError("synthetic wait failure"),
+            ),
+            mock.patch.object(
+                codex_executable,
+                "_terminate_and_reap_preflight",
+                side_effect=TimeoutError("synthetic cleanup failure"),
+            ),
+            self.assertRaises(PreflightProcessClosureUnproven) as caught,
+        ):
+            run_bounded_command(
+                ("/usr/bin/true",),
+                timeout_seconds=1.0,
+                max_output_bytes=1024,
+            )
+
+        evidence = caught.exception.evidence
+        self.assertEqual(evidence.leader_pid, launched.pid)
+        self.assertFalse(evidence.leader_reaped)
+        self.assertFalse(evidence.permitted_process_closure_proven)
+        self.assertFalse(evidence.process_group_emptiness_used_as_descendant_proof)
+
+    def test_selector_creation_failure_terminates_reaps_and_closes_streams(
+        self,
+    ) -> None:
+        stdout_read, stdout_write = os.pipe()
+        stderr_read, stderr_write = os.pipe()
+        os.close(stdout_write)
+        os.close(stderr_write)
+        launched = SimpleNamespace(
+            pid=424242,
+            pgid=424242,
+            session_id=424242,
+            start_identity="synthetic-start",
+            profile_sha256="a" * 64,
+        )
+        with (
+            mock.patch.object(
+                codex_executable,
+                "_prepare_root_protected_no_child_profile",
+                return_value=object(),
+            ),
+            mock.patch.object(
+                codex_executable,
+                "_launch_prepared_bounded_command",
+                side_effect=_published_launch(
+                    launched,
+                    stdout_read,
+                    stderr_read,
+                ),
+            ),
+            mock.patch.object(
+                codex_executable.selectors,
+                "DefaultSelector",
+                side_effect=RuntimeError("synthetic selector creation failure"),
+            ),
+            mock.patch.object(
+                codex_executable,
+                "_terminate_and_reap_preflight",
+                return_value=-signal.SIGKILL,
+            ) as terminate,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "synthetic selector creation failure",
+            ),
+        ):
+            run_bounded_command(
+                ("/usr/bin/true",),
+                timeout_seconds=1.0,
+                max_output_bytes=1024,
+            )
+
+        terminate.assert_called_once()
+        self.assertIs(terminate.call_args.args[0], launched)
+        for descriptor in (stdout_read, stderr_read):
+            with self.subTest(descriptor=descriptor):
+                with self.assertRaises(OSError) as raised:
+                    os.fstat(descriptor)
+                self.assertEqual(raised.exception.errno, errno.EBADF)
+
+    def test_launch_receipt_setup_interrupt_terminates_and_reaps(self) -> None:
+        stdout_read, stdout_write = os.pipe()
+        stderr_read, stderr_write = os.pipe()
+        os.close(stdout_write)
+        os.close(stderr_write)
+        launched = SimpleNamespace(
+            pid=424242,
+            pgid=424242,
+            session_id=424242,
+            start_identity="synthetic-start",
+            profile_sha256="a" * 64,
+        )
+        with (
+            mock.patch.object(
+                codex_executable,
+                "_prepare_root_protected_no_child_profile",
+                return_value=object(),
+            ),
+            mock.patch.object(
+                codex_executable,
+                "_launch_prepared_bounded_command",
+                side_effect=_published_launch(
+                    launched,
+                    stdout_read,
+                    stderr_read,
+                ),
+            ),
+            mock.patch.object(
+                codex_executable.time,
+                "monotonic",
+                side_effect=(
+                    KeyboardInterrupt("synthetic receipt setup interrupt"),
+                    100.0,
+                ),
+            ),
+            mock.patch.object(
+                codex_executable,
+                "_terminate_and_reap_preflight",
+                return_value=-signal.SIGKILL,
+            ) as terminate,
+            self.assertRaisesRegex(
+                KeyboardInterrupt,
+                "synthetic receipt setup interrupt",
+            ),
+        ):
+            run_bounded_command(
+                ("/usr/bin/true",),
+                timeout_seconds=1.0,
+                max_output_bytes=1024,
+            )
+
+        terminate.assert_called_once()
+        self.assertIs(terminate.call_args.args[0], launched)
+        for descriptor in (stdout_read, stderr_read):
+            with self.assertRaises(OSError) as raised:
+                os.fstat(descriptor)
+            self.assertEqual(raised.exception.errno, errno.EBADF)
+
+    def test_no_child_launch_call_to_store_interrupt_terminates_published_leader(
+        self,
+    ) -> None:
+        from review_supervisor import no_child_profile
+
+        prepared = object()
+        ownership = codex_executable._PreflightLaunchOwnership(prepared)
+
+        def launch_template(
+            _prepared: object,
+            _argv: tuple[str, ...],
+            *,
+            cwd: str,
+            environment: dict[str, str],
+            stdin_fd: int,
+            stdout_fd: int,
+            stderr_fd: int,
+            result_owner: object,
+        ) -> object:
+            del (
+                _prepared,
+                _argv,
+                cwd,
+                environment,
+                stdin_fd,
+                stdout_fd,
+                stderr_fd,
+            )
+            launched = SimpleNamespace(
+                pid=424242,
+                pgid=424242,
+                session_id=424242,
+                start_identity="synthetic-start",
+                profile_sha256="a" * 64,
+            )
+            result_owner.publish(launched)
+            return launched
+
+        target_offset = _call_result_store_offset(
+            codex_executable._launch_prepared_bounded_command,
+            called_name="_launch_no_child_process_with_ownership",
+            stored_name="launched",
+        )
+        interruption = KeyboardInterrupt(
+            "injected no-child launch CALL-to-STORE interrupt"
+        )
+        injected = False
+
+        def interrupt_result_store(
+            frame: object,
+            event: str,
+            _argument: object,
+        ) -> object:
+            nonlocal injected
+            if (
+                getattr(frame, "f_code", None)
+                is codex_executable._launch_prepared_bounded_command.__code__
+            ):
+                setattr(frame, "f_trace_opcodes", True)
+                if (
+                    not injected
+                    and event == "opcode"
+                    and getattr(frame, "f_lasti", None) == target_offset
+                ):
+                    injected = True
+                    raise interruption
+            return interrupt_result_store
+
+        previous_trace = sys.gettrace()
+        try:
+            with (
+                mock.patch.object(
+                    no_child_profile,
+                    "PreparedNoChildProfile",
+                    object,
+                ),
+                mock.patch.object(
+                    no_child_profile,
+                    "launch_prepared_no_child_process",
+                    launch_template,
+                ),
+                mock.patch.object(
+                    codex_executable,
+                    "_terminate_and_reap_preflight",
+                    return_value=-signal.SIGKILL,
+                ) as terminate,
+            ):
+                sys.settrace(interrupt_result_store)
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    codex_executable._launch_prepared_bounded_command(
+                        prepared,
+                        ("/usr/bin/true",),
+                        ownership=ownership,
+                    )
+        finally:
+            sys.settrace(previous_trace)
+
+        self.assertTrue(injected)
+        self.assertIs(caught.exception, interruption)
+        terminate.assert_called_once()
+        self.assertEqual(terminate.call_args.args[0].pid, 424242)
+        self.assertTrue(ownership.closure_proven)
+        self.assertEqual(ownership.state, "closed")
+        self.assertEqual(ownership.descriptors, set())
+
+    def test_preflight_close_result_interrupt_abandons_reused_descriptor(
+        self,
+    ) -> None:
+        ownership = codex_executable._PreflightLaunchOwnership(object())
+        descriptor, peer = os.pipe()
+        ownership.track_descriptors(descriptor)
+        real_close = os.close
+        interruption = KeyboardInterrupt(
+            "injected preflight descriptor close result interrupt"
+        )
+        reused_descriptor: int | None = None
+
+        def close_then_reuse(candidate: int) -> None:
+            nonlocal reused_descriptor
+            self.assertEqual(candidate, descriptor)
+            real_close(candidate)
+            replacement = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+            if replacement != candidate:
+                os.dup2(replacement, candidate, inheritable=False)
+                real_close(replacement)
+                replacement = candidate
+            reused_descriptor = replacement
+            raise interruption
+
+        try:
+            with mock.patch.object(
+                codex_executable.os,
+                "close",
+                side_effect=close_then_reuse,
+            ) as first_close:
+                failures = codex_executable._close_preflight_launch_descriptors(
+                    ownership
+                )
+
+            self.assertEqual(failures, (interruption,))
+            first_close.assert_called_once_with(descriptor)
+            self.assertEqual(reused_descriptor, descriptor)
+            self.assertEqual(
+                ownership.descriptor_close_outcomes[descriptor],
+                "close-outcome-unproven",
+            )
+            self.assertIs(
+                ownership.descriptor_close_errors[descriptor],
+                interruption,
+            )
+
+            with mock.patch.object(
+                codex_executable.os,
+                "close",
+                wraps=real_close,
+            ) as retry_close:
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    ownership.close_descriptors_for_recovery()
+            self.assertIs(caught.exception, interruption)
+            retry_close.assert_not_called()
+            os.fstat(descriptor)
+        finally:
+            if reused_descriptor is not None:
+                real_close(reused_descriptor)
+            else:
+                try:
+                    real_close(descriptor)
+                except OSError as error:
+                    if error.errno != errno.EBADF:
+                        raise
+            real_close(peer)
+
+    def test_no_child_publication_result_interrupt_does_not_repeat_owner_callback(
+        self,
+    ) -> None:
+        launched = object()
+
+        class ExternalOwner:
+            def __init__(self) -> None:
+                self.launched: object | None = None
+                self.publish_calls = 0
+
+            def publish(self, candidate: object) -> None:
+                self.publish_calls += 1
+                if self.launched is not None and self.launched is not candidate:
+                    raise ValueError("external owner was rebound")
+                self.launched = candidate
+
+            def owns(self, candidate: object) -> bool:
+                return self.launched is candidate
+
+        external_owner = ExternalOwner()
+        publication_owner = codex_executable._NoChildLaunchResultOwner(
+            external_owner=external_owner
+        )
+        target_offset = _call_result_next_opcode_offset(
+            codex_executable._NoChildLaunchResultOwner.finish_publication,
+            called_name="publish",
+        )
+        interruption = KeyboardInterrupt(
+            "injected external-owner publication result interrupt"
+        )
+        injected = False
+
+        def interrupt_publication_result(
+            frame: object,
+            event: str,
+            _argument: object,
+        ) -> object:
+            nonlocal injected
+            if (
+                getattr(frame, "f_code", None)
+                is codex_executable._NoChildLaunchResultOwner.finish_publication.__code__
+            ):
+                setattr(frame, "f_trace_opcodes", True)
+                if (
+                    not injected
+                    and event == "opcode"
+                    and getattr(frame, "f_lasti", None) == target_offset
+                ):
+                    injected = True
+                    raise interruption
+            return interrupt_publication_result
+
+        previous_trace = sys.gettrace()
+        try:
+            sys.settrace(interrupt_publication_result)
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                publication_owner.publish(launched)
+        finally:
+            sys.settrace(previous_trace)
+
+        self.assertTrue(injected)
+        self.assertIs(caught.exception, interruption)
+        self.assertEqual(external_owner.publish_calls, 1)
+        self.assertTrue(publication_owner.publication_complete)
+        self.assertTrue(publication_owner.owns(launched))
+        publication_owner.finish_publication()
+        self.assertEqual(external_owner.publish_calls, 1)
+
+    def test_preflight_owner_recovers_partial_launched_publication(
+        self,
+    ) -> None:
+        ownership = codex_executable._PreflightLaunchOwnership(object())
+        ownership.arm_launch()
+        launched = object()
+        instructions = tuple(
+            dis.get_instructions(
+                codex_executable._PreflightLaunchOwnership.publish_launched
+            )
+        )
+        store_index = next(
+            index
+            for index, instruction in enumerate(instructions[:-1])
+            if instruction.opname == "STORE_ATTR" and instruction.argval == "launched"
+        )
+        target_offset = instructions[store_index + 1].offset
+        interruption = KeyboardInterrupt(
+            "injected partial preflight owner publication interrupt"
+        )
+        injected = False
+
+        def interrupt_after_launched_store(
+            frame: object,
+            event: str,
+            _argument: object,
+        ) -> object:
+            nonlocal injected
+            if (
+                getattr(frame, "f_code", None)
+                is codex_executable._PreflightLaunchOwnership.publish_launched.__code__
+            ):
+                setattr(frame, "f_trace_opcodes", True)
+                if (
+                    not injected
+                    and event == "opcode"
+                    and getattr(frame, "f_lasti", None) == target_offset
+                ):
+                    injected = True
+                    raise interruption
+            return interrupt_after_launched_store
+
+        previous_trace = sys.gettrace()
+        try:
+            sys.settrace(interrupt_after_launched_store)
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                ownership.publish(launched)
+        finally:
+            sys.settrace(previous_trace)
+
+        self.assertTrue(injected)
+        self.assertIs(caught.exception, interruption)
+        self.assertIs(ownership.launched, launched)
+        self.assertEqual(ownership.state, "launch-may-have-started")
+        self.assertFalse(ownership.owns(launched))
+        ownership.publish(launched)
+        self.assertTrue(ownership.owns(launched))
+        self.assertEqual(ownership.state, "leader-bound")
+
+    def test_bounded_command_call_to_store_interrupt_recovers_published_receipt(
+        self,
+    ) -> None:
+        stdout_read, stdout_write = os.pipe()
+        stderr_read, stderr_write = os.pipe()
+        os.close(stdout_write)
+        os.close(stderr_write)
+        launched = SimpleNamespace(
+            pid=424242,
+            pgid=424242,
+            session_id=424242,
+            start_identity="synthetic-start",
+            profile_sha256="a" * 64,
+        )
+        target_offset = _call_result_store_offset(
+            run_bounded_command,
+            called_name="_launch_prepared_bounded_command",
+            stored_name="launch_receipt",
+        )
+        interruption = KeyboardInterrupt(
+            "injected bounded command CALL-to-STORE interrupt"
+        )
+        injected = False
+        ownerships: list[codex_executable._PreflightLaunchOwnership] = []
+
+        def publish_receipt(
+            _prepared: object,
+            _argv: tuple[str, ...],
+            *,
+            ownership: codex_executable._PreflightLaunchOwnership,
+        ) -> tuple[object, int, int]:
+            ownerships.append(ownership)
+            return _published_launch(
+                launched,
+                stdout_read,
+                stderr_read,
+            )(
+                _prepared,
+                _argv,
+                ownership=ownership,
+            )
+
+        def interrupt_result_store(
+            frame: object,
+            event: str,
+            _argument: object,
+        ) -> object:
+            nonlocal injected
+            if getattr(frame, "f_code", None) is run_bounded_command.__code__:
+                setattr(frame, "f_trace_opcodes", True)
+                if (
+                    not injected
+                    and event == "opcode"
+                    and getattr(frame, "f_lasti", None) == target_offset
+                ):
+                    injected = True
+                    raise interruption
+            return interrupt_result_store
+
+        previous_trace = sys.gettrace()
+        try:
+            with (
+                mock.patch.object(
+                    codex_executable,
+                    "_prepare_root_protected_no_child_profile",
+                    return_value=object(),
+                ),
+                mock.patch.object(
+                    codex_executable,
+                    "_launch_prepared_bounded_command",
+                    side_effect=publish_receipt,
+                ),
+                mock.patch.object(
+                    codex_executable,
+                    "_terminate_and_reap_preflight",
+                    return_value=-signal.SIGKILL,
+                ) as terminate,
+            ):
+                sys.settrace(interrupt_result_store)
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    run_bounded_command(
+                        ("/usr/bin/true",),
+                        timeout_seconds=1.0,
+                        max_output_bytes=1024,
+                    )
+        finally:
+            sys.settrace(previous_trace)
+
+        self.assertIs(caught.exception, interruption)
+        self.assertTrue(injected)
+        terminate.assert_called_once_with(
+            launched,
+            deadline=mock.ANY,
+        )
+        self.assertEqual(len(ownerships), 1)
+        self.assertTrue(ownerships[0].closure_proven)
+        self.assertEqual(ownerships[0].state, "closed")
+        for descriptor in (stdout_read, stderr_read):
+            with self.assertRaises(OSError) as raised:
+                os.fstat(descriptor)
+            self.assertEqual(raised.exception.errno, errno.EBADF)
+
+    def test_cleanup_keyboard_interrupt_becomes_typed_retention(
+        self,
+    ) -> None:
+        stdout_read, stdout_write = os.pipe()
+        stderr_read, stderr_write = os.pipe()
+        os.close(stdout_write)
+        os.close(stderr_write)
+        launched = SimpleNamespace(
+            pid=424242,
+            pgid=424242,
+            session_id=424242,
+            start_identity="synthetic-start",
+            profile_sha256="a" * 64,
+        )
+        cleanup_interrupt = KeyboardInterrupt("injected terminate and reap interrupt")
+        with (
+            mock.patch.object(
+                codex_executable,
+                "_prepare_root_protected_no_child_profile",
+                return_value=object(),
+            ),
+            mock.patch.object(
+                codex_executable,
+                "_launch_prepared_bounded_command",
+                side_effect=_published_launch(
+                    launched,
+                    stdout_read,
+                    stderr_read,
+                ),
+            ),
+            mock.patch.object(
+                codex_executable,
+                "wait_terminal",
+                side_effect=RuntimeError("injected command failure"),
+            ),
+            mock.patch.object(
+                codex_executable,
+                "_terminate_and_reap_preflight",
+                side_effect=cleanup_interrupt,
+            ) as terminate,
+            self.assertRaises(PreflightProcessClosureUnproven) as caught,
+        ):
+            run_bounded_command(
+                ("/usr/bin/true",),
+                timeout_seconds=1.0,
+                max_output_bytes=1024,
+            )
+
+        terminate.assert_called_once()
+        self.assertIs(caught.exception.__cause__, cleanup_interrupt)
+        self.assertEqual(caught.exception.evidence.leader_pid, 424242)
+        self.assertFalse(caught.exception.evidence.permitted_process_closure_proven)
+        ownership = next(
+            resource
+            for resource in caught.exception.retained_resources
+            if isinstance(
+                resource,
+                codex_executable._PreflightLaunchOwnership,
+            )
+        )
+        self.assertIs(ownership.launched, launched)
+        self.assertEqual(ownership.state, "retained")
+        self.assertEqual(
+            ownership.descriptors,
+            {stdout_read, stderr_read},
+        )
+        try:
+            os.fstat(stdout_read)
+            os.fstat(stderr_read)
+        finally:
+            ownership.close_descriptors_for_recovery()
+
+    def test_selector_registration_failure_terminates_reaps_and_closes_streams(
+        self,
+    ) -> None:
+        stdout_read, stdout_write = os.pipe()
+        stderr_read, stderr_write = os.pipe()
+        os.close(stdout_write)
+        os.close(stderr_write)
+        launched = SimpleNamespace(
+            pid=424242,
+            pgid=424242,
+            session_id=424242,
+            start_identity="synthetic-start",
+            profile_sha256="a" * 64,
+        )
+
+        class FailingSelector:
+            def __init__(self) -> None:
+                self.registrations = 0
+                self.closed = False
+
+            def register(self, descriptor: int, _events: int) -> None:
+                del descriptor
+                self.registrations += 1
+                if self.registrations == 2:
+                    raise RuntimeError("synthetic selector registration failure")
+
+            def get_map(self) -> dict[int, object]:
+                return {stdout_read: object()}
+
+            def close(self) -> None:
+                self.closed = True
+
+        selector = FailingSelector()
+        with (
+            mock.patch.object(
+                codex_executable,
+                "_prepare_root_protected_no_child_profile",
+                return_value=object(),
+            ),
+            mock.patch.object(
+                codex_executable,
+                "_launch_prepared_bounded_command",
+                side_effect=_published_launch(
+                    launched,
+                    stdout_read,
+                    stderr_read,
+                ),
+            ),
+            mock.patch.object(
+                codex_executable.selectors,
+                "DefaultSelector",
+                return_value=selector,
+            ),
+            mock.patch.object(
+                codex_executable,
+                "_terminate_and_reap_preflight",
+                return_value=-signal.SIGKILL,
+            ) as terminate,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "synthetic selector registration failure",
+            ),
+        ):
+            run_bounded_command(
+                ("/usr/bin/true",),
+                timeout_seconds=1.0,
+                max_output_bytes=1024,
+            )
+
+        terminate.assert_called_once()
+        self.assertIs(terminate.call_args.args[0], launched)
+        self.assertEqual(selector.registrations, 2)
+        self.assertTrue(selector.closed)
+        for descriptor in (stdout_read, stderr_read):
+            with self.subTest(descriptor=descriptor):
+                with self.assertRaises(OSError) as raised:
+                    os.fstat(descriptor)
+                self.assertEqual(raised.exception.errno, errno.EBADF)
+
+    @unittest.skipUnless(
+        os.environ.get(REQUIRE_LIVE_NO_CHILD_PROFILE_ENV) == "1",
+        "live no-child profile regression requires an explicit opt-in",
+    )
+    def test_bounded_preflight_cannot_leave_child_after_closing_stdio(
+        self,
+    ) -> None:
+        nonce = f"codex-preflight-escape-{os.getpid()}-{time.time_ns()}"
+        script = (
+            "exec 1>&- 2>&-; "
+            '/bin/sh -c \'trap "" TERM; while :; do :; done\' "$1" & '
+            "child=$!; "
+            '[ -n "$child" ] && kill -0 "$child" 2>/dev/null'
+        )
+        result = run_bounded_command(
+            ("/bin/sh", "-c", script, "bounded-preflight", nonce),
+            timeout_seconds=5.0,
+            max_output_bytes=4096,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIsNotNone(result.process_closure)
+        assert result.process_closure is not None
+        self.assertTrue(result.process_closure.leader_reaped)
+        self.assertTrue(result.process_closure.permitted_process_closure_proven)
+        self.assertFalse(
+            result.process_closure.process_group_emptiness_used_as_descendant_proof
+        )
+
+        process_table = subprocess.run(
+            ("/bin/ps", "-axo", "pid=,command="),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5.0,
+        )
+        self.assertEqual(process_table.returncode, 0, process_table.stderr)
+        self.assertLessEqual(len(process_table.stdout), 4 * 1024 * 1024)
+        residual = [
+            line
+            for line in process_table.stdout.splitlines()
+            if nonce.encode("ascii") in line
+        ]
+        for line in residual:
+            try:
+                os.kill(int(line.split(None, 1)[0]), signal.SIGKILL)
+            except (ProcessLookupError, ValueError):
+                pass
+        self.assertEqual(residual, [])
+
     def test_macos_acl_enumerator_counts_successful_zero_returns(self) -> None:
         for expected in (0, 2):
             with self.subTest(expected=expected):
@@ -621,7 +1514,7 @@ class CodexExecutableAuthenticationTests(unittest.TestCase):
                             require_directory_metadata_stability=False,
                         )
 
-    def test_strict_directory_metadata_inspection_still_rejects_ctime_churn(
+    def test_directory_metadata_inspection_ignores_pure_ctime_churn(
         self,
     ) -> None:
         directory_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
@@ -638,14 +1531,14 @@ class CodexExecutableAuthenticationTests(unittest.TestCase):
                 "review_supervisor.codex_executable._read_macos_filesystem_metadata",
                 return_value=CLEAR_METADATA,
             ),
-            self.assertRaisesRegex(OSError, "changed during inspection"),
         ):
-            codex_executable.inspect_macos_filesystem_metadata(
+            evidence = codex_executable.inspect_macos_filesystem_metadata(
                 directory_fd,
                 "directory",
             )
+        self.assertEqual(evidence, CLEAR_METADATA)
 
-    def test_transient_directory_metadata_mutation_changes_the_ctime_window(
+    def test_transient_restored_directory_mode_is_not_inferred_from_ctime(
         self,
     ) -> None:
         with owned_temporary_directory("codex-metadata-race-") as root:
@@ -666,18 +1559,45 @@ class CodexExecutableAuthenticationTests(unittest.TestCase):
                     mutated = True
                 return CLEAR_METADATA
 
-            with self.assertRaisesRegex(
-                CodexExecutableError,
-                "metadata raced with inspection",
-            ):
-                _authenticate(
-                    fixture,
-                    FakeRunner(fixture),
-                    filesystem_metadata_verifier=FakeFilesystemMetadataVerifier(
-                        inspect
-                    ),
-                )
+            custody = _authenticate(
+                fixture,
+                FakeRunner(fixture),
+                filesystem_metadata_verifier=FakeFilesystemMetadataVerifier(inspect),
+            )
+            _cleanup(custody)
             self.assertTrue(mutated)
+
+    def test_directory_access_policy_change_is_rejected_directly(self) -> None:
+        with owned_temporary_directory("codex-metadata-policy-") as root:
+            fixture = _build_fixture(root)
+            changed = False
+
+            def inspect(
+                fd: int,
+                path: pathlib.Path,
+                _kind: str,
+            ) -> ExtendedMetadataEvidence:
+                nonlocal changed
+                if path == fixture.source.parent and not changed:
+                    os.fchmod(fd, 0o500)
+                    changed = True
+                return CLEAR_METADATA
+
+            try:
+                with self.assertRaisesRegex(
+                    CodexExecutableError,
+                    "metadata raced with inspection",
+                ):
+                    _authenticate(
+                        fixture,
+                        FakeRunner(fixture),
+                        filesystem_metadata_verifier=(
+                            FakeFilesystemMetadataVerifier(inspect)
+                        ),
+                    )
+            finally:
+                os.chmod(fixture.source.parent, 0o700)
+            self.assertTrue(changed)
 
     def test_directory_content_writes_between_metadata_windows_are_refreshed(
         self,
@@ -1356,6 +2276,104 @@ class CodexExecutableAuthenticationTests(unittest.TestCase):
             self.assertTrue(swapped)
             self.assertEqual(list(fixture.snapshot_parent.iterdir()), [])
 
+    def test_source_timestamp_churn_does_not_replace_content_evidence(self) -> None:
+        with owned_temporary_directory("codex-source-timestamp-") as root:
+            fixture = _build_fixture(root)
+            runner = FakeRunner(fixture)
+            touched = False
+
+            def touch_on_codesign(argv: tuple[str, ...]) -> None:
+                nonlocal touched
+                if argv[0] == CODESIGN_PATH and not touched:
+                    touched = True
+                    before = fixture.source.stat().st_mtime_ns
+                    os.utime(
+                        fixture.source,
+                        ns=(before + 1_000_000, before + 1_000_000),
+                    )
+
+            runner.hook = touch_on_codesign
+            custody = _authenticate(fixture, runner)
+            _cleanup(custody)
+            self.assertTrue(touched)
+
+    def test_source_link_count_churn_is_not_a_content_mutation_signal(self) -> None:
+        with owned_temporary_directory("codex-source-link-count-") as root:
+            fixture = _build_fixture(root)
+            runner = FakeRunner(fixture)
+            alias = fixture.source.with_name("codex-hardlink")
+            linked = False
+
+            def link_on_codesign(argv: tuple[str, ...]) -> None:
+                nonlocal linked
+                if argv[0] == CODESIGN_PATH and not linked:
+                    linked = True
+                    os.link(fixture.source, alias)
+
+            runner.hook = link_on_codesign
+            custody = _authenticate(fixture, runner)
+            try:
+                self.assertEqual(fixture.source.stat().st_nlink, 2)
+            finally:
+                _cleanup(custody)
+                alias.unlink()
+            self.assertTrue(linked)
+
+    def test_source_ancestor_child_entry_churn_preserves_identity(self) -> None:
+        with owned_temporary_directory("codex-source-directory-churn-") as root:
+            fixture = _build_fixture(root)
+            runner = FakeRunner(fixture)
+            child = fixture.source.parent / "benign-child"
+            created = False
+
+            def create_child_on_codesign(argv: tuple[str, ...]) -> None:
+                nonlocal created
+                if argv[0] == CODESIGN_PATH and not created:
+                    created = True
+                    child.write_bytes(b"benign directory churn\n")
+
+            runner.hook = create_child_on_codesign
+            custody = _authenticate(fixture, runner)
+            _cleanup(custody)
+            self.assertTrue(created)
+            self.assertTrue(child.is_file())
+
+    def test_rejects_same_size_source_content_change_during_codesign(self) -> None:
+        with owned_temporary_directory("codex-source-content-change-") as root:
+            fixture = _build_fixture(root)
+            runner = FakeRunner(fixture)
+            changed = False
+
+            def change_on_codesign(argv: tuple[str, ...]) -> None:
+                nonlocal changed
+                if argv[0] == CODESIGN_PATH and not changed:
+                    changed = True
+                    fixture.source.write_bytes(b"x" * len(SYNTHETIC_BINARY))
+
+            runner.hook = change_on_codesign
+            with self.assertRaisesRegex(CodexExecutableError, "content changed"):
+                _authenticate(fixture, runner)
+            self.assertTrue(changed)
+            self.assertEqual(list(fixture.snapshot_parent.iterdir()), [])
+
+    def test_rejects_source_access_policy_change_during_codesign(self) -> None:
+        with owned_temporary_directory("codex-source-mode-change-") as root:
+            fixture = _build_fixture(root)
+            runner = FakeRunner(fixture)
+            changed = False
+
+            def change_on_codesign(argv: tuple[str, ...]) -> None:
+                nonlocal changed
+                if argv[0] == CODESIGN_PATH and not changed:
+                    changed = True
+                    os.chmod(fixture.source, 0o500)
+
+            runner.hook = change_on_codesign
+            with self.assertRaisesRegex(CodexExecutableError, "identity changed"):
+                _authenticate(fixture, runner)
+            self.assertTrue(changed)
+            self.assertEqual(list(fixture.snapshot_parent.iterdir()), [])
+
     def test_rejects_source_path_swap_during_codesign(self) -> None:
         with owned_temporary_directory("codex-source-codesign-swap-") as root:
             fixture = _build_fixture(root)
@@ -1375,6 +2393,52 @@ class CodexExecutableAuthenticationTests(unittest.TestCase):
                 _authenticate(fixture, runner)
             self.assertTrue(swapped)
             self.assertEqual(list(fixture.snapshot_parent.iterdir()), [])
+
+    def test_revalidation_distinguishes_missing_from_unreadable_path(self) -> None:
+        with owned_temporary_directory("codex-revalidation-errors-") as root:
+            fixture = _build_fixture(root)
+            anchor = codex_executable._open_path_anchor(
+                fixture.source,
+                owner_uid=os.getuid(),
+                leaf_kind="file",
+                require_executable=True,
+                filesystem_metadata_verifier=FakeFilesystemMetadataVerifier(),
+            )
+            try:
+                with (
+                    mock.patch.object(
+                        codex_executable,
+                        "_open_path_anchor",
+                        side_effect=FileNotFoundError(
+                            errno.ENOENT,
+                            "synthetic missing path",
+                        ),
+                    ),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        "path is missing during revalidation",
+                    ),
+                ):
+                    codex_executable._assert_anchor_stable(anchor)
+
+                with (
+                    mock.patch.object(
+                        codex_executable,
+                        "_open_path_anchor",
+                        side_effect=PermissionError(
+                            errno.EACCES,
+                            "synthetic unreadable path",
+                        ),
+                    ),
+                    self.assertRaisesRegex(
+                        OSError,
+                        "path could not be revalidated",
+                    ) as raised,
+                ):
+                    codex_executable._assert_anchor_stable(anchor)
+                self.assertEqual(raised.exception.errno, errno.EACCES)
+            finally:
+                os.close(anchor.fd)
 
     def test_rejects_staged_codesign_and_version_mismatches(self) -> None:
         with owned_temporary_directory("codex-staged-probes-") as root:
@@ -1527,8 +2591,1813 @@ class CodexExecutableAuthenticationTests(unittest.TestCase):
                 _cleanup(custody)
             self.assertEqual(list(schema_work_root.iterdir()), [])
 
+    def test_generated_schema_work_root_result_interrupt_closes_owned_anchor(
+        self,
+    ) -> None:
+        with owned_temporary_directory("codex-schema-root-result-") as root:
+            schema_work_root = root / "schema-work"
+            schema_work_root.mkdir(mode=0o700)
+            opened: list[codex_executable._PathAnchor] = []
+            original_open = codex_executable._open_path_anchor
+            target_offset = _call_result_store_offset(
+                codex_executable._generate_schema,
+                called_name="_open_path_anchor",
+                stored_name="work_root",
+            )
+            interruption = KeyboardInterrupt(
+                "injected schema work-root CALL-to-STORE interrupt"
+            )
+            injected = False
+
+            def recording_open(
+                *args: object,
+                **kwargs: object,
+            ) -> codex_executable._PathAnchor:
+                anchor = original_open(*args, **kwargs)
+                if kwargs.get("result_owner") is not None:
+                    opened.append(anchor)
+                return anchor
+
+            def interrupt_result_store(
+                frame: object,
+                event: str,
+                _argument: object,
+            ) -> object:
+                nonlocal injected
+                if (
+                    getattr(frame, "f_code", None)
+                    is codex_executable._generate_schema.__code__
+                ):
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        raise interruption
+                return interrupt_result_store
+
+            previous_trace = sys.gettrace()
+            try:
+                with mock.patch.object(
+                    codex_executable,
+                    "_open_path_anchor",
+                    side_effect=recording_open,
+                ):
+                    sys.settrace(interrupt_result_store)
+                    with self.assertRaises(KeyboardInterrupt) as caught:
+                        codex_executable._generate_schema(
+                            source_anchor=mock.sentinel.source_anchor,
+                            operations=[],
+                            schema_work_root=schema_work_root,
+                            command_runner=mock.Mock(
+                                side_effect=AssertionError(
+                                    "schema command must not run"
+                                )
+                            ),
+                            owner_uid=os.getuid(),
+                            policy=CodexExecutablePolicy(),
+                        )
+            finally:
+                sys.settrace(previous_trace)
+
+            self.assertTrue(injected)
+            self.assertIs(caught.exception, interruption)
+            self.assertEqual(len(opened), 1)
+            with self.assertRaises(OSError) as raised:
+                os.fstat(opened[0].fd)
+            self.assertEqual(raised.exception.errno, errno.EBADF)
+
+    def test_generated_schema_output_result_interrupt_closes_both_anchors(
+        self,
+    ) -> None:
+        with owned_temporary_directory("codex-schema-output-result-") as root:
+            schema_work_root = root / "schema-work"
+            schema_work_root.mkdir(mode=0o700)
+            opened: list[codex_executable._PathAnchor] = []
+            original_open = codex_executable._open_path_anchor
+            target_offset = _call_result_store_offset(
+                codex_executable._generate_schema,
+                called_name="_open_path_anchor",
+                stored_name="output_anchor",
+            )
+            interruption = KeyboardInterrupt(
+                "injected schema output CALL-to-STORE interrupt"
+            )
+            injected = False
+
+            def recording_open(
+                *args: object,
+                **kwargs: object,
+            ) -> codex_executable._PathAnchor:
+                anchor = original_open(*args, **kwargs)
+                if kwargs.get("result_owner") is not None:
+                    opened.append(anchor)
+                return anchor
+
+            def interrupt_result_store(
+                frame: object,
+                event: str,
+                _argument: object,
+            ) -> object:
+                nonlocal injected
+                if (
+                    getattr(frame, "f_code", None)
+                    is codex_executable._generate_schema.__code__
+                ):
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        raise interruption
+                return interrupt_result_store
+
+            previous_trace = sys.gettrace()
+            try:
+                with mock.patch.object(
+                    codex_executable,
+                    "_open_path_anchor",
+                    side_effect=recording_open,
+                ):
+                    sys.settrace(interrupt_result_store)
+                    with self.assertRaises(KeyboardInterrupt) as caught:
+                        codex_executable._generate_schema(
+                            source_anchor=mock.sentinel.source_anchor,
+                            operations=[],
+                            schema_work_root=schema_work_root,
+                            command_runner=mock.Mock(
+                                side_effect=AssertionError(
+                                    "schema command must not run"
+                                )
+                            ),
+                            owner_uid=os.getuid(),
+                            policy=CodexExecutablePolicy(),
+                        )
+            finally:
+                sys.settrace(previous_trace)
+
+            self.assertTrue(injected)
+            self.assertIs(caught.exception, interruption)
+            self.assertEqual(
+                len(opened),
+                2,
+                [(str(anchor.path), anchor.fd) for anchor in opened],
+            )
+            self.assertEqual(list(schema_work_root.iterdir()), [])
+            for anchor in opened:
+                with self.assertRaises(OSError) as raised:
+                    os.fstat(anchor.fd)
+                self.assertEqual(raised.exception.errno, errno.EBADF)
+
+    def test_schema_process_closure_failure_retains_output_and_custody(
+        self,
+    ) -> None:
+        with owned_temporary_directory("codex-schema-process-retain-") as root:
+            fixture = _build_fixture(root)
+            schema_work_root = root / "schema-work"
+            schema_work_root.mkdir(mode=0o700)
+            runner = FakeRunner(fixture)
+            marker_name = "process-owned-evidence.txt"
+
+            def fail_schema_with_unproven_closure(argv: tuple[str, ...]) -> None:
+                if argv[1:4] != (
+                    "app-server",
+                    "generate-json-schema",
+                    "--out",
+                ):
+                    return
+                output = pathlib.Path(argv[4])
+                (output / marker_name).write_text(
+                    "retain process evidence",
+                    encoding="ascii",
+                )
+                raise PreflightProcessClosureUnproven(
+                    "synthetic schema closure is unproven",
+                    evidence=codex_executable.PreflightProcessClosureEvidence(
+                        leader_pid=424242,
+                        leader_pgid=424242,
+                        leader_session_id=424242,
+                        leader_start_identity="synthetic-start",
+                        profile_sha256="a" * 64,
+                        leader_reaped=False,
+                        stdio_closed=False,
+                        authenticated_no_child_profile=True,
+                        permitted_process_closure_proven=False,
+                        process_group_emptiness_used_as_descendant_proof=False,
+                        reason="synthetic retained schema leader",
+                    ),
+                )
+
+            runner.hook = fail_schema_with_unproven_closure
+            with self.assertRaises(PreflightProcessClosureUnproven) as caught:
+                _authenticate(
+                    fixture,
+                    runner,
+                    aggregate_schema_path=None,
+                    schema_work_root=schema_work_root,
+                )
+
+            generated = next(
+                resource
+                for resource in caught.exception.retained_resources
+                if isinstance(
+                    resource,
+                    codex_executable._RetainedGeneratedSchema,
+                )
+            )
+            staged = next(
+                resource
+                for resource in caught.exception.retained_resources
+                if isinstance(resource, codex_executable._StagedSnapshot)
+            )
+            try:
+                self.assertEqual(
+                    (
+                        generated.work_root.path / generated.output_name / marker_name
+                    ).read_text(encoding="ascii"),
+                    "retain process evidence",
+                )
+                os.fstat(generated.work_root.fd)
+                assert generated.output_anchor is not None
+                os.fstat(generated.output_anchor.fd)
+                os.fstat(staged.directory_anchor.fd)
+                os.fstat(staged.file_anchor.fd)
+                self.assertIn(
+                    "generated-schema",
+                    {evidence.stage for evidence in caught.exception.recovery_evidence},
+                )
+                self.assertIn(
+                    "authentication-retention",
+                    {evidence.stage for evidence in caught.exception.recovery_evidence},
+                )
+            finally:
+                generated.close_descriptors_for_recovery()
+                codex_executable._close_staged_snapshot_fds(staged)
+
+    def test_generated_schema_mkdir_result_interrupt_retains_candidate_custody(
+        self,
+    ) -> None:
+        with owned_temporary_directory("codex-schema-mkdir-result-") as root:
+            fixture = _build_fixture(root)
+            schema_work_root = root / "schema-work"
+            schema_work_root.mkdir(mode=0o700)
+            source_anchor = codex_executable._open_path_anchor(
+                fixture.source,
+                owner_uid=os.getuid(),
+                leaf_kind="file",
+                require_executable=True,
+            )
+            target_offset = _call_result_next_opcode_offset(
+                codex_executable._generate_schema,
+                called_name="mkdir",
+            )
+            interruption = KeyboardInterrupt(
+                "injected generated-schema mkdir result interrupt"
+            )
+            injected = False
+
+            def interrupt_mkdir_result(
+                frame: object,
+                event: str,
+                _argument: object,
+            ) -> object:
+                nonlocal injected
+                if (
+                    getattr(frame, "f_code", None)
+                    is codex_executable._generate_schema.__code__
+                ):
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        raise interruption
+                return interrupt_mkdir_result
+
+            previous_trace = sys.gettrace()
+            try:
+                sys.settrace(interrupt_mkdir_result)
+                with self.assertRaises(CodexExecutableRetentionRequired) as caught:
+                    codex_executable._generate_schema(
+                        source_anchor=source_anchor,
+                        operations=[],
+                        schema_work_root=schema_work_root,
+                        command_runner=FakeRunner(fixture),
+                        owner_uid=os.getuid(),
+                        policy=fixture.policy,
+                    )
+            finally:
+                sys.settrace(previous_trace)
+
+            generated = next(
+                resource
+                for resource in caught.exception.retained_resources
+                if isinstance(
+                    resource,
+                    codex_executable._RetainedGeneratedSchema,
+                )
+            )
+            try:
+                self.assertTrue(injected)
+                self.assertIs(caught.exception.__context__, interruption)
+                self.assertEqual(
+                    caught.exception.failure.code,
+                    "generated-schema-custody-unavailable",
+                )
+                self.assertEqual(
+                    generated.creation_outcome,
+                    "mkdir-outcome-unproven",
+                )
+                self.assertIsNone(generated.output_anchor)
+                os.fstat(generated.work_root.fd)
+                self.assertTrue(
+                    (generated.work_root.path / generated.output_name).is_dir()
+                )
+                evidence = next(
+                    item
+                    for item in caught.exception.recovery_evidence
+                    if isinstance(
+                        item,
+                        codex_executable.CodexExecutableRecoveryEvidence,
+                    )
+                )
+                self.assertIn(
+                    "creation_outcome=mkdir-outcome-unproven",
+                    evidence.reason,
+                )
+            finally:
+                generated.close_descriptors_for_recovery()
+                os.close(source_anchor.fd)
+
+    def test_generated_schema_retention_publication_interrupt_keeps_one_owner(
+        self,
+    ) -> None:
+        for window, target_offset in (
+            (
+                "owner-construction-result",
+                _call_result_offset_with_argument(
+                    codex_executable._generate_schema,
+                    called_name="_generated_schema_retention_owner",
+                    argument_name="error",
+                    following_opname="STORE_FAST",
+                    following_argval="retention_owner",
+                ),
+            ),
+            (
+                "publication-result",
+                _call_result_offset_with_argument(
+                    codex_executable._generate_schema,
+                    called_name="_finish_generated_schema_retention",
+                    argument_name="error",
+                    following_opname="POP_TOP",
+                ),
+            ),
+        ):
+            with (
+                self.subTest(window=window),
+                owned_temporary_directory(
+                    "codex-schema-retention-publication-"
+                ) as root,
+            ):
+                fixture = _build_fixture(root)
+                schema_work_root = root / "schema-work"
+                schema_work_root.mkdir(mode=0o700)
+                runner = FakeRunner(fixture)
+                interruption = KeyboardInterrupt(
+                    f"injected generated-schema {window} interrupt"
+                )
+                injected = False
+                source_error = PreflightProcessClosureUnproven(
+                    "synthetic schema closure is unproven",
+                    evidence=codex_executable.PreflightProcessClosureEvidence(
+                        leader_pid=424242,
+                        leader_pgid=424242,
+                        leader_session_id=424242,
+                        leader_start_identity="synthetic-start",
+                        profile_sha256="a" * 64,
+                        leader_reaped=False,
+                        stdio_closed=False,
+                        authenticated_no_child_profile=True,
+                        permitted_process_closure_proven=False,
+                        process_group_emptiness_used_as_descendant_proof=False,
+                        reason="synthetic retained schema leader",
+                    ),
+                )
+
+                def fail_schema(argv: tuple[str, ...]) -> None:
+                    if argv[1:4] == (
+                        "app-server",
+                        "generate-json-schema",
+                        "--out",
+                    ):
+                        raise source_error
+
+                def interrupt_publication(
+                    frame: object,
+                    event: str,
+                    _argument: object,
+                ) -> object:
+                    nonlocal injected
+                    if (
+                        getattr(frame, "f_code", None)
+                        is codex_executable._generate_schema.__code__
+                    ):
+                        setattr(frame, "f_trace_opcodes", True)
+                        if (
+                            not injected
+                            and event == "opcode"
+                            and getattr(frame, "f_lasti", None) == target_offset
+                        ):
+                            injected = True
+                            raise interruption
+                    return interrupt_publication
+
+                runner.hook = fail_schema
+                previous_trace = sys.gettrace()
+                try:
+                    sys.settrace(interrupt_publication)
+                    with self.assertRaises(PreflightProcessClosureUnproven) as caught:
+                        _authenticate(
+                            fixture,
+                            runner,
+                            aggregate_schema_path=None,
+                            schema_work_root=schema_work_root,
+                        )
+                finally:
+                    sys.settrace(previous_trace)
+
+                generated = tuple(
+                    resource
+                    for resource in caught.exception.retained_resources
+                    if isinstance(
+                        resource,
+                        codex_executable._RetainedGeneratedSchema,
+                    )
+                )
+                staged = tuple(
+                    resource
+                    for resource in caught.exception.retained_resources
+                    if isinstance(resource, codex_executable._StagedSnapshot)
+                )
+                try:
+                    self.assertTrue(injected)
+                    self.assertIs(caught.exception, source_error)
+                    self.assertEqual(
+                        caught.exception.retention_publication_errors,
+                        (interruption,),
+                    )
+                    self.assertEqual(len(generated), 1)
+                    self.assertEqual(len(staged), 1)
+                    self.assertEqual(generated[0].creation_outcome, "descriptor-bound")
+                    os.fstat(generated[0].work_root.fd)
+                    assert generated[0].output_anchor is not None
+                    os.fstat(generated[0].output_anchor.fd)
+                    generated_evidence = tuple(
+                        item
+                        for item in caught.exception.recovery_evidence
+                        if isinstance(
+                            item,
+                            codex_executable.CodexExecutableRecoveryEvidence,
+                        )
+                        and item.stage == "generated-schema"
+                    )
+                    self.assertEqual(len(generated_evidence), 1)
+                finally:
+                    for resource in generated:
+                        resource.close_descriptors_for_recovery()
+                    for resource in staged:
+                        codex_executable._close_staged_snapshot_fds(resource)
+
+    def test_retained_generated_schema_close_abandons_reused_same_object_fd(
+        self,
+    ) -> None:
+        with owned_temporary_directory("codex-schema-close-reuse-") as root:
+            work_root_path = root / "schema-work"
+            work_root_path.mkdir(mode=0o700)
+            output_path = work_root_path / "generated"
+            output_path.mkdir(mode=0o700)
+            work_root = codex_executable._open_path_anchor(
+                work_root_path,
+                owner_uid=os.getuid(),
+                leaf_kind="directory",
+                require_executable=False,
+            )
+            output_anchor = codex_executable._open_path_anchor(
+                output_path,
+                owner_uid=os.getuid(),
+                leaf_kind="directory",
+                require_executable=False,
+            )
+            retained = codex_executable._RetainedGeneratedSchema(
+                work_root=work_root,
+                output_name=output_path.name,
+                output_anchor=output_anchor,
+                creation_outcome="descriptor-bound",
+            )
+            original_output_fd = output_anchor.fd
+            target_offset = _call_result_next_opcode_offset(
+                codex_executable._RetainedGeneratedSchema.close_descriptors_for_recovery,
+                called_name="close",
+            )
+            interruption = KeyboardInterrupt(
+                "injected generated-schema descriptor close result interrupt"
+            )
+            injected = False
+            reused_fd: int | None = None
+
+            def interrupt_and_reopen_same_root(
+                frame: object,
+                event: str,
+                _argument: object,
+            ) -> object:
+                nonlocal injected, reused_fd
+                if (
+                    getattr(frame, "f_code", None)
+                    is codex_executable._RetainedGeneratedSchema.close_descriptors_for_recovery.__code__
+                ):
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        reused_fd = os.open(
+                            output_path,
+                            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        )
+                        raise interruption
+                return interrupt_and_reopen_same_root
+
+            previous_trace = sys.gettrace()
+            try:
+                sys.settrace(interrupt_and_reopen_same_root)
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    retained.close_descriptors_for_recovery()
+            finally:
+                sys.settrace(previous_trace)
+
+            try:
+                self.assertTrue(injected)
+                self.assertIs(caught.exception, interruption)
+                self.assertEqual(reused_fd, original_output_fd)
+                self.assertEqual(retained._output_fd, original_output_fd)
+                self.assertEqual(
+                    retained._descriptor_close_outcomes["_output_fd"],
+                    "unproven",
+                )
+                self.assertIsNotNone(retained._work_root_fd)
+                retained.close_descriptors_for_recovery()
+                self.assertIsNone(retained._work_root_fd)
+                assert reused_fd is not None
+                os.fstat(reused_fd)
+                retained.close_descriptors_for_recovery()
+                os.fstat(reused_fd)
+            finally:
+                if reused_fd is not None:
+                    os.close(reused_fd)
+
+    def test_retained_generated_schema_close_pre_call_interrupt_keeps_evidence(
+        self,
+    ) -> None:
+        with owned_temporary_directory("codex-schema-close-pre-call-") as root:
+            work_root_path = root / "schema-work"
+            work_root_path.mkdir(mode=0o700)
+            output_path = work_root_path / "generated"
+            output_path.mkdir(mode=0o700)
+            work_root = codex_executable._open_path_anchor(
+                work_root_path,
+                owner_uid=os.getuid(),
+                leaf_kind="directory",
+                require_executable=False,
+            )
+            output_anchor = codex_executable._open_path_anchor(
+                output_path,
+                owner_uid=os.getuid(),
+                leaf_kind="directory",
+                require_executable=False,
+            )
+            retained = codex_executable._RetainedGeneratedSchema(
+                work_root=work_root,
+                output_name=output_path.name,
+                output_anchor=output_anchor,
+                creation_outcome="descriptor-bound",
+            )
+            original_output_fd = output_anchor.fd
+            target_offset = _call_opcode_offset(
+                codex_executable._RetainedGeneratedSchema.close_descriptors_for_recovery,
+                called_name="close",
+            )
+            interruption = KeyboardInterrupt(
+                "injected generated-schema descriptor pre-close interrupt"
+            )
+            injected = False
+
+            def interrupt_before_close(
+                frame: object,
+                event: str,
+                _argument: object,
+            ) -> object:
+                nonlocal injected
+                if (
+                    getattr(frame, "f_code", None)
+                    is codex_executable._RetainedGeneratedSchema.close_descriptors_for_recovery.__code__
+                ):
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        raise interruption
+                return interrupt_before_close
+
+            previous_trace = sys.gettrace()
+            try:
+                sys.settrace(interrupt_before_close)
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    retained.close_descriptors_for_recovery()
+            finally:
+                sys.settrace(previous_trace)
+
+            self.assertTrue(injected)
+            self.assertIs(caught.exception, interruption)
+            self.assertIs(
+                caught.exception.retained_generated_schema_close_owner,
+                retained,
+            )
+            self.assertEqual(retained._output_fd, original_output_fd)
+            self.assertEqual(
+                retained._descriptor_close_outcomes["_output_fd"],
+                "unproven",
+            )
+            os.fstat(original_output_fd)
+            retained.close_descriptors_for_recovery()
+            os.fstat(original_output_fd)
+            os.close(original_output_fd)
+
+    def test_path_anchor_close_pre_call_interrupt_retains_result_owner(
+        self,
+    ) -> None:
+        with owned_temporary_directory("codex-anchor-close-pre-call-") as root:
+            anchor = codex_executable._open_path_anchor(
+                root,
+                owner_uid=os.getuid(),
+                leaf_kind="directory",
+                require_executable=False,
+            )
+            owner = codex_executable._PathAnchorResultOwner(anchor=anchor)
+            target_offset = _call_opcode_offset(
+                codex_executable._PathAnchorResultOwner.close,
+                called_name="close",
+            )
+            interruption = KeyboardInterrupt(
+                "injected path-anchor descriptor pre-close interrupt"
+            )
+            injected = False
+
+            def interrupt_before_close(
+                frame: object,
+                event: str,
+                _argument: object,
+            ) -> object:
+                nonlocal injected
+                if (
+                    getattr(frame, "f_code", None)
+                    is codex_executable._PathAnchorResultOwner.close.__code__
+                ):
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        raise interruption
+                return interrupt_before_close
+
+            previous_trace = sys.gettrace()
+            try:
+                sys.settrace(interrupt_before_close)
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    owner.close()
+            finally:
+                sys.settrace(previous_trace)
+
+            self.assertTrue(injected)
+            self.assertIs(caught.exception, interruption)
+            self.assertIs(caught.exception.path_anchor_close_result_owner, owner)
+            self.assertIs(owner.anchor, anchor)
+            self.assertEqual(owner.close_outcome, "unproven")
+            os.fstat(anchor.fd)
+            owner.close()
+            os.fstat(anchor.fd)
+            os.close(anchor.fd)
+
+    def test_snapshot_stability_file_open_failure_closes_reopened_directory(
+        self,
+    ) -> None:
+        with owned_temporary_directory("codex-snapshot-open-rollback-") as root:
+            fixture = _build_fixture(root)
+            custody = _authenticate(fixture, FakeRunner(fixture))
+            staged = custody._staged
+            original_open = codex_executable._open_path_anchor
+            reopened_directory_fd: int | None = None
+            calls = 0
+
+            def fail_file_open(*args: object, **kwargs: object) -> object:
+                nonlocal calls, reopened_directory_fd
+                calls += 1
+                if calls == 2:
+                    raise OSError(errno.EIO, "injected snapshot file open failure")
+                anchor = original_open(*args, **kwargs)
+                reopened_directory_fd = anchor.fd
+                return anchor
+
+            with (
+                mock.patch.object(
+                    codex_executable,
+                    "_open_path_anchor",
+                    side_effect=fail_file_open,
+                ),
+                self.assertRaisesRegex(OSError, "snapshot file open failure"),
+            ):
+                codex_executable._assert_snapshot_stable(
+                    staged.directory_anchor,
+                    staged.file_anchor,
+                )
+
+            assert reopened_directory_fd is not None
+            with self.assertRaises(OSError) as raised:
+                os.fstat(reopened_directory_fd)
+            self.assertEqual(raised.exception.errno, errno.EBADF)
+            _cleanup(custody)
+
+    def test_authentication_rollback_failure_retains_snapshot_fds_and_evidence(
+        self,
+    ) -> None:
+        with owned_temporary_directory("codex-auth-rollback-retain-") as root:
+            fixture = _build_fixture(root)
+            runner = FakeRunner(fixture)
+            runner.version = b"unexpected-version\n"
+            with (
+                mock.patch.object(
+                    codex_executable,
+                    "_destroy_staged_snapshot",
+                    side_effect=OSError(errno.EIO, "injected rollback refusal"),
+                ),
+                self.assertRaises(CodexExecutableRetentionRequired) as caught,
+            ):
+                _authenticate(fixture, runner)
+
+            staged = next(
+                resource
+                for resource in caught.exception.retained_resources
+                if isinstance(resource, codex_executable._StagedSnapshot)
+            )
+            try:
+                os.fstat(staged.directory_anchor.fd)
+                os.fstat(staged.file_anchor.fd)
+                self.assertTrue(staged.directory_anchor.path.is_dir())
+                self.assertTrue(staged.file_anchor.path.is_file())
+                evidence = next(
+                    evidence
+                    for evidence in caught.exception.recovery_evidence
+                    if evidence.stage == "authentication-rollback"
+                )
+                self.assertEqual(
+                    evidence.directory_fd,
+                    staged.directory_anchor.fd,
+                )
+                self.assertEqual(evidence.executable_fd, staged.file_anchor.fd)
+                self.assertIn("injected rollback refusal", evidence.reason)
+            finally:
+                codex_executable._close_staged_snapshot_fds(staged)
+
+    def test_snapshot_mkdir_result_gap_cleans_with_typed_evidence(self) -> None:
+        target_offset = _call_result_next_opcode_offset(
+            codex_executable._create_and_publish_snapshot_directory,
+            called_name="mkdir",
+        )
+        interruption_cases = (
+            KeyboardInterrupt("injected snapshot mkdir result interrupt"),
+            SystemExit("injected snapshot mkdir result exit"),
+        )
+        for interruption in interruption_cases:
+            with (
+                self.subTest(interruption=type(interruption).__name__),
+                owned_temporary_directory(
+                    f"codex-snapshot-mkdir-{type(interruption).__name__}-"
+                ) as root,
+            ):
+                fixture = _build_fixture(root)
+                injected = False
+
+                def interrupt_mkdir_result(
+                    frame: object,
+                    event: str,
+                    _argument: object,
+                ) -> object:
+                    nonlocal injected
+                    if (
+                        getattr(frame, "f_code", None)
+                        is codex_executable._create_and_publish_snapshot_directory.__code__
+                    ):
+                        setattr(frame, "f_trace_opcodes", True)
+                        if (
+                            not injected
+                            and event == "opcode"
+                            and getattr(frame, "f_lasti", None) == target_offset
+                        ):
+                            injected = True
+                            raise interruption
+                    return interrupt_mkdir_result
+
+                previous_trace = sys.gettrace()
+                try:
+                    sys.settrace(interrupt_mkdir_result)
+                    with self.assertRaises(
+                        codex_executable.CodexExecutableSnapshotCreationAborted
+                    ) as caught:
+                        _authenticate(fixture, FakeRunner(fixture))
+                finally:
+                    sys.settrace(previous_trace)
+
+                self.assertTrue(injected)
+                self.assertIs(caught.exception.__cause__, interruption)
+                self.assertEqual(list(fixture.snapshot_parent.iterdir()), [])
+                evidence = caught.exception.evidence
+                self.assertEqual(evidence.operation, "mkdir-directory")
+                self.assertEqual(evidence.entry_state, "removed")
+                self.assertTrue(evidence.directory_removed)
+                self.assertTrue(evidence.parent_fsynced)
+                self.assertTrue(
+                    evidence.directory_name.startswith(SNAPSHOT_DIRECTORY_PREFIX)
+                )
+
+    def test_snapshot_creation_identity_stat_failure_cleans_with_typed_evidence(
+        self,
+    ) -> None:
+        with owned_temporary_directory("codex-snapshot-identity-stat-") as root:
+            fixture = _build_fixture(root)
+            original_stat = os.stat
+            failed = False
+
+            def fail_creation_identity_stat(
+                path: object,
+                *args: object,
+                **kwargs: object,
+            ) -> os.stat_result:
+                nonlocal failed
+                if (
+                    not failed
+                    and kwargs.get("dir_fd") is not None
+                    and kwargs.get("follow_symlinks") is False
+                    and os.fsdecode(path).startswith(SNAPSHOT_DIRECTORY_PREFIX)
+                ):
+                    failed = True
+                    raise OSError(
+                        errno.EIO,
+                        "injected snapshot creation identity stat failure",
+                    )
+                return original_stat(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    codex_executable.os,
+                    "stat",
+                    side_effect=fail_creation_identity_stat,
+                ),
+                self.assertRaises(
+                    codex_executable.CodexExecutableSnapshotCreationAborted
+                ) as caught,
+            ):
+                _authenticate(fixture, FakeRunner(fixture))
+
+            self.assertTrue(failed)
+            self.assertEqual(list(fixture.snapshot_parent.iterdir()), [])
+            self.assertEqual(
+                caught.exception.evidence.operation,
+                "capture-directory-identity",
+            )
+            self.assertEqual(caught.exception.evidence.entry_state, "removed")
+            self.assertTrue(caught.exception.evidence.directory_removed)
+            self.assertTrue(caught.exception.evidence.parent_fsynced)
+
+    def test_new_snapshot_rollback_scopes_object_content_and_access_policy(
+        self,
+    ) -> None:
+        cases = ("content", "object", "access-policy")
+        for mutation in cases:
+            with (
+                self.subTest(mutation=mutation),
+                owned_temporary_directory(f"codex-new-snapshot-{mutation}-") as root,
+            ):
+                fixture = _build_fixture(root)
+
+                def fail_copy(
+                    _source_fd: int,
+                    destination_fd: int,
+                    _expected_size: int,
+                    _max_bytes: int,
+                ) -> SnapshotCopyResult:
+                    if mutation == "content":
+                        os.write(destination_fd, b"partial untrusted content")
+                    elif mutation == "object":
+                        snapshot_directory = next(
+                            path
+                            for path in fixture.snapshot_parent.iterdir()
+                            if path.name.startswith(SNAPSHOT_DIRECTORY_PREFIX)
+                        )
+                        snapshot = snapshot_directory / "codex"
+                        snapshot.unlink()
+                        snapshot.write_bytes(b"replacement object")
+                        os.chmod(snapshot, 0o600)
+                    else:
+                        os.fchmod(destination_fd, 0o400)
+                    raise RuntimeError(f"injected {mutation} copy failure")
+
+                expected_error = (
+                    CodexExecutableError
+                    if mutation == "content"
+                    else CodexExecutableRetentionRequired
+                )
+                with self.assertRaises(expected_error) as caught:
+                    _authenticate(
+                        fixture,
+                        FakeRunner(fixture),
+                        snapshot_copier=fail_copy,
+                    )
+
+                if mutation == "content":
+                    self.assertEqual(list(fixture.snapshot_parent.iterdir()), [])
+                    continue
+
+                retained = next(
+                    resource
+                    for resource in caught.exception.retained_resources
+                    if isinstance(
+                        resource,
+                        codex_executable._RetainedNewSnapshot,
+                    )
+                )
+                try:
+                    os.fstat(retained.parent_fd)
+                    assert retained.directory_fd is not None
+                    os.fstat(retained.directory_fd)
+                    assert retained.file_fd is not None
+                    os.fstat(retained.file_fd)
+                    evidence = next(
+                        evidence
+                        for evidence in caught.exception.recovery_evidence
+                        if isinstance(
+                            evidence,
+                            codex_executable.NewSnapshotRollbackRecoveryEvidence,
+                        )
+                    )
+                    self.assertEqual(
+                        evidence.protected_property,
+                        (
+                            "object-identity"
+                            if mutation == "object"
+                            else "access-policy"
+                        ),
+                    )
+                    self.assertEqual(
+                        evidence.failure_kind,
+                        "revalidation-mismatch",
+                    )
+                    self.assertEqual(evidence.entry_state, "public")
+                finally:
+                    retained.close_descriptors_for_recovery()
+
+    def test_new_snapshot_rollback_fsync_interrupt_retains_quarantine_name(
+        self,
+    ) -> None:
+        with owned_temporary_directory("codex-new-snapshot-fsync-") as root:
+            fixture = _build_fixture(root)
+            original_rename = os.rename
+            original_fsync = os.fsync
+            quarantine_name: str | None = None
+            interrupted = False
+
+            def fail_copy(*_arguments: object) -> SnapshotCopyResult:
+                raise RuntimeError("injected copy failure")
+
+            def record_rename(
+                source: bytes,
+                destination: bytes,
+                **kwargs: object,
+            ) -> None:
+                nonlocal quarantine_name
+                original_rename(source, destination, **kwargs)
+                quarantine_name = os.fsdecode(destination)
+
+            def interrupt_quarantine_fsync(descriptor: int) -> None:
+                nonlocal interrupted
+                if quarantine_name is not None and not interrupted:
+                    interrupted = True
+                    raise KeyboardInterrupt(
+                        "injected quarantine parent fsync interrupt"
+                    )
+                original_fsync(descriptor)
+
+            with (
+                mock.patch.object(
+                    codex_executable.os,
+                    "rename",
+                    side_effect=record_rename,
+                ),
+                mock.patch.object(
+                    codex_executable.os,
+                    "fsync",
+                    side_effect=interrupt_quarantine_fsync,
+                ),
+                self.assertRaises(CodexExecutableRetentionRequired) as caught,
+            ):
+                _authenticate(
+                    fixture,
+                    FakeRunner(fixture),
+                    snapshot_copier=fail_copy,
+                )
+
+            self.assertTrue(interrupted)
+            retained = next(
+                resource
+                for resource in caught.exception.retained_resources
+                if isinstance(
+                    resource,
+                    codex_executable._RetainedNewSnapshot,
+                )
+            )
+            try:
+                self.assertEqual(retained.quarantine_name, quarantine_name)
+                assert quarantine_name is not None
+                self.assertTrue(
+                    quarantine_name.startswith(
+                        codex_executable.SNAPSHOT_QUARANTINE_PREFIX
+                    )
+                )
+                self.assertTrue((fixture.snapshot_parent / quarantine_name).is_dir())
+                self.assertFalse(
+                    (fixture.snapshot_parent / retained.public_name).exists()
+                )
+                os.fstat(retained.parent_fd)
+                assert retained.directory_fd is not None
+                os.fstat(retained.directory_fd)
+                assert retained.file_fd is not None
+                os.fstat(retained.file_fd)
+                evidence = next(
+                    evidence
+                    for evidence in caught.exception.recovery_evidence
+                    if isinstance(
+                        evidence,
+                        codex_executable.NewSnapshotRollbackRecoveryEvidence,
+                    )
+                )
+                self.assertEqual(evidence.operation, "quarantine-parent-fsync")
+                self.assertEqual(evidence.failure_kind, "durability-unproven")
+                self.assertEqual(evidence.protected_property, "durability")
+                self.assertEqual(evidence.quarantine_name, quarantine_name)
+                self.assertEqual(evidence.entry_state, "quarantined")
+            finally:
+                retained.close_descriptors_for_recovery()
+
+    def test_new_snapshot_rollback_revalidation_failure_retains_quarantine(
+        self,
+    ) -> None:
+        with owned_temporary_directory("codex-new-snapshot-revalidate-") as root:
+            fixture = _build_fixture(root)
+            original_rename = os.rename
+            original_stat = os.stat
+            quarantine_name: str | None = None
+            failed = False
+
+            def fail_copy(*_arguments: object) -> SnapshotCopyResult:
+                raise RuntimeError("injected copy failure")
+
+            def record_rename(
+                source: bytes,
+                destination: bytes,
+                **kwargs: object,
+            ) -> None:
+                nonlocal quarantine_name
+                original_rename(source, destination, **kwargs)
+                quarantine_name = os.fsdecode(destination)
+
+            def fail_quarantine_stat(
+                path: object,
+                *args: object,
+                **kwargs: object,
+            ) -> os.stat_result:
+                nonlocal failed
+                if (
+                    quarantine_name is not None
+                    and os.fsdecode(path) == quarantine_name
+                    and not failed
+                ):
+                    failed = True
+                    raise OSError(
+                        errno.EIO,
+                        "injected quarantine revalidation failure",
+                    )
+                return original_stat(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    codex_executable.os,
+                    "rename",
+                    side_effect=record_rename,
+                ),
+                mock.patch.object(
+                    codex_executable.os,
+                    "stat",
+                    side_effect=fail_quarantine_stat,
+                ),
+                self.assertRaises(CodexExecutableRetentionRequired) as caught,
+            ):
+                _authenticate(
+                    fixture,
+                    FakeRunner(fixture),
+                    snapshot_copier=fail_copy,
+                )
+
+            self.assertTrue(failed)
+            retained = next(
+                resource
+                for resource in caught.exception.retained_resources
+                if isinstance(
+                    resource,
+                    codex_executable._RetainedNewSnapshot,
+                )
+            )
+            try:
+                self.assertEqual(retained.quarantine_name, quarantine_name)
+                os.fstat(retained.parent_fd)
+                assert retained.directory_fd is not None
+                os.fstat(retained.directory_fd)
+                assert retained.file_fd is not None
+                os.fstat(retained.file_fd)
+                evidence = next(
+                    evidence
+                    for evidence in caught.exception.recovery_evidence
+                    if isinstance(
+                        evidence,
+                        codex_executable.NewSnapshotRollbackRecoveryEvidence,
+                    )
+                )
+                self.assertEqual(
+                    evidence.operation,
+                    "revalidate-quarantined-directory",
+                )
+                self.assertEqual(
+                    evidence.failure_kind,
+                    "revalidation-unavailable",
+                )
+                self.assertEqual(evidence.protected_property, "availability")
+                self.assertEqual(evidence.quarantine_name, quarantine_name)
+                self.assertEqual(evidence.entry_state, "quarantined")
+            finally:
+                retained.close_descriptors_for_recovery()
+
+    def test_new_snapshot_rollback_rename_result_gap_revalidates_entry_state(
+        self,
+    ) -> None:
+        with owned_temporary_directory("codex-new-snapshot-rename-gap-") as root:
+            fixture = _build_fixture(root)
+            target_offset = _call_result_next_opcode_offset(
+                codex_executable._rollback_new_snapshot,
+                called_name="rename",
+            )
+            interruption = KeyboardInterrupt(
+                "injected snapshot quarantine rename result interrupt"
+            )
+            injected = False
+
+            def fail_copy(*_arguments: object) -> SnapshotCopyResult:
+                raise RuntimeError("injected copy failure")
+
+            def interrupt_rename_result(
+                frame: object,
+                event: str,
+                _argument: object,
+            ) -> object:
+                nonlocal injected
+                if (
+                    getattr(frame, "f_code", None)
+                    is codex_executable._rollback_new_snapshot.__code__
+                ):
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        raise interruption
+                return interrupt_rename_result
+
+            previous_trace = sys.gettrace()
+            try:
+                sys.settrace(interrupt_rename_result)
+                with self.assertRaises(CodexExecutableRetentionRequired) as caught:
+                    _authenticate(
+                        fixture,
+                        FakeRunner(fixture),
+                        snapshot_copier=fail_copy,
+                    )
+            finally:
+                sys.settrace(previous_trace)
+
+            self.assertTrue(injected)
+            self.assertIs(caught.exception.__cause__, interruption)
+            retained = next(
+                resource
+                for resource in caught.exception.retained_resources
+                if isinstance(resource, codex_executable._RetainedNewSnapshot)
+            )
+            try:
+                self.assertEqual(retained.entry_state, "quarantined")
+                self.assertEqual(
+                    retained.entry_state_source,
+                    "descriptor-bound-revalidation",
+                )
+                assert retained.quarantine_name is not None
+                self.assertFalse(
+                    (fixture.snapshot_parent / retained.public_name).exists()
+                )
+                self.assertTrue(
+                    (fixture.snapshot_parent / retained.quarantine_name).is_dir()
+                )
+                evidence = next(
+                    item
+                    for item in caught.exception.recovery_evidence
+                    if isinstance(
+                        item,
+                        codex_executable.NewSnapshotRollbackRecoveryEvidence,
+                    )
+                )
+                self.assertEqual(evidence.entry_state, "quarantined")
+                self.assertEqual(
+                    evidence.entry_state_source,
+                    "descriptor-bound-revalidation",
+                )
+                self.assertEqual(evidence.failure_kind, "durability-unproven")
+                self.assertEqual(evidence.protected_property, "durability")
+            finally:
+                retained.close_descriptors_for_recovery()
+
+    def test_new_snapshot_rollback_rmdir_result_gap_revalidates_entry_state(
+        self,
+    ) -> None:
+        with owned_temporary_directory("codex-new-snapshot-rmdir-gap-") as root:
+            fixture = _build_fixture(root)
+            target_offset = _call_result_next_opcode_offset(
+                codex_executable._rollback_new_snapshot,
+                called_name="rmdir",
+            )
+            interruption = SystemExit("injected snapshot quarantine rmdir result exit")
+            injected = False
+
+            def fail_copy(*_arguments: object) -> SnapshotCopyResult:
+                raise RuntimeError("injected copy failure")
+
+            def interrupt_rmdir_result(
+                frame: object,
+                event: str,
+                _argument: object,
+            ) -> object:
+                nonlocal injected
+                if (
+                    getattr(frame, "f_code", None)
+                    is codex_executable._rollback_new_snapshot.__code__
+                ):
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        raise interruption
+                return interrupt_rmdir_result
+
+            previous_trace = sys.gettrace()
+            try:
+                sys.settrace(interrupt_rmdir_result)
+                with self.assertRaises(CodexExecutableRetentionRequired) as caught:
+                    _authenticate(
+                        fixture,
+                        FakeRunner(fixture),
+                        snapshot_copier=fail_copy,
+                    )
+            finally:
+                sys.settrace(previous_trace)
+
+            self.assertTrue(injected)
+            self.assertIs(caught.exception.__cause__, interruption)
+            retained = next(
+                resource
+                for resource in caught.exception.retained_resources
+                if isinstance(resource, codex_executable._RetainedNewSnapshot)
+            )
+            try:
+                self.assertEqual(retained.entry_state, "removed-unfsynced")
+                self.assertEqual(
+                    retained.entry_state_source,
+                    "descriptor-bound-revalidation",
+                )
+                self.assertFalse(
+                    (fixture.snapshot_parent / retained.public_name).exists()
+                )
+                assert retained.quarantine_name is not None
+                self.assertFalse(
+                    (fixture.snapshot_parent / retained.quarantine_name).exists()
+                )
+                evidence = next(
+                    item
+                    for item in caught.exception.recovery_evidence
+                    if isinstance(
+                        item,
+                        codex_executable.NewSnapshotRollbackRecoveryEvidence,
+                    )
+                )
+                self.assertEqual(evidence.entry_state, "removed-unfsynced")
+                self.assertEqual(
+                    evidence.entry_state_source,
+                    "descriptor-bound-revalidation",
+                )
+                self.assertEqual(evidence.failure_kind, "durability-unproven")
+                self.assertEqual(evidence.protected_property, "durability")
+            finally:
+                retained.close_descriptors_for_recovery()
+
+    def test_generated_schema_cleanup_retains_original_and_replacement_on_race(
+        self,
+    ) -> None:
+        with owned_temporary_directory("codex-schema-cleanup-race-") as root:
+            fixture = _build_fixture(root)
+            schema_work_root = root / "schema-work"
+            schema_work_root.mkdir(mode=0o700)
+            replacement_stage = schema_work_root / "replacement-stage"
+            replacement_stage.mkdir(mode=0o700)
+            replacement_marker = replacement_stage / "replacement.txt"
+            replacement_marker.write_text("replacement evidence", encoding="ascii")
+            displaced = schema_work_root / "original-evidence"
+            original_require = CustodiedManifest.require_live_custody
+            swapped = False
+
+            def swap_after_validation(manifest: CustodiedManifest) -> None:
+                nonlocal swapped
+                original_require(manifest)
+                if swapped or manifest.roots[0].label != "generated-schema":
+                    return
+                swapped = True
+                output = schema_work_root / os.fsdecode(manifest.roots[0].name)
+                os.rename(output, displaced)
+                os.rename(replacement_stage, output)
+
+            with (
+                mock.patch.object(
+                    CustodiedManifest,
+                    "require_live_custody",
+                    new=swap_after_validation,
+                ),
+                self.assertRaisesRegex(
+                    CodexExecutableRetentionRequired,
+                    "cleanup transaction did not complete",
+                ) as caught,
+            ):
+                _authenticate(
+                    fixture,
+                    FakeRunner(fixture),
+                    aggregate_schema_path=None,
+                    schema_work_root=schema_work_root,
+                )
+
+            retained_manifests = tuple(
+                resource
+                for resource in caught.exception.retained_resources
+                if isinstance(resource, CustodiedManifest)
+            )
+            self.assertEqual(len(retained_manifests), 1)
+            self.assertEqual(len(retained_manifests[0].root_fds), 1)
+            os.fstat(retained_manifests[0].root_fds[0])
+            try:
+                self.assertTrue(swapped)
+                self.assertEqual(
+                    (displaced / AGGREGATE_SCHEMA_NAME).read_bytes(),
+                    SYNTHETIC_SCHEMA,
+                )
+                replacement_directories = tuple(
+                    path
+                    for path in schema_work_root.iterdir()
+                    if path.name.startswith(codex_executable.SCHEMA_DIRECTORY_PREFIX)
+                )
+                self.assertEqual(len(replacement_directories), 1)
+                self.assertEqual(
+                    (replacement_directories[0] / replacement_marker.name).read_text(
+                        encoding="ascii"
+                    ),
+                    "replacement evidence",
+                )
+                self.assertTrue(
+                    any(
+                        path.suffix == ".manifest"
+                        for path in schema_work_root.iterdir()
+                    )
+                )
+            finally:
+                for resource in caught.exception.retained_resources:
+                    if isinstance(resource, codex_executable._StagedSnapshot):
+                        codex_executable._close_staged_snapshot_fds(resource)
+                    elif isinstance(
+                        resource,
+                        codex_executable._RetainedGeneratedSchema,
+                    ):
+                        resource.close_descriptors_for_recovery()
+                    elif isinstance(resource, CustodiedManifest):
+                        resource.close()
+
+    def test_generated_schema_manifest_call_to_store_interrupt_retains_live_root_fd(
+        self,
+    ) -> None:
+        with owned_temporary_directory("codex-schema-manifest-store-") as root:
+            work_root_path = root / "schema-work"
+            work_root_path.mkdir(mode=0o700)
+            output_name = "codex-schema-interrupted"
+            output_path = work_root_path / output_name
+            output_path.mkdir(mode=0o700)
+            (output_path / AGGREGATE_SCHEMA_NAME).write_bytes(SYNTHETIC_SCHEMA)
+            work_root = codex_executable._open_path_anchor(
+                work_root_path,
+                owner_uid=os.getuid(),
+                leaf_kind="directory",
+                require_executable=False,
+            )
+            output_anchor = codex_executable._open_path_anchor(
+                output_path,
+                owner_uid=os.getuid(),
+                leaf_kind="directory",
+                require_executable=False,
+            )
+            target_offset = _call_result_store_offset(
+                codex_executable._destroy_generated_schema_directory,
+                called_name="build_custodied_manifest",
+                stored_name="manifest",
+            )
+            interruption = KeyboardInterrupt(
+                "injected generated-schema manifest CALL-to-STORE interrupt"
+            )
+            injected = False
+
+            def interrupt_result_store(
+                frame: object,
+                event: str,
+                _argument: object,
+            ) -> object:
+                nonlocal injected
+                if (
+                    getattr(frame, "f_code", None)
+                    is codex_executable._destroy_generated_schema_directory.__code__
+                ):
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        raise interruption
+                return interrupt_result_store
+
+            previous_trace = sys.gettrace()
+            try:
+                sys.settrace(interrupt_result_store)
+                with self.assertRaises(CodexExecutableRetentionRequired) as caught:
+                    codex_executable._destroy_generated_schema_directory(
+                        work_root=work_root,
+                        output_anchor=output_anchor,
+                        output_name=output_name,
+                    )
+            finally:
+                sys.settrace(previous_trace)
+
+            retained_manifests = tuple(
+                resource
+                for resource in caught.exception.retained_resources
+                if isinstance(resource, CustodiedManifest)
+            )
+            try:
+                self.assertTrue(injected)
+                self.assertIs(caught.exception.__cause__, interruption)
+                self.assertEqual(len(retained_manifests), 1)
+                self.assertEqual(len(retained_manifests[0].root_fds), 1)
+                os.fstat(retained_manifests[0].root_fds[0])
+                self.assertTrue(output_path.is_dir())
+            finally:
+                for manifest in retained_manifests:
+                    manifest.close()
+                os.close(output_anchor.fd)
+                os.close(work_root.fd)
+
+    def test_generated_schema_delete_result_interrupt_retains_completion_proof(
+        self,
+    ) -> None:
+        with owned_temporary_directory("codex-schema-delete-store-") as root:
+            work_root_path = root / "schema-work"
+            work_root_path.mkdir(mode=0o700)
+            output_name = "codex-schema-deleted"
+            output_path = work_root_path / output_name
+            output_path.mkdir(mode=0o700)
+            (output_path / AGGREGATE_SCHEMA_NAME).write_bytes(SYNTHETIC_SCHEMA)
+            work_root = codex_executable._open_path_anchor(
+                work_root_path,
+                owner_uid=os.getuid(),
+                leaf_kind="directory",
+                require_executable=False,
+            )
+            output_anchor = codex_executable._open_path_anchor(
+                output_path,
+                owner_uid=os.getuid(),
+                leaf_kind="directory",
+                require_executable=False,
+            )
+            target_offset = _call_result_store_offset(
+                codex_executable._destroy_generated_schema_directory,
+                called_name="delete_custodied_roots",
+                stored_name="deletion_proof",
+            )
+            interruption = KeyboardInterrupt(
+                "injected generated-schema deletion CALL-to-STORE interrupt"
+            )
+            injected = False
+
+            def interrupt_result_store(
+                frame: object,
+                event: str,
+                _argument: object,
+            ) -> object:
+                nonlocal injected
+                if (
+                    getattr(frame, "f_code", None)
+                    is codex_executable._destroy_generated_schema_directory.__code__
+                ):
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        raise interruption
+                return interrupt_result_store
+
+            previous_trace = sys.gettrace()
+            try:
+                sys.settrace(interrupt_result_store)
+                with self.assertRaises(CodexExecutableRetentionRequired) as caught:
+                    codex_executable._destroy_generated_schema_directory(
+                        work_root=work_root,
+                        output_anchor=output_anchor,
+                        output_name=output_name,
+                    )
+            finally:
+                sys.settrace(previous_trace)
+
+            retained_manifests = tuple(
+                resource
+                for resource in caught.exception.retained_resources
+                if isinstance(resource, CustodiedManifest)
+            )
+            try:
+                self.assertTrue(injected)
+                self.assertIs(caught.exception.__cause__, interruption)
+                self.assertFalse(output_path.exists())
+                self.assertNotIn("schema trees were retained", str(caught.exception))
+                proof = caught.exception.completed_deletion_proof
+                self.assertTrue(proof["parent_fsync_complete"])
+                self.assertTrue(proof["exact_names_absent"])
+                evidence = next(
+                    item
+                    for item in caught.exception.recovery_evidence
+                    if isinstance(
+                        item,
+                        codex_executable.GeneratedSchemaDeletionRecoveryEvidence,
+                    )
+                )
+                self.assertEqual(evidence.stage, "generated-schema-deletion-complete")
+                self.assertEqual(evidence.manifest_sha256, proof["manifest_sha256"])
+                self.assertEqual(len(retained_manifests), 1)
+            finally:
+                for retained_manifest in retained_manifests:
+                    retained_manifest.close()
+                os.close(output_anchor.fd)
+                os.close(work_root.fd)
+
+    def _assert_generated_schema_retention_interrupt(
+        self,
+        *,
+        after_retention_store: bool,
+    ) -> None:
+        with owned_temporary_directory("codex-schema-retain-window-") as root:
+            work_root_path = root / "schema-work"
+            work_root_path.mkdir(mode=0o700)
+            output_name = "codex-schema-retained"
+            output_path = work_root_path / output_name
+            output_path.mkdir(mode=0o700)
+            (output_path / AGGREGATE_SCHEMA_NAME).write_bytes(SYNTHETIC_SCHEMA)
+            work_root = codex_executable._open_path_anchor(
+                work_root_path,
+                owner_uid=os.getuid(),
+                leaf_kind="directory",
+                require_executable=False,
+            )
+            output_anchor = codex_executable._open_path_anchor(
+                output_path,
+                owner_uid=os.getuid(),
+                leaf_kind="directory",
+                require_executable=False,
+            )
+            retention_store = _call_result_store_offset(
+                codex_executable._destroy_generated_schema_directory,
+                called_name="retain",
+                stored_name="retained_manifest",
+            )
+            target_offset = (
+                _instruction_after_offset(
+                    codex_executable._destroy_generated_schema_directory,
+                    retention_store,
+                )
+                if after_retention_store
+                else retention_store
+            )
+            interruption = KeyboardInterrupt(
+                "injected generated-schema manifest retention interrupt"
+            )
+            original = RuntimeError("synthetic generated-schema cleanup failure")
+            original_evidence: list[QuarantinedRootRecoveryEvidence] = []
+            injected = False
+
+            def fail_delete(
+                manifest: CustodiedManifest,
+                *,
+                deadline: float,
+                result_owner: object,
+            ) -> None:
+                del deadline, result_owner
+                evidence = QuarantinedRootRecoveryEvidence(
+                    label="generated-schema",
+                    stage="recursive-delete",
+                    parent_fd=work_root.fd,
+                    root_fd=manifest.root_fds[0],
+                    original_name=os.fsencode(output_name),
+                    quarantine_name=(b".targeted-cleanup-quarantine-" + b"a" * 32),
+                    parent_identity=codex_executable._cleanup_identity(
+                        work_root.identity
+                    ),
+                    expected_identity=codex_executable._cleanup_identity(
+                        output_anchor.identity
+                    ),
+                )
+                original_evidence.append(evidence)
+                recovery_cleanup._attach_quarantined_root_recovery(
+                    original,
+                    evidence,
+                )
+                raise original
+
+            def interrupt_retention(
+                frame: object,
+                event: str,
+                _argument: object,
+            ) -> object:
+                nonlocal injected
+                if (
+                    getattr(frame, "f_code", None)
+                    is codex_executable._destroy_generated_schema_directory.__code__
+                ):
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        raise interruption
+                return interrupt_retention
+
+            previous_trace = sys.gettrace()
+            try:
+                with mock.patch.object(
+                    codex_executable,
+                    "delete_custodied_roots",
+                    side_effect=fail_delete,
+                ):
+                    sys.settrace(interrupt_retention)
+                    with self.assertRaises(CodexExecutableRetentionRequired) as caught:
+                        codex_executable._destroy_generated_schema_directory(
+                            work_root=work_root,
+                            output_anchor=output_anchor,
+                            output_name=output_name,
+                        )
+            finally:
+                sys.settrace(previous_trace)
+
+            retained_manifests = tuple(
+                resource
+                for resource in caught.exception.retained_resources
+                if isinstance(resource, CustodiedManifest)
+            )
+            try:
+                self.assertTrue(injected)
+                self.assertIs(caught.exception.__cause__, original)
+                self.assertIs(caught.exception.source_cleanup_error, original)
+                self.assertEqual(
+                    caught.exception.retention_publication_errors,
+                    (interruption,),
+                )
+                self.assertEqual(len(retained_manifests), 1)
+                self.assertEqual(len(retained_manifests[0].root_fds), 1)
+                os.fstat(retained_manifests[0].root_fds[0])
+                self.assertEqual(len(original_evidence), 1)
+                self.assertIn(
+                    original_evidence[0],
+                    caught.exception.recovery_evidence,
+                )
+                self.assertEqual(
+                    recovery_cleanup.quarantined_root_recovery_evidence(
+                        caught.exception
+                    ),
+                    tuple(original_evidence),
+                )
+                self.assertTrue(output_path.is_dir())
+            finally:
+                for retained_manifest in retained_manifests:
+                    retained_manifest.close()
+                os.close(output_anchor.fd)
+                os.close(work_root.fd)
+
+    def test_generated_schema_retain_call_to_store_interrupt_keeps_manifest_fd(
+        self,
+    ) -> None:
+        self._assert_generated_schema_retention_interrupt(
+            after_retention_store=False,
+        )
+
+    def test_generated_schema_post_retention_interrupt_keeps_original_evidence(
+        self,
+    ) -> None:
+        self._assert_generated_schema_retention_interrupt(
+            after_retention_store=True,
+        )
+
 
 class CodexExecutableCustodyTests(unittest.TestCase):
+    def test_cleanup_failure_retains_snapshot_custody_and_recovery_evidence(
+        self,
+    ) -> None:
+        with owned_temporary_directory("codex-cleanup-retain-") as root:
+            fixture = _build_fixture(root)
+            custody = _authenticate(fixture, FakeRunner(fixture))
+            snapshot_path = custody.snapshot_path
+            directory_fd = custody.directory_fd
+            executable_fd = custody.executable_fd
+            custody.confirm_process_quiescence(_quiescence())
+            with (
+                mock.patch.object(
+                    codex_executable,
+                    "_destroy_staged_snapshot",
+                    side_effect=OSError(errno.EIO, "injected cleanup refusal"),
+                ),
+                self.assertRaises(CodexExecutableRetentionRequired) as caught,
+            ):
+                custody.cleanup()
+
+            try:
+                self.assertTrue(custody.closed)
+                self.assertTrue(custody.retained_snapshot)
+                self.assertTrue(snapshot_path.is_file())
+                os.fstat(directory_fd)
+                os.fstat(executable_fd)
+                self.assertIn(custody, caught.exception.retained_resources)
+                evidence = next(
+                    evidence
+                    for evidence in caught.exception.recovery_evidence
+                    if evidence.stage == "snapshot-cleanup"
+                )
+                self.assertEqual(evidence.directory_fd, directory_fd)
+                self.assertEqual(evidence.executable_fd, executable_fd)
+            finally:
+                codex_executable._close_staged_snapshot_fds(custody._staged)
+
     def test_owner_snapshot_attestation_requires_fresh_authenticated_phase(
         self,
     ) -> None:
@@ -1767,13 +4636,16 @@ class CodexExecutableCustodyTests(unittest.TestCase):
                             process_id=process_id,
                         )
                     )
-                    with self.assertRaisesRegex(
-                        CodexExecutableCustodyStale,
-                        "suspicious paths were retained",
-                    ):
-                        custody.cleanup()
-                    self.assertTrue(custody.closed)
-                    self.assertTrue(custody.retained_snapshot)
+                    try:
+                        with self.assertRaisesRegex(
+                            CodexExecutableRetentionRequired,
+                            "custody descriptors and suspicious paths were retained",
+                        ):
+                            custody.cleanup()
+                        self.assertTrue(custody.closed)
+                        self.assertTrue(custody.retained_snapshot)
+                    finally:
+                        codex_executable._close_staged_snapshot_fds(custody._staged)
 
     def test_disappearance_hardlink_and_parent_mode_change_are_rejected(self) -> None:
         mutations = ("disappear", "hardlink", "parent-mode")
@@ -1797,8 +4669,11 @@ class CodexExecutableCustodyTests(unittest.TestCase):
                     if mutation == "parent-mode":
                         custody.cleanup()
                     else:
-                        with self.assertRaises(CodexExecutableCustodyStale):
-                            custody.cleanup()
+                        try:
+                            with self.assertRaises(CodexExecutableRetentionRequired):
+                                custody.cleanup()
+                        finally:
+                            codex_executable._close_staged_snapshot_fds(custody._staged)
 
     def test_stale_handoff_token_is_rejected(self) -> None:
         with owned_temporary_directory("codex-stale-token-") as root:
