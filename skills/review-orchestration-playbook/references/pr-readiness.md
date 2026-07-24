@@ -68,10 +68,13 @@ combined probes bind the leader and then terminate with `SIGKILL` before probe
 evidence. When the frozen range changes the independent supervisor's Darwin
 isolation implementation, its live-test runner, or the covered integration
 tests, the delivery operator must run this command on a trusted Mac that
-matches the production runtime pin after the final commit exists:
+matches the production runtime pin after the final commit exists. Start from
+the repository root and enter the self-contained tool directory before invoking
+the package-local test runner:
 
 ```bash
-CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE=1 PYTHONDONTWRITEBYTECODE=1 /opt/homebrew/bin/python3.13 -m tests.run_required_no_child_profile
+cd skills/review-orchestration-playbook/scripts/independent_codex_pr_review
+CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE=1 PYTHONDONTWRITEBYTECODE=1 /opt/homebrew/bin/python3.13 -B -m tests.run_required_no_child_profile
 ```
 
 Record the exact `head_sha`, nine tests run, zero skips, and terminal result in

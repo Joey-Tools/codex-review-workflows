@@ -1446,3 +1446,22 @@ metadata behavior.
   product-test failure remains. Signed replacement head, exact-head admission,
   hosted CI, and replacement formal review lanes remain. No local Python 3.10
   run was performed.
+- Signed replacement head
+  `f5342cc521e5557e30a6fdf09f9de7d002a5d569` passed exact-secret admission
+  with complete cleanup and all current-head hosted CI jobs. Fresh-context
+  whole-range Codex reviewer `019f94db-30b1-7b21-9bb8-678c8c7069ce`, launched
+  from the pinned private-release `81755aaa5efb8e004c9acc67cc5ea899d887f3c7`
+  control plane, returned one actionable P2: the Trusted Mac operator command
+  in `pr-readiness.md` used the package-local
+  `tests.run_required_no_child_profile` module without first entering the
+  self-contained tool directory. Running the documented command from the
+  repository root reproduced `ModuleNotFoundError: No module named 'tests'`.
+  The command now explicitly changes from repository root into the tool
+  directory, retains `PYTHONDONTWRITEBYTECODE=1`, and invokes Python 3.13 with
+  `-B`; a repository contract binds both the working directory and no-bytecode
+  spelling.
+- Post-fix Python 3.13 validation passed the focused contract and all 97
+  repository contracts in 22.477 seconds. Ruff lint and formatting passed for
+  the changed Python test. A signed fix head, exact-head admission, hosted CI,
+  the trusted-Mac live gate, and replacement formal lanes remain. No local
+  Python 3.10 run was performed.
