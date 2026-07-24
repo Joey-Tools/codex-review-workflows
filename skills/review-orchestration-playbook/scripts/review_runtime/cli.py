@@ -15,26 +15,98 @@ from .common import (
     forwarded_signals,
     restore_signal_mask,
 )
-from .providers import CLAUDE_EGRESS_CONSENTS, run_review
-from .state import FINAL_CLEANUP_TIMEOUT_SECONDS, ReviewPreparationGuard
-from .state import cleanup as cleanup_state
-from .state import admission, final, run_state, start, status, wait
 from .synthetic_tokens import (
     authoring_metadata,
     legacy_metadata,
     load_catalog,
 )
-from .workspace import (
-    ReviewWorkspace,
-    cleanup_workspace,
-    prepare_workspace,
-    remove_private_review_artifacts,
-    secret_admission,
-    validate_authoring_catalog_scanner_contract,
-)
+
+FINAL_CLEANUP_TIMEOUT_SECONDS = 30.0
+
+
+def run_review(**kwargs):
+    from .providers import run_review as implementation
+
+    return implementation(**kwargs)
+
+
+def prepare_workspace(**kwargs):
+    from .workspace import prepare_workspace as implementation
+
+    return implementation(**kwargs)
+
+
+def cleanup_workspace(*args, **kwargs):
+    from .workspace import cleanup_workspace as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def remove_private_review_artifacts(*args, **kwargs):
+    from .workspace import remove_private_review_artifacts as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def secret_admission(**kwargs):
+    from .workspace import secret_admission as implementation
+
+    return implementation(**kwargs)
+
+
+def validate_authoring_catalog_scanner_contract(catalog):
+    from .workspace import (
+        validate_authoring_catalog_scanner_contract as implementation,
+    )
+
+    return implementation(catalog)
+
+
+def start(**kwargs):
+    from .state import start as implementation
+
+    return implementation(**kwargs)
+
+
+def status(*args, **kwargs):
+    from .state import status as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def admission(*args, **kwargs):
+    from .state import admission as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def wait(*args, **kwargs):
+    from .state import wait as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def final(*args, **kwargs):
+    from .state import final as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def cleanup_state(*args, **kwargs):
+    from .state import cleanup as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def run_state(**kwargs):
+    from .state import run_state as implementation
+
+    return implementation(**kwargs)
 
 
 def _add_review_arguments(parser: argparse.ArgumentParser) -> None:
+    from .providers import CLAUDE_EGRESS_CONSENTS
+
     parser.add_argument("--repo", default=".", help="Source Git repository.")
     parser.add_argument(
         "--reviewer",
@@ -244,7 +316,73 @@ def _run_synthetic_tokens(argv: list[str]) -> int:
     raise ReviewError(f"unknown synthetic-tokens action: {args.action}")
 
 
+def _build_catalog_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="synthetic_catalog_entry")
+    actions = parser.add_subparsers(dest="action", required=True)
+    actions.add_parser("validate")
+    list_parser = actions.add_parser("list")
+    list_parser.add_argument("--json", action="store_true")
+    get_parser = actions.add_parser("get")
+    get_parser.add_argument("id")
+    get_parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def catalog_main(argv: list[str] | None = None) -> int:
+    """Run the closed authoring-only catalog surface."""
+
+    args = _build_catalog_parser().parse_args(argv)
+    catalog = load_catalog()
+    if args.action == "validate":
+        print(
+            json.dumps(
+                {
+                    "pool_version": catalog.pool_version,
+                    "schema_version": catalog.schema_version,
+                    "status": "valid",
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    if args.action == "list":
+        payload = {
+            "pool_version": catalog.pool_version,
+            "tokens": authoring_metadata(catalog),
+        }
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            for token in payload["tokens"]:
+                print(
+                    f"{token['id']}\t{token['role']}\t{token['state']}\t{token['rule']}"
+                )
+        return 0
+    if args.action == "get":
+        token = catalog.authoring_token(args.id)
+        payload = {
+            "pool_version": catalog.pool_version,
+            "token": {
+                "id": token.identifier,
+                "role": token.role,
+                "rule": token.rule,
+                "state": token.state,
+                "value": token.value.decode("ascii"),
+                "value_sha256": token.value_sha256,
+            },
+        }
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print(payload["token"]["value"])
+        return 0
+    raise ReviewError(f"unknown catalog action: {args.action}")
+
+
 def _run_foreground(args: argparse.Namespace) -> int:
+    from .state import ReviewPreparationGuard
+    from .workspace import ReviewWorkspace
+
     preparation_guard = ReviewPreparationGuard()
     _validate_review_arguments(args)
     review = None
@@ -387,6 +525,8 @@ def main(argv: list[str] | None = None) -> int:
     script_path = pathlib.Path(sys.argv[0]).resolve()
     try:
         if arguments and arguments[0] == "_run-state":
+            from .providers import CLAUDE_EGRESS_CONSENTS
+
             internal = argparse.ArgumentParser(add_help=False)
             internal.add_argument("action")
             internal.add_argument("--state-dir", required=True)

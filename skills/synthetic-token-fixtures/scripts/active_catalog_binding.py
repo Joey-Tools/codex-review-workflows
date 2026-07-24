@@ -44,14 +44,29 @@ from typing import Any
 MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_CATALOG_BYTES = 64 * 1024
 MAX_INTERPRETER_BYTES = 128 * 1024 * 1024
-MAX_RUNTIME_BYTES = 64 * 1024 * 1024
-MAX_RUNTIME_FILES = 512
+MAX_RUNTIME_BYTES = 4 * 1024 * 1024
+MAX_RUNTIME_FILES = 8
 MAX_CLI_OUTPUT_BYTES = 1024 * 1024
-EXECUTABLE_CACHE_SUFFIXES = {".pyc", ".pyo", ".so", ".pyd", ".dylib", ".dll"}
 RELEASE_ID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 RUNTIME_NAMESPACE = "review_runtime"
 BOOTSTRAP_CONTRACT_VERSION = 1
+RUNTIME_MANIFEST_SCHEMA_VERSION = 1
+RUNTIME_PROFILE = "synthetic-catalog-authoring-v1"
+RUNTIME_MANIFEST_LEAF = "synthetic-catalog-runtime-manifest.json"
+RUNTIME_ENTRY_PATH = "scripts/synthetic_catalog_entry"
+RUNTIME_SOURCE_PATHS = {
+    "review_runtime": ("scripts/review_runtime/__init__.py", True),
+    "review_runtime.common": ("scripts/review_runtime/common.py", False),
+    "review_runtime.cli": ("scripts/review_runtime/cli.py", False),
+    "review_runtime.synthetic_tokens": (
+        "scripts/review_runtime/synthetic_tokens.py",
+        False,
+    ),
+}
+RUNTIME_DATA_PATHS = {
+    "synthetic-token-catalog": ("scripts/review_runtime/synthetic-token-catalog.json"),
+}
 
 
 class BindingError(RuntimeError):
@@ -572,99 +587,265 @@ def _validate_original_layout(
         (synthetic_root, "loaded synthetic skill root"),
         (scripts_root, "loaded synthetic skill scripts root"),
     ):
-        _require_directory(path, label=label)
+        bound = transaction.directory(path)
+        metadata = os.fstat(bound.descriptor)
+        _validate_directory_policy(metadata, label=label)
+        if metadata.st_uid != os.geteuid():
+            raise BindingError(f"{label} is not owned by the current user")
 
     return release_root, payload_root, skills_root, synthetic_root, resolver_parent
 
 
-def _runtime_paths(review_root: Path) -> tuple[Path, ...]:
-    scripts_root = review_root / "scripts"
-    package_root = scripts_root / RUNTIME_NAMESPACE
-    _require_directory(review_root, label="review skill root")
-    _require_directory(scripts_root, label="review runtime scripts root")
-    _require_directory(package_root, label="review runtime package")
-    for suffix in EXECUTABLE_CACHE_SUFFIXES | {".py"}:
-        shadow = scripts_root / f"{RUNTIME_NAMESPACE}{suffix}"
-        if os.path.lexists(shadow):
-            raise BindingError("review runtime package has an import shadow")
+def _canonical_runtime_path(review_root: Path, value: object, *, label: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise BindingError(f"{label} path is invalid")
+    relative = Path(value)
+    if relative.is_absolute() or str(relative) != relative.as_posix():
+        raise BindingError(f"{label} path is not canonical relative POSIX")
+    if any(part in {"", ".", ".."} for part in relative.parts):
+        raise BindingError(f"{label} path contains traversal")
+    path = review_root / relative
+    if path.parent == review_root.parent or review_root not in path.parents:
+        raise BindingError(f"{label} path escapes the review skill")
+    return path
 
-    paths = [review_root / "SKILL.md"]
-    for directory, names, filenames in os.walk(scripts_root, followlinks=False):
-        names.sort()
-        filenames.sort()
-        directory_path = Path(directory)
-        _require_directory(directory_path, label="review runtime directory")
-        # Python's ordinary source execution may leave cache directories in an
-        # otherwise valid installed release. They are outside the bound runtime
-        # tree and the closed loader never consults them.
-        names[:] = [name for name in names if name != "__pycache__"]
-        for name in names:
-            candidate = directory_path / name
-            if candidate.is_symlink():
-                raise BindingError("review runtime contains a symlink directory")
-        for name in filenames:
-            candidate = directory_path / name
-            if candidate.is_symlink():
-                raise BindingError("review runtime contains a symlink file")
-            if candidate.suffix.lower() in EXECUTABLE_CACHE_SUFFIXES:
-                raise BindingError(
-                    "review runtime contains bytecode or a native extension"
-                )
-            paths.append(candidate)
-    if len(paths) > MAX_RUNTIME_FILES:
-        raise BindingError("review runtime exceeds its file-count limit")
-    return tuple(paths)
+
+def _parse_runtime_manifest(
+    content: bytes,
+    *,
+    review_root: Path,
+) -> tuple[
+    dict[str, tuple[Path, bool, str]],
+    Path,
+    str,
+    Path,
+    str,
+]:
+    manifest = _load_json_object(content, label="catalog runtime manifest")
+    expected_fields = {
+        "schema_version",
+        "profile",
+        "runtime_version",
+        "entrypoint",
+        "sources",
+        "data",
+        "allowed_modules",
+    }
+    if set(manifest) != expected_fields:
+        raise BindingError("catalog runtime manifest fields are not closed")
+    if manifest.get("schema_version") != RUNTIME_MANIFEST_SCHEMA_VERSION:
+        raise BindingError("catalog runtime manifest schema is unsupported")
+    if manifest.get("profile") != RUNTIME_PROFILE:
+        raise BindingError("catalog runtime manifest profile is unsupported")
+    runtime_version = manifest.get("runtime_version")
+    if type(runtime_version) is not int or runtime_version != 1:
+        raise BindingError("catalog runtime manifest version is unsupported")
+
+    entrypoint = manifest.get("entrypoint")
+    if not isinstance(entrypoint, dict) or set(entrypoint) != {"path", "sha256"}:
+        raise BindingError("catalog runtime entrypoint fields are invalid")
+    if entrypoint.get("path") != RUNTIME_ENTRY_PATH:
+        raise BindingError("catalog runtime entrypoint is not the dedicated surface")
+    entry_sha256 = entrypoint.get("sha256")
+    if not isinstance(entry_sha256, str) or SHA256.fullmatch(entry_sha256) is None:
+        raise BindingError("catalog runtime entrypoint digest is invalid")
+    entry_path = _canonical_runtime_path(
+        review_root,
+        entrypoint["path"],
+        label="catalog runtime entrypoint",
+    )
+
+    raw_sources = manifest.get("sources")
+    if not isinstance(raw_sources, list) or len(raw_sources) != len(
+        RUNTIME_SOURCE_PATHS
+    ):
+        raise BindingError("catalog runtime source manifest is not the minimal closure")
+    sources: dict[str, tuple[Path, bool, str]] = {}
+    for entry in raw_sources:
+        if not isinstance(entry, dict) or set(entry) != {
+            "module",
+            "path",
+            "package",
+            "sha256",
+        }:
+            raise BindingError("catalog runtime source fields are invalid")
+        module = entry.get("module")
+        if not isinstance(module, str) or module not in RUNTIME_SOURCE_PATHS:
+            raise BindingError("catalog runtime source module is unlisted")
+        expected_path, expected_package = RUNTIME_SOURCE_PATHS[module]
+        if (
+            entry.get("path") != expected_path
+            or entry.get("package") is not expected_package
+        ):
+            raise BindingError(f"catalog runtime source contract changed for {module}")
+        digest = entry.get("sha256")
+        if not isinstance(digest, str) or SHA256.fullmatch(digest) is None:
+            raise BindingError(f"catalog runtime source digest is invalid for {module}")
+        if module in sources:
+            raise BindingError("catalog runtime source module is duplicated")
+        sources[module] = (
+            _canonical_runtime_path(
+                review_root,
+                expected_path,
+                label=f"catalog runtime source {module}",
+            ),
+            expected_package,
+            digest,
+        )
+    if set(sources) != set(RUNTIME_SOURCE_PATHS):
+        raise BindingError("catalog runtime source closure is incomplete")
+
+    allowed_modules = manifest.get("allowed_modules")
+    if not isinstance(allowed_modules, list) or allowed_modules != sorted(
+        RUNTIME_SOURCE_PATHS
+    ):
+        raise BindingError("catalog runtime allowed modules are not the exact closure")
+
+    raw_data = manifest.get("data")
+    if not isinstance(raw_data, list) or len(raw_data) != 1:
+        raise BindingError("catalog runtime data manifest is not the exact closure")
+    data_entry = raw_data[0]
+    if not isinstance(data_entry, dict) or set(data_entry) != {
+        "id",
+        "path",
+        "sha256",
+    }:
+        raise BindingError("catalog runtime data fields are invalid")
+    data_id = data_entry.get("id")
+    if data_id not in RUNTIME_DATA_PATHS:
+        raise BindingError("catalog runtime data entry is unlisted")
+    expected_data_path = RUNTIME_DATA_PATHS[str(data_id)]
+    if data_entry.get("path") != expected_data_path:
+        raise BindingError("catalog runtime data path changed")
+    data_sha256 = data_entry.get("sha256")
+    if not isinstance(data_sha256, str) or SHA256.fullmatch(data_sha256) is None:
+        raise BindingError("catalog runtime data digest is invalid")
+    data_path = _canonical_runtime_path(
+        review_root,
+        expected_data_path,
+        label="catalog runtime data",
+    )
+    return sources, entry_path, entry_sha256, data_path, data_sha256
 
 
 def _runtime_snapshot(
+    *,
     review_root: Path,
+    manifest_bytes: bytes,
     transaction: _BindingTransaction,
-) -> tuple[str, dict[Path, bytes], dict[Path, _BoundFile]]:
-    catalog_cli = review_root / "scripts" / "isolated_review"
-    catalog = (
-        review_root / "scripts" / RUNTIME_NAMESPACE / "synthetic-token-catalog.json"
+) -> tuple[
+    dict[str, tuple[Path, bytes, bool]],
+    _BoundFile,
+    _BoundFile,
+    tuple[dict[str, object], ...],
+]:
+    scripts_root = review_root / "scripts"
+    scripts_parent = transaction.bind_parent_chain(
+        scripts_root,
+        label="catalog runtime scripts root",
     )
-    retained_paths = {catalog_cli, catalog}
-    retained_parents = {
-        catalog_cli: transaction.bind_parent_chain(
-            catalog_cli.parent,
-            label="catalog CLI absolute parent chain",
-        ),
-        catalog: transaction.bind_parent_chain(
-            catalog.parent,
-            label="catalog absolute parent chain",
-        ),
-    }
-    first = _runtime_paths(review_root)
-    retained_files: dict[Path, _BoundFile] = {}
-    runtime_files: dict[Path, bytes] = {}
+    for leaf in (
+        "review_runtime.py",
+        "review_runtime.pyc",
+        "review_runtime.pyo",
+        "review_runtime.so",
+        "review_runtime.pyd",
+        "review_runtime.dylib",
+        "review_runtime.dll",
+    ):
+        try:
+            os.stat(
+                leaf,
+                dir_fd=scripts_parent.descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise BindingError(
+                f"cannot inspect catalog runtime import substitute {leaf}: {error}"
+            ) from error
+        raise BindingError(f"catalog runtime has an import substitute: {leaf}")
+
+    sources, entry_path, entry_sha256, data_path, data_sha256 = _parse_runtime_manifest(
+        manifest_bytes, review_root=review_root
+    )
+    bound_records: list[dict[str, object]] = []
+    source_specs: dict[str, tuple[Path, bytes, bool]] = {}
     total = 0
-    digest = hashlib.sha256(b"review-runtime-tree-v2\0")
-    for path in first:
-        relative = path.relative_to(review_root).as_posix().encode("utf-8")
+    for module, (path, is_package, expected_sha256) in sources.items():
+        parent = transaction.bind_parent_chain(
+            path.parent,
+            label=f"catalog runtime source parent for {module}",
+        )
         bound = transaction.bind(
             path,
-            label=f"review runtime {relative!r}",
-            retain_descriptor=path in retained_paths,
-            parent=retained_parents.get(path),
+            label=f"catalog runtime source {module}",
+            retain_descriptor=True,
+            parent=parent,
         )
-        if bound.payload is None:
-            raise BindingError("review runtime snapshot unexpectedly omitted content")
+        if bound.payload is None or bound.sha256 != expected_sha256:
+            raise BindingError(f"catalog runtime source digest changed for {module}")
         total += len(bound.payload)
-        if total > MAX_RUNTIME_BYTES:
-            raise BindingError("review runtime exceeds its aggregate byte limit")
-        runtime_files[path] = bound.payload
-        if path in retained_paths:
-            retained_files[path] = bound
-        digest.update(len(relative).to_bytes(4, "big"))
-        digest.update(relative)
-        digest.update(len(bound.payload).to_bytes(8, "big"))
-        digest.update(hashlib.sha256(bound.payload).digest())
-    if first != _runtime_paths(review_root):
-        raise BindingError("review runtime membership changed during binding")
-    if set(retained_files) != retained_paths:
-        raise BindingError("review runtime omitted the catalog CLI or catalog")
-    return digest.hexdigest(), runtime_files, retained_files
+        source_specs[module] = (path, bound.payload, is_package)
+        bound_records.append(
+            {
+                "kind": "source",
+                "module": module,
+                "path": str(path),
+                "sha256": bound.sha256,
+                "identity": list(bound.identity),
+            }
+        )
+
+    entry_parent = transaction.bind_parent_chain(
+        entry_path.parent,
+        label="catalog runtime entrypoint parent",
+    )
+    entry_bound = transaction.bind(
+        entry_path,
+        label="catalog runtime entrypoint",
+        retain_descriptor=True,
+        parent=entry_parent,
+    )
+    if entry_bound.payload is None or entry_bound.sha256 != entry_sha256:
+        raise BindingError("catalog runtime entrypoint digest changed")
+    total += len(entry_bound.payload)
+    bound_records.append(
+        {
+            "kind": "entrypoint",
+            "path": str(entry_path),
+            "sha256": entry_bound.sha256,
+            "identity": list(entry_bound.identity),
+        }
+    )
+
+    data_parent = transaction.bind_parent_chain(
+        data_path.parent,
+        label="catalog runtime data parent",
+    )
+    data_bound = transaction.bind(
+        data_path,
+        label="catalog runtime catalog data",
+        limit=MAX_CATALOG_BYTES,
+        retain_descriptor=True,
+        parent=data_parent,
+    )
+    if data_bound.payload is None or data_bound.sha256 != data_sha256:
+        raise BindingError("catalog runtime data digest changed")
+    total += len(data_bound.payload)
+    bound_records.append(
+        {
+            "kind": "data",
+            "id": "synthetic-token-catalog",
+            "path": str(data_path),
+            "sha256": data_bound.sha256,
+            "identity": list(data_bound.identity),
+        }
+    )
+    if total > MAX_RUNTIME_BYTES or len(bound_records) > MAX_RUNTIME_FILES:
+        raise BindingError("catalog runtime exceeds its closed resource limits")
+    return source_specs, entry_bound, data_bound, tuple(bound_records)
 
 
 def _load_json_object(content: bytes, *, label: str) -> dict[str, Any]:
@@ -745,28 +926,6 @@ def _validate_sync_manifest(content: bytes) -> None:
         raise BindingError(
             "release sync manifest does not bind both co-release skill sources"
         )
-
-
-def _runtime_source_specs(
-    review_root: Path,
-    runtime_files: dict[Path, bytes],
-) -> dict[str, tuple[Path, bytes, bool]]:
-    package_root = review_root / "scripts" / RUNTIME_NAMESPACE
-    specs: dict[str, tuple[Path, bytes, bool]] = {}
-    for path, payload in runtime_files.items():
-        if path.parent == package_root and path.suffix == ".py":
-            if path.name == "__init__.py":
-                module_name = RUNTIME_NAMESPACE
-                is_package = True
-            else:
-                module_name = f"{RUNTIME_NAMESPACE}.{path.stem}"
-                is_package = False
-            if module_name in specs:
-                raise BindingError("review runtime source module is duplicated")
-            specs[module_name] = (path, payload, is_package)
-    if RUNTIME_NAMESPACE not in specs:
-        raise BindingError("review runtime package source is missing")
-    return specs
 
 
 class _BoundSourceLoader:
@@ -945,9 +1104,9 @@ def _execute_catalog_snapshot(
     *,
     action: str,
     requested_id: str | None,
-    review_root: Path,
-    runtime_files: dict[Path, bytes],
-    catalog_cli: Path,
+    source_specs: dict[str, tuple[Path, bytes, bool]],
+    catalog_entry_path: Path,
+    catalog_entry_bytes: bytes,
     catalog_bytes: bytes,
     pool_version: str,
 ) -> dict[str, Any]:
@@ -959,18 +1118,20 @@ def _execute_catalog_snapshot(
     if preexisting:
         raise BindingError("a review_runtime module was loaded before catalog binding")
 
-    specs = _runtime_source_specs(review_root, runtime_files)
-    finder = _BoundRuntimeFinder(specs)
-    cli_payload = runtime_files[catalog_cli]
+    if set(source_specs) != set(RUNTIME_SOURCE_PATHS):
+        raise BindingError("catalog runtime source closure changed before execution")
+    finder = _BoundRuntimeFinder(source_specs)
     try:
-        cli_code = compile(
-            cli_payload,
-            str(catalog_cli),
+        entry_code = compile(
+            catalog_entry_bytes,
+            str(catalog_entry_path),
             "exec",
             dont_inherit=True,
         )
     except Exception as error:
-        raise BindingError(f"catalog CLI snapshot cannot compile: {error}") from error
+        raise BindingError(
+            f"catalog entrypoint snapshot cannot compile: {error}"
+        ) from error
 
     stdout = _BoundTextSink(label="catalog CLI stdout")
     stderr = _BoundTextSink(label="catalog CLI stderr")
@@ -978,13 +1139,12 @@ def _execute_catalog_snapshot(
     try:
         wrapper_namespace = {
             "__builtins__": __builtins__,
-            "__file__": str(catalog_cli),
+            "__file__": str(catalog_entry_path),
             "__name__": "_active_catalog_bound_cli",
             "__package__": None,
         }
-        exec(cli_code, wrapper_namespace)
+        exec(entry_code, wrapper_namespace)
         package = sys.modules.get(RUNTIME_NAMESPACE)
-        importlib.import_module(f"{RUNTIME_NAMESPACE}.cli")
         cli_module = sys.modules.get(f"{RUNTIME_NAMESPACE}.cli")
         synthetic_module = sys.modules.get(f"{RUNTIME_NAMESPACE}.synthetic_tokens")
         if not all(
@@ -992,7 +1152,11 @@ def _execute_catalog_snapshot(
             for module in (package, cli_module, synthetic_module)
         ):
             raise BindingError("bound catalog CLI did not load its required modules")
-        if wrapper_namespace.get("main") is not getattr(package, "main", None):
+        if wrapper_namespace.get("main") is not getattr(
+            cli_module,
+            "catalog_main",
+            None,
+        ):
             raise BindingError("catalog CLI wrapper entrypoint binding changed")
         if (
             "BOUND_CATALOG_BYTES" not in synthetic_module.__dict__
@@ -1000,7 +1164,7 @@ def _execute_catalog_snapshot(
         ):
             raise BindingError("catalog CLI bound-catalog byte hook changed")
 
-        arguments = ["synthetic-tokens", action]
+        arguments = [action]
         if action == "list":
             arguments.append("--json")
         elif action == "get":
@@ -1024,7 +1188,7 @@ def _execute_catalog_snapshot(
             for name in sys.modules
             if name == RUNTIME_NAMESPACE or name.startswith(f"{RUNTIME_NAMESPACE}.")
         }
-        if not loaded_names <= set(specs):
+        if loaded_names != set(source_specs):
             raise BindingError("catalog CLI runtime escaped its closed module manifest")
         for module_name in loaded_names:
             module = sys.modules[module_name]
@@ -1082,6 +1246,10 @@ def _validated_bootstrap_binding(
         "sync_manifest_path",
         "sync_manifest_sha256",
         "catalog_bootstrap_source_sha256",
+        "runtime_manifest_path",
+        "runtime_manifest_sha256",
+        "runtime_manifest_identity",
+        "runtime_profile",
     }
     if set(binding) != expected_fields:
         raise BindingError("trusted catalog bootstrap binding fields are not closed")
@@ -1099,6 +1267,7 @@ def _validated_bootstrap_binding(
         "resolver_sha256",
         "sync_manifest_sha256",
         "catalog_bootstrap_source_sha256",
+        "runtime_manifest_sha256",
     ):
         value = binding.get(field)
         if not isinstance(value, str) or SHA256.fullmatch(value) is None:
@@ -1109,14 +1278,31 @@ def _validated_bootstrap_binding(
     if (
         not isinstance(identity, list)
         or len(identity) != 5
-        or any(not isinstance(value, int) or isinstance(value, bool) for value in identity)
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) for value in identity
+        )
     ):
         raise BindingError("trusted catalog bootstrap resolver identity is invalid")
+    runtime_manifest_identity = binding.get("runtime_manifest_identity")
+    if (
+        not isinstance(runtime_manifest_identity, list)
+        or len(runtime_manifest_identity) != 5
+        or any(
+            not isinstance(value, int) or isinstance(value, bool)
+            for value in runtime_manifest_identity
+        )
+    ):
+        raise BindingError(
+            "trusted catalog bootstrap runtime manifest identity is invalid"
+        )
+    if binding.get("runtime_profile") != RUNTIME_PROFILE:
+        raise BindingError("trusted catalog bootstrap runtime profile is invalid")
     for field in (
         "trusted_review_skill_root",
         "synthetic_skill_root",
         "resolver_path",
         "sync_manifest_path",
+        "runtime_manifest_path",
     ):
         value = binding.get(field)
         if not isinstance(value, str):
@@ -1130,8 +1316,15 @@ def _build_binding(
     resolver: Path,
     loaded_skill_root: Path,
     bootstrap_binding: dict[str, object],
+    trusted_runtime_manifest_bytes: bytes,
     transaction: _BindingTransaction,
-) -> tuple[dict[str, object], Path, dict[Path, bytes], bytes]:
+) -> tuple[
+    dict[str, object],
+    dict[str, tuple[Path, bytes, bool]],
+    Path,
+    bytes,
+    bytes,
+]:
     (
         release_root,
         payload_root,
@@ -1167,9 +1360,7 @@ def _build_binding(
     _validate_sync_manifest(manifest_bound.payload)
     expected_bootstrap = {
         "release_id": release_root.name,
-        "trusted_review_skill_root": str(
-            skills_root / "review-orchestration-playbook"
-        ),
+        "trusted_review_skill_root": str(skills_root / "review-orchestration-playbook"),
         "synthetic_skill_root": str(synthetic_root),
         "synthetic_skill_sha256": synthetic_skill.sha256,
         "resolver_path": str(resolver),
@@ -1180,19 +1371,43 @@ def _build_binding(
     }
     for field, expected in expected_bootstrap.items():
         if bootstrap_binding.get(field) != expected:
-            raise BindingError(
-                f"trusted catalog bootstrap binding changed for {field}"
-            )
+            raise BindingError(f"trusted catalog bootstrap binding changed for {field}")
 
-    runtime_digest, runtime_files, retained_runtime = _runtime_snapshot(
-        review_root,
-        transaction,
+    runtime_manifest = (
+        review_root / "scripts" / RUNTIME_NAMESPACE / RUNTIME_MANIFEST_LEAF
     )
-    catalog_cli = review_root / "scripts" / "isolated_review"
-    catalog = (
-        review_root / "scripts" / RUNTIME_NAMESPACE / "synthetic-token-catalog.json"
+    if (
+        type(trusted_runtime_manifest_bytes) is not bytes
+        or len(trusted_runtime_manifest_bytes) > MAX_FILE_BYTES
+    ):
+        raise BindingError("trusted catalog runtime manifest bytes are invalid")
+    runtime_manifest_parent = transaction.bind_parent_chain(
+        runtime_manifest.parent,
+        label="catalog runtime manifest absolute parent chain",
     )
-    catalog_bytes = runtime_files[catalog]
+    runtime_manifest_bound = transaction.bind(
+        runtime_manifest,
+        label="catalog runtime manifest",
+        retain_descriptor=True,
+        parent=runtime_manifest_parent,
+    )
+    if (
+        runtime_manifest_bound.payload != trusted_runtime_manifest_bytes
+        or runtime_manifest_bound.sha256 != bootstrap_binding["runtime_manifest_sha256"]
+        or str(runtime_manifest) != bootstrap_binding["runtime_manifest_path"]
+        or list(runtime_manifest_bound.identity)
+        != bootstrap_binding["runtime_manifest_identity"]
+    ):
+        raise BindingError("trusted catalog runtime manifest binding changed")
+
+    source_specs, entry_bound, catalog_bound, runtime_records = _runtime_snapshot(
+        review_root=review_root,
+        manifest_bytes=trusted_runtime_manifest_bytes,
+        transaction=transaction,
+    )
+    if catalog_bound.payload is None or entry_bound.payload is None:
+        raise BindingError("catalog runtime snapshot omitted required content")
+    catalog_bytes = catalog_bound.payload
     pool_version = _parse_pool_version(catalog_bytes)
 
     interpreter = Path(sys.executable).resolve(strict=True)
@@ -1210,7 +1425,7 @@ def _build_binding(
         parent=interpreter_parent,
     )
     binding: dict[str, object] = {
-        "schema_version": 3,
+        "schema_version": 4,
         "catalog_bootstrap": bootstrap_binding,
         "release_id": release_root.name,
         "release_root": str(release_root),
@@ -1222,21 +1437,26 @@ def _build_binding(
         "binding_resolver_sha256": resolver_bound.sha256,
         "binding_resolver_identity": list(resolver_bound.identity),
         "review_skill_root": str(review_root),
-        "review_runtime_tree_sha256": runtime_digest,
-        "catalog_cli_path": str(catalog_cli),
-        "catalog_cli_sha256": retained_runtime[catalog_cli].sha256,
-        "catalog_cli_identity": list(retained_runtime[catalog_cli].identity),
-        "catalog_path": str(catalog),
-        "catalog_sha256": retained_runtime[catalog].sha256,
-        "catalog_identity": list(retained_runtime[catalog].identity),
+        "catalog_runtime_profile": RUNTIME_PROFILE,
+        "catalog_runtime_version": 1,
+        "catalog_runtime_manifest_path": str(runtime_manifest),
+        "catalog_runtime_manifest_sha256": runtime_manifest_bound.sha256,
+        "catalog_runtime_manifest_identity": list(runtime_manifest_bound.identity),
+        "catalog_runtime_files": list(runtime_records),
+        "catalog_entry_path": str(entry_bound.path),
+        "catalog_entry_sha256": entry_bound.sha256,
+        "catalog_entry_identity": list(entry_bound.identity),
+        "catalog_path": str(catalog_bound.path),
+        "catalog_sha256": catalog_bound.sha256,
+        "catalog_identity": list(catalog_bound.identity),
         "pool_version": pool_version,
         "python_executable": str(interpreter),
         "python_executable_sha256": interpreter_bound.sha256,
         "python_executable_identity": list(interpreter_bound.identity),
         "python_version": ".".join(str(part) for part in sys.version_info[:3]),
         "python_flags": ["-I", "-B", "-S"],
-        "execution_mode": "in-process-manifest-bound-snapshot",
-        "import_mode": "closed-review-runtime-snapshot",
+        "execution_mode": "trusted-manifest-bound-source-snapshot",
+        "import_mode": "exact-closed-runtime-manifest",
     }
     encoded = json.dumps(
         binding,
@@ -1245,7 +1465,13 @@ def _build_binding(
         sort_keys=True,
     ).encode("ascii")
     binding["binding_sha256"] = hashlib.sha256(encoded).hexdigest()
-    return binding, review_root, runtime_files, catalog_bytes
+    return (
+        binding,
+        source_specs,
+        entry_bound.path,
+        entry_bound.payload,
+        catalog_bytes,
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1270,6 +1496,7 @@ def main(
     argv: list[str] | None = None,
     *,
     bootstrap_binding: object = None,
+    runtime_manifest_bytes: object = None,
 ) -> int:
     try:
         trusted_bootstrap = _validated_bootstrap_binding(bootstrap_binding)
@@ -1287,10 +1514,21 @@ def main(
             )
         resolver = Path(__file__)
         loaded_skill_root = Path(arguments.loaded_skill_root)
-        binding, review_root, runtime_files, catalog_bytes = _build_binding(
+        if type(runtime_manifest_bytes) is not bytes:
+            raise BindingError(
+                "active catalog binding requires trusted runtime manifest bytes"
+            )
+        (
+            binding,
+            source_specs,
+            catalog_entry_path,
+            catalog_entry_bytes,
+            catalog_bytes,
+        ) = _build_binding(
             resolver=resolver,
             loaded_skill_root=loaded_skill_root,
             bootstrap_binding=trusted_bootstrap,
+            trusted_runtime_manifest_bytes=runtime_manifest_bytes,
             transaction=transaction,
         )
         if expected is not None:
@@ -1302,13 +1540,12 @@ def main(
         if arguments.action == "bind":
             output = binding
         else:
-            catalog_cli = review_root / "scripts" / "isolated_review"
             result = _execute_catalog_snapshot(
                 action=arguments.action,
                 requested_id=getattr(arguments, "id", None),
-                review_root=review_root,
-                runtime_files=runtime_files,
-                catalog_cli=catalog_cli,
+                source_specs=source_specs,
+                catalog_entry_path=catalog_entry_path,
+                catalog_entry_bytes=catalog_entry_bytes,
                 catalog_bytes=catalog_bytes,
                 pool_version=str(binding["pool_version"]),
             )

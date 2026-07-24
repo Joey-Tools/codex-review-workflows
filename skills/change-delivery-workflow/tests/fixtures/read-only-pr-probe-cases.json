@@ -40,7 +40,7 @@
         ],
         "terminal": "pr-readiness-read-only-report",
         "terminal_result": {
-          "schema_version": 3,
+          "schema_version": 4,
           "terminal": "pr-readiness-read-only-report",
           "terminal_state": "target-snapshot",
           "report_id": "report:11111111111111111111111111111111",
@@ -189,7 +189,7 @@
       "name": "pre-target-no-match",
       "expected": {
         "terminal_result": {
-          "schema_version": 3,
+          "schema_version": 4,
           "terminal": "pr-readiness-read-only-report",
           "terminal_state": "pre-target",
           "report_id": "report:55555555555555555555555555555555",
@@ -318,7 +318,7 @@
       "name": "pre-target-selection-blocked",
       "expected": {
         "terminal_result": {
-          "schema_version": 3,
+          "schema_version": 4,
           "terminal": "pr-readiness-read-only-report",
           "terminal_state": "pre-target-blocked",
           "report_id": "report:99999999999999999999999999999999",
@@ -445,7 +445,7 @@
       "name": "selected-pr-base-head-blocked",
       "expected": {
         "terminal_result": {
-          "schema_version": 3,
+          "schema_version": 4,
           "terminal": "pr-readiness-read-only-report",
           "terminal_state": "target-resolution-blocked",
           "report_id": "report:dddddddddddddddddddddddddddddddd",
@@ -533,11 +533,13 @@
                   "checks": [
                     {
                       "name": "lint",
+                      "status": "completed",
                       "conclusion": "success"
                     },
                     {
                       "name": "tests",
-                      "conclusion": "pending"
+                      "status": "in_progress",
+                      "conclusion": null
                     }
                   ]
                 }

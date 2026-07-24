@@ -34,8 +34,9 @@ catalog_guard="$trusted_bundle_root/skills/review-orchestration-playbook/scripts
    `-I` is mandatory: `-E -B -s -S` still leaves the script directory on
    `sys.path`. The guard must come from a previously trusted release or frozen
    prior-policy bundle outside any candidate range. Its exact two-source
-   catalog-bootstrap closure and the co-release synthetic `SKILL.md` and
-   resolver are records in that bundle's canonical control manifest. During a
+   catalog-bootstrap closure, trusted runtime-manifest digest, and the
+   co-release synthetic `SKILL.md` and resolver are records in that bundle's
+   canonical control manifest. During a
    self-policy migration, keep using the prior trusted release; candidate-head
    Python and machine schemas are implementation/test subjects only and never
    bootstrap their own activation.
@@ -57,8 +58,15 @@ catalog_guard="$trusted_bundle_root/skills/review-orchestration-playbook/scripts
    The resolver independently repeats the release-to-leaf binding, validates
    the explicitly loaded skill root and sibling review skill from the same
    co-release, and returns the trusted bootstrap binding, release/root
-   identity, review-runtime tree digest, source/interpreter snapshot digests,
+   identity, exact runtime closure, source/interpreter snapshot digests,
    `pool_version`, and one canonical `binding_sha256`.
+
+   The trusted runtime manifest uses profile
+   `synthetic-catalog-authoring-v1`. It binds the dedicated catalog entry,
+   `review_runtime/__init__.py`, `common.py`, `cli.py`,
+   `synthetic_tokens.py`, and `synthetic-token-catalog.json` by exact path and
+   SHA-256. The resolver rejects every other module, path, profile, or import;
+   it does not inventory or authorize the surrounding review scripts tree.
 3. Stop on a non-release layout, loaded-skill mismatch, cross-release symlink,
    missing sibling, bytecode/native import substitute, package shadow, unsafe
    ownership or write policy, invalid catalog, ambiguous source, or digest
@@ -78,8 +86,9 @@ catalog_guard="$trusted_bundle_root/skills/review-orchestration-playbook/scripts
    value.
 
    Each invocation is one controlled in-process transaction. It retains the
-   active interpreter, trusted bootstrap, resolver, review CLI, and catalog
-   descriptor bindings; executes the resolver and review CLI only from
+   active interpreter, trusted bootstrap, resolver, trusted runtime manifest,
+   dedicated catalog entry, four source modules, and catalog descriptor
+   bindings; executes the resolver and catalog entry only from
    manifest-bound source snapshots through closed source loaders that ignore
    `__pycache__` and never load bytecode; captures and validates the operation
    result and `pool_version`; removes the temporary module namespace; and
@@ -92,11 +101,25 @@ catalog or review-skill path, never defines token values, and exposes raw value
 output only for one explicitly requested `get` operation. The manifest-bound
 review skill-local CLI and catalog remain the sole authoring authority.
 
+## Runtime Manifest Rotation
+
+The manifest cannot authorize its own first binding. Its exact SHA-256 is
+provisioned in `named_lane_guard`; changing any listed byte requires an
+ordinary candidate commit that updates the listed digest and that pinned guard
+digest together. Review that candidate with the previous trusted release,
+merge and publish it, and only then use the new release as catalog authority.
+Adding a module or changing the profile also requires a versioned contract
+change; merely listing another file is rejected. Candidate-head guard or
+manifest bytes never bootstrap their own activation.
+
 ## Authoring CLI Contract
 
 The authoring surface has exactly three operations:
 
-- Resolver action `validate` runs `synthetic-tokens validate` against the bound fixed catalog and validates its scanner contract.
+- Resolver action `validate` runs the dedicated authoring-only catalog
+  validation against the bound fixed catalog. The ordinary review-helper test
+  and admission suites independently validate scanner compatibility; the
+  authoring runtime does not import the review workspace or scanner.
 - Resolver action `list` runs `synthetic-tokens list --json` and returns `pool_version` plus metadata-only token records. It must not expose raw values.
 - Resolver action `get <id>` runs `synthetic-tokens get <id> --json` and returns the one explicitly selected record and its exact raw value. It must not bulk-return other raw values.
 

@@ -21,7 +21,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": 3
+      "const": 4
     },
     "terminal": {
       "const": "pr-readiness-read-only-report"
@@ -279,17 +279,19 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 253,
-          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$"
+          "pattern": "^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$"
         },
         "owner": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 128
+          "maxLength": 39,
+          "pattern": "^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$"
         },
         "name": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 256
+          "maxLength": 100,
+          "pattern": "^[A-Za-z0-9._-]*[A-Za-z0-9_][A-Za-z0-9._-]*$"
         }
       },
       "additionalProperties": false
@@ -309,7 +311,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 2048,
-          "pattern": "^https://\\S+$"
+          "pattern": "^https://(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*/[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*/[A-Za-z0-9._-]*[A-Za-z0-9_][A-Za-z0-9._-]*/pull/[1-9][0-9]*$"
         }
       },
       "additionalProperties": false
@@ -787,6 +789,7 @@
                   "type": "object",
                   "required": [
                     "name",
+                    "status",
                     "conclusion"
                   ],
                   "properties": {
@@ -795,16 +798,62 @@
                       "minLength": 1,
                       "maxLength": 512
                     },
-                    "conclusion": {
+                    "status": {
                       "enum": [
-                        "success",
-                        "failure",
+                        "queued",
+                        "in_progress",
+                        "requested",
+                        "waiting",
                         "pending",
-                        "cancelled"
+                        "completed"
+                      ]
+                    },
+                    "conclusion": {
+                      "type": [
+                        "string",
+                        "null"
                       ]
                     }
                   },
-                  "additionalProperties": false
+                  "additionalProperties": false,
+                  "oneOf": [
+                    {
+                      "properties": {
+                        "status": {
+                          "const": "completed"
+                        },
+                        "conclusion": {
+                          "enum": [
+                            "success",
+                            "failure",
+                            "cancelled",
+                            "neutral",
+                            "skipped",
+                            "timed_out",
+                            "action_required",
+                            "stale",
+                            "startup_failure"
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "properties": {
+                        "status": {
+                          "enum": [
+                            "queued",
+                            "in_progress",
+                            "requested",
+                            "waiting",
+                            "pending"
+                          ]
+                        },
+                        "conclusion": {
+                          "type": "null"
+                        }
+                      }
+                    }
+                  ]
                 }
               }
             },

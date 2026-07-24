@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+
+from review_runtime.cli import catalog_main as main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -26,12 +26,37 @@ READ_CHUNK_BYTES = 64 * 1024
 IDENTIFIER_RE = re.compile(
     r"^(?P<kind>report|target|snapshot|observation):(?P<value>[0-9a-f]{32})$"
 )
+REPOSITORY_HOST_RE = re.compile(
+    r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)"
+    r"(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$"
+)
+REPOSITORY_OWNER_RE = re.compile(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$")
+REPOSITORY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]*[A-Za-z0-9_][A-Za-z0-9._-]*$")
 EVIDENCE_NAMES = {
     "pr_selection": "pr-selection",
     "pr_lifecycle": "pr-lifecycle",
     "ci_status": "ci-status",
     "conversation_state": "conversation-state",
     "base_and_head": "base-and-head",
+}
+CI_CHECK_STATUSES = {
+    "queued",
+    "in_progress",
+    "requested",
+    "waiting",
+    "pending",
+    "completed",
+}
+CI_CONCLUSION_BUCKETS = {
+    "success": "success",
+    "neutral": "success",
+    "skipped": "success",
+    "failure": "failure",
+    "timed_out": "failure",
+    "action_required": "failure",
+    "stale": "failure",
+    "startup_failure": "failure",
+    "cancelled": "cancelled",
 }
 
 
@@ -159,6 +184,42 @@ def semantic_errors(report: object) -> list[str]:
         errors.append("snapshot.report_binding must equal report_id")
     if snapshot.get("target_binding") != target_binding:
         errors.append("snapshot.target_binding must equal target.binding_id")
+
+    if "pull_request" in target:
+        repository = _mapping(target.get("repository"))
+        pull_request = _mapping(target.get("pull_request"))
+        if repository is None or pull_request is None:
+            errors.append(
+                "target pull request URL requires structured repository and PR data"
+            )
+        else:
+            host = repository.get("host")
+            owner = repository.get("owner")
+            name = repository.get("name")
+            number = pull_request.get("number")
+            if (
+                not isinstance(host, str)
+                or not 1 <= len(host) <= 253
+                or REPOSITORY_HOST_RE.fullmatch(host) is None
+                or not isinstance(owner, str)
+                or not 1 <= len(owner) <= 39
+                or REPOSITORY_OWNER_RE.fullmatch(owner) is None
+                or not isinstance(name, str)
+                or not 1 <= len(name) <= 100
+                or REPOSITORY_NAME_RE.fullmatch(name) is None
+                or not _is_nonnegative_int(number)
+                or number < 1
+            ):
+                errors.append(
+                    "target pull request URL requires canonical repository components"
+                )
+            else:
+                expected_url = f"https://{host}/{owner}/{name}/pull/{number}"
+                if pull_request.get("url") != expected_url:
+                    errors.append(
+                        "target.pull_request.url must exactly match the canonical "
+                        "repository PR URL"
+                    )
 
     evidence_records: dict[str, Mapping[str, Any]] = {}
     for field in EVIDENCE_NAMES:
@@ -332,11 +393,25 @@ def semantic_errors(report: object) -> list[str]:
                     errors.append("each CI check must be an object")
                     continue
                 names.append(check_record.get("name"))
+                status = check_record.get("status")
                 conclusion = check_record.get("conclusion")
-                if conclusion not in actual:
-                    errors.append("CI check conclusion is unknown")
+                bucket: str | None = None
+                if not isinstance(status, str) or status not in CI_CHECK_STATUSES:
+                    errors.append("CI check status is unknown")
+                elif status != "completed":
+                    if conclusion is not None:
+                        errors.append("non-completed CI check conclusion must be null")
+                    else:
+                        bucket = "pending"
+                elif (
+                    not isinstance(conclusion, str)
+                    or conclusion not in CI_CONCLUSION_BUCKETS
+                ):
+                    errors.append("completed CI check conclusion is unknown")
                 else:
-                    actual[conclusion] += 1
+                    bucket = CI_CONCLUSION_BUCKETS[conclusion]
+                if bucket is not None:
+                    actual[bucket] += 1
             if len(names) != len(set(names)):
                 errors.append("CI check names must be unique")
             reported = {

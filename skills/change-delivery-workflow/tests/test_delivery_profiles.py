@@ -293,7 +293,7 @@ def assert_valid_result_contract(result: object) -> None:
 def assert_read_only_report_contract(report: object) -> None:
     if not isinstance(report, dict) or set(report) != READ_ONLY_REPORT_FIELDS:
         raise AssertionError("read-only PR report fields do not match the contract")
-    if report["schema_version"] != 3:
+    if report["schema_version"] != 4:
         raise AssertionError("unexpected read-only PR report schema version")
     if report["terminal"] != "pr-readiness-read-only-report":
         raise AssertionError("unexpected read-only PR report terminal")
@@ -693,7 +693,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
         self.assertEqual(set(schema["required"]), READ_ONLY_REPORT_FIELDS)
         self.assertEqual(set(schema["properties"]), READ_ONLY_REPORT_FIELDS)
         self.assertFalse(schema["additionalProperties"])
-        self.assertEqual(schema["properties"]["schema_version"]["const"], 3)
+        self.assertEqual(schema["properties"]["schema_version"]["const"], 4)
         self.assertEqual(
             set(schema["properties"]["terminal_state"]["enum"]),
             {
@@ -825,6 +825,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                     "checks": [
                         {
                             "name": "tests",
+                            "status": "completed",
                             "conclusion": "success",
                         }
                     ],
@@ -884,6 +885,287 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 "base-and-head",
             },
         )
+
+    def test_read_only_pr_report_binds_canonical_pr_url_to_target(self) -> None:
+        cases = {
+            case["name"]: case["expected"]["terminal_result"]
+            for case in fixture_cases(
+                READ_ONLY_PR_PROBE_CASES,
+                "read-only-pr-probe",
+            )
+        }
+        valid = cases["resolved-target-snapshot"]
+        validator = read_only_report_validator()
+        canonical = "https://github.com/Joey-Tools/codex-review-workflows/pull/42"
+        self.assertEqual(valid["target"]["pull_request"]["url"], canonical)
+        self.assertEqual(list(validator.iter_errors(valid)), [])
+        validate_read_only_report_semantics(valid)
+
+        invalid_urls = {
+            "userinfo": (
+                "https://attacker@github.com/Joey-Tools/codex-review-workflows/pull/42"
+            ),
+            "port": (
+                "https://github.com:443/Joey-Tools/codex-review-workflows/pull/42"
+            ),
+            "query": f"{canonical}?repository=other",
+            "fragment": f"{canonical}#other",
+            "percent-encoded-owner": (
+                "https://github.com/%4aoey-Tools/codex-review-workflows/pull/42"
+            ),
+            "percent-encoded-slash": (
+                "https://github.com/Joey-Tools%2Fother/codex-review-workflows/pull/42"
+            ),
+            "evil-prefix-host": (
+                "https://evil-github.com/Joey-Tools/codex-review-workflows/pull/42"
+            ),
+            "suffix-host": (
+                "https://github.com.evil.example/"
+                "Joey-Tools/codex-review-workflows/pull/42"
+            ),
+            "other-owner": (
+                "https://github.com/Other-Owner/codex-review-workflows/pull/42"
+            ),
+            "other-repository": ("https://github.com/Joey-Tools/other/pull/42"),
+            "other-number": (
+                "https://github.com/Joey-Tools/codex-review-workflows/pull/43"
+            ),
+            "path-traversal": (
+                "https://github.com/Joey-Tools/codex-review-workflows/../other/pull/42"
+            ),
+            "confusable-host": (
+                "https://g\u0456thub.com/Joey-Tools/codex-review-workflows/pull/42"
+            ),
+            "uppercase-host": (
+                "https://GitHub.com/Joey-Tools/codex-review-workflows/pull/42"
+            ),
+            "trailing-slash": f"{canonical}/",
+        }
+        for name, url in invalid_urls.items():
+            with self.subTest(name=name):
+                candidate = copy.deepcopy(valid)
+                candidate["target"]["pull_request"]["url"] = url
+                with self.assertRaises(ValueError):
+                    validate_read_only_report_semantics(candidate)
+                with self.assertRaises(AssertionError):
+                    assert_read_only_report_contract(candidate)
+
+    def test_read_only_pr_report_repository_components_are_canonical(
+        self,
+    ) -> None:
+        valid = next(
+            case["expected"]["terminal_result"]
+            for case in fixture_cases(
+                READ_ONLY_PR_PROBE_CASES,
+                "read-only-pr-probe",
+            )
+            if case["name"] == "resolved-target-snapshot"
+        )
+        validator = read_only_report_validator()
+        invalid_components = {
+            ("host", "GitHub.com"),
+            ("host", "github..com"),
+            ("host", "-github.com"),
+            ("host", "github.com-"),
+            ("host", "github_com"),
+            ("owner", "-Joey-Tools"),
+            ("owner", "Joey--Tools"),
+            ("owner", "Joey_Tools"),
+            ("owner", "Joey.Tools"),
+            ("owner", "Joey\u2010Tools"),
+            ("name", ".."),
+            ("name", "repo/name"),
+            ("name", "repo%2Fname"),
+            ("name", "r\u0435po"),
+        }
+        for field, value in invalid_components:
+            with self.subTest(field=field, value=value):
+                candidate = copy.deepcopy(valid)
+                candidate["target"]["repository"][field] = value
+                candidate["target"]["pull_request"]["url"] = (
+                    f"https://{candidate['target']['repository']['host']}/"
+                    f"{candidate['target']['repository']['owner']}/"
+                    f"{candidate['target']['repository']['name']}/pull/42"
+                )
+                self.assertTrue(list(validator.iter_errors(candidate)))
+                with self.assertRaises(ValueError):
+                    validate_read_only_report_semantics(candidate)
+
+    def test_read_only_pr_report_preserves_and_maps_all_ci_conclusions(
+        self,
+    ) -> None:
+        base = next(
+            case["expected"]["terminal_result"]
+            for case in fixture_cases(
+                READ_ONLY_PR_PROBE_CASES,
+                "read-only-pr-probe",
+            )
+            if case["name"] == "selected-pr-base-head-blocked"
+        )
+        validator = read_only_report_validator()
+        conclusion_buckets = {
+            "success": "success",
+            "neutral": "success",
+            "skipped": "success",
+            "failure": "failure",
+            "timed_out": "failure",
+            "action_required": "failure",
+            "stale": "failure",
+            "startup_failure": "failure",
+            "cancelled": "cancelled",
+        }
+        for conclusion, bucket in conclusion_buckets.items():
+            with self.subTest(conclusion=conclusion):
+                candidate = copy.deepcopy(base)
+                observed = candidate["evidence"]["ci_status"]["observed"][0]
+                observed.update(
+                    {
+                        "state": bucket,
+                        "total": 1,
+                        "successful": int(bucket == "success"),
+                        "failed": int(bucket == "failure"),
+                        "pending": 0,
+                        "cancelled": int(bucket == "cancelled"),
+                        "checks": [
+                            {
+                                "name": "tests",
+                                "status": "completed",
+                                "conclusion": conclusion,
+                            }
+                        ],
+                    }
+                )
+                self.assertEqual(list(validator.iter_errors(candidate)), [])
+                validate_read_only_report_semantics(candidate)
+                self.assertEqual(
+                    observed["checks"][0]["conclusion"],
+                    conclusion,
+                )
+
+        for status in (
+            "queued",
+            "in_progress",
+            "requested",
+            "waiting",
+            "pending",
+        ):
+            with self.subTest(status=status):
+                candidate = copy.deepcopy(base)
+                observed = candidate["evidence"]["ci_status"]["observed"][0]
+                observed.update(
+                    {
+                        "state": "pending",
+                        "total": 1,
+                        "successful": 0,
+                        "failed": 0,
+                        "pending": 1,
+                        "cancelled": 0,
+                        "checks": [
+                            {
+                                "name": "tests",
+                                "status": status,
+                                "conclusion": None,
+                            }
+                        ],
+                    }
+                )
+                self.assertEqual(list(validator.iter_errors(candidate)), [])
+                validate_read_only_report_semantics(candidate)
+
+        mixed = copy.deepcopy(base)
+        mixed_observed = mixed["evidence"]["ci_status"]["observed"][0]
+        mixed_observed.update(
+            {
+                "state": "failure",
+                "total": 4,
+                "successful": 1,
+                "failed": 1,
+                "pending": 1,
+                "cancelled": 1,
+                "checks": [
+                    {
+                        "name": "docs",
+                        "status": "completed",
+                        "conclusion": "neutral",
+                    },
+                    {
+                        "name": "lint",
+                        "status": "completed",
+                        "conclusion": "stale",
+                    },
+                    {
+                        "name": "tests",
+                        "status": "waiting",
+                        "conclusion": None,
+                    },
+                    {
+                        "name": "e2e",
+                        "status": "completed",
+                        "conclusion": "cancelled",
+                    },
+                ],
+            }
+        )
+        self.assertEqual(list(validator.iter_errors(mixed)), [])
+        validate_read_only_report_semantics(mixed)
+
+    def test_read_only_pr_report_ci_fails_closed_on_unknown_states(
+        self,
+    ) -> None:
+        base = next(
+            case["expected"]["terminal_result"]
+            for case in fixture_cases(
+                READ_ONLY_PR_PROBE_CASES,
+                "read-only-pr-probe",
+            )
+            if case["name"] == "selected-pr-base-head-blocked"
+        )
+        validator = read_only_report_validator()
+        invalid_checks = {
+            "unknown-status": {
+                "name": "tests",
+                "status": "unknown",
+                "conclusion": None,
+            },
+            "unknown-completed-conclusion": {
+                "name": "tests",
+                "status": "completed",
+                "conclusion": "unknown",
+            },
+            "nonterminal-conclusion": {
+                "name": "tests",
+                "status": "in_progress",
+                "conclusion": "success",
+            },
+            "missing-completed-conclusion": {
+                "name": "tests",
+                "status": "completed",
+                "conclusion": None,
+            },
+            "legacy-pending-conclusion": {
+                "name": "tests",
+                "status": "completed",
+                "conclusion": "pending",
+            },
+        }
+        for name, check in invalid_checks.items():
+            with self.subTest(name=name):
+                candidate = copy.deepcopy(base)
+                observed = candidate["evidence"]["ci_status"]["observed"][0]
+                observed.update(
+                    {
+                        "state": "pending",
+                        "total": 1,
+                        "successful": 0,
+                        "failed": 0,
+                        "pending": 1,
+                        "cancelled": 0,
+                        "checks": [check],
+                    }
+                )
+                self.assertTrue(list(validator.iter_errors(candidate)))
+                with self.assertRaises(ValueError):
+                    validate_read_only_report_semantics(candidate)
 
     def test_read_only_pr_report_uses_real_staged_targets(self) -> None:
         cases = {

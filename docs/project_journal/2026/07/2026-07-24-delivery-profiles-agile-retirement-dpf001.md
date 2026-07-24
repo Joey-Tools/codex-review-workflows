@@ -19,7 +19,8 @@ superseded_by:
 - `agile-delivery-workflow` is a compatibility alias that maps legacy
   MVP/agile/scout triggers to `focused-checkpoint`.
 - `synthetic-token-fixtures` routes authoring through the existing review
-  helper's authoritative catalog CLI without defining a second pool or runtime.
+  helper's authoritative catalog CLI through a trusted exact runtime manifest,
+  without defining a second pool or broad executable runtime.
 
 ## Current State
 
@@ -42,13 +43,17 @@ superseded_by:
   cache or state, fix, commit, push, release, or merge. The receiver is
   classified before every generic PR/review route and returns one closed
   terminal report whose action fields and merge-ready claim are fixed false.
-- Read-only report schema v3 represents selection and range failures directly:
+- Read-only report schema v4 represents selection and range failures directly:
   `pre-target` and `pre-target-blocked` omit PR/base/head, while
   `target-resolution-blocked` retains only the selected PR. Every report uses
   fresh independent report/target/snapshot/observation IDs. The standalone
   semantic validator equality-binds every evidence record to that instance and
-  rejects lifecycle, selector, CI/check, conversation-count, and endpoint
-  contradictions that JSON Schema cannot express. Its binding generator
+  requires the exact canonical URL derived from the structured repository and
+  PR number. It preserves each provider check's status and complete conclusion
+  enum, then applies one fail-closed normalization to success, failure,
+  pending, or cancelled aggregates. It also rejects lifecycle, selector,
+  CI/check, conversation-count, and endpoint contradictions that JSON Schema
+  cannot express. Its binding generator
   retries collisions, while file input uses no-follow/nonblocking/close-on-exec
   descriptor admission, regular-file and byte ceilings, exact identity/size
   revalidation, and two identical complete reads. Strict UTF-8 JSON parsing
@@ -89,10 +94,14 @@ superseded_by:
   co-release identity through the release `sync-manifest.json`.
 - Each catalog bind, validation, metadata listing, or single-ID retrieval is
   one in-process transaction. It retains and revalidates the resolver,
-  interpreter, catalog CLI, catalog, and parent-directory descriptors through
-  snapshot execution, result validation, namespace cleanup, and final close.
-  The CLI and its closed `review_runtime` imports execute only from captured
-  source and catalog bytes; no validated mutable pathname is executed later.
+  interpreter, trusted runtime manifest, dedicated catalog entry, four source
+  modules, catalog, and parent-directory descriptors through snapshot
+  execution, result validation, namespace cleanup, and final close. The
+  trusted guard pins the manifest SHA-256; that manifest pins every executable
+  source and data byte in the exact import closure. The closed loader rejects
+  unlisted modules and imports, while candidate changes require explicit
+  manifest rotation reviewed under the previous trusted release. No validated
+  mutable pathname is executed later.
   `CODEX_HOME`, `HOME`, repository shadows, caller-selected catalog paths, and
   same-byte inode replacement cannot select or release a result.
 
@@ -102,41 +111,41 @@ superseded_by:
 
 ## Evidence
 
-- `uv run --offline --with jsonschema python -B skills/change-delivery-workflow/tests/test_delivery_profiles.py`
-  passed (`28` tests), including deterministic local-mutation short circuits,
+- `python3 -B skills/change-delivery-workflow/tests/test_delivery_profiles.py -q`
+  passed (`32` tests), including deterministic local-mutation short circuits,
   the independent mutable-`no-commit` control, constrained-scope conflicts,
   staged read-only PR-probe terminals, fresh instance bindings, cross-report
   splice rejection, collision recovery, descriptor-safe input admission and
-  revalidation, hostile JSON/resource caps, bounded machine-safe errors, closed
-  delivery and terminal report records, and the clean-range, missing-range,
-  findings, and review-not-required terminals under forbidden commit mode.
+  revalidation, hostile JSON/resource caps, bounded machine-safe errors,
+  canonical PR URL attack cases, every provider conclusion and nonterminal
+  status, mixed CI aggregation, closed delivery and terminal report records,
+  and the clean-range, missing-range, findings, and review-not-required
+  terminals under forbidden commit mode.
 - `python3 -B skills/synthetic-token-fixtures/tests/test_skill_contract.py -v`
-  passed (`7` tests), including co-release binding, isolated-import shadows,
+  passed (`13` tests), including co-release binding, isolated-import shadows,
   raw-leaf and intermediate cross-release symlinks, unsafe parent modes,
-  bound validate/list/get operations, same-byte CLI inode replacement, and
-  fail-closed source/layout drift.
-- `python3 -B skills/review-orchestration-playbook/tests/test_synthetic_tokens.py SyntheticTokenCliTest -v`
-  passed (`6` tests), including the explicit exact-bytes catalog hook used only
-  by the bound transaction.
+  bound validate/list/get operations, manifest/source/catalog tampering,
+  unlisted modules and import substitution, parent replacement, same-byte
+  entry inode replacement, valid trusted manifest rotation, and fail-closed
+  source/layout drift.
+- `python3 -B skills/review-orchestration-playbook/tests/test_synthetic_tokens.py -q`
+  passed the complete `190`-test synthetic runtime suite.
 - `uv run --offline --with pyyaml python skills/review-orchestration-playbook/tests/test_contracts.py`
   passed (`87` tests), including the semantic helper's canonical-manifest
   binding without widening a formal named-lane source closure.
 - `python3 -B skills/review-orchestration-playbook/tests/test_cli.py -q`
   passed (`17` tests).
-- `uv run --isolated --with pyyaml python3 /Users/hoteng/.codex/skills/joey-skill-authoring/scripts/codex_skill_validate.py --report /tmp/delivery-binding-review-fixes.TIcfwF/skill-validation-escalated.json skills/change-delivery-workflow skills/agile-delivery-workflow skills/synthetic-token-fixtures skills/review-orchestration-playbook`
-  passed for all four affected skills after the constrained-scope review-fix
-  round.
-- `python3 /Users/hoteng/.codex/skills/joey-skill-authoring/scripts/codex_skill_validate.py skills/change-delivery-workflow skills/review-orchestration-playbook`
-  passed for both helper-owning skills after the final hostile-input hardening.
-- `python3 -m json.tool` passed for both schemas and the read-only probe fixture;
+- Both the system `quick_validate.py` and Joey
+  `codex_skill_validate.py` passed all four affected skills.
+- `python3 -m json.tool` passed for both schemas, the read-only probe fixture,
+  and the trusted synthetic runtime manifest;
   Draft 2020-12 `jsonschema` validation accepted all `13` delivery records and
   all four terminal read-only report states through the registered cross-schema
   reference.
 - `python3 -B /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo .`
   passed.
-- Ruff `E9,F,I` checks passed for the new semantic helper and delivery contract
-  tests; `E9,F` passed for the manifest contract test, and `ruff format --check`
-  passed for all three touched Python files.
+- Full Ruff checks and `ruff format --check` passed for all seven touched
+  Python entrypoints and tests; `py_compile` passed for the runtime/helper set.
 - Broader review-playbook discovery was bounded and manually interrupted after
   six silent minutes in unchanged `test_providers` signal-mask setup; it
   produced no assertion failure and left no process behind. The affected

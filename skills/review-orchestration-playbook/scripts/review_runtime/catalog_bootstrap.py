@@ -18,9 +18,12 @@ MAX_SKILL_BYTES = 1024 * 1024
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 RELEASE_ID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
 RESOLVER_LEAF = "active_catalog_binding.py"
 SYNTHETIC_SKILL_NAME = "synthetic-token-fixtures"
 REVIEW_SKILL_NAME = "review-orchestration-playbook"
+RUNTIME_MANIFEST_LEAF = "synthetic-catalog-runtime-manifest.json"
+RUNTIME_PROFILE = "synthetic-catalog-authoring-v1"
 
 
 class CatalogBootstrapError(RuntimeError):
@@ -61,9 +64,7 @@ def _validate_directory_policy(
     require_current_user: bool = False,
 ) -> None:
     if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-        raise CatalogBootstrapError(
-            f"{label} is not an ordinary non-symlink directory"
-        )
+        raise CatalogBootstrapError(f"{label} is not an ordinary non-symlink directory")
     accepted_owners = {0, os.geteuid()}
     if metadata.st_uid not in accepted_owners:
         raise CatalogBootstrapError(f"{label} has an untrusted owner")
@@ -446,24 +447,17 @@ class _BindingTransaction:
             ) from error
         try:
             opened = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(opened.st_mode)
-                or _file_identity(opened) != _file_identity(lexical)
-            ):
-                raise CatalogBootstrapError(
-                    f"{label} identity changed before binding"
-                )
+            if not stat.S_ISREG(opened.st_mode) or _file_identity(
+                opened
+            ) != _file_identity(lexical):
+                raise CatalogBootstrapError(f"{label} identity changed before binding")
             first = _read_descriptor(descriptor, label=label, limit=limit)
             second = _read_descriptor(descriptor, label=label, limit=limit)
             final = os.fstat(descriptor)
             if _file_identity(final) != _file_identity(opened):
-                raise CatalogBootstrapError(
-                    f"{label} identity changed during binding"
-                )
+                raise CatalogBootstrapError(f"{label} identity changed during binding")
             if first != second or len(first) != opened.st_size:
-                raise CatalogBootstrapError(
-                    f"{label} content changed during binding"
-                )
+                raise CatalogBootstrapError(f"{label} content changed during binding")
             if expected_payload is not None and first != expected_payload:
                 raise CatalogBootstrapError(
                     f"{label} does not match the trusted control manifest"
@@ -531,9 +525,7 @@ def _load_json_object(content: bytes, *, label: str) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in pairs:
             if key in result:
-                raise CatalogBootstrapError(
-                    f"{label} contains duplicate key: {key}"
-                )
+                raise CatalogBootstrapError(f"{label} contains duplicate key: {key}")
             result[key] = value
         return result
 
@@ -669,6 +661,9 @@ def _main(
     trusted_resolver_bytes: bytes | None = None,
     trusted_skill_bytes: bytes | None = None,
     catalog_bootstrap_source_sha256: str | None = None,
+    trusted_runtime_manifest_path: Path | None = None,
+    trusted_runtime_manifest_bytes: bytes | None = None,
+    trusted_runtime_manifest_sha256: str | None = None,
 ) -> int:
     """Bind, execute, and revalidate the trusted co-release resolver."""
     _require_safe_primitives()
@@ -679,6 +674,9 @@ def _main(
         or trusted_resolver_bytes is None
         or trusted_skill_bytes is None
         or catalog_bootstrap_source_sha256 is None
+        or trusted_runtime_manifest_path is None
+        or trusted_runtime_manifest_bytes is None
+        or trusted_runtime_manifest_sha256 is None
     ):
         raise CatalogBootstrapError(
             "catalog bootstrap requires manifest-bound guard inputs"
@@ -693,6 +691,28 @@ def _main(
         resolver_path=trusted_resolver_path,
         loaded_skill_root=loaded_skill_root,
     )
+    expected_runtime_manifest = (
+        trusted_review_skill_root / "scripts" / "review_runtime" / RUNTIME_MANIFEST_LEAF
+    )
+    _require_canonical_absolute(
+        trusted_runtime_manifest_path,
+        label="trusted catalog runtime manifest",
+    )
+    if trusted_runtime_manifest_path != expected_runtime_manifest:
+        raise CatalogBootstrapError(
+            "trusted catalog runtime manifest path is not canonical"
+        )
+    if (
+        type(trusted_runtime_manifest_bytes) is not bytes
+        or len(trusted_runtime_manifest_bytes) > MAX_MANIFEST_BYTES
+        or not isinstance(trusted_runtime_manifest_sha256, str)
+        or SHA256.fullmatch(trusted_runtime_manifest_sha256) is None
+        or hashlib.sha256(trusted_runtime_manifest_bytes).hexdigest()
+        != trusted_runtime_manifest_sha256
+    ):
+        raise CatalogBootstrapError(
+            "trusted catalog runtime manifest bytes are not guard-bound"
+        )
 
     transaction = _BindingTransaction()
     stdout = _BoundTextSink(label="catalog resolver stdout")
@@ -747,6 +767,32 @@ def _main(
             parent=transaction.directory(payload_root),
         )
         _validate_sync_manifest(manifest_bound.payload)
+        runtime_manifest_parent = transaction.bind_parent_chain(
+            trusted_runtime_manifest_path.parent,
+            label="catalog runtime manifest absolute parent chain",
+        )
+        runtime_manifest_bound = transaction.bind_file(
+            trusted_runtime_manifest_path,
+            label="catalog runtime manifest",
+            limit=MAX_MANIFEST_BYTES,
+            parent=runtime_manifest_parent,
+            expected_payload=trusted_runtime_manifest_bytes,
+        )
+        if runtime_manifest_bound.sha256 != trusted_runtime_manifest_sha256:
+            raise CatalogBootstrapError(
+                "catalog runtime manifest digest changed after guard binding"
+            )
+        runtime_manifest = _load_json_object(
+            runtime_manifest_bound.payload,
+            label="catalog runtime manifest",
+        )
+        if (
+            runtime_manifest.get("schema_version") != 1
+            or runtime_manifest.get("profile") != RUNTIME_PROFILE
+        ):
+            raise CatalogBootstrapError(
+                "catalog runtime manifest profile is unsupported"
+            )
 
         bootstrap_binding: dict[str, object] = {
             "schema_version": 1,
@@ -761,6 +807,10 @@ def _main(
             "sync_manifest_path": str(manifest_bound.path),
             "sync_manifest_sha256": manifest_bound.sha256,
             "catalog_bootstrap_source_sha256": catalog_bootstrap_source_sha256,
+            "runtime_manifest_path": str(runtime_manifest_bound.path),
+            "runtime_manifest_sha256": runtime_manifest_bound.sha256,
+            "runtime_manifest_identity": list(runtime_manifest_bound.identity),
+            "runtime_profile": RUNTIME_PROFILE,
         }
 
         try:
@@ -792,6 +842,7 @@ def _main(
             result = entrypoint(
                 list(arguments),
                 bootstrap_binding=bootstrap_binding,
+                runtime_manifest_bytes=runtime_manifest_bound.payload,
             )
         if not isinstance(result, int) or isinstance(result, bool):
             raise CatalogBootstrapError(
@@ -840,6 +891,9 @@ def main(
     trusted_resolver_bytes: bytes | None = None,
     trusted_skill_bytes: bytes | None = None,
     catalog_bootstrap_source_sha256: str | None = None,
+    trusted_runtime_manifest_path: Path | None = None,
+    trusted_runtime_manifest_bytes: bytes | None = None,
+    trusted_runtime_manifest_sha256: str | None = None,
 ) -> int:
     """Return a closed CLI failure for pre-transaction binding errors."""
     try:
@@ -851,6 +905,9 @@ def main(
             trusted_resolver_bytes=trusted_resolver_bytes,
             trusted_skill_bytes=trusted_skill_bytes,
             catalog_bootstrap_source_sha256=catalog_bootstrap_source_sha256,
+            trusted_runtime_manifest_path=trusted_runtime_manifest_path,
+            trusted_runtime_manifest_bytes=trusted_runtime_manifest_bytes,
+            trusted_runtime_manifest_sha256=trusted_runtime_manifest_sha256,
         )
     except (CatalogBootstrapError, OSError) as error:
         print(f"trusted catalog bootstrap failed: {error}", file=sys.stderr)

@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "profile": "synthetic-catalog-authoring-v1",
+  "runtime_version": 1,
+  "entrypoint": {
+    "path": "scripts/synthetic_catalog_entry",
+    "sha256": "5731d06a3bbba4d054881552ef0e04901de64af0fe0ada062b5687538fed41c2"
+  },
+  "sources": [
+    {
+      "module": "review_runtime",
+      "path": "scripts/review_runtime/__init__.py",
+      "package": true,
+      "sha256": "f2b883c57b9536db58951c98b7b5cbdd1fed4efa51b6f27019de901520daebe2"
+    },
+    {
+      "module": "review_runtime.cli",
+      "path": "scripts/review_runtime/cli.py",
+      "package": false,
+      "sha256": "45d68cc53531f13a0ceced798d57833c95f0b19c08cdd2fae74afc4d0c436831"
+    },
+    {
+      "module": "review_runtime.common",
+      "path": "scripts/review_runtime/common.py",
+      "package": false,
+      "sha256": "d199b972f2a5e4a18c55cc7bc51b449a0d6025d5fa597d04d718f2292612515a"
+    },
+    {
+      "module": "review_runtime.synthetic_tokens",
+      "path": "scripts/review_runtime/synthetic_tokens.py",
+      "package": false,
+      "sha256": "114a9f83eda96f30c1561b7c1b002c47d1b8528c275f710d476ee96bbd0f32a5"
+    }
+  ],
+  "data": [
+    {
+      "id": "synthetic-token-catalog",
+      "path": "scripts/review_runtime/synthetic-token-catalog.json",
+      "sha256": "cd571de36f325ac68418e1e9142f8e4fcf3c74bf9c6e904cbc750eb90ee5f93e"
+    }
+  ],
+  "allowed_modules": [
+    "review_runtime",
+    "review_runtime.cli",
+    "review_runtime.common",
+    "review_runtime.synthetic_tokens"
+  ]
+}

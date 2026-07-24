@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -18,13 +20,57 @@ REVIEW_SKILL_ROOT = REPOSITORY_ROOT / "skills" / "review-orchestration-playbook"
 SKILL = SKILL_ROOT / "SKILL.md"
 TEMPLATES = SKILL_ROOT / "references" / "fixture-templates.md"
 BINDING_RESOLVER = SKILL_ROOT / "scripts" / "active_catalog_binding.py"
-BINDING_GUARD = (
-    REVIEW_SKILL_ROOT / "scripts" / "named_lane_guard"
-)
+BINDING_GUARD = REVIEW_SKILL_ROOT / "scripts" / "named_lane_guard"
 RELEASE_ID = "a" * 40
+RUNTIME_MANIFEST_RELATIVE = (
+    Path("scripts") / "review_runtime" / "synthetic-catalog-runtime-manifest.json"
+)
 
 
 class SyntheticTokenSkillContractTest(unittest.TestCase):
+    def rotate_runtime_manifest(
+        self,
+        review_root: Path,
+        *,
+        changed_relative_paths: tuple[Path, ...] = (),
+        mutate_manifest=None,
+        provision_guard: bool = True,
+    ) -> str:
+        manifest_path = review_root / RUNTIME_MANIFEST_RELATIVE
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        changed = {path.as_posix() for path in changed_relative_paths}
+        records = [manifest["entrypoint"], *manifest["sources"], *manifest["data"]]
+        for record in records:
+            if record["path"] in changed:
+                record["sha256"] = hashlib.sha256(
+                    (review_root / record["path"]).read_bytes()
+                ).hexdigest()
+                changed.remove(record["path"])
+        self.assertEqual(changed, set())
+        if mutate_manifest is not None:
+            mutate_manifest(manifest)
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        if not provision_guard:
+            return manifest_sha256
+        guard = review_root / "scripts" / "named_lane_guard"
+        source = guard.read_text(encoding="utf-8")
+        updated, count = re.subn(
+            (
+                r'(_CATALOG_RUNTIME_MANIFEST_SHA256 = \(\n\s*")'
+                r"[0-9a-f]{64}"
+                r'("\n\))'
+            ),
+            rf"\g<1>{manifest_sha256}\g<2>",
+            source,
+        )
+        self.assertEqual(count, 1)
+        guard.write_text(updated, encoding="utf-8")
+        return manifest_sha256
+
     @contextlib.contextmanager
     def installed_release(self):
         with tempfile.TemporaryDirectory(
@@ -133,9 +179,11 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
             "macOS or Linux personal-sync",
             "previously trusted release",
             "canonical control manifest",
+            "dedicated catalog entry",
+            "trusted runtime manifest",
             "co-release `sync-manifest.json`",
             "binding_sha256",
-            "review-runtime tree digest",
+            "exact runtime closure",
             "metadata-only",
             "single-ID",
             "does not define a pool",
@@ -153,8 +201,9 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
             "never executes the resolver or returned CLI as a path",
         ):
             self.assertIn(anchor, normalized_skill)
+        self.assertIn("Resolver action `validate`", normalized_skill)
+        self.assertIn("synthetic-tokens validate", normalized_templates)
         for command in (
-            "synthetic-tokens validate",
             "synthetic-tokens list --json",
             "synthetic-tokens get <id> --json",
         ):
@@ -196,10 +245,15 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
                 "binding_resolver_sha256",
                 "binding_resolver_identity",
                 "review_skill_root",
-                "review_runtime_tree_sha256",
-                "catalog_cli_path",
-                "catalog_cli_sha256",
-                "catalog_cli_identity",
+                "catalog_runtime_profile",
+                "catalog_runtime_version",
+                "catalog_runtime_manifest_path",
+                "catalog_runtime_manifest_sha256",
+                "catalog_runtime_manifest_identity",
+                "catalog_runtime_files",
+                "catalog_entry_path",
+                "catalog_entry_sha256",
+                "catalog_entry_identity",
                 "catalog_path",
                 "catalog_sha256",
                 "catalog_identity",
@@ -214,7 +268,7 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
                 "binding_sha256",
             }
             self.assertEqual(set(binding), expected_fields)
-            self.assertEqual(binding["schema_version"], 3)
+            self.assertEqual(binding["schema_version"], 4)
             self.assertEqual(binding["release_id"], RELEASE_ID)
             self.assertEqual(binding["python_flags"], ["-I", "-B", "-S"])
             self.assertEqual(
@@ -227,15 +281,21 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
             )
             self.assertEqual(
                 binding["execution_mode"],
-                "in-process-manifest-bound-snapshot",
+                "trusted-manifest-bound-source-snapshot",
             )
             self.assertEqual(
                 binding["import_mode"],
-                "closed-review-runtime-snapshot",
+                "exact-closed-runtime-manifest",
             )
+            self.assertEqual(
+                binding["catalog_runtime_profile"],
+                "synthetic-catalog-authoring-v1",
+            )
+            self.assertEqual(binding["catalog_runtime_version"], 1)
             for field in (
                 "binding_resolver_identity",
-                "catalog_cli_identity",
+                "catalog_runtime_manifest_identity",
+                "catalog_entry_identity",
                 "catalog_identity",
                 "python_executable_identity",
             ):
@@ -253,13 +313,32 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
                 "synthetic_skill_sha256",
                 "sync_manifest_sha256",
                 "binding_resolver_sha256",
-                "review_runtime_tree_sha256",
-                "catalog_cli_sha256",
+                "catalog_runtime_manifest_sha256",
+                "catalog_entry_sha256",
                 "catalog_sha256",
                 "python_executable_sha256",
                 "binding_sha256",
             ):
                 self.assertRegex(binding[field], r"^[0-9a-f]{64}$")
+            runtime_files = binding["catalog_runtime_files"]
+            self.assertEqual(len(runtime_files), 6)
+            self.assertEqual(
+                {record["kind"] for record in runtime_files},
+                {"source", "entrypoint", "data"},
+            )
+            self.assertEqual(
+                {
+                    record["module"]
+                    for record in runtime_files
+                    if record["kind"] == "source"
+                },
+                {
+                    "review_runtime",
+                    "review_runtime.common",
+                    "review_runtime.cli",
+                    "review_runtime.synthetic_tokens",
+                },
+            )
 
             for action in ("validate", "list"):
                 with self.subTest(action=action):
@@ -399,7 +478,7 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
             catalog.write_bytes(catalog.read_bytes() + b"\n")
             changed = self.run_binding(resolver, expected=binding["binding_sha256"])
             self.assertEqual(changed.returncode, 2)
-            self.assertIn("active catalog binding changed", changed.stderr)
+            self.assertIn("catalog runtime data digest changed", changed.stderr)
 
         with self.installed_release() as release_root:
             resolver = (
@@ -468,6 +547,188 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
             )
             self.assertEqual(rejected.returncode, 2)
             self.assertIn("versioned immutable release", rejected.stderr)
+
+    def test_runtime_manifest_requires_trusted_rotation_and_binds_source_data(
+        self,
+    ) -> None:
+        with self.installed_release() as release_root:
+            skills_root = release_root / "personal_codex" / "skills"
+            synthetic_root = skills_root / "synthetic-token-fixtures"
+            review_root = skills_root / "review-orchestration-playbook"
+            resolver = synthetic_root / "scripts" / "active_catalog_binding.py"
+            catalog = (
+                review_root
+                / "scripts"
+                / "review_runtime"
+                / "synthetic-token-catalog.json"
+            )
+            catalog.write_bytes(catalog.read_bytes() + b"\n")
+            self.rotate_runtime_manifest(
+                review_root,
+                changed_relative_paths=(
+                    Path("scripts/review_runtime/synthetic-token-catalog.json"),
+                ),
+                provision_guard=False,
+            )
+            unprovisioned = self.run_binding(resolver)
+            self.assertNotEqual(unprovisioned.returncode, 0)
+            self.assertIn(
+                "runtime manifest is not provisioned by this trusted guard",
+                unprovisioned.stderr,
+            )
+
+            self.rotate_runtime_manifest(review_root)
+            rotated = self.run_binding(resolver)
+            self.assertEqual(rotated.returncode, 0, rotated.stderr)
+            binding = json.loads(rotated.stdout)
+            validated = self.run_binding(
+                resolver,
+                action="validate",
+                expected=binding["binding_sha256"],
+            )
+            self.assertEqual(validated.returncode, 0, validated.stderr)
+
+            common = review_root / "scripts" / "review_runtime" / "common.py"
+            common.write_bytes(common.read_bytes() + b"\n# source drift\n")
+            source_drift = self.run_binding(resolver)
+            self.assertEqual(source_drift.returncode, 2)
+            self.assertIn("source digest changed", source_drift.stderr)
+
+        with self.installed_release() as release_root:
+            skills_root = release_root / "personal_codex" / "skills"
+            synthetic_root = skills_root / "synthetic-token-fixtures"
+            review_root = skills_root / "review-orchestration-playbook"
+            resolver = synthetic_root / "scripts" / "active_catalog_binding.py"
+            manifest_path = review_root / RUNTIME_MANIFEST_RELATIVE
+            manifest_path.write_bytes(manifest_path.read_bytes() + b"\n")
+            manifest_drift = self.run_binding(resolver)
+            self.assertNotEqual(manifest_drift.returncode, 0)
+            self.assertIn(
+                "runtime manifest is not provisioned by this trusted guard",
+                manifest_drift.stderr,
+            )
+
+    def test_runtime_manifest_rejects_unlisted_modules_and_import_substitution(
+        self,
+    ) -> None:
+        with self.installed_release() as release_root:
+            skills_root = release_root / "personal_codex" / "skills"
+            synthetic_root = skills_root / "synthetic-token-fixtures"
+            review_root = skills_root / "review-orchestration-playbook"
+            resolver = synthetic_root / "scripts" / "active_catalog_binding.py"
+            runtime_root = review_root / "scripts" / "review_runtime"
+            extra = runtime_root / "extra_catalog_runtime.py"
+            extra.write_text("VALUE = 1\n", encoding="utf-8")
+
+            def add_unlisted(manifest):
+                manifest["sources"].append(
+                    {
+                        "module": "review_runtime.extra_catalog_runtime",
+                        "path": ("scripts/review_runtime/extra_catalog_runtime.py"),
+                        "package": False,
+                        "sha256": hashlib.sha256(extra.read_bytes()).hexdigest(),
+                    }
+                )
+                manifest["allowed_modules"].append(
+                    "review_runtime.extra_catalog_runtime"
+                )
+                manifest["allowed_modules"].sort()
+
+            self.rotate_runtime_manifest(
+                review_root,
+                mutate_manifest=add_unlisted,
+            )
+            unlisted = self.run_binding(resolver)
+            self.assertEqual(unlisted.returncode, 2)
+            self.assertIn("not the minimal closure", unlisted.stderr)
+
+        with self.installed_release() as release_root:
+            skills_root = release_root / "personal_codex" / "skills"
+            synthetic_root = skills_root / "synthetic-token-fixtures"
+            review_root = skills_root / "review-orchestration-playbook"
+            resolver = synthetic_root / "scripts" / "active_catalog_binding.py"
+            runtime_root = review_root / "scripts" / "review_runtime"
+            substitution = runtime_root / "catalog_import_substitution.py"
+            marker = runtime_root / "catalog-import-substitution-executed"
+            substitution.write_text(
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            cli = runtime_root / "cli.py"
+            cli.write_bytes(
+                cli.read_bytes() + b"\nfrom . import catalog_import_substitution\n"
+            )
+            self.rotate_runtime_manifest(
+                review_root,
+                changed_relative_paths=(Path("scripts/review_runtime/cli.py"),),
+            )
+            bound = self.run_binding(resolver)
+            self.assertEqual(bound.returncode, 0, bound.stderr)
+            binding = json.loads(bound.stdout)
+            rejected = self.run_binding(
+                resolver,
+                action="list",
+                expected=binding["binding_sha256"],
+            )
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("outside the closed manifest", rejected.stderr)
+            self.assertFalse(marker.exists())
+
+    def test_runtime_manifest_symlink_and_parent_replacement_fail_closed(
+        self,
+    ) -> None:
+        with self.installed_release() as release_root:
+            skills_root = release_root / "personal_codex" / "skills"
+            synthetic_root = skills_root / "synthetic-token-fixtures"
+            review_root = skills_root / "review-orchestration-playbook"
+            resolver = synthetic_root / "scripts" / "active_catalog_binding.py"
+            manifest_path = review_root / RUNTIME_MANIFEST_RELATIVE
+            copied_manifest = manifest_path.with_name("copied-manifest.json")
+            copied_manifest.write_bytes(manifest_path.read_bytes())
+            manifest_path.unlink()
+            manifest_path.symlink_to(copied_manifest)
+            rejected = self.run_binding(resolver)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("ordinary non-symlink regular file", rejected.stderr)
+
+        with self.installed_release() as release_root:
+            skills_root = release_root / "personal_codex" / "skills"
+            synthetic_root = skills_root / "synthetic-token-fixtures"
+            review_root = skills_root / "review-orchestration-playbook"
+            resolver = synthetic_root / "scripts" / "active_catalog_binding.py"
+            scripts_root = review_root / "scripts"
+            runtime_root = scripts_root / "review_runtime"
+            replacement = scripts_root / "review_runtime.replacement"
+            shutil.copytree(runtime_root, replacement)
+            entry = scripts_root / "synthetic_catalog_entry"
+            entry.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "from pathlib import Path\n\n"
+                "scripts = Path(__file__).parent\n"
+                "runtime = scripts / 'review_runtime'\n"
+                "original = scripts / 'review_runtime.original'\n"
+                "replacement = scripts / 'review_runtime.replacement'\n"
+                "os.rename(runtime, original)\n"
+                "os.rename(replacement, runtime)\n"
+                "from review_runtime.cli import catalog_main as main\n",
+                encoding="utf-8",
+            )
+            self.rotate_runtime_manifest(
+                review_root,
+                changed_relative_paths=(Path("scripts/synthetic_catalog_entry"),),
+            )
+            bound = self.run_binding(resolver)
+            self.assertEqual(bound.returncode, 0, bound.stderr)
+            binding = json.loads(bound.stdout)
+            replaced = self.run_binding(
+                resolver,
+                action="list",
+                expected=binding["binding_sha256"],
+            )
+            self.assertEqual(replaced.returncode, 2)
+            self.assertIn("bound directory entry changed", replaced.stderr)
 
     def test_authoring_operations_require_the_captured_binding_digest(self) -> None:
         with self.installed_release() as release_root:
@@ -564,7 +825,7 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
             )
             rejected = self.run_binding(resolver)
             self.assertEqual(rejected.returncode, 2)
-            self.assertIn("import shadow", rejected.stderr)
+            self.assertIn("import substitute", rejected.stderr)
             self.assertNotIn("package shadow executed", rejected.stderr)
 
     def test_nonisolated_launch_stops_before_resolver_local_imports(self) -> None:
@@ -754,41 +1015,44 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
             self.assertIn("companion content changed", completed.stderr)
             self.assertFalse(marker.exists())
 
-    def test_same_bytes_cli_path_replacement_cannot_release_a_result(self) -> None:
+    def test_same_bytes_entry_path_replacement_cannot_release_a_result(self) -> None:
         with self.installed_release() as release_root:
             synthetic_root = (
                 release_root / "personal_codex" / "skills" / "synthetic-token-fixtures"
             )
             resolver = synthetic_root / "scripts" / "active_catalog_binding.py"
-            catalog_cli = (
+            catalog_entry = (
                 release_root
                 / "personal_codex"
                 / "skills"
                 / "review-orchestration-playbook"
                 / "scripts"
-                / "isolated_review"
+                / "synthetic_catalog_entry"
             )
-            replacement = catalog_cli.with_name(f"{catalog_cli.name}.replacement")
-            marker = catalog_cli.with_name("replacement-path-executed")
+            review_root = catalog_entry.parent.parent
+            replacement = catalog_entry.with_name(f"{catalog_entry.name}.replacement")
+            marker = catalog_entry.with_name("replacement-path-executed")
             wrapper = (
                 "#!/usr/bin/env python3\n"
                 "import os\n"
                 "from pathlib import Path\n"
-                "import sys\n\n"
+                "\n"
                 "replacement = Path(__file__ + '.replacement')\n"
                 f"marker = Path({str(marker)!r})\n"
                 "if replacement.exists():\n"
                 "    os.replace(replacement, __file__)\n"
                 "else:\n"
                 "    marker.write_text('executed', encoding='utf-8')\n\n"
-                "if sys.version_info < (3, 10):\n"
-                "    raise SystemExit(2)\n\n"
-                "from review_runtime import main\n\n"
+                "from review_runtime.cli import catalog_main as main\n\n"
                 "if __name__ == '__main__':\n"
                 "    raise SystemExit(main())\n"
             )
-            catalog_cli.write_text(wrapper, encoding="utf-8")
+            catalog_entry.write_text(wrapper, encoding="utf-8")
             replacement.write_text(wrapper, encoding="utf-8")
+            self.rotate_runtime_manifest(
+                review_root,
+                changed_relative_paths=(Path("scripts/synthetic_catalog_entry"),),
+            )
 
             bound = self.run_binding(resolver)
             self.assertEqual(bound.returncode, 0, bound.stderr)
