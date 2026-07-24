@@ -3961,12 +3961,21 @@ def _terminate_and_reap(pid: int) -> None:
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+    deadline = time.monotonic() + PROBE_TIMEOUT_SECONDS
     while True:
         try:
-            reaped_pid, _ = os.waitpid(pid, 0)
-            break
+            reaped_pid, _ = os.waitpid(pid, os.WNOHANG)
         except InterruptedError:
-            continue
+            reaped_pid = 0
+        if reaped_pid == pid:
+            break
+        if reaped_pid != 0:
+            raise ChildProcessError(
+                f"waitpid reaped {reaped_pid}, expected exact leader {pid}"
+            )
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"process leader {pid} did not exit before deadline")
+        time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
     if reaped_pid != pid:
         raise ChildProcessError(
             f"waitpid reaped {reaped_pid}, expected exact leader {pid}"

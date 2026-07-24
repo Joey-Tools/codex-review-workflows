@@ -1190,3 +1190,35 @@ metadata behavior.
   exact-commit discovery, live no-child profile, secret admission, and formal
   review lanes remain explicit delivery gates. No local Python 3.10 run was
   performed.
+- The final fresh-context Codex lane on
+  `2a6b5e9f90e17b55b80dee344c18173b4956b921..e16eacbebd44ed20ff3e543c5fcaafbe1d1f3316`
+  found three additional closure and revalidation gaps. An outer failure after
+  durable handoff could discard a still-live attempt-supervisor handle after a
+  second bounded wait; launch-failure cleanup used an unbounded blocking
+  `waitpid`; and helper custody treated directory timestamps, size, and link
+  count as protected properties even when the final object, access policy, and
+  entry-name set were unchanged.
+- Post-handoff timeout now latches the exact attempt-supervisor process handle,
+  blocks later direct spawns, and emits a typed recovery receipt bound to the
+  attempt path, handoff-token digest, PID, PGID, and authenticated start
+  identity. The no-child launcher uses a five-second nonblocking reap deadline
+  and retains its existing owner, receipt, prepared runtime, and descriptors
+  when closure remains unproven. Helper and frozen-source directories now bind
+  device, inode, type, owner, and mode, revalidate private ACL/xattr policy on
+  each open, and separately authenticate the final bounded entry-name set and
+  retained file digests. Benign completed child-entry churn passes, while
+  object replacement, access-policy drift, unexpected names, and content
+  mutation remain fail closed.
+- The fixed deterministic supervisor identity is now 524 tests with SHA-256
+  `5a95bf1772f32d35758d44a09f53688c3fa21f180516146bae9bb17736dfd1bf`;
+  all 524 passed in 200.409 seconds under Python 3.13.0 with bytecode disabled.
+  The 79-test frozen-source/custody/no-child/supervisor regression set and all
+  95 repository contract tests pass. The required nine live no-child tests
+  passed outside the Desktop sandbox in 12.503 seconds, and the exact synthetic
+  keychain-broker nested-sandbox regression passed outside the Desktop sandbox
+  in 2.327 seconds. Exact-head discovery, secret admission, replacement
+  fresh-context review, CI, and PR readiness remain required after the signed
+  replacement head is pushed. The actual Claude lane is blocked by the
+  Anthropic organization quota until its 2026-08-01 reset; GitHub Codex must
+  not be requested before that local lane is terminal. No local Python 3.10 run
+  was performed.

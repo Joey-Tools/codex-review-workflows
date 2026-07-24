@@ -613,6 +613,74 @@ def _terminate_incomplete_handoff(process: SpawnedProcess) -> int:
     raise failure from cleanup_error
 
 
+def _retain_attempt_supervisor_closure(
+    process: SpawnedProcess,
+    *,
+    attempt_dir: pathlib.Path,
+    token: str,
+    trigger: BaseException,
+) -> tuple[UnprovenDirectHelperClosure, dict[str, Any]]:
+    failure = latch_direct_process_closure_unproven(process)
+    retained_process = getattr(failure, "process", None)
+    if retained_process is not process:
+        raise RuntimeError("attempt supervisor closure latch retained another process")
+    if not process.start_identity:
+        raise RuntimeError("attempt supervisor has no authenticated start identity")
+    receipt = {
+        "version": 1,
+        "kind": "attempt-supervisor-closure-unproven",
+        "attempt_dir": str(attempt_dir),
+        "handoff_token_sha256": sha256_bytes(token.encode("ascii")),
+        "process": {
+            "pid": process.pid,
+            "pgid": process.pgid,
+            "start_identity": process.start_identity,
+        },
+        "trigger": type(trigger).__name__,
+    }
+    receipt_payload = canonical_json(receipt)
+    return failure, {
+        "status": "retained-in-process",
+        "receipt_path": None,
+        "receipt_sha256": sha256_bytes(receipt_payload),
+        "receipt": receipt,
+    }
+
+
+def _merge_process_closure_recovery(
+    current: dict[str, Any] | None,
+    added: dict[str, Any],
+) -> dict[str, Any]:
+    if current is None:
+        return added
+    return {
+        "status": "multiple-unproven-processes",
+        "recoveries": [current, added],
+    }
+
+
+def _settle_owned_attempt_supervisor_after_failure(
+    process: SpawnedProcess,
+    *,
+    attempt_dir: pathlib.Path,
+    token: str,
+) -> tuple[UnprovenDirectHelperClosure, dict[str, Any]] | None:
+    try:
+        wait_terminal(process.pid, deadline=time.monotonic() + 30)
+        reap(process.pid)
+    except BaseException as closure_error:
+        # Only the attempt supervisor may terminate its child PGID after handoff.
+        # Retain its authenticated handle when liveness-driven settlement exceeds
+        # this bounded outer wait.
+        return _retain_attempt_supervisor_closure(
+            process,
+            attempt_dir=attempt_dir,
+            token=token,
+            trigger=closure_error,
+        )
+    return None
+
+
 def _acquire_source_custody_via_helper(
     *,
     entrypoint: pathlib.Path,
@@ -1637,14 +1705,24 @@ def run(
                 outer_cleanup_error = cleanup_error
         if supervisor is not None:
             if ownership_complete:
-                try:
-                    wait_terminal(supervisor.pid, deadline=time.monotonic() + 30)
-                    reap(supervisor.pid)
-                except BaseException:
-                    # After ownership linearizes, only the attempt supervisor may
-                    # terminate its child PGID. Closing liveness makes it abandon
-                    # and settle; killing it here could orphan a reviewer.
-                    pass
+                if attempt_dir is None:
+                    raise ValueError(
+                        "owned attempt supervisor has no durable attempt directory"
+                    )
+                settlement = _settle_owned_attempt_supervisor_after_failure(
+                    supervisor,
+                    attempt_dir=attempt_dir,
+                    token=token,
+                )
+                if settlement is None:
+                    supervisor = None
+                else:
+                    failure_error, direct_recovery = settlement
+                    process_closure_recovery = _merge_process_closure_recovery(
+                        process_closure_recovery,
+                        direct_recovery,
+                    )
+                    incomplete_handoff_writers_stopped = False
             else:
                 try:
                     _terminate_incomplete_handoff(supervisor)
@@ -1654,7 +1732,8 @@ def run(
                     incomplete_handoff_writers_stopped = False
                 except BaseException:
                     incomplete_handoff_writers_stopped = False
-            supervisor = None
+                else:
+                    supervisor = None
         if git_signal_checkpoint_required:
             checkpoint_bound_signal_interrupt(force=True)
             git_signal_checkpoint_required = False

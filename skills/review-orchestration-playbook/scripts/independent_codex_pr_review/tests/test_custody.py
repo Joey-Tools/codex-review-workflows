@@ -80,6 +80,37 @@ class HelperCustodyTests(unittest.TestCase):
             fcntl.flock(competing, fcntl.LOCK_EX | fcntl.LOCK_NB)
             os.close(competing)
 
+    def test_directory_child_churn_does_not_invalidate_custody(self) -> None:
+        with owned_temporary_directory("custody-directory-churn-") as root:
+            fixture = build_helper_fixture(root)
+            evidence = authenticate_helper_state(
+                state_dir=fixture["state_dir"],
+                repo=fixture["repo"],
+                base_sha=fixture["base"],
+                head_sha=fixture["head"],
+            )
+            for directory in (
+                fixture["state_dir"],
+                fixture["state_dir"] / "workspace",
+                fixture["state_dir"] / "workspace" / ".codex-review",
+            ):
+                transient = directory / "benign-transient-child"
+                transient.mkdir(mode=0o700)
+                transient.rmdir()
+
+            custody = acquire_source_custody(
+                expected=evidence,
+                repo=fixture["repo"],
+                deadline=time.monotonic() + 2,
+            )
+            try:
+                self.assertEqual(
+                    os.read(custody.source_fd, len(fixture["diff"])),
+                    fixture["diff"],
+                )
+            finally:
+                custody.close()
+
     def test_rejects_preflight_control_digest_disagreement(self) -> None:
         with owned_temporary_directory("custody-tamper-") as root:
             fixture = build_helper_fixture(root)

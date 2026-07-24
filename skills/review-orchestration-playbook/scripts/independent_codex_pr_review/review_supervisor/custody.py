@@ -8,7 +8,7 @@ import re
 import socket
 import stat
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .constants import (
@@ -26,11 +26,13 @@ from .models import HelperCustody, Identity
 from .secureio import (
     acquire_flock,
     decode_json_bytes,
+    directory_identities_match,
     identity_from_stat,
     open_absolute_directory_chain,
     open_regular_at,
     read_fd_exact,
     sha256_bytes,
+    validate_private_directory_fd,
 )
 from .wire import receive_record, send_record
 
@@ -84,18 +86,12 @@ def _read_leaf_bytes(
         os.close(fd)
 
 
-def _validate_directory_identity(metadata: os.stat_result, *, label: str) -> Identity:
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != os.getuid()
-        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-    ):
-        raise ValueError(f"{label} is not an owner-controlled directory")
-    return identity_from_stat(metadata)
-
-
 def _open_child_directory(
-    parent_fd: int, name: bytes, *, label: str
+    parent_fd: int,
+    name: bytes,
+    *,
+    label: str,
+    display_path: pathlib.Path,
 ) -> tuple[int, Identity]:
     fd = os.open(
         name,
@@ -103,10 +99,9 @@ def _open_child_directory(
         dir_fd=parent_fd,
     )
     try:
-        descriptor_stat = os.fstat(fd)
         path_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        identity = _validate_directory_identity(descriptor_stat, label=label)
-        if identity != identity_from_stat(path_stat):
+        identity = validate_private_directory_fd(fd, display_path)
+        if not directory_identities_match(identity, identity_from_stat(path_stat)):
             raise ValueError(f"{label} changed while it was opened")
         return fd, identity
     except BaseException:
@@ -160,20 +155,22 @@ def _validate_control_state(
         raise ValueError("control directory evidence contains a non-integer field")
     actual_stat = os.fstat(control_fd)
     actual_names = _directory_names(control_fd, cap=len(CONTROL_ARTIFACT_SPECS))
-    actual = {
-        "ctime_ns": actual_stat.st_ctime_ns,
+    actual_identity = {
         "device": actual_stat.st_dev,
-        "entry_count": len(actual_names),
-        "entry_names_sha256": _entry_names_digest(actual_names),
         "inode": actual_stat.st_ino,
-        "link_count": actual_stat.st_nlink,
         "mode": actual_stat.st_mode,
-        "mtime_ns": actual_stat.st_mtime_ns,
         "uid": actual_stat.st_uid,
     }
-    if actual != directory:
+    expected_identity = {
+        field: directory[field] for field in ("device", "inode", "mode", "uid")
+    }
+    if actual_identity != expected_identity:
         raise ValueError("control directory no longer matches helper evidence")
-    if set(actual_names) != set(CONTROL_ARTIFACT_SPECS):
+    if (
+        len(actual_names) != directory["entry_count"]
+        or _entry_names_digest(actual_names) != directory["entry_names_sha256"]
+        or set(actual_names) != set(CONTROL_ARTIFACT_SPECS)
+    ):
         raise ValueError("control directory has an unexpected entry-name set")
 
     artifacts = payload["artifacts"]
@@ -270,8 +267,10 @@ def authenticate_helper_state(
     workspace_fd: int | None = None
     control_fd: int | None = None
     try:
-        state_fd, state_identity = open_absolute_directory_chain(state_dir)
-        _validate_directory_identity(os.fstat(state_fd), label="helper state directory")
+        state_fd, state_identity = open_absolute_directory_chain(
+            state_dir,
+            private_leaf=True,
+        )
         marker, _ = _read_leaf_bytes(state_fd, b".isolated-review-state", max_bytes=64)
         if marker != HELPER_STATE_MARKER_TEXT:
             raise ValueError("helper state marker is invalid")
@@ -349,7 +348,10 @@ def authenticate_helper_state(
             b"control-artifact-state.json",
             max_bytes=MAX_CONTROL_STATE_BYTES,
         )
-        workspace_fd, _ = open_absolute_directory_chain(workspace_root)
+        workspace_fd, _ = open_absolute_directory_chain(
+            workspace_root,
+            private_leaf=True,
+        )
         try:
             os.stat(b".git", dir_fd=workspace_fd, follow_symlinks=False)
         except FileNotFoundError:
@@ -360,6 +362,7 @@ def authenticate_helper_state(
             workspace_fd,
             b".codex-review",
             label="helper control directory",
+            display_path=workspace_root / ".codex-review",
         )
         control_diff_size, control_diff_sha256 = _validate_control_state(
             control_state,
@@ -435,8 +438,11 @@ def acquire_source_custody(
     cleanup_fd: int | None = None
     source_fd: int | None = None
     try:
-        state_fd, state_identity = open_absolute_directory_chain(state_dir)
-        if state_identity != expected.state_identity:
+        state_fd, state_identity = open_absolute_directory_chain(
+            state_dir,
+            private_leaf=True,
+        )
+        if not directory_identities_match(state_identity, expected.state_identity):
             raise ValueError("helper state directory identity changed")
         cleanup_fd, cleanup_identity = open_regular_at(
             state_fd,
@@ -454,15 +460,27 @@ def acquire_source_custody(
             base_sha=expected.base_sha,
             head_sha=expected.head_sha,
         )
-        if refreshed != expected:
+        if (
+            not directory_identities_match(
+                refreshed.state_identity,
+                expected.state_identity,
+            )
+            or replace(
+                refreshed,
+                state_identity=expected.state_identity,
+            )
+            != expected
+        ):
             raise ValueError("helper custody evidence changed before handoff")
         workspace_fd, _ = open_absolute_directory_chain(
-            pathlib.Path(expected.workspace_root)
+            pathlib.Path(expected.workspace_root),
+            private_leaf=True,
         )
         control_fd, _ = _open_child_directory(
             workspace_fd,
             b".codex-review",
             label="helper control directory",
+            display_path=pathlib.Path(expected.workspace_root) / ".codex-review",
         )
         source_fd, source_identity = open_regular_at(
             control_fd,

@@ -19,7 +19,6 @@ from .custody import (
     _read_leaf_bytes,
     _read_leaf_json,
     _validate_control_state,
-    _validate_directory_identity,
     _validate_runner_complete,
 )
 from .evidence import (
@@ -122,8 +121,10 @@ def authenticate_frozen_source(
     control_fd: int | None = None
     diff_fd: int | None = None
     try:
-        state_fd, _ = open_absolute_directory_chain(state_dir)
-        _validate_directory_identity(os.fstat(state_fd), label="helper state directory")
+        state_fd, _ = open_absolute_directory_chain(
+            state_dir,
+            private_leaf=True,
+        )
         marker, _ = _read_leaf_bytes(state_fd, b".isolated-review-state", max_bytes=64)
         if marker != HELPER_STATE_MARKER_TEXT:
             raise FrozenSourceError("helper state marker is invalid")
@@ -201,7 +202,10 @@ def authenticate_frozen_source(
             b"control-artifact-state.json",
             max_bytes=MAX_CONTROL_STATE_BYTES,
         )
-        workspace_fd, workspace_identity = open_absolute_directory_chain(workspace_root)
+        workspace_fd, workspace_identity = open_absolute_directory_chain(
+            workspace_root,
+            private_leaf=True,
+        )
         try:
             os.stat(b".git", dir_fd=workspace_fd, follow_symlinks=False)
         except FileNotFoundError:
@@ -212,6 +216,7 @@ def authenticate_frozen_source(
             workspace_fd,
             b".codex-review",
             label="helper control directory",
+            display_path=workspace_root / ".codex-review",
         )
         diff_size, diff_sha256 = _validate_control_state(
             control_state,

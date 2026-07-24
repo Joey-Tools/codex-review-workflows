@@ -67,6 +67,7 @@ from review_supervisor.supervisor import (
     _select_reaped_attempt_terminal,
     _spawn_attempt_supervisor,
     _settle_rewritten_process_charge,
+    _settle_owned_attempt_supervisor_after_failure,
     _terminate_incomplete_handoff,
     _validate_unsettled_checkout_summary,
     cleanup,
@@ -2412,6 +2413,62 @@ class IncompleteHandoffProcessTests(unittest.TestCase):
             self.assertIs(direct_process_closure_failure(), raised.exception)
         self.assertEqual(terminate.call_count, 2)
         self.assertIs(raised.exception.process, process)
+
+    def test_owned_attempt_supervisor_timeout_retains_typed_recovery(self) -> None:
+        process = SpawnedProcess(
+            pid=124,
+            pgid=124,
+            acknowledgement_fd=-1,
+            passed_fd_numbers=(),
+            start_identity="darwin-proc-start:124:456",
+        )
+        attempt_dir = pathlib.Path("/private/review/attempt-1")
+        token = "a" * 64
+        with (
+            mock.patch(
+                "review_supervisor.runtime._DIRECT_PROCESS_CLOSURE_UNPROVEN",
+                None,
+            ),
+            mock.patch(
+                "review_supervisor.supervisor.wait_terminal",
+                side_effect=TimeoutError("synthetic settlement timeout"),
+            ) as wait,
+            mock.patch("review_supervisor.supervisor.reap") as reap,
+        ):
+            settlement = _settle_owned_attempt_supervisor_after_failure(
+                process,
+                attempt_dir=attempt_dir,
+                token=token,
+            )
+            self.assertIsNotNone(settlement)
+            assert settlement is not None
+            failure, recovery = settlement
+            self.assertIs(direct_process_closure_failure(), failure)
+
+        self.assertIs(failure.process, process)
+        wait.assert_called_once()
+        reap.assert_not_called()
+        receipt = recovery["receipt"]
+        self.assertEqual(recovery["status"], "retained-in-process")
+        self.assertIsNone(recovery["receipt_path"])
+        self.assertEqual(
+            recovery["receipt_sha256"],
+            sha256_bytes(canonical_json(receipt)),
+        )
+        self.assertEqual(receipt["attempt_dir"], str(attempt_dir))
+        self.assertEqual(
+            receipt["handoff_token_sha256"],
+            sha256_bytes(token.encode("ascii")),
+        )
+        self.assertEqual(
+            receipt["process"],
+            {
+                "pid": process.pid,
+                "pgid": process.pgid,
+                "start_identity": process.start_identity,
+            },
+        )
+        self.assertEqual(receipt["trigger"], "TimeoutError")
 
     def test_prequiescence_abort_preserves_unproven_git_closure(self) -> None:
         process = SimpleNamespace(pid=124)

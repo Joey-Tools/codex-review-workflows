@@ -479,6 +479,9 @@ class FrozenSourceAuthenticationTests(unittest.TestCase):
             payload["schema_version"] = 3
 
         def wrong_directory_identity(payload: JsonObject) -> None:
+            payload["directory"]["inode"] += 1
+
+        def wrong_directory_entries(payload: JsonObject) -> None:
             payload["directory"]["entry_count"] += 1
 
         def malformed_digest(payload: JsonObject) -> None:
@@ -490,6 +493,11 @@ class FrozenSourceAuthenticationTests(unittest.TestCase):
                 "directory identity",
                 wrong_directory_identity,
                 "no longer matches helper evidence",
+            ),
+            (
+                "directory entries",
+                wrong_directory_entries,
+                "unexpected entry-name set",
             ),
             ("artifact digest", malformed_digest, "digest is invalid"),
         )

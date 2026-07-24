@@ -1334,6 +1334,31 @@ class NoChildProfileUnitTests(unittest.TestCase):
                     os.fstat(descriptor)
                 self.assertEqual(raised.exception.errno, errno.EBADF)
 
+    def test_terminate_and_reap_uses_a_bounded_nonblocking_wait(self) -> None:
+        with (
+            mock.patch.object(profile.os, "killpg") as killpg,
+            mock.patch.object(
+                profile.os,
+                "waitpid",
+                return_value=(0, 0),
+            ) as waitpid,
+            mock.patch.object(
+                profile.time,
+                "monotonic",
+                side_effect=(100.0, 106.0),
+            ),
+            mock.patch.object(profile.time, "sleep") as sleep,
+            self.assertRaisesRegex(
+                TimeoutError,
+                "did not exit before deadline",
+            ),
+        ):
+            profile._terminate_and_reap(424242)
+
+        killpg.assert_called_once_with(424242, signal.SIGKILL)
+        waitpid.assert_called_once_with(424242, os.WNOHANG)
+        sleep.assert_not_called()
+
     def _assert_launch_opcode_interrupt_closes_exact_child(
         self,
         *,
