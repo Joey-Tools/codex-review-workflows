@@ -417,6 +417,41 @@ class RepositoryContractTest(unittest.TestCase):
                 journal,
             )
 
+    def test_opaque_container_contract_uses_bounded_final_identities(
+        self,
+    ) -> None:
+        policies = {
+            "SKILL.md": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"),
+            "helper-contract.md": (
+                SKILL_ROOT / "references/helper-contract.md"
+            ).read_text(encoding="utf-8"),
+            "synthetic-token-fixtures.md": (
+                SKILL_ROOT / "references/synthetic-token-fixtures.md"
+            ).read_text(encoding="utf-8"),
+        }
+        for name, content in policies.items():
+            with self.subTest(policy=name):
+                self.assertIn("canonical blob OID alone", content)
+                self.assertIn("blob paths are not retained", content)
+                self.assertIn("100,000", content)
+                self.assertIn("16 MiB", content)
+                self.assertIn("base", content)
+                self.assertIn("head", content)
+                self.assertIn("source-WIP", content)
+                self.assertNotIn("raw path plus blob OID", content)
+                self.assertNotIn("retains raw path plus", content)
+
+        runtime = (RUNTIME / "workspace.py").read_text(encoding="utf-8")
+        self.assertIn(
+            "MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES = "
+            "MAX_SNAPSHOT_ENTRIES",
+            runtime,
+        )
+        self.assertIn(
+            "MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES = 16 * 1024 * 1024",
+            runtime,
+        )
+
     def test_direct_secret_admission_is_required_without_a_reviewer(self) -> None:
         repository_policy = _secret_admission_repository_policy_files(
             REPO_ROOT,
