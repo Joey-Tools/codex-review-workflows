@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import errno
+import hashlib
 import io
 import json
 import os
@@ -120,6 +121,7 @@ TERMINAL_EVIDENCE_FIELDS = {
     "committed_range",
     "formal_review",
     "signature",
+    "signature_verified_head_oid",
     "authorization",
     "input",
 }
@@ -186,6 +188,9 @@ READ_ONLY_ACTION_FIELDS = {
     "local_mutation_performed",
     "remote_mutation_performed",
 }
+FIXTURE_HEAD_OID = "dddddddddddddddddddddddddddddddddddddddd"
+ALTERNATE_HEAD_OID = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+PAGE_DIGEST_DOMAIN = b"joey-tools:pr-readiness-page:v1\x00"
 
 
 def success_evidence(
@@ -206,6 +211,9 @@ def success_evidence(
         "committed_range": committed_range,
         "formal_review": formal_review,
         "signature": signature,
+        "signature_verified_head_oid": (
+            FIXTURE_HEAD_OID if signature == "verified" else None
+        ),
         "authorization": authorization,
         "input": input_state,
     }
@@ -248,12 +256,12 @@ SUCCESS_ROWS = (
     ("clean-range-report", "local-gate", "allowed", "forbidden", True, "forbidden", "checked", "satisfied", "present", "clean", "not-required", "not-required", "not-required", "none", "none"),
     ("read-only-clean-range-report", "local-gate", "forbidden", "forbidden", True, "forbidden", "checked", "read-only-observed", "present", "clean", "not-required", "not-required", "not-required", "none", "none"),
     ("pr-readiness-handoff-ready", "pr-readiness-handoff", "allowed", "allowed", True, "review-authorization-required", "succeeded", "satisfied", "present", "clean", "verified", "satisfied", "satisfied", "review-orchestration-playbook", "pr-readiness"),
-    ("pr-readiness-existing-range-handoff-ready", "pr-readiness-handoff", "allowed", "forbidden", True, "review-authorization-required", "checked", "satisfied", "present", "clean", "not-required", "satisfied", "satisfied", "review-orchestration-playbook", "pr-readiness"),
+    ("pr-readiness-existing-range-handoff-ready", "pr-readiness-handoff", "allowed", "forbidden", True, "review-authorization-required", "checked", "satisfied", "present", "clean", "verified", "satisfied", "satisfied", "review-orchestration-playbook", "pr-readiness"),
     ("pr-readiness-read-only-probe-ready", "local-gate", "forbidden", "forbidden", False, "forbidden", "checked", "read-only-observed", "missing", "not-required", "not-required", "not-required", "satisfied", "review-orchestration-playbook", "pr-readiness-read-only-probe"),
-    ("pr-readiness-read-only-reviewed-probe-ready", "local-gate", "forbidden", "forbidden", True, "forbidden", "checked", "read-only-observed", "present", "clean", "not-required", "not-required", "satisfied", "review-orchestration-playbook", "pr-readiness-read-only-probe"),
+    ("pr-readiness-read-only-reviewed-probe-ready", "local-gate", "forbidden", "forbidden", True, "forbidden", "checked", "read-only-observed", "present", "clean", "verified", "not-required", "satisfied", "review-orchestration-playbook", "pr-readiness-read-only-probe"),
     ("pr-readiness-read-only-gate-ready", "local-gate", "allowed", "allowed", True, "forbidden", "succeeded", "satisfied", "present", "clean", "verified", "not-required", "satisfied", "review-orchestration-playbook", "pr-readiness-read-only-probe"),
     ("pr-readiness-read-only-uncommitted-probe-ready", "local-gate", "allowed", "forbidden", False, "forbidden", "checked", "satisfied", "missing", "not-required", "not-required", "not-required", "satisfied", "review-orchestration-playbook", "pr-readiness-read-only-probe"),
-    ("pr-readiness-read-only-existing-range-probe-ready", "local-gate", "allowed", "forbidden", True, "forbidden", "checked", "satisfied", "present", "clean", "not-required", "not-required", "satisfied", "review-orchestration-playbook", "pr-readiness-read-only-probe"),
+    ("pr-readiness-read-only-existing-range-probe-ready", "local-gate", "allowed", "forbidden", True, "forbidden", "checked", "satisfied", "present", "clean", "verified", "not-required", "satisfied", "review-orchestration-playbook", "pr-readiness-read-only-probe"),
 )
 # fmt: on
 SUCCESS_MATRIX = {
@@ -327,7 +335,7 @@ def constraints_for_success(expected: dict[str, object]) -> list[str]:
 def success_result(reason: str) -> dict[str, object]:
     expected = copy.deepcopy(SUCCESS_MATRIX[reason])
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "constraints": constraints_for_success(expected),
         "terminal_outcome": "succeeded",
         "terminal_reason": reason,
@@ -389,11 +397,33 @@ def status_context_rollup(
     }
 
 
+def canonical_page_digest(kind: str, payload: object) -> str:
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    digest = hashlib.sha256()
+    digest.update(PAGE_DIGEST_DOMAIN)
+    digest.update(kind.encode("ascii"))
+    digest.update(b"\x00")
+    digest.update(canonical)
+    return digest.hexdigest()
+
+
 def bind_ci_pagination(
+    report: dict[str, object],
     observed: dict[str, object],
     *,
     page_size: int = 100,
 ) -> None:
+    snapshot = report["snapshot"]
+    if not isinstance(snapshot, dict):
+        raise AssertionError("report snapshot must be an object")
+    snapshot_binding = snapshot["binding_id"]
+    snapshot_id = snapshot["snapshot_id"]
     target_identity = observed["target_identity"]
     if not isinstance(target_identity, dict):
         raise AssertionError("CI target identity must be an object")
@@ -420,22 +450,111 @@ def bind_ci_pagination(
     previous_cursor: str | None = None
     for index, chunk in enumerate(chunks, start=1):
         end_cursor = None if not chunk else f"CI_CURSOR_{index}"
-        pages.append(
+        page = {
+            "connection": dict(connection),
+            "snapshot_binding": snapshot_binding,
+            "snapshot_id": snapshot_id,
+            "page_index": index,
+            "request_after": previous_cursor,
+            "item_count": len(chunk),
+            "server_total_count": len(rollup),
+            "page_info": {
+                "end_cursor": end_cursor,
+                "has_next_page": index < len(chunks),
+            },
+        }
+        page["content_sha256"] = canonical_page_digest(
+            "ci-status",
             {
-                "connection": dict(connection),
+                "connection": connection,
+                "snapshot_binding": snapshot_binding,
+                "snapshot_id": snapshot_id,
+                "server_total_count": len(rollup),
                 "page_index": index,
                 "request_after": previous_cursor,
                 "item_count": len(chunk),
-                "page_info": {
-                    "end_cursor": end_cursor,
-                    "has_next_page": index < len(chunks),
-                },
-            }
+                "page_info": page["page_info"],
+                "items": chunk,
+            },
         )
+        pages.append(page)
         previous_cursor = end_cursor
     observed["pagination"] = {
         "connection": connection,
         "server_total_count": len(rollup),
+        "pages": pages,
+    }
+
+
+def bind_review_thread_pagination(
+    report: dict[str, object],
+    observed: dict[str, object],
+    *,
+    page_size: int = 100,
+) -> None:
+    snapshot = report["snapshot"]
+    if not isinstance(snapshot, dict):
+        raise AssertionError("report snapshot must be an object")
+    snapshot_binding = snapshot["binding_id"]
+    snapshot_id = snapshot["snapshot_id"]
+    target_identity = observed["target_identity"]
+    if not isinstance(target_identity, dict):
+        raise AssertionError("conversation target identity must be an object")
+    repository = target_identity["repository"]
+    pull_request = target_identity["pull_request"]
+    head = target_identity["head"]
+    if not all(isinstance(item, dict) for item in (repository, pull_request, head)):
+        raise AssertionError("conversation target identity is incomplete")
+    connection = {
+        "provider": "github-graphql",
+        "field": "pullRequest.reviewThreads",
+        "repository_node_id": repository["node_id"],
+        "pull_request_node_id": pull_request["node_id"],
+        "head_oid": head["oid"],
+    }
+    threads = observed["review_threads"]
+    if not isinstance(threads, list):
+        raise AssertionError("review_threads must be an array")
+    chunks = [
+        threads[offset : offset + page_size]
+        for offset in range(0, len(threads), page_size)
+    ] or [[]]
+    pages = []
+    previous_cursor: str | None = None
+    for index, chunk in enumerate(chunks, start=1):
+        end_cursor = None if not chunk else f"THREAD_CURSOR_{index}"
+        page = {
+            "connection": dict(connection),
+            "snapshot_binding": snapshot_binding,
+            "snapshot_id": snapshot_id,
+            "page_index": index,
+            "request_after": previous_cursor,
+            "item_count": len(chunk),
+            "server_total_count": len(threads),
+            "page_info": {
+                "end_cursor": end_cursor,
+                "has_next_page": index < len(chunks),
+            },
+        }
+        page["content_sha256"] = canonical_page_digest(
+            "review-threads",
+            {
+                "connection": connection,
+                "snapshot_binding": snapshot_binding,
+                "snapshot_id": snapshot_id,
+                "server_total_count": len(threads),
+                "page_index": index,
+                "request_after": previous_cursor,
+                "item_count": len(chunk),
+                "page_info": page["page_info"],
+                "items": chunk,
+            },
+        )
+        pages.append(page)
+        previous_cursor = end_cursor
+    observed["pagination"] = {
+        "connection": connection,
+        "server_total_count": len(threads),
         "pages": pages,
     }
 
@@ -494,7 +613,7 @@ def assert_valid_result_contract(result: object) -> None:
         raise AssertionError("delivery result must be an object")
     if set(result) != RESULT_FIELDS:
         raise AssertionError("delivery result fields do not match the closed contract")
-    if result["schema_version"] != 2:
+    if result["schema_version"] != 3:
         raise AssertionError("unexpected delivery result schema version")
     if result["profile"] not in PROFILES:
         raise AssertionError("unknown delivery profile")
@@ -537,10 +656,31 @@ def assert_valid_result_contract(result: object) -> None:
     for field, values in TERMINAL_EVIDENCE_VALUES.items():
         if evidence[field] not in values:
             raise AssertionError(f"unknown terminal evidence value for {field}")
+    verified_head_oid = evidence["signature_verified_head_oid"]
+    if evidence["signature"] == "verified":
+        if (
+            not isinstance(verified_head_oid, str)
+            or len(verified_head_oid) not in {40, 64}
+            or any(
+                character not in "0123456789abcdef" for character in verified_head_oid
+            )
+        ):
+            raise AssertionError(
+                "verified signature lacks a full lowercase head object ID"
+            )
+    elif verified_head_oid is not None:
+        raise AssertionError(
+            "non-verified signature retained a verified head object ID"
+        )
     if outcome == "succeeded":
         expected_terminal = SUCCESS_MATRIX.get(reason)
         if expected_terminal is None:
             raise AssertionError("successful terminal used a blocker reason")
+        expected_terminal = copy.deepcopy(expected_terminal)
+        if evidence["signature"] == "verified":
+            expected_terminal["terminal_evidence"]["signature_verified_head_oid"] = (
+                verified_head_oid
+            )
         actual_terminal = {
             field: result[field]
             for field in (
@@ -648,7 +788,7 @@ def assert_valid_result_contract(result: object) -> None:
 def assert_read_only_report_contract(report: object) -> None:
     if not isinstance(report, dict) or set(report) != READ_ONLY_REPORT_FIELDS:
         raise AssertionError("read-only PR report fields do not match the contract")
-    if report["schema_version"] != 6:
+    if report["schema_version"] != 7:
         raise AssertionError("unexpected read-only PR report schema version")
     if report["terminal"] != "pr-readiness-read-only-report":
         raise AssertionError("unexpected read-only PR report terminal")
@@ -1048,7 +1188,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
         self.assertEqual(set(schema["required"]), READ_ONLY_REPORT_FIELDS)
         self.assertEqual(set(schema["properties"]), READ_ONLY_REPORT_FIELDS)
         self.assertFalse(schema["additionalProperties"])
-        self.assertEqual(schema["properties"]["schema_version"]["const"], 6)
+        self.assertEqual(schema["properties"]["schema_version"]["const"], 7)
         self.assertEqual(
             set(schema["properties"]["terminal_state"]["enum"]),
             {
@@ -1089,14 +1229,20 @@ class DeliveryProfileContractTest(unittest.TestCase):
         for branch in delivery_contract["allOf"][-1]["oneOf"]:
             properties = branch["properties"]
             reason = properties["terminal_reason"]["const"]
-            receiver_matrix[reason] = {
-                field: properties[field]["const"]
-                for field in (
-                    "local_mutation",
-                    "commit_mode",
-                    "formal_review_required",
-                    "terminal_evidence",
+            evidence_properties = properties["terminal_evidence"]["properties"]
+            evidence_matrix = {}
+            for field in TERMINAL_EVIDENCE_FIELDS:
+                field_schema = evidence_properties[field]
+                evidence_matrix[field] = (
+                    "required"
+                    if field_schema.get("$ref") == "#/$defs/oid"
+                    else field_schema["const"]
                 )
+            receiver_matrix[reason] = {
+                "local_mutation": properties["local_mutation"]["const"],
+                "commit_mode": properties["commit_mode"]["const"],
+                "formal_review_required": properties["formal_review_required"]["const"],
+                "terminal_evidence": evidence_matrix,
             }
         self.assertEqual(receiver_matrix, READ_ONLY_DELIVERY_SUCCESS_MATRIX)
         external_refs: list[str] = []
@@ -1166,6 +1312,32 @@ class DeliveryProfileContractTest(unittest.TestCase):
             schema["$defs"]["ciPaginationPage"]["properties"]["item_count"]["maximum"],
             100,
         )
+        self.assertIn(
+            "server_total_count",
+            schema["$defs"]["ciPaginationPage"]["required"],
+        )
+        self.assertIn(
+            "content_sha256",
+            schema["$defs"]["ciPaginationPage"]["required"],
+        )
+        for definition in ("ciPaginationPage", "reviewThreadPaginationPage"):
+            page_schema = schema["$defs"][definition]
+            self.assertIn("snapshot_binding", page_schema["required"])
+            self.assertIn("snapshot_id", page_schema["required"])
+            self.assertEqual(
+                page_schema["properties"]["snapshot_binding"]["$ref"],
+                "#/$defs/snapshotId",
+            )
+            self.assertEqual(
+                page_schema["properties"]["snapshot_id"]["$ref"],
+                "#/$defs/observationId",
+            )
+        self.assertEqual(
+            schema["$defs"]["ciPaginationPage"]["properties"]["content_sha256"][
+                "pattern"
+            ],
+            "^[0-9a-f]{64}$",
+        )
         self.assertEqual(
             schema["$defs"]["statusCheckRollupEntry"]["oneOf"],
             [
@@ -1212,6 +1384,29 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 ]
             ),
             {"ERROR", "EXPECTED", "FAILURE", "PENDING", "SUCCESS"},
+        )
+        conversation_observation = schema["$defs"]["conversationStateEvidence"][
+            "properties"
+        ]["observed"]["items"]
+        self.assertIn("review_threads", conversation_observation["required"])
+        self.assertIn("pagination", conversation_observation["required"])
+        self.assertEqual(
+            conversation_observation["properties"]["review_threads"]["items"]["$ref"],
+            "#/$defs/reviewThread",
+        )
+        self.assertEqual(
+            conversation_observation["properties"]["pagination"]["$ref"],
+            "#/$defs/reviewThreadPaginationEvidence",
+        )
+        self.assertEqual(
+            schema["$defs"]["reviewThreadPaginationConnection"]["properties"]["field"][
+                "const"
+            ],
+            "pullRequest.reviewThreads",
+        )
+        self.assertIn(
+            "content_sha256",
+            schema["$defs"]["reviewThreadPaginationPage"]["required"],
         )
         range_observation = schema["$defs"]["baseAndHeadEvidence"]["properties"][
             "observed"
@@ -1270,6 +1465,9 @@ class DeliveryProfileContractTest(unittest.TestCase):
             if case["prompt"]
             == "Complete the full local workflow, then report PR readiness without remote mutations."
         )
+        commit_allowed["delivery_record"]["terminal_evidence"][
+            "signature_verified_head_oid"
+        ] = commit_allowed["target"]["head"]["oid"]
         self.assertEqual(list(validator.iter_errors(commit_allowed)), [])
         assert_read_only_report_contract(commit_allowed)
 
@@ -1490,7 +1688,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
 
         multipage = copy.deepcopy(base)
         multipage_observed = multipage["evidence"]["ci_status"]["observed"][0]
-        bind_ci_pagination(multipage_observed, page_size=1)
+        bind_ci_pagination(multipage, multipage_observed, page_size=1)
         self.assertEqual(list(validator.iter_errors(multipage)), [])
         validate_read_only_report_semantics(multipage)
         self.assertEqual(len(multipage_observed["pagination"]["pages"]), 2)
@@ -1512,7 +1710,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 "status_check_rollup": [],
             }
         )
-        bind_ci_pagination(no_checks_observed)
+        bind_ci_pagination(no_checks, no_checks_observed)
         self.assertEqual(list(validator.iter_errors(no_checks)), [])
         validate_read_only_report_semantics(no_checks)
 
@@ -1537,23 +1735,54 @@ class DeliveryProfileContractTest(unittest.TestCase):
                     ],
                 }
             )
-            bind_ci_pagination(observed)
+            bind_ci_pagination(candidate, observed)
             connection = observed["pagination"]["connection"]
             first_page = observed["pagination"]["pages"][0]
             first_page["page_info"]["has_next_page"] = True
             observed["pagination"]["server_total_count"] = 2
-            observed["pagination"]["pages"].append(
+            first_page["server_total_count"] = 2
+            first_page["content_sha256"] = canonical_page_digest(
+                "ci-status",
                 {
-                    "connection": copy.deepcopy(connection),
-                    "page_index": 2,
-                    "request_after": first_page["page_info"]["end_cursor"],
+                    "connection": connection,
+                    "snapshot_binding": first_page["snapshot_binding"],
+                    "snapshot_id": first_page["snapshot_id"],
+                    "server_total_count": 2,
+                    "page_index": 1,
+                    "request_after": None,
                     "item_count": 1,
-                    "page_info": {
-                        "end_cursor": f"HIDDEN_{hidden_bucket.upper()}_CURSOR",
-                        "has_next_page": False,
-                    },
-                }
+                    "page_info": first_page["page_info"],
+                    "items": observed["status_check_rollup"],
+                },
             )
+            second_page = {
+                "connection": copy.deepcopy(connection),
+                "snapshot_binding": candidate["snapshot"]["binding_id"],
+                "snapshot_id": candidate["snapshot"]["snapshot_id"],
+                "page_index": 2,
+                "request_after": first_page["page_info"]["end_cursor"],
+                "item_count": 1,
+                "server_total_count": 2,
+                "page_info": {
+                    "end_cursor": f"HIDDEN_{hidden_bucket.upper()}_CURSOR",
+                    "has_next_page": False,
+                },
+            }
+            second_page["content_sha256"] = canonical_page_digest(
+                "ci-status",
+                {
+                    "connection": connection,
+                    "snapshot_binding": second_page["snapshot_binding"],
+                    "snapshot_id": second_page["snapshot_id"],
+                    "server_total_count": 2,
+                    "page_index": 2,
+                    "request_after": second_page["request_after"],
+                    "item_count": 1,
+                    "page_info": second_page["page_info"],
+                    "items": [],
+                },
+            )
+            observed["pagination"]["pages"].append(second_page)
             with self.subTest(hidden_later_page=hidden_bucket):
                 self.assertEqual(list(validator.iter_errors(candidate)), [])
                 with self.assertRaisesRegex(ValueError, "server totalCount"):
@@ -1602,6 +1831,57 @@ class DeliveryProfileContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "final CI page"):
             validate_read_only_report_semantics(incomplete_final)
 
+        content_drift = copy.deepcopy(base)
+        observed = content_drift["evidence"]["ci_status"]["observed"][0]
+        observed["status_check_rollup"][0]["name"] = "tampered-after-page-capture"
+        self.assertEqual(list(validator.iter_errors(content_drift)), [])
+        with self.assertRaisesRegex(ValueError, "content digest"):
+            validate_read_only_report_semantics(content_drift)
+
+        ordering_drift = copy.deepcopy(base)
+        observed = ordering_drift["evidence"]["ci_status"]["observed"][0]
+        observed["status_check_rollup"].reverse()
+        self.assertEqual(list(validator.iter_errors(ordering_drift)), [])
+        with self.assertRaisesRegex(ValueError, "ordered flat-rollup slice"):
+            validate_read_only_report_semantics(ordering_drift)
+
+        page_total_drift = copy.deepcopy(base)
+        observed = page_total_drift["evidence"]["ci_status"]["observed"][0]
+        observed["pagination"]["pages"][0]["server_total_count"] += 1
+        self.assertEqual(list(validator.iter_errors(page_total_drift)), [])
+        with self.assertRaisesRegex(ValueError, "mid-pagination total drift"):
+            validate_read_only_report_semantics(page_total_drift)
+
+        for field, replacement in (
+            ("snapshot_binding", f"snapshot:{'e' * 32}"),
+            ("snapshot_id", f"observation:{'f' * 32}"),
+        ):
+            snapshot_drift = copy.deepcopy(base)
+            observed = snapshot_drift["evidence"]["ci_status"]["observed"][0]
+            page = observed["pagination"]["pages"][0]
+            page[field] = replacement
+            page["content_sha256"] = canonical_page_digest(
+                "ci-status",
+                {
+                    "connection": observed["pagination"]["connection"],
+                    "snapshot_binding": page["snapshot_binding"],
+                    "snapshot_id": page["snapshot_id"],
+                    "server_total_count": observed["pagination"]["server_total_count"],
+                    "page_index": page["page_index"],
+                    "request_after": page["request_after"],
+                    "item_count": page["item_count"],
+                    "page_info": page["page_info"],
+                    "items": observed["status_check_rollup"],
+                },
+            )
+            with self.subTest(page_snapshot_identity=field):
+                self.assertEqual(list(validator.iter_errors(snapshot_drift)), [])
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "changed report snapshot identity",
+                ):
+                    validate_read_only_report_semantics(snapshot_drift)
+
         beyond_legacy_truncation = copy.deepcopy(base)
         observed = beyond_legacy_truncation["evidence"]["ci_status"]["observed"][0]
         rollup = [
@@ -1625,7 +1905,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 "status_check_rollup": rollup,
             }
         )
-        bind_ci_pagination(observed)
+        bind_ci_pagination(beyond_legacy_truncation, observed)
         self.assertEqual(list(validator.iter_errors(beyond_legacy_truncation)), [])
         validate_read_only_report_semantics(beyond_legacy_truncation)
 
@@ -1635,6 +1915,88 @@ class DeliveryProfileContractTest(unittest.TestCase):
         self.assertTrue(list(validator.iter_errors(over_cap)))
         with self.assertRaisesRegex(ValueError, "bounded complete-rollup cap"):
             validate_read_only_report_semantics(over_cap)
+
+    def test_review_threads_require_complete_identity_bound_pagination(
+        self,
+    ) -> None:
+        base = copy.deepcopy(
+            next(
+                case["expected"]["terminal_result"]
+                for case in fixture_cases(
+                    READ_ONLY_PR_PROBE_CASES,
+                    "read-only-pr-probe",
+                )
+                if case["name"] == "selected-pr-base-head-blocked"
+            )
+        )
+        validator = read_only_report_validator()
+        observed = base["evidence"]["conversation_state"]["observed"][0]
+        threads = [
+            {
+                "node_id": f"REVIEW_THREAD_COMPLETE_{index}",
+                "is_resolved": index != 100,
+            }
+            for index in range(101)
+        ]
+        observed.update(
+            {
+                "total_threads": len(threads),
+                "unresolved_threads": 1,
+                "review_threads": threads,
+            }
+        )
+        bind_review_thread_pagination(base, observed)
+        self.assertEqual(list(validator.iter_errors(base)), [])
+        validate_read_only_report_semantics(base)
+        self.assertEqual(len(observed["pagination"]["pages"]), 2)
+        self.assertFalse(observed["review_threads"][-1]["is_resolved"])
+
+        hidden_later_unresolved = copy.deepcopy(base)
+        hidden = hidden_later_unresolved["evidence"]["conversation_state"]["observed"][
+            0
+        ]
+        hidden["unresolved_threads"] = 0
+        self.assertEqual(list(validator.iter_errors(hidden_later_unresolved)), [])
+        with self.assertRaisesRegex(ValueError, "unresolved_threads"):
+            validate_read_only_report_semantics(hidden_later_unresolved)
+
+        incomplete = copy.deepcopy(base)
+        incomplete_observed = incomplete["evidence"]["conversation_state"]["observed"][
+            0
+        ]
+        incomplete_observed["pagination"]["pages"][-1]["page_info"]["has_next_page"] = (
+            True
+        )
+        self.assertEqual(list(validator.iter_errors(incomplete)), [])
+        with self.assertRaisesRegex(ValueError, "final review-thread page"):
+            validate_read_only_report_semantics(incomplete)
+
+        content_drift = copy.deepcopy(base)
+        content_observed = content_drift["evidence"]["conversation_state"]["observed"][
+            0
+        ]
+        content_observed["review_threads"][-1]["is_resolved"] = True
+        content_observed["unresolved_threads"] = 0
+        self.assertEqual(list(validator.iter_errors(content_drift)), [])
+        with self.assertRaisesRegex(ValueError, "content digest"):
+            validate_read_only_report_semantics(content_drift)
+
+        total_drift = copy.deepcopy(base)
+        total_observed = total_drift["evidence"]["conversation_state"]["observed"][0]
+        total_observed["pagination"]["pages"][1]["server_total_count"] += 1
+        self.assertEqual(list(validator.iter_errors(total_drift)), [])
+        with self.assertRaisesRegex(ValueError, "mid-pagination total drift"):
+            validate_read_only_report_semantics(total_drift)
+
+        duplicate = copy.deepcopy(base)
+        duplicate_observed = duplicate["evidence"]["conversation_state"]["observed"][0]
+        duplicate_observed["review_threads"][1]["node_id"] = duplicate_observed[
+            "review_threads"
+        ][0]["node_id"]
+        bind_review_thread_pagination(duplicate, duplicate_observed)
+        self.assertTrue(list(validator.iter_errors(duplicate)))
+        with self.assertRaisesRegex(ValueError, "globally unique"):
+            validate_read_only_report_semantics(duplicate)
 
     def test_read_only_pr_report_preserves_and_maps_all_ci_provider_states(
         self,
@@ -1684,7 +2046,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                         ],
                     }
                 )
-                bind_ci_pagination(observed)
+                bind_ci_pagination(candidate, observed)
                 self.assertEqual(list(validator.iter_errors(candidate)), [])
                 validate_read_only_report_semantics(candidate)
                 self.assertEqual(
@@ -1720,7 +2082,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                         ],
                     }
                 )
-                bind_ci_pagination(observed)
+                bind_ci_pagination(candidate, observed)
                 self.assertEqual(list(validator.iter_errors(candidate)), [])
                 validate_read_only_report_semantics(candidate)
 
@@ -1751,7 +2113,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                         ],
                     }
                 )
-                bind_ci_pagination(observed)
+                bind_ci_pagination(candidate, observed)
                 self.assertEqual(list(validator.iter_errors(candidate)), [])
                 validate_read_only_report_semantics(candidate)
 
@@ -1781,7 +2143,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 ],
             }
         )
-        bind_ci_pagination(nullable_observed)
+        bind_ci_pagination(nullable_database_ids, nullable_observed)
         self.assertEqual(list(validator.iter_errors(nullable_database_ids)), [])
         validate_read_only_report_semantics(nullable_database_ids)
 
@@ -1824,7 +2186,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 ],
             }
         )
-        bind_ci_pagination(mixed_observed)
+        bind_ci_pagination(mixed, mixed_observed)
         self.assertEqual(list(validator.iter_errors(mixed)), [])
         validate_read_only_report_semantics(mixed)
 
@@ -2077,6 +2439,41 @@ class DeliveryProfileContractTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "provider identity"):
             validate_read_only_report_semantics(inconsistent_creator_identity)
+
+        status_context_node_conflict = copy.deepcopy(base)
+        observed = status_context_node_conflict["evidence"]["ci_status"]["observed"][0]
+        observed.update(
+            {
+                "state": "success",
+                "total": 2,
+                "successful": 2,
+                "failed": 0,
+                "pending": 0,
+                "cancelled": 0,
+                "status_check_rollup": [
+                    status_context_rollup(
+                        context="required/lint",
+                        state="SUCCESS",
+                        creator_node_id="ACTOR_PRIMARY",
+                        node_id="STATUS_CONTEXT_REUSED_NODE",
+                    ),
+                    status_context_rollup(
+                        context="required/tests",
+                        state="SUCCESS",
+                        creator_node_id="ACTOR_SECONDARY",
+                        creator_login="secondary-ci[bot]",
+                        node_id="STATUS_CONTEXT_REUSED_NODE",
+                    ),
+                ],
+            }
+        )
+        bind_ci_pagination(status_context_node_conflict, observed)
+        self.assertEqual(list(validator.iter_errors(status_context_node_conflict)), [])
+        with self.assertRaisesRegex(
+            ValueError,
+            "StatusContext Node ID maps to inconsistent creator/context identity",
+        ):
+            validate_read_only_report_semantics(status_context_node_conflict)
 
         app_database_collision = copy.deepcopy(base)
         observed = app_database_collision["evidence"]["ci_status"]["observed"][0]
@@ -2778,7 +3175,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
             set(schema["properties"]["constraints"]["items"]["enum"]),
             CONSTRAINTS,
         )
-        self.assertEqual(schema["properties"]["schema_version"]["const"], 2)
+        self.assertEqual(schema["properties"]["schema_version"]["const"], 3)
         self.assertEqual(
             set(schema["properties"]["terminal_outcome"]["enum"]),
             {"succeeded", "blocked"},
@@ -2958,8 +3355,22 @@ class DeliveryProfileContractTest(unittest.TestCase):
             reason = properties["terminal_reason"]["const"]
             self.assertEqual(branch["title"], reason)
             self.assertEqual(properties["terminal_outcome"]["const"], "succeeded")
+            evidence_properties = properties["terminal_evidence"]["properties"]
+            schema_evidence = {
+                field: (
+                    FIXTURE_HEAD_OID
+                    if evidence_properties[field].get("$ref") == "#/$defs/oid"
+                    else evidence_properties[field]["const"]
+                )
+                for field in TERMINAL_EVIDENCE_FIELDS
+            }
             schema_success_matrix[reason] = {
-                field: properties[field]["const"] for field in SUCCESS_MATRIX[reason]
+                field: (
+                    schema_evidence
+                    if field == "terminal_evidence"
+                    else properties[field]["const"]
+                )
+                for field in SUCCESS_MATRIX[reason]
             }
         self.assertEqual(schema_success_matrix, SUCCESS_MATRIX)
 
@@ -3055,6 +3466,13 @@ class DeliveryProfileContractTest(unittest.TestCase):
         for reason in sorted(read_only_reasons):
             report = copy.deepcopy(base_report)
             report["delivery_record"] = success_result(reason)
+            if (
+                report["delivery_record"]["terminal_evidence"]["signature"]
+                == "verified"
+            ):
+                report["delivery_record"]["terminal_evidence"][
+                    "signature_verified_head_oid"
+                ] = report["target"]["head"]["oid"]
             with self.subTest(reason=reason, mutation="valid"):
                 self.assertEqual(list(validator.iter_errors(report)), [])
                 validate_read_only_report_semantics(report)
@@ -3109,43 +3527,42 @@ class DeliveryProfileContractTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             assert_valid_result_contract(incomplete_success)
 
-        blockers = {
-            "missing-committed-range": {
-                "committed_range": "missing",
-                "formal_review": "not-started",
-                "signature": "not-required",
+        blocker_branches = schema["$defs"]["blockedTerminalMatrix"]["oneOf"]
+        self.assertEqual(
+            {
+                branch["properties"]["terminal_reason"]["const"]
+                for branch in blocker_branches
             },
-            "review-findings": {
-                "formal_review": "findings",
-                "signature": "not-required",
-            },
-            "signing-failed": {
-                "committed_range": "missing",
-                "formal_review": "not-started",
-                "signature": "failed",
-            },
-            "blocked-authorization": {
-                "authorization": "blocked",
-            },
-            "blocked-input": {
-                "input": "blocked",
-            },
-        }
-        for reason, evidence_updates in blockers.items():
-            with self.subTest(reason=reason):
+            BLOCKED_REASONS,
+        )
+        for index, branch in enumerate(blocker_branches):
+            properties = branch["properties"]
+            reason = properties["terminal_reason"]["const"]
+            with self.subTest(reason=reason, row=index):
                 blocked = copy.deepcopy(ready)
-                blocked.update(
-                    {
-                        "terminal_outcome": "blocked",
-                        "terminal_reason": reason,
-                        "handoff": "none",
-                        "handoff_profile": "none",
-                    }
+                for field in (
+                    "terminal_outcome",
+                    "terminal_reason",
+                    "commit_mode",
+                    "formal_review_required",
+                    "handoff",
+                    "handoff_profile",
+                ):
+                    if field in properties:
+                        blocked[field] = properties[field]["const"]
+                blocked["constraints"] = (
+                    ["no-commit"] if blocked["commit_mode"] == "forbidden" else []
                 )
-                blocked["terminal_evidence"].update(evidence_updates)
-                if reason in {"missing-committed-range", "review-findings"}:
-                    blocked["constraints"] = ["no-commit"]
-                    blocked["commit_mode"] = "forbidden"
+                blocked["terminal_evidence"] = {
+                    field: (
+                        FIXTURE_HEAD_OID
+                        if field_schema.get("$ref") == "#/$defs/oid"
+                        else field_schema["const"]
+                    )
+                    for field, field_schema in properties["terminal_evidence"][
+                        "properties"
+                    ].items()
+                }
                 self.assertEqual(list(validator.iter_errors(blocked)), [])
                 assert_valid_result_contract(blocked)
                 self.assertEqual(blocked["profile"], "pr-readiness-handoff")
@@ -3219,6 +3636,108 @@ class DeliveryProfileContractTest(unittest.TestCase):
         self.assertTrue(list(validator.iter_errors(local_only)))
         with self.assertRaisesRegex(ValueError, "local-only delivery"):
             validate_read_only_report_semantics(local_only)
+
+        legacy_delivery = copy.deepcopy(local_only)
+        legacy_delivery["delivery_record"]["constraints"].remove("local-only")
+        legacy_delivery["delivery_record"]["schema_version"] = 2
+        self.assertTrue(list(validator.iter_errors(legacy_delivery)))
+        with self.assertRaisesRegex(ValueError, "schema_version must be 3"):
+            validate_read_only_report_semantics(legacy_delivery)
+
+        legacy_report = copy.deepcopy(local_only)
+        legacy_report["delivery_record"]["constraints"].remove("local-only")
+        legacy_report["schema_version"] = 6
+        self.assertTrue(list(validator.iter_errors(legacy_report)))
+
+    def test_blocked_reason_matrix_rejects_contradictory_evidence(self) -> None:
+        schema = json.loads(DELIVERY_RESULT_SCHEMA.read_text(encoding="utf-8"))
+        validator = Draft202012Validator(schema)
+        ready = copy.deepcopy(
+            next(
+                case["result"]
+                for case in profile_selection_cases()
+                if case["result"]["profile"] == "pr-readiness-handoff"
+            )
+        )
+        alternatives: dict[str, object] = {
+            "local_gate": "succeeded",
+            "build": "read-only-observed",
+            "tests": "read-only-observed",
+            "docs": "read-only-observed",
+            "journal": "read-only-observed",
+            "committed_range": "not-required",
+            "formal_review": "clean",
+            "signature": "failed",
+            "signature_verified_head_oid": FIXTURE_HEAD_OID,
+            "authorization": "blocked",
+            "input": "blocked",
+        }
+        target_reasons = {
+            "implementation-blocked",
+            "validation-blocked",
+            "journal-blocked",
+            "formal-review-blocked",
+        }
+        branches = [
+            branch
+            for branch in schema["$defs"]["blockedTerminalMatrix"]["oneOf"]
+            if branch["properties"]["terminal_reason"]["const"] in target_reasons
+        ]
+        self.assertEqual(
+            {branch["properties"]["terminal_reason"]["const"] for branch in branches},
+            target_reasons,
+        )
+        for index, branch in enumerate(branches):
+            properties = branch["properties"]
+            reason = properties["terminal_reason"]["const"]
+            valid = copy.deepcopy(ready)
+            for field in (
+                "terminal_outcome",
+                "terminal_reason",
+                "commit_mode",
+                "formal_review_required",
+                "handoff",
+                "handoff_profile",
+            ):
+                if field in properties:
+                    valid[field] = properties[field]["const"]
+            valid["constraints"] = (
+                ["no-commit"] if valid["commit_mode"] == "forbidden" else []
+            )
+            valid["terminal_evidence"] = {
+                field: (
+                    FIXTURE_HEAD_OID
+                    if field_schema.get("$ref") == "#/$defs/oid"
+                    else field_schema["const"]
+                )
+                for field, field_schema in properties["terminal_evidence"][
+                    "properties"
+                ].items()
+            }
+            self.assertEqual(list(validator.iter_errors(valid)), [])
+            for field, current in valid["terminal_evidence"].items():
+                replacement = alternatives[field]
+                if replacement == current:
+                    replacement = (
+                        None
+                        if field == "signature_verified_head_oid"
+                        else {
+                            "local_gate": "checked",
+                            "build": "blocked",
+                            "tests": "blocked",
+                            "docs": "blocked",
+                            "journal": "blocked",
+                            "committed_range": "missing",
+                            "formal_review": "not-started",
+                            "signature": "not-required",
+                            "authorization": "not-required",
+                            "input": "not-required",
+                        }[field]
+                    )
+                candidate = copy.deepcopy(valid)
+                candidate["terminal_evidence"][field] = replacement
+                with self.subTest(reason=reason, row=index, field=field):
+                    self.assertTrue(list(validator.iter_errors(candidate)))
 
     def test_constrained_result_cannot_be_reinterpreted_downstream(self) -> None:
         constrained = next(
@@ -3377,6 +3896,76 @@ class DeliveryProfileContractTest(unittest.TestCase):
             "Enter this step only when commit mode is `allowed`",
             "bypass this step without asking for or implying commit authorization",
             "clean pre-existing reviewed range is reported directly",
+        ):
+            self.assertIn(anchor, self.normalized_change)
+
+    def test_no_commit_existing_range_pr_handoff_requires_exact_signature(
+        self,
+    ) -> None:
+        cases = {case["name"]: case for case in formal_review_terminal_cases()}
+        verified = cases["existing-range-pr-handoff-no-commit-verified-signature"]
+        self.assertTrue(verified["expected"]["read_only_signature_verification"])
+        self.assertEqual(verified["expected"]["signature"], "verified")
+        self.assertEqual(
+            verified["expected"]["signature_verified_head_oid"],
+            verified["input"]["frozen_head_oid"],
+        )
+        self.assertTrue(verified["expected"]["handoff"])
+        for name in (
+            "existing-range-pr-handoff-no-commit-unsigned",
+            "existing-range-pr-handoff-no-commit-unverifiable",
+        ):
+            with self.subTest(name=name):
+                case = cases[name]
+                self.assertEqual(case["expected"]["signature"], "failed")
+                self.assertFalse(case["expected"]["handoff"])
+                self.assertEqual(case["expected"]["terminal"], "signing-failed")
+
+        handoff = success_result("pr-readiness-existing-range-handoff-ready")
+        self.assertEqual(handoff["terminal_evidence"]["signature"], "verified")
+        self.assertEqual(
+            handoff["terminal_evidence"]["signature_verified_head_oid"],
+            FIXTURE_HEAD_OID,
+        )
+        schema = json.loads(DELIVERY_RESULT_SCHEMA.read_text(encoding="utf-8"))
+        validator = Draft202012Validator(schema)
+        for replacement in (None, "f" * 39, "F" * 40):
+            candidate = copy.deepcopy(handoff)
+            candidate["terminal_evidence"]["signature_verified_head_oid"] = replacement
+            with self.subTest(replacement=replacement):
+                self.assertTrue(list(validator.iter_errors(candidate)))
+                with self.assertRaises(AssertionError):
+                    assert_valid_result_contract(candidate)
+
+        report = copy.deepcopy(
+            next(
+                case["expected"]["terminal_result"]
+                for case in fixture_cases(
+                    READ_ONLY_PR_PROBE_CASES,
+                    "read-only-pr-probe",
+                )
+                if case["name"] == "resolved-target-snapshot"
+            )
+        )
+        report["delivery_record"] = success_result(
+            "pr-readiness-read-only-existing-range-probe-ready"
+        )
+        report["delivery_record"]["terminal_evidence"][
+            "signature_verified_head_oid"
+        ] = "c" * 40
+        self.assertEqual(
+            list(read_only_report_validator().iter_errors(report)),
+            [],
+        )
+        with self.assertRaisesRegex(ValueError, "exact frozen target head"):
+            validate_read_only_report_semantics(report)
+
+        for anchor in (
+            "read-only signature verification",
+            "`signature_verified_head_oid`",
+            "exact frozen head",
+            "unsigned or unverifiable",
+            "stop with `signing-failed`",
         ):
             self.assertIn(anchor, self.normalized_change)
 

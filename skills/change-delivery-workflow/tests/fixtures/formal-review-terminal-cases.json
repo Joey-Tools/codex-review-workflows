@@ -94,6 +94,67 @@
         "handoff": false,
         "terminal": "uncommitted-checked-result"
       }
+    },
+    {
+      "name": "existing-range-pr-handoff-no-commit-verified-signature",
+      "input": {
+        "profile": "pr-readiness-handoff",
+        "commit_mode": "forbidden",
+        "existing_committed_range": "base_sha..head_sha",
+        "formal_review_required": true,
+        "review_outcome": "clean",
+        "head_signature": "verified",
+        "signature_verified_head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "frozen_head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "expected": {
+        "create_new_head": false,
+        "read_only_signature_verification": true,
+        "signature": "verified",
+        "signature_verified_head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "handoff": true,
+        "terminal": "pr-readiness-existing-range-handoff-ready"
+      }
+    },
+    {
+      "name": "existing-range-pr-handoff-no-commit-unsigned",
+      "input": {
+        "profile": "pr-readiness-handoff",
+        "commit_mode": "forbidden",
+        "existing_committed_range": "base_sha..head_sha",
+        "formal_review_required": true,
+        "review_outcome": "clean",
+        "head_signature": "unsigned",
+        "signature_verified_head_oid": null,
+        "frozen_head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "expected": {
+        "create_new_head": false,
+        "read_only_signature_verification": true,
+        "signature": "failed",
+        "handoff": false,
+        "terminal": "signing-failed"
+      }
+    },
+    {
+      "name": "existing-range-pr-handoff-no-commit-unverifiable",
+      "input": {
+        "profile": "pr-readiness-handoff",
+        "commit_mode": "forbidden",
+        "existing_committed_range": "base_sha..head_sha",
+        "formal_review_required": true,
+        "review_outcome": "clean",
+        "head_signature": "unverifiable",
+        "signature_verified_head_oid": null,
+        "frozen_head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "expected": {
+        "create_new_head": false,
+        "read_only_signature_verification": true,
+        "signature": "failed",
+        "handoff": false,
+        "terminal": "signing-failed"
+      }
     }
   ]
 }

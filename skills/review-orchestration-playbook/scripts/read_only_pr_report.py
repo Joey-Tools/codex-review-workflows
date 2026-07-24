@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import math
 import os
@@ -26,6 +27,10 @@ READ_CHUNK_BYTES = 64 * 1024
 MAX_CI_ROLLUP_ENTRIES = 1_000
 MAX_CI_ROLLUP_PAGES = 10
 MAX_CI_PAGE_ITEMS = 100
+MAX_REVIEW_THREADS = 1_000
+MAX_REVIEW_THREAD_PAGES = 10
+MAX_REVIEW_THREAD_PAGE_ITEMS = 100
+PAGE_DIGEST_DOMAIN = b"joey-tools:pr-readiness-page:v1\x00"
 IDENTIFIER_RE = re.compile(
     r"^(?P<kind>report|target|snapshot|observation):(?P<value>[0-9a-f]{32})$"
 )
@@ -76,6 +81,7 @@ DELIVERY_TERMINAL_EVIDENCE_FIELDS = {
     "committed_range",
     "formal_review",
     "signature",
+    "signature_verified_head_oid",
     "authorization",
     "input",
 }
@@ -93,6 +99,7 @@ READ_ONLY_DELIVERY_SUCCESS_MATRIX = {
             "committed_range": "missing",
             "formal_review": "not-required",
             "signature": "not-required",
+            "signature_verified_head_oid": None,
             "authorization": "not-required",
             "input": "satisfied",
         },
@@ -109,7 +116,8 @@ READ_ONLY_DELIVERY_SUCCESS_MATRIX = {
             "journal": "read-only-observed",
             "committed_range": "present",
             "formal_review": "clean",
-            "signature": "not-required",
+            "signature": "verified",
+            "signature_verified_head_oid": "required",
             "authorization": "not-required",
             "input": "satisfied",
         },
@@ -127,6 +135,7 @@ READ_ONLY_DELIVERY_SUCCESS_MATRIX = {
             "committed_range": "present",
             "formal_review": "clean",
             "signature": "verified",
+            "signature_verified_head_oid": "required",
             "authorization": "not-required",
             "input": "satisfied",
         },
@@ -144,6 +153,7 @@ READ_ONLY_DELIVERY_SUCCESS_MATRIX = {
             "committed_range": "missing",
             "formal_review": "not-required",
             "signature": "not-required",
+            "signature_verified_head_oid": None,
             "authorization": "not-required",
             "input": "satisfied",
         },
@@ -160,7 +170,8 @@ READ_ONLY_DELIVERY_SUCCESS_MATRIX = {
             "journal": "satisfied",
             "committed_range": "present",
             "formal_review": "clean",
-            "signature": "not-required",
+            "signature": "verified",
+            "signature_verified_head_oid": "required",
             "authorization": "not-required",
             "input": "satisfied",
         },
@@ -235,6 +246,22 @@ def _is_github_node_id(value: object) -> bool:
     return isinstance(value, str) and GITHUB_NODE_ID_RE.fullmatch(value) is not None
 
 
+def _canonical_page_digest(kind: str, payload: object) -> str:
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    digest = hashlib.sha256()
+    digest.update(PAGE_DIGEST_DOMAIN)
+    digest.update(kind.encode("ascii"))
+    digest.update(b"\x00")
+    digest.update(canonical)
+    return digest.hexdigest()
+
+
 def _mapping(value: object) -> Mapping[str, Any] | None:
     return value if isinstance(value, Mapping) else None
 
@@ -287,9 +314,9 @@ def _read_only_delivery_errors(record: object) -> list[str]:
     if delivery is None:
         return ["delivery_record must be an object"]
     if set(delivery) != DELIVERY_RESULT_FIELDS:
-        return ["delivery_record fields do not match the closed v2 contract"]
-    if delivery.get("schema_version") != 2:
-        errors.append("delivery_record.schema_version must be 2")
+        return ["delivery_record fields do not match the closed v3 contract"]
+    if delivery.get("schema_version") != 3:
+        errors.append("delivery_record.schema_version must be 3")
     if delivery.get("profile") != "local-gate":
         errors.append("read-only PR probe requires the local-gate profile")
     constraints = _sequence(delivery.get("constraints"))
@@ -372,9 +399,25 @@ def _read_only_delivery_errors(record: object) -> list[str]:
             errors.append(
                 f"delivery_record.{field} contradicts terminal_reason {reason}"
             )
-    if evidence != expected["terminal_evidence"]:
+    static_evidence = dict(evidence)
+    verified_head_oid = static_evidence.pop("signature_verified_head_oid", None)
+    expected_evidence = dict(expected["terminal_evidence"])
+    expected_verified_head = expected_evidence.pop(
+        "signature_verified_head_oid",
+        None,
+    )
+    if static_evidence != expected_evidence:
         errors.append(
             f"delivery terminal evidence contradicts terminal_reason {reason}"
+        )
+    if expected_verified_head == "required":
+        if not _is_oid(verified_head_oid):
+            errors.append(
+                "verified delivery signature requires signature_verified_head_oid"
+            )
+    elif verified_head_oid is not None:
+        errors.append(
+            "non-verified delivery signature must not bind a verified head OID"
         )
     return errors
 
@@ -427,6 +470,9 @@ def _validate_ci_pagination(
     errors: list[str],
     record: Mapping[str, Any],
     rollup: Sequence[Any],
+    *,
+    snapshot_binding: object,
+    snapshot_id: object,
 ) -> None:
     pagination = _mapping(record.get("pagination"))
     identity = _mapping(record.get("target_identity"))
@@ -466,6 +512,7 @@ def _validate_ci_pagination(
         return
 
     page_item_total = 0
+    rollup_offset = 0
     previous_end_cursor: object = None
     seen_end_cursors: set[str] = set()
     for offset, item in enumerate(pages, start=1):
@@ -475,6 +522,12 @@ def _validate_ci_pagination(
             continue
         if page.get("connection") != expected_connection:
             errors.append(f"CI pagination page {offset} changed connection identity")
+        page_snapshot_binding = page.get("snapshot_binding")
+        page_snapshot_id = page.get("snapshot_id")
+        if page_snapshot_binding != snapshot_binding or page_snapshot_id != snapshot_id:
+            errors.append(
+                f"CI pagination page {offset} changed report snapshot identity"
+            )
         if page.get("page_index") != offset:
             errors.append("CI pagination page indexes must be contiguous from one")
         expected_after = None if offset == 1 else previous_end_cursor
@@ -484,6 +537,12 @@ def _validate_ci_pagination(
         if not _is_nonnegative_int(item_count) or item_count > MAX_CI_PAGE_ITEMS:
             errors.append(f"CI pagination page {offset} item count is invalid")
             item_count = 0
+        page_total_count = page.get("server_total_count")
+        if page_total_count != server_total_count:
+            errors.append(
+                "CI pagination observed mid-pagination total drift; "
+                "evidence must be unavailable"
+            )
         page_item_total += item_count
 
         page_info = _mapping(page.get("page_info"))
@@ -511,6 +570,28 @@ def _validate_ci_pagination(
                 errors.append("every non-final CI page needs a continuation cursor")
         elif has_next_page is not False:
             errors.append("the final CI page must prove hasNextPage=false")
+
+        page_slice = list(rollup[rollup_offset : rollup_offset + item_count])
+        digest_payload = {
+            "connection": expected_connection,
+            "snapshot_binding": page_snapshot_binding,
+            "snapshot_id": page_snapshot_id,
+            "server_total_count": server_total_count,
+            "page_index": offset,
+            "request_after": expected_after,
+            "item_count": item_count,
+            "page_info": dict(page_info) if page_info is not None else None,
+            "items": page_slice,
+        }
+        if page.get("content_sha256") != _canonical_page_digest(
+            "ci-status",
+            digest_payload,
+        ):
+            errors.append(
+                f"CI pagination page {offset} content digest does not bind "
+                "its ordered flat-rollup slice"
+            )
+        rollup_offset += item_count
         previous_end_cursor = end_cursor
 
     if _is_nonnegative_int(server_total_count):
@@ -518,6 +599,174 @@ def _validate_ci_pagination(
             errors.append("CI pagination item counts do not match server totalCount")
         if len(rollup) != server_total_count:
             errors.append("CI rollup length does not match server totalCount")
+    if rollup_offset != len(rollup):
+        errors.append("CI pagination page concatenation does not equal the flat rollup")
+
+
+def _validate_review_thread_pagination(
+    errors: list[str],
+    record: Mapping[str, Any],
+    threads: Sequence[Any],
+    *,
+    snapshot_binding: object,
+    snapshot_id: object,
+) -> None:
+    pagination = _mapping(record.get("pagination"))
+    identity = _mapping(record.get("target_identity"))
+    if pagination is None:
+        errors.append("review-thread pagination evidence must be an object")
+        return
+    if identity is None:
+        errors.append("review-thread pagination lacks a target identity")
+        return
+    repository = _mapping(identity.get("repository"))
+    pull_request = _mapping(identity.get("pull_request"))
+    head = _mapping(identity.get("head"))
+    if repository is None or pull_request is None or head is None:
+        errors.append("review-thread pagination target identity is incomplete")
+        return
+    expected_connection = {
+        "provider": "github-graphql",
+        "field": "pullRequest.reviewThreads",
+        "repository_node_id": repository.get("node_id"),
+        "pull_request_node_id": pull_request.get("node_id"),
+        "head_oid": head.get("oid"),
+    }
+    if pagination.get("connection") != expected_connection:
+        errors.append(
+            "review-thread pagination connection does not match the exact PR head"
+        )
+
+    server_total_count = pagination.get("server_total_count")
+    if (
+        not _is_nonnegative_int(server_total_count)
+        or server_total_count > MAX_REVIEW_THREADS
+    ):
+        errors.append(
+            "review-thread server totalCount exceeds the bounded complete-scan cap"
+        )
+
+    pages = _sequence(pagination.get("pages"))
+    if pages is None or not 1 <= len(pages) <= MAX_REVIEW_THREAD_PAGES:
+        errors.append(
+            "review-thread pagination pages are missing or exceed the bounded page cap"
+        )
+        return
+
+    page_item_total = 0
+    thread_offset = 0
+    previous_end_cursor: object = None
+    seen_end_cursors: set[str] = set()
+    for offset, item in enumerate(pages, start=1):
+        page = _mapping(item)
+        if page is None:
+            errors.append(f"review-thread pagination page {offset} must be an object")
+            continue
+        if page.get("connection") != expected_connection:
+            errors.append(
+                f"review-thread pagination page {offset} changed connection identity"
+            )
+        page_snapshot_binding = page.get("snapshot_binding")
+        page_snapshot_id = page.get("snapshot_id")
+        if page_snapshot_binding != snapshot_binding or page_snapshot_id != snapshot_id:
+            errors.append(
+                f"review-thread pagination page {offset} changed report snapshot identity"
+            )
+        if page.get("page_index") != offset:
+            errors.append(
+                "review-thread pagination page indexes must be contiguous from one"
+            )
+        expected_after = None if offset == 1 else previous_end_cursor
+        if page.get("request_after") != expected_after:
+            errors.append(
+                f"review-thread pagination page {offset} request cursor drifted"
+            )
+        item_count = page.get("item_count")
+        if (
+            not _is_nonnegative_int(item_count)
+            or item_count > MAX_REVIEW_THREAD_PAGE_ITEMS
+        ):
+            errors.append(
+                f"review-thread pagination page {offset} item count is invalid"
+            )
+            item_count = 0
+        if page.get("server_total_count") != server_total_count:
+            errors.append(
+                "review-thread pagination observed mid-pagination total drift; "
+                "evidence must be unavailable"
+            )
+        page_item_total += item_count
+
+        page_info = _mapping(page.get("page_info"))
+        if page_info is None:
+            errors.append(f"review-thread pagination page {offset} pageInfo is missing")
+            previous_end_cursor = None
+            continue
+        end_cursor = page_info.get("end_cursor")
+        has_next_page = page_info.get("has_next_page")
+        if not isinstance(has_next_page, bool):
+            errors.append(
+                f"review-thread pagination page {offset} hasNextPage is not boolean"
+            )
+        if item_count == 0:
+            if end_cursor is not None:
+                errors.append("an empty review-thread page must have a null end cursor")
+        elif not isinstance(end_cursor, str) or not end_cursor:
+            errors.append(
+                "a non-empty review-thread page must have a non-empty end cursor"
+            )
+        if isinstance(end_cursor, str):
+            if end_cursor in seen_end_cursors:
+                errors.append("review-thread pagination end cursors must not repeat")
+            seen_end_cursors.add(end_cursor)
+        if offset < len(pages):
+            if has_next_page is not True:
+                errors.append(
+                    "every non-final review-thread page must advertise a next page"
+                )
+            if not isinstance(end_cursor, str) or not end_cursor:
+                errors.append(
+                    "every non-final review-thread page needs a continuation cursor"
+                )
+        elif has_next_page is not False:
+            errors.append("the final review-thread page must prove hasNextPage=false")
+
+        page_slice = list(threads[thread_offset : thread_offset + item_count])
+        digest_payload = {
+            "connection": expected_connection,
+            "snapshot_binding": page_snapshot_binding,
+            "snapshot_id": page_snapshot_id,
+            "server_total_count": server_total_count,
+            "page_index": offset,
+            "request_after": expected_after,
+            "item_count": item_count,
+            "page_info": dict(page_info),
+            "items": page_slice,
+        }
+        if page.get("content_sha256") != _canonical_page_digest(
+            "review-threads",
+            digest_payload,
+        ):
+            errors.append(
+                f"review-thread pagination page {offset} content digest does not "
+                "bind its ordered flat-thread slice"
+            )
+        thread_offset += item_count
+        previous_end_cursor = end_cursor
+
+    if _is_nonnegative_int(server_total_count):
+        if page_item_total != server_total_count:
+            errors.append(
+                "review-thread pagination item counts do not match server totalCount"
+            )
+        if len(threads) != server_total_count:
+            errors.append(
+                "review-thread flat list length does not match server totalCount"
+            )
+    if thread_offset != len(threads):
+        errors.append(
+            "review-thread page concatenation does not equal the flat thread list"
+        )
 
 
 def _ci_rollup_identity_and_bucket(
@@ -681,6 +930,7 @@ def semantic_errors(report: object) -> list[str]:
     report_id = root.get("report_id")
     target_binding = target.get("binding_id")
     snapshot_binding = snapshot.get("binding_id")
+    snapshot_id = snapshot.get("snapshot_id")
     if target.get("report_binding") != report_id:
         errors.append("target.report_binding must equal report_id")
     if snapshot.get("report_binding") != report_id:
@@ -718,6 +968,19 @@ def semantic_errors(report: object) -> list[str]:
             "host"
         ):
             errors.append("target head provider host is inconsistent")
+    delivery = _mapping(root.get("delivery_record"))
+    delivery_evidence = (
+        _mapping(delivery.get("terminal_evidence")) if delivery is not None else None
+    )
+    if (
+        delivery_evidence is not None
+        and delivery_evidence.get("signature") == "verified"
+        and head is not None
+        and delivery_evidence.get("signature_verified_head_oid") != head.get("oid")
+    ):
+        errors.append(
+            "verified delivery signature must bind the exact frozen target head"
+        )
 
     if "pull_request" in target:
         pull_request = _mapping(target.get("pull_request"))
@@ -941,12 +1204,22 @@ def semantic_errors(report: object) -> list[str]:
         if rollup is None:
             errors.append("CI statusCheckRollup must be an array")
         else:
-            _validate_ci_pagination(errors, ci_record, rollup)
+            _validate_ci_pagination(
+                errors,
+                ci_record,
+                rollup,
+                snapshot_binding=snapshot_binding,
+                snapshot_id=snapshot_id,
+            )
             stable_identities: list[tuple[object, ...]] = []
             provider_bindings: dict[tuple[object, object], tuple[object, ...]] = {}
             app_database_bindings: dict[object, object] = {}
             check_run_bindings: dict[object, tuple[object, object]] = {}
             check_run_database_bindings: dict[object, object] = {}
+            status_context_bindings: dict[
+                object,
+                tuple[object, object],
+            ] = {}
             actual = {"success": 0, "failure": 0, "pending": 0, "cancelled": 0}
             for index, item in enumerate(rollup):
                 entry = _mapping(item)
@@ -1003,6 +1276,26 @@ def semantic_errors(report: object) -> list[str]:
                             errors.append(
                                 "CI CheckRun database ID maps to multiple Node IDs"
                             )
+                if entry.get("__typename") == "StatusContext":
+                    creator = _mapping(entry.get("creator"))
+                    node_id = entry.get("node_id")
+                    context = entry.get("context")
+                    if (
+                        creator is not None
+                        and _is_github_node_id(node_id)
+                        and _is_github_node_id(creator.get("node_id"))
+                        and isinstance(context, str)
+                    ):
+                        binding = (creator.get("node_id"), context)
+                        previous_binding = status_context_bindings.setdefault(
+                            node_id,
+                            binding,
+                        )
+                        if previous_binding != binding:
+                            errors.append(
+                                "CI StatusContext Node ID maps to inconsistent "
+                                "creator/context identity"
+                            )
                 if bucket is not None:
                     actual[bucket] += 1
             if len(stable_identities) != len(set(stable_identities)):
@@ -1049,12 +1342,51 @@ def semantic_errors(report: object) -> list[str]:
         )
         total_threads = conversation_record.get("total_threads")
         unresolved_threads = conversation_record.get("unresolved_threads")
+        review_threads = _sequence(conversation_record.get("review_threads"))
         if not _is_nonnegative_int(total_threads) or not _is_nonnegative_int(
             unresolved_threads
         ):
             errors.append("conversation counts must be non-negative integers")
-        elif unresolved_threads > total_threads:
-            errors.append("unresolved_threads cannot exceed total_threads")
+        if review_threads is None:
+            errors.append("conversation review_threads must be an array")
+        else:
+            _validate_review_thread_pagination(
+                errors,
+                conversation_record,
+                review_threads,
+                snapshot_binding=snapshot_binding,
+                snapshot_id=snapshot_id,
+            )
+            seen_thread_ids: set[str] = set()
+            actual_unresolved = 0
+            for index, item in enumerate(review_threads):
+                thread = _mapping(item)
+                if thread is None:
+                    errors.append(f"review thread {index} must be an object")
+                    continue
+                node_id = thread.get("node_id")
+                is_resolved = thread.get("is_resolved")
+                if not _is_github_node_id(node_id):
+                    errors.append(f"review thread {index} has an invalid Node ID")
+                elif node_id in seen_thread_ids:
+                    errors.append("review-thread Node IDs must be globally unique")
+                else:
+                    seen_thread_ids.add(node_id)
+                if not isinstance(is_resolved, bool):
+                    errors.append(f"review thread {index} is_resolved must be boolean")
+                elif not is_resolved:
+                    actual_unresolved += 1
+            if _is_nonnegative_int(total_threads) and total_threads != len(
+                review_threads
+            ):
+                errors.append("total_threads does not match the complete thread list")
+            if (
+                _is_nonnegative_int(unresolved_threads)
+                and unresolved_threads != actual_unresolved
+            ):
+                errors.append(
+                    "unresolved_threads does not match the complete thread list"
+                )
 
     range_record = _observed_record(
         [], evidence_records["base_and_head"], "evidence.base_and_head"

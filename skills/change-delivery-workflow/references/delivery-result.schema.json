@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://joey-tools.invalid/change-delivery-workflow/v2/delivery-result.schema.json",
+  "$id": "https://joey-tools.invalid/change-delivery-workflow/v3/delivery-result.schema.json",
   "title": "Change Delivery Result And Handoff Record",
   "type": "object",
   "required": [
@@ -19,7 +19,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": 2
+      "const": 3
     },
     "profile": {
       "enum": [
@@ -111,6 +111,7 @@
         "committed_range",
         "formal_review",
         "signature",
+        "signature_verified_head_oid",
         "authorization",
         "input"
       ],
@@ -174,6 +175,16 @@
             "verified",
             "failed",
             "not-required"
+          ]
+        },
+        "signature_verified_head_oid": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/oid"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "authorization": {
@@ -441,7 +452,8 @@
           "handoff_profile": {
             "const": "none"
           }
-        }
+        },
+        "$ref": "#/$defs/blockedTerminalMatrix"
       },
       "else": {
         "properties": {
@@ -473,6 +485,47 @@
     {
       "if": {
         "properties": {
+          "terminal_evidence": {
+            "properties": {
+              "signature": {
+                "const": "verified"
+              }
+            },
+            "required": [
+              "signature"
+            ]
+          }
+        },
+        "required": [
+          "terminal_evidence"
+        ]
+      },
+      "then": {
+        "properties": {
+          "terminal_evidence": {
+            "properties": {
+              "signature_verified_head_oid": {
+                "$ref": "#/$defs/oid"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "terminal_evidence": {
+            "properties": {
+              "signature_verified_head_oid": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
           "terminal_outcome": {
             "const": "succeeded"
           }
@@ -483,163 +536,6 @@
       },
       "then": {
         "$ref": "#/$defs/successTerminalMatrix"
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "terminal_reason": {
-            "const": "missing-committed-range"
-          }
-        },
-        "required": [
-          "terminal_reason"
-        ]
-      },
-      "then": {
-        "properties": {
-          "terminal_outcome": {
-            "const": "blocked"
-          },
-          "terminal_evidence": {
-            "properties": {
-              "committed_range": {
-                "const": "missing"
-              },
-              "formal_review": {
-                "const": "not-started"
-              },
-              "signature": {
-                "const": "not-required"
-              }
-            }
-          },
-          "commit_mode": {
-            "const": "forbidden"
-          },
-          "formal_review_required": {
-            "const": true
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "terminal_reason": {
-            "const": "review-findings"
-          }
-        },
-        "required": [
-          "terminal_reason"
-        ]
-      },
-      "then": {
-        "properties": {
-          "terminal_outcome": {
-            "const": "blocked"
-          },
-          "terminal_evidence": {
-            "properties": {
-              "committed_range": {
-                "const": "present"
-              },
-              "formal_review": {
-                "const": "findings"
-              },
-              "signature": {
-                "const": "not-required"
-              }
-            }
-          },
-          "commit_mode": {
-            "const": "forbidden"
-          },
-          "formal_review_required": {
-            "const": true
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "terminal_reason": {
-            "const": "signing-failed"
-          }
-        },
-        "required": [
-          "terminal_reason"
-        ]
-      },
-      "then": {
-        "properties": {
-          "terminal_outcome": {
-            "const": "blocked"
-          },
-          "terminal_evidence": {
-            "properties": {
-              "signature": {
-                "const": "failed"
-              }
-            }
-          },
-          "commit_mode": {
-            "const": "allowed"
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "terminal_reason": {
-            "const": "blocked-authorization"
-          }
-        },
-        "required": [
-          "terminal_reason"
-        ]
-      },
-      "then": {
-        "properties": {
-          "terminal_outcome": {
-            "const": "blocked"
-          },
-          "terminal_evidence": {
-            "properties": {
-              "authorization": {
-                "const": "blocked"
-              }
-            }
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "terminal_reason": {
-            "const": "blocked-input"
-          }
-        },
-        "required": [
-          "terminal_reason"
-        ]
-      },
-      "then": {
-        "properties": {
-          "terminal_outcome": {
-            "const": "blocked"
-          },
-          "terminal_evidence": {
-            "properties": {
-              "input": {
-                "const": "blocked"
-              }
-            }
-          }
-        }
       }
     }
   ],
@@ -671,17 +567,40 @@
               "const": "focused-checkpoint-complete"
             },
             "terminal_evidence": {
-              "const": {
-                "local_gate": "not-required",
-                "build": "satisfied",
-                "tests": "satisfied",
-                "docs": "satisfied",
-                "journal": "satisfied",
-                "committed_range": "present",
-                "formal_review": "not-required",
-                "signature": "verified",
-                "authorization": "not-required",
-                "input": "not-required"
+              "properties": {
+                "local_gate": {
+                  "const": "not-required"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "not-required"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                }
               }
             },
             "handoff": {
@@ -717,17 +636,40 @@
               "const": "focused-checkpoint-reviewed-complete"
             },
             "terminal_evidence": {
-              "const": {
-                "local_gate": "not-required",
-                "build": "satisfied",
-                "tests": "satisfied",
-                "docs": "satisfied",
-                "journal": "satisfied",
-                "committed_range": "present",
-                "formal_review": "clean",
-                "signature": "verified",
-                "authorization": "not-required",
-                "input": "not-required"
+              "properties": {
+                "local_gate": {
+                  "const": "not-required"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                }
               }
             },
             "handoff": {
@@ -763,17 +705,40 @@
               "const": "focused-checkpoint-report"
             },
             "terminal_evidence": {
-              "const": {
-                "local_gate": "not-required",
-                "build": "satisfied",
-                "tests": "satisfied",
-                "docs": "satisfied",
-                "journal": "satisfied",
-                "committed_range": "missing",
-                "formal_review": "not-required",
-                "signature": "not-required",
-                "authorization": "not-required",
-                "input": "not-required"
+              "properties": {
+                "local_gate": {
+                  "const": "not-required"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-required"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
               }
             },
             "handoff": {
@@ -809,17 +774,40 @@
               "const": "focused-checkpoint-read-only-report"
             },
             "terminal_evidence": {
-              "const": {
-                "local_gate": "not-required",
-                "build": "read-only-observed",
-                "tests": "read-only-observed",
-                "docs": "read-only-observed",
-                "journal": "read-only-observed",
-                "committed_range": "missing",
-                "formal_review": "not-required",
-                "signature": "not-required",
-                "authorization": "not-required",
-                "input": "not-required"
+              "properties": {
+                "local_gate": {
+                  "const": "not-required"
+                },
+                "build": {
+                  "const": "read-only-observed"
+                },
+                "tests": {
+                  "const": "read-only-observed"
+                },
+                "docs": {
+                  "const": "read-only-observed"
+                },
+                "journal": {
+                  "const": "read-only-observed"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-required"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
               }
             },
             "handoff": {
@@ -855,17 +843,40 @@
               "const": "focused-checkpoint-clean-range-report"
             },
             "terminal_evidence": {
-              "const": {
-                "local_gate": "not-required",
-                "build": "satisfied",
-                "tests": "satisfied",
-                "docs": "satisfied",
-                "journal": "satisfied",
-                "committed_range": "present",
-                "formal_review": "clean",
-                "signature": "not-required",
-                "authorization": "not-required",
-                "input": "not-required"
+              "properties": {
+                "local_gate": {
+                  "const": "not-required"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
               }
             },
             "handoff": {
@@ -901,17 +912,40 @@
               "const": "focused-checkpoint-read-only-clean-range-report"
             },
             "terminal_evidence": {
-              "const": {
-                "local_gate": "not-required",
-                "build": "read-only-observed",
-                "tests": "read-only-observed",
-                "docs": "read-only-observed",
-                "journal": "read-only-observed",
-                "committed_range": "present",
-                "formal_review": "clean",
-                "signature": "not-required",
-                "authorization": "not-required",
-                "input": "not-required"
+              "properties": {
+                "local_gate": {
+                  "const": "not-required"
+                },
+                "build": {
+                  "const": "read-only-observed"
+                },
+                "tests": {
+                  "const": "read-only-observed"
+                },
+                "docs": {
+                  "const": "read-only-observed"
+                },
+                "journal": {
+                  "const": "read-only-observed"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
               }
             },
             "handoff": {
@@ -947,17 +981,40 @@
               "const": "local-gate-complete"
             },
             "terminal_evidence": {
-              "const": {
-                "local_gate": "succeeded",
-                "build": "satisfied",
-                "tests": "satisfied",
-                "docs": "satisfied",
-                "journal": "satisfied",
-                "committed_range": "present",
-                "formal_review": "clean",
-                "signature": "verified",
-                "authorization": "not-required",
-                "input": "not-required"
+              "properties": {
+                "local_gate": {
+                  "const": "succeeded"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                }
               }
             },
             "handoff": {
@@ -993,17 +1050,40 @@
               "const": "uncommitted-checked-result"
             },
             "terminal_evidence": {
-              "const": {
-                "local_gate": "checked",
-                "build": "satisfied",
-                "tests": "satisfied",
-                "docs": "satisfied",
-                "journal": "satisfied",
-                "committed_range": "missing",
-                "formal_review": "not-required",
-                "signature": "not-required",
-                "authorization": "not-required",
-                "input": "not-required"
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-required"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
               }
             },
             "handoff": {
@@ -1039,17 +1119,40 @@
               "const": "read-only-checked-result"
             },
             "terminal_evidence": {
-              "const": {
-                "local_gate": "checked",
-                "build": "read-only-observed",
-                "tests": "read-only-observed",
-                "docs": "read-only-observed",
-                "journal": "read-only-observed",
-                "committed_range": "missing",
-                "formal_review": "not-required",
-                "signature": "not-required",
-                "authorization": "not-required",
-                "input": "not-required"
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "read-only-observed"
+                },
+                "tests": {
+                  "const": "read-only-observed"
+                },
+                "docs": {
+                  "const": "read-only-observed"
+                },
+                "journal": {
+                  "const": "read-only-observed"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-required"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
               }
             },
             "handoff": {
@@ -1085,17 +1188,40 @@
               "const": "clean-range-report"
             },
             "terminal_evidence": {
-              "const": {
-                "local_gate": "checked",
-                "build": "satisfied",
-                "tests": "satisfied",
-                "docs": "satisfied",
-                "journal": "satisfied",
-                "committed_range": "present",
-                "formal_review": "clean",
-                "signature": "not-required",
-                "authorization": "not-required",
-                "input": "not-required"
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
               }
             },
             "handoff": {
@@ -1131,17 +1257,40 @@
               "const": "read-only-clean-range-report"
             },
             "terminal_evidence": {
-              "const": {
-                "local_gate": "checked",
-                "build": "read-only-observed",
-                "tests": "read-only-observed",
-                "docs": "read-only-observed",
-                "journal": "read-only-observed",
-                "committed_range": "present",
-                "formal_review": "clean",
-                "signature": "not-required",
-                "authorization": "not-required",
-                "input": "not-required"
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "read-only-observed"
+                },
+                "tests": {
+                  "const": "read-only-observed"
+                },
+                "docs": {
+                  "const": "read-only-observed"
+                },
+                "journal": {
+                  "const": "read-only-observed"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
               }
             },
             "handoff": {
@@ -1177,17 +1326,40 @@
               "const": "pr-readiness-handoff-ready"
             },
             "terminal_evidence": {
-              "const": {
-                "local_gate": "succeeded",
-                "build": "satisfied",
-                "tests": "satisfied",
-                "docs": "satisfied",
-                "journal": "satisfied",
-                "committed_range": "present",
-                "formal_review": "clean",
-                "signature": "verified",
-                "authorization": "satisfied",
-                "input": "satisfied"
+              "properties": {
+                "local_gate": {
+                  "const": "succeeded"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "authorization": {
+                  "const": "satisfied"
+                },
+                "input": {
+                  "const": "satisfied"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                }
               }
             },
             "handoff": {
@@ -1223,17 +1395,40 @@
               "const": "pr-readiness-existing-range-handoff-ready"
             },
             "terminal_evidence": {
-              "const": {
-                "local_gate": "checked",
-                "build": "satisfied",
-                "tests": "satisfied",
-                "docs": "satisfied",
-                "journal": "satisfied",
-                "committed_range": "present",
-                "formal_review": "clean",
-                "signature": "not-required",
-                "authorization": "satisfied",
-                "input": "satisfied"
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                },
+                "authorization": {
+                  "const": "satisfied"
+                },
+                "input": {
+                  "const": "satisfied"
+                }
               }
             },
             "handoff": {
@@ -1269,17 +1464,40 @@
               "const": "pr-readiness-read-only-probe-ready"
             },
             "terminal_evidence": {
-              "const": {
-                "local_gate": "checked",
-                "build": "read-only-observed",
-                "tests": "read-only-observed",
-                "docs": "read-only-observed",
-                "journal": "read-only-observed",
-                "committed_range": "missing",
-                "formal_review": "not-required",
-                "signature": "not-required",
-                "authorization": "not-required",
-                "input": "satisfied"
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "read-only-observed"
+                },
+                "tests": {
+                  "const": "read-only-observed"
+                },
+                "docs": {
+                  "const": "read-only-observed"
+                },
+                "journal": {
+                  "const": "read-only-observed"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-required"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "satisfied"
+                }
               }
             },
             "handoff": {
@@ -1315,17 +1533,40 @@
               "const": "pr-readiness-read-only-reviewed-probe-ready"
             },
             "terminal_evidence": {
-              "const": {
-                "local_gate": "checked",
-                "build": "read-only-observed",
-                "tests": "read-only-observed",
-                "docs": "read-only-observed",
-                "journal": "read-only-observed",
-                "committed_range": "present",
-                "formal_review": "clean",
-                "signature": "not-required",
-                "authorization": "not-required",
-                "input": "satisfied"
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "read-only-observed"
+                },
+                "tests": {
+                  "const": "read-only-observed"
+                },
+                "docs": {
+                  "const": "read-only-observed"
+                },
+                "journal": {
+                  "const": "read-only-observed"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "satisfied"
+                }
               }
             },
             "handoff": {
@@ -1361,17 +1602,40 @@
               "const": "pr-readiness-read-only-gate-ready"
             },
             "terminal_evidence": {
-              "const": {
-                "local_gate": "succeeded",
-                "build": "satisfied",
-                "tests": "satisfied",
-                "docs": "satisfied",
-                "journal": "satisfied",
-                "committed_range": "present",
-                "formal_review": "clean",
-                "signature": "verified",
-                "authorization": "not-required",
-                "input": "satisfied"
+              "properties": {
+                "local_gate": {
+                  "const": "succeeded"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "satisfied"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                }
               }
             },
             "handoff": {
@@ -1407,17 +1671,40 @@
               "const": "pr-readiness-read-only-uncommitted-probe-ready"
             },
             "terminal_evidence": {
-              "const": {
-                "local_gate": "checked",
-                "build": "satisfied",
-                "tests": "satisfied",
-                "docs": "satisfied",
-                "journal": "satisfied",
-                "committed_range": "missing",
-                "formal_review": "not-required",
-                "signature": "not-required",
-                "authorization": "not-required",
-                "input": "satisfied"
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-required"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "satisfied"
+                }
               }
             },
             "handoff": {
@@ -1453,17 +1740,40 @@
               "const": "pr-readiness-read-only-existing-range-probe-ready"
             },
             "terminal_evidence": {
-              "const": {
-                "local_gate": "checked",
-                "build": "satisfied",
-                "tests": "satisfied",
-                "docs": "satisfied",
-                "journal": "satisfied",
-                "committed_range": "present",
-                "formal_review": "clean",
-                "signature": "not-required",
-                "authorization": "not-required",
-                "input": "satisfied"
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "satisfied"
+                }
               }
             },
             "handoff": {
@@ -1471,6 +1781,755 @@
             },
             "handoff_profile": {
               "const": "pr-readiness-read-only-probe"
+            }
+          }
+        }
+      ]
+    },
+    "oid": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "blockedTerminalMatrix": {
+      "oneOf": [
+        {
+          "title": "implementation-blocked",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "implementation-blocked"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "blocked"
+                },
+                "build": {
+                  "const": "blocked"
+                },
+                "tests": {
+                  "const": "blocked"
+                },
+                "docs": {
+                  "const": "blocked"
+                },
+                "journal": {
+                  "const": "blocked"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-started"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "validation-blocked",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "validation-blocked"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "blocked"
+                },
+                "build": {
+                  "const": "failed"
+                },
+                "tests": {
+                  "const": "blocked"
+                },
+                "docs": {
+                  "const": "blocked"
+                },
+                "journal": {
+                  "const": "blocked"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-started"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "validation-blocked",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "validation-blocked"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "blocked"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "failed"
+                },
+                "docs": {
+                  "const": "blocked"
+                },
+                "journal": {
+                  "const": "blocked"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-started"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "validation-blocked",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "validation-blocked"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "blocked"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "blocked"
+                },
+                "journal": {
+                  "const": "blocked"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-started"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "journal-blocked",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "journal-blocked"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "blocked"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "blocked"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-started"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "formal-review-blocked",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "formal-review-blocked"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "blocked"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "blocked"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            },
+            "commit_mode": {
+              "const": "allowed"
+            },
+            "formal_review_required": {
+              "const": true
+            }
+          }
+        },
+        {
+          "title": "formal-review-blocked",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "formal-review-blocked"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "blocked"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": true
+            }
+          }
+        },
+        {
+          "title": "missing-committed-range",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "missing-committed-range"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-started"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": true
+            }
+          }
+        },
+        {
+          "title": "review-findings",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "review-findings"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "findings"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": true
+            }
+          }
+        },
+        {
+          "title": "signing-failed",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "signing-failed"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "blocked"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-started"
+                },
+                "signature": {
+                  "const": "failed"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            },
+            "commit_mode": {
+              "const": "allowed"
+            }
+          }
+        },
+        {
+          "title": "signing-failed",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "signing-failed"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "failed"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "satisfied"
+                },
+                "input": {
+                  "const": "satisfied"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": true
+            }
+          }
+        },
+        {
+          "title": "blocked-authorization",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "blocked-authorization"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "succeeded"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                },
+                "authorization": {
+                  "const": "blocked"
+                },
+                "input": {
+                  "const": "satisfied"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            },
+            "formal_review_required": {
+              "const": true
+            }
+          }
+        },
+        {
+          "title": "blocked-input",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "blocked-input"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "succeeded"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                },
+                "authorization": {
+                  "const": "satisfied"
+                },
+                "input": {
+                  "const": "blocked"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            },
+            "formal_review_required": {
+              "const": true
             }
           }
         }

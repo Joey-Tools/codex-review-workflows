@@ -23,7 +23,7 @@ An inbound delivery record whose exact `handoff_profile` is
 `pr-readiness-read-only-probe` is a terminal evidence probe, not PR readiness,
 a named review, or a generic PR/full-workflow request. Classify this structured
 handoff before every prose-based PR/review rule below. Validate the complete
-record against the receiver schema's self-contained closed delivery-v2
+record against the receiver schema's self-contained closed delivery-v3
 definition, preserve its constraints and mutation ceilings, and fail closed
 rather than falling through when the record is missing, unknown,
 non-ready, or contradictory. The formal receiver never resolves an external
@@ -58,8 +58,18 @@ conversation, or endpoint evidence. The target binds provider, immutable
 repository and PR identities, base ref, current head repository/ref/OID, and
 every selection, lifecycle, CI, and conversation observation repeats the
 applicable target identity exactly. A stale green CI result or cross-PR record
-therefore cannot be spliced into the current report. CI preserves the provider-authored
-`statusCheckRollup` union: each `CheckRun` binds its GitHub App and run
+therefore cannot be spliced into the current report. Report schema v7
+additionally requires every CI and review-thread page to bind its exact
+connection, report snapshot binding and observation ID, server total, ordered
+flat-list slice, and canonical domain-separated SHA-256 digest. Conversation
+evidence
+contains the complete paginated review-thread list with immutable Node IDs and
+raw `is_resolved` values; totals and unresolved counts are recomputed from that
+list. Any content, order, cursor, target, or mid-pagination total drift makes
+the evidence unavailable rather than observed. Delivery v2 and report v6 lack
+these bindings and are diagnostic-only inputs that this receiver rejects.
+CI preserves the provider-authored `statusCheckRollup` union: each `CheckRun`
+binds its GitHub App and run
 identity, while each legacy `StatusContext` binds its creator and context.
 Display names may repeat; stable type/provider/object identities may not. Each
 non-null GitHub App or CheckRun database ID has a one-to-one mapping with its

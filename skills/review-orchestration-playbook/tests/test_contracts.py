@@ -3985,7 +3985,7 @@ class RepositoryContractTest(unittest.TestCase):
             "#/$defs/readOnlyProbeDeliveryRecord",
         )
         delivery = schema["$defs"]["readOnlyProbeDeliveryRecord"]
-        self.assertEqual(delivery["properties"]["schema_version"]["const"], 2)
+        self.assertEqual(delivery["properties"]["schema_version"]["const"], 3)
         self.assertEqual(
             delivery["properties"]["terminal_outcome"]["const"],
             "succeeded",

@@ -43,7 +43,7 @@ superseded_by:
   cache or state, fix, commit, push, release, or merge. The receiver is
   classified before every generic PR/review route and returns one closed
   terminal report whose action fields and merge-ready claim are fixed false.
-- Read-only report schema v6 represents selection and range failures directly.
+- Read-only report schema v7 represents selection and range failures directly.
   Every target state binds provider, immutable repository identity, and exact
   current query-head repository/ref/OID. `pre-target` and
   `pre-target-blocked` omit only PR/base, while `target-resolution-blocked`
@@ -61,25 +61,37 @@ superseded_by:
   identity plus complete raw state enum. Stable type/provider/object
   identities, rather than display names, determine uniqueness. Non-null GitHub
   App and CheckRun database IDs map one-to-one to Node IDs in both directions.
+  Every legacy `StatusContext` Node ID also maps globally to exactly one
+  creator Node ID and context; state changes do not change that immutable
+  binding.
   One explicit fail-closed mapping normalizes those provider values to success,
   failure, pending, or cancelled aggregates.
   CI pagination now binds the GraphQL connection and every page to the exact
   repository Node ID, PR Node ID, and observed head OID. Server `totalCount`,
-  page counts, the complete flat rollup, and aggregate total must agree; cursor
-  chaining is contiguous and the final page proves `hasNextPage=false`. The
+  page counts, the complete flat rollup, and aggregate total must agree. Every
+  page repeats the report snapshot binding, observation ID, and server total,
+  and binds those fields plus its exact ordered flat-list slice with the
+  domain-separated canonical JSON SHA-256; cursor chaining is
+  contiguous and the final page proves `hasNextPage=false`. The
   bounded complete profile admits at most 1,000 entries across at most ten
   100-item pages, subject to the tighter independent report-byte ceiling.
   Over-cap, incomplete, hidden-later-page, count-mismatched, or
   identity-drifted results are unavailable/blocked rather than truncated
   observed evidence.
+  Conversation evidence independently exhausts
+  `pullRequest.reviewThreads`, preserves unique thread Node IDs and raw
+  `isResolved` values, binds every page with the same canonical digest
+  contract, and recomputes total and unresolved counts from the complete list.
+  A hidden later-page unresolved thread, incomplete cursor chain, content
+  drift, or mid-pagination total change fails closed.
   Base/head evidence records the exact observed endpoint OIDs and must match
   the target byte-for-byte before object-existence or merge-base results count.
   The validator also rejects lifecycle, selector, CI-rollup,
   conversation-count, and endpoint contradictions that JSON Schema cannot
-  express. The schema embeds its complete closed delivery-v2 receiver
+  express. The schema embeds its complete closed delivery-v3 receiver
   definition and has no external `$ref`. The schema and semantic helper remain
   direct records in the canonical control manifest, so the release digest
-  binds the complete v6 receiving closure without loading an external or
+  binds the complete v7 receiving closure without loading an external or
   candidate-head delivery schema. Its binding generator
   retries collisions, while file input uses no-follow/nonblocking/close-on-exec
   descriptor admission, regular-file and byte ceilings, exact identity/size
@@ -87,23 +99,31 @@ superseded_by:
   rejects duplicate keys, non-finite numbers, oversized integers, excessive
   depth/node counts, and non-object roots; every rejection is one bounded,
   control-free machine record.
-- Every terminal result or permitted handoff carries a closed delivery-v2
+- Every terminal result or permitted handoff carries a closed delivery-v3
   record with the selected profile, immutable constraint list, mutation modes,
   terminal outcome/reason/evidence, handoff target, and handoff profile. A
   blocked PR-readiness run retains its requested profile but forces both
   handoff fields to `none`. A commit-allowed PR handoff requires a succeeded
   local gate, satisfied build/tests/docs/journal, a present clean range, a
-  verified signature, and satisfied authorization/input. A commit-forbidden
+  verified signature bound to the exact head by
+  `signature_verified_head_oid`, and satisfied authorization/input. A
+  commit-forbidden
   PR handoff uses a distinct existing-range reason, checked local gate, present
-  clean range, and signature `not-required`. Missing range, findings, signing
+  clean range, and read-only verification of that exact frozen head. Unsigned,
+  unverifiable, or differently bound heads stop with `signing-failed`; no
+  commit is induced. Missing range, findings, signing
   failure, and authorization/input blockers all stop before handoff.
   Conflicting or widened records fail closed.
-- The delivery schema now owns an exact success-reason matrix. Every reason
+- The delivery schema now owns an exact 18-row success-reason matrix and a
+  finite blocker matrix. Every success reason
   fixes its profile, local/commit/formal/remote modes, complete local
   gate/build/tests/docs/journal/range/review/signature/authorization/input
   evidence, and handoff. Cross-profile, cross-mode, and cross-evidence
   combinations fail both schema and semantic checks. A successful result
   cannot contain blocked, failed, findings, or not-started evidence.
+  Implementation, earliest validation failure, journal, and formal-review
+  blockers each have closed evidence rows; contradictory later-stage evidence
+  is rejected.
 - `review-findings` is terminal only for a required formal review whose commit
   mode is forbidden and whose existing range is preserved. Under allowed
   commit mode, findings have no terminal record: repair, affected validation,
@@ -155,24 +175,13 @@ superseded_by:
 
 ## Evidence
 
-- `python3 -B skills/change-delivery-workflow/tests/test_delivery_profiles.py -q`
-  passed (`39` tests), including deterministic local-mutation short circuits,
-  the independent mutable-`no-commit` control, constrained-scope conflicts,
-  blocked delivery terminals that cannot hand off, receiver rejection of
-  non-ready and local-only delivery records, staged read-only PR-probe
-  terminals, fresh instance bindings, cross-report and cross-PR identity splice
-  rejection, stale-head CI/conversation rejection, collision recovery,
-  descriptor-safe input admission and revalidation, hostile JSON/resource
-  caps, bounded machine-safe errors, canonical PR URL attack cases, the
-  complete CheckRun and StatusContext provider enums, legacy required commit
-  statuses, mixed rollup aggregation, duplicate display names, forward and
-  reverse App/CheckRun ID collisions, malformed providers,
-  swapped/cross-report/stale endpoints, same-merge-base endpoint drift, closed
-  delivery and terminal report records, exhaustive success-reason
-  cross-products, allowed-findings loop enforcement, hidden later CI pages,
-  pagination count/cursor/identity drift, the 257-entry non-truncation case,
-  the 1,000-entry cap, and the clean-range, missing-range, findings, and
-  review-not-required terminals under forbidden commit mode.
+- `python3 -B -m unittest discover -s skills/change-delivery-workflow/tests
+  -p 'test_*.py'` passed (`42` tests). The suite keeps the exact 18-success
+  matrix and now also covers the finite blocked-reason matrix, exact frozen-head
+  signature verification for no-commit existing-range handoff, snapshot- and
+  ordered-content-bound CI pages, complete paginated review threads, global
+  `StatusContext` creator/context identity, and fail-closed delivery-v2/report-v6
+  migration.
 - `python3 -B skills/synthetic-token-fixtures/tests/test_skill_contract.py -v`
   passed (`13` tests), including co-release binding, isolated-import shadows,
   raw-leaf and intermediate cross-release symlinks, unsafe parent modes,
@@ -182,29 +191,26 @@ superseded_by:
   source/layout drift.
 - `python3 -B skills/review-orchestration-playbook/tests/test_synthetic_tokens.py -q`
   passed the complete `190`-test synthetic runtime suite.
-- `uv run --offline --with pyyaml python skills/review-orchestration-playbook/tests/test_contracts.py`
+- `python3 -B skills/review-orchestration-playbook/tests/test_contracts.py -q`
   passed (`88` tests), including the semantic helper's canonical-manifest
   binding, self-contained receiver schema closure, and absence of an external
   delivery-schema dependency without widening a formal named-lane source
   closure.
+- `python3 -B -m unittest discover -s
+  skills/review-orchestration-playbook/tests -p 'test_*.py'` passed the complete
+  review-helper suite outside the filesystem sandbox (`2,401` tests, `5`
+  platform skips). The unsandboxed run was required only for existing
+  loopback-broker tests that bind an ephemeral `127.0.0.1` port.
 - `python3 -B skills/review-orchestration-playbook/tests/test_cli.py -q`
   passed (`17` tests).
 - Both the system `quick_validate.py` and Joey
-  `codex_skill_validate.py` passed all four affected skills.
-- `python3 -m json.tool` passed for both schemas, the read-only probe fixture,
-  and the trusted synthetic runtime manifest;
-  Draft 2020-12 `jsonschema` validation accepted all `13` delivery records and
-  all four terminal read-only report states through the self-contained receiver
-  schema.
+  `codex_skill_validate.py` passed the two modified skills.
+- `jq empty` passed for both schemas and all three changed fixture files.
+  Draft 2020-12 `jsonschema` validation accepted both schema definitions;
+  the delivery suite validated all `13` profile-selection cases, all `8`
+  formal-review terminal cases, and all four terminal read-only report states.
 - `python3 -B /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo .`
   passed.
-- Full Ruff checks and `ruff format --check` passed for all Python entrypoints
-  and tests touched by the workstream; the post-review rerun covered the three
-  newly changed Python files, and `py_compile` passed for that runtime/test set.
-- Broader review-playbook discovery was bounded and manually interrupted after
-  six silent minutes in unchanged `test_providers` signal-mask setup; it
-  produced no assertion failure and left no process behind. The affected
-  targeted modules above completed.
-- The validator's task-local `uv` cache and test-created Python bytecode were
-  removed after validation; the final ignored-cache scan passed.
+- Ruff checks, `ruff format --check`, and `py_compile` passed for the three
+  modified Python runtime/test files.
 - `git diff --check` passed for tracked changes.

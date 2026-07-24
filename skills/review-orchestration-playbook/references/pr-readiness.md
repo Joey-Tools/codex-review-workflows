@@ -13,7 +13,7 @@ follow-up, merge-readiness reporting, or merge.
 
 This path receives only a complete
 `change-delivery-workflow` record whose exact fields validate against the
-read-only report schema's self-contained closed delivery-v2 definition and
+read-only report schema's self-contained closed delivery-v3 definition and
 whose terminal is succeeded and ready for
 `pr-readiness-read-only-probe`. The installed receiver schema and semantic
 helper are both canonical-manifest records from one trusted release; the
@@ -47,7 +47,11 @@ The receiving sequence is closed:
    Fetch that GraphQL connection to exhaustion. Bind the outer connection and
    every page to the exact repository Node ID, PR Node ID, and observed head
    OID; record server `totalCount`, contiguous one-based page indexes, request
-   and end cursors, per-page item counts, and `pageInfo.hasNextPage`. The final
+   and end cursors, per-page item counts, and `pageInfo.hasNextPage`. Each page
+   repeats the report snapshot binding, observation ID, and server total, then
+   records the canonical SHA-256 of those fields and its exact ordered
+   flat-rollup slice using the schema's domain-separated canonical JSON
+   contract. The final
    page must report `hasNextPage=false`, page-item totals, server `totalCount`,
    the complete flat rollup length, and the CI aggregate `total` must all
    agree. The bounded complete profile admits at most 1,000 entries in at most
@@ -55,6 +59,13 @@ The receiving sequence is closed:
    chain, cursor or connection drift, count mismatch, or a first page whose
    later pages remain unread makes CI evidence `unavailable` or `blocked`;
    never truncate it into an observed green result.
+   Fetch `pullRequest.reviewThreads` under the same complete pagination
+   contract. Preserve every thread's immutable Node ID and raw
+   `isResolved` value, require unique Node IDs and cursor exhaustion, and
+   recompute both total and unresolved counts from the complete ordered list.
+   A later-page unresolved thread must count as unresolved. Incomplete pages,
+   page digest mismatch, connection/target drift, or mid-pagination total
+   drift makes conversation evidence unavailable or blocked.
 3. Do not start any local Codex or Claude lane, `materialize-worktree`,
    `validate-worktree`, low-level helper mode, exact-secret admission,
    GitHub Codex request, check, workflow, comment, poll, monitor, or wait. Do

@@ -5,7 +5,7 @@
       "prompt": "Deliver a quick MVP and stop at a local checkpoint.",
       "transition": "focused checkpoint, then stop",
       "result": {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile": "focused-checkpoint",
         "constraints": [],
         "local_mutation": "allowed",
@@ -23,6 +23,7 @@
           "committed_range": "present",
           "formal_review": "not-required",
           "signature": "verified",
+          "signature_verified_head_oid": "dddddddddddddddddddddddddddddddddddddddd",
           "authorization": "not-required",
           "input": "not-required"
         },
@@ -34,7 +35,7 @@
       "prompt": "Deliver an MVP, then open a PR for feedback.",
       "transition": "focused slice, full local gate, then PR handoff",
       "result": {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile": "pr-readiness-handoff",
         "constraints": [],
         "local_mutation": "allowed",
@@ -52,6 +53,7 @@
           "committed_range": "present",
           "formal_review": "clean",
           "signature": "verified",
+          "signature_verified_head_oid": "dddddddddddddddddddddddddddddddddddddddd",
           "authorization": "satisfied",
           "input": "satisfied"
         },
@@ -63,7 +65,7 @@
       "prompt": "Start with an MVP but complete the full local gate now.",
       "transition": "focused slice, full local gate, then stop",
       "result": {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile": "local-gate",
         "constraints": [],
         "local_mutation": "allowed",
@@ -81,6 +83,7 @@
           "committed_range": "present",
           "formal_review": "clean",
           "signature": "verified",
+          "signature_verified_head_oid": "dddddddddddddddddddddddddddddddddddddddd",
           "authorization": "not-required",
           "input": "not-required"
         },
@@ -92,7 +95,7 @@
       "prompt": "Complete this non-trivial implementation locally.",
       "transition": "full local gate, then stop",
       "result": {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile": "local-gate",
         "constraints": [
           "local-only"
@@ -112,6 +115,7 @@
           "committed_range": "present",
           "formal_review": "clean",
           "signature": "verified",
+          "signature_verified_head_oid": "dddddddddddddddddddddddddddddddddddddddd",
           "authorization": "not-required",
           "input": "not-required"
         },
@@ -123,7 +127,7 @@
       "prompt": "Take the implementation to merge-ready and stop before merge.",
       "transition": "full local gate, then PR handoff",
       "result": {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile": "pr-readiness-handoff",
         "constraints": [],
         "local_mutation": "allowed",
@@ -141,6 +145,7 @@
           "committed_range": "present",
           "formal_review": "clean",
           "signature": "verified",
+          "signature_verified_head_oid": "dddddddddddddddddddddddddddddddddddddddd",
           "authorization": "satisfied",
           "input": "satisfied"
         },
@@ -152,7 +157,7 @@
       "prompt": "Probe local gate readiness, but do not commit.",
       "transition": "gate-only report under `no-commit`",
       "result": {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile": "local-gate",
         "constraints": [
           "probe-only",
@@ -173,6 +178,7 @@
           "committed_range": "missing",
           "formal_review": "not-required",
           "signature": "not-required",
+          "signature_verified_head_oid": null,
           "authorization": "not-required",
           "input": "not-required"
         },
@@ -184,7 +190,7 @@
       "prompt": "Implement and validate this locally, but do not commit.",
       "transition": "mutable local gate, then uncommitted report",
       "result": {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile": "local-gate",
         "constraints": [
           "local-only",
@@ -205,6 +211,7 @@
           "committed_range": "missing",
           "formal_review": "not-required",
           "signature": "not-required",
+          "signature_verified_head_oid": null,
           "authorization": "not-required",
           "input": "not-required"
         },
@@ -216,7 +223,7 @@
       "prompt": "Run the full workflow locally, report-only.",
       "transition": "gate-only report under local/report constraints",
       "result": {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile": "local-gate",
         "constraints": [
           "local-only",
@@ -237,6 +244,7 @@
           "committed_range": "missing",
           "formal_review": "not-required",
           "signature": "not-required",
+          "signature_verified_head_oid": null,
           "authorization": "not-required",
           "input": "not-required"
         },
@@ -248,7 +256,7 @@
       "prompt": "Run the full workflow with no remote work.",
       "transition": "full local gate, then stop under `no-remote`",
       "result": {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile": "local-gate",
         "constraints": [
           "no-remote"
@@ -268,6 +276,7 @@
           "committed_range": "present",
           "formal_review": "clean",
           "signature": "verified",
+          "signature_verified_head_oid": "dddddddddddddddddddddddddddddddddddddddd",
           "authorization": "not-required",
           "input": "not-required"
         },
@@ -279,7 +288,7 @@
       "prompt": "Review full-workflow readiness read-only.",
       "transition": "read-only gate report with no handoff",
       "result": {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile": "local-gate",
         "constraints": [
           "read-only"
@@ -299,6 +308,7 @@
           "committed_range": "missing",
           "formal_review": "not-required",
           "signature": "not-required",
+          "signature_verified_head_oid": null,
           "authorization": "not-required",
           "input": "not-required"
         },
@@ -310,7 +320,7 @@
       "prompt": "Probe full workflow and PR readiness; do not make remote changes.",
       "transition": "read-only local report, then read-only PR probe",
       "result": {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile": "local-gate",
         "constraints": [
           "probe-only",
@@ -331,6 +341,7 @@
           "committed_range": "missing",
           "formal_review": "not-required",
           "signature": "not-required",
+          "signature_verified_head_oid": null,
           "authorization": "not-required",
           "input": "satisfied"
         },
@@ -342,7 +353,7 @@
       "prompt": "Complete the full local workflow, then report PR readiness without remote mutations.",
       "transition": "full local gate, formal review, then read-only PR probe",
       "result": {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile": "local-gate",
         "constraints": [
           "no-remote"
@@ -362,6 +373,7 @@
           "committed_range": "present",
           "formal_review": "clean",
           "signature": "verified",
+          "signature_verified_head_oid": "dddddddddddddddddddddddddddddddddddddddd",
           "authorization": "not-required",
           "input": "satisfied"
         },
@@ -373,7 +385,7 @@
       "prompt": "Run the full workflow and open a PR.",
       "transition": "full local gate, then PR handoff",
       "result": {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile": "pr-readiness-handoff",
         "constraints": [],
         "local_mutation": "allowed",
@@ -391,6 +403,7 @@
           "committed_range": "present",
           "formal_review": "clean",
           "signature": "verified",
+          "signature_verified_head_oid": "dddddddddddddddddddddddddddddddddddddddd",
           "authorization": "satisfied",
           "input": "satisfied"
         },

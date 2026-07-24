@@ -331,6 +331,15 @@ authorization.
   under an allowed commit mode.
 - A clean review under forbidden commit mode is complete evidence for the
   pre-existing exact range. It does not turn commit mode back to `allowed`.
+- Before a clean pre-existing range may enter either PR-readiness handoff,
+  perform read-only signature verification on the exact frozen head. Record
+  `signature: verified` together with `signature_verified_head_oid` equal to
+  that exact frozen head. This read-only signature verification authorizes no
+  commit, amendment, ref update, fetch, or key import. An unsigned or
+  unverifiable frozen head cannot hand off: preserve the range, record
+  `signature: failed` with a null verified-head binding, and stop with
+  `signing-failed`. A local-only clean-range report that does not hand off may
+  continue to use `signature: not-required`.
 - A missing exact range or review findings under forbidden commit mode is a
   terminal blocker only when formal review is required. Do not continue to a
   profile handoff from either blocker.
@@ -398,12 +407,15 @@ these fields unchanged across any handoff:
 - `handoff`
 - `handoff_profile`
 
-The schema's `$defs.successTerminalMatrix` is the machine authority for every
+The v3 schema's `$defs.successTerminalMatrix` is the machine authority for every
 successful reason. One reason fixes one exact profile, local-mutation mode,
 commit mode, formal-review requirement, remote-mutation mode, handoff,
 handoff profile, and complete evidence object. The evidence object separately
 records local gate, build, tests, docs, journal, committed range, formal
-review, signature, authorization, and input. Mutation-capable success uses
+review, signature, signature-bound exact head, authorization, and input.
+`signature_verified_head_oid` is a full SHA-1 or SHA-256 object ID exactly when
+`signature` is `verified`; it is null for `failed` and `not-required`.
+Mutation-capable success uses
 `satisfied` for each build/tests/docs/journal gate; a no-mutation observation
 uses `read-only-observed` and never implies that a mutating gate ran. No
 successful matrix row may contain `blocked`, `failed`, `findings`, or
@@ -437,14 +449,16 @@ local gate `succeeded`, build/tests/docs/journal all `satisfied`, committed
 range `present`, formal review `clean`, signature `verified`, authorization
 `satisfied`, and input `satisfied`. A forbidden-commit PR handoff instead uses
 the distinct existing-range reason, local gate `checked`, the same four
-`satisfied` phase records, a present clean range, and signature
-`not-required`. The remote-mutation value is not itself remote authorization;
+`satisfied` phase records, a present clean range, and a read-only verified
+signature whose `signature_verified_head_oid` equals the exact frozen head.
+The remote-mutation value is not itself remote authorization;
 it means the review skill must perform its own target and lifecycle preflight.
 
-Every blocker uses `terminal_outcome: blocked`, one closed reason, and matching
-closed evidence. In particular, `missing-committed-range`, `review-findings`,
-`signing-failed`, `blocked-authorization`, and `blocked-input` bind their
-corresponding evidence field and force both handoff fields to `none`. Preserve
+Every blocker uses `terminal_outcome: blocked`, one closed reason, and one row
+from `$defs.blockedTerminalMatrix`. The matrix closes implementation,
+earliest-failing validation stage, journal, formal-review, missing-range,
+findings, signing, authorization, and input evidence and forces both handoff
+fields to `none`; contradictory later-stage evidence is invalid. Preserve
 the requested profile so the report states what was attempted without
 misrepresenting the blocked terminal as a ready transition.
 `review-findings` is valid only when formal review is required and commit mode
