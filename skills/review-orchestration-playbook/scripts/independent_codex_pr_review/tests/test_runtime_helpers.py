@@ -32,12 +32,14 @@ from review_supervisor.process import (
     ForkExecReceipt,
     ForkExecResultOwner,
     ForkedProcessClosureUnproven,
+    ForkedProcessOwnershipUnproven,
     SpawnedProcess,
     TerminationSchedule,
     process_start_identity,
 )
 from review_supervisor.runtime import (
     DirectProcessClosureUnproven,
+    DirectProcessOwnershipUnproven,
     DurableProcessLifecycle,
     OuterAbandoned,
     PrelaunchWorkerClosureUnproven,
@@ -646,6 +648,56 @@ class RuntimeHelperTests(unittest.TestCase):
             _kill_direct(process)
             self.assertIsNone(direct_process_closure_failure())
         self.assertEqual(terminate.call_count, 2)
+
+    def test_unknown_fork_pid_latches_direct_helper_ownership(self) -> None:
+        result_owner = ForkExecResultOwner()
+        ownership_failure = ForkedProcessOwnershipUnproven(
+            result_owner,
+            KeyboardInterrupt(),
+            ChildProcessError("synthetic PID receipt failure"),
+        )
+        with (
+            mock.patch(
+                "review_supervisor.runtime._DIRECT_PROCESS_CLOSURE_UNPROVEN",
+                None,
+            ),
+            mock.patch(
+                "review_supervisor.runtime.fork_exec",
+                side_effect=ownership_failure,
+            ),
+        ):
+            with self.assertRaises(DirectProcessOwnershipUnproven) as raised:
+                _spawn_internal(
+                    entrypoint=ENTRYPOINT,
+                    mode="_phase-helper",
+                    arguments=(),
+                    cwd=ENTRYPOINT.parent,
+                    pass_fds=(),
+                    own_process_group=False,
+                    result_owner=result_owner,
+                )
+            self.assertIs(direct_process_closure_failure(), raised.exception)
+        self.assertIs(raised.exception.result_owner, result_owner)
+        self.assertIs(raised.exception.__cause__, ownership_failure)
+
+        with (
+            mock.patch(
+                "review_supervisor.runtime._DIRECT_PROCESS_CLOSURE_UNPROVEN",
+                raised.exception,
+            ),
+            mock.patch("review_supervisor.runtime.fork_exec") as fork_exec,
+            self.assertRaises(DirectProcessOwnershipUnproven),
+        ):
+            _spawn_internal(
+                entrypoint=ENTRYPOINT,
+                mode="_phase-helper",
+                arguments=(),
+                cwd=ENTRYPOINT.parent,
+                pass_fds=(),
+                own_process_group=False,
+                result_owner=ForkExecResultOwner(),
+            )
+        fork_exec.assert_not_called()
 
     def test_authenticated_review_boundary_preserves_unproven_helper(self) -> None:
         process = SpawnedProcess(

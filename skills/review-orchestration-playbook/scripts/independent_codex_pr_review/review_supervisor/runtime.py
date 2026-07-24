@@ -74,6 +74,7 @@ from .no_child_profile import LaunchedNoChildProcess
 from .process import (
     ForkExecResultOwner,
     ForkedProcessClosureUnproven,
+    ForkedProcessOwnershipUnproven,
     SpawnedProcess,
     TerminationSchedule,
     await_exec,
@@ -1004,12 +1005,24 @@ class DirectProcessClosureUnproven(UnprovenDirectHelperClosure):
         )
 
 
-_DIRECT_PROCESS_CLOSURE_UNPROVEN: DirectProcessClosureUnproven | None = None
+class DirectProcessOwnershipUnproven(UnprovenDirectHelperClosure):
+    def __init__(self, error: ForkedProcessOwnershipUnproven) -> None:
+        self.result_owner = error.result_owner
+        self.receipt = error.receipt
+        super().__init__("direct helper process ownership is unproven after fork")
+
+
+DirectProcessSafetyFailure = (
+    DirectProcessClosureUnproven | DirectProcessOwnershipUnproven
+)
+
+
+_DIRECT_PROCESS_CLOSURE_UNPROVEN: DirectProcessSafetyFailure | None = None
 
 
 def _remember_direct_process_closure_failure(
-    failure: DirectProcessClosureUnproven,
-) -> DirectProcessClosureUnproven:
+    failure: DirectProcessSafetyFailure,
+) -> DirectProcessSafetyFailure:
     global _DIRECT_PROCESS_CLOSURE_UNPROVEN
     if _DIRECT_PROCESS_CLOSURE_UNPROVEN is None:
         _DIRECT_PROCESS_CLOSURE_UNPROVEN = failure
@@ -1018,13 +1031,21 @@ def _remember_direct_process_closure_failure(
 
 def latch_direct_process_closure_unproven(
     process: SpawnedProcess,
-) -> DirectProcessClosureUnproven:
+) -> DirectProcessSafetyFailure:
     return _remember_direct_process_closure_failure(
         DirectProcessClosureUnproven(process)
     )
 
 
-def direct_process_closure_failure() -> DirectProcessClosureUnproven | None:
+def latch_direct_process_ownership_unproven(
+    error: ForkedProcessOwnershipUnproven,
+) -> DirectProcessSafetyFailure:
+    return _remember_direct_process_closure_failure(
+        DirectProcessOwnershipUnproven(error)
+    )
+
+
+def direct_process_closure_failure() -> DirectProcessSafetyFailure | None:
     return _DIRECT_PROCESS_CLOSURE_UNPROVEN
 
 
@@ -1092,6 +1113,9 @@ def _spawn_internal(
             )
         except ForkedProcessClosureUnproven as error:
             failure = latch_direct_process_closure_unproven(error.process)
+            raise failure from error
+        except ForkedProcessOwnershipUnproven as error:
+            failure = latch_direct_process_ownership_unproven(error)
             raise failure from error
     finally:
         os.close(devnull)

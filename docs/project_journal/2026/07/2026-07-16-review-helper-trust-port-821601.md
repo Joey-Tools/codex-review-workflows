@@ -1166,3 +1166,27 @@ metadata behavior.
   any new `__pycache__`, `.pyc`, or `.pyo` entry in the copied immutable release.
   Ruff lint and format checks pass for all ten changed Python files, and
   `git diff --check` passes. No local Python 3.10 run was performed.
+- Master advanced to merge parent
+  `2a6b5e9f90e17b55b80dee344c18173b4956b921` while PR 53 was under review.
+  The branch preserved all existing signed commits and incorporated that parent
+  through signed merge commit `a145b777deccf0e0439c11780affe33d6e7a09bf`.
+  Its only textual conflict was the `isolated_review` bytecode guard; the
+  resolution retains `sys.dont_write_bytecode = True` before every local
+  package import.
+- A fresh range-local Codex diagnostic then found that a failed child PID
+  receipt could raise `ForkedProcessOwnershipUnproven` past all three production
+  fork callers without latching the process-closure safety gate. Unknown child
+  ownership now becomes a retained `DirectProcessOwnershipUnproven` global
+  failure carrying the exact `ForkExecResultOwner` and receipt. Internal helper,
+  attempt-supervisor, and custody-helper paths all latch that failure, so later
+  spawn and pre-quiescence cleanup remain blocked even when no PID was
+  recoverable.
+- Two fault-injection tests cover the three production fork callers and the
+  persistent spawn fence. The fixed deterministic supervisor identity is now
+  521 tests with SHA-256
+  `2b00ad248d7861a024626ec52b9a06a254bdcbfdade6209a78017dfa35d2c67f`;
+  all 521 passed in 190.956 seconds under Python 3.13.0 with bytecode disabled.
+  All 95 repository contract tests passed in 6.002 seconds. The final
+  exact-commit discovery, live no-child profile, secret admission, and formal
+  review lanes remain explicit delivery gates. No local Python 3.10 run was
+  performed.

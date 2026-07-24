@@ -30,12 +30,14 @@ from review_supervisor.ledger import (
 )
 from review_supervisor.process import (
     ForkExecResultOwner,
+    ForkedProcessOwnershipUnproven,
     SpawnedProcess,
     await_exec,
     fork_exec,
 )
 from review_supervisor.runtime import (
     DirectProcessClosureUnproven,
+    DirectProcessOwnershipUnproven,
     _compact_terminal,
     _validate_terminal_lifecycle,
     build_unsettled_checkout_summary,
@@ -51,6 +53,7 @@ from review_supervisor.secureio import (
     sha256_bytes,
 )
 from review_supervisor.supervisor import (
+    _acquire_source_custody_via_helper,
     _derive_unsettled_checkout_summary,
     _prepare_with_reclamation,
     _prequiescence_abort,
@@ -62,6 +65,7 @@ from review_supervisor.supervisor import (
     _require_primary_serialized_evidence_budget,
     _resolve_codex,
     _select_reaped_attempt_terminal,
+    _spawn_attempt_supervisor,
     _settle_rewritten_process_charge,
     _terminate_incomplete_handoff,
     _validate_unsettled_checkout_summary,
@@ -2015,6 +2019,80 @@ class ReclamationPolicyTests(unittest.TestCase):
 
 
 class IncompleteHandoffProcessTests(unittest.TestCase):
+    def test_unknown_fork_pid_latches_outer_helper_ownership(self) -> None:
+        def fail_fork(*_args: object, **kwargs: object) -> None:
+            raise ForkedProcessOwnershipUnproven(
+                kwargs["result_owner"],
+                KeyboardInterrupt(),
+                ChildProcessError("synthetic PID receipt failure"),
+            )
+
+        control_child = mock.Mock()
+        control_child.fileno.return_value = -1
+        attempt = SimpleNamespace(
+            path=TOOL_ROOT,
+            retention=SimpleNamespace(fd=-1, root_fd=-1),
+            fd=-1,
+        )
+        result_owner = ForkExecResultOwner()
+        with (
+            mock.patch(
+                "review_supervisor.runtime._DIRECT_PROCESS_CLOSURE_UNPROVEN",
+                None,
+            ),
+            mock.patch(
+                "review_supervisor.supervisor.fork_exec",
+                side_effect=fail_fork,
+            ),
+        ):
+            with self.assertRaises(DirectProcessOwnershipUnproven) as raised:
+                _spawn_attempt_supervisor(
+                    entrypoint=ENTRYPOINT,
+                    attempt=attempt,
+                    control_child=control_child,
+                    token="a" * 64,
+                    result_owner=result_owner,
+                )
+            self.assertIs(direct_process_closure_failure(), raised.exception)
+        self.assertIs(raised.exception.result_owner, result_owner)
+
+        parent = mock.Mock()
+        child = mock.Mock()
+        child.fileno.return_value = -1
+        prepared = SimpleNamespace(
+            attempt_dir=TOOL_ROOT,
+            helper=SimpleNamespace(
+                state_dir="/private/review/helper-state",
+                base_sha="1" * 40,
+                head_sha="2" * 40,
+            ),
+            repository=SimpleNamespace(repo=TOOL_ROOT),
+        )
+        with (
+            mock.patch(
+                "review_supervisor.runtime._DIRECT_PROCESS_CLOSURE_UNPROVEN",
+                None,
+            ),
+            mock.patch(
+                "review_supervisor.supervisor.socket_pair",
+                return_value=(parent, child),
+            ),
+            mock.patch(
+                "review_supervisor.supervisor.fork_exec",
+                side_effect=fail_fork,
+            ),
+        ):
+            with self.assertRaises(DirectProcessOwnershipUnproven) as raised:
+                _acquire_source_custody_via_helper(
+                    entrypoint=ENTRYPOINT,
+                    prepared=prepared,
+                    deadline=time.monotonic() + 5,
+                )
+            self.assertIs(direct_process_closure_failure(), raised.exception)
+        self.assertIsNotNone(raised.exception.result_owner)
+        parent.close.assert_called_once()
+        self.assertGreaterEqual(child.close.call_count, 1)
+
     def test_preflight_git_closure_publishes_recovery_before_signal_release(
         self,
     ) -> None:

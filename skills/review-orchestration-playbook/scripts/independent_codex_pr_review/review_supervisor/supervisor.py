@@ -66,6 +66,7 @@ from .models import HelperCustody, Identity
 from .process import (
     ForkExecResultOwner,
     ForkedProcessClosureUnproven,
+    ForkedProcessOwnershipUnproven,
     SpawnedProcess,
     anchored_group_members,
     await_exec,
@@ -110,6 +111,7 @@ from .runtime import (
     complete_final_authorization_rewrite,
     direct_process_closure_failure,
     latch_direct_process_closure_unproven,
+    latch_direct_process_ownership_unproven,
     publish_prompt_via_helper,
     require_direct_process_closure_proven,
     validate_checkout_closure_receipt,
@@ -562,6 +564,9 @@ def _spawn_attempt_supervisor(
         except ForkedProcessClosureUnproven as error:
             failure = latch_direct_process_closure_unproven(error.process)
             raise failure from error
+        except ForkedProcessOwnershipUnproven as error:
+            failure = latch_direct_process_ownership_unproven(error)
+            raise failure from error
     finally:
         os.close(devnull)
 
@@ -655,6 +660,9 @@ def _acquire_source_custody_via_helper(
                 process_owner.transfer(process)
         except ForkedProcessClosureUnproven as error:
             failure = latch_direct_process_closure_unproven(error.process)
+            raise failure from error
+        except ForkedProcessOwnershipUnproven as error:
+            failure = latch_direct_process_ownership_unproven(error)
             raise failure from error
         child.close()
         await_exec(process, deadline=deadline)
