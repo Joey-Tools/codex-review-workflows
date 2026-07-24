@@ -348,7 +348,11 @@ def success_result(reason: str) -> dict[str, object]:
     }
 
 
-def blocker_result(branch: dict[str, object]) -> dict[str, object]:
+def blocker_result(
+    branch: dict[str, object],
+    *,
+    profile: str | None = None,
+) -> dict[str, object]:
     properties = branch["properties"]
     if not isinstance(properties, dict):
         raise AssertionError("blocker row properties must be an object")
@@ -367,6 +371,12 @@ def blocker_result(branch: dict[str, object]) -> dict[str, object]:
         field_schema = properties.get(field)
         if isinstance(field_schema, dict) and "const" in field_schema:
             result[field] = field_schema["const"]
+    if profile is not None:
+        result["profile"] = profile
+    else:
+        profile_schema = properties.get("profile")
+        if isinstance(profile_schema, dict) and "enum" in profile_schema:
+            result["profile"] = "local-gate"
     if result["local_mutation"] == "forbidden":
         result["constraints"] = ["read-only"]
     elif result["commit_mode"] == "forbidden":
@@ -382,14 +392,25 @@ def blocker_result(branch: dict[str, object]) -> dict[str, object]:
     evidence_schema = properties["terminal_evidence"]
     if not isinstance(evidence_schema, dict):
         raise AssertionError("blocker row evidence must be an object")
-    result["terminal_evidence"] = {
-        field: (
-            result["head_sha"]
-            if field_schema.get("$ref") == "#/$defs/oid"
-            else field_schema["const"]
-        )
-        for field, field_schema in evidence_schema["properties"].items()
-    }
+    terminal_evidence: dict[str, object] = {}
+    for field, field_schema in evidence_schema["properties"].items():
+        if field_schema.get("$ref") == "#/$defs/oid":
+            value = result["head_sha"]
+        elif "const" in field_schema:
+            value = field_schema["const"]
+        elif field == "local_gate" and set(field_schema.get("enum", [])) == {
+            "checked",
+            "not-required",
+        }:
+            value = (
+                "not-required"
+                if result["profile"] == "focused-checkpoint"
+                else "checked"
+            )
+        else:
+            raise AssertionError(f"unsupported blocker evidence schema for {field}")
+        terminal_evidence[field] = value
+    result["terminal_evidence"] = terminal_evidence
     return result
 
 
@@ -3656,13 +3677,22 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 blocked = blocker_result(branch)
                 self.assertEqual(list(validator.iter_errors(blocked)), [])
                 assert_valid_result_contract(blocked)
-                self.assertEqual(
-                    blocked["profile"],
-                    properties.get("profile", {}).get(
-                        "const",
+                profile_schema = properties.get("profile", {})
+                if "const" in profile_schema:
+                    self.assertEqual(
+                        blocked["profile"],
+                        profile_schema["const"],
+                    )
+                elif "enum" in profile_schema:
+                    self.assertIn(
+                        blocked["profile"],
+                        profile_schema["enum"],
+                    )
+                else:
+                    self.assertEqual(
+                        blocked["profile"],
                         "pr-readiness-handoff",
-                    ),
-                )
+                    )
 
                 widened = copy.deepcopy(blocked)
                 widened["handoff"] = "review-orchestration-playbook"
@@ -3766,6 +3796,78 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 paths_by_reason[reason],
                 {mutable_commit, no_commit, read_only},
             )
+
+    def test_focused_formal_blockers_close_profile_mode_and_evidence_products(
+        self,
+    ) -> None:
+        schema = json.loads(DELIVERY_RESULT_SCHEMA.read_text(encoding="utf-8"))
+        validator = Draft202012Validator(schema)
+        branches = schema["$defs"]["blockedTerminalMatrix"]["oneOf"]
+        self.assertEqual(len(branches), 26)
+        branches_by_title = {branch["title"]: branch for branch in branches}
+        focused_gate_ref = "#/$defs/focusedFormalBlockerLocalGate"
+
+        contexts = (
+            ("existing-range-no-commit", "allowed", "satisfied", "no-commit"),
+            ("read-only-formal", "forbidden", "read-only-observed", "read-only"),
+        )
+        reasons = (
+            "formal-review-blocked",
+            "missing-committed-range",
+            "review-findings",
+        )
+        for reason in reasons:
+            for suffix, local_mutation, phase, constraint in contexts:
+                title = f"{reason}:{suffix}"
+                branch = branches_by_title[title]
+                self.assertEqual(branch.get("$ref"), focused_gate_ref)
+
+                focused = blocker_result(
+                    branch,
+                    profile="focused-checkpoint",
+                )
+                with self.subTest(title=title, mutation="valid-focused"):
+                    self.assertEqual(list(validator.iter_errors(focused)), [])
+                    assert_valid_result_contract(focused)
+                    self.assertEqual(
+                        focused["terminal_evidence"]["local_gate"],
+                        "not-required",
+                    )
+                    self.assertEqual(focused["local_mutation"], local_mutation)
+                    self.assertEqual(focused["commit_mode"], "forbidden")
+                    self.assertEqual(focused["constraints"], [constraint])
+                    for field in ("build", "tests", "docs", "journal"):
+                        self.assertEqual(
+                            focused["terminal_evidence"][field],
+                            phase,
+                        )
+
+                checked_focused = copy.deepcopy(focused)
+                checked_focused["terminal_evidence"]["local_gate"] = "checked"
+                with self.subTest(title=title, mutation="focused-checked-gate"):
+                    self.assertTrue(list(validator.iter_errors(checked_focused)))
+
+                relabeled_local_gate = copy.deepcopy(focused)
+                relabeled_local_gate["profile"] = "local-gate"
+                with self.subTest(title=title, mutation="local-gate-no-gate"):
+                    self.assertTrue(list(validator.iter_errors(relabeled_local_gate)))
+
+                wrong_phase = copy.deepcopy(focused)
+                wrong_phase["terminal_evidence"]["build"] = (
+                    "read-only-observed" if phase == "satisfied" else "satisfied"
+                )
+                with self.subTest(title=title, mutation="cross-phase"):
+                    self.assertTrue(list(validator.iter_errors(wrong_phase)))
+
+                cross_mode = copy.deepcopy(focused)
+                if local_mutation == "allowed":
+                    cross_mode["local_mutation"] = "forbidden"
+                    cross_mode["constraints"] = ["read-only"]
+                else:
+                    cross_mode["local_mutation"] = "allowed"
+                    cross_mode["constraints"] = ["no-commit"]
+                with self.subTest(title=title, mutation="cross-mode"):
+                    self.assertTrue(list(validator.iter_errors(cross_mode)))
 
     def test_read_only_receiver_rejects_non_ready_delivery_terminal(self) -> None:
         report = copy.deepcopy(

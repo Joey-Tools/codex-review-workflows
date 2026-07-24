@@ -123,8 +123,13 @@ superseded_by:
   26-row blocker matrix. Mutable commit, mutable no-commit existing-range, and
   read-only formal blockers are distinct closed rows that fix
   `local_mutation`, `commit_mode`, local-gate state, and mutable versus
-  read-only phase evidence. No-commit and read-only blockers cannot claim a
-  fake succeeded local gate. Every success reason
+  read-only phase evidence. The six no-commit/read-only formal-review,
+  missing-range, and findings rows contain a second closed profile branch:
+  policy-promoted `focused-checkpoint` blockers use
+  `local_gate: not-required`, while full local/PR gate blockers use `checked`.
+  Cross-profile, cross-mode, and cross-phase relabeling fails closed, and no
+  no-commit or read-only blocker can claim a fake succeeded local gate. Every
+  success reason
   fixes its profile, local/commit/formal/remote modes, complete local
   gate/build/tests/docs/journal/range/review/signature/authorization/input
   evidence, and handoff. Cross-profile, cross-mode, and cross-evidence
@@ -185,11 +190,13 @@ superseded_by:
 ## Evidence
 
 - `python3 -B -m unittest discover -s skills/change-delivery-workflow/tests
-  -p 'test_*.py'` passed (`44` tests). The suite keeps the exact 18-success
+  -p 'test_*.py'` passed (`45` tests). The suite keeps the exact 18-success
   matrix and now also covers the 26 closed blocker rows, mode-specific
   no-commit/read-only blockers, false succeeded-gate rejection, exact
   frozen-head signature verification for both 40- and 64-hex object IDs,
-  ordinary PR-readiness receiver admission, snapshot- and
+  policy-promoted focused-checkpoint blockers with a no-gate terminal, their
+  profile/mode/phase cross-products, ordinary PR-readiness receiver admission,
+  snapshot- and
   ordered-content-bound CI pages, complete paginated review threads, global
   `StatusContext` creator/context identity, and fail-closed delivery-v2/report-v6
   migration.

@@ -471,8 +471,13 @@ commit, mutable no-commit existing-range, and read-only formal paths are
 separate rows: mutable phases use `satisfied`, read-only phases use
 `read-only-observed`, and only a mutable commit path may use a genuinely
 `succeeded` local gate before a downstream authorization or input blocker.
-No-commit and read-only formal blockers use `checked`; they must never borrow a
-mutable row or claim a succeeded local gate.
+Within the six no-commit/read-only formal-review, missing-range, and findings
+rows, the schema branches again by profile. A policy-promoted
+`focused-checkpoint` uses `local_gate: not-required`, because that profile never
+ran the full local gate; `local-gate` and `pr-readiness-handoff` use
+`local_gate: checked`. Those branches retain the same mutable versus read-only
+phase evidence and cannot be relabeled across profile or mode. No no-commit or
+read-only blocker may claim a succeeded local gate.
 `review-findings` is valid only when formal review is required and commit mode
 is `forbidden`, with a present range, findings, and signature
 `not-required`. Findings under commit mode `allowed` are never terminal: they
