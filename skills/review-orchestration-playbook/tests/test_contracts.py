@@ -3957,6 +3957,60 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertIn(anchor, contracts)
 
+    def test_read_only_pr_receiver_is_self_contained_and_manifest_bound(
+        self,
+    ) -> None:
+        schema_path = (
+            SKILL_ROOT / "references/pr-readiness-read-only-report.schema.json"
+        )
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        references: list[str] = []
+
+        def collect_references(value: object) -> None:
+            if isinstance(value, dict):
+                reference = value.get("$ref")
+                if isinstance(reference, str):
+                    references.append(reference)
+                for child in value.values():
+                    collect_references(child)
+            elif isinstance(value, list):
+                for child in value:
+                    collect_references(child)
+
+        collect_references(schema)
+        self.assertTrue(references)
+        self.assertTrue(all(reference.startswith("#/") for reference in references))
+        self.assertEqual(
+            schema["properties"]["delivery_record"]["$ref"],
+            "#/$defs/readOnlyProbeDeliveryRecord",
+        )
+        delivery = schema["$defs"]["readOnlyProbeDeliveryRecord"]
+        self.assertEqual(delivery["properties"]["schema_version"]["const"], 2)
+        self.assertEqual(
+            delivery["properties"]["terminal_outcome"]["const"],
+            "succeeded",
+        )
+        self.assertEqual(
+            delivery["properties"]["terminal_reason"]["const"],
+            "pr-readiness-read-only-probe-ready",
+        )
+
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        for content in (skill, readiness, contracts):
+            self.assertIn("self-contained", content)
+            self.assertIn("candidate-head", content)
+        self.assertNotIn(
+            "../../change-delivery-workflow/references/delivery-result.schema.json",
+            readiness,
+        )
+        self.assertIn("has no external `$ref`", contracts)
+
     def test_self_policy_migration_uses_an_external_trusted_control_plane(
         self,
     ) -> None:

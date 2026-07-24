@@ -5,7 +5,7 @@
       "name": "resolved-target-snapshot",
       "prompt": "Probe full workflow and PR readiness; do not make remote changes.",
       "input": {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile": "local-gate",
         "constraints": [
           "probe-only",
@@ -15,6 +15,16 @@
         "commit_mode": "forbidden",
         "formal_review_required": false,
         "remote_mutation": "forbidden",
+        "terminal_outcome": "succeeded",
+        "terminal_reason": "pr-readiness-read-only-probe-ready",
+        "terminal_evidence": {
+          "local_gate": "checked",
+          "committed_range": "missing",
+          "formal_review": "not-required",
+          "signature": "not-required",
+          "authorization": "not-required",
+          "input": "satisfied"
+        },
         "handoff": "review-orchestration-playbook",
         "handoff_profile": "pr-readiness-read-only-probe"
       },
@@ -40,13 +50,13 @@
         ],
         "terminal": "pr-readiness-read-only-report",
         "terminal_result": {
-          "schema_version": 5,
+          "schema_version": 6,
           "terminal": "pr-readiness-read-only-report",
           "terminal_state": "target-snapshot",
           "report_id": "report:11111111111111111111111111111111",
           "handoff_profile": "pr-readiness-read-only-probe",
           "delivery_record": {
-            "schema_version": 1,
+            "schema_version": 2,
             "profile": "local-gate",
             "constraints": [
               "probe-only",
@@ -56,6 +66,16 @@
             "commit_mode": "forbidden",
             "formal_review_required": false,
             "remote_mutation": "forbidden",
+            "terminal_outcome": "succeeded",
+            "terminal_reason": "pr-readiness-read-only-probe-ready",
+            "terminal_evidence": {
+              "local_gate": "checked",
+              "committed_range": "missing",
+              "formal_review": "not-required",
+              "signature": "not-required",
+              "authorization": "not-required",
+              "input": "satisfied"
+            },
             "handoff": "review-orchestration-playbook",
             "handoff_profile": "pr-readiness-read-only-probe"
           },
@@ -63,14 +83,21 @@
             "report_binding": "report:11111111111111111111111111111111",
             "binding_id": "target:22222222222222222222222222222222",
             "state": "range-resolved",
+            "provider": {
+              "service": "github",
+              "host": "github.com"
+            },
             "repository": {
+              "node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
               "host": "github.com",
               "owner": "Joey-Tools",
               "name": "codex-review-workflows"
             },
             "pull_request": {
+              "node_id": "PR_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS_42",
               "number": 42,
-              "url": "https://github.com/Joey-Tools/codex-review-workflows/pull/42"
+              "url": "https://github.com/Joey-Tools/codex-review-workflows/pull/42",
+              "base_ref": "master"
             },
             "base": {
               "ref": "master",
@@ -78,6 +105,7 @@
             },
             "head": {
               "repository": {
+                "node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
                 "host": "github.com",
                 "owner": "Joey-Tools",
                 "name": "codex-review-workflows"
@@ -106,6 +134,34 @@
               "snapshot_binding": "snapshot:33333333333333333333333333333333",
               "observed": [
                 {
+                  "target_identity": {
+                    "provider": {
+                      "service": "github",
+                      "host": "github.com"
+                    },
+                    "repository": {
+                      "node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                      "host": "github.com",
+                      "owner": "Joey-Tools",
+                      "name": "codex-review-workflows"
+                    },
+                    "pull_request": {
+                      "node_id": "PR_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS_42",
+                      "number": 42,
+                      "url": "https://github.com/Joey-Tools/codex-review-workflows/pull/42",
+                      "base_ref": "master"
+                    },
+                    "head": {
+                      "repository": {
+                        "node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                        "host": "github.com",
+                        "owner": "Joey-Tools",
+                        "name": "codex-review-workflows"
+                      },
+                      "ref": "codex/read-only-probe",
+                      "oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    }
+                  },
                   "selection_method": "explicit",
                   "outcome": "selected",
                   "candidate_count": 1
@@ -119,6 +175,34 @@
               "snapshot_binding": "snapshot:33333333333333333333333333333333",
               "observed": [
                 {
+                  "target_identity": {
+                    "provider": {
+                      "service": "github",
+                      "host": "github.com"
+                    },
+                    "repository": {
+                      "node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                      "host": "github.com",
+                      "owner": "Joey-Tools",
+                      "name": "codex-review-workflows"
+                    },
+                    "pull_request": {
+                      "node_id": "PR_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS_42",
+                      "number": 42,
+                      "url": "https://github.com/Joey-Tools/codex-review-workflows/pull/42",
+                      "base_ref": "master"
+                    },
+                    "head": {
+                      "repository": {
+                        "node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                        "host": "github.com",
+                        "owner": "Joey-Tools",
+                        "name": "codex-review-workflows"
+                      },
+                      "ref": "codex/read-only-probe",
+                      "oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    }
+                  },
                   "state": "open",
                   "merged": false,
                   "merged_at": null,
@@ -191,13 +275,13 @@
       "name": "pre-target-no-match",
       "expected": {
         "terminal_result": {
-          "schema_version": 5,
+          "schema_version": 6,
           "terminal": "pr-readiness-read-only-report",
           "terminal_state": "pre-target",
           "report_id": "report:55555555555555555555555555555555",
           "handoff_profile": "pr-readiness-read-only-probe",
           "delivery_record": {
-            "schema_version": 1,
+            "schema_version": 2,
             "profile": "local-gate",
             "constraints": [
               "probe-only",
@@ -207,6 +291,16 @@
             "commit_mode": "forbidden",
             "formal_review_required": false,
             "remote_mutation": "forbidden",
+            "terminal_outcome": "succeeded",
+            "terminal_reason": "pr-readiness-read-only-probe-ready",
+            "terminal_evidence": {
+              "local_gate": "checked",
+              "committed_range": "missing",
+              "formal_review": "not-required",
+              "signature": "not-required",
+              "authorization": "not-required",
+              "input": "satisfied"
+            },
             "handoff": "review-orchestration-playbook",
             "handoff_profile": "pr-readiness-read-only-probe"
           },
@@ -214,10 +308,25 @@
             "report_binding": "report:55555555555555555555555555555555",
             "binding_id": "target:66666666666666666666666666666666",
             "state": "pre-target",
+            "provider": {
+              "service": "github",
+              "host": "github.com"
+            },
             "repository": {
+              "node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
               "host": "github.com",
               "owner": "Joey-Tools",
               "name": "codex-review-workflows"
+            },
+            "head": {
+              "repository": {
+                "node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                "host": "github.com",
+                "owner": "Joey-Tools",
+                "name": "codex-review-workflows"
+              },
+              "ref": "codex/read-only-probe",
+              "oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             }
           },
           "snapshot": {
@@ -239,6 +348,28 @@
               "snapshot_binding": "snapshot:77777777777777777777777777777777",
               "observed": [
                 {
+                  "target_identity": {
+                    "provider": {
+                      "service": "github",
+                      "host": "github.com"
+                    },
+                    "repository": {
+                      "node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                      "host": "github.com",
+                      "owner": "Joey-Tools",
+                      "name": "codex-review-workflows"
+                    },
+                    "head": {
+                      "repository": {
+                        "node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                        "host": "github.com",
+                        "owner": "Joey-Tools",
+                        "name": "codex-review-workflows"
+                      },
+                      "ref": "codex/read-only-probe",
+                      "oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    }
+                  },
                   "selection_method": "unique-open-head",
                   "outcome": "no-match",
                   "candidate_count": 0
@@ -320,13 +451,13 @@
       "name": "pre-target-selection-blocked",
       "expected": {
         "terminal_result": {
-          "schema_version": 5,
+          "schema_version": 6,
           "terminal": "pr-readiness-read-only-report",
           "terminal_state": "pre-target-blocked",
           "report_id": "report:99999999999999999999999999999999",
           "handoff_profile": "pr-readiness-read-only-probe",
           "delivery_record": {
-            "schema_version": 1,
+            "schema_version": 2,
             "profile": "local-gate",
             "constraints": [
               "probe-only",
@@ -336,6 +467,16 @@
             "commit_mode": "forbidden",
             "formal_review_required": false,
             "remote_mutation": "forbidden",
+            "terminal_outcome": "succeeded",
+            "terminal_reason": "pr-readiness-read-only-probe-ready",
+            "terminal_evidence": {
+              "local_gate": "checked",
+              "committed_range": "missing",
+              "formal_review": "not-required",
+              "signature": "not-required",
+              "authorization": "not-required",
+              "input": "satisfied"
+            },
             "handoff": "review-orchestration-playbook",
             "handoff_profile": "pr-readiness-read-only-probe"
           },
@@ -343,10 +484,25 @@
             "report_binding": "report:99999999999999999999999999999999",
             "binding_id": "target:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "state": "pre-target",
+            "provider": {
+              "service": "github",
+              "host": "github.com"
+            },
             "repository": {
+              "node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
               "host": "github.com",
               "owner": "Joey-Tools",
               "name": "codex-review-workflows"
+            },
+            "head": {
+              "repository": {
+                "node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                "host": "github.com",
+                "owner": "Joey-Tools",
+                "name": "codex-review-workflows"
+              },
+              "ref": "codex/read-only-probe",
+              "oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             }
           },
           "snapshot": {
@@ -447,13 +603,13 @@
       "name": "selected-pr-base-head-blocked",
       "expected": {
         "terminal_result": {
-          "schema_version": 5,
+          "schema_version": 6,
           "terminal": "pr-readiness-read-only-report",
           "terminal_state": "target-resolution-blocked",
           "report_id": "report:dddddddddddddddddddddddddddddddd",
           "handoff_profile": "pr-readiness-read-only-probe",
           "delivery_record": {
-            "schema_version": 1,
+            "schema_version": 2,
             "profile": "local-gate",
             "constraints": [
               "probe-only",
@@ -463,6 +619,16 @@
             "commit_mode": "forbidden",
             "formal_review_required": false,
             "remote_mutation": "forbidden",
+            "terminal_outcome": "succeeded",
+            "terminal_reason": "pr-readiness-read-only-probe-ready",
+            "terminal_evidence": {
+              "local_gate": "checked",
+              "committed_range": "missing",
+              "formal_review": "not-required",
+              "signature": "not-required",
+              "authorization": "not-required",
+              "input": "satisfied"
+            },
             "handoff": "review-orchestration-playbook",
             "handoff_profile": "pr-readiness-read-only-probe"
           },
@@ -470,14 +636,31 @@
             "report_binding": "report:dddddddddddddddddddddddddddddddd",
             "binding_id": "target:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
             "state": "pr-selected",
+            "provider": {
+              "service": "github",
+              "host": "github.com"
+            },
             "repository": {
+              "node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
               "host": "github.com",
               "owner": "Joey-Tools",
               "name": "codex-review-workflows"
             },
             "pull_request": {
+              "node_id": "PR_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS_42",
               "number": 42,
-              "url": "https://github.com/Joey-Tools/codex-review-workflows/pull/42"
+              "url": "https://github.com/Joey-Tools/codex-review-workflows/pull/42",
+              "base_ref": "master"
+            },
+            "head": {
+              "repository": {
+                "node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                "host": "github.com",
+                "owner": "Joey-Tools",
+                "name": "codex-review-workflows"
+              },
+              "ref": "codex/read-only-probe",
+              "oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             }
           },
           "snapshot": {
@@ -499,6 +682,34 @@
               "snapshot_binding": "snapshot:ffffffffffffffffffffffffffffffff",
               "observed": [
                 {
+                  "target_identity": {
+                    "provider": {
+                      "service": "github",
+                      "host": "github.com"
+                    },
+                    "repository": {
+                      "node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                      "host": "github.com",
+                      "owner": "Joey-Tools",
+                      "name": "codex-review-workflows"
+                    },
+                    "pull_request": {
+                      "node_id": "PR_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS_42",
+                      "number": 42,
+                      "url": "https://github.com/Joey-Tools/codex-review-workflows/pull/42",
+                      "base_ref": "master"
+                    },
+                    "head": {
+                      "repository": {
+                        "node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                        "host": "github.com",
+                        "owner": "Joey-Tools",
+                        "name": "codex-review-workflows"
+                      },
+                      "ref": "codex/read-only-probe",
+                      "oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    }
+                  },
                   "selection_method": "explicit",
                   "outcome": "selected",
                   "candidate_count": 1
@@ -512,6 +723,34 @@
               "snapshot_binding": "snapshot:ffffffffffffffffffffffffffffffff",
               "observed": [
                 {
+                  "target_identity": {
+                    "provider": {
+                      "service": "github",
+                      "host": "github.com"
+                    },
+                    "repository": {
+                      "node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                      "host": "github.com",
+                      "owner": "Joey-Tools",
+                      "name": "codex-review-workflows"
+                    },
+                    "pull_request": {
+                      "node_id": "PR_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS_42",
+                      "number": 42,
+                      "url": "https://github.com/Joey-Tools/codex-review-workflows/pull/42",
+                      "base_ref": "master"
+                    },
+                    "head": {
+                      "repository": {
+                        "node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                        "host": "github.com",
+                        "owner": "Joey-Tools",
+                        "name": "codex-review-workflows"
+                      },
+                      "ref": "codex/read-only-probe",
+                      "oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    }
+                  },
                   "state": "open",
                   "merged": false,
                   "merged_at": null,
@@ -526,6 +765,34 @@
               "snapshot_binding": "snapshot:ffffffffffffffffffffffffffffffff",
               "observed": [
                 {
+                  "target_identity": {
+                    "provider": {
+                      "service": "github",
+                      "host": "github.com"
+                    },
+                    "repository": {
+                      "node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                      "host": "github.com",
+                      "owner": "Joey-Tools",
+                      "name": "codex-review-workflows"
+                    },
+                    "pull_request": {
+                      "node_id": "PR_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS_42",
+                      "number": 42,
+                      "url": "https://github.com/Joey-Tools/codex-review-workflows/pull/42",
+                      "base_ref": "master"
+                    },
+                    "head": {
+                      "repository": {
+                        "node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                        "host": "github.com",
+                        "owner": "Joey-Tools",
+                        "name": "codex-review-workflows"
+                      },
+                      "ref": "codex/read-only-probe",
+                      "oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    }
+                  },
                   "state": "pending",
                   "total": 2,
                   "successful": 1,
@@ -569,6 +836,34 @@
               "snapshot_binding": "snapshot:ffffffffffffffffffffffffffffffff",
               "observed": [
                 {
+                  "target_identity": {
+                    "provider": {
+                      "service": "github",
+                      "host": "github.com"
+                    },
+                    "repository": {
+                      "node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                      "host": "github.com",
+                      "owner": "Joey-Tools",
+                      "name": "codex-review-workflows"
+                    },
+                    "pull_request": {
+                      "node_id": "PR_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS_42",
+                      "number": 42,
+                      "url": "https://github.com/Joey-Tools/codex-review-workflows/pull/42",
+                      "base_ref": "master"
+                    },
+                    "head": {
+                      "repository": {
+                        "node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                        "host": "github.com",
+                        "owner": "Joey-Tools",
+                        "name": "codex-review-workflows"
+                      },
+                      "ref": "codex/read-only-probe",
+                      "oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    }
+                  },
                   "total_threads": 3,
                   "unresolved_threads": 1
                 }

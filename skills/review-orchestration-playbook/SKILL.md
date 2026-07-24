@@ -23,9 +23,11 @@ An inbound delivery record whose exact `handoff_profile` is
 `pr-readiness-read-only-probe` is a terminal evidence probe, not PR readiness,
 a named review, or a generic PR/full-workflow request. Classify this structured
 handoff before every prose-based PR/review rule below. Validate the complete
-record against the delivery schema, preserve its constraints and mutation
-ceilings, and fail closed rather than falling through when the record is
-missing, unknown, or contradictory.
+record against the receiver schema's self-contained closed delivery-v2
+definition, preserve its constraints and mutation ceilings, and fail closed
+rather than falling through when the record is missing, unknown,
+non-ready, or contradictory. The formal receiver never resolves an external
+delivery-schema path or loads candidate-head control bytes.
 
 The receiver may take read-only snapshots only of existing-PR selection,
 lifecycle, CI status, conversation state, and exact base/head evidence. It must
@@ -40,10 +42,11 @@ Return the closed terminal
 record and stop. Before the first read, generate fresh in-memory report,
 target, snapshot, and observation identifiers; never reuse identifiers or
 target metadata from an earlier report. A report whose selection is
-unavailable uses the real `pre-target-blocked` terminal with only a repository
-target. A selected PR whose base/head read is unavailable uses
-`target-resolution-blocked` and omits base/head. Only `target-snapshot` carries
-the complete repository/PR/base/head target.
+unavailable uses the real `pre-target-blocked` terminal with provider,
+repository, and exact current query-head identity but no invented PR/base. A
+selected PR whose base read is unavailable uses `target-resolution-blocked`,
+retains that PR and current head, and omits only the unresolved base. Only
+`target-snapshot` carries the complete repository/PR/base/head target.
 
 Each observed evidence kind contains exactly one closed kind-specific record
 whose report, target, and snapshot bindings equal the enclosing instance;
@@ -51,10 +54,16 @@ unavailable or blocked kinds contain none. Validate both the closed JSON
 Schema and the runtime cross-field semantics in
 [`read_only_pr_report.py`](scripts/read_only_pr_report.py), which rejects
 cross-report splicing and contradictory selection, lifecycle, CI,
-conversation, or endpoint evidence. CI preserves the provider-authored
+conversation, or endpoint evidence. The target binds provider, immutable
+repository and PR identities, base ref, current head repository/ref/OID, and
+every selection, lifecycle, CI, and conversation observation repeats the
+applicable target identity exactly. A stale green CI result or cross-PR record
+therefore cannot be spliced into the current report. CI preserves the provider-authored
 `statusCheckRollup` union: each `CheckRun` binds its GitHub App and run
 identity, while each legacy `StatusContext` binds its creator and context.
-Display names may repeat; stable type/provider/object identities may not.
+Display names may repeat; stable type/provider/object identities may not. Each
+non-null GitHub App or CheckRun database ID has a one-to-one mapping with its
+Node ID in both directions.
 Observed base/head OIDs must exactly equal the resolved target OIDs before
 object-presence or merge-base evidence is accepted. Its action fields are all
 schema-fixed to `false`; `merge_ready` is always `false`, and `next_handoff`

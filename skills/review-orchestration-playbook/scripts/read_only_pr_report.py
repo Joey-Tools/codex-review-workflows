@@ -50,6 +50,28 @@ EVIDENCE_NAMES = {
     "conversation_state": "conversation-state",
     "base_and_head": "base-and-head",
 }
+DELIVERY_RESULT_FIELDS = {
+    "schema_version",
+    "profile",
+    "constraints",
+    "local_mutation",
+    "commit_mode",
+    "formal_review_required",
+    "remote_mutation",
+    "terminal_outcome",
+    "terminal_reason",
+    "terminal_evidence",
+    "handoff",
+    "handoff_profile",
+}
+DELIVERY_TERMINAL_EVIDENCE_FIELDS = {
+    "local_gate",
+    "committed_range",
+    "formal_review",
+    "signature",
+    "authorization",
+    "input",
+}
 CI_GATE_BUCKETS_BY_TYPENAME = {
     "CheckRun": {
         ("QUEUED", None): "pending",
@@ -115,6 +137,10 @@ def _is_oid(value: object) -> bool:
     return isinstance(value, str) and OID_RE.fullmatch(value) is not None
 
 
+def _is_github_node_id(value: object) -> bool:
+    return isinstance(value, str) and GITHUB_NODE_ID_RE.fullmatch(value) is not None
+
+
 def _mapping(value: object) -> Mapping[str, Any] | None:
     return value if isinstance(value, Mapping) else None
 
@@ -161,12 +187,162 @@ def _observed_record(
     return None
 
 
+def _read_only_delivery_errors(record: object) -> list[str]:
+    errors: list[str] = []
+    delivery = _mapping(record)
+    if delivery is None:
+        return ["delivery_record must be an object"]
+    if set(delivery) != DELIVERY_RESULT_FIELDS:
+        return ["delivery_record fields do not match the closed v2 contract"]
+    if delivery.get("schema_version") != 2:
+        errors.append("delivery_record.schema_version must be 2")
+    if delivery.get("profile") != "local-gate":
+        errors.append("read-only PR probe requires the local-gate profile")
+    constraints = _sequence(delivery.get("constraints"))
+    constraints_are_strings = constraints is not None and all(
+        isinstance(item, str) for item in constraints
+    )
+    constraint_set = set(constraints) if constraints_are_strings else set()
+    if (
+        constraints is None
+        or not constraints_are_strings
+        or len(constraints) != len(constraint_set)
+        or not constraint_set
+        <= {
+            "local-only",
+            "report-only",
+            "probe-only",
+            "read-only",
+            "no-remote",
+            "no-commit",
+        }
+    ):
+        errors.append("delivery_record.constraints are malformed")
+    elif not constraint_set & {
+        "report-only",
+        "probe-only",
+        "read-only",
+        "no-remote",
+    }:
+        errors.append("read-only PR probe lacks a remote-mutation limit")
+    if "local-only" in constraint_set:
+        errors.append("local-only delivery cannot hand off to a remote PR probe")
+
+    local_mutation_forbidden = bool(
+        constraint_set & {"report-only", "probe-only", "read-only"}
+    )
+    expected_local_mutation = "forbidden" if local_mutation_forbidden else "allowed"
+    if delivery.get("local_mutation") != expected_local_mutation:
+        errors.append("delivery_record.local_mutation contradicts constraints")
+    commit_forbidden = bool(
+        constraint_set
+        & {
+            "report-only",
+            "probe-only",
+            "read-only",
+            "no-commit",
+        }
+    )
+    expected_commit_mode = "forbidden" if commit_forbidden else "allowed"
+    if delivery.get("commit_mode") != expected_commit_mode:
+        errors.append("delivery_record.commit_mode contradicts constraints")
+    if delivery.get("remote_mutation") != "forbidden":
+        errors.append("read-only PR probe must forbid remote mutation")
+    if delivery.get("terminal_outcome") != "succeeded":
+        errors.append("read-only PR probe requires a succeeded delivery terminal")
+    if delivery.get("terminal_reason") != "pr-readiness-read-only-probe-ready":
+        errors.append("read-only PR probe requires its exact ready reason")
+    if delivery.get("handoff") != "review-orchestration-playbook":
+        errors.append("read-only PR probe must route to the review skill")
+    if delivery.get("handoff_profile") != "pr-readiness-read-only-probe":
+        errors.append("delivery_record handoff profile is not read-only PR probe")
+
+    evidence = _mapping(delivery.get("terminal_evidence"))
+    if evidence is None or set(evidence) != DELIVERY_TERMINAL_EVIDENCE_FIELDS:
+        errors.append("delivery terminal evidence is not a closed record")
+        return errors
+    if evidence.get("local_gate") not in {"succeeded", "checked"}:
+        errors.append("read-only PR probe lacks completed local-gate evidence")
+    if evidence.get("authorization") != "not-required":
+        errors.append("read-only PR probe cannot claim mutation authorization")
+    if evidence.get("input") != "satisfied":
+        errors.append("read-only PR probe lacks satisfied input evidence")
+    formal_required = delivery.get("formal_review_required")
+    if not isinstance(formal_required, bool):
+        errors.append("delivery formal_review_required must be boolean")
+    elif formal_required:
+        if (
+            evidence.get("committed_range") != "present"
+            or evidence.get("formal_review") != "clean"
+        ):
+            errors.append("required formal review lacks a clean committed range")
+    elif evidence.get("formal_review") != "not-required":
+        errors.append("non-required formal review has contradictory evidence")
+    if commit_forbidden:
+        if evidence.get("signature") != "not-required":
+            errors.append("commit-forbidden delivery cannot claim a new signature")
+    elif (
+        evidence.get("local_gate") != "succeeded"
+        or evidence.get("committed_range") != "present"
+        or evidence.get("formal_review") != "clean"
+        or evidence.get("signature") != "verified"
+        or formal_required is not True
+    ):
+        errors.append("commit-allowed probe handoff lacks a complete local gate")
+    return errors
+
+
+def _repository_identity_valid(value: object) -> bool:
+    repository = _mapping(value)
+    if repository is None:
+        return False
+    return (
+        set(repository) == {"node_id", "host", "owner", "name"}
+        and _is_github_node_id(repository.get("node_id"))
+        and isinstance(repository.get("host"), str)
+        and 1 <= len(repository["host"]) <= 253
+        and REPOSITORY_HOST_RE.fullmatch(repository["host"]) is not None
+        and isinstance(repository.get("owner"), str)
+        and 1 <= len(repository["owner"]) <= 39
+        and REPOSITORY_OWNER_RE.fullmatch(repository["owner"]) is not None
+        and isinstance(repository.get("name"), str)
+        and 1 <= len(repository["name"]) <= 100
+        and REPOSITORY_NAME_RE.fullmatch(repository["name"]) is not None
+    )
+
+
+def _bind_observed_target_identity(
+    errors: list[str],
+    record: Mapping[str, Any],
+    target: Mapping[str, Any],
+    *,
+    location: str,
+    require_pull_request: bool,
+) -> None:
+    identity = _mapping(record.get("target_identity"))
+    if identity is None:
+        errors.append(f"{location}.target_identity must be an object")
+        return
+    required = {"provider", "repository", "head"}
+    if require_pull_request:
+        required.add("pull_request")
+    if set(identity) != required:
+        errors.append(f"{location}.target_identity fields do not match target state")
+        return
+    for field in required:
+        if identity.get(field) != target.get(field):
+            errors.append(
+                f"{location}.target_identity.{field} must exactly equal target.{field}"
+            )
+
+
 def _ci_rollup_identity_and_bucket(
     errors: list[str],
     entry: Mapping[str, Any],
     *,
     index: int,
 ) -> tuple[
+    tuple[object, ...] | None,
     tuple[object, ...] | None,
     tuple[object, ...] | None,
     str | None,
@@ -214,10 +390,21 @@ def _ci_rollup_identity_and_bucket(
                 app["database_id"],
                 app["slug"],
             )
+            object_identity = (
+                "CheckRun",
+                node_id,
+                database_id,
+                app["node_id"],
+            )
         bucket = CI_GATE_BUCKETS_BY_TYPENAME["CheckRun"].get((status, conclusion))
         if bucket is None:
             errors.append(f"{location} status/conclusion combination is unknown")
-        return identity, provider if identity is not None else None, bucket
+        return (
+            identity,
+            provider if identity is not None else None,
+            object_identity if identity is not None else None,
+            bucket,
+        )
 
     if typename == "StatusContext":
         creator = _mapping(entry.get("creator"))
@@ -257,10 +444,10 @@ def _ci_rollup_identity_and_bucket(
         bucket = CI_GATE_BUCKETS_BY_TYPENAME["StatusContext"].get(state)
         if bucket is None:
             errors.append(f"{location} state is unknown")
-        return identity, provider if identity is not None else None, bucket
+        return identity, provider if identity is not None else None, None, bucket
 
     errors.append(f"{location} typename is unknown")
-    return None, None, None
+    return None, None, None, None
 
 
 def semantic_errors(report: object) -> list[str]:
@@ -271,6 +458,7 @@ def semantic_errors(report: object) -> list[str]:
     if root is None:
         return ["report must be an object"]
 
+    errors.extend(_read_only_delivery_errors(root.get("delivery_record")))
     report_token = _identifier(errors, root.get("report_id"), "report", "report_id")
     target = _mapping(root.get("target"))
     snapshot = _mapping(root.get("snapshot"))
@@ -316,10 +504,40 @@ def semantic_errors(report: object) -> list[str]:
     if snapshot.get("target_binding") != target_binding:
         errors.append("snapshot.target_binding must equal target.binding_id")
 
+    provider = _mapping(target.get("provider"))
+    repository = _mapping(target.get("repository"))
+    head = _mapping(target.get("head"))
+    if (
+        provider is None
+        or set(provider) != {"service", "host"}
+        or provider.get("service") != "github"
+        or not isinstance(provider.get("host"), str)
+        or REPOSITORY_HOST_RE.fullmatch(provider["host"]) is None
+    ):
+        errors.append("target.provider must be the exact GitHub provider identity")
+    if not _repository_identity_valid(repository):
+        errors.append("target.repository must be an exact repository identity")
+    elif provider is not None and provider.get("host") != repository.get("host"):
+        errors.append("target.provider.host must equal target.repository.host")
+    if (
+        head is None
+        or set(head) != {"repository", "ref", "oid"}
+        or not _repository_identity_valid(head.get("repository"))
+        or not isinstance(head.get("ref"), str)
+        or not 1 <= len(head["ref"]) <= 1024
+        or not _is_oid(head.get("oid"))
+    ):
+        errors.append("target.head must be an exact current-head identity")
+    elif provider is not None:
+        head_repository = _mapping(head.get("repository"))
+        if head_repository is not None and provider.get("host") != head_repository.get(
+            "host"
+        ):
+            errors.append("target head provider host is inconsistent")
+
     if "pull_request" in target:
-        repository = _mapping(target.get("repository"))
         pull_request = _mapping(target.get("pull_request"))
-        if repository is None or pull_request is None:
+        if not _repository_identity_valid(repository) or pull_request is None:
             errors.append(
                 "target pull request URL requires structured repository and PR data"
             )
@@ -329,17 +547,12 @@ def semantic_errors(report: object) -> list[str]:
             name = repository.get("name")
             number = pull_request.get("number")
             if (
-                not isinstance(host, str)
-                or not 1 <= len(host) <= 253
-                or REPOSITORY_HOST_RE.fullmatch(host) is None
-                or not isinstance(owner, str)
-                or not 1 <= len(owner) <= 39
-                or REPOSITORY_OWNER_RE.fullmatch(owner) is None
-                or not isinstance(name, str)
-                or not 1 <= len(name) <= 100
-                or REPOSITORY_NAME_RE.fullmatch(name) is None
+                set(pull_request) != {"node_id", "number", "url", "base_ref"}
+                or not _is_github_node_id(pull_request.get("node_id"))
                 or not _is_nonnegative_int(number)
                 or number < 1
+                or not isinstance(pull_request.get("base_ref"), str)
+                or not 1 <= len(pull_request["base_ref"]) <= 1024
             ):
                 errors.append(
                     "target pull request URL requires canonical repository components"
@@ -351,6 +564,13 @@ def semantic_errors(report: object) -> list[str]:
                         "target.pull_request.url must exactly match the canonical "
                         "repository PR URL"
                     )
+            target_base = _mapping(target.get("base"))
+            if target_base is not None and target_base.get("ref") != pull_request.get(
+                "base_ref"
+            ):
+                errors.append(
+                    "target.base.ref must exactly equal target.pull_request.base_ref"
+                )
 
     evidence_records: dict[str, Mapping[str, Any]] = {}
     for field in EVIDENCE_NAMES:
@@ -431,6 +651,13 @@ def semantic_errors(report: object) -> list[str]:
             errors.append("selection outcome is unknown")
         if method == "explicit" and selection_outcome == "ambiguous":
             errors.append("explicit PR selection cannot be ambiguous")
+        _bind_observed_target_identity(
+            errors,
+            selection_record,
+            target,
+            location="PR selection",
+            require_pull_request=selection_outcome == "selected",
+        )
 
     terminal_state = root.get("terminal_state")
     target_state = target.get("state")
@@ -491,6 +718,13 @@ def semantic_errors(report: object) -> list[str]:
         [], evidence_records["pr_lifecycle"], "evidence.pr_lifecycle"
     )
     if lifecycle_record is not None:
+        _bind_observed_target_identity(
+            errors,
+            lifecycle_record,
+            target,
+            location="PR lifecycle",
+            require_pull_request=True,
+        )
         lifecycle_tuple = (
             lifecycle_record.get("state"),
             lifecycle_record.get("merged"),
@@ -512,22 +746,34 @@ def semantic_errors(report: object) -> list[str]:
         [], evidence_records["ci_status"], "evidence.ci_status"
     )
     if ci_record is not None:
+        _bind_observed_target_identity(
+            errors,
+            ci_record,
+            target,
+            location="CI status",
+            require_pull_request=True,
+        )
         rollup = _sequence(ci_record.get("status_check_rollup"))
         if rollup is None:
             errors.append("CI statusCheckRollup must be an array")
         else:
             stable_identities: list[tuple[object, ...]] = []
             provider_bindings: dict[tuple[object, object], tuple[object, ...]] = {}
+            app_database_bindings: dict[object, object] = {}
+            check_run_bindings: dict[object, tuple[object, object]] = {}
+            check_run_database_bindings: dict[object, object] = {}
             actual = {"success": 0, "failure": 0, "pending": 0, "cancelled": 0}
             for index, item in enumerate(rollup):
                 entry = _mapping(item)
                 if entry is None:
                     errors.append("each CI statusCheckRollup entry must be an object")
                     continue
-                identity, provider, bucket = _ci_rollup_identity_and_bucket(
-                    errors,
-                    entry,
-                    index=index,
+                identity, provider, object_identity, bucket = (
+                    _ci_rollup_identity_and_bucket(
+                        errors,
+                        entry,
+                        index=index,
+                    )
                 )
                 if identity is not None:
                     stable_identities.append(identity)
@@ -542,6 +788,36 @@ def semantic_errors(report: object) -> list[str]:
                         errors.append(
                             "CI statusCheckRollup provider identity is inconsistent"
                         )
+                    if provider[0] == "App" and provider[2] is not None:
+                        previous_node = app_database_bindings.setdefault(
+                            provider[2],
+                            provider[1],
+                        )
+                        if previous_node != provider[1]:
+                            errors.append(
+                                "CI GitHub App database ID maps to multiple Node IDs"
+                            )
+                if object_identity is not None:
+                    node_id = object_identity[1]
+                    database_id = object_identity[2]
+                    app_node_id = object_identity[3]
+                    previous_object = check_run_bindings.setdefault(
+                        node_id,
+                        (database_id, app_node_id),
+                    )
+                    if previous_object != (database_id, app_node_id):
+                        errors.append(
+                            "CI CheckRun Node ID maps to inconsistent object identity"
+                        )
+                    if database_id is not None:
+                        previous_node = check_run_database_bindings.setdefault(
+                            database_id,
+                            node_id,
+                        )
+                        if previous_node != node_id:
+                            errors.append(
+                                "CI CheckRun database ID maps to multiple Node IDs"
+                            )
                 if bucket is not None:
                     actual[bucket] += 1
             if len(stable_identities) != len(set(stable_identities)):
@@ -579,6 +855,13 @@ def semantic_errors(report: object) -> list[str]:
         "evidence.conversation_state",
     )
     if conversation_record is not None:
+        _bind_observed_target_identity(
+            errors,
+            conversation_record,
+            target,
+            location="conversation state",
+            require_pull_request=True,
+        )
         total_threads = conversation_record.get("total_threads")
         unresolved_threads = conversation_record.get("unresolved_threads")
         if not _is_nonnegative_int(total_threads) or not _is_nonnegative_int(

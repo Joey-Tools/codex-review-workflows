@@ -16,6 +16,7 @@ The bundle identity is operational evidence, not a free-form label:
 
 - The complete formal-profile byte-binding list includes `CLAUDE_RELEASE_KEY_BYTES`, `COMPATIBILITY_JSON_BYTES`, `BASELINE_SCHEMA_BYTES`, `PROFILE_SCHEMA_BYTES`, `CAPABILITY_SOURCE_BYTES`, and `FD_EXEC_BYTES` where applicable. For the formal default and `preflight-claude` profiles, the guard injects the exact manifest-bound process-companion bytes as `review_runtime.common.FD_EXEC_BYTES`. Descriptor-backed launches validate and compile only those injected bytes, then execute them through the trusted Python interpreter's isolated `-I -B -S -c` bootstrap; they never reopen the `review_runtime/fd_exec.py` path.
 - The optional profiles must not widen this control-plane closure to `review_runtime.workspace`, `review_runtime.prompt`, or `review_runtime.synthetic_tokens`.
+- The manifest-bound read-only PR report schema is self-contained: it contains its complete closed delivery-v2 receiver definition and has no external `$ref`. Formal receiving consumes only that same-release schema plus the manifest-bound standalone semantic helper; it never resolves an external or candidate-head delivery schema.
 
 ## Shared Frozen-Range Contract
 

@@ -21,7 +21,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": 5
+      "const": 6
     },
     "terminal": {
       "const": "pr-readiness-read-only-report"
@@ -41,45 +41,7 @@
       "const": "pr-readiness-read-only-probe"
     },
     "delivery_record": {
-      "allOf": [
-        {
-          "$ref": "https://joey-tools.invalid/change-delivery-workflow/delivery-result.schema.json"
-        },
-        {
-          "type": "object",
-          "properties": {
-            "profile": {
-              "const": "local-gate"
-            },
-            "constraints": {
-              "contains": {
-                "enum": [
-                  "report-only",
-                  "probe-only",
-                  "read-only",
-                  "no-remote"
-                ]
-              }
-            },
-            "remote_mutation": {
-              "const": "forbidden"
-            },
-            "handoff": {
-              "const": "review-orchestration-playbook"
-            },
-            "handoff_profile": {
-              "const": "pr-readiness-read-only-probe"
-            }
-          },
-          "required": [
-            "profile",
-            "constraints",
-            "remote_mutation",
-            "handoff",
-            "handoff_profile"
-          ]
-        }
-      ]
+      "$ref": "#/$defs/readOnlyProbeDeliveryRecord"
     },
     "target": {
       "$ref": "#/$defs/target"
@@ -221,6 +183,274 @@
     }
   ],
   "$defs": {
+    "readOnlyProbeDeliveryRecord": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "profile",
+        "constraints",
+        "local_mutation",
+        "commit_mode",
+        "formal_review_required",
+        "remote_mutation",
+        "terminal_outcome",
+        "terminal_reason",
+        "terminal_evidence",
+        "handoff",
+        "handoff_profile"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 2
+        },
+        "profile": {
+          "const": "local-gate"
+        },
+        "constraints": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "local-only",
+              "report-only",
+              "probe-only",
+              "read-only",
+              "no-remote",
+              "no-commit"
+            ]
+          },
+          "uniqueItems": true,
+          "contains": {
+            "enum": [
+              "report-only",
+              "probe-only",
+              "read-only",
+              "no-remote"
+            ]
+          }
+        },
+        "local_mutation": {
+          "enum": [
+            "allowed",
+            "forbidden"
+          ]
+        },
+        "commit_mode": {
+          "enum": [
+            "allowed",
+            "forbidden"
+          ]
+        },
+        "formal_review_required": {
+          "type": "boolean"
+        },
+        "remote_mutation": {
+          "const": "forbidden"
+        },
+        "terminal_outcome": {
+          "const": "succeeded"
+        },
+        "terminal_reason": {
+          "const": "pr-readiness-read-only-probe-ready"
+        },
+        "terminal_evidence": {
+          "type": "object",
+          "required": [
+            "local_gate",
+            "committed_range",
+            "formal_review",
+            "signature",
+            "authorization",
+            "input"
+          ],
+          "properties": {
+            "local_gate": {
+              "enum": [
+                "succeeded",
+                "checked"
+              ]
+            },
+            "committed_range": {
+              "enum": [
+                "present",
+                "missing",
+                "not-required"
+              ]
+            },
+            "formal_review": {
+              "enum": [
+                "clean",
+                "not-required"
+              ]
+            },
+            "signature": {
+              "enum": [
+                "verified",
+                "not-required"
+              ]
+            },
+            "authorization": {
+              "const": "not-required"
+            },
+            "input": {
+              "const": "satisfied"
+            }
+          },
+          "additionalProperties": false
+        },
+        "handoff": {
+          "const": "review-orchestration-playbook"
+        },
+        "handoff_profile": {
+          "const": "pr-readiness-read-only-probe"
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "constraints": {
+                "contains": {
+                  "const": "local-only"
+                }
+              }
+            },
+            "required": [
+              "constraints"
+            ]
+          },
+          "then": false
+        },
+        {
+          "if": {
+            "properties": {
+              "constraints": {
+                "contains": {
+                  "enum": [
+                    "report-only",
+                    "probe-only",
+                    "read-only"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "constraints"
+            ]
+          },
+          "then": {
+            "properties": {
+              "local_mutation": {
+                "const": "forbidden"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "local_mutation": {
+                "const": "allowed"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "constraints": {
+                "contains": {
+                  "enum": [
+                    "report-only",
+                    "probe-only",
+                    "read-only",
+                    "no-commit"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "constraints"
+            ]
+          },
+          "then": {
+            "properties": {
+              "commit_mode": {
+                "const": "forbidden"
+              },
+              "terminal_evidence": {
+                "properties": {
+                  "signature": {
+                    "const": "not-required"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "commit_mode": {
+                "const": "allowed"
+              },
+              "formal_review_required": {
+                "const": true
+              },
+              "terminal_evidence": {
+                "properties": {
+                  "local_gate": {
+                    "const": "succeeded"
+                  },
+                  "committed_range": {
+                    "const": "present"
+                  },
+                  "formal_review": {
+                    "const": "clean"
+                  },
+                  "signature": {
+                    "const": "verified"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "formal_review_required": {
+                "const": true
+              }
+            },
+            "required": [
+              "formal_review_required"
+            ]
+          },
+          "then": {
+            "properties": {
+              "terminal_evidence": {
+                "properties": {
+                  "committed_range": {
+                    "const": "present"
+                  },
+                  "formal_review": {
+                    "const": "clean"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "terminal_evidence": {
+                "properties": {
+                  "formal_review": {
+                    "const": "not-required"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
     "reportId": {
       "type": "string",
       "pattern": "^report:[0-9a-f]{32}$"
@@ -483,14 +713,40 @@
         "blocked"
       ]
     },
+    "githubProvider": {
+      "type": "object",
+      "required": [
+        "service",
+        "host"
+      ],
+      "properties": {
+        "service": {
+          "const": "github"
+        },
+        "host": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253,
+          "pattern": "^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$"
+        }
+      },
+      "additionalProperties": false
+    },
     "repository": {
       "type": "object",
       "required": [
+        "node_id",
         "host",
         "owner",
         "name"
       ],
       "properties": {
+        "node_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9_:+/=-]+$"
+        },
         "host": {
           "type": "string",
           "minLength": 1,
@@ -515,10 +771,18 @@
     "pullRequest": {
       "type": "object",
       "required": [
+        "node_id",
         "number",
-        "url"
+        "url",
+        "base_ref"
       ],
       "properties": {
+        "node_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9_:+/=-]+$"
+        },
         "number": {
           "type": "integer",
           "minimum": 1
@@ -528,6 +792,11 @@
           "minLength": 1,
           "maxLength": 2048,
           "pattern": "^https://(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*/[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*/[A-Za-z0-9._-]*[A-Za-z0-9_][A-Za-z0-9._-]*/pull/[1-9][0-9]*$"
+        },
+        "base_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
         }
       },
       "additionalProperties": false
@@ -572,13 +841,62 @@
       },
       "additionalProperties": false
     },
+    "selectionTargetIdentity": {
+      "type": "object",
+      "required": [
+        "provider",
+        "repository",
+        "head"
+      ],
+      "properties": {
+        "provider": {
+          "$ref": "#/$defs/githubProvider"
+        },
+        "repository": {
+          "$ref": "#/$defs/repository"
+        },
+        "pull_request": {
+          "$ref": "#/$defs/pullRequest"
+        },
+        "head": {
+          "$ref": "#/$defs/head"
+        }
+      },
+      "additionalProperties": false
+    },
+    "selectedTargetIdentity": {
+      "type": "object",
+      "required": [
+        "provider",
+        "repository",
+        "pull_request",
+        "head"
+      ],
+      "properties": {
+        "provider": {
+          "$ref": "#/$defs/githubProvider"
+        },
+        "repository": {
+          "$ref": "#/$defs/repository"
+        },
+        "pull_request": {
+          "$ref": "#/$defs/pullRequest"
+        },
+        "head": {
+          "$ref": "#/$defs/head"
+        }
+      },
+      "additionalProperties": false
+    },
     "target": {
       "type": "object",
       "required": [
         "report_binding",
         "binding_id",
         "state",
-        "repository"
+        "provider",
+        "repository",
+        "head"
       ],
       "properties": {
         "report_binding": {
@@ -593,6 +911,9 @@
             "pr-selected",
             "range-resolved"
           ]
+        },
+        "provider": {
+          "$ref": "#/$defs/githubProvider"
         },
         "repository": {
           "$ref": "#/$defs/repository"
@@ -629,11 +950,6 @@
                 "required": [
                   "base"
                 ]
-              },
-              {
-                "required": [
-                  "head"
-                ]
               }
             ]
           }
@@ -649,17 +965,8 @@
             "pull_request"
           ],
           "not": {
-            "anyOf": [
-              {
-                "required": [
-                  "base"
-                ]
-              },
-              {
-                "required": [
-                  "head"
-                ]
-              }
+            "required": [
+              "base"
             ]
           }
         },
@@ -753,11 +1060,15 @@
           "items": {
             "type": "object",
             "required": [
+              "target_identity",
               "selection_method",
               "outcome",
               "candidate_count"
             ],
             "properties": {
+              "target_identity": {
+                "$ref": "#/$defs/selectionTargetIdentity"
+              },
               "selection_method": {
                 "enum": [
                   "explicit",
@@ -785,6 +1096,11 @@
                   },
                   "candidate_count": {
                     "const": 1
+                  },
+                  "target_identity": {
+                    "required": [
+                      "pull_request"
+                    ]
                   }
                 }
               },
@@ -795,6 +1111,13 @@
                   },
                   "candidate_count": {
                     "const": 0
+                  },
+                  "target_identity": {
+                    "not": {
+                      "required": [
+                        "pull_request"
+                      ]
+                    }
                   }
                 }
               },
@@ -808,6 +1131,13 @@
                   },
                   "candidate_count": {
                     "minimum": 2
+                  },
+                  "target_identity": {
+                    "not": {
+                      "required": [
+                        "pull_request"
+                      ]
+                    }
                   }
                 }
               }
@@ -850,12 +1180,16 @@
           "items": {
             "type": "object",
             "required": [
+              "target_identity",
               "state",
               "merged",
               "merged_at",
               "draft"
             ],
             "properties": {
+              "target_identity": {
+                "$ref": "#/$defs/selectedTargetIdentity"
+              },
               "state": {
                 "enum": [
                   "open",
@@ -959,6 +1293,7 @@
           "items": {
             "type": "object",
             "required": [
+              "target_identity",
               "state",
               "total",
               "successful",
@@ -968,6 +1303,9 @@
               "status_check_rollup"
             ],
             "properties": {
+              "target_identity": {
+                "$ref": "#/$defs/selectedTargetIdentity"
+              },
               "state": {
                 "enum": [
                   "success",
@@ -1130,10 +1468,14 @@
           "items": {
             "type": "object",
             "required": [
+              "target_identity",
               "total_threads",
               "unresolved_threads"
             ],
             "properties": {
+              "target_identity": {
+                "$ref": "#/$defs/selectedTargetIdentity"
+              },
               "total_threads": {
                 "type": "integer",
                 "minimum": 0

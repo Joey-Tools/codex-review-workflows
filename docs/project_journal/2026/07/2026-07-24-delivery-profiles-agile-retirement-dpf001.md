@@ -43,37 +43,50 @@ superseded_by:
   cache or state, fix, commit, push, release, or merge. The receiver is
   classified before every generic PR/review route and returns one closed
   terminal report whose action fields and merge-ready claim are fixed false.
-- Read-only report schema v5 represents selection and range failures directly:
-  `pre-target` and `pre-target-blocked` omit PR/base/head, while
-  `target-resolution-blocked` retains only the selected PR. Every report uses
-  fresh independent report/target/snapshot/observation IDs. The standalone
-  semantic validator equality-binds every evidence record to that instance and
-  requires the exact canonical URL derived from the structured repository and
-  PR number. It preserves GitHub `statusCheckRollup` as an exact
+- Read-only report schema v6 represents selection and range failures directly.
+  Every target state binds provider, immutable repository identity, and exact
+  current query-head repository/ref/OID. `pre-target` and
+  `pre-target-blocked` omit only PR/base, while `target-resolution-blocked`
+  retains the selected PR and current head but omits unresolved base evidence.
+  Every report uses fresh independent report/target/snapshot/observation IDs.
+  Every selection, lifecycle, CI, and conversation observation repeats the
+  applicable target identity exactly, including PR Node ID/base ref and current
+  head, so cross-PR splicing, head races, and stale-green CI fail closed. The
+  standalone semantic validator equality-binds every evidence record to that
+  instance and requires the exact canonical URL derived from the structured
+  repository and PR number. It preserves GitHub `statusCheckRollup` as an exact
   provider-discriminated union: `CheckRun` binds its Node/database IDs, name,
   GitHub App Node/database IDs and slug plus complete raw status/conclusion
   enums, while legacy `StatusContext` binds its Node ID, context, and creator
   identity plus complete raw state enum. Stable type/provider/object
-  identities, rather than display names, determine uniqueness. One explicit
-  fail-closed mapping normalizes those provider values to success, failure,
-  pending, or cancelled aggregates.
+  identities, rather than display names, determine uniqueness. Non-null GitHub
+  App and CheckRun database IDs map one-to-one to Node IDs in both directions.
+  One explicit fail-closed mapping normalizes those provider values to success,
+  failure, pending, or cancelled aggregates.
   Base/head evidence records the exact observed endpoint OIDs and must match
   the target byte-for-byte before object-existence or merge-base results count.
   The validator also rejects lifecycle, selector, CI-rollup,
   conversation-count, and endpoint contradictions that JSON Schema cannot
-  express. The schema and semantic helper remain direct records in the
-  canonical control manifest, so the release digest binds the exact v5 pair.
-  Its binding generator
+  express. The schema embeds its complete closed delivery-v2 receiver
+  definition and has no external `$ref`. The schema and semantic helper remain
+  direct records in the canonical control manifest, so the release digest
+  binds the complete v6 receiving closure without loading an external or
+  candidate-head delivery schema. Its binding generator
   retries collisions, while file input uses no-follow/nonblocking/close-on-exec
   descriptor admission, regular-file and byte ceilings, exact identity/size
   revalidation, and two identical complete reads. Strict UTF-8 JSON parsing
   rejects duplicate keys, non-finite numbers, oversized integers, excessive
   depth/node counts, and non-object roots; every rejection is one bounded,
   control-free machine record.
-- Every terminal result or permitted handoff carries a closed, versioned record
-  with the selected profile, immutable constraint list, local mutation mode,
-  commit mode, remote mutation mode, handoff target, and handoff profile.
-  Conflicting or widened records fail closed.
+- Every terminal result or permitted handoff carries a closed delivery-v2
+  record with the selected profile, immutable constraint list, mutation modes,
+  terminal outcome/reason/evidence, handoff target, and handoff profile. A
+  blocked PR-readiness run retains its requested profile but forces both
+  handoff fields to `none`. Only a succeeded local gate with a present
+  committed range, clean formal review, verified signature, and satisfied
+  authorization/input may advertise the PR-readiness handoff. Missing range,
+  findings, signing failure, and authorization/input blockers all stop before
+  handoff. Conflicting or widened records fail closed.
 - Terminal-outcome precedence makes a combined MVP-plus-PR request run the
   focused slice, full local gate, and PR handoff in that order. A clean signed
   review checkpoint is already the landing commit; the workflow never creates
@@ -122,14 +135,17 @@ superseded_by:
 ## Evidence
 
 - `python3 -B skills/change-delivery-workflow/tests/test_delivery_profiles.py -q`
-  passed (`33` tests), including deterministic local-mutation short circuits,
+  passed (`36` tests), including deterministic local-mutation short circuits,
   the independent mutable-`no-commit` control, constrained-scope conflicts,
-  staged read-only PR-probe terminals, fresh instance bindings, cross-report
-  splice rejection, collision recovery, descriptor-safe input admission and
-  revalidation, hostile JSON/resource caps, bounded machine-safe errors,
-  canonical PR URL attack cases, the complete CheckRun and StatusContext
-  provider enums, legacy required commit statuses, mixed rollup aggregation,
-  duplicate display names, stable-identity collisions, malformed providers,
+  blocked delivery terminals that cannot hand off, receiver rejection of
+  non-ready and local-only delivery records, staged read-only PR-probe
+  terminals, fresh instance bindings, cross-report and cross-PR identity splice
+  rejection, stale-head CI/conversation rejection, collision recovery,
+  descriptor-safe input admission and revalidation, hostile JSON/resource
+  caps, bounded machine-safe errors, canonical PR URL attack cases, the
+  complete CheckRun and StatusContext provider enums, legacy required commit
+  statuses, mixed rollup aggregation, duplicate display names, forward and
+  reverse App/CheckRun ID collisions, malformed providers,
   swapped/cross-report/stale endpoints, same-merge-base endpoint drift, closed
   delivery and terminal report records, and the clean-range, missing-range,
   findings, and review-not-required terminals under forbidden commit mode.
@@ -143,8 +159,10 @@ superseded_by:
 - `python3 -B skills/review-orchestration-playbook/tests/test_synthetic_tokens.py -q`
   passed the complete `190`-test synthetic runtime suite.
 - `uv run --offline --with pyyaml python skills/review-orchestration-playbook/tests/test_contracts.py`
-  passed (`87` tests), including the semantic helper's canonical-manifest
-  binding without widening a formal named-lane source closure.
+  passed (`88` tests), including the semantic helper's canonical-manifest
+  binding, self-contained receiver schema closure, and absence of an external
+  delivery-schema dependency without widening a formal named-lane source
+  closure.
 - `python3 -B skills/review-orchestration-playbook/tests/test_cli.py -q`
   passed (`17` tests).
 - Both the system `quick_validate.py` and Joey
@@ -152,12 +170,13 @@ superseded_by:
 - `python3 -m json.tool` passed for both schemas, the read-only probe fixture,
   and the trusted synthetic runtime manifest;
   Draft 2020-12 `jsonschema` validation accepted all `13` delivery records and
-  all four terminal read-only report states through the registered cross-schema
-  reference.
+  all four terminal read-only report states through the self-contained receiver
+  schema.
 - `python3 -B /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo .`
   passed.
-- Full Ruff checks and `ruff format --check` passed for all seven touched
-  Python entrypoints and tests; `py_compile` passed for the runtime/helper set.
+- Full Ruff checks and `ruff format --check` passed for all Python entrypoints
+  and tests touched by the workstream; the post-review rerun covered the three
+  newly changed Python files, and `py_compile` passed for that runtime/test set.
 - Broader review-playbook discovery was bounded and manually interrupted after
   six silent minutes in unchanged `test_providers` signal-mask setup; it
   produced no assertion failure and left no process behind. The affected

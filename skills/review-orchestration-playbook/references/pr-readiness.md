@@ -12,11 +12,15 @@ follow-up, merge-readiness reporting, or merge.
 ## Read-Only Delivery Probe: Classify And Stop First
 
 This path receives only a complete
-`change-delivery-workflow` record whose exact fields validate against
-`../../change-delivery-workflow/references/delivery-result.schema.json` and
-whose `handoff_profile` is `pr-readiness-read-only-probe`. Classify it before
-generic PR/full-workflow language, named single/double/triple review, or the
-ordinary gate sequence. A missing field, unknown field, lost constraint,
+`change-delivery-workflow` record whose exact fields validate against the
+read-only report schema's self-contained closed delivery-v2 definition and
+whose terminal is succeeded and ready for
+`pr-readiness-read-only-probe`. The installed receiver schema and semantic
+helper are both canonical-manifest records from one trusted release; the
+formal receiver does not resolve an external delivery-schema path or load
+candidate-head control bytes. Classify it before generic PR/full-workflow
+language, named single/double/triple review, or the ordinary gate sequence. A
+missing field, unknown field, lost constraint, blocked or non-ready terminal,
 non-forbidden remote-mutation mode, different handoff, or widened profile is
 terminal `blocked-input`; do not infer replacement authority from prose.
 
@@ -36,7 +40,10 @@ The receiving sequence is closed:
    Node/database IDs, name, GitHub App Node/database IDs and slug, status, and
    conclusion. A legacy `StatusContext` records its raw typename and Node ID,
    context, creator type/node-ID/login, and state. Do not collapse provider
-   states early or use display-name uniqueness as object identity.
+   states early or use display-name uniqueness as object identity. Require a
+   one-to-one mapping in both directions between every non-null GitHub App
+   database ID and App Node ID, and between every non-null CheckRun database ID
+   and CheckRun Node ID.
 3. Do not start any local Codex or Claude lane, `materialize-worktree`,
    `validate-worktree`, low-level helper mode, exact-secret admission,
    GitHub Codex request, check, workflow, comment, poll, monitor, or wait. Do
@@ -55,14 +62,16 @@ The receiving sequence is closed:
    the identifiers, derive them from PR metadata or time, or reuse an
    identifier or target from an earlier report.
 6. Build the target only as far as current evidence permits:
-   - `pre-target` contains the repository but no PR/base/head. Use terminal
-     `pre-target` for a conclusive no-match or ambiguity, and
-     `pre-target-blocked` when selection is unavailable or blocked.
-   - `pr-selected` adds the selected PR but no base/head. Use terminal
-     `target-resolution-blocked` when the base/head read is unavailable or
-     blocked.
-   - `range-resolved` adds the current base/head and is the only target allowed
-     by terminal `target-snapshot`.
+   - Every state binds the provider, immutable target-repository identity, and
+     exact current query-head repository/ref/OID.
+   - `pre-target` contains no PR/base. Use terminal `pre-target` for a
+     conclusive no-match or ambiguity, and `pre-target-blocked` when selection
+     is unavailable or blocked.
+   - `pr-selected` adds the selected PR's immutable Node ID, number, canonical
+     URL, and base ref but no resolved base. Use terminal
+     `target-resolution-blocked` when the base read is unavailable or blocked.
+   - `range-resolved` adds the current base and is the only target allowed by
+     terminal `target-snapshot`.
    Never copy stale PR, base, head, or binding fields into a newer report to
    make a blocked read appear complete.
 7. Emit exactly one terminal record conforming to
@@ -72,6 +81,12 @@ The receiving sequence is closed:
    An `observed` kind contains exactly one kind-specific, closed structured
    record; an empty array, free-form summary, or record for another
    report/target/snapshot is invalid.
+   Every selection record repeats the provider, target repository, and current
+   head; a selected record also repeats the exact PR identity. Every lifecycle,
+   CI, and conversation record repeats that complete selected-target identity.
+   Require dictionary equality with the enclosing target, including base ref,
+   head repository/ref/OID, and immutable Node IDs. Reject cross-PR splicing,
+   head races, and stale-green CI evidence.
    A base/head observation repeats the exact base and head OIDs used for its
    object lookups and merge-base invocation. Both must byte-for-byte equal the
    resolved target OIDs; a matching merge-base result never makes stale,
@@ -85,7 +100,8 @@ The receiving sequence is closed:
    the exact in-memory JSON through stdin with Python `-I -B -S`. It must
    accept before emission. This second gate binds all instance IDs by equality
    and rejects contradictions that JSON Schema cannot express, including
-   stable provider/object identity collisions, aggregate CI counts versus the
+   target-identity mismatch, stable provider/object identity collisions,
+   non-bijective database-ID/Node-ID mappings, aggregate CI counts versus the
    complete rollup, observed endpoint OIDs versus target OIDs, and unresolved
    threads versus total threads. Its one fail-closed normalization maps the
    complete raw `CheckRun` status/conclusion and `StatusContext` state enums to

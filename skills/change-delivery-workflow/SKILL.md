@@ -159,7 +159,16 @@ gate.
 
 - Complete the full `local-gate` first.
 - Create the signed landing commit when commit mode allows.
-- Hand off to the authoritative `$review-orchestration-playbook`.
+- Hand off to the authoritative `$review-orchestration-playbook` only after the
+  local gate succeeded, an exact committed range exists, required formal review
+  is clean, the landing signature is verified, and required authorization and
+  input are satisfied.
+
+The selected profile records the requested terminal outcome; it is not proof
+that the handoff became ready. Preserve `profile: pr-readiness-handoff` on a
+blocked run, but set `handoff: none` and `handoff_profile: none`. Missing
+committed range, review findings, signing failure, blocked authorization, or
+blocked input always stop before handoff.
 
 The review skill owns target authorization, PR selection and lifecycle, named
 review shapes, CI and conversation handling, and the merge-ready decision.
@@ -183,8 +192,10 @@ mutation is forbidden and remote reads remain allowed.
 - Return terminal `pr-readiness-read-only-report`, conforming to its
   [closed receiver schema](../review-orchestration-playbook/references/pr-readiness-read-only-report.schema.json),
   and let the receiver choose its staged terminal target. Selection failure
-  must remain a real pre-target report with no invented PR/base/head; a
-  selected PR whose base/head lookup fails must omit those unresolved fields.
+  must remain a real pre-target report with no invented PR/base, while
+  preserving the exact current query head; a selected PR whose base lookup
+  fails must retain that selected PR and current head while omitting the
+  unresolved base.
   Every report uses fresh instance IDs, and every `observed` evidence kind
   must contain its one closed kind-specific record and repeat the exact report,
   target, and snapshot bindings. Unavailable or blocked kinds contain no
@@ -356,10 +367,12 @@ authorization.
   required and commit mode forbids a commit. It does not push without separate
   authorization.
 - `pr-readiness-handoff` continues through `$review-orchestration-playbook` and
-  stops at merge-ready or a clear blocker, never at merge. Under forbidden
-  commit mode, it may hand off the clean pre-existing exact range only when no
-  hard constraint forbids remote work; a missing range or findings stop before
-  handoff.
+  stops at merge-ready or a clear blocker, never at merge, only when its
+  terminal record proves the complete ready gate. Under forbidden commit mode,
+  it may hand off the clean pre-existing exact range only when no hard
+  constraint forbids remote work and all remaining evidence is satisfied; a
+  missing range, findings, signing failure, authorization blocker, or input
+  blocker stops before handoff.
 - A hard constraint that forbids remote mutation always wins at this step. Do
   not invoke the review skill's mutation-capable PR-readiness path, push, create
   or update a PR, comment, request `@codex review`, start a state-changing wait,
@@ -379,6 +392,7 @@ these fields unchanged across any handoff:
 - resolved `commit_mode`
 - resolved `formal_review_required`
 - resolved `remote_mutation`
+- closed `terminal_outcome`, `terminal_reason`, and `terminal_evidence`
 - `handoff`
 - `handoff_profile`
 
@@ -388,11 +402,21 @@ For `report-only`, `probe-only`, or `read-only`, `local_mutation` must be
 `pr-readiness-handoff`. For `report-only`, `probe-only`, `read-only`, or
 `no-commit`, `commit_mode` must be `forbidden`.
 
-Only a `pr-readiness-handoff` record without a remote-limiting constraint may
-set `handoff` to `review-orchestration-playbook` and `remote_mutation` to
-`review-authorization-required`. That value is not remote authorization; it
-means the review skill must perform its own target and lifecycle preflight.
-Its `handoff_profile` is `pr-readiness`.
+Only a successful `pr-readiness-handoff` record without a remote-limiting
+constraint and with exact ready evidence may set `handoff` to
+`review-orchestration-playbook`, `handoff_profile` to `pr-readiness`, and
+`remote_mutation` to `review-authorization-required`. Exact ready evidence is:
+local gate `succeeded`, committed range `present`, formal review `clean`,
+signature `verified`, authorization `satisfied`, and input `satisfied`. The
+remote-mutation value is not itself remote authorization; it means the review
+skill must perform its own target and lifecycle preflight.
+
+Every blocker uses `terminal_outcome: blocked`, one closed reason, and matching
+closed evidence. In particular, `missing-committed-range`, `review-findings`,
+`signing-failed`, `blocked-authorization`, and `blocked-input` bind their
+corresponding evidence field and force both handoff fields to `none`. Preserve
+the requested profile so the report states what was attempted without
+misrepresenting the blocked terminal as a ready transition.
 
 A `local-gate` record with an explicit PR-readiness probe and no
 remote-read-limiting constraint may instead set `handoff` to

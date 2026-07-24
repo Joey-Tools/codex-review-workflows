@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://joey-tools.invalid/change-delivery-workflow/delivery-result.schema.json",
+  "$id": "https://joey-tools.invalid/change-delivery-workflow/v2/delivery-result.schema.json",
   "title": "Change Delivery Result And Handoff Record",
   "type": "object",
   "required": [
@@ -11,12 +11,15 @@
     "commit_mode",
     "formal_review_required",
     "remote_mutation",
+    "terminal_outcome",
+    "terminal_reason",
+    "terminal_evidence",
     "handoff",
     "handoff_profile"
   ],
   "properties": {
     "schema_version": {
-      "const": 1
+      "const": 2
     },
     "profile": {
       "enum": [
@@ -59,6 +62,90 @@
         "forbidden",
         "review-authorization-required"
       ]
+    },
+    "terminal_outcome": {
+      "enum": [
+        "succeeded",
+        "blocked"
+      ]
+    },
+    "terminal_reason": {
+      "enum": [
+        "focused-checkpoint-complete",
+        "local-gate-complete",
+        "pr-readiness-handoff-ready",
+        "pr-readiness-read-only-probe-ready",
+        "uncommitted-checked-result",
+        "clean-range-report",
+        "implementation-blocked",
+        "validation-blocked",
+        "journal-blocked",
+        "formal-review-blocked",
+        "missing-committed-range",
+        "review-findings",
+        "signing-failed",
+        "blocked-authorization",
+        "blocked-input"
+      ]
+    },
+    "terminal_evidence": {
+      "type": "object",
+      "required": [
+        "local_gate",
+        "committed_range",
+        "formal_review",
+        "signature",
+        "authorization",
+        "input"
+      ],
+      "properties": {
+        "local_gate": {
+          "enum": [
+            "succeeded",
+            "checked",
+            "blocked",
+            "not-required"
+          ]
+        },
+        "committed_range": {
+          "enum": [
+            "present",
+            "missing",
+            "not-required"
+          ]
+        },
+        "formal_review": {
+          "enum": [
+            "clean",
+            "findings",
+            "blocked",
+            "not-started",
+            "not-required"
+          ]
+        },
+        "signature": {
+          "enum": [
+            "verified",
+            "failed",
+            "not-required"
+          ]
+        },
+        "authorization": {
+          "enum": [
+            "satisfied",
+            "blocked",
+            "not-required"
+          ]
+        },
+        "input": {
+          "enum": [
+            "satisfied",
+            "blocked",
+            "not-required"
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "handoff": {
       "enum": [
@@ -180,12 +267,6 @@
           "remote_mutation": {
             "const": "review-authorization-required"
           },
-          "handoff": {
-            "const": "review-orchestration-playbook"
-          },
-          "handoff_profile": {
-            "const": "pr-readiness"
-          },
           "formal_review_required": {
             "const": true
           }
@@ -259,6 +340,84 @@
     {
       "if": {
         "properties": {
+          "profile": {
+            "const": "pr-readiness-handoff"
+          },
+          "terminal_outcome": {
+            "const": "succeeded"
+          }
+        },
+        "required": [
+          "profile",
+          "terminal_outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "terminal_reason": {
+            "const": "pr-readiness-handoff-ready"
+          },
+          "handoff": {
+            "const": "review-orchestration-playbook"
+          },
+          "handoff_profile": {
+            "const": "pr-readiness"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "terminal_outcome": {
+            "const": "blocked"
+          }
+        },
+        "required": [
+          "terminal_outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "terminal_reason": {
+            "enum": [
+              "implementation-blocked",
+              "validation-blocked",
+              "journal-blocked",
+              "formal-review-blocked",
+              "missing-committed-range",
+              "review-findings",
+              "signing-failed",
+              "blocked-authorization",
+              "blocked-input"
+            ]
+          },
+          "handoff": {
+            "const": "none"
+          },
+          "handoff_profile": {
+            "const": "none"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "terminal_reason": {
+            "enum": [
+              "focused-checkpoint-complete",
+              "local-gate-complete",
+              "pr-readiness-handoff-ready",
+              "pr-readiness-read-only-probe-ready",
+              "uncommitted-checked-result",
+              "clean-range-report"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
           "handoff_profile": {
             "const": "none"
           }
@@ -293,6 +452,34 @@
           },
           "remote_mutation": {
             "const": "review-authorization-required"
+          },
+          "terminal_outcome": {
+            "const": "succeeded"
+          },
+          "terminal_reason": {
+            "const": "pr-readiness-handoff-ready"
+          },
+          "terminal_evidence": {
+            "properties": {
+              "local_gate": {
+                "const": "succeeded"
+              },
+              "committed_range": {
+                "const": "present"
+              },
+              "formal_review": {
+                "const": "clean"
+              },
+              "signature": {
+                "const": "verified"
+              },
+              "authorization": {
+                "const": "satisfied"
+              },
+              "input": {
+                "const": "satisfied"
+              }
+            }
           },
           "handoff": {
             "const": "review-orchestration-playbook"
@@ -332,8 +519,169 @@
           "remote_mutation": {
             "const": "forbidden"
           },
+          "terminal_outcome": {
+            "const": "succeeded"
+          },
+          "terminal_reason": {
+            "const": "pr-readiness-read-only-probe-ready"
+          },
+          "terminal_evidence": {
+            "properties": {
+              "local_gate": {
+                "enum": [
+                  "succeeded",
+                  "checked"
+                ]
+              },
+              "authorization": {
+                "const": "not-required"
+              },
+              "input": {
+                "const": "satisfied"
+              }
+            }
+          },
           "handoff": {
             "const": "review-orchestration-playbook"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "terminal_reason": {
+            "const": "missing-committed-range"
+          }
+        },
+        "required": [
+          "terminal_reason"
+        ]
+      },
+      "then": {
+        "properties": {
+          "terminal_outcome": {
+            "const": "blocked"
+          },
+          "terminal_evidence": {
+            "properties": {
+              "committed_range": {
+                "const": "missing"
+              },
+              "formal_review": {
+                "const": "not-started"
+              },
+              "signature": {
+                "const": "not-required"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "terminal_reason": {
+            "const": "review-findings"
+          }
+        },
+        "required": [
+          "terminal_reason"
+        ]
+      },
+      "then": {
+        "properties": {
+          "terminal_outcome": {
+            "const": "blocked"
+          },
+          "terminal_evidence": {
+            "properties": {
+              "committed_range": {
+                "const": "present"
+              },
+              "formal_review": {
+                "const": "findings"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "terminal_reason": {
+            "const": "signing-failed"
+          }
+        },
+        "required": [
+          "terminal_reason"
+        ]
+      },
+      "then": {
+        "properties": {
+          "terminal_outcome": {
+            "const": "blocked"
+          },
+          "terminal_evidence": {
+            "properties": {
+              "signature": {
+                "const": "failed"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "terminal_reason": {
+            "const": "blocked-authorization"
+          }
+        },
+        "required": [
+          "terminal_reason"
+        ]
+      },
+      "then": {
+        "properties": {
+          "terminal_outcome": {
+            "const": "blocked"
+          },
+          "terminal_evidence": {
+            "properties": {
+              "authorization": {
+                "const": "blocked"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "terminal_reason": {
+            "const": "blocked-input"
+          }
+        },
+        "required": [
+          "terminal_reason"
+        ]
+      },
+      "then": {
+        "properties": {
+          "terminal_outcome": {
+            "const": "blocked"
+          },
+          "terminal_evidence": {
+            "properties": {
+              "input": {
+                "const": "blocked"
+              }
+            }
           }
         }
       }
