@@ -13,7 +13,9 @@ DELIVERY_RESULT_SCHEMA = SKILL_ROOT / "references" / "delivery-result.schema.jso
 PROFILE_SELECTION_CASES = (
     SKILL_ROOT / "tests" / "fixtures" / "profile-selection-cases.json"
 )
-REVIEW_FINDING_CASES = SKILL_ROOT / "tests" / "fixtures" / "review-finding-cases.json"
+FORMAL_REVIEW_TERMINAL_CASES = (
+    SKILL_ROOT / "tests" / "fixtures" / "formal-review-terminal-cases.json"
+)
 
 RESULT_FIELDS = {
     "schema_version",
@@ -74,13 +76,13 @@ def profile_selection_cases() -> list[dict[str, object]]:
     return cases
 
 
-def review_finding_cases() -> list[dict[str, object]]:
-    payload = json.loads(REVIEW_FINDING_CASES.read_text(encoding="utf-8"))
+def formal_review_terminal_cases() -> list[dict[str, object]]:
+    payload = json.loads(FORMAL_REVIEW_TERMINAL_CASES.read_text(encoding="utf-8"))
     if payload.get("schema_version") != 1:
-        raise AssertionError("unexpected review-finding fixture version")
+        raise AssertionError("unexpected formal-review terminal fixture version")
     cases = payload.get("cases")
     if not isinstance(cases, list):
-        raise AssertionError("review-finding cases must be a list")
+        raise AssertionError("formal-review terminal cases must be a list")
     return cases
 
 
@@ -404,11 +406,12 @@ class DeliveryProfileContractTest(unittest.TestCase):
         self.assertEqual(positions, tuple(sorted(positions)))
 
     def test_no_commit_review_findings_preserve_range_and_stop(self) -> None:
-        cases = {case["name"]: case for case in review_finding_cases()}
+        cases = {case["name"]: case for case in formal_review_terminal_cases()}
         case = cases["existing-committed-range-no-commit-review-findings"]
         self.assertEqual(
             case["input"],
             {
+                "profile": "local-gate",
                 "commit_mode": "forbidden",
                 "existing_committed_range": "base_sha..head_sha",
                 "review_outcome": "findings",
@@ -420,7 +423,9 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 "apply_fixes": False,
                 "create_new_head": False,
                 "create_signed_review_checkpoint": False,
+                "create_profile_commit": False,
                 "preserve_committed_range": "base_sha..head_sha",
+                "handoff": False,
                 "terminal": "review-findings-blocker",
             },
         )
@@ -430,6 +435,72 @@ class DeliveryProfileContractTest(unittest.TestCase):
             "Preserve the exact existing committed range",
             "report the unresolved findings as a blocker, and stop",
             "Only a later authorization may begin a new mutation-capable run",
+        ):
+            self.assertIn(anchor, self.normalized_change)
+
+    def test_clean_no_commit_review_reports_without_inducing_commit(self) -> None:
+        cases = {case["name"]: case for case in formal_review_terminal_cases()}
+        case = cases["existing-committed-range-no-commit-review-clean"]
+        self.assertEqual(
+            case["input"],
+            {
+                "profile": "local-gate",
+                "commit_mode": "forbidden",
+                "existing_committed_range": "base_sha..head_sha",
+                "review_outcome": "clean",
+            },
+        )
+        self.assertEqual(
+            case["expected"],
+            {
+                "create_new_head": False,
+                "create_signed_review_checkpoint": False,
+                "create_profile_commit": False,
+                "preserve_committed_range": "base_sha..head_sha",
+                "next_step": "profile-terminal",
+                "terminal": "clean-range-report",
+            },
+        )
+        for anchor in (
+            "Report the exact clean range, bypass the signed-commit step",
+            "Do not create, require, amend, or relabel a commit",
+            "clean review under forbidden commit mode is complete evidence",
+            "Enter this step only when commit mode is `allowed`",
+            "bypass this step without asking for or implying commit authorization",
+            "clean pre-existing reviewed range is reported directly",
+        ):
+            self.assertIn(anchor, self.normalized_change)
+
+    def test_missing_range_no_commit_blocks_without_inducing_commit(self) -> None:
+        cases = {case["name"]: case for case in formal_review_terminal_cases()}
+        case = cases["missing-committed-range-no-commit-formal-review-required"]
+        self.assertEqual(
+            case["input"],
+            {
+                "profile": "local-gate",
+                "commit_mode": "forbidden",
+                "existing_committed_range": None,
+                "formal_review_required": True,
+                "review_outcome": "not-started",
+            },
+        )
+        self.assertEqual(
+            case["expected"],
+            {
+                "start_formal_review": False,
+                "create_new_head": False,
+                "create_signed_review_checkpoint": False,
+                "create_profile_commit": False,
+                "handoff": False,
+                "terminal": "missing-committed-range-blocker",
+            },
+        )
+        for anchor in (
+            "Report `missing-committed-range` as a blocker and stop",
+            "Do not create or require a checkpoint, anchor, or commit to start review",
+            "missing exact range or review findings under forbidden commit mode is a terminal blocker",
+            "Do not continue to a profile handoff from either blocker",
+            "a missing range or findings stop before handoff",
         ):
             self.assertIn(anchor, self.normalized_change)
 

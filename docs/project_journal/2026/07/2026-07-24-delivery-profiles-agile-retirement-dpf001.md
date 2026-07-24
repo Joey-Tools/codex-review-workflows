@@ -52,6 +52,10 @@ superseded_by:
   creates a new signed review checkpoint, and reviews the new exact range. When
   commit mode forbids fixes, it preserves the existing committed range, reports
   the findings as a blocker, and stops without creating or requiring history.
+- The formal-review terminal matrix now distinguishes a clean pre-existing
+  range from missing-range and findings blockers under forbidden commit mode.
+  A clean range is reported and proceeds directly to the selected profile's
+  stop or permitted handoff; no row asks for, implies, or manufactures a commit.
 - Synthetic fixture authoring exposes only catalog validation, metadata-only
   listing, and single-ID retrieval. Legacy exemptions remain helper
   compatibility surfaces rather than authoring paths.
@@ -63,9 +67,10 @@ superseded_by:
 ## Evidence
 
 - `python3 -B skills/change-delivery-workflow/tests/test_delivery_profiles.py`
-  passed (`14` tests), including deterministic constrained-scope conflicts,
+  passed (`16` tests), including deterministic constrained-scope conflicts,
   positive PR-handoff controls, closed result-record rejection cases, and the
-  existing-range/no-commit/review-findings regression.
+  clean-range, missing-range, and findings terminal matrix under forbidden
+  commit mode.
 - `python3 -B skills/synthetic-token-fixtures/tests/test_skill_contract.py -v`
   passed (`2` tests).
 - `python3 -B skills/review-orchestration-playbook/tests/test_synthetic_tokens.py SyntheticTokenCliTest -v`

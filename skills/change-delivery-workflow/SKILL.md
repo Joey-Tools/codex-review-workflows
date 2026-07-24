@@ -200,14 +200,30 @@ authorization.
     head, checkpoint, anchor, or commit. Preserve the exact existing committed
     range, report the unresolved findings as a blocker, and stop. Only a later
     authorization may begin a new mutation-capable run.
-- Continue only when the latest reviewed head is clean under an allowed commit
-  mode, or when a forbidden commit mode has stopped with the findings and
-  blocker reported.
+- Resolve every required formal-review terminal state with this matrix:
+
+| Commit mode | Exact committed range | Formal review result | Required terminal action |
+| --- | --- | --- | --- |
+| `allowed` | available | `clean` | Continue to the signed-commit step, reusing the clean checkpoint when it already is the landing commit. |
+| `allowed` | available | `findings` | Apply fixes and repeat the affected gates on a new exact range. |
+| `forbidden` | missing | not started | Report `missing-committed-range` as a blocker and stop. Do not create or require a checkpoint, anchor, or commit to start review. |
+| `forbidden` | available | `findings` | Report `review-findings` as a blocker and stop on the preserved range without mutation. |
+| `forbidden` | available | `clean` | Report the exact clean range, bypass the signed-commit step, and continue directly to the profile terminal step. Do not create, require, amend, or relabel a commit. |
+
+- Continue to the signed-commit step only when the latest reviewed head is clean
+  under an allowed commit mode.
+- A clean review under forbidden commit mode is complete evidence for the
+  pre-existing exact range. It does not turn commit mode back to `allowed`.
+- A missing exact range or review findings under forbidden commit mode is a
+  terminal blocker. Do not continue to a profile handoff from either blocker.
 - The latest clean reviewed checkpoint is the profile's landing commit. When
   review produces no fixes, do not create an empty commit or amend, squash, or
   rewrite history merely to relabel that checkpoint as the landing.
 
 6. Create the signed checkpoint or landing commit.
+- Enter this step only when commit mode is `allowed`. When commit mode is
+  `forbidden` and the pre-existing exact range reviewed cleanly, bypass this
+  step without asking for or implying commit authorization.
 - When commit mode allows it, selecting a delivery profile authorizes its
   corresponding local commit after the gates pass; do not ask again merely to
   commit.
@@ -226,13 +242,17 @@ authorization.
 
 7. Stop or hand off.
 - `focused-checkpoint` stops at the signed local checkpoint, or at the requested
-  report when commit mode forbids a checkpoint.
+  report when commit mode forbids a checkpoint. A clean pre-existing reviewed
+  range is reported directly; no additional commit is required.
 - `local-gate` stops at the signed local landing commit, or at the requested
-  report or formal-review blocker when commit mode forbids a commit. It does not
-  push without separate authorization.
+  report when a pre-existing exact range reviewed cleanly, or at the
+  `missing-committed-range` / `review-findings` blocker when commit mode forbids
+  a commit. It does not push without separate authorization.
 - `pr-readiness-handoff` continues through `$review-orchestration-playbook` and
-  stops at merge-ready or a clear blocker, including a missing committed range,
-  never at merge.
+  stops at merge-ready or a clear blocker, never at merge. Under forbidden
+  commit mode, it may hand off the clean pre-existing exact range only when no
+  hard constraint forbids remote work; a missing range or findings stop before
+  handoff.
 - A hard constraint that forbids PR handoff always wins at this step. Do not
   invoke the review skill's PR-readiness path, push, create or update a PR,
   comment, start a remote wait, or release.

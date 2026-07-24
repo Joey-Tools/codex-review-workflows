@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "existing-committed-range-no-commit-review-findings",
+      "input": {
+        "profile": "local-gate",
+        "commit_mode": "forbidden",
+        "existing_committed_range": "base_sha..head_sha",
+        "review_outcome": "findings"
+      },
+      "expected": {
+        "apply_fixes": false,
+        "create_new_head": false,
+        "create_signed_review_checkpoint": false,
+        "create_profile_commit": false,
+        "preserve_committed_range": "base_sha..head_sha",
+        "handoff": false,
+        "terminal": "review-findings-blocker"
+      }
+    },
+    {
+      "name": "existing-committed-range-no-commit-review-clean",
+      "input": {
+        "profile": "local-gate",
+        "commit_mode": "forbidden",
+        "existing_committed_range": "base_sha..head_sha",
+        "review_outcome": "clean"
+      },
+      "expected": {
+        "create_new_head": false,
+        "create_signed_review_checkpoint": false,
+        "create_profile_commit": false,
+        "preserve_committed_range": "base_sha..head_sha",
+        "next_step": "profile-terminal",
+        "terminal": "clean-range-report"
+      }
+    },
+    {
+      "name": "missing-committed-range-no-commit-formal-review-required",
+      "input": {
+        "profile": "local-gate",
+        "commit_mode": "forbidden",
+        "existing_committed_range": null,
+        "formal_review_required": true,
+        "review_outcome": "not-started"
+      },
+      "expected": {
+        "start_formal_review": false,
+        "create_new_head": false,
+        "create_signed_review_checkpoint": false,
+        "create_profile_commit": false,
+        "handoff": false,
+        "terminal": "missing-committed-range-blocker"
+      }
+    }
+  ]
+}
