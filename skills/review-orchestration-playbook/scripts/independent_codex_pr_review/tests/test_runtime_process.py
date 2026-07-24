@@ -166,6 +166,55 @@ class ProcessStartIdentityTests(unittest.TestCase):
             process_start_identity(pid)
 
 
+class LinuxProcessGroupEnumerationTests(unittest.TestCase):
+    def test_terminal_proc_states_do_not_block_group_closure(self) -> None:
+        process_group = 700
+        records = {
+            "101": b"101 (running worker) R 1 700\n",
+            "102": b"102 (zombie worker) Z 1 700\n",
+            "103": b"103 (dead worker) X 1 700\n",
+            "104": b"104 (lowercase dead worker) x 1 700\n",
+            "105": b"105 (sleeping worker) S 1 700\n",
+            "106": b"106 (other group) R 1 701\n",
+        }
+        with owned_temporary_directory("linux-proc-group-") as root:
+            for pid, record in records.items():
+                (root / pid).write_bytes(record)
+
+            real_open = os.open
+            real_scandir = os.scandir
+
+            def open_fixture(path: object, flags: int) -> int:
+                path_text = os.fspath(path)
+                if isinstance(path_text, bytes):
+                    path_text = os.fsdecode(path_text)
+                prefix = "/proc/"
+                suffix = "/stat"
+                if path_text.startswith(prefix) and path_text.endswith(suffix):
+                    pid = path_text[len(prefix) : -len(suffix)]
+                    return real_open(root / pid, flags)
+                return real_open(path_text, flags)
+
+            with (
+                mock.patch.object(
+                    process_module.os,
+                    "scandir",
+                    side_effect=lambda _path: real_scandir(root),
+                ),
+                mock.patch.object(
+                    process_module.os,
+                    "open",
+                    side_effect=open_fixture,
+                ),
+            ):
+                members = process_module._linux_process_group_members(
+                    process_group,
+                    deadline=time.monotonic() + 2,
+                )
+
+        self.assertEqual(members, (101, 105))
+
+
 @unittest.skipUnless(os.name == "posix", "POSIX process groups are required")
 class AnchoredProcessGroupTests(unittest.TestCase):
     def test_post_fork_identity_failure_retains_receipt_after_cleanup_gap(

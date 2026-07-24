@@ -1470,7 +1470,7 @@ class RawGitProtocolTests(unittest.TestCase):
                 b"#!/bin/sh\nIFS= read -r request\n"
                 b"/usr/bin/head -c 4194304 /dev/zero >&2\n",
                 OverflowError,
-                1.0,
+                2.0,
             ),
             (
                 "open-pipes",

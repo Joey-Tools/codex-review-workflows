@@ -18,6 +18,7 @@ from typing import Any, Mapping, Sequence
 
 
 PROCESS_GROUP_MEMBER_CAP = 262_144
+_LINUX_TERMINAL_PROCESS_STATES = frozenset({b"Z", b"X", b"x"})
 _FORK_PID_RECEIPT = struct.Struct("!8sQ")
 _FORK_PID_RECEIPT_MAGIC = b"FXPIDv1\0"
 _FORK_PID_RECEIPT_SECONDS = 2.0
@@ -1034,11 +1035,19 @@ def _linux_process_group_members(
             fields = raw[closing + 2 :].split() if closing >= 0 else ()
             if len(fields) < 3:
                 raise ValueError("process stat record is malformed")
+            process_state = fields[0]
+            if len(process_state) != 1:
+                raise ValueError("process stat state is malformed")
             try:
                 observed_group = int(fields[2], 10)
             except ValueError as error:
                 raise ValueError("process stat group is malformed") from error
-            if observed_group == process_group:
+            # Zombies and dead tasks cannot execute or retain inherited streams.
+            # Their parent owns eventual reaping, so they do not block group closure.
+            if (
+                observed_group == process_group
+                and process_state not in _LINUX_TERMINAL_PROCESS_STATES
+            ):
                 members.add(pid)
     return tuple(sorted(members))
 
