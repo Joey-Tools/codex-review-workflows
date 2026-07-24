@@ -116,6 +116,7 @@ instead says that remote or full-gate work must wait for a later request, select
 | `Run the full workflow with no remote work.` | `local-gate` | full local gate, then stop under `no-remote` |
 | `Review full-workflow readiness read-only.` | `local-gate` | read-only gate report with no handoff |
 | `Probe full workflow and PR readiness; do not make remote changes.` | `local-gate` | read-only local report, then read-only PR probe |
+| `Complete the full local workflow, then report PR readiness without remote mutations.` | `local-gate` | full local gate, formal review, then read-only PR probe |
 | `Run the full workflow and open a PR.` | `pr-readiness-handoff` | full local gate, then PR handoff |
 
 ### `focused-checkpoint`
@@ -391,12 +392,13 @@ Its `handoff_profile` is `pr-readiness`.
 A `local-gate` record with an explicit PR-readiness probe and no
 remote-read-limiting constraint may instead set `handoff` to
 `review-orchestration-playbook`, `handoff_profile` to
-`pr-readiness-read-only-probe`, `remote_mutation` to `forbidden`, and
-`formal_review_required` to `false`. A required formal review must terminate at
-its missing-range or findings blocker before this probe rather than being
-silently skipped. The receiver must preserve that read-only capability ceiling
-and return only the selection/lifecycle/CI/conversation/base/head evidence
-report.
+`pr-readiness-read-only-probe`, and `remote_mutation` to `forbidden`. Preserve
+the already resolved `formal_review_required` value: a `local-gate` whose commit
+mode is `allowed` keeps `true` and completes its formal review before the probe;
+a commit-forbidden gate may keep its default `false` or an independent
+policy-required `true`. The handoff never changes that value. The receiver must
+preserve that read-only capability ceiling and return only the
+selection/lifecycle/CI/conversation/base/head evidence report.
 Receivers must fail closed on a missing constraint, an unknown field, or an
 internally contradictory record instead of inferring a broader scope from prose.
 

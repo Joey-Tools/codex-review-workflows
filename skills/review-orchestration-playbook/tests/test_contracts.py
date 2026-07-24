@@ -1460,20 +1460,31 @@ class RepositoryContractTest(unittest.TestCase):
             private,
         )
 
-    def test_canonical_ci_covers_all_active_skill_helpers_and_suites(self) -> None:
-        canonical = (CI_FIXTURE_ROOT / "canonical.yml").read_text(encoding="utf-8")
-        for anchor in (
-            "skills/synthetic-token-fixtures/scripts/active_catalog_binding.py",
-            "skills/change-delivery-workflow/tests",
-            "skills/synthetic-token-fixtures/tests",
-        ):
-            self.assertIn(anchor, canonical)
+    def test_release_ci_profiles_cover_all_active_skill_helpers_and_suites(
+        self,
+    ) -> None:
+        profiles = {
+            "canonical": (
+                (CI_FIXTURE_ROOT / "canonical.yml").read_text(encoding="utf-8"),
+                "skills",
+            ),
+            "private": (
+                (CI_FIXTURE_ROOT / "private.yml").read_text(encoding="utf-8"),
+                "personal_codex/skills",
+            ),
+        }
+        for profile, (workflow, skill_prefix) in profiles.items():
+            with self.subTest(profile=profile):
+                for anchor in (
+                    "jsonschema==4.26.0",
+                    f"{skill_prefix}/synthetic-token-fixtures/scripts/active_catalog_binding.py",
+                    f"{skill_prefix}/change-delivery-workflow/tests",
+                    f"{skill_prefix}/synthetic-token-fixtures/tests",
+                ):
+                    self.assertIn(anchor, workflow)
 
-        if CI_PROFILE == "canonical":
-            workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
-                encoding="utf-8"
-            )
-            self.assertEqual(workflow, canonical)
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertEqual(workflow, profiles[CI_PROFILE][0])
 
     def test_helper_declares_and_tests_its_minimum_python_runtime(self) -> None:
         entrypoint = (SCRIPTS / "isolated_review").read_text(encoding="utf-8")

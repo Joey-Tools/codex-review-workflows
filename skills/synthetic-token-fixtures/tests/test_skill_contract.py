@@ -133,6 +133,8 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
             "never accepts a catalog or review-skill path",
             "POSIX no-follow, nonblocking, close-on-exec",
             "one controlled in-process transaction",
+            "`--expect-binding-sha256` is mandatory",
+            "only `bind` may omit it",
             "manifest-bound source snapshots",
             "never executes the returned Python or CLI path",
         ):
@@ -373,6 +375,34 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
             self.assertEqual(rejected.returncode, 2)
             self.assertIn("release payload", rejected.stderr)
 
+    def test_authoring_operations_require_the_captured_binding_digest(self) -> None:
+        with self.installed_release() as release_root:
+            resolver = (
+                release_root
+                / "personal_codex"
+                / "skills"
+                / "synthetic-token-fixtures"
+                / "scripts"
+                / "active_catalog_binding.py"
+            )
+            for action, token_id in (
+                ("validate", None),
+                ("list", None),
+                ("get", "unused-token-id"),
+            ):
+                with self.subTest(action=action):
+                    rejected = self.run_binding(
+                        resolver,
+                        action=action,
+                        token_id=token_id,
+                    )
+                    self.assertEqual(rejected.returncode, 2)
+                    self.assertEqual(rejected.stdout, "")
+                    self.assertIn(
+                        "--expect-binding-sha256 is required for validate, list, and get",
+                        rejected.stderr,
+                    )
+
     def test_isolated_launch_blocks_stdlib_and_package_shadows(self) -> None:
         with self.installed_release() as release_root:
             synthetic_root = (
@@ -411,9 +441,16 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
                     encoding="utf-8",
                 )
 
+                bound = self.run_binding(
+                    resolver,
+                    cwd=shadow_root,
+                )
+                self.assertEqual(bound.returncode, 0, bound.stderr)
+                binding = json.loads(bound.stdout)
                 captured = self.run_binding(
                     resolver,
                     action="list",
+                    expected=binding["binding_sha256"],
                     cwd=shadow_root,
                 )
                 self.assertEqual(captured.returncode, 0, captured.stderr)

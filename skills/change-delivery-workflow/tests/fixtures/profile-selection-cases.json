@@ -185,6 +185,23 @@
       }
     },
     {
+      "prompt": "Complete the full local workflow, then report PR readiness without remote mutations.",
+      "transition": "full local gate, formal review, then read-only PR probe",
+      "result": {
+        "schema_version": 1,
+        "profile": "local-gate",
+        "constraints": [
+          "no-remote"
+        ],
+        "local_mutation": "allowed",
+        "commit_mode": "allowed",
+        "formal_review_required": true,
+        "remote_mutation": "forbidden",
+        "handoff": "review-orchestration-playbook",
+        "handoff_profile": "pr-readiness-read-only-probe"
+      }
+    },
+    {
       "prompt": "Run the full workflow and open a PR.",
       "transition": "full local gate, then PR handoff",
       "result": {

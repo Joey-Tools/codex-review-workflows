@@ -1185,6 +1185,11 @@ def main(argv: list[str] | None = None) -> int:
     transaction = _BindingTransaction()
     output: dict[str, object] | None = None
     try:
+        expected = arguments.expect_binding_sha256
+        if arguments.action != "bind" and expected is None:
+            raise BindingError(
+                "--expect-binding-sha256 is required for validate, list, and get"
+            )
         resolver = Path(__file__)
         loaded_skill_root = Path(arguments.loaded_skill_root)
         binding, review_root, runtime_files, catalog_bytes = _build_binding(
@@ -1192,7 +1197,6 @@ def main(argv: list[str] | None = None) -> int:
             loaded_skill_root=loaded_skill_root,
             transaction=transaction,
         )
-        expected = arguments.expect_binding_sha256
         if expected is not None:
             if SHA256.fullmatch(expected) is None:
                 raise BindingError("expected binding digest is not canonical SHA-256")

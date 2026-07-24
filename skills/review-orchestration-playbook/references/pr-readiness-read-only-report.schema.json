@@ -49,9 +49,6 @@
             "remote_mutation": {
               "const": "forbidden"
             },
-            "formal_review_required": {
-              "const": false
-            },
             "handoff": {
               "const": "review-orchestration-playbook"
             },
@@ -63,7 +60,6 @@
             "profile",
             "constraints",
             "remote_mutation",
-            "formal_review_required",
             "handoff",
             "handoff_profile"
           ]

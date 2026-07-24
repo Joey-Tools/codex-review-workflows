@@ -187,6 +187,12 @@ def assert_valid_result_contract(result: object) -> None:
         raise AssertionError("unknown commit mode")
     if not isinstance(result["formal_review_required"], bool):
         raise AssertionError("formal-review requirement must be boolean")
+    if (
+        result["profile"] == "local-gate"
+        and commit_mode == "allowed"
+        and result["formal_review_required"] is not True
+    ):
+        raise AssertionError("commit-allowed local gate bypassed formal review")
     remote_mutation = result["remote_mutation"]
     if remote_mutation not in {
         "forbidden",
@@ -237,8 +243,6 @@ def assert_valid_result_contract(result: object) -> None:
         if handoff_profile != "pr-readiness":
             raise AssertionError("PR handoff used the wrong review profile")
     elif handoff_profile == "pr-readiness-read-only-probe":
-        if result["formal_review_required"] is not False:
-            raise AssertionError("read-only PR probe bypassed a required review")
         if result["profile"] != "local-gate":
             raise AssertionError("read-only PR probe did not use the local gate")
         if remote_mutation != "forbidden":
@@ -391,6 +395,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
             "Implement and validate this locally, but do not commit.": False,
             "Run the full workflow with no remote work.": True,
             "Probe full workflow and PR readiness; do not make remote changes.": False,
+            "Complete the full local workflow, then report PR readiness without remote mutations.": True,
             "Run the full workflow and open a PR.": True,
         }
         for prompt, formal_review_required in expected.items():
@@ -405,7 +410,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
         )
         for prompt in (
             "Run the full workflow and open a PR.",
-            "Probe full workflow and PR readiness; do not make remote changes.",
+            "Complete the full local workflow, then report PR readiness without remote mutations.",
         ):
             contradictory = copy.deepcopy(cases[prompt])
             contradictory["formal_review_required"] = not contradictory[
@@ -689,9 +694,9 @@ class DeliveryProfileContractTest(unittest.TestCase):
             delivery_contract[1]["properties"]["handoff_profile"]["const"],
             "pr-readiness-read-only-probe",
         )
-        self.assertIs(
-            delivery_contract[1]["properties"]["formal_review_required"]["const"],
-            False,
+        self.assertNotIn(
+            "formal_review_required",
+            delivery_contract[1]["properties"],
         )
         self.assertEqual(
             set(schema["properties"]["evidence"]["required"]),
@@ -720,7 +725,23 @@ class DeliveryProfileContractTest(unittest.TestCase):
         validator = read_only_report_validator()
         self.assertEqual(list(validator.iter_errors(valid)), [])
 
+        commit_allowed = copy.deepcopy(valid)
+        commit_allowed["delivery_record"] = next(
+            case["result"]
+            for case in profile_selection_cases()
+            if case["prompt"]
+            == "Complete the full local workflow, then report PR readiness without remote mutations."
+        )
+        self.assertEqual(list(validator.iter_errors(commit_allowed)), [])
+        assert_read_only_report_contract(commit_allowed)
+
         inconsistent: dict[str, dict[str, object]] = {}
+
+        downgraded_commit_allowed = copy.deepcopy(commit_allowed)
+        downgraded_commit_allowed["delivery_record"]["formal_review_required"] = False
+        inconsistent["commit-allowed-local-gate-downgraded-review"] = (
+            downgraded_commit_allowed
+        )
 
         missing_unavailable = copy.deepcopy(valid)
         missing_unavailable["unavailable_evidence"].remove("ci-status")
@@ -799,9 +820,10 @@ class DeliveryProfileContractTest(unittest.TestCase):
             set(schema["properties"]["constraints"]["items"]["enum"]),
             CONSTRAINTS,
         )
-        self.assertEqual(len(schema["allOf"]), 8)
+        self.assertEqual(len(schema["allOf"]), 9)
         (
             local_mutation_constraint,
+            local_gate_formal_review_constraint,
             commit_constraint,
             profile_constraint,
             remote_constraint,
@@ -845,6 +867,22 @@ class DeliveryProfileContractTest(unittest.TestCase):
         self.assertEqual(
             commit_constraint["else"]["properties"]["commit_mode"]["const"],
             "allowed",
+        )
+        self.assertEqual(
+            local_gate_formal_review_constraint["if"]["properties"]["profile"]["const"],
+            "local-gate",
+        )
+        self.assertEqual(
+            local_gate_formal_review_constraint["if"]["properties"]["commit_mode"][
+                "const"
+            ],
+            "allowed",
+        )
+        self.assertIs(
+            local_gate_formal_review_constraint["then"]["properties"][
+                "formal_review_required"
+            ]["const"],
+            True,
         )
         self.assertEqual(
             profile_constraint["if"]["properties"]["profile"]["const"],
@@ -900,11 +938,9 @@ class DeliveryProfileContractTest(unittest.TestCase):
             read_only_handoff_constraint["then"]["properties"]["handoff"]["const"],
             "review-orchestration-playbook",
         )
-        self.assertIs(
-            read_only_handoff_constraint["then"]["properties"][
-                "formal_review_required"
-            ]["const"],
-            False,
+        self.assertNotIn(
+            "formal_review_required",
+            read_only_handoff_constraint["then"]["properties"],
         )
 
         for case in profile_selection_cases():

@@ -31,7 +31,7 @@ jobs:
           python-version: "3.10"
       - name: Install Python test dependencies
         run: |
-          python3 -m pip install --disable-pip-version-check --no-input 'tomli==2.2.1; python_version < "3.11"'
+          python3 -m pip install --disable-pip-version-check --no-input 'jsonschema==4.26.0' 'tomli==2.2.1; python_version < "3.11"'
       - name: Install Linux isolation dependencies
         if: runner.os == 'Linux'
         run: |
@@ -47,7 +47,8 @@ jobs:
         run: |
           python3 -m py_compile \
             personal_codex/skills/review-orchestration-playbook/scripts/isolated_review \
-            personal_codex/skills/review-orchestration-playbook/scripts/review_runtime/*.py
+            personal_codex/skills/review-orchestration-playbook/scripts/review_runtime/*.py \
+            personal_codex/skills/synthetic-token-fixtures/scripts/active_catalog_binding.py
       - name: Check Linux launcher C syntax
         run: |
           cc -std=c11 -O2 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -fsyntax-only personal_codex/skills/review-orchestration-playbook/scripts/review_runtime/claude_linux_launcher.c
@@ -55,6 +56,14 @@ jobs:
         run: |
           python3 -m unittest discover \
             -s personal_codex/skills/review-orchestration-playbook/tests \
+            -p 'test_*.py'
+      - name: Verify active delivery and synthetic-token workflows
+        run: |
+          python3 -m unittest discover \
+            -s personal_codex/skills/change-delivery-workflow/tests \
+            -p 'test_*.py'
+          python3 -m unittest discover \
+            -s personal_codex/skills/synthetic-token-fixtures/tests \
             -p 'test_*.py'
       - name: Verify private overlay sync on macOS
         if: runner.os == 'macOS'

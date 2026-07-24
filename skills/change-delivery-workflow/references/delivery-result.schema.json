@@ -111,6 +111,29 @@
     {
       "if": {
         "properties": {
+          "profile": {
+            "const": "local-gate"
+          },
+          "commit_mode": {
+            "const": "allowed"
+          }
+        },
+        "required": [
+          "profile",
+          "commit_mode"
+        ]
+      },
+      "then": {
+        "properties": {
+          "formal_review_required": {
+            "const": true
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
           "constraints": {
             "contains": {
               "enum": [
@@ -311,9 +334,6 @@
           },
           "handoff": {
             "const": "review-orchestration-playbook"
-          },
-          "formal_review_required": {
-            "const": false
           }
         }
       }

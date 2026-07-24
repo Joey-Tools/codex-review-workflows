@@ -56,6 +56,12 @@ binding_resolver="$synthetic_skill_root/scripts/active_catalog_binding.py"
   --expect-binding-sha256 "$binding_sha256" validate
 ```
 
+   `--expect-binding-sha256` is mandatory for every `validate`, `list`, and
+   `get` action; only `bind` may omit it. The resolver rejects a missing,
+   malformed, or changed expected digest before executing the bound catalog
+   operation, including before a `get` can publish a raw credential-shaped
+   value.
+
    Each invocation is one controlled in-process transaction. It retains the
    active interpreter, resolver, review CLI, and catalog descriptor bindings;
    executes the review CLI only from manifest-bound source snapshots through a
