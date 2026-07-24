@@ -32,6 +32,7 @@ from .custody import (
     CustodyHandles,
     acquire_source_custody,
     authenticate_helper_state,
+    helper_custody_evidence_matches,
 )
 from .errors import (
     SupervisorError,
@@ -755,7 +756,10 @@ def _acquire_source_custody_via_helper(
             result.get("type") != "source-custody-result"
             or result.get("token") != token
             or result.get("ok") is not True
-            or result.get("evidence") != prepared.helper.to_json()
+            or not helper_custody_evidence_matches(
+                result.get("evidence"),
+                prepared.helper,
+            )
         ):
             raise ValueError(
                 f"custody helper failed: {result.get('error', 'invalid result')}"

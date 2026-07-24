@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import json
 import os
 import pathlib
 import re
 import socket
 import stat
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 
 from .constants import (
@@ -39,6 +40,15 @@ from .wire import receive_record, send_record
 
 HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 HEX_OBJECT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+_IDENTITY_FIELDS = {
+    "device",
+    "inode",
+    "link_count",
+    "mode",
+    "size",
+    "uid",
+}
+_DIRECTORY_PROTOCOL_FIELDS = {"device", "inode", "mode", "uid"}
 
 
 @dataclass
@@ -53,6 +63,55 @@ class CustodyHandles:
                 os.close(fd)
             except OSError:
                 pass
+
+
+def helper_custody_evidence_matches(
+    actual: HelperCustody | dict[str, Any],
+    expected: HelperCustody | dict[str, Any],
+) -> bool:
+    """Compare custody protocol evidence at the protected-property boundary."""
+
+    actual_value = actual.to_json() if isinstance(actual, HelperCustody) else actual
+    expected_value = (
+        expected.to_json() if isinstance(expected, HelperCustody) else expected
+    )
+    if (
+        not isinstance(actual_value, dict)
+        or not isinstance(expected_value, dict)
+        or set(actual_value) != set(expected_value)
+    ):
+        return False
+    actual_state = actual_value.get("state_identity")
+    expected_state = expected_value.get("state_identity")
+    if (
+        not isinstance(actual_state, dict)
+        or not isinstance(expected_state, dict)
+        or set(actual_state) != _IDENTITY_FIELDS
+        or set(expected_state) != _IDENTITY_FIELDS
+        or any(type(actual_state[field]) is not int for field in _IDENTITY_FIELDS)
+        or any(type(expected_state[field]) is not int for field in _IDENTITY_FIELDS)
+        or any(
+            actual_state[field] != expected_state[field]
+            for field in _DIRECTORY_PROTOCOL_FIELDS
+        )
+    ):
+        return False
+    normalized = dict(actual_value)
+    normalized["state_identity"] = dict(expected_state)
+    try:
+        return json.dumps(
+            normalized,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ) == json.dumps(
+            expected_value,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 def _read_leaf_json(
@@ -460,17 +519,7 @@ def acquire_source_custody(
             base_sha=expected.base_sha,
             head_sha=expected.head_sha,
         )
-        if (
-            not directory_identities_match(
-                refreshed.state_identity,
-                expected.state_identity,
-            )
-            or replace(
-                refreshed,
-                state_identity=expected.state_identity,
-            )
-            != expected
-        ):
+        if not helper_custody_evidence_matches(refreshed, expected):
             raise ValueError("helper custody evidence changed before handoff")
         workspace_fd, _ = open_absolute_directory_chain(
             pathlib.Path(expected.workspace_root),
@@ -547,7 +596,7 @@ def custody_helper_main(
             base_sha=base_sha,
             head_sha=head_sha,
         )
-        if expected.to_json() != expected_value:
+        if not helper_custody_evidence_matches(expected, expected_value):
             raise ValueError(
                 "custody helper evidence differs from pre-admission evidence"
             )

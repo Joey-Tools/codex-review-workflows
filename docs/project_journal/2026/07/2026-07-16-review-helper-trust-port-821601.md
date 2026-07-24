@@ -1222,3 +1222,36 @@ metadata behavior.
   Anthropic organization quota until its 2026-08-01 reset; GitHub Codex must
   not be requested before that local lane is terminal. No local Python 3.10 run
   was performed.
+- The replacement whole-range Codex lane on
+  `2a6b5e9f90e17b55b80dee344c18173b4956b921..67484e0e14aed94812f8a5caa36345f4ca231947`
+  found one remaining property-scope mismatch in the real custody-helper
+  protocol: the in-process acquisition path ignored benign state-directory
+  child churn, while the child request and parent result boundaries still
+  compared serialized directory size and link count exactly. All three
+  custody-evidence transitions now use one closed comparator. It binds the
+  state directory's device, inode, file type and mode, and owner, ignores only
+  directory size and link count, and continues to compare every non-directory
+  field plus the source-file and cleanup-lock identities exactly.
+- The real helper subprocess regression now creates a benign state-directory
+  child after parent admission and leaves it present through child
+  reauthentication and descriptor return. The helper still transfers the same
+  open source and cleanup-lock descriptions, proving that both protocol
+  boundaries apply the same property scope. The final file set passes all 43
+  custody/supervisor tests in 89.353 seconds, all 95 repository contract tests
+  in 8.274 seconds, and the fixed 524-test deterministic supervisor gate in
+  199.451 seconds under Python 3.13.0 with bytecode disabled. Current-head full
+  discovery, live no-child and broker gates, exact-secret admission, signed
+  commit, and replacement formal review remain required. No local Python 3.10
+  run was performed.
+- Final Python 3.13 full discovery exercised 2,813 tests in 1,785.657 seconds
+  with 6 skips. Its only failure was the known nested Desktop sandbox denial in
+  the synthetic keychain broker (`sandbox-exec: sandbox_apply: Operation not
+  permitted`); the exact broker regression passes outside that nested sandbox.
+  A stricter diagnostic confirmed that setting `sys.dont_write_bytecode` inside
+  a package `__init__` is too late to prevent CPython from writing that
+  `__init__.pyc`. Direct package import is therefore supported only through a
+  bytecode-disabled interpreter. The release gate keeps explicit `-B` on that
+  import probe, executes all four real installed entrypoints without ambient
+  bytecode environment controls, and requires every Python child-launch vector
+  to contain `-B`. No test inspects or repairs the currently dirty installed
+  release.

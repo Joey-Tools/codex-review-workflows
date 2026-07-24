@@ -36,20 +36,30 @@ class HelperCustodyTests(unittest.TestCase):
                 pathlib.Path(__file__).resolve().parent.parent
                 / "independent-codex-pr-review"
             )
-            handles = _acquire_source_custody_via_helper(
-                entrypoint=entrypoint,
-                prepared=prepared,
-                deadline=time.monotonic() + 10,
-            )
-            competing = os.open(fixture["state_dir"] / "cleanup.lock", os.O_RDONLY)
+            transient = fixture["state_dir"] / "benign-transient-child"
+            transient.mkdir(mode=0o700)
+            handles = None
+            competing = None
             try:
+                handles = _acquire_source_custody_via_helper(
+                    entrypoint=entrypoint,
+                    prepared=prepared,
+                    deadline=time.monotonic() + 10,
+                )
+                competing = os.open(
+                    fixture["state_dir"] / "cleanup.lock",
+                    os.O_RDONLY,
+                )
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(competing, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 self.assertEqual(
                     os.read(handles.source_fd, len(fixture["diff"])), fixture["diff"]
                 )
             finally:
-                handles.close()
+                if handles is not None:
+                    handles.close()
+                transient.rmdir()
+            assert competing is not None
             fcntl.flock(competing, fcntl.LOCK_EX | fcntl.LOCK_NB)
             os.close(competing)
 
