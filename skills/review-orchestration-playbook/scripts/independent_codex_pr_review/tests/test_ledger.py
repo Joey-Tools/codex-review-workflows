@@ -403,20 +403,20 @@ class InitialAttemptCrashRecoveryTests(unittest.TestCase):
         return canonical_json(
             bind_attempt_state(
                 {
-                "schema_version": SCHEMA_VERSION,
-                "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
-                "named_lane_eligible": NAMED_LANE_ELIGIBLE,
-                "attempt_id": attempt.name.removeprefix("attempt-"),
-                "record_generation": 1,
-                "previous_record_sha256": None,
-                "created_at": created_at + 0.25,
-                "phase": "reserved",
-                "launch_status": "not-attempted",
-                "reservation_status": "outstanding",
-                "closure": "unproven",
-                "process_settlement": "outstanding",
-                "checkout_settlement": "outstanding",
-                "retention_state": "active/unsafe",
+                    "schema_version": SCHEMA_VERSION,
+                    "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+                    "named_lane_eligible": NAMED_LANE_ELIGIBLE,
+                    "attempt_id": attempt.name.removeprefix("attempt-"),
+                    "record_generation": 1,
+                    "previous_record_sha256": None,
+                    "created_at": created_at + 0.25,
+                    "phase": "reserved",
+                    "launch_status": "not-attempted",
+                    "reservation_status": "outstanding",
+                    "closure": "unproven",
+                    "process_settlement": "outstanding",
+                    "checkout_settlement": "outstanding",
+                    "retention_state": "active/unsafe",
                     "leader": None,
                 },
                 retention_root=attempt.parent,
@@ -533,7 +533,7 @@ class InitialAttemptCrashRecoveryTests(unittest.TestCase):
                     self.assertTrue(temporary.is_file())
                     lease.close()
                     self.assertTrue(reconciliation_finished.wait(timeout=5))
-                    worker.join(timeout=0)
+                    worker.join(timeout=5)
             finally:
                 lease.close()
 
@@ -566,9 +566,7 @@ class InitialAttemptCrashRecoveryTests(unittest.TestCase):
     def test_reused_live_pid_does_not_block_reclaim(self) -> None:
         with owned_temporary_directory("ledger-reused-pid-") as root:
             retention, attempt, created_at = self._attempt(root)
-            temporary = attempt / (
-                f".state.json.tmp-{os.getpid()}-fedcba9876543210"
-            )
+            temporary = attempt / (f".state.json.tmp-{os.getpid()}-fedcba9876543210")
             temporary.write_bytes(self._initial_state(attempt, created_at))
             temporary.chmod(0o600)
 

@@ -1278,3 +1278,15 @@ metadata behavior.
   every changed Python file. The final journal, whitespace, signed-commit,
   exact-secret admission, and replacement fresh-context review gates remain
   required. No local Python 3.10 run was performed.
+- The first replacement-head hosted deterministic gate exposed one test-only
+  scheduler race. The crash-recovery worker publishes its completion event in a
+  `finally` block immediately before the Python thread returns, while the test
+  used `join(timeout=0)` and could therefore observe the thread during its final
+  stack exit. The test now performs a bounded five-second join and retains the
+  final `is_alive()` assertion, so a genuinely stuck worker still fails closed.
+  Ten consecutive focused executions passed, and the fixed deterministic
+  supervisor gate again passed all 524 tests in 184.522 seconds.
+  Final Python 3.13 discovery exercised 2,814 tests in 1,708.988 seconds with 6
+  skips; its only failure remained the expected Desktop nested-sandbox denial
+  in the synthetic keychain broker. Exact-head broker, admission, formal review,
+  and hosted CI gates remain required after the signed follow-up push.
