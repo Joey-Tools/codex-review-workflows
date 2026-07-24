@@ -8691,7 +8691,7 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(list(materialized.iterdir()), [])
         self.assertNotIn(secret.encode("ascii"), review.diff_file.read_bytes())
 
-    def test_wip_deleting_secret_from_original_head_still_blocks_review(
+    def test_wip_deleted_source_head_secret_allows_inconclusive_validation(
         self,
     ) -> None:
         secret = ("sk-" + "A" * 40).encode()
@@ -8710,15 +8710,16 @@ class WorkspaceTest(unittest.TestCase):
         )
         self.reviews.append(review)
         self.assertFalse((review.workspace_root / "opaque.bin").exists())
+        secret_delta = self.public_synthetic_manifest(review)["secret_delta"]
+        self.assertEqual(secret_delta["status"], "inconclusive")
+        self.assertEqual(
+            secret_delta["failure_class"],
+            "source-head-exact-growth",
+        )
+        self.assertEqual(secret_delta["violations"], [])
 
-        with self.assertRaises(ReviewError) as raised:
-            validate_external_workspace(review)
-
-        diagnostic = str(raised.exception)
-        self.assertIn("sensitive content preflight blocked external review", diagnostic)
-        self.assertIn("opaque.bin", diagnostic)
-        self.assertIn("openai-key", diagnostic)
-        self.assertNotIn(secret.decode("ascii"), diagnostic)
+        evidence = validate_external_workspace(review)
+        self.assertEqual(evidence["secret_delta"], secret_delta)
 
     def test_oauth_refresh_token_is_detected_in_head_content(self) -> None:
         credential = pathlib.Path(self.temporary.name) / "oauth.json"
@@ -9445,7 +9446,7 @@ class WorkspaceTest(unittest.TestCase):
             "exact-value-scan-incomplete",
         )
 
-    def test_source_wip_cannot_delete_source_head_exact_growth(
+    def test_source_wip_deleted_source_head_exact_growth_allows_validation(
         self,
     ) -> None:
         opaque_payload = b'password = "' + b"R" * 32
@@ -9488,12 +9489,10 @@ class WorkspaceTest(unittest.TestCase):
             manifest["secret_delta"]["failure_class"],
             "source-head-exact-growth",
         )
+        self.assertEqual(manifest["secret_delta"]["violations"], [])
 
-        with self.assertRaisesRegex(
-            ReviewError,
-            "sensitive content preflight blocked external review",
-        ):
-            validate_external_workspace(review)
+        evidence = validate_external_workspace(review)
+        self.assertEqual(evidence["secret_delta"], manifest["secret_delta"])
 
     def test_source_wip_retained_legacy_growth_is_violation(self) -> None:
         legacy_value = unregistered_provider_credential()
@@ -9579,7 +9578,8 @@ class WorkspaceTest(unittest.TestCase):
                 head_ref=source_head,
                 include_source_wip=True,
             )
-        self.reviews.append(review)
+            self.reviews.append(review)
+            evidence = validate_external_workspace(review)
         secret_delta = self.public_synthetic_manifest(review)["secret_delta"]
 
         self.assertEqual(secret_delta["status"], "inconclusive")
@@ -9588,6 +9588,7 @@ class WorkspaceTest(unittest.TestCase):
             "source-head-exact-growth",
         )
         self.assertEqual(secret_delta["violations"], [])
+        self.assertEqual(evidence["secret_delta"], secret_delta)
 
     def test_source_wip_deleted_legacy_growth_does_not_hide_snapshot_violation(
         self,

@@ -2344,6 +2344,7 @@ def start(
             os.fchmod(stderr_handle.fileno(), 0o600)
             runner_arguments = [
                 sys.executable,
+                "-B",
                 str(script_path),
                 "_run-state",
                 "--state-dir",
@@ -3585,6 +3586,7 @@ def _cleanup_before_deadline(
             worker = subprocess.Popen(
                 (
                     sys.executable,
+                    "-B",
                     str(worker_path),
                     str(review.container_dir),
                     *(str(descriptor) for descriptor in cleanup_lock_fds),
