@@ -190,11 +190,19 @@ authorization.
   `$review-orchestration-playbook`.
 - Do not copy the review skill's materialization, provider, PR-state, or evidence
   rules into this skill.
-- Any fix after review creates a new head and immediately invalidates every
-  review result bound to the old range. Rerun affected validation and journal
-  work, create a new signed review checkpoint, and review the new exact range.
-- Continue only when the latest reviewed head is clean or a crisp blocker
-  remains.
+- When formal review returns findings, branch on the resolved `commit_mode`
+  before applying fixes:
+  - If commit mode is `allowed`, apply the fixes, rerun affected validation and
+    journal work, and create a new signed review checkpoint. That checkpoint
+    creates a new head and invalidates every review result bound to the old
+    range; review the new exact range.
+  - If commit mode is `forbidden`, do not apply fixes or create or require a new
+    head, checkpoint, anchor, or commit. Preserve the exact existing committed
+    range, report the unresolved findings as a blocker, and stop. Only a later
+    authorization may begin a new mutation-capable run.
+- Continue only when the latest reviewed head is clean under an allowed commit
+  mode, or when a forbidden commit mode has stopped with the findings and
+  blocker reported.
 - The latest clean reviewed checkpoint is the profile's landing commit. When
   review produces no fixes, do not create an empty commit or amend, squash, or
   rewrite history merely to relabel that checkpoint as the landing.

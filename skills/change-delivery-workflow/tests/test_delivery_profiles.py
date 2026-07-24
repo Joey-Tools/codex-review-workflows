@@ -13,6 +13,7 @@ DELIVERY_RESULT_SCHEMA = SKILL_ROOT / "references" / "delivery-result.schema.jso
 PROFILE_SELECTION_CASES = (
     SKILL_ROOT / "tests" / "fixtures" / "profile-selection-cases.json"
 )
+REVIEW_FINDING_CASES = SKILL_ROOT / "tests" / "fixtures" / "review-finding-cases.json"
 
 RESULT_FIELDS = {
     "schema_version",
@@ -70,6 +71,16 @@ def profile_selection_cases() -> list[dict[str, object]]:
     cases = payload.get("cases")
     if not isinstance(cases, list):
         raise AssertionError("profile-selection cases must be a list")
+    return cases
+
+
+def review_finding_cases() -> list[dict[str, object]]:
+    payload = json.loads(REVIEW_FINDING_CASES.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != 1:
+        raise AssertionError("unexpected review-finding fixture version")
+    cases = payload.get("cases")
+    if not isinstance(cases, list):
+        raise AssertionError("review-finding cases must be a list")
     return cases
 
 
@@ -378,18 +389,49 @@ class DeliveryProfileContractTest(unittest.TestCase):
             self.normalized_change,
         )
 
-    def test_fixes_invalidate_review_and_require_a_new_frozen_range(self) -> None:
+    def test_allowed_review_fixes_require_a_new_frozen_range(self) -> None:
         anchors = (
             "exact frozen range",
-            "Any fix after review creates a new head",
-            "immediately invalidates every review result",
-            "Rerun affected validation and journal work",
+            "branch on the resolved `commit_mode`",
+            "If commit mode is `allowed`",
+            "rerun affected validation and journal work",
             "create a new signed review checkpoint",
+            "creates a new head and invalidates every review result",
             "review the new exact range",
-            "latest reviewed head is clean",
+            "latest reviewed head is clean under an allowed commit mode",
         )
         positions = tuple(self.normalized_change.index(anchor) for anchor in anchors)
         self.assertEqual(positions, tuple(sorted(positions)))
+
+    def test_no_commit_review_findings_preserve_range_and_stop(self) -> None:
+        cases = {case["name"]: case for case in review_finding_cases()}
+        case = cases["existing-committed-range-no-commit-review-findings"]
+        self.assertEqual(
+            case["input"],
+            {
+                "commit_mode": "forbidden",
+                "existing_committed_range": "base_sha..head_sha",
+                "review_outcome": "findings",
+            },
+        )
+        self.assertEqual(
+            case["expected"],
+            {
+                "apply_fixes": False,
+                "create_new_head": False,
+                "create_signed_review_checkpoint": False,
+                "preserve_committed_range": "base_sha..head_sha",
+                "terminal": "review-findings-blocker",
+            },
+        )
+        for anchor in (
+            "If commit mode is `forbidden`",
+            "do not apply fixes or create or require a new head, checkpoint, anchor, or commit",
+            "Preserve the exact existing committed range",
+            "report the unresolved findings as a blocker, and stop",
+            "Only a later authorization may begin a new mutation-capable run",
+        ):
+            self.assertIn(anchor, self.normalized_change)
 
     def test_clean_review_checkpoint_is_the_landing_without_history_churn(
         self,

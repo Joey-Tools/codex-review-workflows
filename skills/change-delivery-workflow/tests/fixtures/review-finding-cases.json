@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "existing-committed-range-no-commit-review-findings",
+      "input": {
+        "commit_mode": "forbidden",
+        "existing_committed_range": "base_sha..head_sha",
+        "review_outcome": "findings"
+      },
+      "expected": {
+        "apply_fixes": false,
+        "create_new_head": false,
+        "create_signed_review_checkpoint": false,
+        "preserve_committed_range": "base_sha..head_sha",
+        "terminal": "review-findings-blocker"
+      }
+    }
+  ]
+}

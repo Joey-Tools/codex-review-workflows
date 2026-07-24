@@ -47,10 +47,11 @@ superseded_by:
   convention, repositories whose policy requires it, and durable cross-session
   or PR handoffs with an existing tracking product. A short checkpoint does not
   introduce first-time tracking by itself.
-- Formal review details remain in `review-orchestration-playbook`. Any fix after
-  review invalidates results bound to the prior range and requires affected
-  validation, journal work, a new signed review checkpoint, and review of the
-  new exact range.
+- Formal review details remain in `review-orchestration-playbook`. When commit
+  mode allows fixes, the workflow reruns affected validation and journal work,
+  creates a new signed review checkpoint, and reviews the new exact range. When
+  commit mode forbids fixes, it preserves the existing committed range, reports
+  the findings as a blocker, and stops without creating or requiring history.
 - Synthetic fixture authoring exposes only catalog validation, metadata-only
   listing, and single-ID retrieval. Legacy exemptions remain helper
   compatibility surfaces rather than authoring paths.
@@ -62,8 +63,9 @@ superseded_by:
 ## Evidence
 
 - `python3 -B skills/change-delivery-workflow/tests/test_delivery_profiles.py`
-  passed (`13` tests), including deterministic constrained-scope conflicts,
-  positive PR-handoff controls, and closed result-record rejection cases.
+  passed (`14` tests), including deterministic constrained-scope conflicts,
+  positive PR-handoff controls, closed result-record rejection cases, and the
+  existing-range/no-commit/review-findings regression.
 - `python3 -B skills/synthetic-token-fixtures/tests/test_skill_contract.py -v`
   passed (`2` tests).
 - `python3 -B skills/review-orchestration-playbook/tests/test_synthetic_tokens.py SyntheticTokenCliTest -v`
@@ -72,8 +74,8 @@ superseded_by:
   passed (`86` tests).
 - `uv run --isolated --with pyyaml python3 /Users/hoteng/.codex/skills/joey-skill-authoring/scripts/codex_skill_validate.py skills/change-delivery-workflow skills/agile-delivery-workflow skills/synthetic-token-fixtures`
   passed (`3/3` skills valid) after the constrained-scope review-fix round.
-- `python3 -m json.tool` passed for the delivery-result schema and deterministic
-  profile-selection fixture.
+- `python3 -m json.tool` passed for the delivery-result schema, deterministic
+  profile-selection fixture, and review-findings fixture.
 - `python3 /Users/hoteng/.codex/personal-sync/overlays/private/releases/9257aca19dc7c370418c1dcf7b8c194b0353eafe/personal_codex/skills/project-journal/scripts/project_journal.py validate --repo .`
   passed.
 - `ruff check skills/change-delivery-workflow/tests/test_delivery_profiles.py skills/synthetic-token-fixtures/tests/test_skill_contract.py skills/review-orchestration-playbook/tests/test_contracts.py`
