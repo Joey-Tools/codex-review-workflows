@@ -21,7 +21,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": 4
+      "const": 5
     },
     "terminal": {
       "const": "pr-readiness-read-only-report"
@@ -259,6 +259,222 @@
         "observed",
         "unavailable",
         "blocked"
+      ]
+    },
+    "githubAppIdentity": {
+      "type": "object",
+      "required": [
+        "__typename",
+        "node_id",
+        "database_id",
+        "slug"
+      ],
+      "properties": {
+        "__typename": {
+          "const": "App"
+        },
+        "node_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9_:+/=-]+$"
+        },
+        "database_id": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "slug": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "githubActorIdentity": {
+      "type": "object",
+      "required": [
+        "__typename",
+        "node_id",
+        "login"
+      ],
+      "properties": {
+        "__typename": {
+          "enum": [
+            "Bot",
+            "EnterpriseUserAccount",
+            "Mannequin",
+            "Organization",
+            "User"
+          ]
+        },
+        "node_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9_:+/=-]+$"
+        },
+        "login": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "checkRunRollupEntry": {
+      "type": "object",
+      "required": [
+        "__typename",
+        "node_id",
+        "database_id",
+        "name",
+        "app",
+        "status",
+        "conclusion"
+      ],
+      "properties": {
+        "__typename": {
+          "const": "CheckRun"
+        },
+        "node_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9_:+/=-]+$"
+        },
+        "database_id": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "app": {
+          "$ref": "#/$defs/githubAppIdentity"
+        },
+        "status": {
+          "enum": [
+            "COMPLETED",
+            "IN_PROGRESS",
+            "PENDING",
+            "QUEUED",
+            "REQUESTED",
+            "WAITING"
+          ]
+        },
+        "conclusion": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "status": {
+              "const": "COMPLETED"
+            },
+            "conclusion": {
+              "enum": [
+                "ACTION_REQUIRED",
+                "CANCELLED",
+                "FAILURE",
+                "NEUTRAL",
+                "SKIPPED",
+                "STALE",
+                "STARTUP_FAILURE",
+                "SUCCESS",
+                "TIMED_OUT"
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "status": {
+              "enum": [
+                "IN_PROGRESS",
+                "PENDING",
+                "QUEUED",
+                "REQUESTED",
+                "WAITING"
+              ]
+            },
+            "conclusion": {
+              "type": "null"
+            }
+          }
+        }
+      ]
+    },
+    "statusContextRollupEntry": {
+      "type": "object",
+      "required": [
+        "__typename",
+        "node_id",
+        "context",
+        "creator",
+        "state"
+      ],
+      "properties": {
+        "__typename": {
+          "const": "StatusContext"
+        },
+        "node_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9_:+/=-]+$"
+        },
+        "context": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "creator": {
+          "$ref": "#/$defs/githubActorIdentity"
+        },
+        "state": {
+          "enum": [
+            "ERROR",
+            "EXPECTED",
+            "FAILURE",
+            "PENDING",
+            "SUCCESS"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "statusCheckRollupEntry": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/checkRunRollupEntry"
+        },
+        {
+          "$ref": "#/$defs/statusContextRollupEntry"
+        }
       ]
     },
     "nonObservedStatus": {
@@ -749,7 +965,7 @@
               "failed",
               "pending",
               "cancelled",
-              "checks"
+              "status_check_rollup"
             ],
             "properties": {
               "state": {
@@ -781,79 +997,12 @@
                 "type": "integer",
                 "minimum": 0
               },
-              "checks": {
+              "status_check_rollup": {
                 "type": "array",
                 "maxItems": 256,
                 "uniqueItems": true,
                 "items": {
-                  "type": "object",
-                  "required": [
-                    "name",
-                    "status",
-                    "conclusion"
-                  ],
-                  "properties": {
-                    "name": {
-                      "type": "string",
-                      "minLength": 1,
-                      "maxLength": 512
-                    },
-                    "status": {
-                      "enum": [
-                        "queued",
-                        "in_progress",
-                        "requested",
-                        "waiting",
-                        "pending",
-                        "completed"
-                      ]
-                    },
-                    "conclusion": {
-                      "type": [
-                        "string",
-                        "null"
-                      ]
-                    }
-                  },
-                  "additionalProperties": false,
-                  "oneOf": [
-                    {
-                      "properties": {
-                        "status": {
-                          "const": "completed"
-                        },
-                        "conclusion": {
-                          "enum": [
-                            "success",
-                            "failure",
-                            "cancelled",
-                            "neutral",
-                            "skipped",
-                            "timed_out",
-                            "action_required",
-                            "stale",
-                            "startup_failure"
-                          ]
-                        }
-                      }
-                    },
-                    {
-                      "properties": {
-                        "status": {
-                          "enum": [
-                            "queued",
-                            "in_progress",
-                            "requested",
-                            "waiting",
-                            "pending"
-                          ]
-                        },
-                        "conclusion": {
-                          "type": "null"
-                        }
-                      }
-                    }
-                  ]
+                  "$ref": "#/$defs/statusCheckRollupEntry"
                 }
               }
             },
@@ -879,7 +1028,7 @@
                   "cancelled": {
                     "const": 0
                   },
-                  "checks": {
+                  "status_check_rollup": {
                     "maxItems": 0
                   }
                 }
@@ -1033,12 +1182,20 @@
           "items": {
             "type": "object",
             "required": [
+              "observed_base_oid",
+              "observed_head_oid",
               "base_object_present",
               "head_object_present",
               "merge_base_count",
               "merge_base_oid"
             ],
             "properties": {
+              "observed_base_oid": {
+                "$ref": "#/$defs/oid"
+              },
+              "observed_head_oid": {
+                "$ref": "#/$defs/oid"
+              },
               "base_object_present": {
                 "type": "boolean"
               },

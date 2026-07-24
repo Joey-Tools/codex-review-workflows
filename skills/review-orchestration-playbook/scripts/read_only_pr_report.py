@@ -26,12 +26,23 @@ READ_CHUNK_BYTES = 64 * 1024
 IDENTIFIER_RE = re.compile(
     r"^(?P<kind>report|target|snapshot|observation):(?P<value>[0-9a-f]{32})$"
 )
+OID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 REPOSITORY_HOST_RE = re.compile(
     r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)"
     r"(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$"
 )
 REPOSITORY_OWNER_RE = re.compile(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$")
 REPOSITORY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]*[A-Za-z0-9_][A-Za-z0-9._-]*$")
+GITHUB_APP_SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+GITHUB_NODE_ID_RE = re.compile(r"^[A-Za-z0-9_:+/=-]{1,256}$")
+GITHUB_LOGIN_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,256}$")
+GITHUB_ACTOR_TYPENAMES = {
+    "Bot",
+    "EnterpriseUserAccount",
+    "Mannequin",
+    "Organization",
+    "User",
+}
 EVIDENCE_NAMES = {
     "pr_selection": "pr-selection",
     "pr_lifecycle": "pr-lifecycle",
@@ -39,24 +50,30 @@ EVIDENCE_NAMES = {
     "conversation_state": "conversation-state",
     "base_and_head": "base-and-head",
 }
-CI_CHECK_STATUSES = {
-    "queued",
-    "in_progress",
-    "requested",
-    "waiting",
-    "pending",
-    "completed",
-}
-CI_CONCLUSION_BUCKETS = {
-    "success": "success",
-    "neutral": "success",
-    "skipped": "success",
-    "failure": "failure",
-    "timed_out": "failure",
-    "action_required": "failure",
-    "stale": "failure",
-    "startup_failure": "failure",
-    "cancelled": "cancelled",
+CI_GATE_BUCKETS_BY_TYPENAME = {
+    "CheckRun": {
+        ("QUEUED", None): "pending",
+        ("IN_PROGRESS", None): "pending",
+        ("REQUESTED", None): "pending",
+        ("WAITING", None): "pending",
+        ("PENDING", None): "pending",
+        ("COMPLETED", "SUCCESS"): "success",
+        ("COMPLETED", "NEUTRAL"): "success",
+        ("COMPLETED", "SKIPPED"): "success",
+        ("COMPLETED", "FAILURE"): "failure",
+        ("COMPLETED", "TIMED_OUT"): "failure",
+        ("COMPLETED", "ACTION_REQUIRED"): "failure",
+        ("COMPLETED", "STALE"): "failure",
+        ("COMPLETED", "STARTUP_FAILURE"): "failure",
+        ("COMPLETED", "CANCELLED"): "cancelled",
+    },
+    "StatusContext": {
+        "SUCCESS": "success",
+        "FAILURE": "failure",
+        "ERROR": "failure",
+        "PENDING": "pending",
+        "EXPECTED": "pending",
+    },
 }
 
 
@@ -84,6 +101,18 @@ def new_bindings() -> dict[str, str]:
 
 def _is_nonnegative_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _is_nullable_positive_int(value: object) -> bool:
+    return value is None or _is_positive_int(value)
+
+
+def _is_oid(value: object) -> bool:
+    return isinstance(value, str) and OID_RE.fullmatch(value) is not None
 
 
 def _mapping(value: object) -> Mapping[str, Any] | None:
@@ -130,6 +159,108 @@ def _observed_record(
     if observed:
         errors.append(f"{location} must not retain a non-observed record")
     return None
+
+
+def _ci_rollup_identity_and_bucket(
+    errors: list[str],
+    entry: Mapping[str, Any],
+    *,
+    index: int,
+) -> tuple[
+    tuple[object, ...] | None,
+    tuple[object, ...] | None,
+    str | None,
+]:
+    location = f"CI statusCheckRollup[{index}]"
+    typename = entry.get("__typename")
+    if typename == "CheckRun":
+        app = _mapping(entry.get("app"))
+        database_id = entry.get("database_id")
+        node_id = entry.get("node_id")
+        name = entry.get("name")
+        status = entry.get("status")
+        conclusion = entry.get("conclusion")
+        if (
+            app is None
+            or app.get("__typename") != "App"
+            or not isinstance(app.get("node_id"), str)
+            or GITHUB_NODE_ID_RE.fullmatch(app["node_id"]) is None
+            or "database_id" not in app
+            or not _is_nullable_positive_int(app.get("database_id"))
+            or not isinstance(app.get("slug"), str)
+            or GITHUB_APP_SLUG_RE.fullmatch(app["slug"]) is None
+        ):
+            errors.append(f"{location} has malformed GitHub App identity")
+            identity = None
+        elif (
+            not isinstance(node_id, str)
+            or GITHUB_NODE_ID_RE.fullmatch(node_id) is None
+            or "database_id" not in entry
+            or not _is_nullable_positive_int(database_id)
+            or not isinstance(name, str)
+            or not (1 <= len(name) <= 512)
+        ):
+            errors.append(f"{location} has malformed CheckRun identity")
+            identity = None
+        else:
+            identity = (
+                "CheckRun",
+                app["node_id"],
+                node_id,
+            )
+            provider = (
+                "App",
+                app["node_id"],
+                app["database_id"],
+                app["slug"],
+            )
+        bucket = CI_GATE_BUCKETS_BY_TYPENAME["CheckRun"].get((status, conclusion))
+        if bucket is None:
+            errors.append(f"{location} status/conclusion combination is unknown")
+        return identity, provider if identity is not None else None, bucket
+
+    if typename == "StatusContext":
+        creator = _mapping(entry.get("creator"))
+        node_id = entry.get("node_id")
+        context = entry.get("context")
+        state = entry.get("state")
+        if (
+            creator is None
+            or creator.get("__typename") not in GITHUB_ACTOR_TYPENAMES
+            or not isinstance(creator.get("node_id"), str)
+            or GITHUB_NODE_ID_RE.fullmatch(creator["node_id"]) is None
+            or not isinstance(creator.get("login"), str)
+            or GITHUB_LOGIN_RE.fullmatch(creator["login"]) is None
+        ):
+            errors.append(f"{location} has malformed creator identity")
+            identity = None
+        elif (
+            not isinstance(node_id, str)
+            or GITHUB_NODE_ID_RE.fullmatch(node_id) is None
+            or not isinstance(context, str)
+            or not 1 <= len(context) <= 512
+        ):
+            errors.append(f"{location} has malformed StatusContext identity")
+            identity = None
+        else:
+            identity = (
+                "StatusContext",
+                creator["node_id"],
+                node_id,
+            )
+            provider = (
+                "Actor",
+                creator["node_id"],
+                creator["__typename"],
+                creator["login"],
+            )
+        bucket = CI_GATE_BUCKETS_BY_TYPENAME["StatusContext"].get(state)
+        if bucket is None:
+            errors.append(f"{location} state is unknown")
+        return identity, provider if identity is not None else None, bucket
+
+    errors.append(f"{location} typename is unknown")
+    return None, None, None
 
 
 def semantic_errors(report: object) -> list[str]:
@@ -381,39 +512,40 @@ def semantic_errors(report: object) -> list[str]:
         [], evidence_records["ci_status"], "evidence.ci_status"
     )
     if ci_record is not None:
-        checks = _sequence(ci_record.get("checks"))
-        if checks is None:
-            errors.append("CI checks must be an array")
+        rollup = _sequence(ci_record.get("status_check_rollup"))
+        if rollup is None:
+            errors.append("CI statusCheckRollup must be an array")
         else:
-            names: list[object] = []
+            stable_identities: list[tuple[object, ...]] = []
+            provider_bindings: dict[tuple[object, object], tuple[object, ...]] = {}
             actual = {"success": 0, "failure": 0, "pending": 0, "cancelled": 0}
-            for check in checks:
-                check_record = _mapping(check)
-                if check_record is None:
-                    errors.append("each CI check must be an object")
+            for index, item in enumerate(rollup):
+                entry = _mapping(item)
+                if entry is None:
+                    errors.append("each CI statusCheckRollup entry must be an object")
                     continue
-                names.append(check_record.get("name"))
-                status = check_record.get("status")
-                conclusion = check_record.get("conclusion")
-                bucket: str | None = None
-                if not isinstance(status, str) or status not in CI_CHECK_STATUSES:
-                    errors.append("CI check status is unknown")
-                elif status != "completed":
-                    if conclusion is not None:
-                        errors.append("non-completed CI check conclusion must be null")
-                    else:
-                        bucket = "pending"
-                elif (
-                    not isinstance(conclusion, str)
-                    or conclusion not in CI_CONCLUSION_BUCKETS
-                ):
-                    errors.append("completed CI check conclusion is unknown")
-                else:
-                    bucket = CI_CONCLUSION_BUCKETS[conclusion]
+                identity, provider, bucket = _ci_rollup_identity_and_bucket(
+                    errors,
+                    entry,
+                    index=index,
+                )
+                if identity is not None:
+                    stable_identities.append(identity)
+                if provider is not None:
+                    provider_key = (provider[0], provider[1])
+                    provider_value = provider[2:]
+                    previous = provider_bindings.setdefault(
+                        provider_key,
+                        provider_value,
+                    )
+                    if previous != provider_value:
+                        errors.append(
+                            "CI statusCheckRollup provider identity is inconsistent"
+                        )
                 if bucket is not None:
                     actual[bucket] += 1
-            if len(names) != len(set(names)):
-                errors.append("CI check names must be unique")
+            if len(stable_identities) != len(set(stable_identities)):
+                errors.append("CI statusCheckRollup stable identities must be unique")
             reported = {
                 "success": ci_record.get("successful"),
                 "failure": ci_record.get("failed"),
@@ -423,13 +555,13 @@ def semantic_errors(report: object) -> list[str]:
             if any(not _is_nonnegative_int(value) for value in reported.values()):
                 errors.append("CI aggregate counts must be non-negative integers")
             elif reported != actual:
-                errors.append("CI aggregate counts do not match check results")
+                errors.append("CI aggregate counts do not match statusCheckRollup")
             total = ci_record.get("total")
-            if not _is_nonnegative_int(total) or total != len(checks):
-                errors.append("CI total does not match check results")
+            if not _is_nonnegative_int(total) or total != len(rollup):
+                errors.append("CI total does not match statusCheckRollup")
             expected_state = (
                 "no-checks"
-                if not checks
+                if not rollup
                 else "failure"
                 if actual["failure"]
                 else "pending"
@@ -439,7 +571,7 @@ def semantic_errors(report: object) -> list[str]:
                 else "success"
             )
             if ci_record.get("state") != expected_state:
-                errors.append("CI aggregate state contradicts check results")
+                errors.append("CI aggregate state contradicts statusCheckRollup")
 
     conversation_record = _observed_record(
         [],
@@ -460,25 +592,51 @@ def semantic_errors(report: object) -> list[str]:
         [], evidence_records["base_and_head"], "evidence.base_and_head"
     )
     if range_record is not None:
-        base_present = range_record.get("base_object_present")
-        head_present = range_record.get("head_object_present")
-        merge_base_count = range_record.get("merge_base_count")
-        merge_base_oid = range_record.get("merge_base_oid")
-        if not isinstance(base_present, bool) or not isinstance(head_present, bool):
-            errors.append("endpoint object-presence fields must be booleans")
-        if not _is_nonnegative_int(merge_base_count):
-            errors.append("merge_base_count must be a non-negative integer")
+        target_base = _mapping(target.get("base"))
+        target_head = _mapping(target.get("head"))
+        observed_base_oid = range_record.get("observed_base_oid")
+        observed_head_oid = range_record.get("observed_head_oid")
+        endpoints_match = True
+        if target_base is None or target_head is None:
+            errors.append(
+                "observed base/head evidence requires resolved target endpoints"
+            )
+            endpoints_match = False
         else:
-            if (not base_present or not head_present) and (
-                merge_base_count != 0 or merge_base_oid is not None
-            ):
-                errors.append(
-                    "missing endpoint objects cannot have merge-base evidence"
-                )
-            elif merge_base_count == 1 and not isinstance(merge_base_oid, str):
-                errors.append("one merge base requires merge_base_oid")
-            elif merge_base_count != 1 and merge_base_oid is not None:
-                errors.append("non-unique merge base must not claim merge_base_oid")
+            target_base_oid = target_base.get("oid")
+            target_head_oid = target_head.get("oid")
+            if not _is_oid(target_base_oid) or not _is_oid(observed_base_oid):
+                errors.append("base endpoint OIDs must be full lowercase object IDs")
+                endpoints_match = False
+            elif observed_base_oid != target_base_oid:
+                errors.append("observed_base_oid must exactly equal target.base.oid")
+                endpoints_match = False
+            if not _is_oid(target_head_oid) or not _is_oid(observed_head_oid):
+                errors.append("head endpoint OIDs must be full lowercase object IDs")
+                endpoints_match = False
+            elif observed_head_oid != target_head_oid:
+                errors.append("observed_head_oid must exactly equal target.head.oid")
+                endpoints_match = False
+        if endpoints_match:
+            base_present = range_record.get("base_object_present")
+            head_present = range_record.get("head_object_present")
+            merge_base_count = range_record.get("merge_base_count")
+            merge_base_oid = range_record.get("merge_base_oid")
+            if not isinstance(base_present, bool) or not isinstance(head_present, bool):
+                errors.append("endpoint object-presence fields must be booleans")
+            if not _is_nonnegative_int(merge_base_count):
+                errors.append("merge_base_count must be a non-negative integer")
+            else:
+                if (not base_present or not head_present) and (
+                    merge_base_count != 0 or merge_base_oid is not None
+                ):
+                    errors.append(
+                        "missing endpoint objects cannot have merge-base evidence"
+                    )
+                elif merge_base_count == 1 and not _is_oid(merge_base_oid):
+                    errors.append("one merge base requires merge_base_oid")
+                elif merge_base_count != 1 and merge_base_oid is not None:
+                    errors.append("non-unique merge base must not claim merge_base_oid")
 
     return errors
 

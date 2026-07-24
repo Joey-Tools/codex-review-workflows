@@ -40,7 +40,7 @@
         ],
         "terminal": "pr-readiness-read-only-report",
         "terminal_result": {
-          "schema_version": 4,
+          "schema_version": 5,
           "terminal": "pr-readiness-read-only-report",
           "terminal_state": "target-snapshot",
           "report_id": "report:11111111111111111111111111111111",
@@ -147,6 +147,8 @@
               "snapshot_binding": "snapshot:33333333333333333333333333333333",
               "observed": [
                 {
+                  "observed_base_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "observed_head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                   "base_object_present": true,
                   "head_object_present": true,
                   "merge_base_count": 1,
@@ -189,7 +191,7 @@
       "name": "pre-target-no-match",
       "expected": {
         "terminal_result": {
-          "schema_version": 4,
+          "schema_version": 5,
           "terminal": "pr-readiness-read-only-report",
           "terminal_state": "pre-target",
           "report_id": "report:55555555555555555555555555555555",
@@ -318,7 +320,7 @@
       "name": "pre-target-selection-blocked",
       "expected": {
         "terminal_result": {
-          "schema_version": 4,
+          "schema_version": 5,
           "terminal": "pr-readiness-read-only-report",
           "terminal_state": "pre-target-blocked",
           "report_id": "report:99999999999999999999999999999999",
@@ -445,7 +447,7 @@
       "name": "selected-pr-base-head-blocked",
       "expected": {
         "terminal_result": {
-          "schema_version": 4,
+          "schema_version": 5,
           "terminal": "pr-readiness-read-only-report",
           "terminal_state": "target-resolution-blocked",
           "report_id": "report:dddddddddddddddddddddddddddddddd",
@@ -530,16 +532,31 @@
                   "failed": 0,
                   "pending": 1,
                   "cancelled": 0,
-                  "checks": [
+                  "status_check_rollup": [
                     {
+                      "__typename": "CheckRun",
+                      "node_id": "CHECK_RUN_1001",
+                      "database_id": 1001,
                       "name": "lint",
-                      "status": "completed",
-                      "conclusion": "success"
+                      "app": {
+                        "__typename": "App",
+                        "node_id": "APP_15368",
+                        "database_id": 15368,
+                        "slug": "github-actions"
+                      },
+                      "status": "COMPLETED",
+                      "conclusion": "SUCCESS"
                     },
                     {
-                      "name": "tests",
-                      "status": "in_progress",
-                      "conclusion": null
+                      "__typename": "StatusContext",
+                      "node_id": "STATUS_CONTEXT_REQUIRED",
+                      "context": "required/legacy-tests",
+                      "creator": {
+                        "__typename": "Bot",
+                        "node_id": "MDM6Qm90MTIzNDU2",
+                        "login": "legacy-ci[bot]"
+                      },
+                      "state": "PENDING"
                     }
                   ]
                 }

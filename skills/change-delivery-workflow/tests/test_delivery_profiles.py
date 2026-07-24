@@ -140,6 +140,60 @@ READ_ONLY_ACTION_FIELDS = {
 }
 
 
+def check_run_rollup(
+    *,
+    database_id: int | None,
+    name: str,
+    status: str,
+    conclusion: str | None,
+    app_database_id: int | None = 15368,
+    app_slug: str = "github-actions",
+    node_id: str | None = None,
+    app_node_id: str = "APP_15368",
+) -> dict[str, object]:
+    resolved_node_id = node_id or (
+        f"CHECK_RUN_{database_id}"
+        if database_id is not None
+        else "CHECK_RUN_NO_DATABASE_ID"
+    )
+    return {
+        "__typename": "CheckRun",
+        "node_id": resolved_node_id,
+        "database_id": database_id,
+        "name": name,
+        "app": {
+            "__typename": "App",
+            "node_id": app_node_id,
+            "database_id": app_database_id,
+            "slug": app_slug,
+        },
+        "status": status,
+        "conclusion": conclusion,
+    }
+
+
+def status_context_rollup(
+    *,
+    context: str,
+    state: str,
+    creator_typename: str = "Bot",
+    creator_node_id: str = "MDM6Qm90MTIzNDU2",
+    creator_login: str = "legacy-ci[bot]",
+    node_id: str = "STATUS_CONTEXT_REQUIRED",
+) -> dict[str, object]:
+    return {
+        "__typename": "StatusContext",
+        "node_id": node_id,
+        "context": context,
+        "creator": {
+            "__typename": creator_typename,
+            "node_id": creator_node_id,
+            "login": creator_login,
+        },
+        "state": state,
+    }
+
+
 def documented_profile_cases(skill: str) -> dict[str, tuple[str, str]]:
     cases: dict[str, tuple[str, str]] = {}
     for line in skill.splitlines():
@@ -293,7 +347,7 @@ def assert_valid_result_contract(result: object) -> None:
 def assert_read_only_report_contract(report: object) -> None:
     if not isinstance(report, dict) or set(report) != READ_ONLY_REPORT_FIELDS:
         raise AssertionError("read-only PR report fields do not match the contract")
-    if report["schema_version"] != 4:
+    if report["schema_version"] != 5:
         raise AssertionError("unexpected read-only PR report schema version")
     if report["terminal"] != "pr-readiness-read-only-report":
         raise AssertionError("unexpected read-only PR report terminal")
@@ -693,7 +747,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
         self.assertEqual(set(schema["required"]), READ_ONLY_REPORT_FIELDS)
         self.assertEqual(set(schema["properties"]), READ_ONLY_REPORT_FIELDS)
         self.assertFalse(schema["additionalProperties"])
-        self.assertEqual(schema["properties"]["schema_version"]["const"], 4)
+        self.assertEqual(schema["properties"]["schema_version"]["const"], 5)
         self.assertEqual(
             set(schema["properties"]["terminal_state"]["enum"]),
             {
@@ -746,6 +800,66 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 schema["$defs"][definition]["allOf"],
                 [{"$ref": "#/$defs/nonemptyObservedEvidence"}],
             )
+        ci_observation = schema["$defs"]["ciStatusEvidence"]["properties"]["observed"][
+            "items"
+        ]
+        self.assertIn("status_check_rollup", ci_observation["required"])
+        self.assertEqual(
+            ci_observation["properties"]["status_check_rollup"]["items"]["$ref"],
+            "#/$defs/statusCheckRollupEntry",
+        )
+        self.assertEqual(
+            schema["$defs"]["statusCheckRollupEntry"]["oneOf"],
+            [
+                {"$ref": "#/$defs/checkRunRollupEntry"},
+                {"$ref": "#/$defs/statusContextRollupEntry"},
+            ],
+        )
+        for definition in (
+            "githubAppIdentity",
+            "githubActorIdentity",
+            "checkRunRollupEntry",
+            "statusContextRollupEntry",
+        ):
+            self.assertIn("node_id", schema["$defs"][definition]["required"])
+        self.assertEqual(
+            set(
+                schema["$defs"]["githubActorIdentity"]["properties"]["__typename"][
+                    "enum"
+                ]
+            ),
+            {
+                "Bot",
+                "EnterpriseUserAccount",
+                "Mannequin",
+                "Organization",
+                "User",
+            },
+        )
+        self.assertEqual(
+            set(schema["$defs"]["checkRunRollupEntry"]["properties"]["status"]["enum"]),
+            {
+                "COMPLETED",
+                "IN_PROGRESS",
+                "PENDING",
+                "QUEUED",
+                "REQUESTED",
+                "WAITING",
+            },
+        )
+        self.assertEqual(
+            set(
+                schema["$defs"]["statusContextRollupEntry"]["properties"]["state"][
+                    "enum"
+                ]
+            ),
+            {"ERROR", "EXPECTED", "FAILURE", "PENDING", "SUCCESS"},
+        )
+        range_observation = schema["$defs"]["baseAndHeadEvidence"]["properties"][
+            "observed"
+        ]["items"]
+        self.assertIn("observed_base_oid", range_observation["required"])
+        self.assertIn("observed_head_oid", range_observation["required"])
         self.assertEqual(
             set(schema["properties"]["actions"]["required"]),
             READ_ONLY_ACTION_FIELDS,
@@ -822,12 +936,13 @@ class DeliveryProfileContractTest(unittest.TestCase):
                     "failed": 0,
                     "pending": 0,
                     "cancelled": 0,
-                    "checks": [
-                        {
-                            "name": "tests",
-                            "status": "completed",
-                            "conclusion": "success",
-                        }
+                    "status_check_rollup": [
+                        check_run_rollup(
+                            database_id=2001,
+                            name="tests",
+                            status="COMPLETED",
+                            conclusion="SUCCESS",
+                        )
                     ],
                 }
             ],
@@ -991,7 +1106,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     validate_read_only_report_semantics(candidate)
 
-    def test_read_only_pr_report_preserves_and_maps_all_ci_conclusions(
+    def test_read_only_pr_report_preserves_and_maps_all_ci_provider_states(
         self,
     ) -> None:
         base = next(
@@ -1004,17 +1119,20 @@ class DeliveryProfileContractTest(unittest.TestCase):
         )
         validator = read_only_report_validator()
         conclusion_buckets = {
-            "success": "success",
-            "neutral": "success",
-            "skipped": "success",
-            "failure": "failure",
-            "timed_out": "failure",
-            "action_required": "failure",
-            "stale": "failure",
-            "startup_failure": "failure",
-            "cancelled": "cancelled",
+            "SUCCESS": "success",
+            "NEUTRAL": "success",
+            "SKIPPED": "success",
+            "FAILURE": "failure",
+            "TIMED_OUT": "failure",
+            "ACTION_REQUIRED": "failure",
+            "STALE": "failure",
+            "STARTUP_FAILURE": "failure",
+            "CANCELLED": "cancelled",
         }
-        for conclusion, bucket in conclusion_buckets.items():
+        for database_id, (conclusion, bucket) in enumerate(
+            conclusion_buckets.items(),
+            start=3001,
+        ):
             with self.subTest(conclusion=conclusion):
                 candidate = copy.deepcopy(base)
                 observed = candidate["evidence"]["ci_status"]["observed"][0]
@@ -1026,28 +1144,29 @@ class DeliveryProfileContractTest(unittest.TestCase):
                         "failed": int(bucket == "failure"),
                         "pending": 0,
                         "cancelled": int(bucket == "cancelled"),
-                        "checks": [
-                            {
-                                "name": "tests",
-                                "status": "completed",
-                                "conclusion": conclusion,
-                            }
+                        "status_check_rollup": [
+                            check_run_rollup(
+                                database_id=database_id,
+                                name="tests",
+                                status="COMPLETED",
+                                conclusion=conclusion,
+                            )
                         ],
                     }
                 )
                 self.assertEqual(list(validator.iter_errors(candidate)), [])
                 validate_read_only_report_semantics(candidate)
                 self.assertEqual(
-                    observed["checks"][0]["conclusion"],
+                    observed["status_check_rollup"][0]["conclusion"],
                     conclusion,
                 )
 
         for status in (
-            "queued",
-            "in_progress",
-            "requested",
-            "waiting",
-            "pending",
+            "QUEUED",
+            "IN_PROGRESS",
+            "REQUESTED",
+            "WAITING",
+            "PENDING",
         ):
             with self.subTest(status=status):
                 candidate = copy.deepcopy(base)
@@ -1060,17 +1179,77 @@ class DeliveryProfileContractTest(unittest.TestCase):
                         "failed": 0,
                         "pending": 1,
                         "cancelled": 0,
-                        "checks": [
-                            {
-                                "name": "tests",
-                                "status": status,
-                                "conclusion": None,
-                            }
+                        "status_check_rollup": [
+                            check_run_rollup(
+                                database_id=4001,
+                                name="tests",
+                                status=status,
+                                conclusion=None,
+                            )
                         ],
                     }
                 )
                 self.assertEqual(list(validator.iter_errors(candidate)), [])
                 validate_read_only_report_semantics(candidate)
+
+        status_context_buckets = {
+            "SUCCESS": "success",
+            "FAILURE": "failure",
+            "ERROR": "failure",
+            "PENDING": "pending",
+            "EXPECTED": "pending",
+        }
+        for state, bucket in status_context_buckets.items():
+            with self.subTest(status_context_state=state):
+                candidate = copy.deepcopy(base)
+                observed = candidate["evidence"]["ci_status"]["observed"][0]
+                observed.update(
+                    {
+                        "state": bucket,
+                        "total": 1,
+                        "successful": int(bucket == "success"),
+                        "failed": int(bucket == "failure"),
+                        "pending": int(bucket == "pending"),
+                        "cancelled": 0,
+                        "status_check_rollup": [
+                            status_context_rollup(
+                                context="required/legacy-commit-status",
+                                state=state,
+                            )
+                        ],
+                    }
+                )
+                self.assertEqual(list(validator.iter_errors(candidate)), [])
+                validate_read_only_report_semantics(candidate)
+
+        nullable_database_ids = copy.deepcopy(base)
+        nullable_observed = nullable_database_ids["evidence"]["ci_status"]["observed"][
+            0
+        ]
+        nullable_observed.update(
+            {
+                "state": "success",
+                "total": 1,
+                "successful": 1,
+                "failed": 0,
+                "pending": 0,
+                "cancelled": 0,
+                "status_check_rollup": [
+                    check_run_rollup(
+                        database_id=None,
+                        node_id="CHECK_RUN_NODE_ONLY",
+                        name="node-only",
+                        status="COMPLETED",
+                        conclusion="SUCCESS",
+                        app_database_id=None,
+                        app_node_id="APP_NODE_ONLY",
+                        app_slug="node-only-provider",
+                    )
+                ],
+            }
+        )
+        self.assertEqual(list(validator.iter_errors(nullable_database_ids)), [])
+        validate_read_only_report_semantics(nullable_database_ids)
 
         mixed = copy.deepcopy(base)
         mixed_observed = mixed["evidence"]["ci_status"]["observed"][0]
@@ -1082,34 +1261,39 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 "failed": 1,
                 "pending": 1,
                 "cancelled": 1,
-                "checks": [
-                    {
-                        "name": "docs",
-                        "status": "completed",
-                        "conclusion": "neutral",
-                    },
-                    {
-                        "name": "lint",
-                        "status": "completed",
-                        "conclusion": "stale",
-                    },
-                    {
-                        "name": "tests",
-                        "status": "waiting",
-                        "conclusion": None,
-                    },
-                    {
-                        "name": "e2e",
-                        "status": "completed",
-                        "conclusion": "cancelled",
-                    },
+                "status_check_rollup": [
+                    check_run_rollup(
+                        database_id=5001,
+                        name="required",
+                        status="COMPLETED",
+                        conclusion="NEUTRAL",
+                    ),
+                    check_run_rollup(
+                        database_id=6001,
+                        name="required",
+                        status="COMPLETED",
+                        conclusion="STALE",
+                        app_database_id=40001,
+                        app_slug="quality-gate",
+                        app_node_id="APP_40001",
+                    ),
+                    status_context_rollup(
+                        context="required",
+                        state="EXPECTED",
+                    ),
+                    check_run_rollup(
+                        database_id=5002,
+                        name="e2e",
+                        status="COMPLETED",
+                        conclusion="CANCELLED",
+                    ),
                 ],
             }
         )
         self.assertEqual(list(validator.iter_errors(mixed)), [])
         validate_read_only_report_semantics(mixed)
 
-    def test_read_only_pr_report_ci_fails_closed_on_unknown_states(
+    def test_read_only_pr_report_ci_fails_closed_on_identity_or_state_drift(
         self,
     ) -> None:
         base = next(
@@ -1122,32 +1306,97 @@ class DeliveryProfileContractTest(unittest.TestCase):
         )
         validator = read_only_report_validator()
         invalid_checks = {
-            "unknown-status": {
-                "name": "tests",
-                "status": "unknown",
-                "conclusion": None,
+            "unknown-typename": {
+                "__typename": "WorkflowRun",
             },
-            "unknown-completed-conclusion": {
-                "name": "tests",
-                "status": "completed",
-                "conclusion": "unknown",
-            },
-            "nonterminal-conclusion": {
-                "name": "tests",
-                "status": "in_progress",
-                "conclusion": "success",
-            },
-            "missing-completed-conclusion": {
-                "name": "tests",
-                "status": "completed",
-                "conclusion": None,
-            },
-            "legacy-pending-conclusion": {
-                "name": "tests",
-                "status": "completed",
-                "conclusion": "pending",
-            },
+            "unknown-check-run-status": check_run_rollup(
+                database_id=7001,
+                name="tests",
+                status="UNKNOWN",
+                conclusion=None,
+            ),
+            "unknown-completed-conclusion": check_run_rollup(
+                database_id=7002,
+                name="tests",
+                status="COMPLETED",
+                conclusion="UNKNOWN",
+            ),
+            "nonterminal-conclusion": check_run_rollup(
+                database_id=7003,
+                name="tests",
+                status="IN_PROGRESS",
+                conclusion="SUCCESS",
+            ),
+            "missing-completed-conclusion": check_run_rollup(
+                database_id=7004,
+                name="tests",
+                status="COMPLETED",
+                conclusion=None,
+            ),
+            "lowercase-provider-state": check_run_rollup(
+                database_id=7005,
+                name="tests",
+                status="completed",
+                conclusion="success",
+            ),
+            "unknown-status-context-state": status_context_rollup(
+                context="required/legacy-commit-status",
+                state="UNKNOWN",
+            ),
         }
+        missing_app_id = check_run_rollup(
+            database_id=7006,
+            name="tests",
+            status="COMPLETED",
+            conclusion="SUCCESS",
+        )
+        del missing_app_id["app"]["database_id"]
+        invalid_checks["missing-app-database-id"] = missing_app_id
+        missing_app_node_id = check_run_rollup(
+            database_id=7007,
+            name="tests",
+            status="COMPLETED",
+            conclusion="SUCCESS",
+        )
+        del missing_app_node_id["app"]["node_id"]
+        invalid_checks["missing-app-node-id"] = missing_app_node_id
+        missing_check_run_node_id = check_run_rollup(
+            database_id=7008,
+            name="tests",
+            status="COMPLETED",
+            conclusion="SUCCESS",
+        )
+        del missing_check_run_node_id["node_id"]
+        invalid_checks["missing-check-run-node-id"] = missing_check_run_node_id
+        malformed_app_slug = check_run_rollup(
+            database_id=7009,
+            name="tests",
+            status="COMPLETED",
+            conclusion="SUCCESS",
+        )
+        malformed_app_slug["app"]["slug"] = "GitHub Actions"
+        invalid_checks["malformed-app-slug"] = malformed_app_slug
+        missing_creator_node_id = status_context_rollup(
+            context="required/legacy-commit-status",
+            state="SUCCESS",
+        )
+        del missing_creator_node_id["creator"]["node_id"]
+        invalid_checks["missing-creator-node-id"] = missing_creator_node_id
+        missing_status_context_node_id = status_context_rollup(
+            context="required/legacy-commit-status",
+            state="SUCCESS",
+        )
+        del missing_status_context_node_id["node_id"]
+        invalid_checks["missing-status-context-node-id"] = (
+            missing_status_context_node_id
+        )
+        malformed_creator_type = status_context_rollup(
+            context="required/legacy-commit-status",
+            state="SUCCESS",
+            creator_typename="Repository",
+        )
+        invalid_checks["malformed-creator-typename"] = malformed_creator_type
+
         for name, check in invalid_checks.items():
             with self.subTest(name=name):
                 candidate = copy.deepcopy(base)
@@ -1160,12 +1409,139 @@ class DeliveryProfileContractTest(unittest.TestCase):
                         "failed": 0,
                         "pending": 1,
                         "cancelled": 0,
-                        "checks": [check],
+                        "status_check_rollup": [check],
                     }
                 )
                 self.assertTrue(list(validator.iter_errors(candidate)))
                 with self.assertRaises(ValueError):
                     validate_read_only_report_semantics(candidate)
+
+        duplicate_check_run_identity = copy.deepcopy(base)
+        observed = duplicate_check_run_identity["evidence"]["ci_status"]["observed"][0]
+        observed.update(
+            {
+                "state": "success",
+                "total": 2,
+                "successful": 2,
+                "failed": 0,
+                "pending": 0,
+                "cancelled": 0,
+                "status_check_rollup": [
+                    check_run_rollup(
+                        database_id=8001,
+                        name="lint",
+                        status="COMPLETED",
+                        conclusion="SUCCESS",
+                    ),
+                    check_run_rollup(
+                        database_id=8001,
+                        name="tests",
+                        status="COMPLETED",
+                        conclusion="SUCCESS",
+                    ),
+                ],
+            }
+        )
+        self.assertEqual(
+            list(validator.iter_errors(duplicate_check_run_identity)),
+            [],
+        )
+        with self.assertRaisesRegex(ValueError, "stable identities"):
+            validate_read_only_report_semantics(duplicate_check_run_identity)
+
+        duplicate_status_context_identity = copy.deepcopy(base)
+        observed = duplicate_status_context_identity["evidence"]["ci_status"][
+            "observed"
+        ][0]
+        observed.update(
+            {
+                "state": "pending",
+                "total": 2,
+                "successful": 1,
+                "failed": 0,
+                "pending": 1,
+                "cancelled": 0,
+                "status_check_rollup": [
+                    status_context_rollup(
+                        context="required/legacy-commit-status",
+                        state="SUCCESS",
+                    ),
+                    status_context_rollup(
+                        context="required/legacy-commit-status",
+                        state="EXPECTED",
+                    ),
+                ],
+            }
+        )
+        self.assertEqual(
+            list(validator.iter_errors(duplicate_status_context_identity)),
+            [],
+        )
+        with self.assertRaisesRegex(ValueError, "stable identities"):
+            validate_read_only_report_semantics(duplicate_status_context_identity)
+
+        inconsistent_app_identity = copy.deepcopy(base)
+        observed = inconsistent_app_identity["evidence"]["ci_status"]["observed"][0]
+        observed.update(
+            {
+                "state": "success",
+                "total": 2,
+                "successful": 2,
+                "failed": 0,
+                "pending": 0,
+                "cancelled": 0,
+                "status_check_rollup": [
+                    check_run_rollup(
+                        database_id=8101,
+                        name="lint",
+                        status="COMPLETED",
+                        conclusion="SUCCESS",
+                    ),
+                    check_run_rollup(
+                        database_id=8102,
+                        name="tests",
+                        status="COMPLETED",
+                        conclusion="SUCCESS",
+                        app_slug="github-actions-renamed",
+                    ),
+                ],
+            }
+        )
+        self.assertEqual(list(validator.iter_errors(inconsistent_app_identity)), [])
+        with self.assertRaisesRegex(ValueError, "provider identity"):
+            validate_read_only_report_semantics(inconsistent_app_identity)
+
+        inconsistent_creator_identity = copy.deepcopy(base)
+        observed = inconsistent_creator_identity["evidence"]["ci_status"]["observed"][0]
+        observed.update(
+            {
+                "state": "success",
+                "total": 2,
+                "successful": 2,
+                "failed": 0,
+                "pending": 0,
+                "cancelled": 0,
+                "status_check_rollup": [
+                    status_context_rollup(
+                        context="required/lint",
+                        state="SUCCESS",
+                        node_id="STATUS_CONTEXT_LINT",
+                    ),
+                    status_context_rollup(
+                        context="required/tests",
+                        state="SUCCESS",
+                        creator_login="renamed-ci[bot]",
+                        node_id="STATUS_CONTEXT_TESTS",
+                    ),
+                ],
+            }
+        )
+        self.assertEqual(
+            list(validator.iter_errors(inconsistent_creator_identity)),
+            [],
+        )
+        with self.assertRaisesRegex(ValueError, "provider identity"):
+            validate_read_only_report_semantics(inconsistent_creator_identity)
 
     def test_read_only_pr_report_uses_real_staged_targets(self) -> None:
         cases = {
@@ -1577,12 +1953,6 @@ class DeliveryProfileContractTest(unittest.TestCase):
         aggregate_mismatch["evidence"]["ci_status"]["observed"][0]["successful"] = 2
         candidates["ci-counts-do-not-match-checks"] = (aggregate_mismatch, False)
 
-        duplicate_check_name = copy.deepcopy(range_blocked)
-        duplicate_check_name["evidence"]["ci_status"]["observed"][0]["checks"][1][
-            "name"
-        ] = "lint"
-        candidates["duplicate-ci-check-name"] = (duplicate_check_name, False)
-
         state_mismatch = copy.deepcopy(range_blocked)
         state_mismatch["evidence"]["ci_status"]["observed"][0]["state"] = "success"
         candidates["ci-state-does-not-match-checks"] = (state_mismatch, True)
@@ -1613,6 +1983,63 @@ class DeliveryProfileContractTest(unittest.TestCase):
                     validate_read_only_report_semantics(candidate)
                 with self.assertRaises(AssertionError):
                     assert_read_only_report_contract(candidate)
+
+    def test_read_only_pr_report_binds_endpoint_observation_to_target(self) -> None:
+        resolved = next(
+            case["expected"]["terminal_result"]
+            for case in fixture_cases(
+                READ_ONLY_PR_PROBE_CASES,
+                "read-only-pr-probe",
+            )
+            if case["name"] == "resolved-target-snapshot"
+        )
+        validator = read_only_report_validator()
+
+        swapped = copy.deepcopy(resolved)
+        swapped_record = swapped["evidence"]["base_and_head"]["observed"][0]
+        swapped_record["observed_base_oid"], swapped_record["observed_head_oid"] = (
+            swapped_record["observed_head_oid"],
+            swapped_record["observed_base_oid"],
+        )
+
+        other_report = copy.deepcopy(resolved)
+        other_report["target"]["base"]["oid"] = "d" * 40
+        other_report["target"]["head"]["oid"] = "e" * 40
+        other_record = other_report["evidence"]["base_and_head"]["observed"][0]
+        other_record["observed_base_oid"] = "d" * 40
+        other_record["observed_head_oid"] = "e" * 40
+        cross_report = copy.deepcopy(resolved)
+        cross_report["evidence"]["base_and_head"]["observed"][0] = copy.deepcopy(
+            other_record
+        )
+
+        stale_endpoint = copy.deepcopy(resolved)
+        stale_endpoint["evidence"]["base_and_head"]["observed"][0][
+            "observed_head_oid"
+        ] = "d" * 40
+
+        same_merge_base_different_head = copy.deepcopy(resolved)
+        same_merge_base_different_head["target"]["head"]["oid"] = "d" * 40
+
+        attacks = {
+            "swapped-endpoints": swapped,
+            "cross-report-endpoint-record": cross_report,
+            "stale-observed-head": stale_endpoint,
+            "same-merge-base-different-head": same_merge_base_different_head,
+        }
+        for name, candidate in attacks.items():
+            with self.subTest(name=name):
+                self.assertEqual(list(validator.iter_errors(candidate)), [])
+                with self.assertRaisesRegex(ValueError, "observed_.*_oid"):
+                    validate_read_only_report_semantics(candidate)
+
+        refreshed_head = copy.deepcopy(resolved)
+        refreshed_head["target"]["head"]["oid"] = "d" * 40
+        refreshed_head["evidence"]["base_and_head"]["observed"][0][
+            "observed_head_oid"
+        ] = "d" * 40
+        self.assertEqual(list(validator.iter_errors(refreshed_head)), [])
+        validate_read_only_report_semantics(refreshed_head)
 
     def test_delivery_result_schema_is_closed_and_fixture_cases_conform(
         self,

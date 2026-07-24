@@ -31,6 +31,12 @@ The receiving sequence is closed:
    locks, lazy fetching, credential prompts, generated commit graphs, and
    persistent caches disabled. It must not create a checkout, worktree, log,
    state directory, or result file.
+   Preserve GitHub GraphQL `statusCheckRollup` entries as their exact
+   provider-discriminated union. A `CheckRun` records its raw typename,
+   Node/database IDs, name, GitHub App Node/database IDs and slug, status, and
+   conclusion. A legacy `StatusContext` records its raw typename and Node ID,
+   context, creator type/node-ID/login, and state. Do not collapse provider
+   states early or use display-name uniqueness as object identity.
 3. Do not start any local Codex or Claude lane, `materialize-worktree`,
    `validate-worktree`, low-level helper mode, exact-secret admission,
    GitHub Codex request, check, workflow, comment, poll, monitor, or wait. Do
@@ -66,6 +72,10 @@ The receiving sequence is closed:
    An `observed` kind contains exactly one kind-specific, closed structured
    record; an empty array, free-form summary, or record for another
    report/target/snapshot is invalid.
+   A base/head observation repeats the exact base and head OIDs used for its
+   object lookups and merge-base invocation. Both must byte-for-byte equal the
+   resolved target OIDs; a matching merge-base result never makes stale,
+   swapped, or cross-report endpoint evidence current.
    Each `unavailable` or `blocked` evidence kind must be listed in
    `unavailable_evidence` and have exactly one blocker whose `evidence` field
    names that kind. An `observed` kind must appear in neither summary. Every
@@ -75,9 +85,13 @@ The receiving sequence is closed:
    the exact in-memory JSON through stdin with Python `-I -B -S`. It must
    accept before emission. This second gate binds all instance IDs by equality
    and rejects contradictions that JSON Schema cannot express, including
-   aggregate CI counts versus check results and unresolved threads versus total
-   threads. Report only evidence actually observed, unavailable evidence, and
-   blockers. Then stop without another handoff.
+   stable provider/object identity collisions, aggregate CI counts versus the
+   complete rollup, observed endpoint OIDs versus target OIDs, and unresolved
+   threads versus total threads. Its one fail-closed normalization maps the
+   complete raw `CheckRun` status/conclusion and `StatusContext` state enums to
+   success, failure, pending, or cancelled. Report only evidence actually
+   observed, unavailable evidence, and blockers. Then stop without another
+   handoff.
 
 This report is never a named-review artifact, secret-admission result,
 PR-readiness completion, or merge-ready claim. Its schema fixes `merge_ready`

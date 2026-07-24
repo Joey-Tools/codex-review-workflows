@@ -43,17 +43,27 @@ superseded_by:
   cache or state, fix, commit, push, release, or merge. The receiver is
   classified before every generic PR/review route and returns one closed
   terminal report whose action fields and merge-ready claim are fixed false.
-- Read-only report schema v4 represents selection and range failures directly:
+- Read-only report schema v5 represents selection and range failures directly:
   `pre-target` and `pre-target-blocked` omit PR/base/head, while
   `target-resolution-blocked` retains only the selected PR. Every report uses
   fresh independent report/target/snapshot/observation IDs. The standalone
   semantic validator equality-binds every evidence record to that instance and
   requires the exact canonical URL derived from the structured repository and
-  PR number. It preserves each provider check's status and complete conclusion
-  enum, then applies one fail-closed normalization to success, failure,
-  pending, or cancelled aggregates. It also rejects lifecycle, selector,
-  CI/check, conversation-count, and endpoint contradictions that JSON Schema
-  cannot express. Its binding generator
+  PR number. It preserves GitHub `statusCheckRollup` as an exact
+  provider-discriminated union: `CheckRun` binds its Node/database IDs, name,
+  GitHub App Node/database IDs and slug plus complete raw status/conclusion
+  enums, while legacy `StatusContext` binds its Node ID, context, and creator
+  identity plus complete raw state enum. Stable type/provider/object
+  identities, rather than display names, determine uniqueness. One explicit
+  fail-closed mapping normalizes those provider values to success, failure,
+  pending, or cancelled aggregates.
+  Base/head evidence records the exact observed endpoint OIDs and must match
+  the target byte-for-byte before object-existence or merge-base results count.
+  The validator also rejects lifecycle, selector, CI-rollup,
+  conversation-count, and endpoint contradictions that JSON Schema cannot
+  express. The schema and semantic helper remain direct records in the
+  canonical control manifest, so the release digest binds the exact v5 pair.
+  Its binding generator
   retries collisions, while file input uses no-follow/nonblocking/close-on-exec
   descriptor admission, regular-file and byte ceilings, exact identity/size
   revalidation, and two identical complete reads. Strict UTF-8 JSON parsing
@@ -112,15 +122,17 @@ superseded_by:
 ## Evidence
 
 - `python3 -B skills/change-delivery-workflow/tests/test_delivery_profiles.py -q`
-  passed (`32` tests), including deterministic local-mutation short circuits,
+  passed (`33` tests), including deterministic local-mutation short circuits,
   the independent mutable-`no-commit` control, constrained-scope conflicts,
   staged read-only PR-probe terminals, fresh instance bindings, cross-report
   splice rejection, collision recovery, descriptor-safe input admission and
   revalidation, hostile JSON/resource caps, bounded machine-safe errors,
-  canonical PR URL attack cases, every provider conclusion and nonterminal
-  status, mixed CI aggregation, closed delivery and terminal report records,
-  and the clean-range, missing-range, findings, and review-not-required
-  terminals under forbidden commit mode.
+  canonical PR URL attack cases, the complete CheckRun and StatusContext
+  provider enums, legacy required commit statuses, mixed rollup aggregation,
+  duplicate display names, stable-identity collisions, malformed providers,
+  swapped/cross-report/stale endpoints, same-merge-base endpoint drift, closed
+  delivery and terminal report records, and the clean-range, missing-range,
+  findings, and review-not-required terminals under forbidden commit mode.
 - `python3 -B skills/synthetic-token-fixtures/tests/test_skill_contract.py -v`
   passed (`13` tests), including co-release binding, isolated-import shadows,
   raw-leaf and intermediate cross-release symlinks, unsafe parent modes,
