@@ -28,6 +28,10 @@ from .constants import (
     REVIEWER_RUNTIME_SECONDS,
     UNSUPPORTED_CLAUSES,
 )
+from .appserver_runtime import (
+    PrelaunchInputSizeError,
+    build_primary_preflight_appserver_input,
+)
 from .custody import (
     CustodyHandles,
     acquire_source_custody,
@@ -310,6 +314,38 @@ def _require_primary_serialized_evidence_budget(
         ) from error
 
 
+def _require_primary_appserver_admission(
+    content: bytes,
+    *,
+    expected_sha256: str,
+    pr_url: str,
+    base_sha: str,
+    head_sha: str,
+    forbidden_paths: tuple[pathlib.Path, ...],
+) -> None:
+    try:
+        build_primary_preflight_appserver_input(
+            content,
+            expected_sha256=expected_sha256,
+            pr_url=pr_url,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            forbidden_paths=forbidden_paths,
+        )
+    except PrelaunchInputSizeError as error:
+        raise blocked(
+            "Primary diff does not fit the final app-server turn/start budget",
+            stage="evidence-admission",
+            code="primary-evidence-size-invalid",
+        ) from error
+    except (EvidenceError, ValueError) as error:
+        raise blocked(
+            "Primary diff is not valid final app-server evidence",
+            stage="evidence-admission",
+            code="primary-evidence-invalid",
+        ) from error
+
+
 def prepare_run(
     *,
     helper_state: pathlib.Path,
@@ -336,6 +372,18 @@ def prepare_run(
         primary_evidence,
         expected_sha256=helper.diff_sha256,
     )
+    attempt_id = f"{int(time.time())}-{uuid.uuid4().hex}"
+    worktree_path = checkout_parent / f"review-{attempt_id}"
+    attempt_dir = retention_root / f"attempt-{attempt_id}"
+    final_fifo = attempt_dir / "final.fifo"
+    _require_primary_appserver_admission(
+        primary_evidence,
+        expected_sha256=helper.diff_sha256,
+        pr_url=pr_url,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        forbidden_paths=(worktree_path,),
+    )
     repository = inspect_repository(
         repo=repo,
         base_sha=base_sha,
@@ -355,10 +403,6 @@ def prepare_run(
         manifest=head_manifest,
         diff_length=helper.diff_length,
     )
-    attempt_id = f"{int(time.time())}-{uuid.uuid4().hex}"
-    worktree_path = checkout_parent / f"review-{attempt_id}"
-    attempt_dir = retention_root / f"attempt-{attempt_id}"
-    final_fifo = attempt_dir / "final.fifo"
     prompt = render_prompt(
         repo=worktree_path,
         pr_url=pr_url,

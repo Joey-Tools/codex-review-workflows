@@ -27,6 +27,10 @@ DNS_HOST_PATTERN = re.compile(
 MAX_PR_URL_BYTES = 2048
 
 
+class AppServerPromptSizeError(ValueError):
+    """The complete app-server prompt does not fit its byte budget."""
+
+
 def _single_line(value: str, label: str) -> str:
     if not value or "\0" in value or "\n" in value or "\r" in value:
         raise ValueError(f"{label} must be a nonempty single line")
@@ -185,7 +189,7 @@ Review the frozen change now. Output findings only.
 
 def validate_appserver_prompt(prompt: bytes) -> None:
     if not 1 <= len(prompt) <= MAX_APP_SERVER_PROMPT_BYTES:
-        raise ValueError(
+        raise AppServerPromptSizeError(
             f"app-server prompt must contain 1..{MAX_APP_SERVER_PROMPT_BYTES} bytes"
         )
     if b"\0" in prompt:

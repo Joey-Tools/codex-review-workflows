@@ -1290,3 +1290,35 @@ metadata behavior.
   skips; its only failure remained the expected Desktop nested-sandbox denial
   in the synthetic keychain broker. Exact-head broker, admission, formal review,
   and hosted CI gates remain required after the signed follow-up push.
+- The next fresh-context Codex review found that evidence admission proved only
+  the 5 MiB primary bundle, while the final 8 MiB app-server `turn/start` record
+  JSON-escaped the complete prompt again and runtime-added nearby context.
+  Mandatory primary evidence now renders and validates the exact final record
+  before repository inspection can create an attempt or checkout. The
+  prelaunch builder validates every requested nearby path against the
+  authenticated manifest, then uses a canonical-prefix binary search to retain
+  the largest optional context set that still fits both the prompt and final
+  record budgets; only size overflow can reduce that set.
+- A 2,516,582-byte backslash fixture now proves CLI preflight rejects the
+  double-escaping overflow without creating an attempt or checkout. A separate
+  boundary fixture proves that a valid near-limit primary remains admissible
+  while one 64 KiB optional context file is deterministically omitted. The 14
+  focused admission/app-server tests, the real CLI regression, and the expanded
+  112-test app-server/supervisor/runtime-helper/checkout set pass under Python
+  3.13.0 with bytecode disabled. The signed replacement head, full current-head
+  discovery, live broker/no-child gates, secret admission, and all formal
+  review lanes remain required. No local Python 3.10 run was performed.
+- The four reviewed boundary-test identities increase the fixed deterministic
+  supervisor set to 528 tests with SHA-256
+  `c4975a3bee6df5b2ccfa6b8b4edcb7398c6893ab75f46b8ab80cb7e685823b72`;
+  all 528 passed in 190.981 seconds. All 96 repository contract tests passed in
+  6.868 seconds. Current-tree Python 3.13 discovery exercised 2,814 tests in
+  1,567.576 seconds with 6 skips. Its only failure was the known nested Desktop
+  sandbox denial in the synthetic keychain broker
+  (`sandbox-exec: sandbox_apply: Operation not permitted`); the exact broker
+  regression passed outside that nested sandbox in 3.204 seconds. The required
+  nine live no-child tests also passed outside the Desktop sandbox in 11.288
+  seconds. Ruff lint and format checks pass for all eight changed Python files,
+  and project-journal validation passes. Signed commit, exact-head secret
+  admission, replacement fresh-context review, hosted CI, and the unavailable
+  Claude/GitHub lanes remain. No local Python 3.10 run was performed.

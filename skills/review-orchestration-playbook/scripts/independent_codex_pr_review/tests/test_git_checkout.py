@@ -2364,6 +2364,68 @@ class RawGitCheckoutTests(unittest.TestCase):
                 ("retention.lock",),
             )
 
+    def test_cli_preflight_rejects_final_turn_record_overflow_without_attempt(
+        self,
+    ) -> None:
+        with owned_temporary_directory("preflight-turn-record-") as root:
+            repo, base_sha, head_sha = _build_repository(root)
+            fixture = build_helper_fixture(
+                root,
+                source_repo=repo,
+                base_sha=base_sha,
+                head_sha=head_sha,
+                primary_diff=b"\\" * 2_516_582,
+            )
+            retention = root / "retention"
+            checkouts = root / "checkouts"
+            entrypoint = (
+                pathlib.Path(__file__).resolve().parent.parent
+                / "independent-codex-pr-review"
+            )
+            completed = subprocess.run(
+                (
+                    sys.executable,
+                    str(entrypoint),
+                    "preflight",
+                    "--helper-state",
+                    str(fixture["state_dir"]),
+                    "--repo",
+                    str(repo),
+                    "--base",
+                    base_sha,
+                    "--head",
+                    head_sha,
+                    "--pr-url",
+                    "https://github.example/owner/repo/pull/1",
+                    "--retention-root",
+                    str(retention),
+                    "--checkout-parent",
+                    str(checkouts),
+                    "--codex",
+                    "/usr/bin/true",
+                ),
+                cwd=pathlib.Path(__file__).resolve().parent.parent,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=30,
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertEqual(payload["overall_status"], "blocked")
+            self.assertEqual(payload["failure_stage"], "evidence-admission")
+            self.assertEqual(
+                payload["failure_code"],
+                "primary-evidence-size-invalid",
+            )
+            self.assertEqual(tuple(checkouts.iterdir()), ())
+            self.assertEqual(
+                tuple(path.name for path in retention.iterdir()),
+                ("retention.lock",),
+            )
+
     def _assert_raw_detached_checkout_and_sealed_diff(
         self,
         root: pathlib.Path,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import os
+import pathlib
 import unittest
 from unittest import mock
 
@@ -12,14 +13,19 @@ from review_supervisor.appserver_protocol import (
     encode_json_line,
 )
 from review_supervisor.appserver_runtime import (
+    PrelaunchInputSizeError,
     build_prelaunch_appserver_input,
     run_appserver_stdio_session,
 )
 from review_supervisor.evidence import (
     AuthenticatedManifest,
+    EvidenceError,
     ManifestEntry,
+    build_evidence_bundle,
     manifest_sha256,
 )
+from review_supervisor.appserver_protocol import validate_prelaunch_turn_start_record
+from review_supervisor.prompt import render_appserver_prompt
 from review_supervisor.secureio import sha256_bytes
 
 from tests.test_appserver_protocol import (
@@ -219,7 +225,7 @@ class AppServerRuntimeTests(unittest.TestCase):
                     "review_supervisor.appserver_runtime.render_appserver_prompt",
                     return_value=b"\\" * (4 * 1024 * 1024),
                 ):
-                    with self.assertRaises(AppServerProtocolError) as raised:
+                    with self.assertRaises(PrelaunchInputSizeError):
                         build_prelaunch_appserver_input(
                             root_fd=root_fd,
                             manifest=manifest,
@@ -230,7 +236,92 @@ class AppServerRuntimeTests(unittest.TestCase):
                         )
             finally:
                 os.close(root_fd)
-        self.assertEqual(raised.exception.code, "record-size")
+
+    def test_drops_optional_context_to_fit_final_turn_record(self) -> None:
+        with owned_temporary_directory("appserver-context-budget-") as root:
+            control = root / ".codex-review"
+            control.mkdir()
+            diff = b"\\" * 2_050_000
+            context = b"\\" * (64 * 1024)
+            (control / "review.diff").write_bytes(diff)
+            (root / "context.py").write_bytes(context)
+            entries = (
+                ManifestEntry(
+                    path=".codex-review/review.diff",
+                    kind="regular",
+                    size=len(diff),
+                    sha256=sha256_bytes(diff),
+                ),
+                ManifestEntry(
+                    path="context.py",
+                    kind="regular",
+                    size=len(context),
+                    sha256=sha256_bytes(context),
+                ),
+            )
+            manifest = AuthenticatedManifest.authenticate(
+                entries,
+                expected_sha256=manifest_sha256(entries),
+            )
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                full_bundle = build_evidence_bundle(
+                    root_fd=root_fd,
+                    manifest=manifest,
+                    nearby_paths=("context.py",),
+                )
+                full_prompt = render_appserver_prompt(
+                    pr_url="https://github.example/owner/repo/pull/1",
+                    base_sha="1" * 40,
+                    head_sha="2" * 40,
+                    evidence_bundle=full_bundle,
+                    forbidden_paths=(root,),
+                )
+                with self.assertRaises(AppServerProtocolError) as raised:
+                    validate_prelaunch_turn_start_record(full_prompt)
+                self.assertEqual(raised.exception.code, "record-size")
+
+                prepared = build_prelaunch_appserver_input(
+                    root_fd=root_fd,
+                    manifest=manifest,
+                    pr_url="https://github.example/owner/repo/pull/1",
+                    base_sha="1" * 40,
+                    head_sha="2" * 40,
+                    forbidden_paths=(root,),
+                    nearby_paths=("context.py",),
+                )
+            finally:
+                os.close(root_fd)
+
+        self.assertEqual(prepared.nearby_paths, ())
+        self.assertEqual(
+            [artifact.role for artifact in prepared.evidence_bundle.artifacts],
+            ["primary_diff"],
+        )
+        validate_prelaunch_turn_start_record(prepared.prompt)
+
+    def test_rejects_malformed_optional_paths_before_budget_selection(self) -> None:
+        diff = b"diff --git a/a.py b/a.py\n+fixed\n"
+        entry = ManifestEntry(
+            path=".codex-review/review.diff",
+            kind="regular",
+            size=len(diff),
+            sha256=sha256_bytes(diff),
+        )
+        manifest = AuthenticatedManifest.authenticate(
+            (entry,),
+            expected_sha256=manifest_sha256((entry,)),
+        )
+        with self.assertRaisesRegex(EvidenceError, "not a string"):
+            build_prelaunch_appserver_input(
+                root_fd=-1,
+                manifest=manifest,
+                pr_url="https://github.example/owner/repo/pull/1",
+                base_sha="1" * 40,
+                head_sha="2" * 40,
+                forbidden_paths=(pathlib.Path("/private/review/worktree"),),
+                nearby_paths=([],),
+            )
 
     def test_rejects_abnormal_eof_trailing_record_and_short_write(self) -> None:
         with self.assertRaises(AppServerProtocolError) as raised:

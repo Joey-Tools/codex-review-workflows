@@ -61,6 +61,7 @@ from review_supervisor.supervisor import (
     _publish_final_authorization,
     _publish_retained_git_closure_recovery,
     _reclaim_released_attempts,
+    _require_primary_appserver_admission,
     _require_primary_evidence_budget,
     _require_primary_serialized_evidence_budget,
     _resolve_codex,
@@ -299,6 +300,24 @@ class PreflightAdmissionTests(unittest.TestCase):
                 content,
                 expected_sha256=sha256_bytes(content),
             )
+
+    def test_rejects_primary_diff_after_final_turn_record_escaping(self) -> None:
+        content = b"\\" * 2_516_582
+        with self.assertRaises(SupervisorError) as caught:
+            _require_primary_appserver_admission(
+                content,
+                expected_sha256=sha256_bytes(content),
+                pr_url="https://github.example/owner/repo/pull/1",
+                base_sha="1" * 40,
+                head_sha="2" * 40,
+                forbidden_paths=(pathlib.Path("/private/review/worktree"),),
+            )
+
+        self.assertEqual(caught.exception.failure.stage, "evidence-admission")
+        self.assertEqual(
+            caught.exception.failure.code,
+            "primary-evidence-size-invalid",
+        )
 
     def test_rejects_invalid_primary_content_separately_from_bundle_size(self) -> None:
         with self.assertRaises(SupervisorError) as caught:
