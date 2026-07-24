@@ -40,18 +40,44 @@ The receiving sequence is closed:
    caches, tool state, or connector state. When that guarantee is unavailable,
    do not attempt the read; mark its evidence `unavailable` or `blocked` and
    record a blocker.
-5. Emit exactly one terminal record conforming to
+5. Before the first read, create four independent fresh 128-bit in-memory
+   identifiers for the report, target binding, snapshot binding, and
+   observation. Resolve the helper from the same manifest-verified immutable
+   release as this schema, then invoke its absolute path with Python
+   `-I -B -S` and argument `new-bindings`. Do not execute a
+   repository-relative, caller-selected, or cross-release copy. Do not persist
+   the identifiers, derive them from PR metadata or time, or reuse an
+   identifier or target from an earlier report.
+6. Build the target only as far as current evidence permits:
+   - `pre-target` contains the repository but no PR/base/head. Use terminal
+     `pre-target` for a conclusive no-match or ambiguity, and
+     `pre-target-blocked` when selection is unavailable or blocked.
+   - `pr-selected` adds the selected PR but no base/head. Use terminal
+     `target-resolution-blocked` when the base/head read is unavailable or
+     blocked.
+   - `range-resolved` adds the current base/head and is the only target allowed
+     by terminal `target-snapshot`.
+   Never copy stale PR, base, head, or binding fields into a newer report to
+   make a blocked read appear complete.
+7. Emit exactly one terminal record conforming to
    [pr-readiness-read-only-report.schema.json](pr-readiness-read-only-report.schema.json).
-   Bind the record to one explicit repository/PR/base/head target and one
-   current observation snapshot. Every evidence kind repeats those target and
-   snapshot binding identifiers. An `observed` kind contains exactly one
-   kind-specific, closed structured record; an empty array, free-form summary,
-   or record for another target/snapshot is invalid.
+   Every target and snapshot repeats the report binding, and every evidence
+   kind repeats the exact report, target, and snapshot binding identifiers.
+   An `observed` kind contains exactly one kind-specific, closed structured
+   record; an empty array, free-form summary, or record for another
+   report/target/snapshot is invalid.
    Each `unavailable` or `blocked` evidence kind must be listed in
    `unavailable_evidence` and have exactly one blocker whose `evidence` field
    names that kind. An `observed` kind must appear in neither summary. Every
-   action field remains `false`. Report only evidence actually observed,
-   unavailable evidence, and blockers. Then stop without another handoff.
+   action field remains `false`.
+8. After closed-schema validation, run the installed
+   same-release `read_only_pr_report.py validate-semantics -` validator over
+   the exact in-memory JSON through stdin with Python `-I -B -S`. It must
+   accept before emission. This second gate binds all instance IDs by equality
+   and rejects contradictions that JSON Schema cannot express, including
+   aggregate CI counts versus check results and unresolved threads versus total
+   threads. Report only evidence actually observed, unavailable evidence, and
+   blockers. Then stop without another handoff.
 
 This report is never a named-review artifact, secret-admission result,
 PR-readiness completion, or merge-ready claim. Its schema fixes `merge_ready`

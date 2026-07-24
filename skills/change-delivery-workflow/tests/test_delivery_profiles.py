@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+import contextlib
 import copy
+import errno
+import io
 import json
-from pathlib import Path
-import re
+import os
+import runpy
+import stat
+import tempfile
+import unicodedata
 import unittest
+from pathlib import Path
+from unittest import mock
 
 from jsonschema import Draft202012Validator
 from referencing import Registry, Resource
-
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 CHANGE_SKILL = SKILL_ROOT / "SKILL.md"
@@ -31,6 +38,25 @@ PR_READINESS = REVIEW_SKILL_ROOT / "references" / "pr-readiness.md"
 READ_ONLY_PR_REPORT_SCHEMA = (
     REVIEW_SKILL_ROOT / "references" / "pr-readiness-read-only-report.schema.json"
 )
+READ_ONLY_PR_REPORT_RUNTIME = REVIEW_SKILL_ROOT / "scripts" / "read_only_pr_report.py"
+READ_ONLY_PR_REPORT_RUNTIME_API = runpy.run_path(
+    str(READ_ONLY_PR_REPORT_RUNTIME),
+    run_name="read_only_pr_report_contract",
+)
+new_read_only_report_bindings = READ_ONLY_PR_REPORT_RUNTIME_API["new_bindings"]
+validate_read_only_report_semantics = READ_ONLY_PR_REPORT_RUNTIME_API[
+    "validate_semantics"
+]
+read_only_report_payload = READ_ONLY_PR_REPORT_RUNTIME_API["_read_payload"]
+read_only_report_main = READ_ONLY_PR_REPORT_RUNTIME_API["main"]
+READ_ONLY_PR_REPORT_GLOBALS = read_only_report_main.__globals__
+READ_ONLY_REPORT_MAX_BYTES = READ_ONLY_PR_REPORT_RUNTIME_API["MAX_REPORT_BYTES"]
+READ_ONLY_REPORT_MAX_DEPTH = READ_ONLY_PR_REPORT_RUNTIME_API["MAX_JSON_DEPTH"]
+READ_ONLY_REPORT_MAX_NODES = READ_ONLY_PR_REPORT_RUNTIME_API["MAX_JSON_NODES"]
+READ_ONLY_REPORT_MAX_INTEGER_DIGITS = READ_ONLY_PR_REPORT_RUNTIME_API[
+    "MAX_INTEGER_DIGITS"
+]
+READ_ONLY_REPORT_MAX_ERROR_CHARS = READ_ONLY_PR_REPORT_RUNTIME_API["MAX_ERROR_CHARS"]
 
 RESULT_FIELDS = {
     "schema_version",
@@ -83,6 +109,8 @@ HANDOFF_PROFILES = {
 READ_ONLY_REPORT_FIELDS = {
     "schema_version",
     "terminal",
+    "terminal_state",
+    "report_id",
     "handoff_profile",
     "delivery_record",
     "target",
@@ -109,12 +137,6 @@ READ_ONLY_ACTION_FIELDS = {
     "cache_or_state_written",
     "local_mutation_performed",
     "remote_mutation_performed",
-}
-READ_ONLY_EVIDENCE_SNAPSHOT_FIELDS = {
-    "status",
-    "target_binding",
-    "snapshot_binding",
-    "observed",
 }
 
 
@@ -271,7 +293,7 @@ def assert_valid_result_contract(result: object) -> None:
 def assert_read_only_report_contract(report: object) -> None:
     if not isinstance(report, dict) or set(report) != READ_ONLY_REPORT_FIELDS:
         raise AssertionError("read-only PR report fields do not match the contract")
-    if report["schema_version"] != 2:
+    if report["schema_version"] != 3:
         raise AssertionError("unexpected read-only PR report schema version")
     if report["terminal"] != "pr-readiness-read-only-report":
         raise AssertionError("unexpected read-only PR report terminal")
@@ -280,158 +302,13 @@ def assert_read_only_report_contract(report: object) -> None:
     assert_valid_result_contract(report["delivery_record"])
     if report["delivery_record"]["handoff_profile"] != report["handoff_profile"]:
         raise AssertionError("read-only PR report widened its delivery handoff")
-
-    repository_fields = {"host", "owner", "name"}
-
-    def assert_repository(value: object) -> None:
-        if (
-            not isinstance(value, dict)
-            or set(value) != repository_fields
-            or not all(isinstance(value[field], str) and value[field] for field in value)
-        ):
-            raise AssertionError("read-only PR repository binding is invalid")
-
-    oid_pattern = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
-    target = report["target"]
-    if not isinstance(target, dict) or set(target) != {
-        "binding_id",
-        "repository",
-        "pull_request",
-        "base",
-        "head",
-    }:
-        raise AssertionError("read-only PR target binding is not closed")
-    if target["binding_id"] != "report-target-v1":
-        raise AssertionError("read-only PR target binding ID is invalid")
-    assert_repository(target["repository"])
-    pull_request = target["pull_request"]
-    if (
-        not isinstance(pull_request, dict)
-        or set(pull_request) != {"number", "url"}
-        or not isinstance(pull_request["number"], int)
-        or isinstance(pull_request["number"], bool)
-        or pull_request["number"] < 1
-        or not isinstance(pull_request["url"], str)
-        or not pull_request["url"].startswith("https://")
-    ):
-        raise AssertionError("read-only PR selector binding is invalid")
-    base = target["base"]
-    if (
-        not isinstance(base, dict)
-        or set(base) != {"ref", "oid"}
-        or not isinstance(base["ref"], str)
-        or not base["ref"]
-        or not isinstance(base["oid"], str)
-        or oid_pattern.fullmatch(base["oid"]) is None
-    ):
-        raise AssertionError("read-only PR base binding is invalid")
-    head = target["head"]
-    if (
-        not isinstance(head, dict)
-        or set(head) != {"repository", "ref", "oid"}
-        or not isinstance(head["ref"], str)
-        or not head["ref"]
-        or not isinstance(head["oid"], str)
-        or oid_pattern.fullmatch(head["oid"]) is None
-    ):
-        raise AssertionError("read-only PR head binding is invalid")
-    assert_repository(head["repository"])
-
-    snapshot = report["snapshot"]
-    if (
-        not isinstance(snapshot, dict)
-        or set(snapshot)
-        != {"binding_id", "snapshot_id", "observed_at", "freshness", "sources"}
-        or snapshot["binding_id"] != "report-snapshot-v1"
-        or snapshot["freshness"] != "current"
-        or not isinstance(snapshot["snapshot_id"], str)
-        or not snapshot["snapshot_id"]
-        or not isinstance(snapshot["observed_at"], str)
-        or not snapshot["observed_at"].endswith("Z")
-        or not isinstance(snapshot["sources"], list)
-        or not snapshot["sources"]
-        or len(snapshot["sources"]) != len(set(snapshot["sources"]))
-    ):
-        raise AssertionError("read-only PR snapshot binding is invalid")
-
-    evidence = report["evidence"]
-    if not isinstance(evidence, dict) or set(evidence) != READ_ONLY_EVIDENCE_FIELDS:
-        raise AssertionError("read-only PR report evidence is not closed")
-    unavailable = report["unavailable_evidence"]
-    if not isinstance(unavailable, list) or len(unavailable) != len(set(unavailable)):
-        raise AssertionError("read-only PR unavailable evidence is invalid")
-    evidence_names = {
-        "pr_selection": "pr-selection",
-        "pr_lifecycle": "pr-lifecycle",
-        "ci_status": "ci-status",
-        "conversation_state": "conversation-state",
-        "base_and_head": "base-and-head",
-    }
-    observed_fields = {
-        "pr_selection": {"selection_method", "candidate_count"},
-        "pr_lifecycle": {"state", "merged", "merged_at", "draft"},
-        "ci_status": {"state", "total", "successful", "failed", "pending"},
-        "conversation_state": {"total_threads", "unresolved_threads"},
-        "base_and_head": {
-            "base_object_present",
-            "head_object_present",
-            "merge_base_count",
-            "merge_base_oid",
-        },
-    }
-    blocker_evidence: list[str] = []
-    for field, external_name in evidence_names.items():
-        evidence_snapshot = evidence[field]
-        if (
-            not isinstance(evidence_snapshot, dict)
-            or set(evidence_snapshot) != READ_ONLY_EVIDENCE_SNAPSHOT_FIELDS
-        ):
-            raise AssertionError("read-only PR evidence snapshot is not closed")
-        if evidence_snapshot["status"] not in {
-            "observed",
-            "unavailable",
-            "blocked",
-        }:
-            raise AssertionError("read-only PR evidence status is invalid")
-        if evidence_snapshot["target_binding"] != target["binding_id"]:
-            raise AssertionError("read-only PR evidence targets another report")
-        if evidence_snapshot["snapshot_binding"] != snapshot["binding_id"]:
-            raise AssertionError("read-only PR evidence uses a stale snapshot")
-        observed = evidence_snapshot["observed"]
-        if not isinstance(observed, list):
-            raise AssertionError("read-only PR observed evidence is not a list")
-        if evidence_snapshot["status"] == "observed":
-            if len(observed) != 1 or not isinstance(observed[0], dict):
-                raise AssertionError("observed evidence must contain one record")
-            if set(observed[0]) != observed_fields[field]:
-                raise AssertionError("observed evidence record is not closed")
-        elif observed:
-            raise AssertionError("unavailable evidence must not claim observations")
-        if (evidence_snapshot["status"] != "observed") != (
-            external_name in unavailable
-        ):
-            raise AssertionError("unavailable evidence does not match its snapshot")
-
-    blockers = report["blockers"]
-    if not isinstance(blockers, list) or not all(
-        isinstance(blocker, dict)
-        and set(blocker) == {"evidence", "code", "detail"}
-        and blocker["evidence"] in evidence_names.values()
-        and isinstance(blocker["code"], str)
-        and blocker["code"]
-        and isinstance(blocker["detail"], str)
-        and blocker["detail"]
-        for blocker in blockers
-    ):
-        raise AssertionError("read-only PR report blockers are invalid")
-    blocker_evidence = [blocker["evidence"] for blocker in blockers]
-    if len(blocker_evidence) != len(set(blocker_evidence)):
-        raise AssertionError("read-only PR report has duplicate evidence blockers")
-    for field, external_name in evidence_names.items():
-        if (evidence[field]["status"] != "observed") != (
-            external_name in blocker_evidence
-        ):
-            raise AssertionError("evidence blocker does not match its snapshot")
+    schema_errors = list(read_only_report_validator().iter_errors(report))
+    if schema_errors:
+        raise AssertionError(schema_errors[0].message)
+    try:
+        validate_read_only_report_semantics(report)
+    except ValueError as exc:
+        raise AssertionError(str(exc)) from exc
     actions = report["actions"]
     if not isinstance(actions, dict) or set(actions) != READ_ONLY_ACTION_FIELDS:
         raise AssertionError("read-only PR report actions are not closed")
@@ -693,8 +570,18 @@ class DeliveryProfileContractTest(unittest.TestCase):
 
     def test_remote_mutation_limit_routes_explicit_read_only_pr_probe(self) -> None:
         cases = fixture_cases(READ_ONLY_PR_PROBE_CASES, "read-only-pr-probe")
-        self.assertEqual(len(cases), 1)
-        case = cases[0]
+        self.assertEqual(
+            {case["name"] for case in cases},
+            {
+                "resolved-target-snapshot",
+                "pre-target-no-match",
+                "pre-target-selection-blocked",
+                "selected-pr-base-head-blocked",
+            },
+        )
+        case = next(
+            case for case in cases if case["name"] == "resolved-target-snapshot"
+        )
         selected = next(
             item["result"]
             for item in profile_selection_cases()
@@ -732,7 +619,11 @@ class DeliveryProfileContractTest(unittest.TestCase):
         )
         terminal_result = case["expected"]["terminal_result"]
         self.assertEqual(terminal_result["delivery_record"], case["input"])
-        assert_read_only_report_contract(terminal_result)
+        for fixture_case in cases:
+            with self.subTest(name=fixture_case["name"]):
+                assert_read_only_report_contract(
+                    fixture_case["expected"]["terminal_result"]
+                )
         for anchor in (
             "Remote mutation being forbidden does not erase",
             "`pr-readiness-read-only-probe`",
@@ -746,6 +637,8 @@ class DeliveryProfileContractTest(unittest.TestCase):
             "Never call this merge-ready",
             "receiver must preserve that read-only capability ceiling",
             "pr-readiness-read-only-report.schema.json",
+            "fresh instance IDs",
+            "real pre-target report",
         ):
             self.assertIn(anchor, self.normalized_change)
 
@@ -787,6 +680,9 @@ class DeliveryProfileContractTest(unittest.TestCase):
             "persist authentication refreshes, caches, tool state, or connector state",
             "Then stop without another handoff",
             "never a named-review artifact",
+            "pre-target-blocked",
+            "target-resolution-blocked",
+            "validate-semantics",
         ):
             self.assertIn(anchor, self.normalized_pr_readiness)
 
@@ -797,7 +693,20 @@ class DeliveryProfileContractTest(unittest.TestCase):
         self.assertEqual(set(schema["required"]), READ_ONLY_REPORT_FIELDS)
         self.assertEqual(set(schema["properties"]), READ_ONLY_REPORT_FIELDS)
         self.assertFalse(schema["additionalProperties"])
-        self.assertEqual(schema["properties"]["schema_version"]["const"], 2)
+        self.assertEqual(schema["properties"]["schema_version"]["const"], 3)
+        self.assertEqual(
+            set(schema["properties"]["terminal_state"]["enum"]),
+            {
+                "pre-target",
+                "pre-target-blocked",
+                "target-resolution-blocked",
+                "target-snapshot",
+            },
+        )
+        self.assertEqual(
+            schema["properties"]["report_id"]["$ref"],
+            "#/$defs/reportId",
+        )
         self.assertEqual(schema["properties"]["target"]["$ref"], "#/$defs/target")
         self.assertEqual(
             schema["properties"]["snapshot"]["$ref"],
@@ -852,13 +761,22 @@ class DeliveryProfileContractTest(unittest.TestCase):
     def test_read_only_pr_report_schema_rejects_inconsistent_summaries(
         self,
     ) -> None:
+        cases = {
+            case["name"]: case
+            for case in fixture_cases(
+                READ_ONLY_PR_PROBE_CASES,
+                "read-only-pr-probe",
+            )
+        }
         valid = copy.deepcopy(
-            fixture_cases(READ_ONLY_PR_PROBE_CASES, "read-only-pr-probe")[0][
-                "expected"
-            ]["terminal_result"]
+            cases["resolved-target-snapshot"]["expected"]["terminal_result"]
         )
         validator = read_only_report_validator()
-        self.assertEqual(list(validator.iter_errors(valid)), [])
+        for name, case in cases.items():
+            with self.subTest(name=name):
+                terminal_result = case["expected"]["terminal_result"]
+                self.assertEqual(list(validator.iter_errors(terminal_result)), [])
+                assert_read_only_report_contract(terminal_result)
 
         commit_allowed = copy.deepcopy(valid)
         commit_allowed["delivery_record"] = next(
@@ -893,8 +811,9 @@ class DeliveryProfileContractTest(unittest.TestCase):
         observed_with_summaries = copy.deepcopy(valid)
         observed_with_summaries["evidence"]["ci_status"] = {
             "status": "observed",
-            "target_binding": "report-target-v1",
-            "snapshot_binding": "report-snapshot-v1",
+            "report_binding": valid["report_id"],
+            "target_binding": valid["target"]["binding_id"],
+            "snapshot_binding": valid["snapshot"]["binding_id"],
             "observed": [
                 {
                     "state": "success",
@@ -902,6 +821,13 @@ class DeliveryProfileContractTest(unittest.TestCase):
                     "successful": 1,
                     "failed": 0,
                     "pending": 0,
+                    "cancelled": 0,
+                    "checks": [
+                        {
+                            "name": "tests",
+                            "conclusion": "success",
+                        }
+                    ],
                 }
             ],
         }
@@ -921,18 +847,6 @@ class DeliveryProfileContractTest(unittest.TestCase):
         )
         inconsistent["duplicate-blocker-for-one-evidence-kind"] = duplicate_blocker
 
-        wrong_target_binding = copy.deepcopy(valid)
-        wrong_target_binding["evidence"]["pr_selection"]["target_binding"] = (
-            "another-target"
-        )
-        inconsistent["evidence-bound-to-another-target"] = wrong_target_binding
-
-        wrong_snapshot_binding = copy.deepcopy(valid)
-        wrong_snapshot_binding["evidence"]["pr_lifecycle"]["snapshot_binding"] = (
-            "stale-snapshot"
-        )
-        inconsistent["evidence-bound-to-another-snapshot"] = wrong_snapshot_binding
-
         stale_snapshot = copy.deepcopy(valid)
         stale_snapshot["snapshot"]["freshness"] = "stale"
         inconsistent["stale-report-snapshot"] = stale_snapshot
@@ -942,9 +856,9 @@ class DeliveryProfileContractTest(unittest.TestCase):
         inconsistent["observed-status-without-record"] = empty_observed
 
         extra_observed_field = copy.deepcopy(valid)
-        extra_observed_field["evidence"]["pr_lifecycle"]["observed"][0][
-            "summary"
-        ] = "open"
+        extra_observed_field["evidence"]["pr_lifecycle"]["observed"][0]["summary"] = (
+            "open"
+        )
         inconsistent["observed-record-with-free-form-field"] = extra_observed_field
 
         for name, candidate in inconsistent.items():
@@ -954,14 +868,14 @@ class DeliveryProfileContractTest(unittest.TestCase):
                     assert_read_only_report_contract(candidate)
 
         schema = validator.schema
-        self.assertEqual(len(schema["allOf"]), len(READ_ONLY_EVIDENCE_FIELDS))
+        self.assertEqual(len(schema["allOf"]), len(READ_ONLY_EVIDENCE_FIELDS) + 2)
         blocker_schema = schema["properties"]["blockers"]["items"]
         self.assertEqual(
             set(blocker_schema["required"]),
             {"evidence", "code", "detail"},
         )
         self.assertEqual(
-            set(blocker_schema["properties"]["evidence"]["enum"]),
+            set(schema["$defs"]["evidenceName"]["enum"]),
             {
                 "pr-selection",
                 "pr-lifecycle",
@@ -970,6 +884,453 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 "base-and-head",
             },
         )
+
+    def test_read_only_pr_report_uses_real_staged_targets(self) -> None:
+        cases = {
+            case["name"]: case["expected"]["terminal_result"]
+            for case in fixture_cases(
+                READ_ONLY_PR_PROBE_CASES,
+                "read-only-pr-probe",
+            )
+        }
+        no_match = cases["pre-target-no-match"]
+        selection_blocked = cases["pre-target-selection-blocked"]
+        range_blocked = cases["selected-pr-base-head-blocked"]
+
+        self.assertEqual(no_match["target"]["state"], "pre-target")
+        self.assertNotIn("pull_request", no_match["target"])
+        self.assertNotIn("base", no_match["target"])
+        self.assertNotIn("head", no_match["target"])
+        self.assertEqual(selection_blocked["terminal_state"], "pre-target-blocked")
+        self.assertNotIn("pull_request", selection_blocked["target"])
+        self.assertEqual(
+            range_blocked["terminal_state"],
+            "target-resolution-blocked",
+        )
+        self.assertEqual(range_blocked["target"]["state"], "pr-selected")
+        self.assertIn("pull_request", range_blocked["target"])
+        self.assertNotIn("base", range_blocked["target"])
+        self.assertNotIn("head", range_blocked["target"])
+
+    def test_read_only_pr_report_binding_generator_is_instance_unique(self) -> None:
+        first = new_read_only_report_bindings()
+        second = new_read_only_report_bindings()
+        self.assertEqual(
+            set(first),
+            {
+                "report_id",
+                "target_binding",
+                "snapshot_binding",
+                "snapshot_id",
+            },
+        )
+        self.assertEqual(len(set(first.values())), 4)
+        self.assertTrue(set(first.values()).isdisjoint(second.values()))
+        for field, prefix in (
+            ("report_id", "report:"),
+            ("target_binding", "target:"),
+            ("snapshot_binding", "snapshot:"),
+            ("snapshot_id", "observation:"),
+        ):
+            with self.subTest(field=field):
+                self.assertTrue(first[field].startswith(prefix))
+                self.assertEqual(len(first[field]), len(prefix) + 32)
+
+        repeated = "a" * 32
+        runtime_secrets = new_read_only_report_bindings.__globals__["secrets"]
+        with mock.patch.object(
+            runtime_secrets,
+            "token_hex",
+            side_effect=[
+                repeated,
+                repeated,
+                "b" * 32,
+                "c" * 32,
+                "d" * 32,
+            ],
+        ) as token_hex:
+            collision_recovered = new_read_only_report_bindings()
+        self.assertEqual(token_hex.call_count, 5)
+        self.assertEqual(
+            len({value.split(":", 1)[1] for value in collision_recovered.values()}),
+            4,
+        )
+        binding_attempts = new_read_only_report_bindings.__globals__[
+            "MAX_BINDING_ATTEMPTS"
+        ]
+        with mock.patch.object(
+            runtime_secrets,
+            "token_hex",
+            return_value=repeated,
+        ) as token_hex:
+            with self.assertRaisesRegex(RuntimeError, "unique report bindings"):
+                new_read_only_report_bindings()
+        self.assertEqual(token_hex.call_count, binding_attempts + 1)
+
+        with mock.patch.dict(
+            READ_ONLY_PR_REPORT_GLOBALS,
+            {
+                "new_bindings": mock.Mock(
+                    side_effect=OSError(
+                        errno.EIO,
+                        "entropy failure",
+                        "untrusted\npath" * 1_000,
+                    )
+                )
+            },
+        ):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                return_code = read_only_report_main(["new-bindings"])
+        self.assertEqual(return_code, 2)
+        rejection = json.loads(stdout.getvalue())
+        self.assertEqual(rejection["classification"], "rejected")
+        self.assertEqual(rejection["error"], "report binding generation failed (EIO)")
+
+    def test_read_only_pr_report_path_reads_are_descriptor_safe(self) -> None:
+        runtime_os = read_only_report_payload.__globals__["os"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            valid = root / "report.json"
+            valid.write_bytes(b"{}")
+
+            with mock.patch.object(runtime_os, "open", wraps=os.open) as open_mock:
+                self.assertEqual(read_only_report_payload(str(valid)), {})
+            flags = open_mock.call_args.args[1]
+            for required_flag in (os.O_NOFOLLOW, os.O_NONBLOCK, os.O_CLOEXEC):
+                self.assertEqual(flags & required_flag, required_flag)
+
+            with mock.patch.object(runtime_os, "O_NOFOLLOW", None):
+                with self.assertRaisesRegex(ValueError, "open is unavailable"):
+                    read_only_report_payload(str(valid))
+
+            missing = root / "missing.json"
+            with self.assertRaisesRegex(ValueError, "missing at descriptor admission"):
+                read_only_report_payload(str(missing))
+
+            with mock.patch.object(
+                runtime_os,
+                "open",
+                side_effect=PermissionError(
+                    errno.EACCES,
+                    "denied",
+                    "untrusted-path",
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, r"open failed \(EACCES\)"):
+                    read_only_report_payload(str(valid))
+
+            symlink = root / "report-link.json"
+            symlink.symlink_to(valid)
+            with self.assertRaisesRegex(ValueError, r"open failed \(ELOOP\)"):
+                read_only_report_payload(str(symlink))
+
+            fifo = root / "report.fifo"
+            os.mkfifo(fifo)
+            with self.assertRaisesRegex(ValueError, "regular file"):
+                read_only_report_payload(str(fifo))
+
+            oversized = root / "oversized.json"
+            with oversized.open("wb") as handle:
+                handle.truncate(READ_ONLY_REPORT_MAX_BYTES + 1)
+            with self.assertRaisesRegex(ValueError, "1 MiB"):
+                read_only_report_payload(str(oversized))
+
+            with mock.patch.object(
+                runtime_os,
+                "read",
+                side_effect=[b"{}", b"", b"[]", b""],
+            ):
+                with self.assertRaisesRegex(ValueError, "content changed"):
+                    read_only_report_payload(str(valid))
+
+            path_info = os.stat(valid, follow_symlinks=False)
+            replaced_path_info = mock.Mock(
+                st_dev=path_info.st_dev,
+                st_ino=path_info.st_ino + 1,
+                st_mode=path_info.st_mode,
+                st_size=path_info.st_size,
+            )
+            with mock.patch.object(
+                runtime_os,
+                "stat",
+                return_value=replaced_path_info,
+            ):
+                with self.assertRaisesRegex(ValueError, "path identity changed"):
+                    read_only_report_payload(str(valid))
+
+            nonregular_path_info = mock.Mock(
+                st_dev=path_info.st_dev,
+                st_ino=path_info.st_ino,
+                st_mode=stat.S_IFIFO | 0o600,
+                st_size=path_info.st_size,
+            )
+            with mock.patch.object(
+                runtime_os,
+                "stat",
+                return_value=nonregular_path_info,
+            ):
+                with self.assertRaisesRegex(ValueError, "path identity changed"):
+                    read_only_report_payload(str(valid))
+
+            oversized_path_info = mock.Mock(
+                st_dev=path_info.st_dev,
+                st_ino=path_info.st_ino,
+                st_mode=path_info.st_mode,
+                st_size=READ_ONLY_REPORT_MAX_BYTES + 1,
+            )
+            with mock.patch.object(
+                runtime_os,
+                "stat",
+                return_value=oversized_path_info,
+            ):
+                with self.assertRaisesRegex(ValueError, "path size changed"):
+                    read_only_report_payload(str(valid))
+
+            with mock.patch.object(
+                runtime_os,
+                "stat",
+                side_effect=FileNotFoundError(
+                    errno.ENOENT,
+                    "gone",
+                    "untrusted-path",
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "disappeared"):
+                    read_only_report_payload(str(valid))
+
+            with mock.patch.object(
+                runtime_os,
+                "stat",
+                side_effect=PermissionError(
+                    errno.EACCES,
+                    "denied",
+                    "untrusted-path",
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"final revalidation failed \(EACCES\)",
+                ):
+                    read_only_report_payload(str(valid))
+
+        class FakeStdin:
+            def __init__(self, payload: bytes) -> None:
+                self.buffer = io.BytesIO(payload)
+
+        runtime_sys = read_only_report_payload.__globals__["sys"]
+        with mock.patch.object(
+            runtime_sys,
+            "stdin",
+            FakeStdin(b"x" * (READ_ONLY_REPORT_MAX_BYTES + 1)),
+        ):
+            with self.assertRaisesRegex(ValueError, "1 MiB"):
+                read_only_report_payload("-")
+        self.assertIn(
+            "caller's transport",
+            read_only_report_payload.__doc__ or "",
+        )
+
+    def test_read_only_pr_report_json_and_errors_are_bounded_and_strict(
+        self,
+    ) -> None:
+        nested = (
+            '{"value":' * (READ_ONLY_REPORT_MAX_DEPTH + 1)
+            + "0"
+            + "}" * (READ_ONLY_REPORT_MAX_DEPTH + 1)
+        ).encode("utf-8")
+        too_many_nodes = (
+            '{"values":['
+            + ",".join("0" for _ in range(READ_ONLY_REPORT_MAX_NODES))
+            + "]}"
+        ).encode("utf-8")
+        invalid_payloads = {
+            "invalid-utf8": b'{"value":"\xff"}',
+            "malformed-json": b'{"value":',
+            "duplicate-key": b'{"value":1,"value":2}',
+            "nonfinite-constant": b'{"value":NaN}',
+            "nonfinite-exponent": b'{"value":1e9999}',
+            "non-object-root": b"[]",
+            "oversized-integer": (
+                b'{"value":' + b"9" * (READ_ONLY_REPORT_MAX_INTEGER_DIGITS + 1) + b"}"
+            ),
+            "excessive-depth": nested,
+            "excessive-nodes": too_many_nodes,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, payload in invalid_payloads.items():
+                with self.subTest(payload=name):
+                    path = root / f"{name}.json"
+                    path.write_bytes(payload)
+                    with self.assertRaises(
+                        (
+                            UnicodeDecodeError,
+                            json.JSONDecodeError,
+                            ValueError,
+                        )
+                    ):
+                        read_only_report_payload(str(path))
+
+        injected_errors: list[BaseException] = [
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid"),
+            json.JSONDecodeError("malformed", "", 0),
+            RecursionError("nested\ninput"),
+            ValueError("x" * 1_000 + "\n\x1b\u202e"),
+            MemoryError("allocation failed"),
+            OSError(
+                errno.ENAMETOOLONG,
+                "oversized path",
+                "untrusted\npath" * 1_000,
+            ),
+        ]
+        for injected in injected_errors:
+            with self.subTest(error=type(injected).__name__):
+                with mock.patch.dict(
+                    READ_ONLY_PR_REPORT_GLOBALS,
+                    {"_read_payload": mock.Mock(side_effect=injected)},
+                ):
+                    stdout = io.StringIO()
+                    with contextlib.redirect_stdout(stdout):
+                        return_code = read_only_report_main(
+                            ["validate-semantics", "ignored"]
+                        )
+                self.assertEqual(return_code, 2)
+                result = json.loads(stdout.getvalue())
+                self.assertEqual(result["classification"], "rejected")
+                self.assertLessEqual(
+                    len(result["error"]),
+                    READ_ONLY_REPORT_MAX_ERROR_CHARS,
+                )
+                self.assertFalse(
+                    any(
+                        unicodedata.category(character).startswith("C")
+                        for character in result["error"]
+                    )
+                )
+
+        for interrupt in (KeyboardInterrupt(), SystemExit(9)):
+            with self.subTest(interrupt=type(interrupt).__name__):
+                with mock.patch.dict(
+                    READ_ONLY_PR_REPORT_GLOBALS,
+                    {"_read_payload": mock.Mock(side_effect=interrupt)},
+                ):
+                    with self.assertRaises(type(interrupt)):
+                        read_only_report_main(["validate-semantics", "ignored"])
+
+    def test_runtime_validator_rejects_splicing_and_cross_field_conflicts(
+        self,
+    ) -> None:
+        cases = {
+            case["name"]: case["expected"]["terminal_result"]
+            for case in fixture_cases(
+                READ_ONLY_PR_PROBE_CASES,
+                "read-only-pr-probe",
+            )
+        }
+        resolved = cases["resolved-target-snapshot"]
+        range_blocked = cases["selected-pr-base-head-blocked"]
+        validator = read_only_report_validator()
+
+        candidates: dict[str, tuple[dict[str, object], bool]] = {}
+
+        spliced_evidence = copy.deepcopy(resolved)
+        spliced_evidence["evidence"]["pr_lifecycle"] = copy.deepcopy(
+            range_blocked["evidence"]["pr_lifecycle"]
+        )
+        candidates["cross-report-evidence-splice"] = (spliced_evidence, False)
+
+        spliced_snapshot = copy.deepcopy(resolved)
+        spliced_snapshot["snapshot"] = copy.deepcopy(range_blocked["snapshot"])
+        candidates["cross-report-snapshot-splice"] = (spliced_snapshot, False)
+
+        reused_instance_token = copy.deepcopy(resolved)
+        reused_instance_token["snapshot"]["snapshot_id"] = (
+            "observation:33333333333333333333333333333333"
+        )
+        candidates["reused-instance-token"] = (reused_instance_token, False)
+
+        observed_without_source = copy.deepcopy(resolved)
+        observed_without_source["snapshot"]["sources"] = []
+        candidates["observed-evidence-without-source"] = (
+            observed_without_source,
+            True,
+        )
+
+        contradictory_lifecycle = copy.deepcopy(resolved)
+        contradictory_lifecycle["evidence"]["pr_lifecycle"]["observed"][0].update(
+            {
+                "merged": True,
+                "merged_at": "2026-07-24T06:04:00Z",
+            }
+        )
+        candidates["open-and-merged-lifecycle"] = (
+            contradictory_lifecycle,
+            True,
+        )
+
+        contradictory_selection = copy.deepcopy(resolved)
+        contradictory_selection["evidence"]["pr_selection"]["observed"][0][
+            "candidate_count"
+        ] = 2
+        candidates["selected-with-two-candidates"] = (
+            contradictory_selection,
+            True,
+        )
+
+        explicit_ambiguity = copy.deepcopy(cases["pre-target-no-match"])
+        explicit_ambiguity["evidence"]["pr_selection"]["observed"][0].update(
+            {
+                "selection_method": "explicit",
+                "outcome": "ambiguous",
+                "candidate_count": 2,
+            }
+        )
+        candidates["explicit-selection-cannot-be-ambiguous"] = (
+            explicit_ambiguity,
+            True,
+        )
+
+        aggregate_mismatch = copy.deepcopy(range_blocked)
+        aggregate_mismatch["evidence"]["ci_status"]["observed"][0]["successful"] = 2
+        candidates["ci-counts-do-not-match-checks"] = (aggregate_mismatch, False)
+
+        duplicate_check_name = copy.deepcopy(range_blocked)
+        duplicate_check_name["evidence"]["ci_status"]["observed"][0]["checks"][1][
+            "name"
+        ] = "lint"
+        candidates["duplicate-ci-check-name"] = (duplicate_check_name, False)
+
+        state_mismatch = copy.deepcopy(range_blocked)
+        state_mismatch["evidence"]["ci_status"]["observed"][0]["state"] = "success"
+        candidates["ci-state-does-not-match-checks"] = (state_mismatch, True)
+
+        thread_mismatch = copy.deepcopy(range_blocked)
+        thread_mismatch["evidence"]["conversation_state"]["observed"][0].update(
+            {
+                "total_threads": 1,
+                "unresolved_threads": 2,
+            }
+        )
+        candidates["unresolved-threads-exceed-total"] = (thread_mismatch, False)
+
+        endpoint_mismatch = copy.deepcopy(resolved)
+        endpoint_mismatch["evidence"]["base_and_head"]["observed"][0][
+            "base_object_present"
+        ] = False
+        candidates["missing-base-with-merge-base"] = (endpoint_mismatch, True)
+
+        for name, (candidate, schema_must_reject) in candidates.items():
+            with self.subTest(name=name):
+                schema_errors = list(validator.iter_errors(candidate))
+                if schema_must_reject:
+                    self.assertTrue(schema_errors)
+                else:
+                    self.assertEqual(schema_errors, [])
+                with self.assertRaises(ValueError):
+                    validate_read_only_report_semantics(candidate)
+                with self.assertRaises(AssertionError):
+                    assert_read_only_report_contract(candidate)
 
     def test_delivery_result_schema_is_closed_and_fixture_cases_conform(
         self,

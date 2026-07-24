@@ -42,6 +42,19 @@ superseded_by:
   cache or state, fix, commit, push, release, or merge. The receiver is
   classified before every generic PR/review route and returns one closed
   terminal report whose action fields and merge-ready claim are fixed false.
+- Read-only report schema v3 represents selection and range failures directly:
+  `pre-target` and `pre-target-blocked` omit PR/base/head, while
+  `target-resolution-blocked` retains only the selected PR. Every report uses
+  fresh independent report/target/snapshot/observation IDs. The standalone
+  semantic validator equality-binds every evidence record to that instance and
+  rejects lifecycle, selector, CI/check, conversation-count, and endpoint
+  contradictions that JSON Schema cannot express. Its binding generator
+  retries collisions, while file input uses no-follow/nonblocking/close-on-exec
+  descriptor admission, regular-file and byte ceilings, exact identity/size
+  revalidation, and two identical complete reads. Strict UTF-8 JSON parsing
+  rejects duplicate keys, non-finite numbers, oversized integers, excessive
+  depth/node counts, and non-object roots; every rejection is one bounded,
+  control-free machine record.
 - Every terminal result or permitted handoff carries a closed, versioned record
   with the selected profile, immutable constraint list, local mutation mode,
   commit mode, remote mutation mode, handoff target, and handoff profile.
@@ -89,12 +102,14 @@ superseded_by:
 
 ## Evidence
 
-- `python3 -B skills/change-delivery-workflow/tests/test_delivery_profiles.py -q`
-  passed (`21` tests), including deterministic local-mutation short circuits,
+- `uv run --offline --with jsonschema python -B skills/change-delivery-workflow/tests/test_delivery_profiles.py`
+  passed (`28` tests), including deterministic local-mutation short circuits,
   the independent mutable-`no-commit` control, constrained-scope conflicts,
-  read-only PR-probe routing and receiver ordering, closed delivery and terminal
-  report records, and the clean-range, missing-range, findings, and
-  review-not-required terminals under forbidden commit mode.
+  staged read-only PR-probe terminals, fresh instance bindings, cross-report
+  splice rejection, collision recovery, descriptor-safe input admission and
+  revalidation, hostile JSON/resource caps, bounded machine-safe errors, closed
+  delivery and terminal report records, and the clean-range, missing-range,
+  findings, and review-not-required terminals under forbidden commit mode.
 - `python3 -B skills/synthetic-token-fixtures/tests/test_skill_contract.py -v`
   passed (`7` tests), including co-release binding, isolated-import shadows,
   raw-leaf and intermediate cross-release symlinks, unsafe parent modes,
@@ -103,24 +118,29 @@ superseded_by:
 - `python3 -B skills/review-orchestration-playbook/tests/test_synthetic_tokens.py SyntheticTokenCliTest -v`
   passed (`6` tests), including the explicit exact-bytes catalog hook used only
   by the bound transaction.
-- `python3 -B skills/review-orchestration-playbook/tests/test_contracts.py -q`
-  passed (`86` tests).
+- `uv run --offline --with pyyaml python skills/review-orchestration-playbook/tests/test_contracts.py`
+  passed (`87` tests), including the semantic helper's canonical-manifest
+  binding without widening a formal named-lane source closure.
 - `python3 -B skills/review-orchestration-playbook/tests/test_cli.py -q`
   passed (`17` tests).
 - `uv run --isolated --with pyyaml python3 /Users/hoteng/.codex/skills/joey-skill-authoring/scripts/codex_skill_validate.py --report /tmp/delivery-binding-review-fixes.TIcfwF/skill-validation-escalated.json skills/change-delivery-workflow skills/agile-delivery-workflow skills/synthetic-token-fixtures skills/review-orchestration-playbook`
   passed for all four affected skills after the constrained-scope review-fix
   round.
+- `python3 /Users/hoteng/.codex/skills/joey-skill-authoring/scripts/codex_skill_validate.py skills/change-delivery-workflow skills/review-orchestration-playbook`
+  passed for both helper-owning skills after the final hostile-input hardening.
 - `python3 -m json.tool` passed for both schemas and the read-only probe fixture;
   Draft 2020-12 `jsonschema` validation accepted all `13` delivery records and
-  the terminal read-only report through the registered cross-schema reference.
+  all four terminal read-only report states through the registered cross-schema
+  reference.
 - `python3 -B /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo .`
   passed.
-- `ruff check` and `ruff format --check` passed for the five changed Python
-  implementation and test files.
-- Broader review-playbook discovery and full synthetic-token test commands were
-  bounded and manually interrupted after long silent runs in unchanged heavy
-  workspace/provider tests; neither produced an assertion failure. The
-  affected targeted modules above completed.
+- Ruff `E9,F,I` checks passed for the new semantic helper and delivery contract
+  tests; `E9,F` passed for the manifest contract test, and `ruff format --check`
+  passed for all three touched Python files.
+- Broader review-playbook discovery was bounded and manually interrupted after
+  six silent minutes in unchanged `test_providers` signal-mask setup; it
+  produced no assertion failure and left no process behind. The affected
+  targeted modules above completed.
 - The validator's task-local `uv` cache and test-created Python bytecode were
   removed after validation; the final ignored-cache scan passed.
 - `git diff --check` passed for tracked changes.

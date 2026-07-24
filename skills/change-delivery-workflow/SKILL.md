@@ -182,12 +182,14 @@ mutation is forbidden and remote reads remain allowed.
   metadata changes, fixes, commits, pushes, releases, and merge.
 - Return terminal `pr-readiness-read-only-report`, conforming to its
   [closed receiver schema](../review-orchestration-playbook/references/pr-readiness-read-only-report.schema.json),
-  bound to one explicit repository/PR/base/head target and one current
-  observation snapshot. Every `observed` evidence kind must contain its one
-  closed kind-specific record and repeat those target/snapshot bindings;
-  unavailable or blocked kinds contain no observation record. Never call this
-  merge-ready and never promote the handoff to the mutation-capable
-  `pr-readiness` profile.
+  and let the receiver choose its staged terminal target. Selection failure
+  must remain a real pre-target report with no invented PR/base/head; a
+  selected PR whose base/head lookup fails must omit those unresolved fields.
+  Every report uses fresh instance IDs, and every `observed` evidence kind
+  must contain its one closed kind-specific record and repeat the exact report,
+  target, and snapshot bindings. Unavailable or blocked kinds contain no
+  observation record. Never call this merge-ready and never promote the
+  handoff to the mutation-capable `pr-readiness` profile.
 
 When a non-trivial delivery request is otherwise ambiguous, use `local-gate`.
 Stop for input when the missing choice would materially change scope or remote

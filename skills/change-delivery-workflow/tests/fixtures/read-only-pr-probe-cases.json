@@ -2,6 +2,7 @@
   "schema_version": 1,
   "cases": [
     {
+      "name": "resolved-target-snapshot",
       "prompt": "Probe full workflow and PR readiness; do not make remote changes.",
       "input": {
         "schema_version": 1,
@@ -39,8 +40,10 @@
         ],
         "terminal": "pr-readiness-read-only-report",
         "terminal_result": {
-          "schema_version": 2,
+          "schema_version": 3,
           "terminal": "pr-readiness-read-only-report",
+          "terminal_state": "target-snapshot",
+          "report_id": "report:11111111111111111111111111111111",
           "handoff_profile": "pr-readiness-read-only-probe",
           "delivery_record": {
             "schema_version": 1,
@@ -57,7 +60,9 @@
             "handoff_profile": "pr-readiness-read-only-probe"
           },
           "target": {
-            "binding_id": "report-target-v1",
+            "report_binding": "report:11111111111111111111111111111111",
+            "binding_id": "target:22222222222222222222222222222222",
+            "state": "range-resolved",
             "repository": {
               "host": "github.com",
               "owner": "Joey-Tools",
@@ -82,8 +87,10 @@
             }
           },
           "snapshot": {
-            "binding_id": "report-snapshot-v1",
-            "snapshot_id": "github-pr-42-at-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "report_binding": "report:11111111111111111111111111111111",
+            "target_binding": "target:22222222222222222222222222222222",
+            "binding_id": "snapshot:33333333333333333333333333333333",
+            "snapshot_id": "observation:44444444444444444444444444444444",
             "observed_at": "2026-07-24T06:00:00Z",
             "freshness": "current",
             "sources": [
@@ -94,19 +101,22 @@
           "evidence": {
             "pr_selection": {
               "status": "observed",
-              "target_binding": "report-target-v1",
-              "snapshot_binding": "report-snapshot-v1",
+              "report_binding": "report:11111111111111111111111111111111",
+              "target_binding": "target:22222222222222222222222222222222",
+              "snapshot_binding": "snapshot:33333333333333333333333333333333",
               "observed": [
                 {
                   "selection_method": "explicit",
+                  "outcome": "selected",
                   "candidate_count": 1
                 }
               ]
             },
             "pr_lifecycle": {
               "status": "observed",
-              "target_binding": "report-target-v1",
-              "snapshot_binding": "report-snapshot-v1",
+              "report_binding": "report:11111111111111111111111111111111",
+              "target_binding": "target:22222222222222222222222222222222",
+              "snapshot_binding": "snapshot:33333333333333333333333333333333",
               "observed": [
                 {
                   "state": "open",
@@ -118,20 +128,23 @@
             },
             "ci_status": {
               "status": "unavailable",
-              "target_binding": "report-target-v1",
-              "snapshot_binding": "report-snapshot-v1",
+              "report_binding": "report:11111111111111111111111111111111",
+              "target_binding": "target:22222222222222222222222222222222",
+              "snapshot_binding": "snapshot:33333333333333333333333333333333",
               "observed": []
             },
             "conversation_state": {
               "status": "unavailable",
-              "target_binding": "report-target-v1",
-              "snapshot_binding": "report-snapshot-v1",
+              "report_binding": "report:11111111111111111111111111111111",
+              "target_binding": "target:22222222222222222222222222222222",
+              "snapshot_binding": "snapshot:33333333333333333333333333333333",
               "observed": []
             },
             "base_and_head": {
               "status": "observed",
-              "target_binding": "report-target-v1",
-              "snapshot_binding": "report-snapshot-v1",
+              "report_binding": "report:11111111111111111111111111111111",
+              "target_binding": "target:22222222222222222222222222222222",
+              "snapshot_binding": "snapshot:33333333333333333333333333333333",
               "observed": [
                 {
                   "base_object_present": true,
@@ -156,6 +169,408 @@
               "evidence": "conversation-state",
               "code": "evidence-unavailable",
               "detail": "The conversation read could not be proved cache-free."
+            }
+          ],
+          "actions": {
+            "local_lanes_started": false,
+            "secret_admission_started": false,
+            "comments_posted": false,
+            "waits_started": false,
+            "cache_or_state_written": false,
+            "local_mutation_performed": false,
+            "remote_mutation_performed": false
+          },
+          "merge_ready": false,
+          "next_handoff": "none"
+        }
+      }
+    },
+    {
+      "name": "pre-target-no-match",
+      "expected": {
+        "terminal_result": {
+          "schema_version": 3,
+          "terminal": "pr-readiness-read-only-report",
+          "terminal_state": "pre-target",
+          "report_id": "report:55555555555555555555555555555555",
+          "handoff_profile": "pr-readiness-read-only-probe",
+          "delivery_record": {
+            "schema_version": 1,
+            "profile": "local-gate",
+            "constraints": [
+              "probe-only",
+              "no-remote"
+            ],
+            "local_mutation": "forbidden",
+            "commit_mode": "forbidden",
+            "formal_review_required": false,
+            "remote_mutation": "forbidden",
+            "handoff": "review-orchestration-playbook",
+            "handoff_profile": "pr-readiness-read-only-probe"
+          },
+          "target": {
+            "report_binding": "report:55555555555555555555555555555555",
+            "binding_id": "target:66666666666666666666666666666666",
+            "state": "pre-target",
+            "repository": {
+              "host": "github.com",
+              "owner": "Joey-Tools",
+              "name": "codex-review-workflows"
+            }
+          },
+          "snapshot": {
+            "report_binding": "report:55555555555555555555555555555555",
+            "target_binding": "target:66666666666666666666666666666666",
+            "binding_id": "snapshot:77777777777777777777777777777777",
+            "snapshot_id": "observation:88888888888888888888888888888888",
+            "observed_at": "2026-07-24T06:01:00Z",
+            "freshness": "current",
+            "sources": [
+              "github-rest"
+            ]
+          },
+          "evidence": {
+            "pr_selection": {
+              "status": "observed",
+              "report_binding": "report:55555555555555555555555555555555",
+              "target_binding": "target:66666666666666666666666666666666",
+              "snapshot_binding": "snapshot:77777777777777777777777777777777",
+              "observed": [
+                {
+                  "selection_method": "unique-open-head",
+                  "outcome": "no-match",
+                  "candidate_count": 0
+                }
+              ]
+            },
+            "pr_lifecycle": {
+              "status": "unavailable",
+              "report_binding": "report:55555555555555555555555555555555",
+              "target_binding": "target:66666666666666666666666666666666",
+              "snapshot_binding": "snapshot:77777777777777777777777777777777",
+              "observed": []
+            },
+            "ci_status": {
+              "status": "unavailable",
+              "report_binding": "report:55555555555555555555555555555555",
+              "target_binding": "target:66666666666666666666666666666666",
+              "snapshot_binding": "snapshot:77777777777777777777777777777777",
+              "observed": []
+            },
+            "conversation_state": {
+              "status": "unavailable",
+              "report_binding": "report:55555555555555555555555555555555",
+              "target_binding": "target:66666666666666666666666666666666",
+              "snapshot_binding": "snapshot:77777777777777777777777777777777",
+              "observed": []
+            },
+            "base_and_head": {
+              "status": "unavailable",
+              "report_binding": "report:55555555555555555555555555555555",
+              "target_binding": "target:66666666666666666666666666666666",
+              "snapshot_binding": "snapshot:77777777777777777777777777777777",
+              "observed": []
+            }
+          },
+          "unavailable_evidence": [
+            "pr-lifecycle",
+            "ci-status",
+            "conversation-state",
+            "base-and-head"
+          ],
+          "blockers": [
+            {
+              "evidence": "pr-lifecycle",
+              "code": "no-selected-pr",
+              "detail": "No selected PR exists for lifecycle evidence."
+            },
+            {
+              "evidence": "ci-status",
+              "code": "no-selected-pr",
+              "detail": "No selected PR exists for CI evidence."
+            },
+            {
+              "evidence": "conversation-state",
+              "code": "no-selected-pr",
+              "detail": "No selected PR exists for conversation evidence."
+            },
+            {
+              "evidence": "base-and-head",
+              "code": "no-selected-pr",
+              "detail": "No selected PR exists for base/head evidence."
+            }
+          ],
+          "actions": {
+            "local_lanes_started": false,
+            "secret_admission_started": false,
+            "comments_posted": false,
+            "waits_started": false,
+            "cache_or_state_written": false,
+            "local_mutation_performed": false,
+            "remote_mutation_performed": false
+          },
+          "merge_ready": false,
+          "next_handoff": "none"
+        }
+      }
+    },
+    {
+      "name": "pre-target-selection-blocked",
+      "expected": {
+        "terminal_result": {
+          "schema_version": 3,
+          "terminal": "pr-readiness-read-only-report",
+          "terminal_state": "pre-target-blocked",
+          "report_id": "report:99999999999999999999999999999999",
+          "handoff_profile": "pr-readiness-read-only-probe",
+          "delivery_record": {
+            "schema_version": 1,
+            "profile": "local-gate",
+            "constraints": [
+              "probe-only",
+              "no-remote"
+            ],
+            "local_mutation": "forbidden",
+            "commit_mode": "forbidden",
+            "formal_review_required": false,
+            "remote_mutation": "forbidden",
+            "handoff": "review-orchestration-playbook",
+            "handoff_profile": "pr-readiness-read-only-probe"
+          },
+          "target": {
+            "report_binding": "report:99999999999999999999999999999999",
+            "binding_id": "target:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "state": "pre-target",
+            "repository": {
+              "host": "github.com",
+              "owner": "Joey-Tools",
+              "name": "codex-review-workflows"
+            }
+          },
+          "snapshot": {
+            "report_binding": "report:99999999999999999999999999999999",
+            "target_binding": "target:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "binding_id": "snapshot:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "snapshot_id": "observation:cccccccccccccccccccccccccccccccc",
+            "observed_at": "2026-07-24T06:02:00Z",
+            "freshness": "current",
+            "sources": []
+          },
+          "evidence": {
+            "pr_selection": {
+              "status": "blocked",
+              "report_binding": "report:99999999999999999999999999999999",
+              "target_binding": "target:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "snapshot_binding": "snapshot:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "observed": []
+            },
+            "pr_lifecycle": {
+              "status": "blocked",
+              "report_binding": "report:99999999999999999999999999999999",
+              "target_binding": "target:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "snapshot_binding": "snapshot:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "observed": []
+            },
+            "ci_status": {
+              "status": "blocked",
+              "report_binding": "report:99999999999999999999999999999999",
+              "target_binding": "target:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "snapshot_binding": "snapshot:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "observed": []
+            },
+            "conversation_state": {
+              "status": "blocked",
+              "report_binding": "report:99999999999999999999999999999999",
+              "target_binding": "target:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "snapshot_binding": "snapshot:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "observed": []
+            },
+            "base_and_head": {
+              "status": "blocked",
+              "report_binding": "report:99999999999999999999999999999999",
+              "target_binding": "target:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "snapshot_binding": "snapshot:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "observed": []
+            }
+          },
+          "unavailable_evidence": [
+            "pr-selection",
+            "pr-lifecycle",
+            "ci-status",
+            "conversation-state",
+            "base-and-head"
+          ],
+          "blockers": [
+            {
+              "evidence": "pr-selection",
+              "code": "read-not-provably-non-mutating",
+              "detail": "The PR selection read could not be proved non-mutating."
+            },
+            {
+              "evidence": "pr-lifecycle",
+              "code": "selection-blocked",
+              "detail": "Lifecycle evidence requires a selected PR."
+            },
+            {
+              "evidence": "ci-status",
+              "code": "selection-blocked",
+              "detail": "CI evidence requires a selected PR."
+            },
+            {
+              "evidence": "conversation-state",
+              "code": "selection-blocked",
+              "detail": "Conversation evidence requires a selected PR."
+            },
+            {
+              "evidence": "base-and-head",
+              "code": "selection-blocked",
+              "detail": "Base/head evidence requires a selected PR."
+            }
+          ],
+          "actions": {
+            "local_lanes_started": false,
+            "secret_admission_started": false,
+            "comments_posted": false,
+            "waits_started": false,
+            "cache_or_state_written": false,
+            "local_mutation_performed": false,
+            "remote_mutation_performed": false
+          },
+          "merge_ready": false,
+          "next_handoff": "none"
+        }
+      }
+    },
+    {
+      "name": "selected-pr-base-head-blocked",
+      "expected": {
+        "terminal_result": {
+          "schema_version": 3,
+          "terminal": "pr-readiness-read-only-report",
+          "terminal_state": "target-resolution-blocked",
+          "report_id": "report:dddddddddddddddddddddddddddddddd",
+          "handoff_profile": "pr-readiness-read-only-probe",
+          "delivery_record": {
+            "schema_version": 1,
+            "profile": "local-gate",
+            "constraints": [
+              "probe-only",
+              "no-remote"
+            ],
+            "local_mutation": "forbidden",
+            "commit_mode": "forbidden",
+            "formal_review_required": false,
+            "remote_mutation": "forbidden",
+            "handoff": "review-orchestration-playbook",
+            "handoff_profile": "pr-readiness-read-only-probe"
+          },
+          "target": {
+            "report_binding": "report:dddddddddddddddddddddddddddddddd",
+            "binding_id": "target:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "state": "pr-selected",
+            "repository": {
+              "host": "github.com",
+              "owner": "Joey-Tools",
+              "name": "codex-review-workflows"
+            },
+            "pull_request": {
+              "number": 42,
+              "url": "https://github.com/Joey-Tools/codex-review-workflows/pull/42"
+            }
+          },
+          "snapshot": {
+            "report_binding": "report:dddddddddddddddddddddddddddddddd",
+            "target_binding": "target:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "binding_id": "snapshot:ffffffffffffffffffffffffffffffff",
+            "snapshot_id": "observation:00000000000000000000000000000000",
+            "observed_at": "2026-07-24T06:03:00Z",
+            "freshness": "current",
+            "sources": [
+              "github-rest"
+            ]
+          },
+          "evidence": {
+            "pr_selection": {
+              "status": "observed",
+              "report_binding": "report:dddddddddddddddddddddddddddddddd",
+              "target_binding": "target:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "snapshot_binding": "snapshot:ffffffffffffffffffffffffffffffff",
+              "observed": [
+                {
+                  "selection_method": "explicit",
+                  "outcome": "selected",
+                  "candidate_count": 1
+                }
+              ]
+            },
+            "pr_lifecycle": {
+              "status": "observed",
+              "report_binding": "report:dddddddddddddddddddddddddddddddd",
+              "target_binding": "target:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "snapshot_binding": "snapshot:ffffffffffffffffffffffffffffffff",
+              "observed": [
+                {
+                  "state": "open",
+                  "merged": false,
+                  "merged_at": null,
+                  "draft": false
+                }
+              ]
+            },
+            "ci_status": {
+              "status": "observed",
+              "report_binding": "report:dddddddddddddddddddddddddddddddd",
+              "target_binding": "target:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "snapshot_binding": "snapshot:ffffffffffffffffffffffffffffffff",
+              "observed": [
+                {
+                  "state": "pending",
+                  "total": 2,
+                  "successful": 1,
+                  "failed": 0,
+                  "pending": 1,
+                  "cancelled": 0,
+                  "checks": [
+                    {
+                      "name": "lint",
+                      "conclusion": "success"
+                    },
+                    {
+                      "name": "tests",
+                      "conclusion": "pending"
+                    }
+                  ]
+                }
+              ]
+            },
+            "conversation_state": {
+              "status": "observed",
+              "report_binding": "report:dddddddddddddddddddddddddddddddd",
+              "target_binding": "target:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "snapshot_binding": "snapshot:ffffffffffffffffffffffffffffffff",
+              "observed": [
+                {
+                  "total_threads": 3,
+                  "unresolved_threads": 1
+                }
+              ]
+            },
+            "base_and_head": {
+              "status": "blocked",
+              "report_binding": "report:dddddddddddddddddddddddddddddddd",
+              "target_binding": "target:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+              "snapshot_binding": "snapshot:ffffffffffffffffffffffffffffffff",
+              "observed": []
+            }
+          },
+          "unavailable_evidence": [
+            "base-and-head"
+          ],
+          "blockers": [
+            {
+              "evidence": "base-and-head",
+              "code": "read-not-provably-non-mutating",
+              "detail": "The base/head read could not be proved non-mutating."
             }
           ],
           "actions": {

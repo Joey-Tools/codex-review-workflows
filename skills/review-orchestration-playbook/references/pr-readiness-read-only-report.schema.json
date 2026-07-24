@@ -6,6 +6,8 @@
   "required": [
     "schema_version",
     "terminal",
+    "terminal_state",
+    "report_id",
     "handoff_profile",
     "delivery_record",
     "target",
@@ -19,10 +21,21 @@
   ],
   "properties": {
     "schema_version": {
-      "const": 2
+      "const": 3
     },
     "terminal": {
       "const": "pr-readiness-read-only-report"
+    },
+    "terminal_state": {
+      "enum": [
+        "pre-target",
+        "pre-target-blocked",
+        "target-resolution-blocked",
+        "target-snapshot"
+      ]
+    },
+    "report_id": {
+      "$ref": "#/$defs/reportId"
     },
     "handoff_profile": {
       "const": "pr-readiness-read-only-probe"
@@ -105,15 +118,10 @@
     "unavailable_evidence": {
       "type": "array",
       "items": {
-        "enum": [
-          "pr-selection",
-          "pr-lifecycle",
-          "ci-status",
-          "conversation-state",
-          "base-and-head"
-        ]
+        "$ref": "#/$defs/evidenceName"
       },
-      "uniqueItems": true
+      "uniqueItems": true,
+      "maxItems": 5
     },
     "blockers": {
       "type": "array",
@@ -126,13 +134,7 @@
         ],
         "properties": {
           "evidence": {
-            "enum": [
-              "pr-selection",
-              "pr-lifecycle",
-              "ci-status",
-              "conversation-state",
-              "base-and-head"
-            ]
+            "$ref": "#/$defs/evidenceName"
           },
           "code": {
             "type": "string",
@@ -149,7 +151,7 @@
         "additionalProperties": false
       },
       "uniqueItems": true,
-      "maxItems": 64
+      "maxItems": 5
     },
     "actions": {
       "type": "object",
@@ -197,6 +199,12 @@
   "additionalProperties": false,
   "allOf": [
     {
+      "$ref": "#/$defs/terminalStateConsistency"
+    },
+    {
+      "$ref": "#/$defs/observedSourceConsistency"
+    },
+    {
       "$ref": "#/$defs/prSelectionConsistency"
     },
     {
@@ -213,9 +221,51 @@
     }
   ],
   "$defs": {
+    "reportId": {
+      "type": "string",
+      "pattern": "^report:[0-9a-f]{32}$"
+    },
+    "targetId": {
+      "type": "string",
+      "pattern": "^target:[0-9a-f]{32}$"
+    },
+    "snapshotId": {
+      "type": "string",
+      "pattern": "^snapshot:[0-9a-f]{32}$"
+    },
+    "observationId": {
+      "type": "string",
+      "pattern": "^observation:[0-9a-f]{32}$"
+    },
     "oid": {
       "type": "string",
       "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z$"
+    },
+    "evidenceName": {
+      "enum": [
+        "pr-selection",
+        "pr-lifecycle",
+        "ci-status",
+        "conversation-state",
+        "base-and-head"
+      ]
+    },
+    "evidenceStatus": {
+      "enum": [
+        "observed",
+        "unavailable",
+        "blocked"
+      ]
+    },
+    "nonObservedStatus": {
+      "enum": [
+        "unavailable",
+        "blocked"
+      ]
     },
     "repository": {
       "type": "object",
@@ -244,88 +294,177 @@
       },
       "additionalProperties": false
     },
+    "pullRequest": {
+      "type": "object",
+      "required": [
+        "number",
+        "url"
+      ],
+      "properties": {
+        "number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "pattern": "^https://\\S+$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "base": {
+      "type": "object",
+      "required": [
+        "ref",
+        "oid"
+      ],
+      "properties": {
+        "ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "oid": {
+          "$ref": "#/$defs/oid"
+        }
+      },
+      "additionalProperties": false
+    },
+    "head": {
+      "type": "object",
+      "required": [
+        "repository",
+        "ref",
+        "oid"
+      ],
+      "properties": {
+        "repository": {
+          "$ref": "#/$defs/repository"
+        },
+        "ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "oid": {
+          "$ref": "#/$defs/oid"
+        }
+      },
+      "additionalProperties": false
+    },
     "target": {
       "type": "object",
       "required": [
+        "report_binding",
         "binding_id",
-        "repository",
-        "pull_request",
-        "base",
-        "head"
+        "state",
+        "repository"
       ],
       "properties": {
+        "report_binding": {
+          "$ref": "#/$defs/reportId"
+        },
         "binding_id": {
-          "const": "report-target-v1"
+          "$ref": "#/$defs/targetId"
+        },
+        "state": {
+          "enum": [
+            "pre-target",
+            "pr-selected",
+            "range-resolved"
+          ]
         },
         "repository": {
           "$ref": "#/$defs/repository"
         },
         "pull_request": {
-          "type": "object",
-          "required": [
-            "number",
-            "url"
-          ],
-          "properties": {
-            "number": {
-              "type": "integer",
-              "minimum": 1
-            },
-            "url": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 2048,
-              "pattern": "^https://\\S+$"
-            }
-          },
-          "additionalProperties": false
+          "$ref": "#/$defs/pullRequest"
         },
         "base": {
-          "type": "object",
-          "required": [
-            "ref",
-            "oid"
-          ],
-          "properties": {
-            "ref": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 1024
-            },
-            "oid": {
-              "$ref": "#/$defs/oid"
-            }
-          },
-          "additionalProperties": false
+          "$ref": "#/$defs/base"
         },
         "head": {
-          "type": "object",
-          "required": [
-            "repository",
-            "ref",
-            "oid"
-          ],
-          "properties": {
-            "repository": {
-              "$ref": "#/$defs/repository"
-            },
-            "ref": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 1024
-            },
-            "oid": {
-              "$ref": "#/$defs/oid"
-            }
-          },
-          "additionalProperties": false
+          "$ref": "#/$defs/head"
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "state": {
+              "const": "pre-target"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "pull_request"
+                ]
+              },
+              {
+                "required": [
+                  "base"
+                ]
+              },
+              {
+                "required": [
+                  "head"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "state": {
+              "const": "pr-selected"
+            }
+          },
+          "required": [
+            "state",
+            "pull_request"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "base"
+                ]
+              },
+              {
+                "required": [
+                  "head"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "state": {
+              "const": "range-resolved"
+            }
+          },
+          "required": [
+            "state",
+            "pull_request",
+            "base",
+            "head"
+          ]
+        }
+      ]
     },
     "snapshot": {
       "type": "object",
       "required": [
+        "report_binding",
+        "target_binding",
         "binding_id",
         "snapshot_id",
         "observed_at",
@@ -333,25 +472,27 @@
         "sources"
       ],
       "properties": {
+        "report_binding": {
+          "$ref": "#/$defs/reportId"
+        },
+        "target_binding": {
+          "$ref": "#/$defs/targetId"
+        },
         "binding_id": {
-          "const": "report-snapshot-v1"
+          "$ref": "#/$defs/snapshotId"
         },
         "snapshot_id": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 256,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+          "$ref": "#/$defs/observationId"
         },
         "observed_at": {
-          "type": "string",
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z$"
+          "$ref": "#/$defs/timestamp"
         },
         "freshness": {
           "const": "current"
         },
         "sources": {
           "type": "array",
-          "minItems": 1,
+          "minItems": 0,
           "maxItems": 8,
           "uniqueItems": true,
           "items": {
@@ -366,17 +507,11 @@
       },
       "additionalProperties": false
     },
-    "evidenceStatus": {
-      "enum": [
-        "observed",
-        "unavailable",
-        "blocked"
-      ]
-    },
     "prSelectionEvidence": {
       "type": "object",
       "required": [
         "status",
+        "report_binding",
         "target_binding",
         "snapshot_binding",
         "observed"
@@ -385,11 +520,14 @@
         "status": {
           "$ref": "#/$defs/evidenceStatus"
         },
+        "report_binding": {
+          "$ref": "#/$defs/reportId"
+        },
         "target_binding": {
-          "const": "report-target-v1"
+          "$ref": "#/$defs/targetId"
         },
         "snapshot_binding": {
-          "const": "report-snapshot-v1"
+          "$ref": "#/$defs/snapshotId"
         },
         "observed": {
           "type": "array",
@@ -398,6 +536,7 @@
             "type": "object",
             "required": [
               "selection_method",
+              "outcome",
               "candidate_count"
             ],
             "properties": {
@@ -407,12 +546,54 @@
                   "unique-open-head"
                 ]
               },
+              "outcome": {
+                "enum": [
+                  "selected",
+                  "no-match",
+                  "ambiguous"
+                ]
+              },
               "candidate_count": {
                 "type": "integer",
-                "minimum": 1
+                "minimum": 0
               }
             },
-            "additionalProperties": false
+            "additionalProperties": false,
+            "oneOf": [
+              {
+                "properties": {
+                  "outcome": {
+                    "const": "selected"
+                  },
+                  "candidate_count": {
+                    "const": 1
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "outcome": {
+                    "const": "no-match"
+                  },
+                  "candidate_count": {
+                    "const": 0
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "selection_method": {
+                    "const": "unique-open-head"
+                  },
+                  "outcome": {
+                    "const": "ambiguous"
+                  },
+                  "candidate_count": {
+                    "minimum": 2
+                  }
+                }
+              }
+            ]
           }
         }
       },
@@ -427,6 +608,7 @@
       "type": "object",
       "required": [
         "status",
+        "report_binding",
         "target_binding",
         "snapshot_binding",
         "observed"
@@ -435,11 +617,14 @@
         "status": {
           "$ref": "#/$defs/evidenceStatus"
         },
+        "report_binding": {
+          "$ref": "#/$defs/reportId"
+        },
         "target_binding": {
-          "const": "report-target-v1"
+          "$ref": "#/$defs/targetId"
         },
         "snapshot_binding": {
-          "const": "report-snapshot-v1"
+          "$ref": "#/$defs/snapshotId"
         },
         "observed": {
           "type": "array",
@@ -468,8 +653,7 @@
                     "type": "null"
                   },
                   {
-                    "type": "string",
-                    "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z$"
+                    "$ref": "#/$defs/timestamp"
                   }
                 ]
               },
@@ -477,7 +661,48 @@
                 "type": "boolean"
               }
             },
-            "additionalProperties": false
+            "additionalProperties": false,
+            "oneOf": [
+              {
+                "properties": {
+                  "state": {
+                    "const": "open"
+                  },
+                  "merged": {
+                    "const": false
+                  },
+                  "merged_at": {
+                    "type": "null"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "state": {
+                    "const": "closed"
+                  },
+                  "merged": {
+                    "const": false
+                  },
+                  "merged_at": {
+                    "type": "null"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "state": {
+                    "const": "closed"
+                  },
+                  "merged": {
+                    "const": true
+                  },
+                  "merged_at": {
+                    "$ref": "#/$defs/timestamp"
+                  }
+                }
+              }
+            ]
           }
         }
       },
@@ -492,6 +717,7 @@
       "type": "object",
       "required": [
         "status",
+        "report_binding",
         "target_binding",
         "snapshot_binding",
         "observed"
@@ -500,11 +726,14 @@
         "status": {
           "$ref": "#/$defs/evidenceStatus"
         },
+        "report_binding": {
+          "$ref": "#/$defs/reportId"
+        },
         "target_binding": {
-          "const": "report-target-v1"
+          "$ref": "#/$defs/targetId"
         },
         "snapshot_binding": {
-          "const": "report-snapshot-v1"
+          "$ref": "#/$defs/snapshotId"
         },
         "observed": {
           "type": "array",
@@ -516,7 +745,9 @@
               "total",
               "successful",
               "failed",
-              "pending"
+              "pending",
+              "cancelled",
+              "checks"
             ],
             "properties": {
               "state": {
@@ -543,9 +774,126 @@
               "pending": {
                 "type": "integer",
                 "minimum": 0
+              },
+              "cancelled": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checks": {
+                "type": "array",
+                "maxItems": 256,
+                "uniqueItems": true,
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "name",
+                    "conclusion"
+                  ],
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 512
+                    },
+                    "conclusion": {
+                      "enum": [
+                        "success",
+                        "failure",
+                        "pending",
+                        "cancelled"
+                      ]
+                    }
+                  },
+                  "additionalProperties": false
+                }
               }
             },
-            "additionalProperties": false
+            "additionalProperties": false,
+            "oneOf": [
+              {
+                "properties": {
+                  "state": {
+                    "const": "no-checks"
+                  },
+                  "total": {
+                    "const": 0
+                  },
+                  "successful": {
+                    "const": 0
+                  },
+                  "failed": {
+                    "const": 0
+                  },
+                  "pending": {
+                    "const": 0
+                  },
+                  "cancelled": {
+                    "const": 0
+                  },
+                  "checks": {
+                    "maxItems": 0
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "state": {
+                    "const": "success"
+                  },
+                  "successful": {
+                    "minimum": 1
+                  },
+                  "failed": {
+                    "const": 0
+                  },
+                  "pending": {
+                    "const": 0
+                  },
+                  "cancelled": {
+                    "const": 0
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "state": {
+                    "const": "failure"
+                  },
+                  "failed": {
+                    "minimum": 1
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "state": {
+                    "const": "pending"
+                  },
+                  "failed": {
+                    "const": 0
+                  },
+                  "pending": {
+                    "minimum": 1
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "state": {
+                    "const": "cancelled"
+                  },
+                  "failed": {
+                    "const": 0
+                  },
+                  "pending": {
+                    "const": 0
+                  },
+                  "cancelled": {
+                    "minimum": 1
+                  }
+                }
+              }
+            ]
           }
         }
       },
@@ -560,6 +908,7 @@
       "type": "object",
       "required": [
         "status",
+        "report_binding",
         "target_binding",
         "snapshot_binding",
         "observed"
@@ -568,11 +917,14 @@
         "status": {
           "$ref": "#/$defs/evidenceStatus"
         },
+        "report_binding": {
+          "$ref": "#/$defs/reportId"
+        },
         "target_binding": {
-          "const": "report-target-v1"
+          "$ref": "#/$defs/targetId"
         },
         "snapshot_binding": {
-          "const": "report-snapshot-v1"
+          "$ref": "#/$defs/snapshotId"
         },
         "observed": {
           "type": "array",
@@ -608,6 +960,7 @@
       "type": "object",
       "required": [
         "status",
+        "report_binding",
         "target_binding",
         "snapshot_binding",
         "observed"
@@ -616,11 +969,14 @@
         "status": {
           "$ref": "#/$defs/evidenceStatus"
         },
+        "report_binding": {
+          "$ref": "#/$defs/reportId"
+        },
         "target_binding": {
-          "const": "report-target-v1"
+          "$ref": "#/$defs/targetId"
         },
         "snapshot_binding": {
-          "const": "report-snapshot-v1"
+          "$ref": "#/$defs/snapshotId"
         },
         "observed": {
           "type": "array",
@@ -655,7 +1011,86 @@
                 ]
               }
             },
-            "additionalProperties": false
+            "additionalProperties": false,
+            "oneOf": [
+              {
+                "properties": {
+                  "base_object_present": {
+                    "const": false
+                  },
+                  "merge_base_count": {
+                    "const": 0
+                  },
+                  "merge_base_oid": {
+                    "type": "null"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "base_object_present": {
+                    "const": true
+                  },
+                  "head_object_present": {
+                    "const": false
+                  },
+                  "merge_base_count": {
+                    "const": 0
+                  },
+                  "merge_base_oid": {
+                    "type": "null"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "base_object_present": {
+                    "const": true
+                  },
+                  "head_object_present": {
+                    "const": true
+                  },
+                  "merge_base_count": {
+                    "const": 0
+                  },
+                  "merge_base_oid": {
+                    "type": "null"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "base_object_present": {
+                    "const": true
+                  },
+                  "head_object_present": {
+                    "const": true
+                  },
+                  "merge_base_count": {
+                    "const": 1
+                  },
+                  "merge_base_oid": {
+                    "$ref": "#/$defs/oid"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "base_object_present": {
+                    "const": true
+                  },
+                  "head_object_present": {
+                    "const": true
+                  },
+                  "merge_base_count": {
+                    "minimum": 2
+                  },
+                  "merge_base_oid": {
+                    "type": "null"
+                  }
+                }
+              }
+            ]
           }
         }
       },
@@ -692,7 +1127,302 @@
         }
       }
     },
+    "observedSourceConsistency": {
+      "if": {
+        "properties": {
+          "evidence": {
+            "anyOf": [
+              {
+                "properties": {
+                  "pr_selection": {
+                    "properties": {
+                      "status": {
+                        "const": "observed"
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "pr_lifecycle": {
+                    "properties": {
+                      "status": {
+                        "const": "observed"
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "ci_status": {
+                    "properties": {
+                      "status": {
+                        "const": "observed"
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "conversation_state": {
+                    "properties": {
+                      "status": {
+                        "const": "observed"
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "base_and_head": {
+                    "properties": {
+                      "status": {
+                        "const": "observed"
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "snapshot": {
+            "properties": {
+              "sources": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    "terminalStateConsistency": {
+      "oneOf": [
+        {
+          "properties": {
+            "terminal_state": {
+              "const": "pre-target"
+            },
+            "target": {
+              "properties": {
+                "state": {
+                  "const": "pre-target"
+                }
+              }
+            },
+            "evidence": {
+              "properties": {
+                "pr_selection": {
+                  "properties": {
+                    "status": {
+                      "const": "observed"
+                    },
+                    "observed": {
+                      "items": {
+                        "properties": {
+                          "outcome": {
+                            "enum": [
+                              "no-match",
+                              "ambiguous"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "pr_lifecycle": {
+                  "properties": {
+                    "status": {
+                      "$ref": "#/$defs/nonObservedStatus"
+                    }
+                  }
+                },
+                "ci_status": {
+                  "properties": {
+                    "status": {
+                      "$ref": "#/$defs/nonObservedStatus"
+                    }
+                  }
+                },
+                "conversation_state": {
+                  "properties": {
+                    "status": {
+                      "$ref": "#/$defs/nonObservedStatus"
+                    }
+                  }
+                },
+                "base_and_head": {
+                  "properties": {
+                    "status": {
+                      "$ref": "#/$defs/nonObservedStatus"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "terminal_state": {
+              "const": "pre-target-blocked"
+            },
+            "target": {
+              "properties": {
+                "state": {
+                  "const": "pre-target"
+                }
+              }
+            },
+            "evidence": {
+              "properties": {
+                "pr_selection": {
+                  "properties": {
+                    "status": {
+                      "$ref": "#/$defs/nonObservedStatus"
+                    }
+                  }
+                },
+                "pr_lifecycle": {
+                  "properties": {
+                    "status": {
+                      "$ref": "#/$defs/nonObservedStatus"
+                    }
+                  }
+                },
+                "ci_status": {
+                  "properties": {
+                    "status": {
+                      "$ref": "#/$defs/nonObservedStatus"
+                    }
+                  }
+                },
+                "conversation_state": {
+                  "properties": {
+                    "status": {
+                      "$ref": "#/$defs/nonObservedStatus"
+                    }
+                  }
+                },
+                "base_and_head": {
+                  "properties": {
+                    "status": {
+                      "$ref": "#/$defs/nonObservedStatus"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "terminal_state": {
+              "const": "target-resolution-blocked"
+            },
+            "target": {
+              "properties": {
+                "state": {
+                  "const": "pr-selected"
+                }
+              }
+            },
+            "evidence": {
+              "properties": {
+                "pr_selection": {
+                  "properties": {
+                    "status": {
+                      "const": "observed"
+                    },
+                    "observed": {
+                      "items": {
+                        "properties": {
+                          "outcome": {
+                            "const": "selected"
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "base_and_head": {
+                  "properties": {
+                    "status": {
+                      "$ref": "#/$defs/nonObservedStatus"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "terminal_state": {
+              "const": "target-snapshot"
+            },
+            "target": {
+              "properties": {
+                "state": {
+                  "const": "range-resolved"
+                }
+              }
+            },
+            "evidence": {
+              "properties": {
+                "pr_selection": {
+                  "properties": {
+                    "status": {
+                      "const": "observed"
+                    },
+                    "observed": {
+                      "items": {
+                        "properties": {
+                          "outcome": {
+                            "const": "selected"
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "base_and_head": {
+                  "properties": {
+                    "status": {
+                      "const": "observed"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
     "prSelectionConsistency": {
+      "$ref": "#/$defs/prSelectionStatusConsistency"
+    },
+    "prLifecycleConsistency": {
+      "$ref": "#/$defs/prLifecycleStatusConsistency"
+    },
+    "ciStatusConsistency": {
+      "$ref": "#/$defs/ciStatusStatusConsistency"
+    },
+    "conversationStateConsistency": {
+      "$ref": "#/$defs/conversationStateStatusConsistency"
+    },
+    "baseAndHeadConsistency": {
+      "$ref": "#/$defs/baseAndHeadStatusConsistency"
+    },
+    "prSelectionStatusConsistency": {
       "if": {
         "properties": {
           "evidence": {
@@ -702,20 +1432,11 @@
                   "status": {
                     "const": "observed"
                   }
-                },
-                "required": [
-                  "status"
-                ]
+                }
               }
-            },
-            "required": [
-              "pr_selection"
-            ]
+            }
           }
-        },
-        "required": [
-          "evidence"
-        ]
+        }
       },
       "then": {
         "properties": {
@@ -746,12 +1467,13 @@
             "contains": {
               "$ref": "#/$defs/prSelectionBlocker"
             },
+            "minContains": 1,
             "maxContains": 1
           }
         }
       }
     },
-    "prLifecycleConsistency": {
+    "prLifecycleStatusConsistency": {
       "if": {
         "properties": {
           "evidence": {
@@ -761,20 +1483,11 @@
                   "status": {
                     "const": "observed"
                   }
-                },
-                "required": [
-                  "status"
-                ]
+                }
               }
-            },
-            "required": [
-              "pr_lifecycle"
-            ]
+            }
           }
-        },
-        "required": [
-          "evidence"
-        ]
+        }
       },
       "then": {
         "properties": {
@@ -805,12 +1518,13 @@
             "contains": {
               "$ref": "#/$defs/prLifecycleBlocker"
             },
+            "minContains": 1,
             "maxContains": 1
           }
         }
       }
     },
-    "ciStatusConsistency": {
+    "ciStatusStatusConsistency": {
       "if": {
         "properties": {
           "evidence": {
@@ -820,20 +1534,11 @@
                   "status": {
                     "const": "observed"
                   }
-                },
-                "required": [
-                  "status"
-                ]
+                }
               }
-            },
-            "required": [
-              "ci_status"
-            ]
+            }
           }
-        },
-        "required": [
-          "evidence"
-        ]
+        }
       },
       "then": {
         "properties": {
@@ -864,12 +1569,13 @@
             "contains": {
               "$ref": "#/$defs/ciStatusBlocker"
             },
+            "minContains": 1,
             "maxContains": 1
           }
         }
       }
     },
-    "conversationStateConsistency": {
+    "conversationStateStatusConsistency": {
       "if": {
         "properties": {
           "evidence": {
@@ -879,20 +1585,11 @@
                   "status": {
                     "const": "observed"
                   }
-                },
-                "required": [
-                  "status"
-                ]
+                }
               }
-            },
-            "required": [
-              "conversation_state"
-            ]
+            }
           }
-        },
-        "required": [
-          "evidence"
-        ]
+        }
       },
       "then": {
         "properties": {
@@ -923,12 +1620,13 @@
             "contains": {
               "$ref": "#/$defs/conversationStateBlocker"
             },
+            "minContains": 1,
             "maxContains": 1
           }
         }
       }
     },
-    "baseAndHeadConsistency": {
+    "baseAndHeadStatusConsistency": {
       "if": {
         "properties": {
           "evidence": {
@@ -938,20 +1636,11 @@
                   "status": {
                     "const": "observed"
                   }
-                },
-                "required": [
-                  "status"
-                ]
+                }
               }
-            },
-            "required": [
-              "base_and_head"
-            ]
+            }
           }
-        },
-        "required": [
-          "evidence"
-        ]
+        }
       },
       "then": {
         "properties": {
@@ -982,6 +1671,7 @@
             "contains": {
               "$ref": "#/$defs/baseAndHeadBlocker"
             },
+            "minContains": 1,
             "maxContains": 1
           }
         }
