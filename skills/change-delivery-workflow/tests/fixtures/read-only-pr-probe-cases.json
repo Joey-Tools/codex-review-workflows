@@ -25,15 +25,85 @@
           "base-and-head"
         ],
         "forbid": [
+          "local-review-lanes",
+          "secret-admission",
           "comments",
           "github-codex-request",
-          "state-changing-waits",
+          "waits",
+          "cache-or-state-writes",
           "branch-or-pr-metadata-changes",
           "fixes",
           "commits",
           "pushes"
         ],
-        "terminal": "pr-readiness-read-only-report"
+        "terminal": "pr-readiness-read-only-report",
+        "terminal_result": {
+          "schema_version": 1,
+          "terminal": "pr-readiness-read-only-report",
+          "handoff_profile": "pr-readiness-read-only-probe",
+          "delivery_record": {
+            "schema_version": 1,
+            "profile": "local-gate",
+            "constraints": [
+              "probe-only",
+              "no-remote"
+            ],
+            "local_mutation": "forbidden",
+            "commit_mode": "forbidden",
+            "remote_mutation": "forbidden",
+            "handoff": "review-orchestration-playbook",
+            "handoff_profile": "pr-readiness-read-only-probe"
+          },
+          "evidence": {
+            "pr_selection": {
+              "status": "observed",
+              "details": [
+                "One existing PR was selected."
+              ]
+            },
+            "pr_lifecycle": {
+              "status": "observed",
+              "details": [
+                "The selected PR was open at the snapshot."
+              ]
+            },
+            "ci_status": {
+              "status": "unavailable",
+              "details": []
+            },
+            "conversation_state": {
+              "status": "unavailable",
+              "details": []
+            },
+            "base_and_head": {
+              "status": "observed",
+              "details": [
+                "Base and head metadata were read without mutation."
+              ]
+            }
+          },
+          "unavailable_evidence": [
+            "ci-status",
+            "conversation-state"
+          ],
+          "blockers": [
+            {
+              "code": "evidence-unavailable",
+              "detail": "CI and conversation reads could not be proved cache-free."
+            }
+          ],
+          "actions": {
+            "local_lanes_started": false,
+            "secret_admission_started": false,
+            "comments_posted": false,
+            "waits_started": false,
+            "cache_or_state_written": false,
+            "local_mutation_performed": false,
+            "remote_mutation_performed": false
+          },
+          "merge_ready": false,
+          "next_handoff": "none"
+        }
       }
     }
   ]

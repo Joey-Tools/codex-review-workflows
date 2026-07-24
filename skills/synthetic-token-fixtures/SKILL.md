@@ -19,41 +19,64 @@ binding_resolver="$synthetic_skill_root/scripts/active_catalog_binding.py"
 ## Bind The Active Source
 
 1. Resolve one absolute Python 3 interpreter through the user or repository's
-   normal runtime authority. Run that interpreter with `-E -B -s -S` against
-   the skill-relative `binding_resolver`. Do not search `CODEX_HOME`, `HOME`,
-   `PATH`, another checkout, or a caller-provided catalog path for the review
-   skill. The resolver requires POSIX no-follow, nonblocking, close-on-exec, and
-   ownership primitives; on an unsupported native runtime, stop rather than
-   selecting another source.
-2. Require a successful versioned-release binding. The resolver derives the
-   sibling review skill from its own resolved file location, verifies that the
-   release `sync-manifest.json` installs both skill sources, and returns the
-   exact absolute release/root/manifest/CLI/catalog/interpreter paths, release
-   ID, review-runtime tree digest, manifest/CLI/catalog/skill/interpreter
-   SHA-256 digests, `pool_version`, and one canonical `binding_sha256`.
-3. Stop on a non-release layout, missing sibling, symlink, bytecode/native
-   import substitute, package shadow, unsafe ownership or write policy, invalid
-   catalog, ambiguous source, or digest mismatch. A repository working copy is
-   not an active release.
-4. Before and after every authoring CLI operation, rerun the same resolver with
-   `--expect-binding-sha256 <binding_sha256>`. Use only the returned exact
-   `python_executable` and `catalog_cli_path`; invoke them as:
+   normal runtime authority. Invoke the skill-relative `binding_resolver` only
+   with `-I -B -S`, the exact absolute directory containing this loaded
+   `SKILL.md`, and the `bind` action:
 
 ```bash
-"$python_executable" -E -B -s -S "$catalog_cli" synthetic-tokens validate
+"$python_executable" -I -B -S "$binding_resolver" \
+  --loaded-skill-root "$synthetic_skill_root" bind
 ```
 
-The resolver binds source identity but is not a second token CLI. It never
-accepts a catalog or review-skill path and never returns token values. The
+   `-I` is mandatory: `-E -B -s -S` still leaves the script directory on
+   `sys.path`. The resolver checks isolated-mode flags before importing
+   `argparse`, `json`, or any other non-builtin module, so a resolver-local or
+   current-directory module shadow cannot execute before source admission.
+   It requires POSIX no-follow, nonblocking, close-on-exec file primitives and
+   fails closed when they are unavailable.
+   Do not search `CODEX_HOME`, `HOME`, `PATH`, another checkout, or a
+   caller-provided catalog path for the review skill.
+2. Require a successful versioned-release binding. The resolver validates the
+   original absolute resolver leaf before any `resolve`, rejects symlinks,
+   validates every release-to-resolver parent including the `scripts`
+   directory, binds the explicitly loaded skill root, and derives the sibling
+   review skill from that same co-release. It verifies that the release
+   `sync-manifest.json` installs both skill sources and returns release/root
+   identity, review-runtime tree digest, source/interpreter snapshot digests,
+   `pool_version`, and one canonical `binding_sha256`.
+3. Stop on a non-release layout, loaded-skill mismatch, cross-release symlink,
+   missing sibling, bytecode/native import substitute, package shadow, unsafe
+   ownership or write policy, invalid catalog, ambiguous source, or digest
+   mismatch. A repository working copy is not an active release.
+4. Run each authoring operation through the resolver with the captured binding:
+
+```bash
+"$python_executable" -I -B -S "$binding_resolver" \
+  --loaded-skill-root "$synthetic_skill_root" \
+  --expect-binding-sha256 "$binding_sha256" validate
+```
+
+   Each invocation is one controlled in-process transaction. It retains the
+   active interpreter, resolver, review CLI, and catalog descriptor bindings;
+   executes the review CLI only from manifest-bound source snapshots through a
+   closed `review_runtime` import set; captures and validates the operation
+   result and `pool_version`; removes the temporary module namespace; and
+   closes the bound descriptors before publishing the result envelope. It
+   never executes the returned Python or CLI path, and there is no
+   validate-path / execute-path / revalidate-path window.
+
+The resolver is an execution guard, not a second token CLI. It never accepts a
+catalog or review-skill path, never defines token values, and exposes raw value
+output only for one explicitly requested `get` operation. The manifest-bound
 review skill-local CLI and catalog remain the sole authoring authority.
 
 ## Authoring CLI Contract
 
 The authoring surface has exactly three operations:
 
-- `"$catalog_cli" synthetic-tokens validate` validates the fixed catalog and its scanner contract.
-- `"$catalog_cli" synthetic-tokens list --json` returns `pool_version` plus metadata-only token records. It must not expose raw values.
-- `"$catalog_cli" synthetic-tokens get <id> --json` returns the one explicitly selected record and its exact raw value. It must not bulk-return other raw values.
+- Resolver action `validate` runs `synthetic-tokens validate` against the bound fixed catalog and validates its scanner contract.
+- Resolver action `list` runs `synthetic-tokens list --json` and returns `pool_version` plus metadata-only token records. It must not expose raw values.
+- Resolver action `get <id>` runs `synthetic-tokens get <id> --json` and returns the one explicitly selected record and its exact raw value. It must not bulk-return other raw values.
 
 If any operation is missing, the catalog does not validate, the CLI response
 `pool_version` differs from the bound `pool_version`, the binding changes during
@@ -63,8 +86,8 @@ values from documentation or source.
 ## Select Authoring Tokens
 
 1. Capture and verify the active-source binding above.
-2. Run bound `validate`, then metadata-only `list --json`, revalidating
-   `binding_sha256` around each operation.
+2. Run bound `validate`, then metadata-only `list`, requiring the same
+   `binding_sha256` inside each completed transaction envelope.
 3. Read `pool_version` and each token's `id`, `role`, `state`, `rule`, and
    `value_sha256`. Supported roles are `access`, `refresh`, `id`, `api-key`, and
    `bearer`; supported states are `active`, `expired`, and `consumed`.
@@ -72,9 +95,9 @@ values from documentation or source.
    fit. Otherwise filter by role and state, sort by ID, and choose the first
    compatible entry. Choose distinct IDs for fixtures that model distinct
    credentials, and record those IDs with the fixture.
-5. Run bound single-ID `get <id> --json` for each chosen ID. Revalidate the
-   binding and `pool_version`, then insert the returned value verbatim as the
-   complete credential value.
+5. Run bound single-ID `get <id>` for each chosen ID. Require the same binding
+   and `pool_version`, then insert the returned value verbatim as the complete
+   credential value.
 6. Run the affected tests. Hand frozen-range preflight and review work to
    `$review-orchestration-playbook`; a catalog match does not override another
    scanner rule or a credential-like path finding.

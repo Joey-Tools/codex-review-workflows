@@ -179,9 +179,11 @@ mutation is forbidden and remote reads remain allowed.
   blocked.
 - Forbid comments, `@codex review`, state-changing waits, branch/ref or PR
   metadata changes, fixes, commits, pushes, releases, and merge.
-- Return terminal `pr-readiness-read-only-report` with the evidence actually
-  observed, unavailable evidence, and blockers. Never call this merge-ready and
-  never promote the handoff to the mutation-capable `pr-readiness` profile.
+- Return terminal `pr-readiness-read-only-report`, conforming to its
+  [closed receiver schema](../review-orchestration-playbook/references/pr-readiness-read-only-report.schema.json),
+  with the evidence actually observed, unavailable evidence, and blockers.
+  Never call this merge-ready and never promote the handoff to the
+  mutation-capable `pr-readiness` profile.
 
 When a non-trivial delivery request is otherwise ambiguous, use `local-gate`.
 Stop for input when the missing choice would materially change scope or remote

@@ -1,0 +1,207 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://joey-tools.invalid/review-orchestration-playbook/pr-readiness-read-only-report.schema.json",
+  "title": "PR Readiness Read-Only Probe Terminal Report",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "terminal",
+    "handoff_profile",
+    "delivery_record",
+    "evidence",
+    "unavailable_evidence",
+    "blockers",
+    "actions",
+    "merge_ready",
+    "next_handoff"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "terminal": {
+      "const": "pr-readiness-read-only-report"
+    },
+    "handoff_profile": {
+      "const": "pr-readiness-read-only-probe"
+    },
+    "delivery_record": {
+      "allOf": [
+        {
+          "$ref": "https://joey-tools.invalid/change-delivery-workflow/delivery-result.schema.json"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "profile": {
+              "const": "local-gate"
+            },
+            "constraints": {
+              "contains": {
+                "enum": [
+                  "report-only",
+                  "probe-only",
+                  "read-only",
+                  "no-remote"
+                ]
+              }
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "handoff": {
+              "const": "review-orchestration-playbook"
+            },
+            "handoff_profile": {
+              "const": "pr-readiness-read-only-probe"
+            }
+          },
+          "required": [
+            "profile",
+            "constraints",
+            "remote_mutation",
+            "handoff",
+            "handoff_profile"
+          ]
+        }
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "required": [
+        "pr_selection",
+        "pr_lifecycle",
+        "ci_status",
+        "conversation_state",
+        "base_and_head"
+      ],
+      "properties": {
+        "pr_selection": {
+          "$ref": "#/$defs/evidenceSnapshot"
+        },
+        "pr_lifecycle": {
+          "$ref": "#/$defs/evidenceSnapshot"
+        },
+        "ci_status": {
+          "$ref": "#/$defs/evidenceSnapshot"
+        },
+        "conversation_state": {
+          "$ref": "#/$defs/evidenceSnapshot"
+        },
+        "base_and_head": {
+          "$ref": "#/$defs/evidenceSnapshot"
+        }
+      },
+      "additionalProperties": false
+    },
+    "unavailable_evidence": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "pr-selection",
+          "pr-lifecycle",
+          "ci-status",
+          "conversation-state",
+          "base-and-head"
+        ]
+      },
+      "uniqueItems": true
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "code",
+          "detail"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[a-z0-9]+(?:[a-z0-9-]*[a-z0-9])?$"
+          },
+          "detail": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          }
+        },
+        "additionalProperties": false
+      },
+      "maxItems": 64
+    },
+    "actions": {
+      "type": "object",
+      "required": [
+        "local_lanes_started",
+        "secret_admission_started",
+        "comments_posted",
+        "waits_started",
+        "cache_or_state_written",
+        "local_mutation_performed",
+        "remote_mutation_performed"
+      ],
+      "properties": {
+        "local_lanes_started": {
+          "const": false
+        },
+        "secret_admission_started": {
+          "const": false
+        },
+        "comments_posted": {
+          "const": false
+        },
+        "waits_started": {
+          "const": false
+        },
+        "cache_or_state_written": {
+          "const": false
+        },
+        "local_mutation_performed": {
+          "const": false
+        },
+        "remote_mutation_performed": {
+          "const": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "merge_ready": {
+      "const": false
+    },
+    "next_handoff": {
+      "const": "none"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "evidenceSnapshot": {
+      "type": "object",
+      "required": [
+        "status",
+        "details"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "observed",
+            "unavailable",
+            "blocked"
+          ]
+        },
+        "details": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          },
+          "maxItems": 64
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

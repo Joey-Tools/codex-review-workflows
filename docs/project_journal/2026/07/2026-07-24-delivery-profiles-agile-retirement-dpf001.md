@@ -38,8 +38,10 @@ superseded_by:
   remote mutation routes through the review orchestrator's
   `pr-readiness-read-only-probe` handoff. It can read only PR selection,
   lifecycle, CI, conversation, and base/head evidence; it cannot comment,
-  request GitHub Codex, start state-changing work, fix, commit, push, release,
-  or merge.
+  request GitHub Codex, start local lanes or secret admission, wait, write
+  cache or state, fix, commit, push, release, or merge. The receiver is
+  classified before every generic PR/review route and returns one closed
+  terminal report whose action fields and merge-ready claim are fixed false.
 - Every terminal result or permitted handoff carries a closed, versioned record
   with the selected profile, immutable constraint list, local mutation mode,
   commit mode, remote mutation mode, handoff target, and handoff profile.
@@ -68,12 +70,18 @@ superseded_by:
   the uncommitted checked result and exact validations; it does not invent a
   missing-range blocker or handoff.
 - Synthetic fixture authoring binds its sibling review runtime from the same
-  active immutable release. The machine receipt carries absolute paths, release
-  ID, a co-release `sync-manifest.json` proof, source/interpreter digests,
-  `pool_version`, and a canonical binding digest that is revalidated around
-  catalog validation, metadata-only listing, and single-ID retrieval.
-  `CODEX_HOME`, `HOME`, arbitrary repository copies, and caller-selected catalog
-  paths cannot select the authority.
+  active immutable release. The resolver admits imports only after an absolute
+  Python interpreter starts it with `-I -B -S`, rejects a raw resolver leaf or
+  parent-chain symlink before resolution, and binds the loaded-skill and
+  co-release identity through the release `sync-manifest.json`.
+- Each catalog bind, validation, metadata listing, or single-ID retrieval is
+  one in-process transaction. It retains and revalidates the resolver,
+  interpreter, catalog CLI, catalog, and parent-directory descriptors through
+  snapshot execution, result validation, namespace cleanup, and final close.
+  The CLI and its closed `review_runtime` imports execute only from captured
+  source and catalog bytes; no validated mutable pathname is executed later.
+  `CODEX_HOME`, `HOME`, repository shadows, caller-selected catalog paths, and
+  same-byte inode replacement cannot select or release a result.
 
 ## Next Steps
 
@@ -81,29 +89,38 @@ superseded_by:
 
 ## Evidence
 
-- `python3 -B skills/change-delivery-workflow/tests/test_delivery_profiles.py`
-  passed (`20` tests), including deterministic local-mutation short circuits,
+- `python3 -B skills/change-delivery-workflow/tests/test_delivery_profiles.py -q`
+  passed (`21` tests), including deterministic local-mutation short circuits,
   the independent mutable-`no-commit` control, constrained-scope conflicts,
-  read-only PR-probe routing, closed result-record rejection cases, and the
-  clean-range, missing-range, findings, and review-not-required terminals under
-  forbidden commit mode.
+  read-only PR-probe routing and receiver ordering, closed delivery and terminal
+  report records, and the clean-range, missing-range, findings, and
+  review-not-required terminals under forbidden commit mode.
 - `python3 -B skills/synthetic-token-fixtures/tests/test_skill_contract.py -v`
-  passed (`3` tests), including a co-release installation fixture, bound
-  validate/list/get operations, and fail-closed source/layout drift.
+  passed (`7` tests), including co-release binding, isolated-import shadows,
+  raw-leaf and intermediate cross-release symlinks, unsafe parent modes,
+  bound validate/list/get operations, same-byte CLI inode replacement, and
+  fail-closed source/layout drift.
 - `python3 -B skills/review-orchestration-playbook/tests/test_synthetic_tokens.py SyntheticTokenCliTest -v`
-  passed (`5` tests).
+  passed (`6` tests), including the explicit exact-bytes catalog hook used only
+  by the bound transaction.
 - `python3 -B skills/review-orchestration-playbook/tests/test_contracts.py -q`
   passed (`86` tests).
-- `uv run --isolated --with pyyaml python3 /Users/hoteng/.codex/skills/joey-skill-authoring/scripts/codex_skill_validate.py skills/change-delivery-workflow skills/agile-delivery-workflow skills/synthetic-token-fixtures`
-  passed (`3/3` skills valid) after the constrained-scope review-fix round.
-- `python3 -m json.tool` passed for the delivery-result schema and all four
-  delivery fixtures; Draft 2020-12 `jsonschema` validation accepted all `12`
-  profile result records.
+- `python3 -B skills/review-orchestration-playbook/tests/test_cli.py -q`
+  passed (`17` tests).
+- `uv run --isolated --with pyyaml python3 /Users/hoteng/.codex/skills/joey-skill-authoring/scripts/codex_skill_validate.py --report /tmp/delivery-binding-review-fixes.TIcfwF/skill-validation-escalated.json skills/change-delivery-workflow skills/agile-delivery-workflow skills/synthetic-token-fixtures skills/review-orchestration-playbook`
+  passed for all four affected skills after the constrained-scope review-fix
+  round.
+- `python3 -m json.tool` passed for both schemas and the read-only probe fixture;
+  Draft 2020-12 `jsonschema` validation accepted all `13` delivery records and
+  the terminal read-only report through the registered cross-schema reference.
 - `python3 -B /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo .`
   passed.
-- `ruff check` passed for the delivery tests, synthetic skill tests, active
-  binding resolver, and review-contract tests; `ruff format --check` passed for
-  the same Python files.
+- `ruff check` and `ruff format --check` passed for the five changed Python
+  implementation and test files.
+- Broader review-playbook discovery and full synthetic-token test commands were
+  bounded and manually interrupted after long silent runs in unchanged heavy
+  workspace/provider tests; neither produced an assertion failure. The
+  affected targeted modules above completed.
 - The validator's task-local `uv` cache and test-created Python bytecode were
   removed after validation; the final ignored-cache scan passed.
 - `git diff --check` passed for tracked changes.

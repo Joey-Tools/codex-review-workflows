@@ -1,6 +1,56 @@
 # PR Readiness
 
-Use this reference after the local delivery gate has produced a reviewable commit and the parent request owns PR creation/update, review/CI follow-up, merge-readiness reporting, or merge.
+First classify an inbound `pr-readiness-read-only-probe` delivery handoff through
+the closed receiving path below. Only when that profile is absent may the
+ordinary authorization, review, admission, wait, fix-loop, and merge-readiness
+rules in the rest of this reference apply.
+
+Otherwise, use this reference after the local delivery gate has produced a
+reviewable commit and the parent request owns PR creation/update, review/CI
+follow-up, merge-readiness reporting, or merge.
+
+## Read-Only Delivery Probe: Classify And Stop First
+
+This path receives only a complete
+`change-delivery-workflow` record whose exact fields validate against
+`../../change-delivery-workflow/references/delivery-result.schema.json` and
+whose `handoff_profile` is `pr-readiness-read-only-probe`. Classify it before
+generic PR/full-workflow language, named single/double/triple review, or the
+ordinary gate sequence. A missing field, unknown field, lost constraint,
+non-forbidden remote-mutation mode, different handoff, or widened profile is
+terminal `blocked-input`; do not infer replacement authority from prose.
+
+The receiving sequence is closed:
+
+1. Preserve the inbound delivery record verbatim. Do not change its profile,
+   constraints, `local_mutation`, `commit_mode`, `remote_mutation`, handoff, or
+   handoff profile.
+2. Take only bounded, non-mutating snapshots of existing-PR selection,
+   lifecycle, CI status, unresolved-conversation state, and exact base/head
+   evidence. A read-only local object lookup may be used only with optional
+   locks, lazy fetching, credential prompts, generated commit graphs, and
+   persistent caches disabled. It must not create a checkout, worktree, log,
+   state directory, or result file.
+3. Do not start any local Codex or Claude lane, `materialize-worktree`,
+   `validate-worktree`, low-level helper mode, exact-secret admission,
+   GitHub Codex request, check, workflow, comment, poll, monitor, or wait. Do
+   not fix code, write a journal, create or update a branch/PR/ref, commit,
+   push, release, merge, or perform another local or remote mutation.
+4. Use only a read mechanism proved not to persist authentication refreshes,
+   caches, tool state, or connector state. When that guarantee is unavailable,
+   do not attempt the read; mark its evidence `unavailable` or `blocked` and
+   record a blocker.
+5. Emit exactly one terminal record conforming to
+   [pr-readiness-read-only-report.schema.json](pr-readiness-read-only-report.schema.json).
+   Each unavailable evidence kind must be listed in `unavailable_evidence`;
+   every action field remains `false`. Report only evidence actually observed,
+   unavailable evidence, and blockers. Then stop without another handoff.
+
+This report is never a named-review artifact, secret-admission result,
+PR-readiness completion, or merge-ready claim. Its schema fixes `merge_ready`
+to `false` and `next_handoff` to `none`. Even a snapshot in which every
+observed check is green cannot be promoted to ordinary readiness without a
+later explicit mutation-capable request and a new classification.
 
 ## Authorization
 

@@ -6840,6 +6840,33 @@ class SyntheticTokenCliTest(unittest.TestCase):
             returncode = cli.main(["synthetic-tokens", *args])
         return returncode, stdout.getvalue(), stderr.getvalue()
 
+    def test_bound_catalog_bytes_hook_is_explicit_and_exact(self) -> None:
+        catalog_bytes = synthetic_tokens.CATALOG_PATH.read_bytes()
+        missing_path = synthetic_tokens.CATALOG_PATH.with_name("missing-catalog.json")
+        with (
+            mock.patch.object(
+                synthetic_tokens,
+                "BOUND_CATALOG_BYTES",
+                catalog_bytes,
+            ),
+            mock.patch.object(synthetic_tokens, "CATALOG_PATH", missing_path),
+        ):
+            catalog = synthetic_tokens.load_catalog()
+        self.assertEqual(
+            catalog.pool_version,
+            json.loads(catalog_bytes)["authoring_pool"]["version"],
+        )
+
+        with (
+            mock.patch.object(
+                synthetic_tokens,
+                "BOUND_CATALOG_BYTES",
+                bytearray(catalog_bytes),
+            ),
+            self.assertRaisesRegex(ReviewError, "exact bytes"),
+        ):
+            synthetic_tokens.load_catalog()
+
     def test_validate_and_list_return_metadata_without_raw_values(self) -> None:
         returncode, output, error = self.run_cli("validate")
         self.assertEqual((returncode, error), (0, ""))

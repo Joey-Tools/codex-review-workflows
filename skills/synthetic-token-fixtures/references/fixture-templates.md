@@ -1,13 +1,14 @@
 # Placeholder-Only Fixture Templates
 
 First capture the parent skill's skill-relative active-release binding. Require
-the same `binding_sha256` before and after each operation, use only its exact
-`python_executable` and `catalog_cli_path`, and require the CLI result's
-`pool_version` to equal the binding. Run bound `synthetic-tokens validate`,
-select IDs from the metadata-only bound `synthetic-tokens list --json` result,
-and resolve each placeholder with bound single-ID `synthetic-tokens get <id>
---json`. Replace the complete placeholder with the returned value. Do not
-concatenate, transform, encode, or partially substitute a value.
+the same `binding_sha256` in each resolver transaction envelope and require the
+CLI result's `pool_version` to equal the binding. Use resolver actions
+`validate`, `list`, and single-ID `get <id>`; those actions execute the bound
+`synthetic-tokens validate`, metadata-only `synthetic-tokens list --json`, and
+single-ID `synthetic-tokens get <id> --json` surfaces from validated snapshots.
+Never execute the returned interpreter or CLI pathname. Replace the complete
+placeholder with the returned value. Do not concatenate, transform, encode, or
+partially substitute a value.
 
 ## Single OAuth Session
 

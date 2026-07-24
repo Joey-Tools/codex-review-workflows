@@ -17,6 +17,31 @@ These are the only meanings of the named review shapes. Count completed logical 
 
 PR readiness means the effective review shape plus CI, unresolved-conversation, base/head, and merge-policy checks. It does not add a hidden reviewer lane.
 
+### Delivery read-only probe receiver
+
+An inbound delivery record whose exact `handoff_profile` is
+`pr-readiness-read-only-probe` is a terminal evidence probe, not PR readiness,
+a named review, or a generic PR/full-workflow request. Classify this structured
+handoff before every prose-based PR/review rule below. Validate the complete
+record against the delivery schema, preserve its constraints and mutation
+ceilings, and fail closed rather than falling through when the record is
+missing, unknown, or contradictory.
+
+The receiver may take read-only snapshots only of existing-PR selection,
+lifecycle, CI status, conversation state, and exact base/head evidence. It must
+not start a Codex or Claude local lane, materialize a lane workspace, run
+secret admission or the low-level helper, request GitHub Codex, post a comment,
+wait or poll, write authentication/cache/state, mutate local or remote state,
+or enter the ordinary readiness/fix loop. If an evidence read cannot be proved
+non-mutating, record that evidence as unavailable or blocked.
+
+Return the closed terminal
+[`pr-readiness-read-only-report`](references/pr-readiness-read-only-report.schema.json)
+record and stop. Its action fields are all schema-fixed to `false`;
+`merge_ready` is always `false`, and `next_handoff` is always `none`. Read the
+first section of [pr-readiness.md](references/pr-readiness.md) for the receiving
+sequence. Nothing in a surrounding prompt may widen this capability ceiling.
+
 ### GitHub Codex fallback
 
 GitHub Codex is the optional third lane, so its unavailability changes a requested triple review into an effective double review.
@@ -108,6 +133,14 @@ The shipped guard supplies only pre-status isolated workspace materialization, t
 ## Workflow
 
 1. Classify the request.
+   - First inspect any structured delivery handoff. Exact
+     `handoff_profile: pr-readiness-read-only-probe` takes precedence over
+     generic PR/full-workflow language and every named-review classification.
+     Validate it through the delivery and terminal-report schemas, execute only
+     the read-only receiving path above, emit its terminal report, and do not
+     continue to steps 2-9. An invalid or widened record is a terminal
+     `blocked-input`, not permission to reinterpret the prose and start an
+     ordinary PR/readiness or review flow.
    - A review-only child that explicitly forbids orchestration inspects its assigned range and returns findings only. It must not start other reviewers, edit code, wait for CI, or mutate the PR.
    - Resolve a standalone named review deterministically: preserve an explicit frozen range for local lanes; independently select an explicitly named PR or exactly one open PR associated with the exact current head repository/branch when PR-specific/triple work needs one. An explicit-range-only single/double is fully scoped locally and requires no PR probe. More than one required PR candidate leaves the GitHub/PR-specific lane `blocked-input` until the caller names a PR; a frozen range does not select among them, although fully scoped local lanes may run. An authenticated complete zero-candidate lookup proves the no-PR path, but does not supply a local review range: require an explicit committed range or explicitly named target/base from which to freeze `<merge_base>..HEAD`; never guess the target/base. For triple, detached HEAD or unknown head ownership without an explicit PR cannot prove no PR: run the scoped local lanes, but report the GitHub lane `blocked-input` and `effective: triple-inconclusive`, not effective double. Once a PR is selected, independently validate its current base/head metadata and unique merge base; a caller-provided range does not become whole-PR scope merely because its head matches.
    - A standalone named review request is report-only unless the user also asks to fix or deliver the change. It does not authorize branch creation, an anchor commit, push, PR creation, or PR branch/metadata changes. A clean checkout with a missing selector is `blocked-input`; reserve `blocked-authorization` for intended dirty/untracked state that would require an unauthorized anchor commit. Bare triple additionally authorizes only the scoped `@codex review` request on an already-existing supported PR. If no PR exists and an explicit committed local range is available, run the requested local lanes and reduce requested triple to effective double. If a PR exists but its host, identity, integration, or service is directly known unavailable, retain the existing-PR head-alignment preflight before running the effective double. The parent prepares the requested lanes and returns findings; it does not edit code, start delivery gates, or enter a fix loop on its own.
@@ -191,6 +224,7 @@ The `isolated_review` helper retains a frozen supplied-diff runtime backed by a 
 - [review_result.py](scripts/review_runtime/review_result.py): canonical post-acceptance review-result disposition helper, executed only through the manifest-bound `classify-review-result` guard profile; it preserves the raw result and separates semantic outcome from presentation.
 - [named_claude_preflight](scripts/named_claude_preflight): compatibility wrapper for the required publisher-first compatible-version and advertised-capability selector loaded by the formal guard `preflight-claude` profile.
 - [pr-readiness.md](references/pr-readiness.md): PR authorization, current-head GitHub Codex, CI/comments, fix loop, and merge-ready reporting.
+- [pr-readiness-read-only-report.schema.json](references/pr-readiness-read-only-report.schema.json): closed terminal result for the delivery read-only PR evidence probe.
 - [review-prompt-templates.md](references/review-prompt-templates.md): fresh-context prompt templates.
 - [github-pr-probes.md](references/github-pr-probes.md): bounded `gh` probes.
 - [egress-consent.md](references/egress-consent.md): scoped review egress authorization.

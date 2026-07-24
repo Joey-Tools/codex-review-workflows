@@ -16,6 +16,9 @@ from .common import ReviewError
 
 
 CATALOG_PATH = pathlib.Path(__file__).with_name("synthetic-token-catalog.json")
+# A manifest-bound loader may set this only on its private raw-source module
+# instance. Ordinary CLI execution leaves it unset and reads CATALOG_PATH.
+BOUND_CATALOG_BYTES: bytes | None = None
 CATALOG_SCHEMA_VERSION = 1
 MAX_CATALOG_BYTES = 64 * 1024
 MAX_AUTHORING_TOKENS = 128
@@ -592,6 +595,10 @@ def _read_catalog_file(path: pathlib.Path) -> bytes:
 
 
 def load_catalog() -> SyntheticTokenCatalog:
+    if BOUND_CATALOG_BYTES is not None:
+        if type(BOUND_CATALOG_BYTES) is not bytes:
+            raise ReviewError("bound synthetic token catalog must use exact bytes")
+        return parse_catalog_bytes(BOUND_CATALOG_BYTES)
     return parse_catalog_bytes(_read_catalog_file(CATALOG_PATH))
 
 

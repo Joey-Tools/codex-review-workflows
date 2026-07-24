@@ -20,6 +20,12 @@ LOCAL_MUTATION_CASES = SKILL_ROOT / "tests" / "fixtures" / "local-mutation-cases
 READ_ONLY_PR_PROBE_CASES = (
     SKILL_ROOT / "tests" / "fixtures" / "read-only-pr-probe-cases.json"
 )
+REVIEW_SKILL_ROOT = SKILL_ROOT.parent / "review-orchestration-playbook"
+REVIEW_SKILL = REVIEW_SKILL_ROOT / "SKILL.md"
+PR_READINESS = REVIEW_SKILL_ROOT / "references" / "pr-readiness.md"
+READ_ONLY_PR_REPORT_SCHEMA = (
+    REVIEW_SKILL_ROOT / "references" / "pr-readiness-read-only-report.schema.json"
+)
 
 RESULT_FIELDS = {
     "schema_version",
@@ -67,6 +73,34 @@ HANDOFF_PROFILES = {
     "none",
     "pr-readiness",
     "pr-readiness-read-only-probe",
+}
+READ_ONLY_REPORT_FIELDS = {
+    "schema_version",
+    "terminal",
+    "handoff_profile",
+    "delivery_record",
+    "evidence",
+    "unavailable_evidence",
+    "blockers",
+    "actions",
+    "merge_ready",
+    "next_handoff",
+}
+READ_ONLY_EVIDENCE_FIELDS = {
+    "pr_selection",
+    "pr_lifecycle",
+    "ci_status",
+    "conversation_state",
+    "base_and_head",
+}
+READ_ONLY_ACTION_FIELDS = {
+    "local_lanes_started",
+    "secret_admission_started",
+    "comments_posted",
+    "waits_started",
+    "cache_or_state_written",
+    "local_mutation_performed",
+    "remote_mutation_performed",
 }
 
 
@@ -198,6 +232,65 @@ def assert_valid_result_contract(result: object) -> None:
         raise AssertionError("a local profile attempted an unsupported handoff")
 
 
+def assert_read_only_report_contract(report: object) -> None:
+    if not isinstance(report, dict) or set(report) != READ_ONLY_REPORT_FIELDS:
+        raise AssertionError("read-only PR report fields do not match the contract")
+    if report["schema_version"] != 1:
+        raise AssertionError("unexpected read-only PR report schema version")
+    if report["terminal"] != "pr-readiness-read-only-report":
+        raise AssertionError("unexpected read-only PR report terminal")
+    if report["handoff_profile"] != "pr-readiness-read-only-probe":
+        raise AssertionError("unexpected read-only PR report handoff profile")
+    assert_valid_result_contract(report["delivery_record"])
+    if report["delivery_record"]["handoff_profile"] != report["handoff_profile"]:
+        raise AssertionError("read-only PR report widened its delivery handoff")
+
+    evidence = report["evidence"]
+    if not isinstance(evidence, dict) or set(evidence) != READ_ONLY_EVIDENCE_FIELDS:
+        raise AssertionError("read-only PR report evidence is not closed")
+    unavailable = report["unavailable_evidence"]
+    if not isinstance(unavailable, list) or len(unavailable) != len(set(unavailable)):
+        raise AssertionError("read-only PR unavailable evidence is invalid")
+    evidence_names = {
+        "pr_selection": "pr-selection",
+        "pr_lifecycle": "pr-lifecycle",
+        "ci_status": "ci-status",
+        "conversation_state": "conversation-state",
+        "base_and_head": "base-and-head",
+    }
+    for field, external_name in evidence_names.items():
+        snapshot = evidence[field]
+        if not isinstance(snapshot, dict) or set(snapshot) != {"status", "details"}:
+            raise AssertionError("read-only PR evidence snapshot is not closed")
+        if snapshot["status"] not in {"observed", "unavailable", "blocked"}:
+            raise AssertionError("read-only PR evidence status is invalid")
+        if not isinstance(snapshot["details"], list) or not all(
+            isinstance(detail, str) and detail for detail in snapshot["details"]
+        ):
+            raise AssertionError("read-only PR evidence details are invalid")
+        if (snapshot["status"] != "observed") != (external_name in unavailable):
+            raise AssertionError("unavailable evidence does not match its snapshot")
+
+    blockers = report["blockers"]
+    if not isinstance(blockers, list) or not all(
+        isinstance(blocker, dict)
+        and set(blocker) == {"code", "detail"}
+        and isinstance(blocker["code"], str)
+        and blocker["code"]
+        and isinstance(blocker["detail"], str)
+        and blocker["detail"]
+        for blocker in blockers
+    ):
+        raise AssertionError("read-only PR report blockers are invalid")
+    actions = report["actions"]
+    if not isinstance(actions, dict) or set(actions) != READ_ONLY_ACTION_FIELDS:
+        raise AssertionError("read-only PR report actions are not closed")
+    if any(actions.values()):
+        raise AssertionError("read-only PR report recorded a forbidden action")
+    if report["merge_ready"] is not False or report["next_handoff"] != "none":
+        raise AssertionError("read-only PR report escaped its terminal boundary")
+
+
 class DeliveryProfileContractTest(unittest.TestCase):
     def setUp(self) -> None:
         self.change = CHANGE_SKILL.read_text(encoding="utf-8")
@@ -210,6 +303,10 @@ class DeliveryProfileContractTest(unittest.TestCase):
         self.normalized_validation_environments = " ".join(
             self.validation_environments.split()
         )
+        self.review = REVIEW_SKILL.read_text(encoding="utf-8")
+        self.pr_readiness = PR_READINESS.read_text(encoding="utf-8")
+        self.normalized_review = " ".join(self.review.split())
+        self.normalized_pr_readiness = " ".join(self.pr_readiness.split())
 
     def test_one_active_entrypoint_declares_three_ordered_profiles(self) -> None:
         self.assertIn("only active delivery entrypoint", self.normalized_change)
@@ -419,9 +516,12 @@ class DeliveryProfileContractTest(unittest.TestCase):
         self.assertEqual(
             case["expected"]["forbid"],
             [
+                "local-review-lanes",
+                "secret-admission",
                 "comments",
                 "github-codex-request",
-                "state-changing-waits",
+                "waits",
+                "cache-or-state-writes",
                 "branch-or-pr-metadata-changes",
                 "fixes",
                 "commits",
@@ -432,6 +532,9 @@ class DeliveryProfileContractTest(unittest.TestCase):
             case["expected"]["terminal"],
             "pr-readiness-read-only-report",
         )
+        terminal_result = case["expected"]["terminal_result"]
+        self.assertEqual(terminal_result["delivery_record"], case["input"])
+        assert_read_only_report_contract(terminal_result)
         for anchor in (
             "Remote mutation being forbidden does not erase",
             "`pr-readiness-read-only-probe`",
@@ -444,8 +547,82 @@ class DeliveryProfileContractTest(unittest.TestCase):
             "terminal `pr-readiness-read-only-report`",
             "Never call this merge-ready",
             "receiver must preserve that read-only capability ceiling",
+            "pr-readiness-read-only-report.schema.json",
         ):
             self.assertIn(anchor, self.normalized_change)
+
+    def test_read_only_pr_probe_receiver_precedes_generic_review_and_is_closed(
+        self,
+    ) -> None:
+        workflow = self.review.split("## Workflow", 1)[1]
+        receiver = workflow.index("`handoff_profile: pr-readiness-read-only-probe`")
+        generic_review = workflow.index("A review-only child")
+        generic_pr = workflow.index("A PR/full-workflow request")
+        self.assertLess(receiver, generic_review)
+        self.assertLess(receiver, generic_pr)
+        self.assertLess(
+            self.pr_readiness.index(
+                "## Read-Only Delivery Probe: Classify And Stop First"
+            ),
+            self.pr_readiness.index("## Authorization"),
+        )
+
+        for anchor in (
+            "terminal evidence probe, not PR readiness",
+            "Classify this structured handoff before every prose-based PR/review rule",
+            "must not start a Codex or Claude local lane",
+            "run secret admission or the low-level helper",
+            "post a comment",
+            "wait or poll",
+            "write authentication/cache/state",
+            "do not continue to steps 2-9",
+            "invalid or widened record",
+        ):
+            self.assertIn(anchor, self.normalized_review)
+        for anchor in (
+            "First classify an inbound `pr-readiness-read-only-probe`",
+            "Classify it before generic PR/full-workflow language",
+            "Do not start any local Codex or Claude lane",
+            "exact-secret admission",
+            "GitHub Codex request",
+            "poll, monitor, or wait",
+            "persist authentication refreshes, caches, tool state, or connector state",
+            "Then stop without another handoff",
+            "never a named-review artifact",
+        ):
+            self.assertIn(anchor, self.normalized_pr_readiness)
+
+        schema = json.loads(READ_ONLY_PR_REPORT_SCHEMA.read_text(encoding="utf-8"))
+        self.assertEqual(
+            schema["$schema"], "https://json-schema.org/draft/2020-12/schema"
+        )
+        self.assertEqual(set(schema["required"]), READ_ONLY_REPORT_FIELDS)
+        self.assertEqual(set(schema["properties"]), READ_ONLY_REPORT_FIELDS)
+        self.assertFalse(schema["additionalProperties"])
+        delivery_contract = schema["properties"]["delivery_record"]["allOf"]
+        self.assertEqual(
+            delivery_contract[0]["$ref"],
+            "https://joey-tools.invalid/change-delivery-workflow/delivery-result.schema.json",
+        )
+        self.assertEqual(
+            delivery_contract[1]["properties"]["handoff_profile"]["const"],
+            "pr-readiness-read-only-probe",
+        )
+        self.assertEqual(
+            set(schema["properties"]["evidence"]["required"]),
+            READ_ONLY_EVIDENCE_FIELDS,
+        )
+        self.assertEqual(
+            set(schema["properties"]["actions"]["required"]),
+            READ_ONLY_ACTION_FIELDS,
+        )
+        for field in READ_ONLY_ACTION_FIELDS:
+            self.assertIs(
+                schema["properties"]["actions"]["properties"][field]["const"],
+                False,
+            )
+        self.assertIs(schema["properties"]["merge_ready"]["const"], False)
+        self.assertEqual(schema["properties"]["next_handoff"]["const"], "none")
 
     def test_delivery_result_schema_is_closed_and_fixture_cases_conform(
         self,
