@@ -18,6 +18,9 @@ REVIEW_SKILL_ROOT = REPOSITORY_ROOT / "skills" / "review-orchestration-playbook"
 SKILL = SKILL_ROOT / "SKILL.md"
 TEMPLATES = SKILL_ROOT / "references" / "fixture-templates.md"
 BINDING_RESOLVER = SKILL_ROOT / "scripts" / "active_catalog_binding.py"
+BINDING_GUARD = (
+    REVIEW_SKILL_ROOT / "scripts" / "named_lane_guard"
+)
 RELEASE_ID = "a" * 40
 
 
@@ -78,12 +81,19 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
         loaded_skill_root: Path | None = None,
         cwd: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        guard = (
+            resolver.parents[2]
+            / "review-orchestration-playbook"
+            / "scripts"
+            / "named_lane_guard"
+        )
         arguments = [
             str(Path(sys.executable).resolve()),
             "-I",
             "-B",
             "-S",
-            str(resolver),
+            str(guard),
+            "catalog-bootstrap",
             "--loaded-skill-root",
             str(loaded_skill_root or resolver.parents[1]),
         ]
@@ -121,8 +131,9 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
             "routing and selection guidance only",
             "same active immutable release",
             "macOS or Linux personal-sync",
-            "skill-relative",
-            "release `sync-manifest.json` installs both skill sources",
+            "previously trusted release",
+            "canonical control manifest",
+            "co-release `sync-manifest.json`",
             "binding_sha256",
             "review-runtime tree digest",
             "metadata-only",
@@ -131,12 +142,15 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
             "Never create a project-local pool",
             "second token CLI",
             "never accepts a catalog or review-skill path",
-            "POSIX no-follow, nonblocking, close-on-exec",
+            "O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC",
             "one controlled in-process transaction",
             "`--expect-binding-sha256` is mandatory",
             "only `bind` may omit it",
             "manifest-bound source snapshots",
-            "never executes the returned Python or CLI path",
+            "ignore `__pycache__`",
+            "never load bytecode",
+            "never executes the resolver",
+            "never executes the resolver or returned CLI as a path",
         ):
             self.assertIn(anchor, normalized_skill)
         for command in (
@@ -151,6 +165,7 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
         self.assertNotIn("${CODEX_HOME", skill)
         self.assertNotIn("${HOME", skill)
         self.assertTrue(BINDING_RESOLVER.is_file())
+        self.assertTrue(BINDING_GUARD.is_file())
         self.assertFalse((SKILL_ROOT / "synthetic-token-catalog.json").exists())
 
     def test_release_binding_drives_authoritative_validate_list_and_get(
@@ -170,6 +185,7 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
             binding = json.loads(captured.stdout)
             expected_fields = {
                 "schema_version",
+                "catalog_bootstrap",
                 "release_id",
                 "release_root",
                 "sync_manifest_path",
@@ -198,9 +214,17 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
                 "binding_sha256",
             }
             self.assertEqual(set(binding), expected_fields)
-            self.assertEqual(binding["schema_version"], 2)
+            self.assertEqual(binding["schema_version"], 3)
             self.assertEqual(binding["release_id"], RELEASE_ID)
             self.assertEqual(binding["python_flags"], ["-I", "-B", "-S"])
+            self.assertEqual(
+                binding["catalog_bootstrap"]["mode"],
+                "trusted-guard-manifest-bound-source",
+            )
+            self.assertEqual(
+                binding["catalog_bootstrap"]["resolver_sha256"],
+                binding["binding_resolver_sha256"],
+            )
             self.assertEqual(
                 binding["execution_mode"],
                 "in-process-manifest-bound-snapshot",
@@ -293,6 +317,70 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
             self.assertTrue(payload["token"]["value"])
             self.assertNotIn(payload["token"]["value"], json.dumps(listing))
 
+    def test_helper_bytecode_cache_is_ignored_by_closed_authoring_loader(
+        self,
+    ) -> None:
+        with self.installed_release() as release_root:
+            skills_root = release_root / "personal_codex" / "skills"
+            synthetic_root = skills_root / "synthetic-token-fixtures"
+            review_root = skills_root / "review-orchestration-playbook"
+            resolver = synthetic_root / "scripts" / "active_catalog_binding.py"
+            helper = review_root / "scripts" / "isolated_review"
+            environment = dict(os.environ)
+            environment.pop("PYTHONDONTWRITEBYTECODE", None)
+            environment.pop("PYTHONPYCACHEPREFIX", None)
+            generated = subprocess.run(
+                (
+                    str(Path(sys.executable).resolve()),
+                    str(helper),
+                    "synthetic-tokens",
+                    "validate",
+                ),
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+                env=environment,
+            )
+            self.assertEqual(generated.returncode, 0, generated.stderr)
+            cache_files = sorted(
+                (review_root / "scripts" / "review_runtime").rglob("*.pyc")
+            )
+            self.assertTrue(cache_files)
+
+            captured = self.run_binding(resolver)
+            self.assertEqual(captured.returncode, 0, captured.stderr)
+            binding = json.loads(captured.stdout)
+            for action in ("validate", "list"):
+                with self.subTest(action=action):
+                    completed = self.run_binding(
+                        resolver,
+                        action=action,
+                        expected=binding["binding_sha256"],
+                    )
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+
+            listing = json.loads(
+                self.run_binding(
+                    resolver,
+                    action="list",
+                    expected=binding["binding_sha256"],
+                ).stdout
+            )["result"]
+            selected_id = sorted(token["id"] for token in listing["tokens"])[0]
+            selected = self.run_binding(
+                resolver,
+                action="get",
+                token_id=selected_id,
+                expected=binding["binding_sha256"],
+            )
+            self.assertEqual(selected.returncode, 0, selected.stderr)
+            self.assertEqual(
+                json.loads(selected.stdout)["result"]["token"]["id"],
+                selected_id,
+            )
+
     def test_binding_fails_closed_on_release_drift_or_ambiguous_layout(self) -> None:
         with self.installed_release() as release_root:
             resolver = (
@@ -363,17 +451,23 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(
             prefix="synthetic-token-nonrelease-"
         ) as temporary:
-            copied = Path(temporary) / "synthetic-token-fixtures"
+            skills_root = Path(temporary).resolve() / "skills"
+            copied = skills_root / "synthetic-token-fixtures"
             shutil.copytree(
                 SKILL_ROOT,
                 copied,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            )
+            shutil.copytree(
+                REVIEW_SKILL_ROOT,
+                skills_root / "review-orchestration-playbook",
                 ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
             )
             rejected = self.run_binding(
                 copied / "scripts" / "active_catalog_binding.py"
             )
             self.assertEqual(rejected.returncode, 2)
-            self.assertIn("release payload", rejected.stderr)
+            self.assertIn("versioned immutable release", rejected.stderr)
 
     def test_authoring_operations_require_the_captured_binding_digest(self) -> None:
         with self.installed_release() as release_root:
@@ -485,12 +579,19 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
                 f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n",
                 encoding="utf-8",
             )
+            guard = (
+                synthetic_root.parent
+                / "review-orchestration-playbook"
+                / "scripts"
+                / "named_lane_guard"
+            )
             completed = subprocess.run(
                 (
                     str(Path(sys.executable).resolve()),
                     "-B",
                     "-S",
-                    str(resolver),
+                    str(guard),
+                    "catalog-bootstrap",
                     "--loaded-skill-root",
                     str(synthetic_root),
                     "bind",
@@ -502,8 +603,8 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
                 timeout=30,
                 env=dict(os.environ),
             )
-            self.assertEqual(completed.returncode, 2)
-            self.assertIn("requires an absolute Python interpreter", completed.stderr)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("requires a prevalidated absolute Python", completed.stderr)
             self.assertFalse(marker.exists())
 
     def test_cross_release_symlinks_and_unsafe_scripts_parent_fail_closed(
@@ -538,7 +639,7 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
                 )
                 self.assertEqual(wrong_loaded_skill.returncode, 2)
                 self.assertIn(
-                    "explicitly loaded synthetic skill",
+                    "outside the trusted catalog bundle",
                     wrong_loaded_skill.stderr,
                 )
 
@@ -556,18 +657,25 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
                 )
                 self.assertEqual(intermediate_symlink.returncode, 2)
                 self.assertIn(
-                    "not an ordinary non-symlink directory",
+                    "outside the trusted catalog bundle",
                     intermediate_symlink.stderr,
                 )
 
+                marker = first_skill / "resolver-symlink-executed"
+                second_resolver.write_text(
+                    "from pathlib import Path\n"
+                    f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n",
+                    encoding="utf-8",
+                )
                 first_resolver.unlink()
                 first_resolver.symlink_to(second_resolver)
                 rejected = self.run_binding(
                     first_resolver,
                     loaded_skill_root=first_skill,
                 )
-                self.assertEqual(rejected.returncode, 2)
+                self.assertNotEqual(rejected.returncode, 0)
                 self.assertIn("non-symlink regular file", rejected.stderr)
+                self.assertFalse(marker.exists())
 
         with self.installed_release() as release_root:
             synthetic_root = (
@@ -581,7 +689,70 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
             finally:
                 scripts_root.chmod(0o755)
             self.assertEqual(rejected.returncode, 2)
-            self.assertIn("scripts is group/world writable", rejected.stderr)
+            self.assertIn(
+                f"{scripts_root} is group/world writable",
+                rejected.stderr,
+            )
+
+    def test_resolver_leaf_replacement_after_guard_binding_is_not_executed(
+        self,
+    ) -> None:
+        with self.installed_release() as release_root:
+            skills_root = release_root / "personal_codex" / "skills"
+            synthetic_root = skills_root / "synthetic-token-fixtures"
+            resolver = synthetic_root / "scripts" / "active_catalog_binding.py"
+            guard = (
+                skills_root
+                / "review-orchestration-playbook"
+                / "scripts"
+                / "named_lane_guard"
+            )
+            marker = synthetic_root / "resolver-replacement-executed"
+            replacement = resolver.with_name("active_catalog_binding.replacement.py")
+            replacement.write_text(
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            probe = release_root / "catalog-bootstrap-replacement-probe.py"
+            probe.write_text(
+                "import os\n"
+                "from pathlib import Path\n"
+                "import sys\n"
+                f"guard = Path({str(guard)!r})\n"
+                f"resolver = Path({str(resolver)!r})\n"
+                f"replacement = Path({str(replacement)!r})\n"
+                f"synthetic_root = Path({str(synthetic_root)!r})\n"
+                "sys.argv = [str(guard), 'catalog-bootstrap']\n"
+                "namespace = {'__name__': '_catalog_guard_probe', "
+                "'__file__': str(guard)}\n"
+                "source = guard.read_bytes()\n"
+                "exec(compile(source, str(guard), 'exec'), namespace)\n"
+                "os.replace(replacement, resolver)\n"
+                "raise SystemExit(namespace['main']([\n"
+                "    '--loaded-skill-root', str(synthetic_root), 'bind'\n"
+                "]))\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                (
+                    str(Path(sys.executable).resolve()),
+                    "-I",
+                    "-B",
+                    "-S",
+                    str(probe),
+                ),
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+                env=dict(os.environ),
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertEqual(completed.stdout, "")
+            self.assertIn("companion content changed", completed.stderr)
+            self.assertFalse(marker.exists())
 
     def test_same_bytes_cli_path_replacement_cannot_release_a_result(self) -> None:
         with self.installed_release() as release_root:

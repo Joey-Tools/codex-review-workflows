@@ -20,6 +20,7 @@ if not (
         "invoked with -I -B -S"
     )
 
+import hashlib
 import importlib.machinery
 import importlib.util
 import os
@@ -89,6 +90,10 @@ _CLAUDE_STREAM_VALIDATOR_SOURCES = (
 _REVIEW_RESULT_SOURCES = (
     ("review_runtime", "__init__.py", True),
     ("review_runtime.review_result", "review_result.py", False),
+)
+_CATALOG_BOOTSTRAP_SOURCES = (
+    ("review_runtime", "__init__.py", True),
+    ("review_runtime.catalog_bootstrap", "catalog_bootstrap.py", False),
 )
 _SourceIdentity = tuple[int, int, int, int, int]
 _CompanionBinding = bytes
@@ -708,6 +713,53 @@ def _load_review_result_entrypoint(scripts_root: pathlib.Path) -> object:
     )
 
 
+def _load_catalog_bootstrap_entrypoint(scripts_root: pathlib.Path) -> object:
+    runtime_root = scripts_root / "review_runtime"
+    bootstrap_path = runtime_root / "catalog_bootstrap.py"
+    bootstrap_bytes = _validate_bound_companion(bootstrap_path)
+    review_skill_root = scripts_root.parent
+    skills_root = review_skill_root.parent
+    synthetic_skill_root = skills_root / "synthetic-token-fixtures"
+    resolver_path = (
+        synthetic_skill_root / "scripts" / "active_catalog_binding.py"
+    )
+    synthetic_skill_path = synthetic_skill_root / "SKILL.md"
+    resolver_bytes = _validate_bound_companion(resolver_path)
+    synthetic_skill_bytes = _validate_bound_companion(synthetic_skill_path)
+    entrypoint = _load_bound_sources(
+        runtime_root,
+        _CATALOG_BOOTSTRAP_SOURCES,
+        namespace_root="review_runtime",
+        entry_module_name="review_runtime.catalog_bootstrap",
+        source_byte_bindings=(
+            ("review_runtime.catalog_bootstrap", bootstrap_bytes),
+        ),
+    )
+    _remove_bound_namespace("review_runtime")
+
+    def guarded_catalog_bootstrap(argv: object = None) -> object:
+        return entrypoint(
+            argv,
+            trusted_review_skill_root=review_skill_root,
+            trusted_synthetic_skill_root=synthetic_skill_root,
+            trusted_resolver_path=resolver_path,
+            trusted_resolver_bytes=resolver_bytes,
+            trusted_skill_bytes=synthetic_skill_bytes,
+            catalog_bootstrap_source_sha256=hashlib.sha256(
+                bootstrap_bytes
+            ).hexdigest(),
+        )
+
+    return _guard_companions(
+        guarded_catalog_bootstrap,
+        (
+            (bootstrap_path, bootstrap_bytes),
+            (resolver_path, resolver_bytes),
+            (synthetic_skill_path, synthetic_skill_bytes),
+        ),
+    )
+
+
 def _select_entrypoint(
     scripts_root: pathlib.Path,
     argv: tuple[str, ...],
@@ -718,6 +770,8 @@ def _select_entrypoint(
         return _load_claude_stream_validator_entrypoint(scripts_root), argv[1:]
     if argv and argv[0] == "classify-review-result":
         return _load_review_result_entrypoint(scripts_root), argv[1:]
+    if argv and argv[0] == "catalog-bootstrap":
+        return _load_catalog_bootstrap_entrypoint(scripts_root), argv[1:]
     return _load_default_entrypoint(scripts_root), argv
 
 

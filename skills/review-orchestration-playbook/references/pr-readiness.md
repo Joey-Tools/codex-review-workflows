@@ -42,6 +42,11 @@ The receiving sequence is closed:
    record a blocker.
 5. Emit exactly one terminal record conforming to
    [pr-readiness-read-only-report.schema.json](pr-readiness-read-only-report.schema.json).
+   Bind the record to one explicit repository/PR/base/head target and one
+   current observation snapshot. Every evidence kind repeats those target and
+   snapshot binding identifiers. An `observed` kind contains exactly one
+   kind-specific, closed structured record; an empty array, free-form summary,
+   or record for another target/snapshot is invalid.
    Each `unavailable` or `blocked` evidence kind must be listed in
    `unavailable_evidence` and have exactly one blocker whose `evidence` field
    names that kind. An `observed` kind must appear in neither summary. Every

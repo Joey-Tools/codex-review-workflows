@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+import re
 import unittest
 
 from jsonschema import Draft202012Validator
@@ -84,6 +85,8 @@ READ_ONLY_REPORT_FIELDS = {
     "terminal",
     "handoff_profile",
     "delivery_record",
+    "target",
+    "snapshot",
     "evidence",
     "unavailable_evidence",
     "blockers",
@@ -106,6 +109,12 @@ READ_ONLY_ACTION_FIELDS = {
     "cache_or_state_written",
     "local_mutation_performed",
     "remote_mutation_performed",
+}
+READ_ONLY_EVIDENCE_SNAPSHOT_FIELDS = {
+    "status",
+    "target_binding",
+    "snapshot_binding",
+    "observed",
 }
 
 
@@ -262,7 +271,7 @@ def assert_valid_result_contract(result: object) -> None:
 def assert_read_only_report_contract(report: object) -> None:
     if not isinstance(report, dict) or set(report) != READ_ONLY_REPORT_FIELDS:
         raise AssertionError("read-only PR report fields do not match the contract")
-    if report["schema_version"] != 1:
+    if report["schema_version"] != 2:
         raise AssertionError("unexpected read-only PR report schema version")
     if report["terminal"] != "pr-readiness-read-only-report":
         raise AssertionError("unexpected read-only PR report terminal")
@@ -271,6 +280,79 @@ def assert_read_only_report_contract(report: object) -> None:
     assert_valid_result_contract(report["delivery_record"])
     if report["delivery_record"]["handoff_profile"] != report["handoff_profile"]:
         raise AssertionError("read-only PR report widened its delivery handoff")
+
+    repository_fields = {"host", "owner", "name"}
+
+    def assert_repository(value: object) -> None:
+        if (
+            not isinstance(value, dict)
+            or set(value) != repository_fields
+            or not all(isinstance(value[field], str) and value[field] for field in value)
+        ):
+            raise AssertionError("read-only PR repository binding is invalid")
+
+    oid_pattern = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+    target = report["target"]
+    if not isinstance(target, dict) or set(target) != {
+        "binding_id",
+        "repository",
+        "pull_request",
+        "base",
+        "head",
+    }:
+        raise AssertionError("read-only PR target binding is not closed")
+    if target["binding_id"] != "report-target-v1":
+        raise AssertionError("read-only PR target binding ID is invalid")
+    assert_repository(target["repository"])
+    pull_request = target["pull_request"]
+    if (
+        not isinstance(pull_request, dict)
+        or set(pull_request) != {"number", "url"}
+        or not isinstance(pull_request["number"], int)
+        or isinstance(pull_request["number"], bool)
+        or pull_request["number"] < 1
+        or not isinstance(pull_request["url"], str)
+        or not pull_request["url"].startswith("https://")
+    ):
+        raise AssertionError("read-only PR selector binding is invalid")
+    base = target["base"]
+    if (
+        not isinstance(base, dict)
+        or set(base) != {"ref", "oid"}
+        or not isinstance(base["ref"], str)
+        or not base["ref"]
+        or not isinstance(base["oid"], str)
+        or oid_pattern.fullmatch(base["oid"]) is None
+    ):
+        raise AssertionError("read-only PR base binding is invalid")
+    head = target["head"]
+    if (
+        not isinstance(head, dict)
+        or set(head) != {"repository", "ref", "oid"}
+        or not isinstance(head["ref"], str)
+        or not head["ref"]
+        or not isinstance(head["oid"], str)
+        or oid_pattern.fullmatch(head["oid"]) is None
+    ):
+        raise AssertionError("read-only PR head binding is invalid")
+    assert_repository(head["repository"])
+
+    snapshot = report["snapshot"]
+    if (
+        not isinstance(snapshot, dict)
+        or set(snapshot)
+        != {"binding_id", "snapshot_id", "observed_at", "freshness", "sources"}
+        or snapshot["binding_id"] != "report-snapshot-v1"
+        or snapshot["freshness"] != "current"
+        or not isinstance(snapshot["snapshot_id"], str)
+        or not snapshot["snapshot_id"]
+        or not isinstance(snapshot["observed_at"], str)
+        or not snapshot["observed_at"].endswith("Z")
+        or not isinstance(snapshot["sources"], list)
+        or not snapshot["sources"]
+        or len(snapshot["sources"]) != len(set(snapshot["sources"]))
+    ):
+        raise AssertionError("read-only PR snapshot binding is invalid")
 
     evidence = report["evidence"]
     if not isinstance(evidence, dict) or set(evidence) != READ_ONLY_EVIDENCE_FIELDS:
@@ -285,18 +367,49 @@ def assert_read_only_report_contract(report: object) -> None:
         "conversation_state": "conversation-state",
         "base_and_head": "base-and-head",
     }
+    observed_fields = {
+        "pr_selection": {"selection_method", "candidate_count"},
+        "pr_lifecycle": {"state", "merged", "merged_at", "draft"},
+        "ci_status": {"state", "total", "successful", "failed", "pending"},
+        "conversation_state": {"total_threads", "unresolved_threads"},
+        "base_and_head": {
+            "base_object_present",
+            "head_object_present",
+            "merge_base_count",
+            "merge_base_oid",
+        },
+    }
     blocker_evidence: list[str] = []
     for field, external_name in evidence_names.items():
-        snapshot = evidence[field]
-        if not isinstance(snapshot, dict) or set(snapshot) != {"status", "details"}:
-            raise AssertionError("read-only PR evidence snapshot is not closed")
-        if snapshot["status"] not in {"observed", "unavailable", "blocked"}:
-            raise AssertionError("read-only PR evidence status is invalid")
-        if not isinstance(snapshot["details"], list) or not all(
-            isinstance(detail, str) and detail for detail in snapshot["details"]
+        evidence_snapshot = evidence[field]
+        if (
+            not isinstance(evidence_snapshot, dict)
+            or set(evidence_snapshot) != READ_ONLY_EVIDENCE_SNAPSHOT_FIELDS
         ):
-            raise AssertionError("read-only PR evidence details are invalid")
-        if (snapshot["status"] != "observed") != (external_name in unavailable):
+            raise AssertionError("read-only PR evidence snapshot is not closed")
+        if evidence_snapshot["status"] not in {
+            "observed",
+            "unavailable",
+            "blocked",
+        }:
+            raise AssertionError("read-only PR evidence status is invalid")
+        if evidence_snapshot["target_binding"] != target["binding_id"]:
+            raise AssertionError("read-only PR evidence targets another report")
+        if evidence_snapshot["snapshot_binding"] != snapshot["binding_id"]:
+            raise AssertionError("read-only PR evidence uses a stale snapshot")
+        observed = evidence_snapshot["observed"]
+        if not isinstance(observed, list):
+            raise AssertionError("read-only PR observed evidence is not a list")
+        if evidence_snapshot["status"] == "observed":
+            if len(observed) != 1 or not isinstance(observed[0], dict):
+                raise AssertionError("observed evidence must contain one record")
+            if set(observed[0]) != observed_fields[field]:
+                raise AssertionError("observed evidence record is not closed")
+        elif observed:
+            raise AssertionError("unavailable evidence must not claim observations")
+        if (evidence_snapshot["status"] != "observed") != (
+            external_name in unavailable
+        ):
             raise AssertionError("unavailable evidence does not match its snapshot")
 
     blockers = report["blockers"]
@@ -684,6 +797,12 @@ class DeliveryProfileContractTest(unittest.TestCase):
         self.assertEqual(set(schema["required"]), READ_ONLY_REPORT_FIELDS)
         self.assertEqual(set(schema["properties"]), READ_ONLY_REPORT_FIELDS)
         self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(schema["properties"]["schema_version"]["const"], 2)
+        self.assertEqual(schema["properties"]["target"]["$ref"], "#/$defs/target")
+        self.assertEqual(
+            schema["properties"]["snapshot"]["$ref"],
+            "#/$defs/snapshot",
+        )
         Draft202012Validator.check_schema(schema)
         delivery_contract = schema["properties"]["delivery_record"]["allOf"]
         self.assertEqual(
@@ -702,6 +821,22 @@ class DeliveryProfileContractTest(unittest.TestCase):
             set(schema["properties"]["evidence"]["required"]),
             READ_ONLY_EVIDENCE_FIELDS,
         )
+        evidence_definitions = {
+            "pr_selection": "prSelectionEvidence",
+            "pr_lifecycle": "prLifecycleEvidence",
+            "ci_status": "ciStatusEvidence",
+            "conversation_state": "conversationStateEvidence",
+            "base_and_head": "baseAndHeadEvidence",
+        }
+        for field, definition in evidence_definitions.items():
+            self.assertEqual(
+                schema["properties"]["evidence"]["properties"][field]["$ref"],
+                f"#/$defs/{definition}",
+            )
+            self.assertEqual(
+                schema["$defs"][definition]["allOf"],
+                [{"$ref": "#/$defs/nonemptyObservedEvidence"}],
+            )
         self.assertEqual(
             set(schema["properties"]["actions"]["required"]),
             READ_ONLY_ACTION_FIELDS,
@@ -758,7 +893,17 @@ class DeliveryProfileContractTest(unittest.TestCase):
         observed_with_summaries = copy.deepcopy(valid)
         observed_with_summaries["evidence"]["ci_status"] = {
             "status": "observed",
-            "details": ["CI was observed."],
+            "target_binding": "report-target-v1",
+            "snapshot_binding": "report-snapshot-v1",
+            "observed": [
+                {
+                    "state": "success",
+                    "total": 1,
+                    "successful": 1,
+                    "failed": 0,
+                    "pending": 0,
+                }
+            ],
         }
         inconsistent["observed-with-unavailable-and-blocker"] = observed_with_summaries
 
@@ -775,6 +920,32 @@ class DeliveryProfileContractTest(unittest.TestCase):
             }
         )
         inconsistent["duplicate-blocker-for-one-evidence-kind"] = duplicate_blocker
+
+        wrong_target_binding = copy.deepcopy(valid)
+        wrong_target_binding["evidence"]["pr_selection"]["target_binding"] = (
+            "another-target"
+        )
+        inconsistent["evidence-bound-to-another-target"] = wrong_target_binding
+
+        wrong_snapshot_binding = copy.deepcopy(valid)
+        wrong_snapshot_binding["evidence"]["pr_lifecycle"]["snapshot_binding"] = (
+            "stale-snapshot"
+        )
+        inconsistent["evidence-bound-to-another-snapshot"] = wrong_snapshot_binding
+
+        stale_snapshot = copy.deepcopy(valid)
+        stale_snapshot["snapshot"]["freshness"] = "stale"
+        inconsistent["stale-report-snapshot"] = stale_snapshot
+
+        empty_observed = copy.deepcopy(valid)
+        empty_observed["evidence"]["pr_selection"]["observed"] = []
+        inconsistent["observed-status-without-record"] = empty_observed
+
+        extra_observed_field = copy.deepcopy(valid)
+        extra_observed_field["evidence"]["pr_lifecycle"]["observed"][0][
+            "summary"
+        ] = "open"
+        inconsistent["observed-record-with-free-form-field"] = extra_observed_field
 
         for name, candidate in inconsistent.items():
             with self.subTest(name=name):

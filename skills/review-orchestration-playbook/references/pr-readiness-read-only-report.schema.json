@@ -8,6 +8,8 @@
     "terminal",
     "handoff_profile",
     "delivery_record",
+    "target",
+    "snapshot",
     "evidence",
     "unavailable_evidence",
     "blockers",
@@ -17,7 +19,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": 1
+      "const": 2
     },
     "terminal": {
       "const": "pr-readiness-read-only-report"
@@ -66,6 +68,12 @@
         }
       ]
     },
+    "target": {
+      "$ref": "#/$defs/target"
+    },
+    "snapshot": {
+      "$ref": "#/$defs/snapshot"
+    },
     "evidence": {
       "type": "object",
       "required": [
@@ -77,19 +85,19 @@
       ],
       "properties": {
         "pr_selection": {
-          "$ref": "#/$defs/evidenceSnapshot"
+          "$ref": "#/$defs/prSelectionEvidence"
         },
         "pr_lifecycle": {
-          "$ref": "#/$defs/evidenceSnapshot"
+          "$ref": "#/$defs/prLifecycleEvidence"
         },
         "ci_status": {
-          "$ref": "#/$defs/evidenceSnapshot"
+          "$ref": "#/$defs/ciStatusEvidence"
         },
         "conversation_state": {
-          "$ref": "#/$defs/evidenceSnapshot"
+          "$ref": "#/$defs/conversationStateEvidence"
         },
         "base_and_head": {
-          "$ref": "#/$defs/evidenceSnapshot"
+          "$ref": "#/$defs/baseAndHeadEvidence"
         }
       },
       "additionalProperties": false
@@ -205,34 +213,486 @@
     }
   ],
   "$defs": {
-    "evidenceSnapshot": {
+    "oid": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "repository": {
       "type": "object",
       "required": [
-        "status",
-        "details"
+        "host",
+        "owner",
+        "name"
       ],
       "properties": {
-        "status": {
-          "enum": [
-            "observed",
-            "unavailable",
-            "blocked"
-          ]
+        "host": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$"
         },
-        "details": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 2048
-          },
-          "maxItems": 64
+        "owner": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
         }
       },
       "additionalProperties": false
     },
+    "target": {
+      "type": "object",
+      "required": [
+        "binding_id",
+        "repository",
+        "pull_request",
+        "base",
+        "head"
+      ],
+      "properties": {
+        "binding_id": {
+          "const": "report-target-v1"
+        },
+        "repository": {
+          "$ref": "#/$defs/repository"
+        },
+        "pull_request": {
+          "type": "object",
+          "required": [
+            "number",
+            "url"
+          ],
+          "properties": {
+            "number": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048,
+              "pattern": "^https://\\S+$"
+            }
+          },
+          "additionalProperties": false
+        },
+        "base": {
+          "type": "object",
+          "required": [
+            "ref",
+            "oid"
+          ],
+          "properties": {
+            "ref": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024
+            },
+            "oid": {
+              "$ref": "#/$defs/oid"
+            }
+          },
+          "additionalProperties": false
+        },
+        "head": {
+          "type": "object",
+          "required": [
+            "repository",
+            "ref",
+            "oid"
+          ],
+          "properties": {
+            "repository": {
+              "$ref": "#/$defs/repository"
+            },
+            "ref": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024
+            },
+            "oid": {
+              "$ref": "#/$defs/oid"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "snapshot": {
+      "type": "object",
+      "required": [
+        "binding_id",
+        "snapshot_id",
+        "observed_at",
+        "freshness",
+        "sources"
+      ],
+      "properties": {
+        "binding_id": {
+          "const": "report-snapshot-v1"
+        },
+        "snapshot_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+        },
+        "observed_at": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z$"
+        },
+        "freshness": {
+          "const": "current"
+        },
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "github-rest",
+              "github-graphql",
+              "gh-cli-read-only",
+              "local-git-read-only"
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "evidenceStatus": {
+      "enum": [
+        "observed",
+        "unavailable",
+        "blocked"
+      ]
+    },
+    "prSelectionEvidence": {
+      "type": "object",
+      "required": [
+        "status",
+        "target_binding",
+        "snapshot_binding",
+        "observed"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/evidenceStatus"
+        },
+        "target_binding": {
+          "const": "report-target-v1"
+        },
+        "snapshot_binding": {
+          "const": "report-snapshot-v1"
+        },
+        "observed": {
+          "type": "array",
+          "maxItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "selection_method",
+              "candidate_count"
+            ],
+            "properties": {
+              "selection_method": {
+                "enum": [
+                  "explicit",
+                  "unique-open-head"
+                ]
+              },
+              "candidate_count": {
+                "type": "integer",
+                "minimum": 1
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/nonemptyObservedEvidence"
+        }
+      ]
+    },
+    "prLifecycleEvidence": {
+      "type": "object",
+      "required": [
+        "status",
+        "target_binding",
+        "snapshot_binding",
+        "observed"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/evidenceStatus"
+        },
+        "target_binding": {
+          "const": "report-target-v1"
+        },
+        "snapshot_binding": {
+          "const": "report-snapshot-v1"
+        },
+        "observed": {
+          "type": "array",
+          "maxItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "state",
+              "merged",
+              "merged_at",
+              "draft"
+            ],
+            "properties": {
+              "state": {
+                "enum": [
+                  "open",
+                  "closed"
+                ]
+              },
+              "merged": {
+                "type": "boolean"
+              },
+              "merged_at": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "type": "string",
+                    "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z$"
+                  }
+                ]
+              },
+              "draft": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/nonemptyObservedEvidence"
+        }
+      ]
+    },
+    "ciStatusEvidence": {
+      "type": "object",
+      "required": [
+        "status",
+        "target_binding",
+        "snapshot_binding",
+        "observed"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/evidenceStatus"
+        },
+        "target_binding": {
+          "const": "report-target-v1"
+        },
+        "snapshot_binding": {
+          "const": "report-snapshot-v1"
+        },
+        "observed": {
+          "type": "array",
+          "maxItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "state",
+              "total",
+              "successful",
+              "failed",
+              "pending"
+            ],
+            "properties": {
+              "state": {
+                "enum": [
+                  "success",
+                  "failure",
+                  "pending",
+                  "cancelled",
+                  "no-checks"
+                ]
+              },
+              "total": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "successful": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "failed": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "pending": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/nonemptyObservedEvidence"
+        }
+      ]
+    },
+    "conversationStateEvidence": {
+      "type": "object",
+      "required": [
+        "status",
+        "target_binding",
+        "snapshot_binding",
+        "observed"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/evidenceStatus"
+        },
+        "target_binding": {
+          "const": "report-target-v1"
+        },
+        "snapshot_binding": {
+          "const": "report-snapshot-v1"
+        },
+        "observed": {
+          "type": "array",
+          "maxItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "total_threads",
+              "unresolved_threads"
+            ],
+            "properties": {
+              "total_threads": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "unresolved_threads": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/nonemptyObservedEvidence"
+        }
+      ]
+    },
+    "baseAndHeadEvidence": {
+      "type": "object",
+      "required": [
+        "status",
+        "target_binding",
+        "snapshot_binding",
+        "observed"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/evidenceStatus"
+        },
+        "target_binding": {
+          "const": "report-target-v1"
+        },
+        "snapshot_binding": {
+          "const": "report-snapshot-v1"
+        },
+        "observed": {
+          "type": "array",
+          "maxItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "base_object_present",
+              "head_object_present",
+              "merge_base_count",
+              "merge_base_oid"
+            ],
+            "properties": {
+              "base_object_present": {
+                "type": "boolean"
+              },
+              "head_object_present": {
+                "type": "boolean"
+              },
+              "merge_base_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "merge_base_oid": {
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/oid"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/nonemptyObservedEvidence"
+        }
+      ]
+    },
+    "nonemptyObservedEvidence": {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "observed"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "observed": {
+            "minItems": 1
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "observed": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
     "prSelectionConsistency": {
-      "$comment": "Expanded below because JSON Schema has no parameterized references.",
       "if": {
         "properties": {
           "evidence": {

@@ -4001,12 +4001,14 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/references/claude-stream-schema.json",
             "skills/review-orchestration-playbook/references/egress-consent.md",
             "skills/review-orchestration-playbook/references/github-pr-probes.md",
+            "skills/review-orchestration-playbook/references/pr-readiness-read-only-report.schema.json",
             "skills/review-orchestration-playbook/references/pr-readiness.md",
             "skills/review-orchestration-playbook/references/review-lane-contracts.md",
             "skills/review-orchestration-playbook/references/review-prompt-templates.md",
             "skills/review-orchestration-playbook/scripts/named_claude_preflight",
             "skills/review-orchestration-playbook/scripts/named_lane_guard",
             "skills/review-orchestration-playbook/scripts/review_runtime/__init__.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/catalog_bootstrap.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/claude_capabilities.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/claude_code_release.asc",
             "skills/review-orchestration-playbook/scripts/review_runtime/claude_linux.py",
@@ -4020,6 +4022,8 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/scripts/review_runtime/named_lane.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/review_result.py",
             "skills/review-orchestration-playbook/scripts/validate_claude_stream.py",
+            "skills/synthetic-token-fixtures/SKILL.md",
+            "skills/synthetic-token-fixtures/scripts/active_catalog_binding.py",
         )
         self.assertEqual(
             manifest_paths,
@@ -4035,8 +4039,11 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/references/base-only-retarget-state-machine.json",
             "skills/review-orchestration-playbook/references/egress-consent.md",
             "skills/review-orchestration-playbook/references/github-pr-probes.md",
+            "skills/review-orchestration-playbook/references/pr-readiness-read-only-report.schema.json",
             "skills/review-orchestration-playbook/references/pr-readiness.md",
             "skills/review-orchestration-playbook/scripts/review_runtime/review_result.py",
+            "skills/synthetic-token-fixtures/SKILL.md",
+            "skills/synthetic-token-fixtures/scripts/active_catalog_binding.py",
         )
 
         def manifest_digest(overrides: dict[str, bytes] | None = None) -> str:
@@ -4075,6 +4082,7 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/references/base-only-retarget-state-machine.json",
             "skills/review-orchestration-playbook/references/egress-consent.md",
             "skills/review-orchestration-playbook/references/github-pr-probes.md",
+            "skills/review-orchestration-playbook/references/pr-readiness-read-only-report.schema.json",
             "skills/review-orchestration-playbook/references/pr-readiness.md",
             "skills/review-orchestration-playbook/references/review-lane-contracts.md",
             "skills/review-orchestration-playbook/references/review-prompt-templates.md",
@@ -4083,6 +4091,7 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/scripts/named_claude_preflight",
             "skills/review-orchestration-playbook/scripts/named_lane_guard",
             "skills/review-orchestration-playbook/scripts/review_runtime/__init__.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/catalog_bootstrap.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/claude_capabilities.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/claude_code_release.asc",
             "skills/review-orchestration-playbook/scripts/review_runtime/claude_linux.py",
@@ -4099,6 +4108,8 @@ class RepositoryContractTest(unittest.TestCase):
             "isolated `-I -B -S -c` bootstrap",
             "never reopen the `review_runtime/fd_exec.py` path",
             "skills/review-orchestration-playbook/scripts/validate_claude_stream.py",
+            "skills/synthetic-token-fixtures/SKILL.md",
+            "skills/synthetic-token-fixtures/scripts/active_catalog_binding.py",
             "immediately before each guard, Claude preflight, stream-validator, Claude-launch, and Codex-spawn use",
             "Recompute it after each lane",
             "exact bytes must match the manifest entry",
@@ -4110,6 +4121,7 @@ class RepositoryContractTest(unittest.TestCase):
             "preflight-claude",
             "validate-claude-stream",
             "classify-review-result",
+            "catalog-bootstrap",
         ):
             self.assertIn(anchor, contracts)
         self.assertNotIn(

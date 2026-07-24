@@ -51,6 +51,7 @@ EXECUTABLE_CACHE_SUFFIXES = {".pyc", ".pyo", ".so", ".pyd", ".dylib", ".dll"}
 RELEASE_ID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 RUNTIME_NAMESPACE = "review_runtime"
+BOOTSTRAP_CONTRACT_VERSION = 1
 
 
 class BindingError(RuntimeError):
@@ -593,8 +594,10 @@ def _runtime_paths(review_root: Path) -> tuple[Path, ...]:
         filenames.sort()
         directory_path = Path(directory)
         _require_directory(directory_path, label="review runtime directory")
-        if "__pycache__" in names:
-            raise BindingError("review runtime contains executable bytecode cache")
+        # Python's ordinary source execution may leave cache directories in an
+        # otherwise valid installed release. They are outside the bound runtime
+        # tree and the closed loader never consults them.
+        names[:] = [name for name in names if name != "__pycache__"]
         for name in names:
             candidate = directory_path / name
             if candidate.is_symlink():
@@ -1059,10 +1062,74 @@ def _execute_catalog_snapshot(
             raise BindingError("catalog CLI runtime cleanup was incomplete")
 
 
+def _validated_bootstrap_binding(
+    binding: object,
+) -> dict[str, object]:
+    if not isinstance(binding, dict):
+        raise BindingError(
+            "active catalog binding requires the trusted catalog bootstrap"
+        )
+    expected_fields = {
+        "schema_version",
+        "mode",
+        "release_id",
+        "trusted_review_skill_root",
+        "synthetic_skill_root",
+        "synthetic_skill_sha256",
+        "resolver_path",
+        "resolver_sha256",
+        "resolver_identity",
+        "sync_manifest_path",
+        "sync_manifest_sha256",
+        "catalog_bootstrap_source_sha256",
+    }
+    if set(binding) != expected_fields:
+        raise BindingError("trusted catalog bootstrap binding fields are not closed")
+    if binding.get("schema_version") != 1 or binding.get("mode") != (
+        "trusted-guard-manifest-bound-source"
+    ):
+        raise BindingError("trusted catalog bootstrap binding mode is invalid")
+    if (
+        not isinstance(binding.get("release_id"), str)
+        or RELEASE_ID.fullmatch(str(binding["release_id"])) is None
+    ):
+        raise BindingError("trusted catalog bootstrap release ID is invalid")
+    for field in (
+        "synthetic_skill_sha256",
+        "resolver_sha256",
+        "sync_manifest_sha256",
+        "catalog_bootstrap_source_sha256",
+    ):
+        value = binding.get(field)
+        if not isinstance(value, str) or SHA256.fullmatch(value) is None:
+            raise BindingError(
+                f"trusted catalog bootstrap {field} is not canonical SHA-256"
+            )
+    identity = binding.get("resolver_identity")
+    if (
+        not isinstance(identity, list)
+        or len(identity) != 5
+        or any(not isinstance(value, int) or isinstance(value, bool) for value in identity)
+    ):
+        raise BindingError("trusted catalog bootstrap resolver identity is invalid")
+    for field in (
+        "trusted_review_skill_root",
+        "synthetic_skill_root",
+        "resolver_path",
+        "sync_manifest_path",
+    ):
+        value = binding.get(field)
+        if not isinstance(value, str):
+            raise BindingError(f"trusted catalog bootstrap {field} is invalid")
+        _require_canonical_absolute(Path(value), label=f"bootstrap {field}")
+    return dict(binding)
+
+
 def _build_binding(
     *,
     resolver: Path,
     loaded_skill_root: Path,
+    bootstrap_binding: dict[str, object],
     transaction: _BindingTransaction,
 ) -> tuple[dict[str, object], Path, dict[Path, bytes], bytes]:
     (
@@ -1098,6 +1165,24 @@ def _build_binding(
     if manifest_bound.payload is None:
         raise BindingError("release sync manifest snapshot omitted its content")
     _validate_sync_manifest(manifest_bound.payload)
+    expected_bootstrap = {
+        "release_id": release_root.name,
+        "trusted_review_skill_root": str(
+            skills_root / "review-orchestration-playbook"
+        ),
+        "synthetic_skill_root": str(synthetic_root),
+        "synthetic_skill_sha256": synthetic_skill.sha256,
+        "resolver_path": str(resolver),
+        "resolver_sha256": resolver_bound.sha256,
+        "resolver_identity": list(resolver_bound.identity),
+        "sync_manifest_path": str(sync_manifest),
+        "sync_manifest_sha256": manifest_bound.sha256,
+    }
+    for field, expected in expected_bootstrap.items():
+        if bootstrap_binding.get(field) != expected:
+            raise BindingError(
+                f"trusted catalog bootstrap binding changed for {field}"
+            )
 
     runtime_digest, runtime_files, retained_runtime = _runtime_snapshot(
         review_root,
@@ -1125,7 +1210,8 @@ def _build_binding(
         parent=interpreter_parent,
     )
     binding: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": 3,
+        "catalog_bootstrap": bootstrap_binding,
         "release_id": release_root.name,
         "release_root": str(release_root),
         "sync_manifest_path": str(sync_manifest),
@@ -1180,7 +1266,16 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    bootstrap_binding: object = None,
+) -> int:
+    try:
+        trusted_bootstrap = _validated_bootstrap_binding(bootstrap_binding)
+    except BindingError as error:
+        print(f"active catalog binding failed: {error}", file=sys.stderr)
+        return 2
     arguments = _build_parser().parse_args(argv)
     transaction = _BindingTransaction()
     output: dict[str, object] | None = None
@@ -1195,6 +1290,7 @@ def main(argv: list[str] | None = None) -> int:
         binding, review_root, runtime_files, catalog_bytes = _build_binding(
             resolver=resolver,
             loaded_skill_root=loaded_skill_root,
+            bootstrap_binding=trusted_bootstrap,
             transaction=transaction,
         )
         if expected is not None:
@@ -1255,4 +1351,9 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    print(
+        "active catalog binding failed: launch through the trusted "
+        "named_lane_guard catalog-bootstrap profile",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)

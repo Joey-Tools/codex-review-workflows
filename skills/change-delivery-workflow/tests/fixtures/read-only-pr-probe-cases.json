@@ -39,7 +39,7 @@
         ],
         "terminal": "pr-readiness-read-only-report",
         "terminal_result": {
-          "schema_version": 1,
+          "schema_version": 2,
           "terminal": "pr-readiness-read-only-report",
           "handoff_profile": "pr-readiness-read-only-probe",
           "delivery_record": {
@@ -56,31 +56,89 @@
             "handoff": "review-orchestration-playbook",
             "handoff_profile": "pr-readiness-read-only-probe"
           },
+          "target": {
+            "binding_id": "report-target-v1",
+            "repository": {
+              "host": "github.com",
+              "owner": "Joey-Tools",
+              "name": "codex-review-workflows"
+            },
+            "pull_request": {
+              "number": 42,
+              "url": "https://github.com/Joey-Tools/codex-review-workflows/pull/42"
+            },
+            "base": {
+              "ref": "master",
+              "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "head": {
+              "repository": {
+                "host": "github.com",
+                "owner": "Joey-Tools",
+                "name": "codex-review-workflows"
+              },
+              "ref": "codex/read-only-probe",
+              "oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }
+          },
+          "snapshot": {
+            "binding_id": "report-snapshot-v1",
+            "snapshot_id": "github-pr-42-at-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "observed_at": "2026-07-24T06:00:00Z",
+            "freshness": "current",
+            "sources": [
+              "github-rest",
+              "local-git-read-only"
+            ]
+          },
           "evidence": {
             "pr_selection": {
               "status": "observed",
-              "details": [
-                "One existing PR was selected."
+              "target_binding": "report-target-v1",
+              "snapshot_binding": "report-snapshot-v1",
+              "observed": [
+                {
+                  "selection_method": "explicit",
+                  "candidate_count": 1
+                }
               ]
             },
             "pr_lifecycle": {
               "status": "observed",
-              "details": [
-                "The selected PR was open at the snapshot."
+              "target_binding": "report-target-v1",
+              "snapshot_binding": "report-snapshot-v1",
+              "observed": [
+                {
+                  "state": "open",
+                  "merged": false,
+                  "merged_at": null,
+                  "draft": false
+                }
               ]
             },
             "ci_status": {
               "status": "unavailable",
-              "details": []
+              "target_binding": "report-target-v1",
+              "snapshot_binding": "report-snapshot-v1",
+              "observed": []
             },
             "conversation_state": {
               "status": "unavailable",
-              "details": []
+              "target_binding": "report-target-v1",
+              "snapshot_binding": "report-snapshot-v1",
+              "observed": []
             },
             "base_and_head": {
               "status": "observed",
-              "details": [
-                "Base and head metadata were read without mutation."
+              "target_binding": "report-target-v1",
+              "snapshot_binding": "report-snapshot-v1",
+              "observed": [
+                {
+                  "base_object_present": true,
+                  "head_object_present": true,
+                  "merge_base_count": 1,
+                  "merge_base_oid": "cccccccccccccccccccccccccccccccccccccccc"
+                }
               ]
             }
           },

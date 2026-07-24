@@ -13,35 +13,50 @@ the catalog.
 
 ```bash
 synthetic_skill_root="<absolute directory containing this loaded SKILL.md>"
-binding_resolver="$synthetic_skill_root/scripts/active_catalog_binding.py"
+trusted_bundle_root="<parent-verified bundle containing agents/ and skills/>"
+catalog_guard="$trusted_bundle_root/skills/review-orchestration-playbook/scripts/named_lane_guard"
 ```
 
 ## Bind The Active Source
 
 1. Resolve one absolute Python 3 interpreter through the user or repository's
-   normal runtime authority. Invoke the skill-relative `binding_resolver` only
-   with `-I -B -S`, the exact absolute directory containing this loaded
-   `SKILL.md`, and the `bind` action:
+   normal runtime authority. Independently bind the trusted bundle's canonical
+   control manifest and record its release/version plus SHA-256 as required by
+   `$review-orchestration-playbook`. Invoke only that manifest-bound guard with
+   `-I -B -S`, the exact absolute directory containing this loaded `SKILL.md`,
+   and its `catalog-bootstrap` profile:
 
 ```bash
-"$python_executable" -I -B -S "$binding_resolver" \
+"$python_executable" -I -B -S "$catalog_guard" catalog-bootstrap \
   --loaded-skill-root "$synthetic_skill_root" bind
 ```
 
    `-I` is mandatory: `-E -B -s -S` still leaves the script directory on
-   `sys.path`. The resolver checks isolated-mode flags before importing
-   `argparse`, `json`, or any other non-builtin module, so a resolver-local or
-   current-directory module shadow cannot execute before source admission.
-   It requires POSIX no-follow, nonblocking, close-on-exec file primitives and
-   fails closed when they are unavailable.
+   `sys.path`. The guard must come from a previously trusted release or frozen
+   prior-policy bundle outside any candidate range. Its exact two-source
+   catalog-bootstrap closure and the co-release synthetic `SKILL.md` and
+   resolver are records in that bundle's canonical control manifest. During a
+   self-policy migration, keep using the prior trusted release; candidate-head
+   Python and machine schemas are implementation/test subjects only and never
+   bootstrap their own activation.
    Do not search `CODEX_HOME`, `HOME`, `PATH`, another checkout, or a
    caller-provided catalog path for the review skill.
-2. Require a successful versioned-release binding. The resolver validates the
-   original absolute resolver leaf before any `resolve`, rejects symlinks,
-   validates every release-to-resolver parent including the `scripts`
-   directory, binds the explicitly loaded skill root, and derives the sibling
-   review skill from that same co-release. It verifies that the release
-   `sync-manifest.json` installs both skill sources and returns release/root
+2. Require a successful versioned-release binding. The guard derives the
+   resolver from its own manifest-bound co-release instead of accepting a
+   resolver path. Before any resolver byte executes, the trusted bootstrap
+   opens every target with POSIX `O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`, validates
+   regular-file type, current-user ownership, non-writable access policy,
+   descriptor/path identity, stable complete content, the co-release
+   `sync-manifest.json`, and exact equality with the control-manifest source
+   bytes. It then compiles and executes those same bound resolver bytes
+   in-process, retains the descriptors, and withholds stdout and raw values
+   until final identity/content revalidation succeeds. A symlink, malicious
+   leaf replacement, or loaded-skill root from another release therefore
+   cannot run through the resolver path or publish a result.
+
+   The resolver independently repeats the release-to-leaf binding, validates
+   the explicitly loaded skill root and sibling review skill from the same
+   co-release, and returns the trusted bootstrap binding, release/root
    identity, review-runtime tree digest, source/interpreter snapshot digests,
    `pool_version`, and one canonical `binding_sha256`.
 3. Stop on a non-release layout, loaded-skill mismatch, cross-release symlink,
@@ -51,7 +66,7 @@ binding_resolver="$synthetic_skill_root/scripts/active_catalog_binding.py"
 4. Run each authoring operation through the resolver with the captured binding:
 
 ```bash
-"$python_executable" -I -B -S "$binding_resolver" \
+"$python_executable" -I -B -S "$catalog_guard" catalog-bootstrap \
   --loaded-skill-root "$synthetic_skill_root" \
   --expect-binding-sha256 "$binding_sha256" validate
 ```
@@ -63,12 +78,13 @@ binding_resolver="$synthetic_skill_root/scripts/active_catalog_binding.py"
    value.
 
    Each invocation is one controlled in-process transaction. It retains the
-   active interpreter, resolver, review CLI, and catalog descriptor bindings;
-   executes the review CLI only from manifest-bound source snapshots through a
-   closed `review_runtime` import set; captures and validates the operation
+   active interpreter, trusted bootstrap, resolver, review CLI, and catalog
+   descriptor bindings; executes the resolver and review CLI only from
+   manifest-bound source snapshots through closed source loaders that ignore
+   `__pycache__` and never load bytecode; captures and validates the operation
    result and `pool_version`; removes the temporary module namespace; and
    closes the bound descriptors before publishing the result envelope. It
-   never executes the returned Python or CLI path, and there is no
+   never executes the resolver or returned CLI as a path, and there is no
    validate-path / execute-path / revalidate-path window.
 
 The resolver is an execution guard, not a second token CLI. It never accepts a
@@ -130,6 +146,8 @@ commit; hand an unavoidable historical-range review to
 ## Guardrails
 
 - Never copy token literals into this skill, templates, project instructions, or an allocator.
+- Never pass the resolver path as Python's script argv or use candidate-head
+  review control to activate its own catalog bootstrap.
 - Never create a project-local pool, catalog override, second token CLI, reservation, or fallback value.
 - Never select the catalog through `CODEX_HOME`, `HOME`, `PATH`, a repository copy, or a caller-provided path.
 - Never invent IDs, suffixes, reservations, counters, or regex namespaces.
