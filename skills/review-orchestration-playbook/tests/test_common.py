@@ -4201,6 +4201,75 @@ class ChildEnvironmentTest(unittest.TestCase):
 
         live_members.assert_called_once_with(12345)
 
+    def test_linux_process_group_scan_ignores_every_terminal_state(self) -> None:
+        records = {
+            "101": "101 (zombie worker) Z 1 700\n",
+            "102": "102 (dead worker) X 1 700\n",
+            "103": "103 (lowercase dead worker) x 1 700\n",
+            "104": "104 (other group) R 1 701\n",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for pid, record in records.items():
+                (root / pid).write_text(record, encoding="utf-8")
+
+            real_open = open
+            real_scandir = os.scandir
+
+            def open_fixture(path, *args, **kwargs):
+                path_text = os.fspath(path)
+                prefix = "/proc/"
+                suffix = "/stat"
+                if path_text.startswith(prefix) and path_text.endswith(suffix):
+                    pid = path_text[len(prefix) : -len(suffix)]
+                    return real_open(root / pid, *args, **kwargs)
+                return real_open(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    common.os,
+                    "scandir",
+                    side_effect=lambda _path: real_scandir(root),
+                ),
+                mock.patch.object(
+                    common,
+                    "open",
+                    side_effect=open_fixture,
+                    create=True,
+                ),
+            ):
+                self.assertFalse(common._linux_process_group_has_live_members(700))
+                (root / "105").write_text(
+                    "105 (running worker) R 1 700\n",
+                    encoding="utf-8",
+                )
+                self.assertTrue(common._linux_process_group_has_live_members(700))
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
+    def test_terminal_only_linux_group_allows_quiescence_callback(self) -> None:
+        callback = mock.Mock()
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(common.sys, "platform", "linux"),
+            mock.patch.object(common.os, "killpg"),
+            mock.patch.object(
+                common,
+                "_linux_process_group_has_live_members",
+                return_value=False,
+            ) as live_members,
+        ):
+            root = pathlib.Path(temporary)
+            completed = common.run(
+                (sys.executable, "-c", "pass"),
+                stdout_path=root / "stdout.log",
+                stderr_path=root / "stderr.log",
+                on_process_quiescent=callback,
+            )
+
+        self.assertEqual(completed.returncode, 0)
+        live_members.assert_called()
+        callback.assert_called_once_with()
+
     def test_process_cleanup_reaps_child_after_group_members_exit(self) -> None:
         process = mock.Mock(pid=12345)
         process.poll.return_value = 0

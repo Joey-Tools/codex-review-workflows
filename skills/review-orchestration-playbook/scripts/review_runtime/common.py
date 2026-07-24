@@ -363,6 +363,7 @@ BASE_ENV_KEYS = (
 PROCESS_GROUP_TERM_GRACE_SECONDS = 0.5
 PROCESS_GROUP_EXIT_GRACE_SECONDS = 0.5
 PROCESS_GROUP_POLL_SECONDS = 0.05
+_LINUX_TERMINAL_PROCESS_STATES = frozenset({"Z", "X", "x"})
 # A cancelled spawn worker can spend one poll handing off ownership, then all
 # three bounded phases in terminate_process_group(). Keep a separate budget so
 # its parent does not mistake expected cleanup for a leaked worker.
@@ -1556,7 +1557,10 @@ def _linux_process_group_has_live_members(process_group: int) -> bool | None:
                     member_group = int(fields[2])
                 except (IndexError, ValueError):
                     return None
-                if member_group == process_group and state not in {"X", "Z"}:
+                if (
+                    member_group == process_group
+                    and state not in _LINUX_TERMINAL_PROCESS_STATES
+                ):
                     return True
     except OSError:
         return None
