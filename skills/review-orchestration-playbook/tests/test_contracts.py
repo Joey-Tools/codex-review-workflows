@@ -5709,11 +5709,21 @@ class RepositoryContractTest(unittest.TestCase):
                         text=True,
                         timeout=30,
                     )
-                    self.assertEqual(
-                        completed.returncode,
-                        expected_returncode,
-                        completed.stderr,
+                    requires_python_313 = (
+                        entrypoint.name == "independent-codex-pr-review"
                     )
+                    if requires_python_313 and sys.version_info < (3, 13):
+                        self.assertNotEqual(completed.returncode, 0)
+                        self.assertIn(
+                            "Python 3.13 is required; running",
+                            completed.stderr,
+                        )
+                    else:
+                        self.assertEqual(
+                            completed.returncode,
+                            expected_returncode,
+                            completed.stderr,
+                        )
                     bytecode = sorted(
                         path.relative_to(copied_skill)
                         for path in copied_skill.rglob("*")

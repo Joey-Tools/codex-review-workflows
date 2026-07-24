@@ -1140,3 +1140,9 @@ metadata behavior.
   `typing.NoReturn`, which preserves runtime behavior and avoids a dependency.
   Local validation remains Python 3.13-only; the GitHub Actions platform matrix
   is the Python 3.10 authority.
+- The next Ubuntu matrix run reached the helper's intentional Python 3.13
+  runtime gate, but the copied-bundle no-bytecode contract treated that expected
+  fail-closed rejection as an entrypoint failure. The contract now requires
+  ordinary helper success on Python 3.13 and the exact version rejection on
+  older matrix interpreters while preserving the zero-bytecode assertion in
+  both cases. The production Python 3.13 requirement is unchanged.
