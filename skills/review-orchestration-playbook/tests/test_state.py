@@ -521,7 +521,14 @@ class StatefulLifecycleTest(unittest.TestCase):
         )
 
         completed = subprocess.run(
-            (sys.executable, "-c", probe, str(SCRIPTS), str(self.review.container_dir)),
+            (
+                sys.executable,
+                "-B",
+                "-c",
+                probe,
+                str(SCRIPTS),
+                str(self.review.container_dir),
+            ),
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

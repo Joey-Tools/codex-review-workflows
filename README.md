@@ -76,6 +76,6 @@ An incomplete or exact-readback-unverified macOS recovery temp is cleanup residu
 The helper requires Python 3.10 or later; CI pins the minimum supported runtime.
 
 ```bash
-python3 -m py_compile skills/review-orchestration-playbook/scripts/isolated_review skills/review-orchestration-playbook/scripts/named_lane_guard skills/review-orchestration-playbook/scripts/review_runtime/*.py
-python3 -m unittest discover -s skills/review-orchestration-playbook/tests
+python3 -B -c 'import pathlib, sys; [compile(pathlib.Path(path).read_bytes(), path, "exec") for path in sys.argv[1:]]' skills/review-orchestration-playbook/scripts/isolated_review skills/review-orchestration-playbook/scripts/named_lane_guard skills/review-orchestration-playbook/scripts/review_runtime/*.py
+python3 -B -m unittest discover -s skills/review-orchestration-playbook/tests
 ```

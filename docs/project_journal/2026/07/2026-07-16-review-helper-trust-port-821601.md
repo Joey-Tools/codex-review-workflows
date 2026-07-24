@@ -1344,3 +1344,38 @@ metadata behavior.
   supervisor tree. Signed commit, exact-head secret admission, replacement
   fresh-context review, hosted CI, and the unavailable Claude/GitHub lanes
   remain. No local Python 3.10 run was performed.
+- The current-head fresh-context Codex review found that the README validation
+  recipe still used `py_compile` in the release tree and launched unittest
+  without `-B`. In an environment without an inherited bytecode policy, the
+  first command could mutate an immutable installed bundle and the second would
+  then trigger the runtime's fail-closed bytecode guard. The syntax recipe now
+  uses in-memory `compile()` under `python3 -B`, and the unittest recipe also
+  passes `-B`. A copied-bundle regression clears every bytecode-related
+  environment variable, executes the equivalent syntax validation and a real
+  named-lane unittest import, and proves that the bundle gains no
+  `__pycache__`, `.pyc`, or `.pyo` artifact. The focused regression passed in
+  1.140 seconds and all four bytecode contract tests passed in 4.484 seconds
+  under Python 3.13.0. Full current-head gates and replacement formal review
+  remain required. No local Python 3.10 run was performed.
+- The first full bytecode-clean discovery exercised 2,815 tests in 1,693.235
+  seconds with 6 skips. In addition to the expected nested Desktop sandbox
+  broker denial, it exposed three test-owned Python subprocesses that imported
+  `review_runtime` without forwarding `-B`. Those child argv now pass `-B`
+  explicitly rather than relying on an inherited
+  `PYTHONDONTWRITEBYTECODE` environment. The three exact regressions pass in
+  1.882 seconds, and Ruff lint and format checks pass for all four touched test
+  modules. A clean standalone full discovery is still required before the next
+  signed head. No local Python 3.10 run was performed.
+- The clean standalone Python 3.13 discovery exercised 2,815 tests in
+  1,716.219 seconds with 6 skips. Its only failure was the expected Desktop
+  nested-sandbox denial in
+  `test_claude_keychain_broker_serves_one_in_memory_value`; that exact broker
+  test passed outside the Desktop sandbox in 2.607 seconds. The complete
+  required live no-child profile then passed all 9 tests without skips in
+  14.364 seconds outside the Desktop sandbox. The fixed deterministic
+  supervisor set passed all 530 tests in 191.294 seconds, all 97 repository
+  contract tests passed in 8.481 seconds, the documented copied-bundle
+  validation passed, and Ruff lint/format plus `git diff --check` pass on the
+  final tree. Signed commit, exact-head secret admission, replacement
+  fresh-context Codex review, hosted CI, and the unavailable Claude/GitHub
+  lanes remain. No local Python 3.10 run was performed.

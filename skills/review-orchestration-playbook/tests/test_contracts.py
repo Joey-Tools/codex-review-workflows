@@ -5822,6 +5822,85 @@ class RepositoryContractTest(unittest.TestCase):
             )
             self.assertEqual(bytecode, [])
 
+    def test_documented_validation_does_not_create_bundle_bytecode(self) -> None:
+        syntax_probe = (
+            "import pathlib, sys; "
+            '[compile(pathlib.Path(path).read_bytes(), path, "exec") '
+            "for path in sys.argv[1:]]"
+        )
+        if CI_PROFILE == "canonical":
+            readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+            self.assertIn(f"python3 -B -c '{syntax_probe}'", readme)
+            self.assertIn(
+                "python3 -B -m unittest discover "
+                "-s skills/review-orchestration-playbook/tests",
+                readme,
+            )
+
+        with tempfile.TemporaryDirectory(
+            prefix="review-documented-validation-"
+        ) as temporary:
+            copied_skill = pathlib.Path(temporary) / "review-orchestration-playbook"
+            shutil.copytree(
+                SKILL_ROOT,
+                copied_skill,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            )
+            copied_scripts = copied_skill / "scripts"
+            syntax_sources = [
+                copied_scripts / "isolated_review",
+                copied_scripts / "named_lane_guard",
+                *sorted((copied_scripts / "review_runtime").glob("*.py")),
+            ]
+            environment = os.environ.copy()
+            environment.pop("PYTHONDONTWRITEBYTECODE", None)
+            environment.pop("PYTHONPYCACHEPREFIX", None)
+            environment.pop("PYTHONPATH", None)
+
+            syntax_check = subprocess.run(
+                (
+                    sys.executable,
+                    "-B",
+                    "-c",
+                    syntax_probe,
+                    *(str(path) for path in syntax_sources),
+                ),
+                cwd=copied_skill,
+                env=environment,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(syntax_check.returncode, 0, syntax_check.stderr)
+
+            tests = subprocess.run(
+                (
+                    sys.executable,
+                    "-B",
+                    "-m",
+                    "unittest",
+                    "test_named_lane.NamedLaneGuardTest."
+                    "test_entrypoint_does_not_write_import_bytecode",
+                ),
+                cwd=copied_skill / "tests",
+                env=environment,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(tests.returncode, 0, tests.stderr)
+
+            bytecode = sorted(
+                path.relative_to(copied_skill)
+                for path in copied_skill.rglob("*")
+                if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}
+            )
+            self.assertEqual(bytecode, [])
+
     def test_bare_direct_package_import_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory(
             prefix="review-installed-bare-import-"

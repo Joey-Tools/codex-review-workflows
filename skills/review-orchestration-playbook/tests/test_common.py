@@ -3914,7 +3914,7 @@ class ChildEnvironmentTest(unittest.TestCase):
                 ")\n"
             )
             completed = subprocess.run(
-                (sys.executable, "-c", script, str(SCRIPTS), str(result_path)),
+                (sys.executable, "-B", "-c", script, str(SCRIPTS), str(result_path)),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 check=False,

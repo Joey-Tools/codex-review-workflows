@@ -7906,6 +7906,7 @@ class CredentialStagingTest(unittest.TestCase):
             completed = subprocess.run(
                 (
                     sys.executable,
+                    "-B",
                     "-c",
                     child,
                     str(SCRIPTS),
