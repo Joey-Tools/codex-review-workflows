@@ -46,6 +46,9 @@ new_read_only_report_bindings = READ_ONLY_PR_REPORT_RUNTIME_API["new_bindings"]
 validate_read_only_report_semantics = READ_ONLY_PR_REPORT_RUNTIME_API[
     "validate_semantics"
 ]
+READ_ONLY_DELIVERY_SUCCESS_MATRIX = READ_ONLY_PR_REPORT_RUNTIME_API[
+    "READ_ONLY_DELIVERY_SUCCESS_MATRIX"
+]
 read_only_report_payload = READ_ONLY_PR_REPORT_RUNTIME_API["_read_payload"]
 read_only_report_main = READ_ONLY_PR_REPORT_RUNTIME_API["main"]
 READ_ONLY_PR_REPORT_GLOBALS = read_only_report_main.__globals__
@@ -110,6 +113,10 @@ HANDOFF_PROFILES = {
 }
 TERMINAL_EVIDENCE_FIELDS = {
     "local_gate",
+    "build",
+    "tests",
+    "docs",
+    "journal",
     "committed_range",
     "formal_review",
     "signature",
@@ -118,11 +125,23 @@ TERMINAL_EVIDENCE_FIELDS = {
 }
 SUCCESS_REASONS = {
     "focused-checkpoint-complete",
+    "focused-checkpoint-reviewed-complete",
+    "focused-checkpoint-report",
+    "focused-checkpoint-read-only-report",
+    "focused-checkpoint-clean-range-report",
+    "focused-checkpoint-read-only-clean-range-report",
     "local-gate-complete",
     "pr-readiness-handoff-ready",
+    "pr-readiness-existing-range-handoff-ready",
     "pr-readiness-read-only-probe-ready",
+    "pr-readiness-read-only-reviewed-probe-ready",
+    "pr-readiness-read-only-gate-ready",
+    "pr-readiness-read-only-uncommitted-probe-ready",
+    "pr-readiness-read-only-existing-range-probe-ready",
     "uncommitted-checked-result",
+    "read-only-checked-result",
     "clean-range-report",
+    "read-only-clean-range-report",
 }
 BLOCKED_REASONS = {
     "implementation-blocked",
@@ -167,6 +186,153 @@ READ_ONLY_ACTION_FIELDS = {
     "local_mutation_performed",
     "remote_mutation_performed",
 }
+
+
+def success_evidence(
+    local_gate: str,
+    phase: str,
+    committed_range: str,
+    formal_review: str,
+    signature: str,
+    authorization: str,
+    input_state: str,
+) -> dict[str, str]:
+    return {
+        "local_gate": local_gate,
+        "build": phase,
+        "tests": phase,
+        "docs": phase,
+        "journal": phase,
+        "committed_range": committed_range,
+        "formal_review": formal_review,
+        "signature": signature,
+        "authorization": authorization,
+        "input": input_state,
+    }
+
+
+def success_terminal(
+    *,
+    profile: str,
+    local_mutation: str,
+    commit_mode: str,
+    formal_review_required: bool,
+    remote_mutation: str,
+    terminal_evidence: dict[str, str],
+    handoff: str = "none",
+    handoff_profile: str = "none",
+) -> dict[str, object]:
+    return {
+        "profile": profile,
+        "local_mutation": local_mutation,
+        "commit_mode": commit_mode,
+        "formal_review_required": formal_review_required,
+        "remote_mutation": remote_mutation,
+        "terminal_evidence": terminal_evidence,
+        "handoff": handoff,
+        "handoff_profile": handoff_profile,
+    }
+
+
+# fmt: off
+SUCCESS_ROWS = (
+    ("focused-checkpoint-complete", "focused-checkpoint", "allowed", "allowed", False, "forbidden", "not-required", "satisfied", "present", "not-required", "verified", "not-required", "not-required", "none", "none"),
+    ("focused-checkpoint-reviewed-complete", "focused-checkpoint", "allowed", "allowed", True, "forbidden", "not-required", "satisfied", "present", "clean", "verified", "not-required", "not-required", "none", "none"),
+    ("focused-checkpoint-report", "focused-checkpoint", "allowed", "forbidden", False, "forbidden", "not-required", "satisfied", "missing", "not-required", "not-required", "not-required", "not-required", "none", "none"),
+    ("focused-checkpoint-read-only-report", "focused-checkpoint", "forbidden", "forbidden", False, "forbidden", "not-required", "read-only-observed", "missing", "not-required", "not-required", "not-required", "not-required", "none", "none"),
+    ("focused-checkpoint-clean-range-report", "focused-checkpoint", "allowed", "forbidden", True, "forbidden", "not-required", "satisfied", "present", "clean", "not-required", "not-required", "not-required", "none", "none"),
+    ("focused-checkpoint-read-only-clean-range-report", "focused-checkpoint", "forbidden", "forbidden", True, "forbidden", "not-required", "read-only-observed", "present", "clean", "not-required", "not-required", "not-required", "none", "none"),
+    ("local-gate-complete", "local-gate", "allowed", "allowed", True, "forbidden", "succeeded", "satisfied", "present", "clean", "verified", "not-required", "not-required", "none", "none"),
+    ("uncommitted-checked-result", "local-gate", "allowed", "forbidden", False, "forbidden", "checked", "satisfied", "missing", "not-required", "not-required", "not-required", "not-required", "none", "none"),
+    ("read-only-checked-result", "local-gate", "forbidden", "forbidden", False, "forbidden", "checked", "read-only-observed", "missing", "not-required", "not-required", "not-required", "not-required", "none", "none"),
+    ("clean-range-report", "local-gate", "allowed", "forbidden", True, "forbidden", "checked", "satisfied", "present", "clean", "not-required", "not-required", "not-required", "none", "none"),
+    ("read-only-clean-range-report", "local-gate", "forbidden", "forbidden", True, "forbidden", "checked", "read-only-observed", "present", "clean", "not-required", "not-required", "not-required", "none", "none"),
+    ("pr-readiness-handoff-ready", "pr-readiness-handoff", "allowed", "allowed", True, "review-authorization-required", "succeeded", "satisfied", "present", "clean", "verified", "satisfied", "satisfied", "review-orchestration-playbook", "pr-readiness"),
+    ("pr-readiness-existing-range-handoff-ready", "pr-readiness-handoff", "allowed", "forbidden", True, "review-authorization-required", "checked", "satisfied", "present", "clean", "not-required", "satisfied", "satisfied", "review-orchestration-playbook", "pr-readiness"),
+    ("pr-readiness-read-only-probe-ready", "local-gate", "forbidden", "forbidden", False, "forbidden", "checked", "read-only-observed", "missing", "not-required", "not-required", "not-required", "satisfied", "review-orchestration-playbook", "pr-readiness-read-only-probe"),
+    ("pr-readiness-read-only-reviewed-probe-ready", "local-gate", "forbidden", "forbidden", True, "forbidden", "checked", "read-only-observed", "present", "clean", "not-required", "not-required", "satisfied", "review-orchestration-playbook", "pr-readiness-read-only-probe"),
+    ("pr-readiness-read-only-gate-ready", "local-gate", "allowed", "allowed", True, "forbidden", "succeeded", "satisfied", "present", "clean", "verified", "not-required", "satisfied", "review-orchestration-playbook", "pr-readiness-read-only-probe"),
+    ("pr-readiness-read-only-uncommitted-probe-ready", "local-gate", "allowed", "forbidden", False, "forbidden", "checked", "satisfied", "missing", "not-required", "not-required", "not-required", "satisfied", "review-orchestration-playbook", "pr-readiness-read-only-probe"),
+    ("pr-readiness-read-only-existing-range-probe-ready", "local-gate", "allowed", "forbidden", True, "forbidden", "checked", "satisfied", "present", "clean", "not-required", "not-required", "satisfied", "review-orchestration-playbook", "pr-readiness-read-only-probe"),
+)
+# fmt: on
+SUCCESS_MATRIX = {
+    reason: success_terminal(
+        profile=profile,
+        local_mutation=local_mutation,
+        commit_mode=commit_mode,
+        formal_review_required=formal_review_required,
+        remote_mutation=remote_mutation,
+        terminal_evidence=success_evidence(
+            local_gate,
+            phase,
+            committed_range,
+            formal_review,
+            signature,
+            authorization,
+            input_state,
+        ),
+        handoff=handoff,
+        handoff_profile=handoff_profile,
+    )
+    for (
+        reason,
+        profile,
+        local_mutation,
+        commit_mode,
+        formal_review_required,
+        remote_mutation,
+        local_gate,
+        phase,
+        committed_range,
+        formal_review,
+        signature,
+        authorization,
+        input_state,
+        handoff,
+        handoff_profile,
+    ) in SUCCESS_ROWS
+}
+TERMINAL_EVIDENCE_VALUES = {
+    "local_gate": {"succeeded", "checked", "blocked", "not-required"},
+    "build": {"satisfied", "read-only-observed", "failed", "blocked"},
+    "tests": {"satisfied", "read-only-observed", "failed", "blocked"},
+    "docs": {"satisfied", "read-only-observed", "blocked"},
+    "journal": {"satisfied", "read-only-observed", "blocked"},
+    "committed_range": {"present", "missing", "not-required"},
+    "formal_review": {
+        "clean",
+        "findings",
+        "blocked",
+        "not-started",
+        "not-required",
+    },
+    "signature": {"verified", "failed", "not-required"},
+    "authorization": {"satisfied", "blocked", "not-required"},
+    "input": {"satisfied", "blocked", "not-required"},
+}
+
+
+def constraints_for_success(expected: dict[str, object]) -> list[str]:
+    constraints: list[str] = []
+    if expected["local_mutation"] == "forbidden":
+        constraints.append("probe-only")
+    elif expected["commit_mode"] == "forbidden":
+        constraints.append("no-commit")
+    if expected["handoff_profile"] == "pr-readiness-read-only-probe":
+        constraints.append("no-remote")
+    return constraints
+
+
+def success_result(reason: str) -> dict[str, object]:
+    expected = copy.deepcopy(SUCCESS_MATRIX[reason])
+    return {
+        "schema_version": 2,
+        "constraints": constraints_for_success(expected),
+        "terminal_outcome": "succeeded",
+        "terminal_reason": reason,
+        **expected,
+    }
 
 
 def check_run_rollup(
@@ -220,6 +386,57 @@ def status_context_rollup(
             "login": creator_login,
         },
         "state": state,
+    }
+
+
+def bind_ci_pagination(
+    observed: dict[str, object],
+    *,
+    page_size: int = 100,
+) -> None:
+    target_identity = observed["target_identity"]
+    if not isinstance(target_identity, dict):
+        raise AssertionError("CI target identity must be an object")
+    repository = target_identity["repository"]
+    pull_request = target_identity["pull_request"]
+    head = target_identity["head"]
+    if not all(isinstance(item, dict) for item in (repository, pull_request, head)):
+        raise AssertionError("CI target identity is incomplete")
+    connection = {
+        "provider": "github-graphql",
+        "field": "commit.statusCheckRollup.contexts",
+        "repository_node_id": repository["node_id"],
+        "pull_request_node_id": pull_request["node_id"],
+        "head_oid": head["oid"],
+    }
+    rollup = observed["status_check_rollup"]
+    if not isinstance(rollup, list):
+        raise AssertionError("CI rollup must be an array")
+    chunks = [
+        rollup[offset : offset + page_size]
+        for offset in range(0, len(rollup), page_size)
+    ] or [[]]
+    pages = []
+    previous_cursor: str | None = None
+    for index, chunk in enumerate(chunks, start=1):
+        end_cursor = None if not chunk else f"CI_CURSOR_{index}"
+        pages.append(
+            {
+                "connection": dict(connection),
+                "page_index": index,
+                "request_after": previous_cursor,
+                "item_count": len(chunk),
+                "page_info": {
+                    "end_cursor": end_cursor,
+                    "has_next_page": index < len(chunks),
+                },
+            }
+        )
+        previous_cursor = end_cursor
+    observed["pagination"] = {
+        "connection": connection,
+        "server_total_count": len(rollup),
+        "pages": pages,
     }
 
 
@@ -317,26 +534,30 @@ def assert_valid_result_contract(result: object) -> None:
         raise AssertionError(
             "terminal evidence fields do not match the closed contract"
         )
-    allowed_evidence = {
-        "local_gate": {"succeeded", "checked", "blocked", "not-required"},
-        "committed_range": {"present", "missing", "not-required"},
-        "formal_review": {
-            "clean",
-            "findings",
-            "blocked",
-            "not-started",
-            "not-required",
-        },
-        "signature": {"verified", "failed", "not-required"},
-        "authorization": {"satisfied", "blocked", "not-required"},
-        "input": {"satisfied", "blocked", "not-required"},
-    }
-    for field, values in allowed_evidence.items():
+    for field, values in TERMINAL_EVIDENCE_VALUES.items():
         if evidence[field] not in values:
             raise AssertionError(f"unknown terminal evidence value for {field}")
     if outcome == "succeeded":
-        if reason not in SUCCESS_REASONS:
+        expected_terminal = SUCCESS_MATRIX.get(reason)
+        if expected_terminal is None:
             raise AssertionError("successful terminal used a blocker reason")
+        actual_terminal = {
+            field: result[field]
+            for field in (
+                "profile",
+                "local_mutation",
+                "commit_mode",
+                "formal_review_required",
+                "remote_mutation",
+                "terminal_evidence",
+                "handoff",
+                "handoff_profile",
+            )
+        }
+        if actual_terminal != expected_terminal:
+            raise AssertionError(
+                f"successful terminal contradicts terminal_reason {reason}"
+            )
     elif outcome == "blocked":
         if reason not in BLOCKED_REASONS:
             raise AssertionError("blocked terminal used a success reason")
@@ -380,26 +601,10 @@ def assert_valid_result_contract(result: object) -> None:
             raise AssertionError("PR handoff bypassed required formal review")
         if remote_mutation != "review-authorization-required":
             raise AssertionError("PR handoff bypassed review authorization")
-        if outcome == "succeeded":
-            if reason != "pr-readiness-handoff-ready":
-                raise AssertionError("successful PR profile lacks its ready terminal")
-            if handoff != "review-orchestration-playbook":
-                raise AssertionError("ready PR handoff did not route to review")
-            if handoff_profile != "pr-readiness":
-                raise AssertionError("ready PR handoff used the wrong review profile")
-            expected_evidence = {
-                "local_gate": "succeeded",
-                "committed_range": "present",
-                "formal_review": "clean",
-                "signature": "verified",
-                "authorization": "satisfied",
-                "input": "satisfied",
-            }
-            if evidence != expected_evidence:
-                raise AssertionError("ready PR handoff lacks complete gate evidence")
-        elif handoff != "none" or handoff_profile != "none":
-            raise AssertionError("non-ready PR profile attempted a handoff")
-    elif handoff_profile == "pr-readiness-read-only-probe":
+    elif remote_mutation != "forbidden":
+        raise AssertionError("a local profile allowed unsupported remote mutation")
+
+    if handoff_profile == "pr-readiness-read-only-probe":
         if result["profile"] != "local-gate":
             raise AssertionError("read-only PR probe did not use the local gate")
         if remote_mutation != "forbidden":
@@ -410,19 +615,12 @@ def assert_valid_result_contract(result: object) -> None:
             REMOTE_LIMITING_CONSTRAINTS - REMOTE_READ_LIMITING_CONSTRAINTS
         ):
             raise AssertionError("read-only PR probe lacks a mutation limit")
-        if outcome != "succeeded" or reason != "pr-readiness-read-only-probe-ready":
-            raise AssertionError("read-only PR probe lacks a ready terminal")
-        if evidence["local_gate"] not in {"succeeded", "checked"}:
-            raise AssertionError("read-only PR probe lacks a completed local check")
-        if evidence["authorization"] != "not-required":
-            raise AssertionError("read-only PR probe claimed mutation authorization")
-        if evidence["input"] != "satisfied":
-            raise AssertionError("read-only PR probe lacks required input")
-    elif (
-        (remote_mutation != "forbidden" and result["profile"] != "pr-readiness-handoff")
-        or handoff != "none"
-        or handoff_profile != "none"
-    ):
+    elif handoff_profile == "pr-readiness":
+        if result["profile"] != "pr-readiness-handoff":
+            raise AssertionError("PR handoff profile used a local delivery profile")
+        if handoff != "review-orchestration-playbook":
+            raise AssertionError("PR handoff did not route to the review skill")
+    elif handoff != "none" or handoff_profile != "none":
         raise AssertionError("a local profile attempted an unsupported handoff")
 
     blocker_evidence = {
@@ -436,6 +634,15 @@ def assert_valid_result_contract(result: object) -> None:
         field, expected = blocker_evidence[reason]
         if evidence[field] != expected:
             raise AssertionError(f"{reason} lacks matching terminal evidence")
+    if reason == "review-findings" and (
+        commit_mode != "forbidden"
+        or result["formal_review_required"] is not True
+        or evidence["committed_range"] != "present"
+        or evidence["signature"] != "not-required"
+    ):
+        raise AssertionError(
+            "review-findings is terminal only for a required no-commit review"
+        )
 
 
 def assert_read_only_report_contract(report: object) -> None:
@@ -875,9 +1082,23 @@ class DeliveryProfileContractTest(unittest.TestCase):
             "succeeded",
         )
         self.assertEqual(
-            delivery_contract["properties"]["terminal_reason"]["const"],
-            "pr-readiness-read-only-probe-ready",
+            set(delivery_contract["properties"]["terminal_reason"]["enum"]),
+            set(READ_ONLY_DELIVERY_SUCCESS_MATRIX),
         )
+        receiver_matrix = {}
+        for branch in delivery_contract["allOf"][-1]["oneOf"]:
+            properties = branch["properties"]
+            reason = properties["terminal_reason"]["const"]
+            receiver_matrix[reason] = {
+                field: properties[field]["const"]
+                for field in (
+                    "local_mutation",
+                    "commit_mode",
+                    "formal_review_required",
+                    "terminal_evidence",
+                )
+            }
+        self.assertEqual(receiver_matrix, READ_ONLY_DELIVERY_SUCCESS_MATRIX)
         external_refs: list[str] = []
 
         def collect_external_refs(value: object) -> None:
@@ -917,10 +1138,33 @@ class DeliveryProfileContractTest(unittest.TestCase):
             "items"
         ]
         self.assertIn("target_identity", ci_observation["required"])
+        self.assertIn("pagination", ci_observation["required"])
         self.assertIn("status_check_rollup", ci_observation["required"])
+        self.assertEqual(
+            ci_observation["properties"]["pagination"]["$ref"],
+            "#/$defs/ciPaginationEvidence",
+        )
+        self.assertEqual(
+            ci_observation["properties"]["status_check_rollup"]["maxItems"],
+            1_000,
+        )
         self.assertEqual(
             ci_observation["properties"]["status_check_rollup"]["items"]["$ref"],
             "#/$defs/statusCheckRollupEntry",
+        )
+        self.assertEqual(
+            schema["$defs"]["ciPaginationEvidence"]["properties"]["server_total_count"][
+                "maximum"
+            ],
+            1_000,
+        )
+        self.assertEqual(
+            schema["$defs"]["ciPaginationEvidence"]["properties"]["pages"]["maxItems"],
+            10,
+        )
+        self.assertEqual(
+            schema["$defs"]["ciPaginationPage"]["properties"]["item_count"]["maximum"],
+            100,
         )
         self.assertEqual(
             schema["$defs"]["statusCheckRollupEntry"]["oneOf"],
@@ -1233,6 +1477,165 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     validate_read_only_report_semantics(candidate)
 
+    def test_ci_rollup_requires_complete_identity_bound_pagination(self) -> None:
+        base = next(
+            case["expected"]["terminal_result"]
+            for case in fixture_cases(
+                READ_ONLY_PR_PROBE_CASES,
+                "read-only-pr-probe",
+            )
+            if case["name"] == "selected-pr-base-head-blocked"
+        )
+        validator = read_only_report_validator()
+
+        multipage = copy.deepcopy(base)
+        multipage_observed = multipage["evidence"]["ci_status"]["observed"][0]
+        bind_ci_pagination(multipage_observed, page_size=1)
+        self.assertEqual(list(validator.iter_errors(multipage)), [])
+        validate_read_only_report_semantics(multipage)
+        self.assertEqual(len(multipage_observed["pagination"]["pages"]), 2)
+        self.assertIs(
+            multipage_observed["pagination"]["pages"][-1]["page_info"]["has_next_page"],
+            False,
+        )
+
+        no_checks = copy.deepcopy(base)
+        no_checks_observed = no_checks["evidence"]["ci_status"]["observed"][0]
+        no_checks_observed.update(
+            {
+                "state": "no-checks",
+                "total": 0,
+                "successful": 0,
+                "failed": 0,
+                "pending": 0,
+                "cancelled": 0,
+                "status_check_rollup": [],
+            }
+        )
+        bind_ci_pagination(no_checks_observed)
+        self.assertEqual(list(validator.iter_errors(no_checks)), [])
+        validate_read_only_report_semantics(no_checks)
+
+        for hidden_bucket in ("failure", "pending"):
+            candidate = copy.deepcopy(base)
+            observed = candidate["evidence"]["ci_status"]["observed"][0]
+            observed.update(
+                {
+                    "state": "success",
+                    "total": 1,
+                    "successful": 1,
+                    "failed": 0,
+                    "pending": 0,
+                    "cancelled": 0,
+                    "status_check_rollup": [
+                        check_run_rollup(
+                            database_id=9001,
+                            name="first-page-green",
+                            status="COMPLETED",
+                            conclusion="SUCCESS",
+                        )
+                    ],
+                }
+            )
+            bind_ci_pagination(observed)
+            connection = observed["pagination"]["connection"]
+            first_page = observed["pagination"]["pages"][0]
+            first_page["page_info"]["has_next_page"] = True
+            observed["pagination"]["server_total_count"] = 2
+            observed["pagination"]["pages"].append(
+                {
+                    "connection": copy.deepcopy(connection),
+                    "page_index": 2,
+                    "request_after": first_page["page_info"]["end_cursor"],
+                    "item_count": 1,
+                    "page_info": {
+                        "end_cursor": f"HIDDEN_{hidden_bucket.upper()}_CURSOR",
+                        "has_next_page": False,
+                    },
+                }
+            )
+            with self.subTest(hidden_later_page=hidden_bucket):
+                self.assertEqual(list(validator.iter_errors(candidate)), [])
+                with self.assertRaisesRegex(ValueError, "server totalCount"):
+                    validate_read_only_report_semantics(candidate)
+
+        count_mismatch = copy.deepcopy(base)
+        observed = count_mismatch["evidence"]["ci_status"]["observed"][0]
+        observed["pagination"]["server_total_count"] = 3
+        self.assertEqual(list(validator.iter_errors(count_mismatch)), [])
+        with self.assertRaisesRegex(ValueError, "item counts"):
+            validate_read_only_report_semantics(count_mismatch)
+
+        cursor_drift = copy.deepcopy(multipage)
+        observed = cursor_drift["evidence"]["ci_status"]["observed"][0]
+        observed["pagination"]["pages"][1]["request_after"] = "WRONG_CURSOR"
+        self.assertEqual(list(validator.iter_errors(cursor_drift)), [])
+        with self.assertRaisesRegex(ValueError, "request cursor drifted"):
+            validate_read_only_report_semantics(cursor_drift)
+
+        page_connection_drift = copy.deepcopy(multipage)
+        observed = page_connection_drift["evidence"]["ci_status"]["observed"][0]
+        observed["pagination"]["pages"][1]["connection"]["head_oid"] = "c" * 40
+        self.assertEqual(list(validator.iter_errors(page_connection_drift)), [])
+        with self.assertRaisesRegex(ValueError, "changed connection identity"):
+            validate_read_only_report_semantics(page_connection_drift)
+
+        for field, replacement in (
+            ("repository_node_id", "REPO_OTHER"),
+            ("pull_request_node_id", "PR_OTHER"),
+            ("head_oid", "c" * 40),
+        ):
+            identity_drift = copy.deepcopy(base)
+            observed = identity_drift["evidence"]["ci_status"]["observed"][0]
+            observed["pagination"]["connection"][field] = replacement
+            for page in observed["pagination"]["pages"]:
+                page["connection"][field] = replacement
+            with self.subTest(connection_identity=field):
+                self.assertEqual(list(validator.iter_errors(identity_drift)), [])
+                with self.assertRaisesRegex(ValueError, "exact PR head"):
+                    validate_read_only_report_semantics(identity_drift)
+
+        incomplete_final = copy.deepcopy(base)
+        observed = incomplete_final["evidence"]["ci_status"]["observed"][0]
+        observed["pagination"]["pages"][-1]["page_info"]["has_next_page"] = True
+        self.assertEqual(list(validator.iter_errors(incomplete_final)), [])
+        with self.assertRaisesRegex(ValueError, "final CI page"):
+            validate_read_only_report_semantics(incomplete_final)
+
+        beyond_legacy_truncation = copy.deepcopy(base)
+        observed = beyond_legacy_truncation["evidence"]["ci_status"]["observed"][0]
+        rollup = [
+            check_run_rollup(
+                database_id=10_000 + index,
+                node_id=f"CHECK_RUN_COMPLETE_{index}",
+                name=f"check-{index}",
+                status="COMPLETED",
+                conclusion="SUCCESS",
+            )
+            for index in range(257)
+        ]
+        observed.update(
+            {
+                "state": "success",
+                "total": len(rollup),
+                "successful": len(rollup),
+                "failed": 0,
+                "pending": 0,
+                "cancelled": 0,
+                "status_check_rollup": rollup,
+            }
+        )
+        bind_ci_pagination(observed)
+        self.assertEqual(list(validator.iter_errors(beyond_legacy_truncation)), [])
+        validate_read_only_report_semantics(beyond_legacy_truncation)
+
+        over_cap = copy.deepcopy(base)
+        observed = over_cap["evidence"]["ci_status"]["observed"][0]
+        observed["pagination"]["server_total_count"] = 1_001
+        self.assertTrue(list(validator.iter_errors(over_cap)))
+        with self.assertRaisesRegex(ValueError, "bounded complete-rollup cap"):
+            validate_read_only_report_semantics(over_cap)
+
     def test_read_only_pr_report_preserves_and_maps_all_ci_provider_states(
         self,
     ) -> None:
@@ -1281,6 +1684,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                         ],
                     }
                 )
+                bind_ci_pagination(observed)
                 self.assertEqual(list(validator.iter_errors(candidate)), [])
                 validate_read_only_report_semantics(candidate)
                 self.assertEqual(
@@ -1316,6 +1720,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                         ],
                     }
                 )
+                bind_ci_pagination(observed)
                 self.assertEqual(list(validator.iter_errors(candidate)), [])
                 validate_read_only_report_semantics(candidate)
 
@@ -1346,6 +1751,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                         ],
                     }
                 )
+                bind_ci_pagination(observed)
                 self.assertEqual(list(validator.iter_errors(candidate)), [])
                 validate_read_only_report_semantics(candidate)
 
@@ -1375,6 +1781,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 ],
             }
         )
+        bind_ci_pagination(nullable_observed)
         self.assertEqual(list(validator.iter_errors(nullable_database_ids)), [])
         validate_read_only_report_semantics(nullable_database_ids)
 
@@ -1417,6 +1824,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 ],
             }
         )
+        bind_ci_pagination(mixed_observed)
         self.assertEqual(list(validator.iter_errors(mixed)), [])
         validate_read_only_report_semantics(mixed)
 
@@ -2427,22 +2835,18 @@ class DeliveryProfileContractTest(unittest.TestCase):
             if rule["if"]["properties"].get("terminal_outcome", {}).get("const")
             == "blocked"
         )
-        successful_pr_constraint = next(
+        successful_constraint = next(
             rule
             for rule in schema["allOf"]
-            if rule["if"]["properties"].get("profile", {}).get("const")
-            == "pr-readiness-handoff"
-            and rule["if"]["properties"].get("terminal_outcome", {}).get("const")
+            if rule["if"]["properties"].get("terminal_outcome", {}).get("const")
             == "succeeded"
         )
-        handoff_rules = {
-            rule["if"]["properties"]["handoff_profile"]["const"]: rule
+        read_only_handoff_constraint = next(
+            rule
             for rule in schema["allOf"]
-            if "handoff_profile" in rule["if"]["properties"]
-        }
-        no_handoff_constraint = handoff_rules["none"]
-        pr_handoff_constraint = handoff_rules["pr-readiness"]
-        read_only_handoff_constraint = handoff_rules["pr-readiness-read-only-probe"]
+            if rule["if"]["properties"].get("handoff_profile", {}).get("const")
+            == "pr-readiness-read-only-probe"
+        )
         self.assertEqual(
             set(
                 local_mutation_constraint["if"]["properties"]["constraints"][
@@ -2513,16 +2917,8 @@ class DeliveryProfileContractTest(unittest.TestCase):
             True,
         )
         self.assertEqual(
-            successful_pr_constraint["then"]["properties"]["terminal_reason"]["const"],
-            "pr-readiness-handoff-ready",
-        )
-        self.assertEqual(
-            successful_pr_constraint["then"]["properties"]["handoff"]["const"],
-            "review-orchestration-playbook",
-        )
-        self.assertEqual(
-            successful_pr_constraint["then"]["properties"]["handoff_profile"]["const"],
-            "pr-readiness",
+            successful_constraint["then"]["$ref"],
+            "#/$defs/successTerminalMatrix",
         )
         self.assertEqual(
             profile_constraint["else"]["properties"]["remote_mutation"]["const"],
@@ -2549,57 +2945,147 @@ class DeliveryProfileContractTest(unittest.TestCase):
             BLOCKED_REASONS,
         )
         self.assertEqual(
-            no_handoff_constraint["then"]["properties"]["handoff"]["const"],
-            "none",
+            set(
+                read_only_handoff_constraint["then"]["properties"]["constraints"][
+                    "contains"
+                ]["enum"]
+            ),
+            REMOTE_LIMITING_CONSTRAINTS - REMOTE_READ_LIMITING_CONSTRAINTS,
         )
-        self.assertEqual(
-            pr_handoff_constraint["then"]["properties"]["profile"]["const"],
-            "pr-readiness-handoff",
-        )
-        self.assertIs(
-            pr_handoff_constraint["then"]["properties"]["formal_review_required"][
-                "const"
-            ],
-            True,
-        )
-        self.assertEqual(
-            pr_handoff_constraint["then"]["properties"]["terminal_outcome"]["const"],
-            "succeeded",
-        )
-        self.assertEqual(
-            pr_handoff_constraint["then"]["properties"]["terminal_reason"]["const"],
-            "pr-readiness-handoff-ready",
-        )
-        self.assertEqual(
-            pr_handoff_constraint["then"]["properties"]["terminal_evidence"][
-                "properties"
-            ],
-            {
-                "local_gate": {"const": "succeeded"},
-                "committed_range": {"const": "present"},
-                "formal_review": {"const": "clean"},
-                "signature": {"const": "verified"},
-                "authorization": {"const": "satisfied"},
-                "input": {"const": "satisfied"},
-            },
-        )
-        self.assertEqual(
-            read_only_handoff_constraint["then"]["properties"]["profile"]["const"],
-            "local-gate",
-        )
-        self.assertEqual(
-            read_only_handoff_constraint["then"]["properties"]["handoff"]["const"],
-            "review-orchestration-playbook",
-        )
-        self.assertNotIn(
-            "formal_review_required",
-            read_only_handoff_constraint["then"]["properties"],
-        )
+        schema_success_matrix = {}
+        for branch in schema["$defs"]["successTerminalMatrix"]["oneOf"]:
+            properties = branch["properties"]
+            reason = properties["terminal_reason"]["const"]
+            self.assertEqual(branch["title"], reason)
+            self.assertEqual(properties["terminal_outcome"]["const"], "succeeded")
+            schema_success_matrix[reason] = {
+                field: properties[field]["const"] for field in SUCCESS_MATRIX[reason]
+            }
+        self.assertEqual(schema_success_matrix, SUCCESS_MATRIX)
 
         for case in profile_selection_cases():
             with self.subTest(prompt=case["prompt"]):
                 assert_valid_result_contract(case["result"])
                 self.assertEqual(list(validator.iter_errors(case["result"])), [])
+
+    def test_success_reason_matrix_rejects_every_cross_product(self) -> None:
+        schema = json.loads(DELIVERY_RESULT_SCHEMA.read_text(encoding="utf-8"))
+        validator = Draft202012Validator(schema)
+        top_level_values = {
+            "profile": PROFILES,
+            "local_mutation": {"allowed", "forbidden"},
+            "commit_mode": {"allowed", "forbidden"},
+            "formal_review_required": {True, False},
+            "remote_mutation": {
+                "forbidden",
+                "review-authorization-required",
+            },
+            "handoff": {"none", "review-orchestration-playbook"},
+            "handoff_profile": HANDOFF_PROFILES,
+        }
+
+        def assert_rejected(candidate: dict[str, object]) -> None:
+            self.assertTrue(list(validator.iter_errors(candidate)))
+            with self.assertRaises(AssertionError):
+                assert_valid_result_contract(candidate)
+
+        for reason in sorted(SUCCESS_MATRIX):
+            valid = success_result(reason)
+            with self.subTest(reason=reason, mutation="valid"):
+                self.assertEqual(list(validator.iter_errors(valid)), [])
+                assert_valid_result_contract(valid)
+                self.assertTrue(
+                    set(valid["terminal_evidence"].values()).isdisjoint(
+                        {"blocked", "failed", "findings", "not-started"}
+                    )
+                )
+
+            for field, values in top_level_values.items():
+                for alternative in values - {valid[field]}:
+                    with self.subTest(
+                        reason=reason,
+                        mutation=field,
+                        alternative=alternative,
+                    ):
+                        candidate = copy.deepcopy(valid)
+                        candidate[field] = alternative
+                        assert_rejected(candidate)
+
+            for field, values in TERMINAL_EVIDENCE_VALUES.items():
+                for alternative in values - {valid["terminal_evidence"][field]}:
+                    with self.subTest(
+                        reason=reason,
+                        mutation=f"terminal_evidence.{field}",
+                        alternative=alternative,
+                    ):
+                        candidate = copy.deepcopy(valid)
+                        candidate["terminal_evidence"][field] = alternative
+                        assert_rejected(candidate)
+
+            for alternative_reason in SUCCESS_REASONS - {reason}:
+                with self.subTest(
+                    reason=reason,
+                    mutation="terminal_reason",
+                    alternative=alternative_reason,
+                ):
+                    candidate = copy.deepcopy(valid)
+                    candidate["terminal_reason"] = alternative_reason
+                    assert_rejected(candidate)
+
+            missing_evidence = copy.deepcopy(valid)
+            del missing_evidence["terminal_evidence"]["journal"]
+            assert_rejected(missing_evidence)
+            extra_evidence = copy.deepcopy(valid)
+            extra_evidence["terminal_evidence"]["summary"] = "looks good"
+            assert_rejected(extra_evidence)
+
+    def test_read_only_receiver_enforces_each_success_reason_matrix(self) -> None:
+        base_report = copy.deepcopy(
+            next(
+                case["expected"]["terminal_result"]
+                for case in fixture_cases(
+                    READ_ONLY_PR_PROBE_CASES,
+                    "read-only-pr-probe",
+                )
+                if case["name"] == "resolved-target-snapshot"
+            )
+        )
+        validator = read_only_report_validator()
+        read_only_reasons = set(READ_ONLY_DELIVERY_SUCCESS_MATRIX)
+        for reason in sorted(read_only_reasons):
+            report = copy.deepcopy(base_report)
+            report["delivery_record"] = success_result(reason)
+            with self.subTest(reason=reason, mutation="valid"):
+                self.assertEqual(list(validator.iter_errors(report)), [])
+                validate_read_only_report_semantics(report)
+
+            for alternative_reason in read_only_reasons - {reason}:
+                candidate = copy.deepcopy(report)
+                candidate["delivery_record"]["terminal_reason"] = alternative_reason
+                with self.subTest(
+                    reason=reason,
+                    mutation="terminal_reason",
+                    alternative=alternative_reason,
+                ):
+                    self.assertTrue(list(validator.iter_errors(candidate)))
+                    with self.assertRaises(ValueError):
+                        validate_read_only_report_semantics(candidate)
+
+            for field, values in TERMINAL_EVIDENCE_VALUES.items():
+                current = report["delivery_record"]["terminal_evidence"][field]
+                for alternative in values - {current}:
+                    candidate = copy.deepcopy(report)
+                    candidate["delivery_record"]["terminal_evidence"][field] = (
+                        alternative
+                    )
+                    with self.subTest(
+                        reason=reason,
+                        mutation=f"terminal_evidence.{field}",
+                        alternative=alternative,
+                    ):
+                        self.assertTrue(list(validator.iter_errors(candidate)))
+                        with self.assertRaises(ValueError):
+                            validate_read_only_report_semantics(candidate)
 
     def test_pr_readiness_blockers_preserve_profile_without_handoff(self) -> None:
         schema = json.loads(DELIVERY_RESULT_SCHEMA.read_text(encoding="utf-8"))
@@ -2631,6 +3117,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
             },
             "review-findings": {
                 "formal_review": "findings",
+                "signature": "not-required",
             },
             "signing-failed": {
                 "committed_range": "missing",
@@ -2656,6 +3143,9 @@ class DeliveryProfileContractTest(unittest.TestCase):
                     }
                 )
                 blocked["terminal_evidence"].update(evidence_updates)
+                if reason in {"missing-committed-range", "review-findings"}:
+                    blocked["constraints"] = ["no-commit"]
+                    blocked["commit_mode"] = "forbidden"
                 self.assertEqual(list(validator.iter_errors(blocked)), [])
                 assert_valid_result_contract(blocked)
                 self.assertEqual(blocked["profile"], "pr-readiness-handoff")
@@ -2666,6 +3156,23 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 self.assertTrue(list(validator.iter_errors(widened)))
                 with self.assertRaises(AssertionError):
                     assert_valid_result_contract(widened)
+
+        allowed_findings = copy.deepcopy(ready)
+        allowed_findings.update(
+            {
+                "terminal_outcome": "blocked",
+                "terminal_reason": "review-findings",
+                "handoff": "none",
+                "handoff_profile": "none",
+            }
+        )
+        allowed_findings["terminal_evidence"]["formal_review"] = "findings"
+        self.assertTrue(list(validator.iter_errors(allowed_findings)))
+        with self.assertRaisesRegex(
+            AssertionError,
+            "terminal only for a required no-commit review",
+        ):
+            assert_valid_result_contract(allowed_findings)
 
     def test_read_only_receiver_rejects_non_ready_delivery_terminal(self) -> None:
         report = copy.deepcopy(
@@ -2778,6 +3285,20 @@ class DeliveryProfileContractTest(unittest.TestCase):
         )
 
     def test_allowed_review_fixes_require_a_new_frozen_range(self) -> None:
+        cases = {case["name"]: case for case in formal_review_terminal_cases()}
+        loop = cases["existing-committed-range-commit-allowed-review-findings"]
+        self.assertEqual(
+            loop["expected"],
+            {
+                "apply_fixes": True,
+                "rerun_validation": True,
+                "rerun_journal_gate": True,
+                "create_new_signed_head": True,
+                "invalidate_reviewed_range": "base_sha..old_head_sha",
+                "review_new_exact_range": True,
+                "terminal": None,
+            },
+        )
         anchors = (
             "exact frozen range",
             "branch on the resolved `commit_mode`",

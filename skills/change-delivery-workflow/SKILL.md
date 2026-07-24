@@ -309,7 +309,9 @@ authorization.
   - If commit mode is `allowed`, apply the fixes, rerun affected validation and
     journal work, and create a new signed review checkpoint. That checkpoint
     creates a new head and invalidates every review result bound to the old
-    range; review the new exact range.
+    range; review the new exact range. This branch has no terminal delivery
+    record until a later exact range is clean or another independent blocker
+    occurs. In particular, it may never emit `review-findings`.
   - If commit mode is `forbidden`, do not apply fixes or create or require a new
     head, checkpoint, anchor, or commit. Preserve the exact existing committed
     range, report the unresolved findings as a blocker, and stop. Only a later
@@ -396,6 +398,31 @@ these fields unchanged across any handoff:
 - `handoff`
 - `handoff_profile`
 
+The schema's `$defs.successTerminalMatrix` is the machine authority for every
+successful reason. One reason fixes one exact profile, local-mutation mode,
+commit mode, formal-review requirement, remote-mutation mode, handoff,
+handoff profile, and complete evidence object. The evidence object separately
+records local gate, build, tests, docs, journal, committed range, formal
+review, signature, authorization, and input. Mutation-capable success uses
+`satisfied` for each build/tests/docs/journal gate; a no-mutation observation
+uses `read-only-observed` and never implies that a mutating gate ran. No
+successful matrix row may contain `blocked`, `failed`, `findings`, or
+`not-started`.
+
+The closed reason families are:
+
+- focused checkpoint: signed, reviewed-signed, mutable uncommitted,
+  read-only uncommitted, mutable clean-range, or read-only clean-range;
+- local gate: signed complete, mutable uncommitted, read-only uncommitted,
+  mutable clean-range, or read-only clean-range;
+- mutation-capable PR handoff: signed ready or clean existing-range ready;
+- read-only PR handoff: read-only unreviewed, read-only reviewed,
+  signed local-gate, mutable uncommitted, or mutable existing-range probe.
+
+Do not reuse a reason across two rows or infer a missing row from prose. A
+receiver must reject a reason/profile/mode/evidence cross-product even when
+every individual value is otherwise in its enum.
+
 For `report-only`, `probe-only`, or `read-only`, `local_mutation` must be
 `forbidden`. For `local-only`, `report-only`, `probe-only`, `read-only`, or
 `no-remote`, `remote_mutation` must be `forbidden` and `profile` must not be
@@ -406,10 +433,13 @@ Only a successful `pr-readiness-handoff` record without a remote-limiting
 constraint and with exact ready evidence may set `handoff` to
 `review-orchestration-playbook`, `handoff_profile` to `pr-readiness`, and
 `remote_mutation` to `review-authorization-required`. Exact ready evidence is:
-local gate `succeeded`, committed range `present`, formal review `clean`,
-signature `verified`, authorization `satisfied`, and input `satisfied`. The
-remote-mutation value is not itself remote authorization; it means the review
-skill must perform its own target and lifecycle preflight.
+local gate `succeeded`, build/tests/docs/journal all `satisfied`, committed
+range `present`, formal review `clean`, signature `verified`, authorization
+`satisfied`, and input `satisfied`. A forbidden-commit PR handoff instead uses
+the distinct existing-range reason, local gate `checked`, the same four
+`satisfied` phase records, a present clean range, and signature
+`not-required`. The remote-mutation value is not itself remote authorization;
+it means the review skill must perform its own target and lifecycle preflight.
 
 Every blocker uses `terminal_outcome: blocked`, one closed reason, and matching
 closed evidence. In particular, `missing-committed-range`, `review-findings`,
@@ -417,6 +447,10 @@ closed evidence. In particular, `missing-committed-range`, `review-findings`,
 corresponding evidence field and force both handoff fields to `none`. Preserve
 the requested profile so the report states what was attempted without
 misrepresenting the blocked terminal as a ready transition.
+`review-findings` is valid only when formal review is required and commit mode
+is `forbidden`, with a present range, findings, and signature
+`not-required`. Findings under commit mode `allowed` are never terminal: they
+must return to repair, validation, journal, signed-head, and exact-range review.
 
 A `local-gate` record with an explicit PR-readiness probe and no
 remote-read-limiting constraint may instead set `handoff` to
@@ -425,9 +459,14 @@ remote-read-limiting constraint may instead set `handoff` to
 the already resolved `formal_review_required` value: a `local-gate` whose commit
 mode is `allowed` keeps `true` and completes its formal review before the probe;
 a commit-forbidden gate may keep its default `false` or an independent
-policy-required `true`. The handoff never changes that value. The receiver must
-preserve that read-only capability ceiling and return only the
-selection/lifecycle/CI/conversation/base/head evidence report.
+policy-required `true`. The exact reason distinguishes those states:
+`pr-readiness-read-only-probe-ready`,
+`pr-readiness-read-only-reviewed-probe-ready`,
+`pr-readiness-read-only-gate-ready`,
+`pr-readiness-read-only-uncommitted-probe-ready`, or
+`pr-readiness-read-only-existing-range-probe-ready`. The handoff never changes
+that value. The receiver must preserve that read-only capability ceiling and
+return only the selection/lifecycle/CI/conversation/base/head evidence report.
 Receivers must fail closed on a missing constraint, an unknown field, or an
 internally contradictory record instead of inferring a broader scope from prose.
 

@@ -23,6 +23,9 @@ MAX_JSON_DEPTH = 64
 MAX_JSON_NODES = 16_384
 MAX_JSON_STRUCTURE_MARKERS = MAX_JSON_NODES * 2
 READ_CHUNK_BYTES = 64 * 1024
+MAX_CI_ROLLUP_ENTRIES = 1_000
+MAX_CI_ROLLUP_PAGES = 10
+MAX_CI_PAGE_ITEMS = 100
 IDENTIFIER_RE = re.compile(
     r"^(?P<kind>report|target|snapshot|observation):(?P<value>[0-9a-f]{32})$"
 )
@@ -66,11 +69,102 @@ DELIVERY_RESULT_FIELDS = {
 }
 DELIVERY_TERMINAL_EVIDENCE_FIELDS = {
     "local_gate",
+    "build",
+    "tests",
+    "docs",
+    "journal",
     "committed_range",
     "formal_review",
     "signature",
     "authorization",
     "input",
+}
+READ_ONLY_DELIVERY_SUCCESS_MATRIX = {
+    "pr-readiness-read-only-probe-ready": {
+        "local_mutation": "forbidden",
+        "commit_mode": "forbidden",
+        "formal_review_required": False,
+        "terminal_evidence": {
+            "local_gate": "checked",
+            "build": "read-only-observed",
+            "tests": "read-only-observed",
+            "docs": "read-only-observed",
+            "journal": "read-only-observed",
+            "committed_range": "missing",
+            "formal_review": "not-required",
+            "signature": "not-required",
+            "authorization": "not-required",
+            "input": "satisfied",
+        },
+    },
+    "pr-readiness-read-only-reviewed-probe-ready": {
+        "local_mutation": "forbidden",
+        "commit_mode": "forbidden",
+        "formal_review_required": True,
+        "terminal_evidence": {
+            "local_gate": "checked",
+            "build": "read-only-observed",
+            "tests": "read-only-observed",
+            "docs": "read-only-observed",
+            "journal": "read-only-observed",
+            "committed_range": "present",
+            "formal_review": "clean",
+            "signature": "not-required",
+            "authorization": "not-required",
+            "input": "satisfied",
+        },
+    },
+    "pr-readiness-read-only-gate-ready": {
+        "local_mutation": "allowed",
+        "commit_mode": "allowed",
+        "formal_review_required": True,
+        "terminal_evidence": {
+            "local_gate": "succeeded",
+            "build": "satisfied",
+            "tests": "satisfied",
+            "docs": "satisfied",
+            "journal": "satisfied",
+            "committed_range": "present",
+            "formal_review": "clean",
+            "signature": "verified",
+            "authorization": "not-required",
+            "input": "satisfied",
+        },
+    },
+    "pr-readiness-read-only-uncommitted-probe-ready": {
+        "local_mutation": "allowed",
+        "commit_mode": "forbidden",
+        "formal_review_required": False,
+        "terminal_evidence": {
+            "local_gate": "checked",
+            "build": "satisfied",
+            "tests": "satisfied",
+            "docs": "satisfied",
+            "journal": "satisfied",
+            "committed_range": "missing",
+            "formal_review": "not-required",
+            "signature": "not-required",
+            "authorization": "not-required",
+            "input": "satisfied",
+        },
+    },
+    "pr-readiness-read-only-existing-range-probe-ready": {
+        "local_mutation": "allowed",
+        "commit_mode": "forbidden",
+        "formal_review_required": True,
+        "terminal_evidence": {
+            "local_gate": "checked",
+            "build": "satisfied",
+            "tests": "satisfied",
+            "docs": "satisfied",
+            "journal": "satisfied",
+            "committed_range": "present",
+            "formal_review": "clean",
+            "signature": "not-required",
+            "authorization": "not-required",
+            "input": "satisfied",
+        },
+    },
 }
 CI_GATE_BUCKETS_BY_TYPENAME = {
     "CheckRun": {
@@ -250,8 +344,6 @@ def _read_only_delivery_errors(record: object) -> list[str]:
         errors.append("read-only PR probe must forbid remote mutation")
     if delivery.get("terminal_outcome") != "succeeded":
         errors.append("read-only PR probe requires a succeeded delivery terminal")
-    if delivery.get("terminal_reason") != "pr-readiness-read-only-probe-ready":
-        errors.append("read-only PR probe requires its exact ready reason")
     if delivery.get("handoff") != "review-orchestration-playbook":
         errors.append("read-only PR probe must route to the review skill")
     if delivery.get("handoff_profile") != "pr-readiness-read-only-probe":
@@ -261,34 +353,29 @@ def _read_only_delivery_errors(record: object) -> list[str]:
     if evidence is None or set(evidence) != DELIVERY_TERMINAL_EVIDENCE_FIELDS:
         errors.append("delivery terminal evidence is not a closed record")
         return errors
-    if evidence.get("local_gate") not in {"succeeded", "checked"}:
-        errors.append("read-only PR probe lacks completed local-gate evidence")
-    if evidence.get("authorization") != "not-required":
-        errors.append("read-only PR probe cannot claim mutation authorization")
-    if evidence.get("input") != "satisfied":
-        errors.append("read-only PR probe lacks satisfied input evidence")
+
     formal_required = delivery.get("formal_review_required")
     if not isinstance(formal_required, bool):
         errors.append("delivery formal_review_required must be boolean")
-    elif formal_required:
-        if (
-            evidence.get("committed_range") != "present"
-            or evidence.get("formal_review") != "clean"
-        ):
-            errors.append("required formal review lacks a clean committed range")
-    elif evidence.get("formal_review") != "not-required":
-        errors.append("non-required formal review has contradictory evidence")
-    if commit_forbidden:
-        if evidence.get("signature") != "not-required":
-            errors.append("commit-forbidden delivery cannot claim a new signature")
-    elif (
-        evidence.get("local_gate") != "succeeded"
-        or evidence.get("committed_range") != "present"
-        or evidence.get("formal_review") != "clean"
-        or evidence.get("signature") != "verified"
-        or formal_required is not True
+
+    reason = delivery.get("terminal_reason")
+    expected = READ_ONLY_DELIVERY_SUCCESS_MATRIX.get(reason)
+    if expected is None:
+        errors.append("read-only PR probe requires an exact ready reason")
+        return errors
+    for field in (
+        "local_mutation",
+        "commit_mode",
+        "formal_review_required",
     ):
-        errors.append("commit-allowed probe handoff lacks a complete local gate")
+        if delivery.get(field) != expected[field]:
+            errors.append(
+                f"delivery_record.{field} contradicts terminal_reason {reason}"
+            )
+    if evidence != expected["terminal_evidence"]:
+        errors.append(
+            f"delivery terminal evidence contradicts terminal_reason {reason}"
+        )
     return errors
 
 
@@ -334,6 +421,103 @@ def _bind_observed_target_identity(
             errors.append(
                 f"{location}.target_identity.{field} must exactly equal target.{field}"
             )
+
+
+def _validate_ci_pagination(
+    errors: list[str],
+    record: Mapping[str, Any],
+    rollup: Sequence[Any],
+) -> None:
+    pagination = _mapping(record.get("pagination"))
+    identity = _mapping(record.get("target_identity"))
+    if pagination is None:
+        errors.append("CI pagination evidence must be an object")
+        return
+    if identity is None:
+        errors.append("CI pagination lacks a target identity")
+        return
+    repository = _mapping(identity.get("repository"))
+    pull_request = _mapping(identity.get("pull_request"))
+    head = _mapping(identity.get("head"))
+    if repository is None or pull_request is None or head is None:
+        errors.append("CI pagination target identity is incomplete")
+        return
+    expected_connection = {
+        "provider": "github-graphql",
+        "field": "commit.statusCheckRollup.contexts",
+        "repository_node_id": repository.get("node_id"),
+        "pull_request_node_id": pull_request.get("node_id"),
+        "head_oid": head.get("oid"),
+    }
+    connection = _mapping(pagination.get("connection"))
+    if connection != expected_connection:
+        errors.append("CI pagination connection does not match the exact PR head")
+
+    server_total_count = pagination.get("server_total_count")
+    if (
+        not _is_nonnegative_int(server_total_count)
+        or server_total_count > MAX_CI_ROLLUP_ENTRIES
+    ):
+        errors.append("CI server totalCount exceeds the bounded complete-rollup cap")
+
+    pages = _sequence(pagination.get("pages"))
+    if pages is None or not 1 <= len(pages) <= MAX_CI_ROLLUP_PAGES:
+        errors.append("CI pagination pages are missing or exceed the bounded page cap")
+        return
+
+    page_item_total = 0
+    previous_end_cursor: object = None
+    seen_end_cursors: set[str] = set()
+    for offset, item in enumerate(pages, start=1):
+        page = _mapping(item)
+        if page is None:
+            errors.append(f"CI pagination page {offset} must be an object")
+            continue
+        if page.get("connection") != expected_connection:
+            errors.append(f"CI pagination page {offset} changed connection identity")
+        if page.get("page_index") != offset:
+            errors.append("CI pagination page indexes must be contiguous from one")
+        expected_after = None if offset == 1 else previous_end_cursor
+        if page.get("request_after") != expected_after:
+            errors.append(f"CI pagination page {offset} request cursor drifted")
+        item_count = page.get("item_count")
+        if not _is_nonnegative_int(item_count) or item_count > MAX_CI_PAGE_ITEMS:
+            errors.append(f"CI pagination page {offset} item count is invalid")
+            item_count = 0
+        page_item_total += item_count
+
+        page_info = _mapping(page.get("page_info"))
+        if page_info is None:
+            errors.append(f"CI pagination page {offset} pageInfo is missing")
+            previous_end_cursor = None
+            continue
+        end_cursor = page_info.get("end_cursor")
+        has_next_page = page_info.get("has_next_page")
+        if not isinstance(has_next_page, bool):
+            errors.append(f"CI pagination page {offset} hasNextPage is not boolean")
+        if item_count == 0:
+            if end_cursor is not None:
+                errors.append("an empty CI page must have a null end cursor")
+        elif not isinstance(end_cursor, str) or not end_cursor:
+            errors.append("a non-empty CI page must have a non-empty end cursor")
+        if isinstance(end_cursor, str):
+            if end_cursor in seen_end_cursors:
+                errors.append("CI pagination end cursors must not repeat")
+            seen_end_cursors.add(end_cursor)
+        if offset < len(pages):
+            if has_next_page is not True:
+                errors.append("every non-final CI page must advertise a next page")
+            if not isinstance(end_cursor, str) or not end_cursor:
+                errors.append("every non-final CI page needs a continuation cursor")
+        elif has_next_page is not False:
+            errors.append("the final CI page must prove hasNextPage=false")
+        previous_end_cursor = end_cursor
+
+    if _is_nonnegative_int(server_total_count):
+        if page_item_total != server_total_count:
+            errors.append("CI pagination item counts do not match server totalCount")
+        if len(rollup) != server_total_count:
+            errors.append("CI rollup length does not match server totalCount")
 
 
 def _ci_rollup_identity_and_bucket(
@@ -757,6 +941,7 @@ def semantic_errors(report: object) -> list[str]:
         if rollup is None:
             errors.append("CI statusCheckRollup must be an array")
         else:
+            _validate_ci_pagination(errors, ci_record, rollup)
             stable_identities: list[tuple[object, ...]] = []
             provider_bindings: dict[tuple[object, object], tuple[object, ...]] = {}
             app_database_bindings: dict[object, object] = {}

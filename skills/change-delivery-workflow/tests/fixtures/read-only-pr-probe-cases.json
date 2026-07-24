@@ -19,6 +19,10 @@
         "terminal_reason": "pr-readiness-read-only-probe-ready",
         "terminal_evidence": {
           "local_gate": "checked",
+          "build": "read-only-observed",
+          "tests": "read-only-observed",
+          "docs": "read-only-observed",
+          "journal": "read-only-observed",
           "committed_range": "missing",
           "formal_review": "not-required",
           "signature": "not-required",
@@ -70,6 +74,10 @@
             "terminal_reason": "pr-readiness-read-only-probe-ready",
             "terminal_evidence": {
               "local_gate": "checked",
+              "build": "read-only-observed",
+              "tests": "read-only-observed",
+              "docs": "read-only-observed",
+              "journal": "read-only-observed",
               "committed_range": "missing",
               "formal_review": "not-required",
               "signature": "not-required",
@@ -295,6 +303,10 @@
             "terminal_reason": "pr-readiness-read-only-probe-ready",
             "terminal_evidence": {
               "local_gate": "checked",
+              "build": "read-only-observed",
+              "tests": "read-only-observed",
+              "docs": "read-only-observed",
+              "journal": "read-only-observed",
               "committed_range": "missing",
               "formal_review": "not-required",
               "signature": "not-required",
@@ -471,6 +483,10 @@
             "terminal_reason": "pr-readiness-read-only-probe-ready",
             "terminal_evidence": {
               "local_gate": "checked",
+              "build": "read-only-observed",
+              "tests": "read-only-observed",
+              "docs": "read-only-observed",
+              "journal": "read-only-observed",
               "committed_range": "missing",
               "formal_review": "not-required",
               "signature": "not-required",
@@ -623,6 +639,10 @@
             "terminal_reason": "pr-readiness-read-only-probe-ready",
             "terminal_evidence": {
               "local_gate": "checked",
+              "build": "read-only-observed",
+              "tests": "read-only-observed",
+              "docs": "read-only-observed",
+              "journal": "read-only-observed",
               "committed_range": "missing",
               "formal_review": "not-required",
               "signature": "not-required",
@@ -825,7 +845,35 @@
                       },
                       "state": "PENDING"
                     }
-                  ]
+                  ],
+                  "pagination": {
+                    "connection": {
+                      "provider": "github-graphql",
+                      "field": "commit.statusCheckRollup.contexts",
+                      "repository_node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                      "pull_request_node_id": "PR_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS_42",
+                      "head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    },
+                    "server_total_count": 2,
+                    "pages": [
+                      {
+                        "connection": {
+                          "provider": "github-graphql",
+                          "field": "commit.statusCheckRollup.contexts",
+                          "repository_node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                          "pull_request_node_id": "PR_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS_42",
+                          "head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        },
+                        "page_index": 1,
+                        "request_after": null,
+                        "item_count": 2,
+                        "page_info": {
+                          "end_cursor": "CI_CURSOR_1",
+                          "has_next_page": false
+                        }
+                      }
+                    ]
+                  }
                 }
               ]
             },

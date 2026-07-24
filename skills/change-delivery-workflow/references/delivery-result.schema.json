@@ -72,11 +72,23 @@
     "terminal_reason": {
       "enum": [
         "focused-checkpoint-complete",
+        "focused-checkpoint-reviewed-complete",
+        "focused-checkpoint-report",
+        "focused-checkpoint-read-only-report",
+        "focused-checkpoint-clean-range-report",
+        "focused-checkpoint-read-only-clean-range-report",
         "local-gate-complete",
-        "pr-readiness-handoff-ready",
-        "pr-readiness-read-only-probe-ready",
         "uncommitted-checked-result",
+        "read-only-checked-result",
         "clean-range-report",
+        "read-only-clean-range-report",
+        "pr-readiness-handoff-ready",
+        "pr-readiness-existing-range-handoff-ready",
+        "pr-readiness-read-only-probe-ready",
+        "pr-readiness-read-only-reviewed-probe-ready",
+        "pr-readiness-read-only-gate-ready",
+        "pr-readiness-read-only-uncommitted-probe-ready",
+        "pr-readiness-read-only-existing-range-probe-ready",
         "implementation-blocked",
         "validation-blocked",
         "journal-blocked",
@@ -92,6 +104,10 @@
       "type": "object",
       "required": [
         "local_gate",
+        "build",
+        "tests",
+        "docs",
+        "journal",
         "committed_range",
         "formal_review",
         "signature",
@@ -105,6 +121,36 @@
             "checked",
             "blocked",
             "not-required"
+          ]
+        },
+        "build": {
+          "enum": [
+            "satisfied",
+            "read-only-observed",
+            "failed",
+            "blocked"
+          ]
+        },
+        "tests": {
+          "enum": [
+            "satisfied",
+            "read-only-observed",
+            "failed",
+            "blocked"
+          ]
+        },
+        "docs": {
+          "enum": [
+            "satisfied",
+            "read-only-observed",
+            "blocked"
+          ]
+        },
+        "journal": {
+          "enum": [
+            "satisfied",
+            "read-only-observed",
+            "blocked"
           ]
         },
         "committed_range": {
@@ -340,28 +386,25 @@
     {
       "if": {
         "properties": {
-          "profile": {
-            "const": "pr-readiness-handoff"
-          },
-          "terminal_outcome": {
-            "const": "succeeded"
+          "handoff_profile": {
+            "const": "pr-readiness-read-only-probe"
           }
         },
         "required": [
-          "profile",
-          "terminal_outcome"
+          "handoff_profile"
         ]
       },
       "then": {
         "properties": {
-          "terminal_reason": {
-            "const": "pr-readiness-handoff-ready"
-          },
-          "handoff": {
-            "const": "review-orchestration-playbook"
-          },
-          "handoff_profile": {
-            "const": "pr-readiness"
+          "constraints": {
+            "contains": {
+              "enum": [
+                "report-only",
+                "probe-only",
+                "read-only",
+                "no-remote"
+              ]
+            }
           }
         }
       }
@@ -405,11 +448,23 @@
           "terminal_reason": {
             "enum": [
               "focused-checkpoint-complete",
+              "focused-checkpoint-reviewed-complete",
+              "focused-checkpoint-report",
+              "focused-checkpoint-read-only-report",
+              "focused-checkpoint-clean-range-report",
+              "focused-checkpoint-read-only-clean-range-report",
               "local-gate-complete",
-              "pr-readiness-handoff-ready",
-              "pr-readiness-read-only-probe-ready",
               "uncommitted-checked-result",
-              "clean-range-report"
+              "read-only-checked-result",
+              "clean-range-report",
+              "read-only-clean-range-report",
+              "pr-readiness-handoff-ready",
+              "pr-readiness-existing-range-handoff-ready",
+              "pr-readiness-read-only-probe-ready",
+              "pr-readiness-read-only-reviewed-probe-ready",
+              "pr-readiness-read-only-gate-ready",
+              "pr-readiness-read-only-uncommitted-probe-ready",
+              "pr-readiness-read-only-existing-range-probe-ready"
             ]
           }
         }
@@ -418,133 +473,16 @@
     {
       "if": {
         "properties": {
-          "handoff_profile": {
-            "const": "none"
-          }
-        },
-        "required": [
-          "handoff_profile"
-        ]
-      },
-      "then": {
-        "properties": {
-          "handoff": {
-            "const": "none"
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "handoff_profile": {
-            "const": "pr-readiness"
-          }
-        },
-        "required": [
-          "handoff_profile"
-        ]
-      },
-      "then": {
-        "properties": {
-          "profile": {
-            "const": "pr-readiness-handoff"
-          },
-          "remote_mutation": {
-            "const": "review-authorization-required"
-          },
           "terminal_outcome": {
             "const": "succeeded"
-          },
-          "terminal_reason": {
-            "const": "pr-readiness-handoff-ready"
-          },
-          "terminal_evidence": {
-            "properties": {
-              "local_gate": {
-                "const": "succeeded"
-              },
-              "committed_range": {
-                "const": "present"
-              },
-              "formal_review": {
-                "const": "clean"
-              },
-              "signature": {
-                "const": "verified"
-              },
-              "authorization": {
-                "const": "satisfied"
-              },
-              "input": {
-                "const": "satisfied"
-              }
-            }
-          },
-          "handoff": {
-            "const": "review-orchestration-playbook"
-          },
-          "formal_review_required": {
-            "const": true
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "handoff_profile": {
-            "const": "pr-readiness-read-only-probe"
           }
         },
         "required": [
-          "handoff_profile"
+          "terminal_outcome"
         ]
       },
       "then": {
-        "properties": {
-          "profile": {
-            "const": "local-gate"
-          },
-          "constraints": {
-            "contains": {
-              "enum": [
-                "report-only",
-                "probe-only",
-                "read-only",
-                "no-remote"
-              ]
-            }
-          },
-          "remote_mutation": {
-            "const": "forbidden"
-          },
-          "terminal_outcome": {
-            "const": "succeeded"
-          },
-          "terminal_reason": {
-            "const": "pr-readiness-read-only-probe-ready"
-          },
-          "terminal_evidence": {
-            "properties": {
-              "local_gate": {
-                "enum": [
-                  "succeeded",
-                  "checked"
-                ]
-              },
-              "authorization": {
-                "const": "not-required"
-              },
-              "input": {
-                "const": "satisfied"
-              }
-            }
-          },
-          "handoff": {
-            "const": "review-orchestration-playbook"
-          }
-        }
+        "$ref": "#/$defs/successTerminalMatrix"
       }
     },
     {
@@ -575,6 +513,12 @@
                 "const": "not-required"
               }
             }
+          },
+          "commit_mode": {
+            "const": "forbidden"
+          },
+          "formal_review_required": {
+            "const": true
           }
         }
       }
@@ -602,8 +546,17 @@
               },
               "formal_review": {
                 "const": "findings"
+              },
+              "signature": {
+                "const": "not-required"
               }
             }
+          },
+          "commit_mode": {
+            "const": "forbidden"
+          },
+          "formal_review_required": {
+            "const": true
           }
         }
       }
@@ -630,6 +583,9 @@
                 "const": "failed"
               }
             }
+          },
+          "commit_mode": {
+            "const": "allowed"
           }
         }
       }
@@ -686,5 +642,839 @@
         }
       }
     }
-  ]
+  ],
+  "$defs": {
+    "successTerminalMatrix": {
+      "oneOf": [
+        {
+          "title": "focused-checkpoint-complete",
+          "properties": {
+            "profile": {
+              "const": "focused-checkpoint"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "allowed"
+            },
+            "formal_review_required": {
+              "const": false
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "focused-checkpoint-complete"
+            },
+            "terminal_evidence": {
+              "const": {
+                "local_gate": "not-required",
+                "build": "satisfied",
+                "tests": "satisfied",
+                "docs": "satisfied",
+                "journal": "satisfied",
+                "committed_range": "present",
+                "formal_review": "not-required",
+                "signature": "verified",
+                "authorization": "not-required",
+                "input": "not-required"
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "focused-checkpoint-reviewed-complete",
+          "properties": {
+            "profile": {
+              "const": "focused-checkpoint"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "allowed"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "focused-checkpoint-reviewed-complete"
+            },
+            "terminal_evidence": {
+              "const": {
+                "local_gate": "not-required",
+                "build": "satisfied",
+                "tests": "satisfied",
+                "docs": "satisfied",
+                "journal": "satisfied",
+                "committed_range": "present",
+                "formal_review": "clean",
+                "signature": "verified",
+                "authorization": "not-required",
+                "input": "not-required"
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "focused-checkpoint-report",
+          "properties": {
+            "profile": {
+              "const": "focused-checkpoint"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": false
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "focused-checkpoint-report"
+            },
+            "terminal_evidence": {
+              "const": {
+                "local_gate": "not-required",
+                "build": "satisfied",
+                "tests": "satisfied",
+                "docs": "satisfied",
+                "journal": "satisfied",
+                "committed_range": "missing",
+                "formal_review": "not-required",
+                "signature": "not-required",
+                "authorization": "not-required",
+                "input": "not-required"
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "focused-checkpoint-read-only-report",
+          "properties": {
+            "profile": {
+              "const": "focused-checkpoint"
+            },
+            "local_mutation": {
+              "const": "forbidden"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": false
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "focused-checkpoint-read-only-report"
+            },
+            "terminal_evidence": {
+              "const": {
+                "local_gate": "not-required",
+                "build": "read-only-observed",
+                "tests": "read-only-observed",
+                "docs": "read-only-observed",
+                "journal": "read-only-observed",
+                "committed_range": "missing",
+                "formal_review": "not-required",
+                "signature": "not-required",
+                "authorization": "not-required",
+                "input": "not-required"
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "focused-checkpoint-clean-range-report",
+          "properties": {
+            "profile": {
+              "const": "focused-checkpoint"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "focused-checkpoint-clean-range-report"
+            },
+            "terminal_evidence": {
+              "const": {
+                "local_gate": "not-required",
+                "build": "satisfied",
+                "tests": "satisfied",
+                "docs": "satisfied",
+                "journal": "satisfied",
+                "committed_range": "present",
+                "formal_review": "clean",
+                "signature": "not-required",
+                "authorization": "not-required",
+                "input": "not-required"
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "focused-checkpoint-read-only-clean-range-report",
+          "properties": {
+            "profile": {
+              "const": "focused-checkpoint"
+            },
+            "local_mutation": {
+              "const": "forbidden"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "focused-checkpoint-read-only-clean-range-report"
+            },
+            "terminal_evidence": {
+              "const": {
+                "local_gate": "not-required",
+                "build": "read-only-observed",
+                "tests": "read-only-observed",
+                "docs": "read-only-observed",
+                "journal": "read-only-observed",
+                "committed_range": "present",
+                "formal_review": "clean",
+                "signature": "not-required",
+                "authorization": "not-required",
+                "input": "not-required"
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "local-gate-complete",
+          "properties": {
+            "profile": {
+              "const": "local-gate"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "allowed"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "local-gate-complete"
+            },
+            "terminal_evidence": {
+              "const": {
+                "local_gate": "succeeded",
+                "build": "satisfied",
+                "tests": "satisfied",
+                "docs": "satisfied",
+                "journal": "satisfied",
+                "committed_range": "present",
+                "formal_review": "clean",
+                "signature": "verified",
+                "authorization": "not-required",
+                "input": "not-required"
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "uncommitted-checked-result",
+          "properties": {
+            "profile": {
+              "const": "local-gate"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": false
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "uncommitted-checked-result"
+            },
+            "terminal_evidence": {
+              "const": {
+                "local_gate": "checked",
+                "build": "satisfied",
+                "tests": "satisfied",
+                "docs": "satisfied",
+                "journal": "satisfied",
+                "committed_range": "missing",
+                "formal_review": "not-required",
+                "signature": "not-required",
+                "authorization": "not-required",
+                "input": "not-required"
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "read-only-checked-result",
+          "properties": {
+            "profile": {
+              "const": "local-gate"
+            },
+            "local_mutation": {
+              "const": "forbidden"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": false
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "read-only-checked-result"
+            },
+            "terminal_evidence": {
+              "const": {
+                "local_gate": "checked",
+                "build": "read-only-observed",
+                "tests": "read-only-observed",
+                "docs": "read-only-observed",
+                "journal": "read-only-observed",
+                "committed_range": "missing",
+                "formal_review": "not-required",
+                "signature": "not-required",
+                "authorization": "not-required",
+                "input": "not-required"
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "clean-range-report",
+          "properties": {
+            "profile": {
+              "const": "local-gate"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "clean-range-report"
+            },
+            "terminal_evidence": {
+              "const": {
+                "local_gate": "checked",
+                "build": "satisfied",
+                "tests": "satisfied",
+                "docs": "satisfied",
+                "journal": "satisfied",
+                "committed_range": "present",
+                "formal_review": "clean",
+                "signature": "not-required",
+                "authorization": "not-required",
+                "input": "not-required"
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "read-only-clean-range-report",
+          "properties": {
+            "profile": {
+              "const": "local-gate"
+            },
+            "local_mutation": {
+              "const": "forbidden"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "read-only-clean-range-report"
+            },
+            "terminal_evidence": {
+              "const": {
+                "local_gate": "checked",
+                "build": "read-only-observed",
+                "tests": "read-only-observed",
+                "docs": "read-only-observed",
+                "journal": "read-only-observed",
+                "committed_range": "present",
+                "formal_review": "clean",
+                "signature": "not-required",
+                "authorization": "not-required",
+                "input": "not-required"
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "pr-readiness-handoff-ready",
+          "properties": {
+            "profile": {
+              "const": "pr-readiness-handoff"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "allowed"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "remote_mutation": {
+              "const": "review-authorization-required"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "pr-readiness-handoff-ready"
+            },
+            "terminal_evidence": {
+              "const": {
+                "local_gate": "succeeded",
+                "build": "satisfied",
+                "tests": "satisfied",
+                "docs": "satisfied",
+                "journal": "satisfied",
+                "committed_range": "present",
+                "formal_review": "clean",
+                "signature": "verified",
+                "authorization": "satisfied",
+                "input": "satisfied"
+              }
+            },
+            "handoff": {
+              "const": "review-orchestration-playbook"
+            },
+            "handoff_profile": {
+              "const": "pr-readiness"
+            }
+          }
+        },
+        {
+          "title": "pr-readiness-existing-range-handoff-ready",
+          "properties": {
+            "profile": {
+              "const": "pr-readiness-handoff"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "remote_mutation": {
+              "const": "review-authorization-required"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "pr-readiness-existing-range-handoff-ready"
+            },
+            "terminal_evidence": {
+              "const": {
+                "local_gate": "checked",
+                "build": "satisfied",
+                "tests": "satisfied",
+                "docs": "satisfied",
+                "journal": "satisfied",
+                "committed_range": "present",
+                "formal_review": "clean",
+                "signature": "not-required",
+                "authorization": "satisfied",
+                "input": "satisfied"
+              }
+            },
+            "handoff": {
+              "const": "review-orchestration-playbook"
+            },
+            "handoff_profile": {
+              "const": "pr-readiness"
+            }
+          }
+        },
+        {
+          "title": "pr-readiness-read-only-probe-ready",
+          "properties": {
+            "profile": {
+              "const": "local-gate"
+            },
+            "local_mutation": {
+              "const": "forbidden"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": false
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "pr-readiness-read-only-probe-ready"
+            },
+            "terminal_evidence": {
+              "const": {
+                "local_gate": "checked",
+                "build": "read-only-observed",
+                "tests": "read-only-observed",
+                "docs": "read-only-observed",
+                "journal": "read-only-observed",
+                "committed_range": "missing",
+                "formal_review": "not-required",
+                "signature": "not-required",
+                "authorization": "not-required",
+                "input": "satisfied"
+              }
+            },
+            "handoff": {
+              "const": "review-orchestration-playbook"
+            },
+            "handoff_profile": {
+              "const": "pr-readiness-read-only-probe"
+            }
+          }
+        },
+        {
+          "title": "pr-readiness-read-only-reviewed-probe-ready",
+          "properties": {
+            "profile": {
+              "const": "local-gate"
+            },
+            "local_mutation": {
+              "const": "forbidden"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "pr-readiness-read-only-reviewed-probe-ready"
+            },
+            "terminal_evidence": {
+              "const": {
+                "local_gate": "checked",
+                "build": "read-only-observed",
+                "tests": "read-only-observed",
+                "docs": "read-only-observed",
+                "journal": "read-only-observed",
+                "committed_range": "present",
+                "formal_review": "clean",
+                "signature": "not-required",
+                "authorization": "not-required",
+                "input": "satisfied"
+              }
+            },
+            "handoff": {
+              "const": "review-orchestration-playbook"
+            },
+            "handoff_profile": {
+              "const": "pr-readiness-read-only-probe"
+            }
+          }
+        },
+        {
+          "title": "pr-readiness-read-only-gate-ready",
+          "properties": {
+            "profile": {
+              "const": "local-gate"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "allowed"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "pr-readiness-read-only-gate-ready"
+            },
+            "terminal_evidence": {
+              "const": {
+                "local_gate": "succeeded",
+                "build": "satisfied",
+                "tests": "satisfied",
+                "docs": "satisfied",
+                "journal": "satisfied",
+                "committed_range": "present",
+                "formal_review": "clean",
+                "signature": "verified",
+                "authorization": "not-required",
+                "input": "satisfied"
+              }
+            },
+            "handoff": {
+              "const": "review-orchestration-playbook"
+            },
+            "handoff_profile": {
+              "const": "pr-readiness-read-only-probe"
+            }
+          }
+        },
+        {
+          "title": "pr-readiness-read-only-uncommitted-probe-ready",
+          "properties": {
+            "profile": {
+              "const": "local-gate"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": false
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "pr-readiness-read-only-uncommitted-probe-ready"
+            },
+            "terminal_evidence": {
+              "const": {
+                "local_gate": "checked",
+                "build": "satisfied",
+                "tests": "satisfied",
+                "docs": "satisfied",
+                "journal": "satisfied",
+                "committed_range": "missing",
+                "formal_review": "not-required",
+                "signature": "not-required",
+                "authorization": "not-required",
+                "input": "satisfied"
+              }
+            },
+            "handoff": {
+              "const": "review-orchestration-playbook"
+            },
+            "handoff_profile": {
+              "const": "pr-readiness-read-only-probe"
+            }
+          }
+        },
+        {
+          "title": "pr-readiness-read-only-existing-range-probe-ready",
+          "properties": {
+            "profile": {
+              "const": "local-gate"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "pr-readiness-read-only-existing-range-probe-ready"
+            },
+            "terminal_evidence": {
+              "const": {
+                "local_gate": "checked",
+                "build": "satisfied",
+                "tests": "satisfied",
+                "docs": "satisfied",
+                "journal": "satisfied",
+                "committed_range": "present",
+                "formal_review": "clean",
+                "signature": "not-required",
+                "authorization": "not-required",
+                "input": "satisfied"
+              }
+            },
+            "handoff": {
+              "const": "review-orchestration-playbook"
+            },
+            "handoff_profile": {
+              "const": "pr-readiness-read-only-probe"
+            }
+          }
+        }
+      ]
+    }
+  }
 }

@@ -3991,8 +3991,26 @@ class RepositoryContractTest(unittest.TestCase):
             "succeeded",
         )
         self.assertEqual(
-            delivery["properties"]["terminal_reason"]["const"],
-            "pr-readiness-read-only-probe-ready",
+            set(delivery["properties"]["terminal_reason"]["enum"]),
+            {
+                "pr-readiness-read-only-probe-ready",
+                "pr-readiness-read-only-reviewed-probe-ready",
+                "pr-readiness-read-only-gate-ready",
+                "pr-readiness-read-only-uncommitted-probe-ready",
+                "pr-readiness-read-only-existing-range-probe-ready",
+            },
+        )
+        self.assertTrue(
+            {"build", "tests", "docs", "journal"}
+            <= set(delivery["properties"]["terminal_evidence"]["required"])
+        )
+        ci_observation = schema["$defs"]["ciStatusEvidence"]["properties"]["observed"][
+            "items"
+        ]
+        self.assertIn("pagination", ci_observation["required"])
+        self.assertEqual(
+            ci_observation["properties"]["status_check_rollup"]["maxItems"],
+            1_000,
         )
 
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")

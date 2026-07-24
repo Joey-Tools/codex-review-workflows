@@ -63,7 +63,14 @@ therefore cannot be spliced into the current report. CI preserves the provider-a
 identity, while each legacy `StatusContext` binds its creator and context.
 Display names may repeat; stable type/provider/object identities may not. Each
 non-null GitHub App or CheckRun database ID has a one-to-one mapping with its
-Node ID in both directions.
+Node ID in both directions. CI is observed only after the exact
+repository/PR/head-bound GraphQL connection is exhausted: server `totalCount`,
+the complete flat rollup, per-page item counts, and aggregate `total` must
+agree, cursors must form one contiguous chain, and the final page must prove
+`hasNextPage=false`. The bounded profile admits at most 1,000 entries in at
+most ten pages of 100; the independent report-byte ceiling may be tighter.
+Over-cap, incomplete, or drifted pagination is unavailable/blocked evidence,
+never a truncated green result.
 Observed base/head OIDs must exactly equal the resolved target OIDs before
 object-presence or merge-base evidence is accepted. Its action fields are all
 schema-fixed to `false`; `merge_ready` is always `false`, and `next_handoff`

@@ -44,6 +44,17 @@ The receiving sequence is closed:
    one-to-one mapping in both directions between every non-null GitHub App
    database ID and App Node ID, and between every non-null CheckRun database ID
    and CheckRun Node ID.
+   Fetch that GraphQL connection to exhaustion. Bind the outer connection and
+   every page to the exact repository Node ID, PR Node ID, and observed head
+   OID; record server `totalCount`, contiguous one-based page indexes, request
+   and end cursors, per-page item counts, and `pageInfo.hasNextPage`. The final
+   page must report `hasNextPage=false`, page-item totals, server `totalCount`,
+   the complete flat rollup length, and the CI aggregate `total` must all
+   agree. The bounded complete profile admits at most 1,000 entries in at most
+   ten pages of at most 100 items. A larger connection, an incomplete page
+   chain, cursor or connection drift, count mismatch, or a first page whose
+   later pages remain unread makes CI evidence `unavailable` or `blocked`;
+   never truncate it into an observed green result.
 3. Do not start any local Codex or Claude lane, `materialize-worktree`,
    `validate-worktree`, low-level helper mode, exact-secret admission,
    GitHub Codex request, check, workflow, comment, poll, monitor, or wait. Do
@@ -102,12 +113,13 @@ The receiving sequence is closed:
    and rejects contradictions that JSON Schema cannot express, including
    target-identity mismatch, stable provider/object identity collisions,
    non-bijective database-ID/Node-ID mappings, aggregate CI counts versus the
-   complete rollup, observed endpoint OIDs versus target OIDs, and unresolved
-   threads versus total threads. Its one fail-closed normalization maps the
-   complete raw `CheckRun` status/conclusion and `StatusContext` state enums to
-   success, failure, pending, or cancelled. Report only evidence actually
-   observed, unavailable evidence, and blockers. Then stop without another
-   handoff.
+   complete rollup, incomplete or identity-drifted CI pagination, server and
+   page count mismatches, observed endpoint OIDs versus target OIDs, and
+   unresolved threads versus total threads. Its one fail-closed normalization
+   maps the complete raw `CheckRun` status/conclusion and `StatusContext` state
+   enums to success, failure, pending, or cancelled. Report only evidence
+   actually observed, unavailable evidence, and blockers. Then stop without
+   another handoff.
 
 This report is never a named-review artifact, secret-admission result,
 PR-readiness completion, or merge-ready claim. Its schema fixes `merge_ready`
@@ -166,7 +178,12 @@ Reserve `blocked-authorization` for a different condition: the intended review i
    - Eligible candidate: an existing, head-aligned and exact-range-aligned PR whose host is exact `github.com`, whose operating identity is not in the unsupported set, and which has no other directly known disqualifier. Unknown pre-request integration/service status does not block the request or become an availability claim.
    - Base-only local recovery: keep `requested: triple`, `effective: triple-inconclusive`, run only the recovered local lanes and required admission/readiness checks, and skip step 8. This is neither an eligible candidate nor effective-double unavailability.
 8. For an eligible candidate, first revalidate exact lifecycle `state == "open"`, `merged == false`, and `merged_at == null`, then establish request isolation for the unchanged current `pr_head_oid`. At most one exact `@codex review` request may be accepted for one unchanged head. Never post a second exact request while `headRefOid` is unchanged: if the one recorded current-head request already exists, continue waiting for or validating it; if multiple current-head requests exist, or authenticated history plus the audit record cannot exclude an older request whose run/result could overlap, report `effective: triple-inconclusive`. Otherwise post the one exact `@codex review` comment after the intended range is exactly the selected PR's current `pr_merge_base..pr_head_oid`, then re-read it and record its API ID, URL, server `created_at`, and the surrounding lifecycle/base/head observations. Re-read complete authenticated request history immediately before accepting a result; a second request that appeared after preflight is a race, not a new candidate, and makes the lane triple-inconclusive. Also revalidate the exact open lifecycle, re-read `baseRefName`, `baseRefOid`, and `headRefOid`, recompute the unique local `pr_merge_base`, and require the frozen range still to equal `pr_merge_base..pr_head_oid` immediately before accepting the terminal artifact. An observed non-open lifecycle at a mandated snapshot, a changed head, or a changed merge base invalidates the local whole-PR lanes and GitHub evidence. If this is a base-only retarget, stop through the already-prioritized `base-changed-same-head` branch; do not rewrite a caller-supplied range, demand an immediate local rerun from it, fall through to generic `scope-mismatch`, or post a second request. Server timestamps prove ordering, not request/run lineage. A review or issue comment exposes no request/run identifier, so do not attribute it to the current request when any possibly overlapping older request remains; it is triple-inconclusive even when its timestamp is later. Subject to those isolation rules, an authenticated provider rejection may prove no-start integration/service unavailability and reduce the shape to effective double only when it comes from the exact accepted provider identity below; acknowledgement or run/review activity proves start only when it comes from that provider or its exact accepted app/check identity; missing response, timeout, comment-write/generic HTTP failure, unknown author/app identity, or evidence proving neither state is `effective: triple-inconclusive`. The comment write alone is neither completion nor proof of service start. An exact-App check/run proves service start only when its `head_sha` equals the unchanged current `headRefOid` and its non-null `started_at` is strictly later than this request's `created_at`; its status, conclusion, and `completed_at` never make it completion or clean/no-findings evidence. A same-App check can be unrelated to the requested review, and a successful check can coexist with provider review findings. Accept triple only from a complete terminal provider-authored findings payload from the exact bot, bound to the same head, whole-PR range, and isolated request. For a review, fetch its body plus every fully paginated associated inline review comment and require exact case-sensitive state `COMMENTED`, `APPROVED`, or `CHANGES_REQUESTED`; `PENDING` continues bounded waiting, while `DISMISSED`, missing, or unknown state is `triple-inconclusive`. Alternatively, consume a terminal issue-comment body that unambiguously reports the completed findings/no-findings outcome rather than acknowledgement or progress. For issue-comment-only terminal or no-start evidence, apply the request-ledger and correlation rule in [github-pr-probes.md](github-pr-probes.md#issue-comment-only-correlation); do not pair a response to a request by nearest timestamp. Missing or ambiguous payload, terminal nature, pagination completeness, association, or correlation is `triple-inconclusive`.
-9. Read required CI/check state and unresolved PR conversations. Distinguish required checks from informational jobs and stale runs from current-head runs.
+9. Read required CI/check state and unresolved PR conversations. Distinguish
+   required checks from informational jobs and stale runs from current-head
+   runs. Exhaust every paginated CI connection and bind it to the selected
+   repository, PR, and current head before treating any aggregate as complete;
+   a first-page green result, over-cap connection, count mismatch, cursor drift,
+   or final `hasNextPage=true` is unavailable/blocked evidence, not readiness.
 10. Apply actionable findings in the implementation workspace, rerun affected tests, publish the new head, and invalidate every earlier named-lane artifact, optional low-level helper result, and direct admission result whose range/head changed.
 11. Repeat the affected local lanes, direct current-head admission, the supported GitHub Codex request, CI checks, and conversation scan until the effective shape and all delivery gates are clean or a crisp blocker remains. The `base-changed-same-head` branch is the exception: never repeat its GitHub request, and rerun local lanes only in a later pass whose current range was explicitly supplied or validly rederived as described above.
 12. Re-read the selected PR's base ref/SHA and head SHA, recompute the unique merge base, revalidate exact range equality, then recheck mergeability, direct current-head admission exit `0`, approval/ruleset requirements, and the repository's merge model immediately before reporting merge-ready or merging.

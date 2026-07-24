@@ -2,6 +2,25 @@
   "schema_version": 1,
   "cases": [
     {
+      "name": "existing-committed-range-commit-allowed-review-findings",
+      "input": {
+        "profile": "local-gate",
+        "commit_mode": "allowed",
+        "existing_committed_range": "base_sha..old_head_sha",
+        "formal_review_required": true,
+        "review_outcome": "findings"
+      },
+      "expected": {
+        "apply_fixes": true,
+        "rerun_validation": true,
+        "rerun_journal_gate": true,
+        "create_new_signed_head": true,
+        "invalidate_reviewed_range": "base_sha..old_head_sha",
+        "review_new_exact_range": true,
+        "terminal": null
+      }
+    },
+    {
       "name": "existing-committed-range-no-commit-review-findings",
       "input": {
         "profile": "local-gate",

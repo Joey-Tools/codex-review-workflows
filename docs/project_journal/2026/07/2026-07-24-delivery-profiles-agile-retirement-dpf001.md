@@ -63,6 +63,15 @@ superseded_by:
   App and CheckRun database IDs map one-to-one to Node IDs in both directions.
   One explicit fail-closed mapping normalizes those provider values to success,
   failure, pending, or cancelled aggregates.
+  CI pagination now binds the GraphQL connection and every page to the exact
+  repository Node ID, PR Node ID, and observed head OID. Server `totalCount`,
+  page counts, the complete flat rollup, and aggregate total must agree; cursor
+  chaining is contiguous and the final page proves `hasNextPage=false`. The
+  bounded complete profile admits at most 1,000 entries across at most ten
+  100-item pages, subject to the tighter independent report-byte ceiling.
+  Over-cap, incomplete, hidden-later-page, count-mismatched, or
+  identity-drifted results are unavailable/blocked rather than truncated
+  observed evidence.
   Base/head evidence records the exact observed endpoint OIDs and must match
   the target byte-for-byte before object-existence or merge-base results count.
   The validator also rejects lifecycle, selector, CI-rollup,
@@ -82,11 +91,23 @@ superseded_by:
   record with the selected profile, immutable constraint list, mutation modes,
   terminal outcome/reason/evidence, handoff target, and handoff profile. A
   blocked PR-readiness run retains its requested profile but forces both
-  handoff fields to `none`. Only a succeeded local gate with a present
-  committed range, clean formal review, verified signature, and satisfied
-  authorization/input may advertise the PR-readiness handoff. Missing range,
-  findings, signing failure, and authorization/input blockers all stop before
-  handoff. Conflicting or widened records fail closed.
+  handoff fields to `none`. A commit-allowed PR handoff requires a succeeded
+  local gate, satisfied build/tests/docs/journal, a present clean range, a
+  verified signature, and satisfied authorization/input. A commit-forbidden
+  PR handoff uses a distinct existing-range reason, checked local gate, present
+  clean range, and signature `not-required`. Missing range, findings, signing
+  failure, and authorization/input blockers all stop before handoff.
+  Conflicting or widened records fail closed.
+- The delivery schema now owns an exact success-reason matrix. Every reason
+  fixes its profile, local/commit/formal/remote modes, complete local
+  gate/build/tests/docs/journal/range/review/signature/authorization/input
+  evidence, and handoff. Cross-profile, cross-mode, and cross-evidence
+  combinations fail both schema and semantic checks. A successful result
+  cannot contain blocked, failed, findings, or not-started evidence.
+- `review-findings` is terminal only for a required formal review whose commit
+  mode is forbidden and whose existing range is preserved. Under allowed
+  commit mode, findings have no terminal record: repair, affected validation,
+  journal work, a new signed head, and exact-range review must repeat.
 - Terminal-outcome precedence makes a combined MVP-plus-PR request run the
   focused slice, full local gate, and PR handoff in that order. A clean signed
   review checkpoint is already the landing commit; the workflow never creates
@@ -135,7 +156,7 @@ superseded_by:
 ## Evidence
 
 - `python3 -B skills/change-delivery-workflow/tests/test_delivery_profiles.py -q`
-  passed (`36` tests), including deterministic local-mutation short circuits,
+  passed (`39` tests), including deterministic local-mutation short circuits,
   the independent mutable-`no-commit` control, constrained-scope conflicts,
   blocked delivery terminals that cannot hand off, receiver rejection of
   non-ready and local-only delivery records, staged read-only PR-probe
@@ -147,8 +168,11 @@ superseded_by:
   statuses, mixed rollup aggregation, duplicate display names, forward and
   reverse App/CheckRun ID collisions, malformed providers,
   swapped/cross-report/stale endpoints, same-merge-base endpoint drift, closed
-  delivery and terminal report records, and the clean-range, missing-range,
-  findings, and review-not-required terminals under forbidden commit mode.
+  delivery and terminal report records, exhaustive success-reason
+  cross-products, allowed-findings loop enforcement, hidden later CI pages,
+  pagination count/cursor/identity drift, the 257-entry non-truncation case,
+  the 1,000-entry cap, and the clean-range, missing-range, findings, and
+  review-not-required terminals under forbidden commit mode.
 - `python3 -B skills/synthetic-token-fixtures/tests/test_skill_contract.py -v`
   passed (`13` tests), including co-release binding, isolated-import shadows,
   raw-leaf and intermediate cross-release symlinks, unsafe parent modes,
