@@ -1,12 +1,13 @@
 # Placeholder-Only Fixture Templates
 
-First resolve `catalog_cli` exactly as required by the parent skill. Require
-`"$catalog_cli" synthetic-tokens validate`, select IDs from the metadata-only
-`"$catalog_cli" synthetic-tokens list --json` result, and resolve each
-placeholder with single-ID
-`"$catalog_cli" synthetic-tokens get <id> --json`. Replace the complete
-placeholder with the returned value. Do not concatenate, transform, encode, or
-partially substitute a value.
+First capture the parent skill's skill-relative active-release binding. Require
+the same `binding_sha256` before and after each operation, use only its exact
+`python_executable` and `catalog_cli_path`, and require the CLI result's
+`pool_version` to equal the binding. Run bound `synthetic-tokens validate`,
+select IDs from the metadata-only bound `synthetic-tokens list --json` result,
+and resolve each placeholder with bound single-ID `synthetic-tokens get <id>
+--json`. Replace the complete placeholder with the returned value. Do not
+concatenate, transform, encode, or partially substitute a value.
 
 ## Single OAuth Session
 

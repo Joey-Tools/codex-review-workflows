@@ -53,6 +53,26 @@
         "handoff": false,
         "terminal": "missing-committed-range-blocker"
       }
+    },
+    {
+      "name": "uncommitted-no-commit-formal-review-not-required",
+      "input": {
+        "profile": "local-gate",
+        "commit_mode": "forbidden",
+        "existing_committed_range": null,
+        "formal_review_required": false,
+        "review_outcome": "not-required"
+      },
+      "expected": {
+        "start_formal_review": false,
+        "create_new_head": false,
+        "create_signed_review_checkpoint": false,
+        "create_profile_commit": false,
+        "report_exact_validations": true,
+        "missing_committed_range_blocker": false,
+        "handoff": false,
+        "terminal": "uncommitted-checked-result"
+      }
     }
   ]
 }

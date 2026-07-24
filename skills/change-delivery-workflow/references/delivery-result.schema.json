@@ -7,9 +7,11 @@
     "schema_version",
     "profile",
     "constraints",
+    "local_mutation",
     "commit_mode",
     "remote_mutation",
-    "handoff"
+    "handoff",
+    "handoff_profile"
   ],
   "properties": {
     "schema_version": {
@@ -42,6 +44,12 @@
         "forbidden"
       ]
     },
+    "local_mutation": {
+      "enum": [
+        "allowed",
+        "forbidden"
+      ]
+    },
     "remote_mutation": {
       "enum": [
         "forbidden",
@@ -53,6 +61,13 @@
         "none",
         "review-orchestration-playbook"
       ]
+    },
+    "handoff_profile": {
+      "enum": [
+        "none",
+        "pr-readiness",
+        "pr-readiness-read-only-probe"
+      ]
     }
   },
   "additionalProperties": false,
@@ -63,11 +78,9 @@
           "constraints": {
             "contains": {
               "enum": [
-                "local-only",
                 "report-only",
                 "probe-only",
-                "read-only",
-                "no-remote"
+                "read-only"
               ]
             }
           }
@@ -78,17 +91,15 @@
       },
       "then": {
         "properties": {
-          "profile": {
-            "enum": [
-              "focused-checkpoint",
-              "local-gate"
-            ]
-          },
-          "remote_mutation": {
+          "local_mutation": {
             "const": "forbidden"
-          },
-          "handoff": {
-            "const": "none"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "local_mutation": {
+            "const": "allowed"
           }
         }
       }
@@ -117,6 +128,13 @@
             "const": "forbidden"
           }
         }
+      },
+      "else": {
+        "properties": {
+          "commit_mode": {
+            "const": "allowed"
+          }
+        }
       }
     },
     {
@@ -137,6 +155,9 @@
           },
           "handoff": {
             "const": "review-orchestration-playbook"
+          },
+          "handoff_profile": {
+            "const": "pr-readiness"
           }
         }
       },
@@ -144,9 +165,142 @@
         "properties": {
           "remote_mutation": {
             "const": "forbidden"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "constraints": {
+            "contains": {
+              "enum": [
+                "local-only",
+                "report-only",
+                "probe-only",
+                "read-only",
+                "no-remote"
+              ]
+            }
+          }
+        },
+        "required": [
+          "constraints"
+        ]
+      },
+      "then": {
+        "properties": {
+          "remote_mutation": {
+            "const": "forbidden"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "constraints": {
+            "contains": {
+              "const": "local-only"
+            }
+          }
+        },
+        "required": [
+          "constraints"
+        ]
+      },
+      "then": {
+        "properties": {
+          "profile": {
+            "enum": [
+              "focused-checkpoint",
+              "local-gate"
+            ]
           },
           "handoff": {
             "const": "none"
+          },
+          "handoff_profile": {
+            "const": "none"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "handoff_profile": {
+            "const": "none"
+          }
+        },
+        "required": [
+          "handoff_profile"
+        ]
+      },
+      "then": {
+        "properties": {
+          "handoff": {
+            "const": "none"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "handoff_profile": {
+            "const": "pr-readiness"
+          }
+        },
+        "required": [
+          "handoff_profile"
+        ]
+      },
+      "then": {
+        "properties": {
+          "profile": {
+            "const": "pr-readiness-handoff"
+          },
+          "remote_mutation": {
+            "const": "review-authorization-required"
+          },
+          "handoff": {
+            "const": "review-orchestration-playbook"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "handoff_profile": {
+            "const": "pr-readiness-read-only-probe"
+          }
+        },
+        "required": [
+          "handoff_profile"
+        ]
+      },
+      "then": {
+        "properties": {
+          "profile": {
+            "const": "local-gate"
+          },
+          "constraints": {
+            "contains": {
+              "enum": [
+                "report-only",
+                "probe-only",
+                "read-only",
+                "no-remote"
+              ]
+            }
+          },
+          "remote_mutation": {
+            "const": "forbidden"
+          },
+          "handoff": {
+            "const": "review-orchestration-playbook"
           }
         }
       }

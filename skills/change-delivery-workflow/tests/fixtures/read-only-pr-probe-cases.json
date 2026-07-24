@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "prompt": "Probe full workflow and PR readiness; do not make remote changes.",
+      "input": {
+        "schema_version": 1,
+        "profile": "local-gate",
+        "constraints": [
+          "probe-only",
+          "no-remote"
+        ],
+        "local_mutation": "forbidden",
+        "commit_mode": "forbidden",
+        "remote_mutation": "forbidden",
+        "handoff": "review-orchestration-playbook",
+        "handoff_profile": "pr-readiness-read-only-probe"
+      },
+      "expected": {
+        "allow": [
+          "pr-selection",
+          "pr-lifecycle",
+          "ci-status",
+          "conversation-state",
+          "base-and-head"
+        ],
+        "forbid": [
+          "comments",
+          "github-codex-request",
+          "state-changing-waits",
+          "branch-or-pr-metadata-changes",
+          "fixes",
+          "commits",
+          "pushes"
+        ],
+        "terminal": "pr-readiness-read-only-report"
+      }
+    }
+  ]
+}

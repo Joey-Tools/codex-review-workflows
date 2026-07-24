@@ -1,18 +1,51 @@
 ---
 name: synthetic-token-fixtures
-description: Select exact catalog-approved synthetic access, refresh, ID, API-key, and bearer values through the installed review helper's authoring CLI. Use when adding or revising credential-shaped fixtures, choosing distinct token roles or lifecycle states, or replacing invented or branch-only synthetic literals.
+description: Select exact catalog-approved synthetic access, refresh, ID, API-key, and bearer values through the active immutable macOS or Linux personal-sync review-skill release's authoring CLI. Use when adding or revising credential-shaped fixtures, choosing distinct token roles or lifecycle states, or replacing invented or branch-only synthetic literals.
 ---
 
 # Synthetic Token Fixtures
 
-Use the installed review helper's catalog and CLI as the only machine authority
-for authoring token IDs, metadata, and raw values. This skill is routing and
-selection guidance only: it does not define a pool, copy values, allocate tokens,
-or let a project override the catalog.
+Use the review helper catalog and CLI from the same active immutable release as
+this loaded skill as the only machine authority for authoring token IDs,
+metadata, and raw values. This skill is routing and selection guidance only: it
+does not define a pool, copy values, allocate tokens, or let a project override
+the catalog.
 
 ```bash
-catalog_cli="${CODEX_HOME:-$HOME/.codex}/skills/review-orchestration-playbook/scripts/isolated_review"
+synthetic_skill_root="<absolute directory containing this loaded SKILL.md>"
+binding_resolver="$synthetic_skill_root/scripts/active_catalog_binding.py"
 ```
+
+## Bind The Active Source
+
+1. Resolve one absolute Python 3 interpreter through the user or repository's
+   normal runtime authority. Run that interpreter with `-E -B -s -S` against
+   the skill-relative `binding_resolver`. Do not search `CODEX_HOME`, `HOME`,
+   `PATH`, another checkout, or a caller-provided catalog path for the review
+   skill. The resolver requires POSIX no-follow, nonblocking, close-on-exec, and
+   ownership primitives; on an unsupported native runtime, stop rather than
+   selecting another source.
+2. Require a successful versioned-release binding. The resolver derives the
+   sibling review skill from its own resolved file location, verifies that the
+   release `sync-manifest.json` installs both skill sources, and returns the
+   exact absolute release/root/manifest/CLI/catalog/interpreter paths, release
+   ID, review-runtime tree digest, manifest/CLI/catalog/skill/interpreter
+   SHA-256 digests, `pool_version`, and one canonical `binding_sha256`.
+3. Stop on a non-release layout, missing sibling, symlink, bytecode/native
+   import substitute, package shadow, unsafe ownership or write policy, invalid
+   catalog, ambiguous source, or digest mismatch. A repository working copy is
+   not an active release.
+4. Before and after every authoring CLI operation, rerun the same resolver with
+   `--expect-binding-sha256 <binding_sha256>`. Use only the returned exact
+   `python_executable` and `catalog_cli_path`; invoke them as:
+
+```bash
+"$python_executable" -E -B -s -S "$catalog_cli" synthetic-tokens validate
+```
+
+The resolver binds source identity but is not a second token CLI. It never
+accepts a catalog or review-skill path and never returns token values. The
+review skill-local CLI and catalog remain the sole authoring authority.
 
 ## Authoring CLI Contract
 
@@ -22,15 +55,16 @@ The authoring surface has exactly three operations:
 - `"$catalog_cli" synthetic-tokens list --json` returns `pool_version` plus metadata-only token records. It must not expose raw values.
 - `"$catalog_cli" synthetic-tokens get <id> --json` returns the one explicitly selected record and its exact raw value. It must not bulk-return other raw values.
 
-If any of these operations is missing, the catalog does not validate, or output
-violates this boundary, stop instead of reconstructing values from documentation
-or source.
+If any operation is missing, the catalog does not validate, the CLI response
+`pool_version` differs from the bound `pool_version`, the binding changes during
+selection, or output violates this boundary, stop instead of reconstructing
+values from documentation or source.
 
 ## Select Authoring Tokens
 
-1. Resolve `catalog_cli` from the installed skill root shown above; do not use a
-   repository-local copy or caller-selected catalog.
-2. Run `validate`, then metadata-only `list --json`.
+1. Capture and verify the active-source binding above.
+2. Run bound `validate`, then metadata-only `list --json`, revalidating
+   `binding_sha256` around each operation.
 3. Read `pool_version` and each token's `id`, `role`, `state`, `rule`, and
    `value_sha256`. Supported roles are `access`, `refresh`, `id`, `api-key`, and
    `bearer`; supported states are `active`, `expired`, and `consumed`.
@@ -38,8 +72,9 @@ or source.
    fit. Otherwise filter by role and state, sort by ID, and choose the first
    compatible entry. Choose distinct IDs for fixtures that model distinct
    credentials, and record those IDs with the fixture.
-5. Run single-ID `get <id> --json` for each chosen ID. Insert the returned value
-   verbatim as the complete credential value.
+5. Run bound single-ID `get <id> --json` for each chosen ID. Revalidate the
+   binding and `pool_version`, then insert the returned value verbatim as the
+   complete credential value.
 6. Run the affected tests. Hand frozen-range preflight and review work to
    `$review-orchestration-playbook`; a catalog match does not override another
    scanner rule or a credential-like path finding.
@@ -66,7 +101,8 @@ commit; hand an unavoidable historical-range review to
 ## Guardrails
 
 - Never copy token literals into this skill, templates, project instructions, or an allocator.
-- Never create a project-local pool, catalog override, second CLI, reservation, or fallback value.
+- Never create a project-local pool, catalog override, second token CLI, reservation, or fallback value.
+- Never select the catalog through `CODEX_HOME`, `HOME`, `PATH`, a repository copy, or a caller-provided path.
 - Never invent IDs, suffixes, reservations, counters, or regex namespaces.
 - Never treat words such as `synthetic`, `test`, `fixture`, or `sentinel` as proof that a value is safe.
 - Never use a legacy compatibility exemption for prompts, new fixtures, or a net increase in repository occurrences.

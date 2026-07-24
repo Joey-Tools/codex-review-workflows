@@ -8,9 +8,11 @@
         "schema_version": 1,
         "profile": "focused-checkpoint",
         "constraints": [],
+        "local_mutation": "allowed",
         "commit_mode": "allowed",
         "remote_mutation": "forbidden",
-        "handoff": "none"
+        "handoff": "none",
+        "handoff_profile": "none"
       }
     },
     {
@@ -20,9 +22,11 @@
         "schema_version": 1,
         "profile": "pr-readiness-handoff",
         "constraints": [],
+        "local_mutation": "allowed",
         "commit_mode": "allowed",
         "remote_mutation": "review-authorization-required",
-        "handoff": "review-orchestration-playbook"
+        "handoff": "review-orchestration-playbook",
+        "handoff_profile": "pr-readiness"
       }
     },
     {
@@ -32,9 +36,11 @@
         "schema_version": 1,
         "profile": "local-gate",
         "constraints": [],
+        "local_mutation": "allowed",
         "commit_mode": "allowed",
         "remote_mutation": "forbidden",
-        "handoff": "none"
+        "handoff": "none",
+        "handoff_profile": "none"
       }
     },
     {
@@ -46,9 +52,11 @@
         "constraints": [
           "local-only"
         ],
+        "local_mutation": "allowed",
         "commit_mode": "allowed",
         "remote_mutation": "forbidden",
-        "handoff": "none"
+        "handoff": "none",
+        "handoff_profile": "none"
       }
     },
     {
@@ -58,9 +66,11 @@
         "schema_version": 1,
         "profile": "pr-readiness-handoff",
         "constraints": [],
+        "local_mutation": "allowed",
         "commit_mode": "allowed",
         "remote_mutation": "review-authorization-required",
-        "handoff": "review-orchestration-playbook"
+        "handoff": "review-orchestration-playbook",
+        "handoff_profile": "pr-readiness"
       }
     },
     {
@@ -73,9 +83,28 @@
           "probe-only",
           "no-commit"
         ],
+        "local_mutation": "forbidden",
         "commit_mode": "forbidden",
         "remote_mutation": "forbidden",
-        "handoff": "none"
+        "handoff": "none",
+        "handoff_profile": "none"
+      }
+    },
+    {
+      "prompt": "Implement and validate this locally, but do not commit.",
+      "transition": "mutable local gate, then uncommitted report",
+      "result": {
+        "schema_version": 1,
+        "profile": "local-gate",
+        "constraints": [
+          "local-only",
+          "no-commit"
+        ],
+        "local_mutation": "allowed",
+        "commit_mode": "forbidden",
+        "remote_mutation": "forbidden",
+        "handoff": "none",
+        "handoff_profile": "none"
       }
     },
     {
@@ -88,9 +117,11 @@
           "local-only",
           "report-only"
         ],
+        "local_mutation": "forbidden",
         "commit_mode": "forbidden",
         "remote_mutation": "forbidden",
-        "handoff": "none"
+        "handoff": "none",
+        "handoff_profile": "none"
       }
     },
     {
@@ -102,9 +133,11 @@
         "constraints": [
           "no-remote"
         ],
+        "local_mutation": "allowed",
         "commit_mode": "allowed",
         "remote_mutation": "forbidden",
-        "handoff": "none"
+        "handoff": "none",
+        "handoff_profile": "none"
       }
     },
     {
@@ -116,14 +149,16 @@
         "constraints": [
           "read-only"
         ],
+        "local_mutation": "forbidden",
         "commit_mode": "forbidden",
         "remote_mutation": "forbidden",
-        "handoff": "none"
+        "handoff": "none",
+        "handoff_profile": "none"
       }
     },
     {
       "prompt": "Probe full workflow and PR readiness; do not make remote changes.",
-      "transition": "probe-only local report with no handoff",
+      "transition": "read-only local report, then read-only PR probe",
       "result": {
         "schema_version": 1,
         "profile": "local-gate",
@@ -131,9 +166,11 @@
           "probe-only",
           "no-remote"
         ],
+        "local_mutation": "forbidden",
         "commit_mode": "forbidden",
         "remote_mutation": "forbidden",
-        "handoff": "none"
+        "handoff": "review-orchestration-playbook",
+        "handoff_profile": "pr-readiness-read-only-probe"
       }
     },
     {
@@ -143,9 +180,11 @@
         "schema_version": 1,
         "profile": "pr-readiness-handoff",
         "constraints": [],
+        "local_mutation": "allowed",
         "commit_mode": "allowed",
         "remote_mutation": "review-authorization-required",
-        "handoff": "review-orchestration-playbook"
+        "handoff": "review-orchestration-playbook",
+        "handoff_profile": "pr-readiness"
       }
     }
   ]

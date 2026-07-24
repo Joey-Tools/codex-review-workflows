@@ -28,18 +28,36 @@ Resolve explicit scope and commit constraints before selecting a profile:
 - `local-only`: the requested terminal scope is explicitly local, such as
   `locally and stop` or `only work locally`. A mere reference to the local-gate
   phase inside an otherwise explicit PR request is not this constraint.
-- `report-only` or `probe-only`: inspect or evaluate without delivery mutation.
+- `report-only` or `probe-only`: inspect or evaluate without mutating the
+  working result.
 - `read-only`: do not mutate the working result or any remote state.
 - `no-remote`: do not push, create or update a PR, comment, start a remote
   readiness wait, release, or perform another remote mutation.
 - `no-commit`: leave Git history unchanged.
 
+Resolve two independent mutation dimensions:
+
+- `local_mutation` is `forbidden` for `report-only`, `probe-only`, or
+  `read-only`; otherwise it is `allowed`.
+- `remote_mutation` is `forbidden` for `local-only`, `report-only`,
+  `probe-only`, `read-only`, or `no-remote`; otherwise a selected
+  `pr-readiness-handoff` records `review-authorization-required`.
+
 These constraints are subtractive and take precedence over `full workflow`,
-PR-ish, merge-ready, or similar expansion signals in the same request. Any of
-`local-only`, `report-only`, `probe-only`, `read-only`, or `no-remote` forbids
-`pr-readiness-handoff` and every remote mutation. Select the appropriate
-remaining local profile and stop locally. A later explicit user request may
-remove the constraint; a downstream workflow may not reinterpret it.
+PR-ish, merge-ready, or similar expansion signals in the same request. Any
+remote-mutation-limiting constraint forbids `pr-readiness-handoff` and every
+remote mutation. Select the appropriate remaining local profile. A later
+explicit user request may remove the constraint; a downstream workflow may not
+reinterpret it.
+
+Remote mutation being forbidden does not erase an explicitly requested
+read-only PR-readiness probe. Unless `local-only` or an explicit no-network/no
+remote-access instruction also forbids remote reads, route that request to
+`$review-orchestration-playbook` with handoff profile
+`pr-readiness-read-only-probe`. This handoff may collect only PR selection,
+lifecycle, CI, conversation, base, and head evidence. It never authorizes a
+comment, `@codex review` request, state-changing wait, branch or PR metadata
+change, fix, commit, push, release, or merge.
 
 An explicit `report-only`, `probe-only`, `read-only`, or `no-commit` request
 also sets commit mode to `forbidden` for the whole run. Apply it before any
@@ -50,7 +68,17 @@ When commit mode is `forbidden`, run only the requested inspection or gate work
 and leave Git history unchanged. A formal review may use a pre-existing exact
 committed range only when it already represents the result under review.
 Otherwise skip the formal lane and report that the missing committed range is a
-blocker; do not create an implicit checkpoint to satisfy the reviewer.
+blocker only when formal review is required; do not create an implicit
+checkpoint to satisfy the reviewer. When formal review is not required, report
+the uncommitted checked result and exact validations directly without inventing
+a missing-range blocker or review handoff.
+
+When `local_mutation` is `forbidden`, short-circuit the implementation and
+journal steps. Do not edit source or documentation, write a journal, create a
+commit, generate working-result artifacts, update an index or ref, or run a
+validation known to create output, caches, or persistent state. Run only the
+read-only validation subset defined below. Unknown mutation behavior is not
+read-only.
 
 ## Choose The Profile
 
@@ -60,7 +88,9 @@ outcome, using this precedence:
 1. An explicit PR, PR-readiness, full-workflow, or merge-ready outcome selects
    `pr-readiness-handoff` only when no hard constraint forbids that handoff.
    When the handoff is forbidden, the same full-workflow signal selects
-   `local-gate` and stops there.
+   `local-gate`. It stops locally unless the request also explicitly asks for
+   PR-readiness evidence and remote reads remain allowed; that combination uses
+   the read-only PR probe handoff.
 2. Otherwise, an explicit full local gate or local landing outcome selects
    `local-gate`.
 3. Otherwise, an explicit early usable slice selects `focused-checkpoint`.
@@ -81,10 +111,11 @@ instead says that remote or full-gate work must wait for a later request, select
 | `Complete this non-trivial implementation locally.` | `local-gate` | full local gate, then stop |
 | `Take the implementation to merge-ready and stop before merge.` | `pr-readiness-handoff` | full local gate, then PR handoff |
 | `Probe local gate readiness, but do not commit.` | `local-gate` | gate-only report under `no-commit` |
+| `Implement and validate this locally, but do not commit.` | `local-gate` | mutable local gate, then uncommitted report |
 | `Run the full workflow locally, report-only.` | `local-gate` | gate-only report under local/report constraints |
 | `Run the full workflow with no remote work.` | `local-gate` | full local gate, then stop under `no-remote` |
 | `Review full-workflow readiness read-only.` | `local-gate` | read-only gate report with no handoff |
-| `Probe full workflow and PR readiness; do not make remote changes.` | `local-gate` | probe-only local report with no handoff |
+| `Probe full workflow and PR readiness; do not make remote changes.` | `local-gate` | read-only local report, then read-only PR probe |
 | `Run the full workflow and open a PR.` | `pr-readiness-handoff` | full local gate, then PR handoff |
 
 ### `focused-checkpoint`
@@ -94,7 +125,10 @@ agile delivery, scout, `先可用`, `快速迭代`, or similar first-slice reque
 
 - Define the smallest user-visible behavior, artifact, command, or diagnostic
   that makes the slice useful.
-- Run focused checks and the conditional journal gate.
+- When `local_mutation` is `forbidden`, inspect that slice without creating or
+  changing it and report only read-only evidence.
+- Run focused checks and, when local mutation is allowed, the conditional
+  journal gate.
 - When commit mode allows, create a signed local checkpoint automatically.
 - Stop at the checkpoint unless the user asks to continue.
 
@@ -107,8 +141,11 @@ merge.
 Choose this for ordinary non-trivial delivery, local gate readiness, or a
 pre-commit workflow when no narrower or remote outcome was requested.
 
-- Complete the implementation and reasonable local validation.
-- Update required documentation and apply the conditional journal gate.
+- Complete the implementation and reasonable local validation when
+  `local_mutation` is `allowed`; otherwise perform only the read-only validation
+  subset and report the existing result.
+- When local mutation is allowed, update required documentation and apply the
+  conditional journal gate.
 - Complete the required local/internal review.
 - When commit mode allows, create a signed landing commit automatically.
 - Stop locally unless the user separately authorizes remote work.
@@ -127,6 +164,25 @@ The review skill owns target authorization, PR selection and lifecycle, named
 review shapes, CI and conversation handling, and the merge-ready decision.
 This profile does not authorize merge.
 
+### `pr-readiness-read-only-probe` handoff
+
+This is a handoff mode from `local-gate`, not a fourth delivery profile. Select
+it only when the request explicitly asks for PR-readiness evidence while remote
+mutation is forbidden and remote reads remain allowed.
+
+- Hand the closed delivery record to `$review-orchestration-playbook`.
+- Allow only selection of an existing PR and read-only snapshots of lifecycle,
+  CI status, conversation state, and exact base/head evidence.
+- A bounded refresh may reread that evidence. It must not start CI, a reviewer,
+  a check, or another remote action and must not persist an authentication
+  refresh or cache. If the required read cannot remain non-mutating, report it
+  blocked.
+- Forbid comments, `@codex review`, state-changing waits, branch/ref or PR
+  metadata changes, fixes, commits, pushes, releases, and merge.
+- Return terminal `pr-readiness-read-only-report` with the evidence actually
+  observed, unavailable evidence, and blockers. Never call this merge-ready and
+  never promote the handoff to the mutation-capable `pr-readiness` profile.
+
 When a non-trivial delivery request is otherwise ambiguous, use `local-gate`.
 Stop for input when the missing choice would materially change scope or remote
 authorization.
@@ -136,20 +192,40 @@ authorization.
 1. Confirm scope.
 - Read the applicable repository policy and preserve unrelated user changes.
 - Record the selected profile, every canonical hard-constraint token, resolved
-  commit mode, intended local outcome, and any permitted remote handoff.
-- Fix only blockers that are necessary for that outcome.
+  local-mutation mode, commit mode, intended local outcome, and any permitted
+  remote handoff.
+- When `local_mutation` is `allowed`, fix only blockers that are necessary for
+  that outcome. Otherwise report them without modification.
 
 2. Implement.
+- Skip this entire step when `local_mutation` is `forbidden`; inspection cannot
+  become an implementation pass.
 - Read the relevant code, tests, and documentation before editing.
 - Keep the diff focused and correct low-level mistakes introduced by the task.
 - Under `focused-checkpoint`, defer polish, broad refactors, extra platforms,
   release wiring, and full gates that are not required for the first slice.
 
 3. Validate.
-- `focused-checkpoint` uses the narrowest checks that prove the slice builds,
-  runs, or can be inspected, and reports broader checks that were skipped.
-- `local-gate` and `pr-readiness-handoff` use the repository's broadest
-  reasonable local build, unit, integration, and end-to-end checks.
+- When `local_mutation` is `forbidden`, first classify each candidate check by
+  its documented side effects. Run only commands proven not to write the
+  worktree, Git index or refs, generated output, caches, journals, user
+  configuration, or persistent host state. Disable optional caches and lock
+  refreshes where the tool provides an authoritative no-write mode. Treat an
+  unknown or merely hoped-for no-write behavior as mutating: skip it and report
+  the unavailable gate. Source/object inspection, already-produced result
+  parsing, and explicitly no-cache/no-output validators form the read-only
+  subset; builds, tests, formatters, code generators, dependency resolution,
+  and validators that may populate caches do not.
+- Do not create a generated artifact merely to make a read-only check possible.
+  A formal review of a pre-existing range may use the review skill's own
+  isolated ephemeral evidence lane only when formal review is required; that
+  lane must not change the delivery worktree or become a delivered artifact.
+- When local mutation is allowed, `focused-checkpoint` uses the narrowest checks
+  that prove the slice builds, runs, or can be inspected, and reports broader
+  checks that were skipped.
+- When local mutation is allowed, `local-gate` and `pr-readiness-handoff` use
+  the repository's broadest reasonable local build, unit, integration, and
+  end-to-end checks.
 - Resolve each runtime or toolchain from the user's instruction, then repository
   policy and an authoritative repository runner or version pin. If the selected
   authority is missing, internally contradictory, ambiguous, or incompatible,
@@ -161,9 +237,12 @@ authorization.
   choosing or running checks. That reference owns deterministic environment
   selection and isolation; this workflow only consumes its results.
 - After a failure, return to the earliest affected step and rerun the affected
-  checks. Never claim a gate that was not run.
+  checks only when `local_mutation` allows the needed fix. Otherwise report the
+  failure without changing the result. Never claim a gate that was not run.
 
 4. Apply the journal automation gate.
+- Skip this entire step when `local_mutation` is `forbidden`; an adopted journal
+  is still part of the working result and cannot be updated by a read-only run.
 - Update automatically when the repository already adopted the convention
   through `docs/project_journal/`, stable entrypoints, or an explicit manifest.
 - Update automatically when repository policy requires it.
@@ -182,8 +261,10 @@ authorization.
   formal lane only when the user or repository policy requires it.
 - Apply the resolved commit mode before creating anything for review. Under
   `report-only`, `probe-only`, `read-only`, or `no-commit`, do not create a
-  checkpoint or anchor. Use a pre-existing exact committed range only when it
-  already represents the result; otherwise report the formal lane blocked.
+  checkpoint or anchor. When formal review is required, use a pre-existing
+  exact committed range only when it already represents the result; otherwise
+  report the formal lane blocked. When formal review is not required, report
+  the checked result and exact validations without requiring a range.
 - When a formal review is required and commits are allowed, create a signed
   review checkpoint after implementation, validation, and the journal gate,
   then hand the exact frozen range to the authoritative
@@ -202,20 +283,22 @@ authorization.
     authorization may begin a new mutation-capable run.
 - Resolve every required formal-review terminal state with this matrix:
 
-| Commit mode | Exact committed range | Formal review result | Required terminal action |
-| --- | --- | --- | --- |
-| `allowed` | available | `clean` | Continue to the signed-commit step, reusing the clean checkpoint when it already is the landing commit. |
-| `allowed` | available | `findings` | Apply fixes and repeat the affected gates on a new exact range. |
-| `forbidden` | missing | not started | Report `missing-committed-range` as a blocker and stop. Do not create or require a checkpoint, anchor, or commit to start review. |
-| `forbidden` | available | `findings` | Report `review-findings` as a blocker and stop on the preserved range without mutation. |
-| `forbidden` | available | `clean` | Report the exact clean range, bypass the signed-commit step, and continue directly to the profile terminal step. Do not create, require, amend, or relabel a commit. |
+| Formal review required | Commit mode | Exact committed range | Formal review result | Required terminal action |
+| --- | --- | --- | --- | --- |
+| `true` | `allowed` | available | `clean` | Continue to the signed-commit step, reusing the clean checkpoint when it already is the landing commit. |
+| `true` | `allowed` | available | `findings` | Apply fixes and repeat the affected gates on a new exact range. |
+| `true` | `forbidden` | missing | not started | Report `missing-committed-range` as a blocker and stop. Do not create or require a checkpoint, anchor, or commit to start review. |
+| `true` | `forbidden` | available | `findings` | Report `review-findings` as a blocker and stop on the preserved range without mutation. |
+| `true` | `forbidden` | available | `clean` | Report the exact clean range, bypass the signed-commit step, and continue directly to the profile terminal step. Do not create, require, amend, or relabel a commit. |
+| `false` | `forbidden` | missing | not required | Report the uncommitted checked result and exact validations. Do not invent a missing-range blocker, start formal review, create a commit, or hand off solely for review. |
 
 - Continue to the signed-commit step only when the latest reviewed head is clean
   under an allowed commit mode.
 - A clean review under forbidden commit mode is complete evidence for the
   pre-existing exact range. It does not turn commit mode back to `allowed`.
 - A missing exact range or review findings under forbidden commit mode is a
-  terminal blocker. Do not continue to a profile handoff from either blocker.
+  terminal blocker only when formal review is required. Do not continue to a
+  profile handoff from either blocker.
 - The latest clean reviewed checkpoint is the profile's landing commit. When
   review produces no fixes, do not create an empty commit or amend, squash, or
   rewrite history merely to relabel that checkpoint as the landing.
@@ -244,18 +327,22 @@ authorization.
 - `focused-checkpoint` stops at the signed local checkpoint, or at the requested
   report when commit mode forbids a checkpoint. A clean pre-existing reviewed
   range is reported directly; no additional commit is required.
-- `local-gate` stops at the signed local landing commit, or at the requested
+- `local-gate` stops at the signed local landing commit, at the requested
+  uncommitted checked-result report when formal review is not required, at the
   report when a pre-existing exact range reviewed cleanly, or at the
-  `missing-committed-range` / `review-findings` blocker when commit mode forbids
-  a commit. It does not push without separate authorization.
+  `missing-committed-range` / `review-findings` blocker when formal review is
+  required and commit mode forbids a commit. It does not push without separate
+  authorization.
 - `pr-readiness-handoff` continues through `$review-orchestration-playbook` and
   stops at merge-ready or a clear blocker, never at merge. Under forbidden
   commit mode, it may hand off the clean pre-existing exact range only when no
   hard constraint forbids remote work; a missing range or findings stop before
   handoff.
-- A hard constraint that forbids PR handoff always wins at this step. Do not
-  invoke the review skill's PR-readiness path, push, create or update a PR,
-  comment, start a remote wait, or release.
+- A hard constraint that forbids remote mutation always wins at this step. Do
+  not invoke the review skill's mutation-capable PR-readiness path, push, create
+  or update a PR, comment, request `@codex review`, start a state-changing wait,
+  or release. An explicitly requested read-only PR probe may still use the
+  `pr-readiness-read-only-probe` handoff unless remote reads are also forbidden.
 
 ## Emit The Result And Handoff Record
 
@@ -266,19 +353,30 @@ these fields unchanged across any handoff:
 
 - `profile`
 - every explicit canonical token in `constraints`
+- resolved `local_mutation`
 - resolved `commit_mode`
 - resolved `remote_mutation`
 - `handoff`
+- `handoff_profile`
 
-For `local-only`, `report-only`, `probe-only`, `read-only`, or `no-remote`,
-`remote_mutation` must be `forbidden`, `handoff` must be `none`, and `profile`
-must not be `pr-readiness-handoff`. For `report-only`, `probe-only`,
-`read-only`, or `no-commit`, `commit_mode` must be `forbidden`.
+For `report-only`, `probe-only`, or `read-only`, `local_mutation` must be
+`forbidden`. For `local-only`, `report-only`, `probe-only`, `read-only`, or
+`no-remote`, `remote_mutation` must be `forbidden` and `profile` must not be
+`pr-readiness-handoff`. For `report-only`, `probe-only`, `read-only`, or
+`no-commit`, `commit_mode` must be `forbidden`.
 
 Only a `pr-readiness-handoff` record without a remote-limiting constraint may
 set `handoff` to `review-orchestration-playbook` and `remote_mutation` to
 `review-authorization-required`. That value is not remote authorization; it
 means the review skill must perform its own target and lifecycle preflight.
+Its `handoff_profile` is `pr-readiness`.
+
+A `local-gate` record with an explicit PR-readiness probe and no
+remote-read-limiting constraint may instead set `handoff` to
+`review-orchestration-playbook`, `handoff_profile` to
+`pr-readiness-read-only-probe`, and `remote_mutation` to `forbidden`. The
+receiver must preserve that read-only capability ceiling and return only the
+selection/lifecycle/CI/conversation/base/head evidence report.
 Receivers must fail closed on a missing constraint, an unknown field, or an
 internally contradictory record instead of inferring a broader scope from prose.
 

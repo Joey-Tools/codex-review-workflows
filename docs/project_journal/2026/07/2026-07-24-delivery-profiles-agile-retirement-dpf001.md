@@ -30,12 +30,20 @@ superseded_by:
   no-commit run may reuse an already-correct committed range, but it never
   creates history merely to satisfy a formal lane.
 - Explicit local-only, report-only, probe-only, read-only, and no-remote
-  constraints are resolved before terminal-outcome signals. They prevent a
-  conflicting `full workflow` or PR phrase from selecting PR readiness or
-  authorizing remote mutation.
+  constraints are resolved before terminal-outcome signals. The result records
+  local and remote mutation independently. Report/probe/read-only requests
+  short-circuit implementation, journal, commit, generated-result, and
+  mutation/cache-writing validation steps.
+- A request that explicitly asks for PR-readiness evidence while forbidding
+  remote mutation routes through the review orchestrator's
+  `pr-readiness-read-only-probe` handoff. It can read only PR selection,
+  lifecycle, CI, conversation, and base/head evidence; it cannot comment,
+  request GitHub Codex, start state-changing work, fix, commit, push, release,
+  or merge.
 - Every terminal result or permitted handoff carries a closed, versioned record
-  with the selected profile, immutable constraint list, commit mode, remote
-  mutation mode, and handoff target. Conflicting or widened records fail closed.
+  with the selected profile, immutable constraint list, local mutation mode,
+  commit mode, remote mutation mode, handoff target, and handoff profile.
+  Conflicting or widened records fail closed.
 - Terminal-outcome precedence makes a combined MVP-plus-PR request run the
   focused slice, full local gate, and PR handoff in that order. A clean signed
   review checkpoint is already the landing commit; the workflow never creates
@@ -56,9 +64,16 @@ superseded_by:
   range from missing-range and findings blockers under forbidden commit mode.
   A clean range is reported and proceeds directly to the selected profile's
   stop or permitted handoff; no row asks for, implies, or manufactures a commit.
-- Synthetic fixture authoring exposes only catalog validation, metadata-only
-  listing, and single-ID retrieval. Legacy exemptions remain helper
-  compatibility surfaces rather than authoring paths.
+- When formal review is not required, forbidden commit mode now terminates with
+  the uncommitted checked result and exact validations; it does not invent a
+  missing-range blocker or handoff.
+- Synthetic fixture authoring binds its sibling review runtime from the same
+  active immutable release. The machine receipt carries absolute paths, release
+  ID, a co-release `sync-manifest.json` proof, source/interpreter digests,
+  `pool_version`, and a canonical binding digest that is revalidated around
+  catalog validation, metadata-only listing, and single-ID retrieval.
+  `CODEX_HOME`, `HOME`, arbitrary repository copies, and caller-selected catalog
+  paths cannot select the authority.
 
 ## Next Steps
 
@@ -67,24 +82,28 @@ superseded_by:
 ## Evidence
 
 - `python3 -B skills/change-delivery-workflow/tests/test_delivery_profiles.py`
-  passed (`16` tests), including deterministic constrained-scope conflicts,
-  positive PR-handoff controls, closed result-record rejection cases, and the
-  clean-range, missing-range, and findings terminal matrix under forbidden
-  commit mode.
+  passed (`20` tests), including deterministic local-mutation short circuits,
+  the independent mutable-`no-commit` control, constrained-scope conflicts,
+  read-only PR-probe routing, closed result-record rejection cases, and the
+  clean-range, missing-range, findings, and review-not-required terminals under
+  forbidden commit mode.
 - `python3 -B skills/synthetic-token-fixtures/tests/test_skill_contract.py -v`
-  passed (`2` tests).
+  passed (`3` tests), including a co-release installation fixture, bound
+  validate/list/get operations, and fail-closed source/layout drift.
 - `python3 -B skills/review-orchestration-playbook/tests/test_synthetic_tokens.py SyntheticTokenCliTest -v`
   passed (`5` tests).
 - `python3 -B skills/review-orchestration-playbook/tests/test_contracts.py -q`
   passed (`86` tests).
 - `uv run --isolated --with pyyaml python3 /Users/hoteng/.codex/skills/joey-skill-authoring/scripts/codex_skill_validate.py skills/change-delivery-workflow skills/agile-delivery-workflow skills/synthetic-token-fixtures`
   passed (`3/3` skills valid) after the constrained-scope review-fix round.
-- `python3 -m json.tool` passed for the delivery-result schema, deterministic
-  profile-selection fixture, and review-findings fixture.
-- `python3 /Users/hoteng/.codex/personal-sync/overlays/private/releases/9257aca19dc7c370418c1dcf7b8c194b0353eafe/personal_codex/skills/project-journal/scripts/project_journal.py validate --repo .`
+- `python3 -m json.tool` passed for the delivery-result schema and all four
+  delivery fixtures; Draft 2020-12 `jsonschema` validation accepted all `12`
+  profile result records.
+- `python3 -B /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo .`
   passed.
-- `ruff check skills/change-delivery-workflow/tests/test_delivery_profiles.py skills/synthetic-token-fixtures/tests/test_skill_contract.py skills/review-orchestration-playbook/tests/test_contracts.py`
-  passed, and `ruff format --check` passed for the same files.
+- `ruff check` passed for the delivery tests, synthetic skill tests, active
+  binding resolver, and review-contract tests; `ruff format --check` passed for
+  the same Python files.
 - The validator's task-local `uv` cache and test-created Python bytecode were
   removed after validation; the final ignored-cache scan passed.
 - `git diff --check` passed for tracked changes.

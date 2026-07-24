@@ -4,6 +4,13 @@ Read this reference when runtime or toolchain selection is material to the
 gate, when the task may require local multi-version validation, or when build
 and test results can depend on version-sensitive checkout, cache, or state.
 
+The parent workflow's `local_mutation` ceiling applies before this reference.
+When it is `forbidden`, do not create an isolated worktree, cache, generated
+output, log, environment, or persistent state and do not run a versioned build
+or test that may write any of them. Limit work to the parent's proven read-only
+validation subset; report unavailable single- or multi-version gates instead of
+materializing an environment for them.
+
 ## Select Single-Version Or Multi-Version Shape
 
 A minimum supported version or CI matrix does not by itself require a local
