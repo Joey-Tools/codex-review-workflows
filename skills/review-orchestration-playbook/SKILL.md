@@ -89,6 +89,18 @@ Read the first section of [pr-readiness.md](references/pr-readiness.md) for the
 receiving sequence. Nothing in a surrounding prompt may widen this capability
 ceiling.
 
+### Ordinary delivery handoff receiver
+
+Before ordinary PR readiness consumes an inbound delivery record, invoke the
+same manifest-bound helper with `validate-delivery-handoff -`. Accept only its
+closed `pr-readiness` success row, preserve the record's exact `head_sha`, and
+require `signature_verified_head_oid == head_sha` for both SHA-1 and SHA-256.
+After the local range is frozen, require that inbound `head_sha` to equal the
+range head; for a selected PR it must also equal current `pr_head_oid`. A
+missing field, a different but well-formed OID, a blocker terminal, or any
+mode/evidence cross-product is `blocked-input` before a lane or PR action
+starts.
+
 ### GitHub Codex fallback
 
 GitHub Codex is the optional third lane, so its unavailability changes a requested triple review into an effective double review.
@@ -281,7 +293,7 @@ The `isolated_review` helper retains a frozen supplied-diff runtime backed by a 
 - [validate_claude_stream.py](scripts/validate_claude_stream.py): required bounded strict preflight-bound raw-JSONL validator loaded by the formal guard `validate-claude-stream` profile; its direct CLI is compatibility-only.
 - [review_result.py](scripts/review_runtime/review_result.py): canonical post-acceptance review-result disposition helper, executed only through the manifest-bound `classify-review-result` guard profile; it preserves the raw result and separates semantic outcome from presentation.
 - [named_claude_preflight](scripts/named_claude_preflight): compatibility wrapper for the required publisher-first compatible-version and advertised-capability selector loaded by the formal guard `preflight-claude` profile.
-- [read_only_pr_report.py](scripts/read_only_pr_report.py): fresh instance-binding generator and second-stage semantic validator for terminal read-only PR probe reports.
+- [read_only_pr_report.py](scripts/read_only_pr_report.py): closed delivery-handoff validator plus fresh instance-binding generator and second-stage semantic validator for terminal read-only PR probe reports.
 - [pr-readiness.md](references/pr-readiness.md): PR authorization, current-head GitHub Codex, CI/comments, fix loop, and merge-ready reporting.
 - [pr-readiness-read-only-report.schema.json](references/pr-readiness-read-only-report.schema.json): closed terminal result for the delivery read-only PR evidence probe.
 - [review-prompt-templates.md](references/review-prompt-templates.md): fresh-context prompt templates.

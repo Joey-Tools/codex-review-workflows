@@ -189,6 +189,7 @@
         "schema_version",
         "profile",
         "constraints",
+        "head_sha",
         "local_mutation",
         "commit_mode",
         "formal_review_required",
@@ -227,6 +228,9 @@
               "no-remote"
             ]
           }
+        },
+        "head_sha": {
+          "$ref": "#/$defs/oid"
         },
         "local_mutation": {
           "enum": [

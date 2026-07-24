@@ -8,6 +8,7 @@
         "schema_version": 3,
         "profile": "focused-checkpoint",
         "constraints": [],
+        "head_sha": "dddddddddddddddddddddddddddddddddddddddd",
         "local_mutation": "allowed",
         "commit_mode": "allowed",
         "formal_review_required": false,
@@ -38,6 +39,7 @@
         "schema_version": 3,
         "profile": "pr-readiness-handoff",
         "constraints": [],
+        "head_sha": "dddddddddddddddddddddddddddddddddddddddd",
         "local_mutation": "allowed",
         "commit_mode": "allowed",
         "formal_review_required": true,
@@ -68,6 +70,7 @@
         "schema_version": 3,
         "profile": "local-gate",
         "constraints": [],
+        "head_sha": "dddddddddddddddddddddddddddddddddddddddd",
         "local_mutation": "allowed",
         "commit_mode": "allowed",
         "formal_review_required": true,
@@ -100,6 +103,7 @@
         "constraints": [
           "local-only"
         ],
+        "head_sha": "dddddddddddddddddddddddddddddddddddddddd",
         "local_mutation": "allowed",
         "commit_mode": "allowed",
         "formal_review_required": true,
@@ -130,6 +134,7 @@
         "schema_version": 3,
         "profile": "pr-readiness-handoff",
         "constraints": [],
+        "head_sha": "dddddddddddddddddddddddddddddddddddddddd",
         "local_mutation": "allowed",
         "commit_mode": "allowed",
         "formal_review_required": true,
@@ -163,6 +168,7 @@
           "probe-only",
           "no-commit"
         ],
+        "head_sha": "dddddddddddddddddddddddddddddddddddddddd",
         "local_mutation": "forbidden",
         "commit_mode": "forbidden",
         "formal_review_required": false,
@@ -196,6 +202,7 @@
           "local-only",
           "no-commit"
         ],
+        "head_sha": "dddddddddddddddddddddddddddddddddddddddd",
         "local_mutation": "allowed",
         "commit_mode": "forbidden",
         "formal_review_required": false,
@@ -229,6 +236,7 @@
           "local-only",
           "report-only"
         ],
+        "head_sha": "dddddddddddddddddddddddddddddddddddddddd",
         "local_mutation": "forbidden",
         "commit_mode": "forbidden",
         "formal_review_required": false,
@@ -261,6 +269,7 @@
         "constraints": [
           "no-remote"
         ],
+        "head_sha": "dddddddddddddddddddddddddddddddddddddddd",
         "local_mutation": "allowed",
         "commit_mode": "allowed",
         "formal_review_required": true,
@@ -293,6 +302,7 @@
         "constraints": [
           "read-only"
         ],
+        "head_sha": "dddddddddddddddddddddddddddddddddddddddd",
         "local_mutation": "forbidden",
         "commit_mode": "forbidden",
         "formal_review_required": false,
@@ -326,6 +336,7 @@
           "probe-only",
           "no-remote"
         ],
+        "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "local_mutation": "forbidden",
         "commit_mode": "forbidden",
         "formal_review_required": false,
@@ -358,6 +369,7 @@
         "constraints": [
           "no-remote"
         ],
+        "head_sha": "dddddddddddddddddddddddddddddddddddddddd",
         "local_mutation": "allowed",
         "commit_mode": "allowed",
         "formal_review_required": true,
@@ -388,6 +400,7 @@
         "schema_version": 3,
         "profile": "pr-readiness-handoff",
         "constraints": [],
+        "head_sha": "dddddddddddddddddddddddddddddddddddddddd",
         "local_mutation": "allowed",
         "commit_mode": "allowed",
         "formal_review_required": true,

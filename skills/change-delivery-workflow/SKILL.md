@@ -399,6 +399,7 @@ these fields unchanged across any handoff:
 
 - `profile`
 - every explicit canonical token in `constraints`
+- exact full `head_sha` for the frozen or handed-off repository head
 - resolved `local_mutation`
 - resolved `commit_mode`
 - resolved `formal_review_required`
@@ -413,8 +414,12 @@ commit mode, formal-review requirement, remote-mutation mode, handoff,
 handoff profile, and complete evidence object. The evidence object separately
 records local gate, build, tests, docs, journal, committed range, formal
 review, signature, signature-bound exact head, authorization, and input.
-`signature_verified_head_oid` is a full SHA-1 or SHA-256 object ID exactly when
-`signature` is `verified`; it is null for `failed` and `not-required`.
+`head_sha` and `signature_verified_head_oid` admit full lowercase SHA-1 or
+SHA-256 object IDs. `signature_verified_head_oid` is present exactly when
+`signature` is `verified`, must byte-for-byte equal `head_sha`, and is null for
+`failed` and `not-required`. JSON Schema closes both field shapes; every formal
+receiver must additionally run the same-release semantic validator because
+Draft 2020-12 cannot express this cross-field equality.
 Mutation-capable success uses
 `satisfied` for each build/tests/docs/journal gate; a no-mutation observation
 uses `read-only-observed` and never implies that a mutating gate ran. No
@@ -461,6 +466,13 @@ findings, signing, authorization, and input evidence and forces both handoff
 fields to `none`; contradictory later-stage evidence is invalid. Preserve
 the requested profile so the report states what was attempted without
 misrepresenting the blocked terminal as a ready transition.
+Every row also fixes one legal `local_mutation` / `commit_mode` pair. Mutable
+commit, mutable no-commit existing-range, and read-only formal paths are
+separate rows: mutable phases use `satisfied`, read-only phases use
+`read-only-observed`, and only a mutable commit path may use a genuinely
+`succeeded` local gate before a downstream authorization or input blocker.
+No-commit and read-only formal blockers use `checked`; they must never borrow a
+mutable row or claim a succeeded local gate.
 `review-findings` is valid only when formal review is required and commit mode
 is `forbidden`, with a present range, findings, and signature
 `not-required`. Findings under commit mode `allowed` are never terminal: they

@@ -47,6 +47,9 @@ new_read_only_report_bindings = READ_ONLY_PR_REPORT_RUNTIME_API["new_bindings"]
 validate_read_only_report_semantics = READ_ONLY_PR_REPORT_RUNTIME_API[
     "validate_semantics"
 ]
+validate_delivery_handoff_semantics = READ_ONLY_PR_REPORT_RUNTIME_API[
+    "validate_delivery_handoff"
+]
 READ_ONLY_DELIVERY_SUCCESS_MATRIX = READ_ONLY_PR_REPORT_RUNTIME_API[
     "READ_ONLY_DELIVERY_SUCCESS_MATRIX"
 ]
@@ -65,6 +68,7 @@ RESULT_FIELDS = {
     "schema_version",
     "profile",
     "constraints",
+    "head_sha",
     "local_mutation",
     "commit_mode",
     "formal_review_required",
@@ -337,10 +341,56 @@ def success_result(reason: str) -> dict[str, object]:
     return {
         "schema_version": 3,
         "constraints": constraints_for_success(expected),
+        "head_sha": FIXTURE_HEAD_OID,
         "terminal_outcome": "succeeded",
         "terminal_reason": reason,
         **expected,
     }
+
+
+def blocker_result(branch: dict[str, object]) -> dict[str, object]:
+    properties = branch["properties"]
+    if not isinstance(properties, dict):
+        raise AssertionError("blocker row properties must be an object")
+    result = success_result("pr-readiness-handoff-ready")
+    for field in (
+        "profile",
+        "local_mutation",
+        "commit_mode",
+        "formal_review_required",
+        "remote_mutation",
+        "terminal_outcome",
+        "terminal_reason",
+        "handoff",
+        "handoff_profile",
+    ):
+        field_schema = properties.get(field)
+        if isinstance(field_schema, dict) and "const" in field_schema:
+            result[field] = field_schema["const"]
+    if result["local_mutation"] == "forbidden":
+        result["constraints"] = ["read-only"]
+    elif result["commit_mode"] == "forbidden":
+        result["constraints"] = ["no-commit"]
+    else:
+        result["constraints"] = []
+    if "remote_mutation" not in properties:
+        result["remote_mutation"] = (
+            "review-authorization-required"
+            if result["profile"] == "pr-readiness-handoff"
+            else "forbidden"
+        )
+    evidence_schema = properties["terminal_evidence"]
+    if not isinstance(evidence_schema, dict):
+        raise AssertionError("blocker row evidence must be an object")
+    result["terminal_evidence"] = {
+        field: (
+            result["head_sha"]
+            if field_schema.get("$ref") == "#/$defs/oid"
+            else field_schema["const"]
+        )
+        for field, field_schema in evidence_schema["properties"].items()
+    }
+    return result
 
 
 def check_run_rollup(
@@ -617,6 +667,13 @@ def assert_valid_result_contract(result: object) -> None:
         raise AssertionError("unexpected delivery result schema version")
     if result["profile"] not in PROFILES:
         raise AssertionError("unknown delivery profile")
+    head_sha = result["head_sha"]
+    if (
+        not isinstance(head_sha, str)
+        or len(head_sha) not in {40, 64}
+        or any(character not in "0123456789abcdef" for character in head_sha)
+    ):
+        raise AssertionError("delivery result lacks a full lowercase head object ID")
 
     constraints = result["constraints"]
     if not isinstance(constraints, list):
@@ -667,6 +724,10 @@ def assert_valid_result_contract(result: object) -> None:
         ):
             raise AssertionError(
                 "verified signature lacks a full lowercase head object ID"
+            )
+        if verified_head_oid != head_sha:
+            raise AssertionError(
+                "verified signature does not bind the exact delivery head"
             )
     elif verified_head_oid is not None:
         raise AssertionError(
@@ -1468,6 +1529,9 @@ class DeliveryProfileContractTest(unittest.TestCase):
         commit_allowed["delivery_record"]["terminal_evidence"][
             "signature_verified_head_oid"
         ] = commit_allowed["target"]["head"]["oid"]
+        commit_allowed["delivery_record"]["head_sha"] = commit_allowed["target"][
+            "head"
+        ]["oid"]
         self.assertEqual(list(validator.iter_errors(commit_allowed)), [])
         assert_read_only_report_contract(commit_allowed)
 
@@ -3145,6 +3209,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
 
         refreshed_head = copy.deepcopy(resolved)
         refreshed_head["target"]["head"]["oid"] = "d" * 40
+        refreshed_head["delivery_record"]["head_sha"] = "d" * 40
         refreshed_head["evidence"]["base_and_head"]["observed"][0][
             "observed_head_oid"
         ] = "d" * 40
@@ -3175,6 +3240,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
             set(schema["properties"]["constraints"]["items"]["enum"]),
             CONSTRAINTS,
         )
+        self.assertEqual(schema["properties"]["head_sha"]["$ref"], "#/$defs/oid")
         self.assertEqual(schema["properties"]["schema_version"]["const"], 3)
         self.assertEqual(
             set(schema["properties"]["terminal_outcome"]["enum"]),
@@ -3466,6 +3532,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
         for reason in sorted(read_only_reasons):
             report = copy.deepcopy(base_report)
             report["delivery_record"] = success_result(reason)
+            report["delivery_record"]["head_sha"] = report["target"]["head"]["oid"]
             if (
                 report["delivery_record"]["terminal_evidence"]["signature"]
                 == "verified"
@@ -3505,6 +3572,53 @@ class DeliveryProfileContractTest(unittest.TestCase):
                         with self.assertRaises(ValueError):
                             validate_read_only_report_semantics(candidate)
 
+    def test_ordinary_pr_readiness_receiver_requires_exact_delivery_head(
+        self,
+    ) -> None:
+        schema = json.loads(DELIVERY_RESULT_SCHEMA.read_text(encoding="utf-8"))
+        validator = Draft202012Validator(schema)
+        for reason in (
+            "pr-readiness-handoff-ready",
+            "pr-readiness-existing-range-handoff-ready",
+        ):
+            valid = success_result(reason)
+            with self.subTest(reason=reason, mode="valid"):
+                self.assertEqual(list(validator.iter_errors(valid)), [])
+                validate_delivery_handoff_semantics(valid)
+
+            for alternate_head in ("e" * 40, "f" * 64):
+                candidate = copy.deepcopy(valid)
+                candidate["terminal_evidence"]["signature_verified_head_oid"] = (
+                    alternate_head
+                )
+                with self.subTest(
+                    reason=reason,
+                    mode="different-valid-oid",
+                    alternate_head=alternate_head,
+                ):
+                    self.assertEqual(list(validator.iter_errors(candidate)), [])
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "delivery_record.head_sha",
+                    ):
+                        validate_delivery_handoff_semantics(candidate)
+
+        accepted = success_result("pr-readiness-handoff-ready")
+        with mock.patch.dict(
+            READ_ONLY_PR_REPORT_GLOBALS,
+            {"_read_payload": mock.Mock(return_value=accepted)},
+        ):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                return_code = read_only_report_main(
+                    ["validate-delivery-handoff", "ignored"]
+                )
+        self.assertEqual(return_code, 0)
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {"classification": "accepted"},
+        )
+
     def test_pr_readiness_blockers_preserve_profile_without_handoff(self) -> None:
         schema = json.loads(DELIVERY_RESULT_SCHEMA.read_text(encoding="utf-8"))
         validator = Draft202012Validator(schema)
@@ -3539,33 +3653,16 @@ class DeliveryProfileContractTest(unittest.TestCase):
             properties = branch["properties"]
             reason = properties["terminal_reason"]["const"]
             with self.subTest(reason=reason, row=index):
-                blocked = copy.deepcopy(ready)
-                for field in (
-                    "terminal_outcome",
-                    "terminal_reason",
-                    "commit_mode",
-                    "formal_review_required",
-                    "handoff",
-                    "handoff_profile",
-                ):
-                    if field in properties:
-                        blocked[field] = properties[field]["const"]
-                blocked["constraints"] = (
-                    ["no-commit"] if blocked["commit_mode"] == "forbidden" else []
-                )
-                blocked["terminal_evidence"] = {
-                    field: (
-                        FIXTURE_HEAD_OID
-                        if field_schema.get("$ref") == "#/$defs/oid"
-                        else field_schema["const"]
-                    )
-                    for field, field_schema in properties["terminal_evidence"][
-                        "properties"
-                    ].items()
-                }
+                blocked = blocker_result(branch)
                 self.assertEqual(list(validator.iter_errors(blocked)), [])
                 assert_valid_result_contract(blocked)
-                self.assertEqual(blocked["profile"], "pr-readiness-handoff")
+                self.assertEqual(
+                    blocked["profile"],
+                    properties.get("profile", {}).get(
+                        "const",
+                        "pr-readiness-handoff",
+                    ),
+                )
 
                 widened = copy.deepcopy(blocked)
                 widened["handoff"] = "review-orchestration-playbook"
@@ -3590,6 +3687,85 @@ class DeliveryProfileContractTest(unittest.TestCase):
             "terminal only for a required no-commit review",
         ):
             assert_valid_result_contract(allowed_findings)
+
+    def test_blocker_matrix_closes_each_mutation_and_commit_path(self) -> None:
+        schema = json.loads(DELIVERY_RESULT_SCHEMA.read_text(encoding="utf-8"))
+        validator = Draft202012Validator(schema)
+        branches = schema["$defs"]["blockedTerminalMatrix"]["oneOf"]
+        self.assertEqual(
+            len({branch["title"] for branch in branches}),
+            len(branches),
+        )
+
+        paths_by_reason: dict[str, set[tuple[str, str]]] = {}
+        for branch in branches:
+            properties = branch["properties"]
+            reason = properties["terminal_reason"]["const"]
+            path = (
+                properties["local_mutation"]["const"],
+                properties["commit_mode"]["const"],
+            )
+            paths_by_reason.setdefault(reason, set()).add(path)
+
+            valid = blocker_result(branch)
+            self.assertEqual(list(validator.iter_errors(valid)), [])
+            assert_valid_result_contract(valid)
+
+            for field, alternative in (
+                (
+                    "local_mutation",
+                    "forbidden" if valid["local_mutation"] == "allowed" else "allowed",
+                ),
+                (
+                    "commit_mode",
+                    "forbidden" if valid["commit_mode"] == "allowed" else "allowed",
+                ),
+            ):
+                candidate = copy.deepcopy(valid)
+                candidate[field] = alternative
+                with self.subTest(
+                    title=branch["title"],
+                    mutation=field,
+                    alternative=alternative,
+                ):
+                    self.assertTrue(list(validator.iter_errors(candidate)))
+
+            if valid["commit_mode"] == "forbidden":
+                fake_success = copy.deepcopy(valid)
+                fake_success["terminal_evidence"]["local_gate"] = "succeeded"
+                with self.subTest(
+                    title=branch["title"],
+                    mutation="fake-succeeded-local-gate",
+                ):
+                    self.assertTrue(list(validator.iter_errors(fake_success)))
+            if valid["local_mutation"] == "forbidden":
+                for phase in ("build", "tests", "docs", "journal"):
+                    self.assertEqual(
+                        valid["terminal_evidence"][phase],
+                        "read-only-observed",
+                    )
+
+        mutable_commit = ("allowed", "allowed")
+        no_commit = ("allowed", "forbidden")
+        read_only = ("forbidden", "forbidden")
+        self.assertEqual(
+            paths_by_reason["missing-committed-range"],
+            {no_commit, read_only},
+        )
+        self.assertEqual(
+            paths_by_reason["review-findings"],
+            {no_commit, read_only},
+        )
+        for reason in (
+            "formal-review-blocked",
+            "signing-failed",
+            "blocked-authorization",
+            "blocked-input",
+        ):
+            self.assertEqual(
+                paths_by_reason[reason],
+                {mutable_commit, no_commit, read_only},
+            )
 
     def test_read_only_receiver_rejects_non_ready_delivery_terminal(self) -> None:
         report = copy.deepcopy(
@@ -3652,13 +3828,6 @@ class DeliveryProfileContractTest(unittest.TestCase):
     def test_blocked_reason_matrix_rejects_contradictory_evidence(self) -> None:
         schema = json.loads(DELIVERY_RESULT_SCHEMA.read_text(encoding="utf-8"))
         validator = Draft202012Validator(schema)
-        ready = copy.deepcopy(
-            next(
-                case["result"]
-                for case in profile_selection_cases()
-                if case["result"]["profile"] == "pr-readiness-handoff"
-            )
-        )
         alternatives: dict[str, object] = {
             "local_gate": "succeeded",
             "build": "read-only-observed",
@@ -3690,30 +3859,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
         for index, branch in enumerate(branches):
             properties = branch["properties"]
             reason = properties["terminal_reason"]["const"]
-            valid = copy.deepcopy(ready)
-            for field in (
-                "terminal_outcome",
-                "terminal_reason",
-                "commit_mode",
-                "formal_review_required",
-                "handoff",
-                "handoff_profile",
-            ):
-                if field in properties:
-                    valid[field] = properties[field]["const"]
-            valid["constraints"] = (
-                ["no-commit"] if valid["commit_mode"] == "forbidden" else []
-            )
-            valid["terminal_evidence"] = {
-                field: (
-                    FIXTURE_HEAD_OID
-                    if field_schema.get("$ref") == "#/$defs/oid"
-                    else field_schema["const"]
-                )
-                for field, field_schema in properties["terminal_evidence"][
-                    "properties"
-                ].items()
-            }
+            valid = blocker_result(branch)
             self.assertEqual(list(validator.iter_errors(valid)), [])
             for field, current in valid["terminal_evidence"].items():
                 replacement = alternatives[field]
@@ -3925,10 +4071,11 @@ class DeliveryProfileContractTest(unittest.TestCase):
         self.assertEqual(handoff["terminal_evidence"]["signature"], "verified")
         self.assertEqual(
             handoff["terminal_evidence"]["signature_verified_head_oid"],
-            FIXTURE_HEAD_OID,
+            handoff["head_sha"],
         )
         schema = json.loads(DELIVERY_RESULT_SCHEMA.read_text(encoding="utf-8"))
         validator = Draft202012Validator(schema)
+        validate_delivery_handoff_semantics(handoff)
         for replacement in (None, "f" * 39, "F" * 40):
             candidate = copy.deepcopy(handoff)
             candidate["terminal_evidence"]["signature_verified_head_oid"] = replacement
@@ -3936,6 +4083,31 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 self.assertTrue(list(validator.iter_errors(candidate)))
                 with self.assertRaises(AssertionError):
                     assert_valid_result_contract(candidate)
+                with self.assertRaises(ValueError):
+                    validate_delivery_handoff_semantics(candidate)
+
+        for replacement in ("e" * 40, "f" * 64):
+            candidate = copy.deepcopy(handoff)
+            candidate["terminal_evidence"]["signature_verified_head_oid"] = replacement
+            with self.subTest(valid_but_different_oid=replacement):
+                self.assertEqual(list(validator.iter_errors(candidate)), [])
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    "exact delivery head",
+                ):
+                    assert_valid_result_contract(candidate)
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "delivery_record.head_sha",
+                ):
+                    validate_delivery_handoff_semantics(candidate)
+
+        sha256_handoff = copy.deepcopy(handoff)
+        sha256_handoff["head_sha"] = "a" * 64
+        sha256_handoff["terminal_evidence"]["signature_verified_head_oid"] = "a" * 64
+        self.assertEqual(list(validator.iter_errors(sha256_handoff)), [])
+        assert_valid_result_contract(sha256_handoff)
+        validate_delivery_handoff_semantics(sha256_handoff)
 
         report = copy.deepcopy(
             next(
@@ -3950,6 +4122,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
         report["delivery_record"] = success_result(
             "pr-readiness-read-only-existing-range-probe-ready"
         )
+        report["delivery_record"]["head_sha"] = report["target"]["head"]["oid"]
         report["delivery_record"]["terminal_evidence"][
             "signature_verified_head_oid"
         ] = "c" * 40
@@ -3957,7 +4130,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
             list(read_only_report_validator().iter_errors(report)),
             [],
         )
-        with self.assertRaisesRegex(ValueError, "exact frozen target head"):
+        with self.assertRaisesRegex(ValueError, "delivery_record.head_sha"):
             validate_read_only_report_semantics(report)
 
         for anchor in (

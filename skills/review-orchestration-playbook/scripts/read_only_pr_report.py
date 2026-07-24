@@ -1,4 +1,4 @@
-"""Generate bindings and validate cross-field read-only PR report semantics."""
+"""Validate delivery handoffs and cross-field read-only PR report semantics."""
 
 from __future__ import annotations
 
@@ -62,6 +62,7 @@ DELIVERY_RESULT_FIELDS = {
     "schema_version",
     "profile",
     "constraints",
+    "head_sha",
     "local_mutation",
     "commit_mode",
     "formal_review_required",
@@ -173,6 +174,44 @@ READ_ONLY_DELIVERY_SUCCESS_MATRIX = {
             "signature": "verified",
             "signature_verified_head_oid": "required",
             "authorization": "not-required",
+            "input": "satisfied",
+        },
+    },
+}
+PR_READINESS_DELIVERY_SUCCESS_MATRIX = {
+    "pr-readiness-handoff-ready": {
+        "local_mutation": "allowed",
+        "commit_mode": "allowed",
+        "formal_review_required": True,
+        "terminal_evidence": {
+            "local_gate": "succeeded",
+            "build": "satisfied",
+            "tests": "satisfied",
+            "docs": "satisfied",
+            "journal": "satisfied",
+            "committed_range": "present",
+            "formal_review": "clean",
+            "signature": "verified",
+            "signature_verified_head_oid": "required",
+            "authorization": "satisfied",
+            "input": "satisfied",
+        },
+    },
+    "pr-readiness-existing-range-handoff-ready": {
+        "local_mutation": "allowed",
+        "commit_mode": "forbidden",
+        "formal_review_required": True,
+        "terminal_evidence": {
+            "local_gate": "checked",
+            "build": "satisfied",
+            "tests": "satisfied",
+            "docs": "satisfied",
+            "journal": "satisfied",
+            "committed_range": "present",
+            "formal_review": "clean",
+            "signature": "verified",
+            "signature_verified_head_oid": "required",
+            "authorization": "satisfied",
             "input": "satisfied",
         },
     },
@@ -308,6 +347,32 @@ def _observed_record(
     return None
 
 
+def _delivery_signature_head_errors(
+    delivery: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+) -> list[str]:
+    errors: list[str] = []
+    head_sha = delivery.get("head_sha")
+    if not _is_oid(head_sha):
+        errors.append("delivery_record.head_sha must be a full lowercase object ID")
+    signature = evidence.get("signature")
+    verified_head_oid = evidence.get("signature_verified_head_oid")
+    if signature == "verified":
+        if not _is_oid(verified_head_oid):
+            errors.append(
+                "verified delivery signature requires signature_verified_head_oid"
+            )
+        elif _is_oid(head_sha) and verified_head_oid != head_sha:
+            errors.append(
+                "verified delivery signature must bind delivery_record.head_sha"
+            )
+    elif verified_head_oid is not None:
+        errors.append(
+            "non-verified delivery signature must not bind a verified head OID"
+        )
+    return errors
+
+
 def _read_only_delivery_errors(record: object) -> list[str]:
     errors: list[str] = []
     delivery = _mapping(record)
@@ -380,6 +445,7 @@ def _read_only_delivery_errors(record: object) -> list[str]:
     if evidence is None or set(evidence) != DELIVERY_TERMINAL_EVIDENCE_FIELDS:
         errors.append("delivery terminal evidence is not a closed record")
         return errors
+    errors.extend(_delivery_signature_head_errors(delivery, evidence))
 
     formal_required = delivery.get("formal_review_required")
     if not isinstance(formal_required, bool):
@@ -410,16 +476,112 @@ def _read_only_delivery_errors(record: object) -> list[str]:
         errors.append(
             f"delivery terminal evidence contradicts terminal_reason {reason}"
         )
-    if expected_verified_head == "required":
-        if not _is_oid(verified_head_oid):
+    if expected_verified_head != "required" and verified_head_oid is not None:
+        errors.append("delivery reason must not bind a verified head OID")
+    return errors
+
+
+def _pr_readiness_delivery_errors(record: object) -> list[str]:
+    errors: list[str] = []
+    delivery = _mapping(record)
+    if delivery is None:
+        return ["delivery_record must be an object"]
+    if set(delivery) != DELIVERY_RESULT_FIELDS:
+        return ["delivery_record fields do not match the closed v3 contract"]
+    if delivery.get("schema_version") != 3:
+        errors.append("delivery_record.schema_version must be 3")
+    if delivery.get("profile") != "pr-readiness-handoff":
+        errors.append("ordinary PR readiness requires the PR handoff profile")
+
+    constraints = _sequence(delivery.get("constraints"))
+    constraints_are_strings = constraints is not None and all(
+        isinstance(item, str) for item in constraints
+    )
+    constraint_set = set(constraints) if constraints_are_strings else set()
+    if (
+        constraints is None
+        or not constraints_are_strings
+        or len(constraints) != len(constraint_set)
+        or not constraint_set
+        <= {
+            "local-only",
+            "report-only",
+            "probe-only",
+            "read-only",
+            "no-remote",
+            "no-commit",
+        }
+    ):
+        errors.append("delivery_record.constraints are malformed")
+    elif constraint_set & {
+        "local-only",
+        "report-only",
+        "probe-only",
+        "read-only",
+        "no-remote",
+    }:
+        errors.append("ordinary PR readiness cannot discard a remote-mutation limit")
+
+    expected_commit_mode = "forbidden" if "no-commit" in constraint_set else "allowed"
+    if delivery.get("local_mutation") != "allowed":
+        errors.append("ordinary PR readiness requires allowed local mutation")
+    if delivery.get("commit_mode") != expected_commit_mode:
+        errors.append("delivery_record.commit_mode contradicts constraints")
+    if delivery.get("formal_review_required") is not True:
+        errors.append("ordinary PR readiness requires formal review")
+    if delivery.get("remote_mutation") != "review-authorization-required":
+        errors.append("ordinary PR readiness requires review authorization")
+    if delivery.get("terminal_outcome") != "succeeded":
+        errors.append("ordinary PR readiness requires a succeeded delivery terminal")
+    if delivery.get("handoff") != "review-orchestration-playbook":
+        errors.append("ordinary PR readiness must route to the review skill")
+    if delivery.get("handoff_profile") != "pr-readiness":
+        errors.append("delivery_record handoff profile is not ordinary PR readiness")
+
+    evidence = _mapping(delivery.get("terminal_evidence"))
+    if evidence is None or set(evidence) != DELIVERY_TERMINAL_EVIDENCE_FIELDS:
+        errors.append("delivery terminal evidence is not a closed record")
+        return errors
+    errors.extend(_delivery_signature_head_errors(delivery, evidence))
+
+    reason = delivery.get("terminal_reason")
+    expected = PR_READINESS_DELIVERY_SUCCESS_MATRIX.get(reason)
+    if expected is None:
+        errors.append("ordinary PR readiness requires an exact ready reason")
+        return errors
+    for field in (
+        "local_mutation",
+        "commit_mode",
+        "formal_review_required",
+    ):
+        if delivery.get(field) != expected[field]:
             errors.append(
-                "verified delivery signature requires signature_verified_head_oid"
+                f"delivery_record.{field} contradicts terminal_reason {reason}"
             )
-    elif verified_head_oid is not None:
+    static_evidence = dict(evidence)
+    static_evidence.pop("signature_verified_head_oid", None)
+    expected_evidence = dict(expected["terminal_evidence"])
+    expected_evidence.pop("signature_verified_head_oid", None)
+    if static_evidence != expected_evidence:
         errors.append(
-            "non-verified delivery signature must not bind a verified head OID"
+            f"delivery terminal evidence contradicts terminal_reason {reason}"
         )
     return errors
+
+
+def validate_delivery_handoff(record: object) -> None:
+    """Raise ValueError unless one exact delivery handoff is receiver-safe."""
+
+    delivery = _mapping(record)
+    handoff_profile = delivery.get("handoff_profile") if delivery is not None else None
+    if handoff_profile == "pr-readiness-read-only-probe":
+        errors = _read_only_delivery_errors(record)
+    elif handoff_profile == "pr-readiness":
+        errors = _pr_readiness_delivery_errors(record)
+    else:
+        errors = ["delivery_record has no supported receiver handoff profile"]
+    if errors:
+        raise ValueError("; ".join(errors))
 
 
 def _repository_identity_valid(value: object) -> bool:
@@ -969,18 +1131,12 @@ def semantic_errors(report: object) -> list[str]:
         ):
             errors.append("target head provider host is inconsistent")
     delivery = _mapping(root.get("delivery_record"))
-    delivery_evidence = (
-        _mapping(delivery.get("terminal_evidence")) if delivery is not None else None
-    )
     if (
-        delivery_evidence is not None
-        and delivery_evidence.get("signature") == "verified"
+        delivery is not None
         and head is not None
-        and delivery_evidence.get("signature_verified_head_oid") != head.get("oid")
+        and delivery.get("head_sha") != head.get("oid")
     ):
-        errors.append(
-            "verified delivery signature must bind the exact frozen target head"
-        )
+        errors.append("delivery_record.head_sha must bind the exact frozen target head")
 
     if "pull_request" in target:
         pull_request = _mapping(target.get("pull_request"))
@@ -1758,9 +1914,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _emit_rejection(exc)
         print(json.dumps({"classification": "accepted"}, sort_keys=True))
         return 0
+    if len(args) == 2 and args[0] == "validate-delivery-handoff":
+        try:
+            payload = _read_payload(args[1])
+            validate_delivery_handoff(payload)
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            RecursionError,
+            MemoryError,
+            OSError,
+            ValueError,
+            TypeError,
+            KeyError,
+            OverflowError,
+        ) as exc:
+            return _emit_rejection(exc)
+        print(json.dumps({"classification": "accepted"}, sort_keys=True))
+        return 0
     print(
         "usage: read_only_pr_report.py "
-        "{new-bindings|validate-semantics <report.json|->}",
+        "{new-bindings|validate-semantics <report.json|->|"
+        "validate-delivery-handoff <delivery.json|->}",
         file=sys.stderr,
     )
     return 64

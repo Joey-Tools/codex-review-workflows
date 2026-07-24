@@ -3,7 +3,7 @@ id: 20260724-dpf001
 title: Unify Delivery Profiles And Retire Standalone Agile Delivery
 status: completed
 created: 2026-07-24
-updated: 2026-07-24
+updated: 2026-07-25
 branch: codex/delivery-profiles-agile-retirement-20260724
 pr:
 supersedes: []
@@ -100,8 +100,13 @@ superseded_by:
   depth/node counts, and non-object roots; every rejection is one bounded,
   control-free machine record.
 - Every terminal result or permitted handoff carries a closed delivery-v3
-  record with the selected profile, immutable constraint list, mutation modes,
-  terminal outcome/reason/evidence, handoff target, and handoff profile. A
+  record with the selected profile, immutable constraint list, exact full
+  `head_sha`, mutation modes, terminal outcome/reason/evidence, handoff target,
+  and handoff profile. A verified `signature_verified_head_oid` must
+  byte-for-byte equal `head_sha` for both SHA-1 and SHA-256; the ordinary and
+  read-only PR-readiness receivers enforce that equality through the
+  same-release semantic helper, and the read-only report additionally binds
+  the delivery head to its exact target head. A
   blocked PR-readiness run retains its requested profile but forces both
   handoff fields to `none`. A commit-allowed PR handoff requires a succeeded
   local gate, satisfied build/tests/docs/journal, a present clean range, a
@@ -115,7 +120,11 @@ superseded_by:
   failure, and authorization/input blockers all stop before handoff.
   Conflicting or widened records fail closed.
 - The delivery schema now owns an exact 18-row success-reason matrix and a
-  finite blocker matrix. Every success reason
+  26-row blocker matrix. Mutable commit, mutable no-commit existing-range, and
+  read-only formal blockers are distinct closed rows that fix
+  `local_mutation`, `commit_mode`, local-gate state, and mutable versus
+  read-only phase evidence. No-commit and read-only blockers cannot claim a
+  fake succeeded local gate. Every success reason
   fixes its profile, local/commit/formal/remote modes, complete local
   gate/build/tests/docs/journal/range/review/signature/authorization/input
   evidence, and handoff. Cross-profile, cross-mode, and cross-evidence
@@ -176,9 +185,11 @@ superseded_by:
 ## Evidence
 
 - `python3 -B -m unittest discover -s skills/change-delivery-workflow/tests
-  -p 'test_*.py'` passed (`42` tests). The suite keeps the exact 18-success
-  matrix and now also covers the finite blocked-reason matrix, exact frozen-head
-  signature verification for no-commit existing-range handoff, snapshot- and
+  -p 'test_*.py'` passed (`44` tests). The suite keeps the exact 18-success
+  matrix and now also covers the 26 closed blocker rows, mode-specific
+  no-commit/read-only blockers, false succeeded-gate rejection, exact
+  frozen-head signature verification for both 40- and 64-hex object IDs,
+  ordinary PR-readiness receiver admission, snapshot- and
   ordered-content-bound CI pages, complete paginated review threads, global
   `StatusContext` creator/context identity, and fail-closed delivery-v2/report-v6
   migration.
@@ -203,8 +214,12 @@ superseded_by:
   loopback-broker tests that bind an ephemeral `127.0.0.1` port.
 - `python3 -B skills/review-orchestration-playbook/tests/test_cli.py -q`
   passed (`17` tests).
-- Both the system `quick_validate.py` and Joey
-  `codex_skill_validate.py` passed the two modified skills.
+- The system `quick_validate.py` and Joey `codex_skill_validate.py` could not
+  run because local PyYAML is absent and the unapproved PyPI dependency fetch
+  was denied. The documented offline fallback passed for both modified skills:
+  Ruby/Psych parsed closed frontmatter and `agents/openai.yaml`, checked the
+  quick-validator name/description constraints, and resolved every relative
+  Markdown link target.
 - `jq empty` passed for both schemas and all three changed fixture files.
   Draft 2020-12 `jsonschema` validation accepted both schema definitions;
   the delivery suite validated all `13` profile-selection cases, all `8`

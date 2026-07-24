@@ -3986,6 +3986,8 @@ class RepositoryContractTest(unittest.TestCase):
         )
         delivery = schema["$defs"]["readOnlyProbeDeliveryRecord"]
         self.assertEqual(delivery["properties"]["schema_version"]["const"], 3)
+        self.assertIn("head_sha", delivery["required"])
+        self.assertEqual(delivery["properties"]["head_sha"]["$ref"], "#/$defs/oid")
         self.assertEqual(
             delivery["properties"]["terminal_outcome"]["const"],
             "succeeded",
@@ -4023,6 +4025,10 @@ class RepositoryContractTest(unittest.TestCase):
         for content in (skill, readiness, contracts):
             self.assertIn("self-contained", content)
             self.assertIn("candidate-head", content)
+        for content in (skill, readiness):
+            self.assertIn("validate-delivery-handoff", content)
+            self.assertIn("signature_verified_head_oid", content)
+            self.assertIn("head_sha", content)
         self.assertNotIn(
             "../../change-delivery-workflow/references/delivery-result.schema.json",
             readiness,

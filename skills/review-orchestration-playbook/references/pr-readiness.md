@@ -9,6 +9,18 @@ Otherwise, use this reference after the local delivery gate has produced a
 reviewable commit and the parent request owns PR creation/update, review/CI
 follow-up, merge-readiness reporting, or merge.
 
+An ordinary inbound delivery handoff is accepted only after the installed
+same-release `read_only_pr_report.py validate-delivery-handoff -` semantic
+validator accepts the exact in-memory record through stdin. That receiver
+admits only the two closed `pr-readiness` success rows, requires a full
+lowercase SHA-1 or SHA-256 `head_sha`, and requires
+`signature_verified_head_oid` to byte-for-byte equal `head_sha`. Preserve the
+record unchanged. Before any lane, admission, PR read, or PR mutation, require
+its `head_sha` to equal the frozen local range head; after selecting a PR,
+require the same value to equal current `pr_head_oid`. A missing binding or
+another syntactically valid 40- or 64-hex OID is terminal `blocked-input`, not
+authority to infer or substitute a head.
+
 ## Read-Only Delivery Probe: Classify And Stop First
 
 This path receives only a complete
@@ -122,6 +134,7 @@ The receiving sequence is closed:
    the exact in-memory JSON through stdin with Python `-I -B -S`. It must
    accept before emission. This second gate binds all instance IDs by equality
    and rejects contradictions that JSON Schema cannot express, including
+   delivery `head_sha` versus both its verified-signature OID and target head,
    target-identity mismatch, stable provider/object identity collisions,
    non-bijective database-ID/Node-ID mappings, aggregate CI counts versus the
    complete rollup, incomplete or identity-drifted CI pagination, server and
