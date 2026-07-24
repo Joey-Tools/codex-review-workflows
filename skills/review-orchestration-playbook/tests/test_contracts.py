@@ -1460,6 +1460,21 @@ class RepositoryContractTest(unittest.TestCase):
             private,
         )
 
+    def test_canonical_ci_covers_all_active_skill_helpers_and_suites(self) -> None:
+        canonical = (CI_FIXTURE_ROOT / "canonical.yml").read_text(encoding="utf-8")
+        for anchor in (
+            "skills/synthetic-token-fixtures/scripts/active_catalog_binding.py",
+            "skills/change-delivery-workflow/tests",
+            "skills/synthetic-token-fixtures/tests",
+        ):
+            self.assertIn(anchor, canonical)
+
+        if CI_PROFILE == "canonical":
+            workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
+                encoding="utf-8"
+            )
+            self.assertEqual(workflow, canonical)
+
     def test_helper_declares_and_tests_its_minimum_python_runtime(self) -> None:
         entrypoint = (SCRIPTS / "isolated_review").read_text(encoding="utf-8")
         workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")

@@ -9,6 +9,7 @@
     "constraints",
     "local_mutation",
     "commit_mode",
+    "formal_review_required",
     "remote_mutation",
     "handoff",
     "handoff_profile"
@@ -49,6 +50,9 @@
         "allowed",
         "forbidden"
       ]
+    },
+    "formal_review_required": {
+      "type": "boolean"
     },
     "remote_mutation": {
       "enum": [
@@ -158,6 +162,9 @@
           },
           "handoff_profile": {
             "const": "pr-readiness"
+          },
+          "formal_review_required": {
+            "const": true
           }
         }
       },
@@ -266,6 +273,9 @@
           },
           "handoff": {
             "const": "review-orchestration-playbook"
+          },
+          "formal_review_required": {
+            "const": true
           }
         }
       }
@@ -301,6 +311,9 @@
           },
           "handoff": {
             "const": "review-orchestration-playbook"
+          },
+          "formal_review_required": {
+            "const": false
           }
         }
       }

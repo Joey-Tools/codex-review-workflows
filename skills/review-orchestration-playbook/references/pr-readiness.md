@@ -42,8 +42,10 @@ The receiving sequence is closed:
    record a blocker.
 5. Emit exactly one terminal record conforming to
    [pr-readiness-read-only-report.schema.json](pr-readiness-read-only-report.schema.json).
-   Each unavailable evidence kind must be listed in `unavailable_evidence`;
-   every action field remains `false`. Report only evidence actually observed,
+   Each `unavailable` or `blocked` evidence kind must be listed in
+   `unavailable_evidence` and have exactly one blocker whose `evidence` field
+   names that kind. An `observed` kind must appear in neither summary. Every
+   action field remains `false`. Report only evidence actually observed,
    unavailable evidence, and blockers. Then stop without another handoff.
 
 This report is never a named-review artifact, secret-admission result,

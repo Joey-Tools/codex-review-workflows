@@ -10,6 +10,7 @@
         "constraints": [],
         "local_mutation": "allowed",
         "commit_mode": "allowed",
+        "formal_review_required": false,
         "remote_mutation": "forbidden",
         "handoff": "none",
         "handoff_profile": "none"
@@ -24,6 +25,7 @@
         "constraints": [],
         "local_mutation": "allowed",
         "commit_mode": "allowed",
+        "formal_review_required": true,
         "remote_mutation": "review-authorization-required",
         "handoff": "review-orchestration-playbook",
         "handoff_profile": "pr-readiness"
@@ -38,6 +40,7 @@
         "constraints": [],
         "local_mutation": "allowed",
         "commit_mode": "allowed",
+        "formal_review_required": true,
         "remote_mutation": "forbidden",
         "handoff": "none",
         "handoff_profile": "none"
@@ -54,6 +57,7 @@
         ],
         "local_mutation": "allowed",
         "commit_mode": "allowed",
+        "formal_review_required": true,
         "remote_mutation": "forbidden",
         "handoff": "none",
         "handoff_profile": "none"
@@ -68,6 +72,7 @@
         "constraints": [],
         "local_mutation": "allowed",
         "commit_mode": "allowed",
+        "formal_review_required": true,
         "remote_mutation": "review-authorization-required",
         "handoff": "review-orchestration-playbook",
         "handoff_profile": "pr-readiness"
@@ -85,6 +90,7 @@
         ],
         "local_mutation": "forbidden",
         "commit_mode": "forbidden",
+        "formal_review_required": false,
         "remote_mutation": "forbidden",
         "handoff": "none",
         "handoff_profile": "none"
@@ -102,6 +108,7 @@
         ],
         "local_mutation": "allowed",
         "commit_mode": "forbidden",
+        "formal_review_required": false,
         "remote_mutation": "forbidden",
         "handoff": "none",
         "handoff_profile": "none"
@@ -119,6 +126,7 @@
         ],
         "local_mutation": "forbidden",
         "commit_mode": "forbidden",
+        "formal_review_required": false,
         "remote_mutation": "forbidden",
         "handoff": "none",
         "handoff_profile": "none"
@@ -135,6 +143,7 @@
         ],
         "local_mutation": "allowed",
         "commit_mode": "allowed",
+        "formal_review_required": true,
         "remote_mutation": "forbidden",
         "handoff": "none",
         "handoff_profile": "none"
@@ -151,6 +160,7 @@
         ],
         "local_mutation": "forbidden",
         "commit_mode": "forbidden",
+        "formal_review_required": false,
         "remote_mutation": "forbidden",
         "handoff": "none",
         "handoff_profile": "none"
@@ -168,6 +178,7 @@
         ],
         "local_mutation": "forbidden",
         "commit_mode": "forbidden",
+        "formal_review_required": false,
         "remote_mutation": "forbidden",
         "handoff": "review-orchestration-playbook",
         "handoff_profile": "pr-readiness-read-only-probe"
@@ -182,6 +193,7 @@
         "constraints": [],
         "local_mutation": "allowed",
         "commit_mode": "allowed",
+        "formal_review_required": true,
         "remote_mutation": "review-authorization-required",
         "handoff": "review-orchestration-playbook",
         "handoff_profile": "pr-readiness"

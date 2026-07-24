@@ -49,6 +49,9 @@
             "remote_mutation": {
               "const": "forbidden"
             },
+            "formal_review_required": {
+              "const": false
+            },
             "handoff": {
               "const": "review-orchestration-playbook"
             },
@@ -60,6 +63,7 @@
             "profile",
             "constraints",
             "remote_mutation",
+            "formal_review_required",
             "handoff",
             "handoff_profile"
           ]
@@ -112,10 +116,20 @@
       "items": {
         "type": "object",
         "required": [
+          "evidence",
           "code",
           "detail"
         ],
         "properties": {
+          "evidence": {
+            "enum": [
+              "pr-selection",
+              "pr-lifecycle",
+              "ci-status",
+              "conversation-state",
+              "base-and-head"
+            ]
+          },
           "code": {
             "type": "string",
             "minLength": 1,
@@ -130,6 +144,7 @@
         },
         "additionalProperties": false
       },
+      "uniqueItems": true,
       "maxItems": 64
     },
     "actions": {
@@ -176,6 +191,23 @@
     }
   },
   "additionalProperties": false,
+  "allOf": [
+    {
+      "$ref": "#/$defs/prSelectionConsistency"
+    },
+    {
+      "$ref": "#/$defs/prLifecycleConsistency"
+    },
+    {
+      "$ref": "#/$defs/ciStatusConsistency"
+    },
+    {
+      "$ref": "#/$defs/conversationStateConsistency"
+    },
+    {
+      "$ref": "#/$defs/baseAndHeadConsistency"
+    }
+  ],
   "$defs": {
     "evidenceSnapshot": {
       "type": "object",
@@ -202,6 +234,357 @@
         }
       },
       "additionalProperties": false
+    },
+    "prSelectionConsistency": {
+      "$comment": "Expanded below because JSON Schema has no parameterized references.",
+      "if": {
+        "properties": {
+          "evidence": {
+            "properties": {
+              "pr_selection": {
+                "properties": {
+                  "status": {
+                    "const": "observed"
+                  }
+                },
+                "required": [
+                  "status"
+                ]
+              }
+            },
+            "required": [
+              "pr_selection"
+            ]
+          }
+        },
+        "required": [
+          "evidence"
+        ]
+      },
+      "then": {
+        "properties": {
+          "unavailable_evidence": {
+            "not": {
+              "contains": {
+                "const": "pr-selection"
+              }
+            }
+          },
+          "blockers": {
+            "not": {
+              "contains": {
+                "$ref": "#/$defs/prSelectionBlocker"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "unavailable_evidence": {
+            "contains": {
+              "const": "pr-selection"
+            }
+          },
+          "blockers": {
+            "contains": {
+              "$ref": "#/$defs/prSelectionBlocker"
+            },
+            "maxContains": 1
+          }
+        }
+      }
+    },
+    "prLifecycleConsistency": {
+      "if": {
+        "properties": {
+          "evidence": {
+            "properties": {
+              "pr_lifecycle": {
+                "properties": {
+                  "status": {
+                    "const": "observed"
+                  }
+                },
+                "required": [
+                  "status"
+                ]
+              }
+            },
+            "required": [
+              "pr_lifecycle"
+            ]
+          }
+        },
+        "required": [
+          "evidence"
+        ]
+      },
+      "then": {
+        "properties": {
+          "unavailable_evidence": {
+            "not": {
+              "contains": {
+                "const": "pr-lifecycle"
+              }
+            }
+          },
+          "blockers": {
+            "not": {
+              "contains": {
+                "$ref": "#/$defs/prLifecycleBlocker"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "unavailable_evidence": {
+            "contains": {
+              "const": "pr-lifecycle"
+            }
+          },
+          "blockers": {
+            "contains": {
+              "$ref": "#/$defs/prLifecycleBlocker"
+            },
+            "maxContains": 1
+          }
+        }
+      }
+    },
+    "ciStatusConsistency": {
+      "if": {
+        "properties": {
+          "evidence": {
+            "properties": {
+              "ci_status": {
+                "properties": {
+                  "status": {
+                    "const": "observed"
+                  }
+                },
+                "required": [
+                  "status"
+                ]
+              }
+            },
+            "required": [
+              "ci_status"
+            ]
+          }
+        },
+        "required": [
+          "evidence"
+        ]
+      },
+      "then": {
+        "properties": {
+          "unavailable_evidence": {
+            "not": {
+              "contains": {
+                "const": "ci-status"
+              }
+            }
+          },
+          "blockers": {
+            "not": {
+              "contains": {
+                "$ref": "#/$defs/ciStatusBlocker"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "unavailable_evidence": {
+            "contains": {
+              "const": "ci-status"
+            }
+          },
+          "blockers": {
+            "contains": {
+              "$ref": "#/$defs/ciStatusBlocker"
+            },
+            "maxContains": 1
+          }
+        }
+      }
+    },
+    "conversationStateConsistency": {
+      "if": {
+        "properties": {
+          "evidence": {
+            "properties": {
+              "conversation_state": {
+                "properties": {
+                  "status": {
+                    "const": "observed"
+                  }
+                },
+                "required": [
+                  "status"
+                ]
+              }
+            },
+            "required": [
+              "conversation_state"
+            ]
+          }
+        },
+        "required": [
+          "evidence"
+        ]
+      },
+      "then": {
+        "properties": {
+          "unavailable_evidence": {
+            "not": {
+              "contains": {
+                "const": "conversation-state"
+              }
+            }
+          },
+          "blockers": {
+            "not": {
+              "contains": {
+                "$ref": "#/$defs/conversationStateBlocker"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "unavailable_evidence": {
+            "contains": {
+              "const": "conversation-state"
+            }
+          },
+          "blockers": {
+            "contains": {
+              "$ref": "#/$defs/conversationStateBlocker"
+            },
+            "maxContains": 1
+          }
+        }
+      }
+    },
+    "baseAndHeadConsistency": {
+      "if": {
+        "properties": {
+          "evidence": {
+            "properties": {
+              "base_and_head": {
+                "properties": {
+                  "status": {
+                    "const": "observed"
+                  }
+                },
+                "required": [
+                  "status"
+                ]
+              }
+            },
+            "required": [
+              "base_and_head"
+            ]
+          }
+        },
+        "required": [
+          "evidence"
+        ]
+      },
+      "then": {
+        "properties": {
+          "unavailable_evidence": {
+            "not": {
+              "contains": {
+                "const": "base-and-head"
+              }
+            }
+          },
+          "blockers": {
+            "not": {
+              "contains": {
+                "$ref": "#/$defs/baseAndHeadBlocker"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "unavailable_evidence": {
+            "contains": {
+              "const": "base-and-head"
+            }
+          },
+          "blockers": {
+            "contains": {
+              "$ref": "#/$defs/baseAndHeadBlocker"
+            },
+            "maxContains": 1
+          }
+        }
+      }
+    },
+    "prSelectionBlocker": {
+      "type": "object",
+      "properties": {
+        "evidence": {
+          "const": "pr-selection"
+        }
+      },
+      "required": [
+        "evidence"
+      ]
+    },
+    "prLifecycleBlocker": {
+      "type": "object",
+      "properties": {
+        "evidence": {
+          "const": "pr-lifecycle"
+        }
+      },
+      "required": [
+        "evidence"
+      ]
+    },
+    "ciStatusBlocker": {
+      "type": "object",
+      "properties": {
+        "evidence": {
+          "const": "ci-status"
+        }
+      },
+      "required": [
+        "evidence"
+      ]
+    },
+    "conversationStateBlocker": {
+      "type": "object",
+      "properties": {
+        "evidence": {
+          "const": "conversation-state"
+        }
+      },
+      "required": [
+        "evidence"
+      ]
+    },
+    "baseAndHeadBlocker": {
+      "type": "object",
+      "properties": {
+        "evidence": {
+          "const": "base-and-head"
+        }
+      },
+      "required": [
+        "evidence"
+      ]
     }
   }
 }

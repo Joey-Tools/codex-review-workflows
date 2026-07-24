@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 import unittest
+
+from jsonschema import Draft202012Validator
+from referencing import Registry, Resource
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +37,7 @@ RESULT_FIELDS = {
     "constraints",
     "local_mutation",
     "commit_mode",
+    "formal_review_required",
     "remote_mutation",
     "handoff",
     "handoff_profile",
@@ -147,6 +152,18 @@ def fixture_cases(path: Path, label: str) -> list[dict[str, object]]:
     return cases
 
 
+def read_only_report_validator() -> Draft202012Validator:
+    delivery_schema = json.loads(DELIVERY_RESULT_SCHEMA.read_text(encoding="utf-8"))
+    report_schema = json.loads(READ_ONLY_PR_REPORT_SCHEMA.read_text(encoding="utf-8"))
+    Draft202012Validator.check_schema(delivery_schema)
+    Draft202012Validator.check_schema(report_schema)
+    registry = Registry().with_resource(
+        delivery_schema["$id"],
+        Resource.from_contents(delivery_schema),
+    )
+    return Draft202012Validator(report_schema, registry=registry)
+
+
 def assert_valid_result_contract(result: object) -> None:
     if not isinstance(result, dict):
         raise AssertionError("delivery result must be an object")
@@ -168,6 +185,8 @@ def assert_valid_result_contract(result: object) -> None:
     commit_mode = result["commit_mode"]
     if commit_mode not in {"allowed", "forbidden"}:
         raise AssertionError("unknown commit mode")
+    if not isinstance(result["formal_review_required"], bool):
+        raise AssertionError("formal-review requirement must be boolean")
     remote_mutation = result["remote_mutation"]
     if remote_mutation not in {
         "forbidden",
@@ -209,6 +228,8 @@ def assert_valid_result_contract(result: object) -> None:
     if handoff_profile not in HANDOFF_PROFILES:
         raise AssertionError("unknown handoff profile")
     if result["profile"] == "pr-readiness-handoff":
+        if result["formal_review_required"] is not True:
+            raise AssertionError("PR handoff bypassed required formal review")
         if remote_mutation != "review-authorization-required":
             raise AssertionError("PR handoff bypassed review authorization")
         if handoff != "review-orchestration-playbook":
@@ -216,6 +237,8 @@ def assert_valid_result_contract(result: object) -> None:
         if handoff_profile != "pr-readiness":
             raise AssertionError("PR handoff used the wrong review profile")
     elif handoff_profile == "pr-readiness-read-only-probe":
+        if result["formal_review_required"] is not False:
+            raise AssertionError("read-only PR probe bypassed a required review")
         if result["profile"] != "local-gate":
             raise AssertionError("read-only PR probe did not use the local gate")
         if remote_mutation != "forbidden":
@@ -258,6 +281,7 @@ def assert_read_only_report_contract(report: object) -> None:
         "conversation_state": "conversation-state",
         "base_and_head": "base-and-head",
     }
+    blocker_evidence: list[str] = []
     for field, external_name in evidence_names.items():
         snapshot = evidence[field]
         if not isinstance(snapshot, dict) or set(snapshot) != {"status", "details"}:
@@ -274,7 +298,8 @@ def assert_read_only_report_contract(report: object) -> None:
     blockers = report["blockers"]
     if not isinstance(blockers, list) or not all(
         isinstance(blocker, dict)
-        and set(blocker) == {"code", "detail"}
+        and set(blocker) == {"evidence", "code", "detail"}
+        and blocker["evidence"] in evidence_names.values()
         and isinstance(blocker["code"], str)
         and blocker["code"]
         and isinstance(blocker["detail"], str)
@@ -282,6 +307,14 @@ def assert_read_only_report_contract(report: object) -> None:
         for blocker in blockers
     ):
         raise AssertionError("read-only PR report blockers are invalid")
+    blocker_evidence = [blocker["evidence"] for blocker in blockers]
+    if len(blocker_evidence) != len(set(blocker_evidence)):
+        raise AssertionError("read-only PR report has duplicate evidence blockers")
+    for field, external_name in evidence_names.items():
+        if (evidence[field]["status"] != "observed") != (
+            external_name in blocker_evidence
+        ):
+            raise AssertionError("evidence blocker does not match its snapshot")
     actions = report["actions"]
     if not isinstance(actions, dict) or set(actions) != READ_ONLY_ACTION_FIELDS:
         raise AssertionError("read-only PR report actions are not closed")
@@ -344,6 +377,53 @@ class DeliveryProfileContractTest(unittest.TestCase):
             "combined MVP-plus-PR request therefore selects `pr-readiness-handoff`",
             "combined MVP-plus-full-local-gate request similarly selects `local-gate`",
             "remote or full-gate work must wait for a later request",
+        ):
+            self.assertIn(anchor, self.normalized_change)
+
+    def test_profiles_resolve_formal_review_requirement_deterministically(
+        self,
+    ) -> None:
+        cases = {case["prompt"]: case["result"] for case in profile_selection_cases()}
+        expected = {
+            "Deliver a quick MVP and stop at a local checkpoint.": False,
+            "Complete this non-trivial implementation locally.": True,
+            "Probe local gate readiness, but do not commit.": False,
+            "Implement and validate this locally, but do not commit.": False,
+            "Run the full workflow with no remote work.": True,
+            "Probe full workflow and PR readiness; do not make remote changes.": False,
+            "Run the full workflow and open a PR.": True,
+        }
+        for prompt, formal_review_required in expected.items():
+            with self.subTest(prompt=prompt):
+                self.assertIs(
+                    cases[prompt]["formal_review_required"],
+                    formal_review_required,
+                )
+
+        validator = Draft202012Validator(
+            json.loads(DELIVERY_RESULT_SCHEMA.read_text(encoding="utf-8"))
+        )
+        for prompt in (
+            "Run the full workflow and open a PR.",
+            "Probe full workflow and PR readiness; do not make remote changes.",
+        ):
+            contradictory = copy.deepcopy(cases[prompt])
+            contradictory["formal_review_required"] = not contradictory[
+                "formal_review_required"
+            ]
+            with self.subTest(contradictory_prompt=prompt):
+                self.assertTrue(list(validator.iter_errors(contradictory)))
+                with self.assertRaises(AssertionError):
+                    assert_valid_result_contract(contradictory)
+
+        for anchor in (
+            "Resolve `formal_review_required` once after the profile and hard constraints",
+            "`pr-readiness-handoff` always resolves to `true`",
+            "ordinary mutation-capable `local-gate` with commit mode `allowed` resolves to `true`",
+            "constrained `local-gate` with commit mode `forbidden` resolves to `false`",
+            "`focused-checkpoint` resolves to `false` by default",
+            "may not downgrade either profile-mandated `true`",
+            "preserve it unchanged across every handoff",
         ):
             self.assertIn(anchor, self.normalized_change)
 
@@ -599,6 +679,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
         self.assertEqual(set(schema["required"]), READ_ONLY_REPORT_FIELDS)
         self.assertEqual(set(schema["properties"]), READ_ONLY_REPORT_FIELDS)
         self.assertFalse(schema["additionalProperties"])
+        Draft202012Validator.check_schema(schema)
         delivery_contract = schema["properties"]["delivery_record"]["allOf"]
         self.assertEqual(
             delivery_contract[0]["$ref"],
@@ -607,6 +688,10 @@ class DeliveryProfileContractTest(unittest.TestCase):
         self.assertEqual(
             delivery_contract[1]["properties"]["handoff_profile"]["const"],
             "pr-readiness-read-only-probe",
+        )
+        self.assertIs(
+            delivery_contract[1]["properties"]["formal_review_required"]["const"],
+            False,
         )
         self.assertEqual(
             set(schema["properties"]["evidence"]["required"]),
@@ -624,6 +709,76 @@ class DeliveryProfileContractTest(unittest.TestCase):
         self.assertIs(schema["properties"]["merge_ready"]["const"], False)
         self.assertEqual(schema["properties"]["next_handoff"]["const"], "none")
 
+    def test_read_only_pr_report_schema_rejects_inconsistent_summaries(
+        self,
+    ) -> None:
+        valid = copy.deepcopy(
+            fixture_cases(READ_ONLY_PR_PROBE_CASES, "read-only-pr-probe")[0][
+                "expected"
+            ]["terminal_result"]
+        )
+        validator = read_only_report_validator()
+        self.assertEqual(list(validator.iter_errors(valid)), [])
+
+        inconsistent: dict[str, dict[str, object]] = {}
+
+        missing_unavailable = copy.deepcopy(valid)
+        missing_unavailable["unavailable_evidence"].remove("ci-status")
+        inconsistent["non-observed-without-unavailable-summary"] = missing_unavailable
+
+        missing_blocker = copy.deepcopy(valid)
+        missing_blocker["blockers"] = [
+            blocker
+            for blocker in missing_blocker["blockers"]
+            if blocker["evidence"] != "ci-status"
+        ]
+        inconsistent["non-observed-without-blocker"] = missing_blocker
+
+        observed_with_summaries = copy.deepcopy(valid)
+        observed_with_summaries["evidence"]["ci_status"] = {
+            "status": "observed",
+            "details": ["CI was observed."],
+        }
+        inconsistent["observed-with-unavailable-and-blocker"] = observed_with_summaries
+
+        wrong_blocker_target = copy.deepcopy(valid)
+        wrong_blocker_target["blockers"][0]["evidence"] = "pr-selection"
+        inconsistent["blocker-targets-observed-evidence"] = wrong_blocker_target
+
+        duplicate_blocker = copy.deepcopy(valid)
+        duplicate_blocker["blockers"].append(
+            {
+                "evidence": "ci-status",
+                "code": "second-ci-blocker",
+                "detail": "A second blocker must not summarize the same evidence.",
+            }
+        )
+        inconsistent["duplicate-blocker-for-one-evidence-kind"] = duplicate_blocker
+
+        for name, candidate in inconsistent.items():
+            with self.subTest(name=name):
+                self.assertTrue(list(validator.iter_errors(candidate)))
+                with self.assertRaises(AssertionError):
+                    assert_read_only_report_contract(candidate)
+
+        schema = validator.schema
+        self.assertEqual(len(schema["allOf"]), len(READ_ONLY_EVIDENCE_FIELDS))
+        blocker_schema = schema["properties"]["blockers"]["items"]
+        self.assertEqual(
+            set(blocker_schema["required"]),
+            {"evidence", "code", "detail"},
+        )
+        self.assertEqual(
+            set(blocker_schema["properties"]["evidence"]["enum"]),
+            {
+                "pr-selection",
+                "pr-lifecycle",
+                "ci-status",
+                "conversation-state",
+                "base-and-head",
+            },
+        )
+
     def test_delivery_result_schema_is_closed_and_fixture_cases_conform(
         self,
     ) -> None:
@@ -634,6 +789,8 @@ class DeliveryProfileContractTest(unittest.TestCase):
         self.assertEqual(set(schema["required"]), RESULT_FIELDS)
         self.assertEqual(set(schema["properties"]), RESULT_FIELDS)
         self.assertFalse(schema["additionalProperties"])
+        Draft202012Validator.check_schema(schema)
+        validator = Draft202012Validator(schema)
         self.assertEqual(
             set(schema["properties"]["profile"]["enum"]),
             PROFILES,
@@ -705,6 +862,10 @@ class DeliveryProfileContractTest(unittest.TestCase):
             profile_constraint["then"]["properties"]["handoff_profile"]["const"],
             "pr-readiness",
         )
+        self.assertIs(
+            profile_constraint["then"]["properties"]["formal_review_required"]["const"],
+            True,
+        )
         self.assertEqual(
             profile_constraint["else"]["properties"]["remote_mutation"]["const"],
             "forbidden",
@@ -725,6 +886,12 @@ class DeliveryProfileContractTest(unittest.TestCase):
             pr_handoff_constraint["then"]["properties"]["profile"]["const"],
             "pr-readiness-handoff",
         )
+        self.assertIs(
+            pr_handoff_constraint["then"]["properties"]["formal_review_required"][
+                "const"
+            ],
+            True,
+        )
         self.assertEqual(
             read_only_handoff_constraint["then"]["properties"]["profile"]["const"],
             "local-gate",
@@ -733,10 +900,17 @@ class DeliveryProfileContractTest(unittest.TestCase):
             read_only_handoff_constraint["then"]["properties"]["handoff"]["const"],
             "review-orchestration-playbook",
         )
+        self.assertIs(
+            read_only_handoff_constraint["then"]["properties"][
+                "formal_review_required"
+            ]["const"],
+            False,
+        )
 
         for case in profile_selection_cases():
             with self.subTest(prompt=case["prompt"]):
                 assert_valid_result_contract(case["result"])
+                self.assertEqual(list(validator.iter_errors(case["result"])), [])
 
     def test_constrained_result_cannot_be_reinterpreted_downstream(self) -> None:
         constrained = next(
@@ -825,6 +999,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 "profile": "local-gate",
                 "commit_mode": "forbidden",
                 "existing_committed_range": "base_sha..head_sha",
+                "formal_review_required": True,
                 "review_outcome": "findings",
             },
         )
@@ -858,6 +1033,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 "profile": "local-gate",
                 "commit_mode": "forbidden",
                 "existing_committed_range": "base_sha..head_sha",
+                "formal_review_required": True,
                 "review_outcome": "clean",
             },
         )

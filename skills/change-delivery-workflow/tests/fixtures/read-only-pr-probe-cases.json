@@ -12,6 +12,7 @@
         ],
         "local_mutation": "forbidden",
         "commit_mode": "forbidden",
+        "formal_review_required": false,
         "remote_mutation": "forbidden",
         "handoff": "review-orchestration-playbook",
         "handoff_profile": "pr-readiness-read-only-probe"
@@ -50,6 +51,7 @@
             ],
             "local_mutation": "forbidden",
             "commit_mode": "forbidden",
+            "formal_review_required": false,
             "remote_mutation": "forbidden",
             "handoff": "review-orchestration-playbook",
             "handoff_profile": "pr-readiness-read-only-probe"
@@ -88,8 +90,14 @@
           ],
           "blockers": [
             {
+              "evidence": "ci-status",
               "code": "evidence-unavailable",
-              "detail": "CI and conversation reads could not be proved cache-free."
+              "detail": "The CI read could not be proved cache-free."
+            },
+            {
+              "evidence": "conversation-state",
+              "code": "evidence-unavailable",
+              "detail": "The conversation read could not be proved cache-free."
             }
           ],
           "actions": {

@@ -259,8 +259,22 @@ authorization.
   or backlog changes.
 
 5. Review the exact result.
-- Use risk-proportionate local diff/self-review for `focused-checkpoint`; start a
-  formal lane only when the user or repository policy requires it.
+- Resolve `formal_review_required` once after the profile and hard constraints,
+  before creating any review checkpoint:
+  - `pr-readiness-handoff` always resolves to `true`.
+  - An ordinary mutation-capable `local-gate` with commit mode `allowed`
+    resolves to `true`.
+  - A constrained `local-gate` with commit mode `forbidden` resolves to `false`
+    unless the user or repository policy independently requires formal review.
+  - `focused-checkpoint` resolves to `false` by default and uses
+    risk-proportionate local diff/self-review. It resolves to `true` only when
+    the user, repository policy, or authoritative risk policy requires a formal
+    lane.
+  - An independent formal-review requirement may promote a default `false` to
+    `true`; it may not downgrade either profile-mandated `true`.
+- Record the resolved boolean in the delivery result before review starts and
+  preserve it unchanged across every handoff. Do not let a downstream receiver
+  reinterpret the profile, constraints, or risk prose into a different value.
 - Apply the resolved commit mode before creating anything for review. Under
   `report-only`, `probe-only`, `read-only`, or `no-commit`, do not create a
   checkpoint or anchor. When formal review is required, use a pre-existing
@@ -357,6 +371,7 @@ these fields unchanged across any handoff:
 - every explicit canonical token in `constraints`
 - resolved `local_mutation`
 - resolved `commit_mode`
+- resolved `formal_review_required`
 - resolved `remote_mutation`
 - `handoff`
 - `handoff_profile`
@@ -376,9 +391,12 @@ Its `handoff_profile` is `pr-readiness`.
 A `local-gate` record with an explicit PR-readiness probe and no
 remote-read-limiting constraint may instead set `handoff` to
 `review-orchestration-playbook`, `handoff_profile` to
-`pr-readiness-read-only-probe`, and `remote_mutation` to `forbidden`. The
-receiver must preserve that read-only capability ceiling and return only the
-selection/lifecycle/CI/conversation/base/head evidence report.
+`pr-readiness-read-only-probe`, `remote_mutation` to `forbidden`, and
+`formal_review_required` to `false`. A required formal review must terminate at
+its missing-range or findings blocker before this probe rather than being
+silently skipped. The receiver must preserve that read-only capability ceiling
+and return only the selection/lifecycle/CI/conversation/base/head evidence
+report.
 Receivers must fail closed on a missing constraint, an unknown field, or an
 internally contradictory record instead of inferring a broader scope from prose.
 
