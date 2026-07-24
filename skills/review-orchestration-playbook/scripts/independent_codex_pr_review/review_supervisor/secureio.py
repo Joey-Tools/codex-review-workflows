@@ -27,6 +27,13 @@ DARWIN_ROOT_ALIASES = {
     "tmp": "private/tmp",
     "var": "private/var",
 }
+DARWIN_BOOT_SESSION_MARKER = pathlib.Path("/private/var/run/bootSessionMA.txt")
+DARWIN_BOOT_SESSION_PARENT_GID = 1
+DARWIN_BOOT_SESSION_PARENT_MODE = 0o775
+DARWIN_BOOT_SESSION_MARKER_MODE = 0o644
+DARWIN_BOOT_SESSION_MARKER_XATTRS = frozenset(
+    {"com.apple.TextEncoding", "com.apple.provenance"}
+)
 
 
 def require_python_313() -> None:
@@ -75,9 +82,10 @@ def _verify_macos_metadata(
     kind: str,
     *,
     private: bool,
-) -> None:
+    extra_permitted_xattrs: frozenset[str] = frozenset(),
+) -> Any | None:
     if sys.platform != "darwin":
-        return
+        return None
     # Keep one authoritative ACL/xattr parser for executable and runtime custody.
     from .codex_executable import (
         inspect_macos_filesystem_metadata,
@@ -97,15 +105,22 @@ def _verify_macos_metadata(
             or set(evidence.xattrs) - {"com.apple.provenance"}
         ):
             raise ValueError("private filesystem object has extended metadata")
-        return
+        return evidence
     if (
         evidence.acl_entry_count == 0
         and not evidence.acl_entries
         and not evidence.quarantine_present
-        and set(evidence.xattrs) <= {"com.apple.provenance", "com.apple.rootless"}
+        and set(evidence.xattrs)
+        <= {
+            "com.apple.provenance",
+            "com.apple.rootless",
+            *extra_permitted_xattrs,
+        }
     ):
-        return
-    verify_macos_filesystem_metadata(
+        return evidence
+    if extra_permitted_xattrs:
+        raise ValueError("extended ACLs, xattrs, and quarantine are forbidden")
+    return verify_macos_filesystem_metadata(
         fd,
         path,
         kind,
@@ -851,6 +866,222 @@ def raw_directory_entries(path: pathlib.Path, *, cap: int) -> tuple[bytes, ...]:
     return encoded
 
 
+def _darwin_boot_access_policy_key(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_uid,
+        metadata.st_gid,
+        stat.S_IMODE(metadata.st_mode),
+        getattr(metadata, "st_flags", 0),
+    )
+
+
+def _darwin_boot_content_stability_key(
+    metadata: os.stat_result,
+) -> tuple[int, ...]:
+    return (
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _require_trusted_boot_marker_metadata(metadata: os.stat_result) -> None:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != DARWIN_BOOT_SESSION_MARKER_MODE
+        or getattr(metadata, "st_flags", 0) != 0
+        or not 1 <= metadata.st_size <= 128
+    ):
+        raise ValueError("Darwin boot-session marker access policy is unsafe")
+
+
+def _require_trusted_boot_parent_metadata(metadata: os.stat_result) -> None:
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != DARWIN_BOOT_SESSION_PARENT_GID
+        or stat.S_IMODE(metadata.st_mode) != DARWIN_BOOT_SESSION_PARENT_MODE
+        or getattr(metadata, "st_flags", 0) != 0
+    ):
+        raise ValueError("Darwin boot-session marker parent access policy is unsafe")
+
+
+def _open_darwin_boot_marker_parent(marker: pathlib.Path) -> tuple[int, Identity]:
+    if marker != DARWIN_BOOT_SESSION_MARKER:
+        raise ValueError("Darwin boot-session marker path is invalid")
+    ancestor_fd, _ = open_absolute_directory_chain(marker.parent.parent)
+    parent_fd: int | None = None
+    try:
+        raw_parent_name = os.fsencode(marker.parent.name)
+        parent_fd = os.open(
+            raw_parent_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=ancestor_fd,
+        )
+        descriptor_metadata = os.fstat(parent_fd)
+        path_metadata = os.stat(
+            raw_parent_name,
+            dir_fd=ancestor_fd,
+            follow_symlinks=False,
+        )
+        _require_trusted_boot_parent_metadata(descriptor_metadata)
+        _require_trusted_boot_parent_metadata(path_metadata)
+        descriptor_identity = identity_from_stat(descriptor_metadata)
+        path_identity = identity_from_stat(path_metadata)
+        if not directory_identities_match(descriptor_identity, path_identity):
+            raise OSError(
+                errno.ESTALE,
+                "Darwin boot-session marker parent identity changed while opening",
+            )
+        _verify_macos_metadata(parent_fd, marker.parent, "directory", private=False)
+        return parent_fd, descriptor_identity
+    except BaseException:
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise
+    finally:
+        os.close(ancestor_fd)
+
+
+def _read_darwin_boot_session_marker(
+    marker: pathlib.Path = DARWIN_BOOT_SESSION_MARKER,
+) -> bytes:
+    if marker != DARWIN_BOOT_SESSION_MARKER:
+        raise ValueError("Darwin boot-session marker path is invalid")
+    parent_fd, parent_identity = _open_darwin_boot_marker_parent(marker)
+    marker_fd: int | None = None
+    refreshed_parent_fd: int | None = None
+    try:
+        marker_fd, opened_identity = open_regular_at(
+            parent_fd,
+            os.fsencode(marker.name),
+            expected_uid=0,
+            require_link_one=True,
+        )
+        opened_metadata = os.fstat(marker_fd)
+        _require_trusted_boot_marker_metadata(opened_metadata)
+        opened_access_policy = _darwin_boot_access_policy_key(opened_metadata)
+        opened_content_stability = _darwin_boot_content_stability_key(opened_metadata)
+        before = identity_from_stat(opened_metadata)
+        if before != opened_identity:
+            raise OSError(
+                errno.ESTALE,
+                "Darwin boot-session marker identity changed after opening",
+            )
+        first_metadata = _verify_macos_metadata(
+            marker_fd,
+            marker,
+            "file",
+            private=False,
+            extra_permitted_xattrs=DARWIN_BOOT_SESSION_MARKER_XATTRS,
+        )
+        first = read_fd_exact(
+            marker_fd,
+            max_bytes=128,
+            expected_size=opened_identity.size,
+        )
+        middle_metadata = os.fstat(marker_fd)
+        _require_trusted_boot_marker_metadata(middle_metadata)
+        middle = identity_from_stat(middle_metadata)
+        second_metadata = _verify_macos_metadata(
+            marker_fd,
+            marker,
+            "file",
+            private=False,
+            extra_permitted_xattrs=DARWIN_BOOT_SESSION_MARKER_XATTRS,
+        )
+        second = read_fd_exact(
+            marker_fd,
+            max_bytes=128,
+            expected_size=opened_identity.size,
+        )
+        after_read_metadata = os.fstat(marker_fd)
+        _require_trusted_boot_marker_metadata(after_read_metadata)
+        final_extended_metadata = _verify_macos_metadata(
+            marker_fd,
+            marker,
+            "file",
+            private=False,
+            extra_permitted_xattrs=DARWIN_BOOT_SESSION_MARKER_XATTRS,
+        )
+        final_metadata = os.fstat(marker_fd)
+        path_after_metadata = os.stat(
+            os.fsencode(marker.name),
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        _require_trusted_boot_marker_metadata(final_metadata)
+        _require_trusted_boot_marker_metadata(path_after_metadata)
+        after_read = identity_from_stat(after_read_metadata)
+        final = identity_from_stat(final_metadata)
+        path_after = identity_from_stat(path_after_metadata)
+        if any(
+            identity != opened_identity
+            for identity in (middle, after_read, final, path_after)
+        ):
+            raise OSError(
+                errno.ESTALE,
+                "Darwin boot-session marker identity or access policy changed",
+            )
+        if any(
+            _darwin_boot_access_policy_key(metadata) != opened_access_policy
+            for metadata in (
+                middle_metadata,
+                after_read_metadata,
+                final_metadata,
+                path_after_metadata,
+            )
+        ):
+            raise OSError(
+                errno.ESTALE,
+                "Darwin boot-session marker access policy changed",
+            )
+        if any(
+            _darwin_boot_content_stability_key(metadata) != opened_content_stability
+            for metadata in (
+                middle_metadata,
+                after_read_metadata,
+                final_metadata,
+                path_after_metadata,
+            )
+        ):
+            raise OSError(
+                errno.ESTALE,
+                "Darwin boot-session marker content metadata changed",
+            )
+        if not (first_metadata == second_metadata == final_extended_metadata):
+            raise OSError(
+                errno.ESTALE,
+                "Darwin boot-session marker extended metadata changed",
+            )
+        if first != second:
+            raise OSError(
+                errno.ESTALE,
+                "Darwin boot-session marker content changed while reading",
+            )
+        refreshed_parent_fd, refreshed_parent_identity = (
+            _open_darwin_boot_marker_parent(marker)
+        )
+        if not directory_identities_match(
+            parent_identity,
+            refreshed_parent_identity,
+        ):
+            raise OSError(
+                errno.ESTALE,
+                "Darwin boot-session marker parent path changed while reading",
+            )
+        return second.strip()
+    finally:
+        if refreshed_parent_fd is not None:
+            os.close(refreshed_parent_fd)
+        if marker_fd is not None:
+            os.close(marker_fd)
+        os.close(parent_fd)
+
+
 def boot_identifier() -> str:
     linux_path = pathlib.Path("/proc/sys/kernel/random/boot_id")
     if linux_path.is_file():
@@ -892,18 +1123,7 @@ def boot_identifier() -> str:
                 raw = f"{value.seconds}:{value.microseconds}".encode("ascii")
                 return "darwin-kern-boottime:" + sha256_bytes(raw)
 
-        marker = pathlib.Path("/private/var/run/bootSessionMA.txt")
-        fd, identity = open_regular_nofollow(
-            marker,
-            expected_uid=0,
-            require_link_one=True,
-        )
-        try:
-            if not 1 <= identity.size <= 128:
-                raise ValueError("Darwin boot-session marker has an invalid size")
-            raw = read_fd_exact(fd, max_bytes=128, expected_size=identity.size).strip()
-        finally:
-            os.close(fd)
+        raw = _read_darwin_boot_session_marker()
         try:
             marker_text = raw.decode("ascii", "strict")
             uuid.UUID(marker_text)

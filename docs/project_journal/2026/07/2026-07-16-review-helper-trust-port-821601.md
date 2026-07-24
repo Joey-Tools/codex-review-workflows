@@ -1402,3 +1402,47 @@ metadata behavior.
   sandbox, and the required live no-child profile passed 9/9 in the same host
   execution context. This leaves no unexplained product-test failure. No local
   Python 3.10 run was performed.
+- The next fresh-context Codex review found two current-head access-policy
+  gaps. Root-protected executable authentication checked mode and ownership
+  through visible paths without binding extended ACLs, and the Darwin
+  boot-session fallback accepted a root-owned marker without descriptor-bound
+  object, content, access-policy, or parent-path revalidation. Executable reads
+  now reuse the complete descriptor-relative path attestation, including `/`,
+  reject every ACL for the singleton root-protected policy, preserve the
+  non-root threat-model gate, and apply the same root-only authentication before
+  compatibility probing and live sandbox-exec revalidation. The fixed Darwin
+  marker path now requires the exact root-owned marker and macOS daemon-parent
+  policy, binds descriptor and visible-path identity, content timestamps,
+  permitted ACL/xattr evidence, repeated content, and parent identity, and
+  retains the original marker and parent descriptors through final
+  revalidation.
+- A separate pre-commit security audit then found that the marker's second
+  content read lacked a following content-metadata and ACL/xattr checkpoint,
+  that the original parent descriptor closed before refreshed-path comparison,
+  and that tests mocked the new parent opener without covering replacement or
+  cleanup. Final content timestamps and a third extended-metadata snapshot now
+  close those stages, the original descriptors remain live until refreshed
+  parent comparison completes, and regressions cover final content and metadata
+  drift, close ordering, parent replacement, and descriptor cleanup.
+- Python 3.13 validation after those fixes passed the 150-test executable,
+  no-child, and secure-I/O group with two expected platform skips, the fixed
+  deterministic supervisor set passed 545/545 in 216.761 seconds with identity
+  SHA-256
+  `b275e39f7cc9356703295cdc8eb5c8c5f70dfb43027c073d82291ffe128e9e56`,
+  and all 97 repository contract tests passed in 8.330 seconds. The real Darwin
+  fallback returned the hashed `darwin-boot-session` form without exposing the
+  raw marker. Full discovery, exact host broker and live no-child gates, signed
+  replacement head, admission, hosted CI, and replacement formal lanes remain.
+  No local Python 3.10 run was performed.
+- Final Python 3.13 full discovery exercised 2,815 tests in 1,995.590
+  seconds with six skips. Its only failure was the exact expected Codex Desktop
+  outer-sandbox denial of the nested synthetic Keychain broker
+  (`sandbox-exec: sandbox_apply: Operation not permitted`). The exact broker
+  test passed 1/1 in 2.661 seconds outside that outer sandbox, and the complete
+  required live no-child gate passed 9/9 in 12.186 seconds in the same host
+  execution context. The four installed-bundle and helper no-bytecode contract
+  tests passed in 6.286 seconds; the candidate tree's newest pre-existing
+  bytecode timestamp remained unchanged after the run. No unexplained
+  product-test failure remains. Signed replacement head, exact-head admission,
+  hosted CI, and replacement formal review lanes remain. No local Python 3.10
+  run was performed.

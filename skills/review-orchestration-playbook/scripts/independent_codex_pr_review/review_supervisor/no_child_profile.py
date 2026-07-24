@@ -589,97 +589,10 @@ def python_runtime_executable() -> pathlib.Path:
     return pathlib.Path(sys.executable).resolve(strict=True)
 
 
-def _stat_executable_protected_key(value: os.stat_result) -> tuple[int, ...]:
-    return (
-        value.st_dev,
-        value.st_ino,
-        stat.S_IFMT(value.st_mode),
-        getattr(value, "st_gen", 0),
-        value.st_uid,
-        value.st_gid,
-        stat.S_IMODE(value.st_mode),
-        getattr(value, "st_flags", 0),
-        value.st_size,
-    )
-
-
-def _read_fd_digest_and_magic(descriptor: int) -> tuple[str, bytes]:
-    digest = hashlib.sha256()
-    magic = b""
-    while True:
-        chunk = os.read(descriptor, 1 << 20)
-        if not chunk:
-            break
-        if len(magic) < 4:
-            magic = (magic + chunk)[:4]
-        digest.update(chunk)
-    return digest.hexdigest(), magic
-
-
 def _read_executable_identity(
     path: os.PathLike[str] | str,
 ) -> ExecutableIdentity:
-    canonical = _canonical_absolute_path(path)
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(canonical, flags)
-    except OSError as error:
-        raise ExecutableAuthenticationError(
-            f"cannot open executable without following symlinks: {error}"
-        ) from error
-    try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode):
-            raise ExecutableAuthenticationError("executable is not a regular file")
-        if before.st_size < 4 or before.st_size > MAX_EXECUTABLE_BYTES:
-            raise ExecutableAuthenticationError("executable size is outside policy")
-        if before.st_mode & 0o111 == 0:
-            raise ExecutableAuthenticationError("executable has no execute mode bit")
-        first_digest, first_magic = _read_fd_digest_and_magic(descriptor)
-        middle = os.fstat(descriptor)
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        second_digest, second_magic = _read_fd_digest_and_magic(descriptor)
-        after = os.fstat(descriptor)
-        if not (
-            _stat_executable_protected_key(before)
-            == _stat_executable_protected_key(middle)
-            == _stat_executable_protected_key(after)
-        ):
-            raise ExecutableAuthenticationError(
-                "executable metadata changed while it was authenticated"
-            )
-        if first_digest != second_digest or first_magic != second_magic:
-            raise ExecutableAuthenticationError(
-                "executable content changed while it was authenticated"
-            )
-        current = os.stat(canonical, follow_symlinks=False)
-        if _stat_executable_protected_key(current) != _stat_executable_protected_key(
-            after
-        ):
-            raise ExecutableAuthenticationError(
-                "executable path changed while it was authenticated"
-            )
-        if second_magic not in _MACHO_MAGICS:
-            raise ExecutableAuthenticationError(
-                "only a native Mach-O executable can be the authenticated target"
-            )
-        return ExecutableIdentity(
-            path=str(canonical),
-            device=after.st_dev,
-            inode=after.st_ino,
-            mode=after.st_mode,
-            uid=after.st_uid,
-            gid=after.st_gid,
-            size=after.st_size,
-            mtime_ns=after.st_mtime_ns,
-            ctime_ns=after.st_ctime_ns,
-            sha256=second_digest,
-            flags=getattr(after, "st_flags", 0),
-            generation=getattr(after, "st_gen", 0),
-        )
-    finally:
-        os.close(descriptor)
+    return _authenticate_path_executed_executable(path).executable
 
 
 def _fd_digest_and_magic(fd: int, *, size: int) -> tuple[str, bytes]:
@@ -1563,31 +1476,42 @@ def _validated_writable_roots(
     return validated
 
 
-def _require_protected_path(identity: ExecutableIdentity) -> None:
+def _require_protected_path(
+    attestation: PathExecutedExecutableAttestation,
+) -> None:
+    """Require the singleton safe ACL state for a root-protected path.
+
+    ACL evidence is intentionally not copied into ``ExecutableIdentity``:
+    every authentication and revalidation rejects every ACL before the
+    identity is eligible, so the accepted ACL policy has only one state.
+    """
+
     if os.geteuid() == 0:
         raise ExecutableAuthenticationError(
             "root execution is outside the no-child-process threat model"
         )
-    current = pathlib.Path("/")
-    for component in pathlib.Path(identity.path).parts[1:]:
-        current /= component
-        metadata = os.stat(current, follow_symlinks=False)
-        is_target = str(current) == identity.path
-        if is_target and not stat.S_ISREG(metadata.st_mode):
-            raise ExecutableAuthenticationError("target stopped being a regular file")
-        if not is_target and not stat.S_ISDIR(metadata.st_mode):
+    _require_path_execution_attestation_consistent(attestation)
+    for component in attestation.components:
+        metadata = component.extended_metadata
+        if (
+            component.identity.uid != 0
+            or component.identity.mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or not isinstance(metadata, ExtendedMetadataEvidence)
+            or metadata.acl_entry_count != 0
+            or metadata.acl_entries
+        ):
             raise ExecutableAuthenticationError(
-                "an executable path ancestor is not a directory"
+                "executable path component is not root-owned and immutable "
+                f"or has an extended ACL: {component.path}"
             )
-        if metadata.st_uid != 0 or metadata.st_mode & 0o022:
-            raise ExecutableAuthenticationError(
-                f"executable path component is not root-owned and immutable: {current}"
-            )
-        access_mode = os.W_OK if is_target else os.W_OK | os.X_OK
-        if os.access(current, access_mode) and os.access(current, os.W_OK):
-            raise ExecutableAuthenticationError(
-                f"effective user can modify executable path component: {current}"
-            )
+
+
+def _authenticate_root_protected_executable(
+    path: os.PathLike[str] | str,
+) -> PathExecutedExecutableAttestation:
+    attestation = _authenticate_path_executed_executable(path)
+    _require_protected_path(attestation)
+    return attestation
 
 
 def authenticate_executable(
@@ -1596,10 +1520,10 @@ def authenticate_executable(
     expected_sha256: str,
 ) -> ExecutableIdentity:
     _validate_digest(expected_sha256)
-    identity = _read_executable_identity(path)
+    attestation = _authenticate_root_protected_executable(path)
+    identity = attestation.executable
     if identity.sha256 != expected_sha256:
         raise ExecutableAuthenticationError("executable SHA-256 does not match the pin")
-    _require_protected_path(identity)
     return identity
 
 
@@ -3143,7 +3067,9 @@ def probe_compatibility(
 
     if runtime.platform == "darwin" and runtime.system == "Darwin":
         try:
-            sandbox_identity = _read_executable_identity(SANDBOX_EXEC)
+            sandbox_identity = _authenticate_root_protected_executable(
+                SANDBOX_EXEC
+            ).executable
         except ExecutableAuthenticationError:
             sandbox_identity = None
     blockers = _runtime_blockers(runtime, pin, sandbox_identity)
@@ -3269,7 +3195,7 @@ def _require_live_runtime(evidence: CompatibilityEvidence) -> None:
     if _runtime_fingerprint() != evidence.runtime:
         blockers.append("runtime-changed-after-probe")
     try:
-        sandbox_exec = _read_executable_identity(SANDBOX_EXEC)
+        sandbox_exec = _authenticate_root_protected_executable(SANDBOX_EXEC).executable
     except ExecutableAuthenticationError as error:
         sandbox_exec = None
         sandbox_error = error

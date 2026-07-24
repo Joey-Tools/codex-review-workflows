@@ -11,7 +11,12 @@ import review_supervisor.ledger as ledger_module
 from review_supervisor.codex_executable import ExtendedMetadataEvidence
 from review_supervisor.errors import SupervisorError
 from review_supervisor.ledger import acquire_retention_lease
+from review_supervisor.models import Identity
 from review_supervisor.secureio import (
+    _open_darwin_boot_marker_parent,
+    _require_trusted_boot_marker_metadata,
+    _require_trusted_boot_parent_metadata,
+    _read_darwin_boot_session_marker,
     _verify_macos_metadata,
     atomic_write_json,
     canonical_json,
@@ -388,6 +393,299 @@ class PrivateMetadataTests(unittest.TestCase):
                     expected_uid=os.getuid(),
                     private_metadata=True,
                 )
+
+
+class DarwinBootSessionMarkerTests(unittest.TestCase):
+    MARKER = pathlib.Path("/synthetic/bootSessionMA.txt")
+    CONTENT = b"25d4721a-7845-4f34-ae22-19e56fa8280b\n"
+
+    @staticmethod
+    def _identity(
+        *,
+        inode: int,
+        mode: int,
+        uid: int = 0,
+        size: int = 0,
+        link_count: int = 1,
+    ) -> Identity:
+        return Identity(
+            device=7,
+            inode=inode,
+            mode=mode,
+            link_count=link_count,
+            uid=uid,
+            size=size,
+        )
+
+    @staticmethod
+    def _stat_result(
+        identity: Identity,
+        *,
+        mtime_ns: int = 1,
+        ctime_ns: int = 1,
+    ) -> mock.Mock:
+        return mock.Mock(
+            st_dev=identity.device,
+            st_ino=identity.inode,
+            st_mode=identity.mode,
+            st_nlink=identity.link_count,
+            st_uid=identity.uid,
+            st_gid=0,
+            st_size=identity.size,
+            st_flags=0,
+            st_mtime_ns=mtime_ns,
+            st_ctime_ns=ctime_ns,
+        )
+
+    def _read_with(
+        self,
+        *,
+        file_identity: Identity | None = None,
+        parent_identities: tuple[Identity, Identity] | None = None,
+        reads: tuple[bytes, bytes] | None = None,
+        metadata_error: BaseException | None = None,
+        metadata_results: tuple[object, object, object] | None = None,
+        fstat_results: tuple[mock.Mock, mock.Mock, mock.Mock, mock.Mock] | None = None,
+        path_result: mock.Mock | None = None,
+        events: list[str] | None = None,
+    ) -> bytes:
+        file_identity = file_identity or self._identity(
+            inode=20,
+            mode=stat.S_IFREG | 0o644,
+            size=len(self.CONTENT),
+        )
+        parent = self._identity(
+            inode=10,
+            mode=stat.S_IFDIR | 0o755,
+            size=128,
+            link_count=2,
+        )
+        first_parent, second_parent = parent_identities or (parent, parent)
+        parent_results = iter(((11, first_parent), (12, second_parent)))
+
+        def open_parent(_marker: pathlib.Path) -> tuple[int, Identity]:
+            descriptor, identity = next(parent_results)
+            if events is not None:
+                events.append(f"open:{descriptor}")
+            return descriptor, identity
+
+        def close(descriptor: int) -> None:
+            if events is not None:
+                events.append(f"close:{descriptor}")
+
+        if metadata_results is not None:
+            metadata_effect: object = metadata_results
+        else:
+            metadata_effect = metadata_error
+        fstat_patch = (
+            mock.patch(
+                "review_supervisor.secureio.os.fstat",
+                side_effect=fstat_results,
+            )
+            if fstat_results is not None
+            else mock.patch(
+                "review_supervisor.secureio.os.fstat",
+                return_value=self._stat_result(file_identity),
+            )
+        )
+        with (
+            mock.patch(
+                "review_supervisor.secureio.DARWIN_BOOT_SESSION_MARKER",
+                self.MARKER,
+            ),
+            mock.patch(
+                "review_supervisor.secureio._open_darwin_boot_marker_parent",
+                side_effect=open_parent,
+            ),
+            mock.patch(
+                "review_supervisor.secureio.open_regular_at",
+                return_value=(21, file_identity),
+            ),
+            fstat_patch,
+            mock.patch(
+                "review_supervisor.secureio.os.stat",
+                return_value=path_result or self._stat_result(file_identity),
+            ),
+            mock.patch(
+                "review_supervisor.secureio.read_fd_exact",
+                side_effect=reads or (self.CONTENT, self.CONTENT),
+            ),
+            mock.patch(
+                "review_supervisor.secureio._verify_macos_metadata",
+                side_effect=metadata_effect,
+            ),
+            mock.patch("review_supervisor.secureio.os.close", side_effect=close),
+        ):
+            return _read_darwin_boot_session_marker(self.MARKER)
+
+    def test_marker_binds_stable_identity_content_and_parent(self) -> None:
+        self.assertEqual(self._read_with(), self.CONTENT.strip())
+
+    def test_marker_rejects_content_mutation(self) -> None:
+        changed = b"54be2dd6-7659-4227-84ea-ddf64170e320\n"
+        with self.assertRaisesRegex(OSError, "content changed"):
+            self._read_with(reads=(self.CONTENT, changed))
+
+    def test_marker_rejects_final_content_and_extended_metadata_drift(self) -> None:
+        file_identity = self._identity(
+            inode=20,
+            mode=stat.S_IFREG | 0o644,
+            size=len(self.CONTENT),
+        )
+        stable = self._stat_result(file_identity)
+        changed = self._stat_result(file_identity, mtime_ns=2, ctime_ns=2)
+        with self.assertRaisesRegex(OSError, "content metadata changed"):
+            self._read_with(
+                file_identity=file_identity,
+                fstat_results=(stable, stable, changed, changed),
+                path_result=changed,
+            )
+
+        clear = ExtendedMetadataEvidence(0, (), False)
+        acl = ExtendedMetadataEvidence(
+            1,
+            (),
+            False,
+            ("user:fixture:allow:write",),
+        )
+        with self.assertRaisesRegex(OSError, "extended metadata changed"):
+            self._read_with(metadata_results=(clear, clear, acl))
+
+    def test_marker_rejects_unsafe_mode_and_extended_metadata(self) -> None:
+        unsafe = self._identity(
+            inode=20,
+            mode=stat.S_IFREG | 0o664,
+            size=len(self.CONTENT),
+        )
+        with self.assertRaisesRegex(ValueError, "access policy is unsafe"):
+            self._read_with(file_identity=unsafe)
+        with self.assertRaisesRegex(ValueError, "synthetic ACL"):
+            self._read_with(metadata_error=ValueError("synthetic ACL"))
+
+    def test_marker_rejects_parent_path_replacement(self) -> None:
+        first = self._identity(
+            inode=10,
+            mode=stat.S_IFDIR | 0o755,
+            size=128,
+            link_count=2,
+        )
+        replacement = self._identity(
+            inode=11,
+            mode=stat.S_IFDIR | 0o755,
+            size=128,
+            link_count=2,
+        )
+        with self.assertRaisesRegex(OSError, "parent path changed"):
+            self._read_with(parent_identities=(first, replacement))
+
+    def test_marker_keeps_original_parent_open_through_revalidation(self) -> None:
+        events: list[str] = []
+        self.assertEqual(self._read_with(events=events), self.CONTENT.strip())
+        self.assertLess(events.index("open:12"), events.index("close:11"))
+
+    def test_parent_opener_rejects_replacement_and_closes_descriptors(self) -> None:
+        ancestor = self._identity(
+            inode=9,
+            mode=stat.S_IFDIR | 0o755,
+            size=128,
+            link_count=2,
+        )
+        parent = mock.Mock(
+            st_dev=7,
+            st_ino=10,
+            st_mode=stat.S_IFDIR | 0o775,
+            st_nlink=2,
+            st_uid=0,
+            st_gid=1,
+            st_size=128,
+            st_flags=0,
+        )
+        replacement = mock.Mock(
+            st_dev=7,
+            st_ino=11,
+            st_mode=stat.S_IFDIR | 0o775,
+            st_nlink=2,
+            st_uid=0,
+            st_gid=1,
+            st_size=128,
+            st_flags=0,
+        )
+        with (
+            mock.patch(
+                "review_supervisor.secureio.DARWIN_BOOT_SESSION_MARKER",
+                self.MARKER,
+            ),
+            mock.patch(
+                "review_supervisor.secureio.open_absolute_directory_chain",
+                return_value=(30, ancestor),
+            ),
+            mock.patch("review_supervisor.secureio.os.open", return_value=31),
+            mock.patch("review_supervisor.secureio.os.fstat", return_value=parent),
+            mock.patch("review_supervisor.secureio.os.stat", return_value=replacement),
+            mock.patch(
+                "review_supervisor.secureio._verify_macos_metadata",
+            ) as verify_metadata,
+            mock.patch("review_supervisor.secureio.os.close") as close,
+            self.assertRaisesRegex(OSError, "parent identity changed"),
+        ):
+            _open_darwin_boot_marker_parent(self.MARKER)
+
+        verify_metadata.assert_not_called()
+        self.assertEqual(
+            close.call_args_list,
+            [mock.call(31), mock.call(30)],
+        )
+
+    def test_marker_and_parent_require_exact_system_access_policy(self) -> None:
+        def marker_metadata(**changes: int) -> mock.Mock:
+            values = {
+                "st_dev": 7,
+                "st_ino": 20,
+                "st_mode": stat.S_IFREG | 0o644,
+                "st_nlink": 1,
+                "st_uid": 0,
+                "st_gid": 0,
+                "st_size": len(self.CONTENT),
+                "st_flags": 0,
+            }
+            values.update(changes)
+            return mock.Mock(**values)
+
+        def parent_metadata(**changes: int) -> mock.Mock:
+            values = {
+                "st_mode": stat.S_IFDIR | 0o775,
+                "st_uid": 0,
+                "st_gid": 1,
+                "st_flags": 0,
+            }
+            values.update(changes)
+            return mock.Mock(**values)
+
+        marker = marker_metadata()
+        parent = parent_metadata()
+        _require_trusted_boot_marker_metadata(marker)
+        _require_trusted_boot_parent_metadata(parent)
+
+        for field, value in (
+            ("st_gid", 1),
+            ("st_mode", stat.S_IFREG | 0o640),
+            ("st_flags", getattr(stat, "UF_IMMUTABLE", 2)),
+        ):
+            with self.subTest(marker_field=field):
+                changed = marker_metadata(**{field: value})
+                with self.assertRaisesRegex(ValueError, "marker access policy"):
+                    _require_trusted_boot_marker_metadata(changed)
+
+        for field, value in (
+            ("st_uid", 501),
+            ("st_gid", 20),
+            ("st_mode", stat.S_IFDIR | 0o755),
+            ("st_flags", getattr(stat, "UF_IMMUTABLE", 2)),
+        ):
+            with self.subTest(parent_field=field):
+                changed = parent_metadata(**{field: value})
+                with self.assertRaisesRegex(ValueError, "parent access policy"):
+                    _require_trusted_boot_parent_metadata(changed)
 
 
 if __name__ == "__main__":

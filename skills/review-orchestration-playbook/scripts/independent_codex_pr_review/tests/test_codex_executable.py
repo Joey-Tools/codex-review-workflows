@@ -1367,6 +1367,18 @@ class CodexExecutableAuthenticationTests(unittest.TestCase):
                 True,
             ),
             (
+                pathlib.Path("/usr"),
+                "directory",
+                ("com.apple.rootless",),
+                True,
+            ),
+            (
+                pathlib.Path("/Applications/Other.app"),
+                "directory",
+                ("com.apple.rootless",),
+                False,
+            ),
+            (
                 pathlib.Path("/Applications/Other.app"),
                 "directory",
                 ("user.synthetic",),

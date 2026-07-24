@@ -2484,15 +2484,27 @@ class NoChildProfileUnitTests(unittest.TestCase):
             probe_override: profile.ExecutableIdentity,
         ) -> object:
             values = {
-                sandbox.path: replace(sandbox, mtime_ns=9, ctime_ns=10),
                 probe.path: probe_override,
                 alternate.path: replace(alternate, mtime_ns=11, ctime_ns=12),
             }
-            return mock.patch.object(
-                profile,
-                "_read_executable_identity",
-                side_effect=lambda path: values[str(path)],
+            stack = contextlib.ExitStack()
+            stack.enter_context(
+                mock.patch.object(
+                    profile,
+                    "_authenticate_root_protected_executable",
+                    return_value=_synthetic_probe_attestation(
+                        replace(sandbox, mtime_ns=9, ctime_ns=10)
+                    ),
+                )
             )
+            stack.enter_context(
+                mock.patch.object(
+                    profile,
+                    "_read_executable_identity",
+                    side_effect=lambda path: values[str(path)],
+                )
+            )
+            return stack
 
         with (
             mock.patch.object(profile, "_runtime_fingerprint", return_value=runtime),
@@ -2720,6 +2732,179 @@ class NoChildProfileUnitTests(unittest.TestCase):
                     finally:
                         runtime.chmod(0o755)
 
+    def test_root_protected_executable_rejects_component_acl(self) -> None:
+        executable = profile.ExecutableIdentity(
+            path="/usr/bin/true",
+            device=1,
+            inode=4,
+            mode=stat.S_IFREG | 0o555,
+            uid=0,
+            gid=0,
+            size=4,
+            mtime_ns=1,
+            ctime_ns=1,
+            sha256="a" * 64,
+        )
+        clear = ExtendedMetadataEvidence(0, (), False)
+        acl = ExtendedMetadataEvidence(
+            1,
+            (),
+            False,
+            ("user:fixture:allow:write",),
+        )
+
+        def component(
+            path: str,
+            *,
+            kind: str,
+            inode: int,
+            metadata: ExtendedMetadataEvidence,
+        ) -> PathComponentEvidence:
+            return PathComponentEvidence(
+                path=path,
+                kind=kind,
+                identity=NodeIdentity(
+                    device=1,
+                    inode=inode,
+                    mode=(
+                        stat.S_IFREG | 0o555 if kind == "file" else stat.S_IFDIR | 0o555
+                    ),
+                    link_count=1 if kind == "file" else 2,
+                    uid=0,
+                    gid=0,
+                    size=4 if kind == "file" else 0,
+                    mtime_ns=1,
+                    ctime_ns=1,
+                    flags=0,
+                    generation=0,
+                ),
+                extended_metadata=metadata,
+            )
+
+        clear_components = (
+            component("/", kind="directory", inode=1, metadata=clear),
+            component("/usr", kind="directory", inode=2, metadata=clear),
+            component("/usr/bin", kind="directory", inode=3, metadata=clear),
+            component("/usr/bin/true", kind="file", inode=4, metadata=clear),
+        )
+        for acl_index in range(len(clear_components)):
+            with self.subTest(acl_component=clear_components[acl_index].path):
+                components = list(clear_components)
+                components[acl_index] = replace(
+                    components[acl_index],
+                    extended_metadata=acl,
+                )
+                attestation = profile.PathExecutedExecutableAttestation(
+                    executable=executable,
+                    components=tuple(components),
+                )
+                with (
+                    mock.patch.object(
+                        profile,
+                        "_authenticate_path_executed_executable",
+                        return_value=attestation,
+                    ),
+                    self.assertRaisesRegex(
+                        profile.ExecutableAuthenticationError,
+                        "extended ACL",
+                    ),
+                ):
+                    profile.authenticate_executable(
+                        executable.path,
+                        expected_sha256=executable.sha256,
+                    )
+
+    def test_root_protected_executable_rejects_non_root_component(self) -> None:
+        executable, _ = _synthetic_probe_identities()
+        clear = ExtendedMetadataEvidence(0, (), False)
+
+        def directory(path: str, *, inode: int, uid: int) -> PathComponentEvidence:
+            return PathComponentEvidence(
+                path=path,
+                kind="directory",
+                identity=NodeIdentity(
+                    device=1,
+                    inode=inode,
+                    mode=stat.S_IFDIR | 0o555,
+                    link_count=2,
+                    uid=uid,
+                    gid=0,
+                    size=0,
+                    mtime_ns=1,
+                    ctime_ns=1,
+                    flags=0,
+                    generation=0,
+                ),
+                extended_metadata=clear,
+            )
+
+        leaf = PathComponentEvidence(
+            path=executable.path,
+            kind="file",
+            identity=NodeIdentity(
+                device=1,
+                inode=executable.inode,
+                mode=executable.mode,
+                link_count=1,
+                uid=executable.uid,
+                gid=executable.gid,
+                size=executable.size,
+                mtime_ns=executable.mtime_ns,
+                ctime_ns=executable.ctime_ns,
+                flags=executable.flags,
+                generation=executable.generation,
+            ),
+            extended_metadata=clear,
+        )
+        attestation = profile.PathExecutedExecutableAttestation(
+            executable=executable,
+            components=(
+                directory("/", inode=10, uid=0),
+                directory("/synthetic", inode=11, uid=max(1, os.geteuid())),
+                leaf,
+            ),
+        )
+        with (
+            mock.patch.object(
+                profile,
+                "_authenticate_path_executed_executable",
+                return_value=attestation,
+            ),
+            self.assertRaisesRegex(
+                profile.ExecutableAuthenticationError,
+                "root-owned and immutable",
+            ),
+        ):
+            profile._authenticate_root_protected_executable(executable.path)
+
+    def test_root_protected_executable_rejects_root_runtime(self) -> None:
+        executable, _ = _synthetic_probe_identities()
+        with (
+            mock.patch.object(profile.os, "geteuid", return_value=0),
+            mock.patch.object(
+                profile,
+                "_authenticate_path_executed_executable",
+                return_value=_synthetic_probe_attestation(executable),
+            ),
+            self.assertRaisesRegex(
+                profile.ExecutableAuthenticationError,
+                "root execution is outside",
+            ),
+        ):
+            profile._authenticate_root_protected_executable(executable.path)
+
+    def test_generic_executable_reads_use_path_attestation(self) -> None:
+        executable, _ = _synthetic_probe_identities()
+        attestation = _synthetic_probe_attestation(executable)
+        with mock.patch.object(
+            profile,
+            "_authenticate_path_executed_executable",
+            return_value=attestation,
+        ) as authenticate:
+            observed = profile._read_executable_identity(executable.path)
+        authenticate.assert_called_once_with(executable.path)
+        self.assertIs(observed, executable)
+
     def test_launch_budgets_exact_sandbox_argv_before_fork(self) -> None:
         executable = profile.ExecutableIdentity(
             path="/synthetic/app-server",
@@ -2924,8 +3109,8 @@ class NoChildProfileUnitTests(unittest.TestCase):
             mock.patch.object(profile, "_runtime_fingerprint", return_value=runtime),
             mock.patch.object(
                 profile,
-                "_read_executable_identity",
-                return_value=sandbox_exec,
+                "_authenticate_root_protected_executable",
+                return_value=_synthetic_probe_attestation(sandbox_exec),
             ),
             mock.patch.object(
                 profile,
@@ -2953,6 +3138,95 @@ class NoChildProfileUnitTests(unittest.TestCase):
                 )
                 for blocker in evidence.blockers
             )
+        )
+
+    def test_sandbox_root_authentication_failure_precedes_probe_exec(self) -> None:
+        runtime = profile.RuntimeFingerprint(
+            platform="darwin",
+            system="Darwin",
+            macos_product_version=profile.PINNED_RUNTIME.macos_product_version,
+            macos_build_version=profile.PINNED_RUNTIME.macos_build_version,
+            darwin_release=profile.PINNED_RUNTIME.darwin_release,
+            python_version=(3, 13, 0),
+            python_executable="/synthetic/python3.13",
+            effective_uid=501,
+        )
+        with (
+            mock.patch.object(profile, "_runtime_fingerprint", return_value=runtime),
+            mock.patch.object(
+                profile,
+                "_authenticate_root_protected_executable",
+                side_effect=profile.ExecutableAuthenticationError(
+                    "synthetic root-path ACL"
+                ),
+            ) as authenticate_root,
+            mock.patch.object(
+                profile,
+                "_authenticate_path_executed_executable",
+            ) as authenticate_probe,
+            mock.patch.object(profile, "_run_probe_case") as run_probe,
+        ):
+            evidence = profile.probe_compatibility()
+
+        authenticate_root.assert_called_once_with(profile.SANDBOX_EXEC)
+        authenticate_probe.assert_not_called()
+        run_probe.assert_not_called()
+        self.assertIn("sandbox-exec-unavailable", evidence.blockers)
+
+    def test_live_runtime_rejects_failed_sandbox_root_revalidation(self) -> None:
+        runtime = profile.RuntimeFingerprint(
+            platform="darwin",
+            system="Darwin",
+            macos_product_version=profile.PINNED_RUNTIME.macos_product_version,
+            macos_build_version=profile.PINNED_RUNTIME.macos_build_version,
+            darwin_release=profile.PINNED_RUNTIME.darwin_release,
+            python_version=(3, 13, 0),
+            python_executable="/synthetic/python3.13",
+            effective_uid=501,
+        )
+        sandbox_exec = profile.ExecutableIdentity(
+            path=str(profile.SANDBOX_EXEC),
+            device=1,
+            inode=2,
+            mode=stat.S_IFREG | 0o555,
+            uid=0,
+            gid=0,
+            size=4,
+            mtime_ns=1,
+            ctime_ns=1,
+            sha256=profile.PINNED_RUNTIME.sandbox_exec_sha256,
+        )
+        evidence = profile.CompatibilityEvidence(
+            schema_version=profile.EVIDENCE_SCHEMA_VERSION,
+            runtime_pin=profile.PINNED_RUNTIME,
+            runtime=runtime,
+            sandbox_exec=sandbox_exec,
+            probe_executable=None,
+            alternate_executable=None,
+            seatbelt_profile_sha256=None,
+            parent_nproc_before=None,
+            parent_nproc_after=None,
+            observations=(),
+            blockers=(),
+        )
+        with (
+            mock.patch.object(profile, "_runtime_fingerprint", return_value=runtime),
+            mock.patch.object(
+                profile,
+                "_authenticate_root_protected_executable",
+                side_effect=profile.ExecutableAuthenticationError(
+                    "synthetic root-path ACL"
+                ),
+            ),
+            mock.patch.object(profile, "_read_executable_identity") as read_generic,
+            self.assertRaises(profile.NoChildProfileUnavailable) as caught,
+        ):
+            profile._require_live_runtime(evidence)
+
+        read_generic.assert_not_called()
+        self.assertIn(
+            "sandbox-exec-revalidation-failed-after-probe",
+            caught.exception.evidence.blockers,
         )
 
     def test_ambiguous_observation_cannot_be_hidden_by_empty_blockers(self) -> None:
@@ -3045,8 +3319,8 @@ class NoChildProfileUnitTests(unittest.TestCase):
             mock.patch.object(profile, "_runtime_fingerprint", return_value=runtime),
             mock.patch.object(
                 profile,
-                "_read_executable_identity",
-                return_value=sandbox_exec,
+                "_authenticate_root_protected_executable",
+                return_value=_synthetic_probe_attestation(sandbox_exec),
             ),
             mock.patch.object(profile, "_run_probe_case") as run_probe,
         ):

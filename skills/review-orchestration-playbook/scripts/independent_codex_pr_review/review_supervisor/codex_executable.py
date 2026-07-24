@@ -93,6 +93,13 @@ BOUND_LAUNCH_STATE = "bound-launch"
 NEVER_LAUNCHED_ABORT_STATE = "never-launched-abort"
 TRUSTED_CHATGPT_BUNDLE_ROOT = pathlib.Path("/Applications/ChatGPT.app")
 UNIVERSALLY_PERMITTED_MACOS_XATTRS = frozenset({"com.apple.provenance"})
+SYSTEM_PROTECTED_MACOS_XATTRS = frozenset({"com.apple.rootless"})
+SYSTEM_PROTECTED_MACOS_ROOTS = (
+    pathlib.Path("/System"),
+    pathlib.Path("/usr"),
+    pathlib.Path("/bin"),
+    pathlib.Path("/sbin"),
+)
 TRUSTED_CHATGPT_BUNDLE_ROOT_XATTRS = frozenset(
     {
         "com.apple.macl",
@@ -1685,6 +1692,10 @@ def _permitted_macos_xattrs(path: pathlib.Path, *, kind: str) -> frozenset[str]:
         return frozenset()
     if path == TRUSTED_CHATGPT_BUNDLE_ROOT:
         return UNIVERSALLY_PERMITTED_MACOS_XATTRS | TRUSTED_CHATGPT_BUNDLE_ROOT_XATTRS
+    if any(
+        path == root or root in path.parents for root in SYSTEM_PROTECTED_MACOS_ROOTS
+    ):
+        return UNIVERSALLY_PERMITTED_MACOS_XATTRS | SYSTEM_PROTECTED_MACOS_XATTRS
     return UNIVERSALLY_PERMITTED_MACOS_XATTRS
 
 
