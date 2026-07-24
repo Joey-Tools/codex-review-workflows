@@ -17,7 +17,7 @@ import time
 import unicodedata
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from typing import Any, Never, Protocol, TypeVar
+from typing import Any, NoReturn, Protocol, TypeVar
 
 from .errors import SupervisorError, UnprovenDirectHelperClosure
 from .models import Identity
@@ -2488,7 +2488,7 @@ def _abort_unpublished_snapshot_creation(
     *,
     operation: str,
     trigger: BaseException,
-) -> Never:
+) -> NoReturn:
     if creation.directory_name is None:
         raise ValueError("snapshot creation abort lacks its random name") from trigger
     try:
@@ -5002,7 +5002,11 @@ class CodexExecutableCustody:
                 code="codex-custody-closed",
             )
 
-    def _mark_stale(self, message: str, error: Exception | None = None) -> Never:
+    def _mark_stale(
+        self,
+        message: str,
+        error: Exception | None = None,
+    ) -> NoReturn:
         self._stale_reason = message
         exception = CodexExecutableCustodyStale(message)
         if error is None:

@@ -1134,3 +1134,9 @@ metadata behavior.
   and formatting pass for all 25 changed Python or Python entrypoint files, and
   `git diff --check` passes. The signed exact-head live rerun and formal named
   lanes remain explicit delivery gates. No local Python 3.10 run was performed.
+- The first current-head Ubuntu matrix run exposed one Python 3.10 import-only
+  compatibility defect in the copied installed-bundle smoke: `typing.Never` is
+  unavailable there. The type-only annotation now uses the equivalent
+  `typing.NoReturn`, which preserves runtime behavior and avoids a dependency.
+  Local validation remains Python 3.13-only; the GitHub Actions platform matrix
+  is the Python 3.10 authority.
