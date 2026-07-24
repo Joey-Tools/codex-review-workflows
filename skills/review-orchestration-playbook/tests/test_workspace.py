@@ -620,6 +620,15 @@ class WorkspaceTest(unittest.TestCase):
         )
         return secret_delta
 
+    def public_synthetic_manifest(self, review) -> dict:
+        return json.loads(
+            (
+                review.workspace_root
+                / ".codex-review"
+                / workspace_runtime.SYNTHETIC_MANIFEST_NAME
+            ).read_text(encoding="utf-8")
+        )
+
     def assert_secret_violation(
         self,
         review,
@@ -9219,6 +9228,217 @@ class WorkspaceTest(unittest.TestCase):
             "sensitive content preflight blocked external review",
         ):
             validate_external_workspace(review)
+
+    def test_source_wip_retained_legacy_growth_is_violation(self) -> None:
+        legacy_value = unregistered_provider_credential()
+        catalog = self.catalog_with_legacy_values(
+            (legacy_value,),
+            rule="github-token",
+        )
+        source_head = self.commit_bytes(
+            "legacy-secret.txt",
+            b'password = "' + legacy_value + b'"\n',
+            "Add legacy credential to source HEAD",
+        )
+        (self.repo / "unrelated-wip.txt").write_text(
+            "unrelated WIP\n",
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(
+            workspace_runtime,
+            "load_catalog",
+            return_value=catalog,
+        ):
+            review = prepare_workspace(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=source_head,
+                include_source_wip=True,
+            )
+            self.reviews.append(review)
+            evidence = validate_external_workspace(review)
+        manifest = self.public_synthetic_manifest(review)
+        secret_delta = manifest["secret_delta"]
+
+        self.assertEqual(secret_delta["status"], "violations")
+        self.assertEqual(len(secret_delta["violations"]), 1)
+        violation = secret_delta["violations"][0]
+        self.assertEqual(
+            violation["value_sha256"],
+            hashlib.sha256(legacy_value).hexdigest(),
+        )
+        self.assertEqual(
+            (violation["base_count"], violation["head_count"]),
+            (0, 1),
+        )
+        self.assertEqual(manifest["secret_reductions"], [])
+        self.assertEqual(evidence["synthetic_tokens"]["secret_reductions"], [])
+        matching_entries = [
+            entry
+            for entry in manifest["entries"]
+            if entry["value_sha256"] == hashlib.sha256(legacy_value).hexdigest()
+        ]
+        self.assertEqual(len(matching_entries), 1)
+        self.assertEqual(
+            (
+                matching_entries[0]["base_count"],
+                matching_entries[0]["head_count"],
+                matching_entries[0]["source_head_count"],
+            ),
+            (0, 1, 1),
+        )
+
+    def test_source_wip_deleted_legacy_growth_is_inconclusive(self) -> None:
+        legacy_value = unregistered_generic_credential()
+        catalog = self.catalog_with_legacy_values(
+            (legacy_value,),
+            rule="generic-secret-assignment",
+        )
+        source_head = self.commit_bytes(
+            "legacy-secret.txt",
+            b'password = "' + legacy_value + b'"\n',
+            "Add legacy credential to source HEAD",
+        )
+        git(self.repo, "rm", "legacy-secret.txt")
+
+        with mock.patch.object(
+            workspace_runtime,
+            "load_catalog",
+            return_value=catalog,
+        ):
+            review = prepare_workspace(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=source_head,
+                include_source_wip=True,
+            )
+        self.reviews.append(review)
+        secret_delta = self.public_synthetic_manifest(review)["secret_delta"]
+
+        self.assertEqual(secret_delta["status"], "inconclusive")
+        self.assertEqual(
+            secret_delta["failure_class"],
+            "source-head-exact-growth",
+        )
+        self.assertEqual(secret_delta["violations"], [])
+
+    def test_source_wip_deleted_legacy_growth_does_not_hide_snapshot_violation(
+        self,
+    ) -> None:
+        legacy_value = unregistered_generic_credential()
+        snapshot_value = second_unregistered_generic_credential()
+        catalog = self.catalog_with_legacy_values(
+            (legacy_value,),
+            rule="generic-secret-assignment",
+        )
+        source_head = self.commit_bytes(
+            "legacy-secret.txt",
+            b'password = "' + legacy_value + b'"\n',
+            "Add legacy credential to source HEAD",
+        )
+        git(self.repo, "rm", "legacy-secret.txt")
+        (self.repo / "snapshot-secret.txt").write_bytes(
+            b'password = "' + snapshot_value + b'"\n'
+        )
+        git(self.repo, "add", "snapshot-secret.txt")
+
+        with mock.patch.object(
+            workspace_runtime,
+            "load_catalog",
+            return_value=catalog,
+        ):
+            review = prepare_workspace(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=source_head,
+                include_source_wip=True,
+            )
+        self.reviews.append(review)
+        manifest = self.public_synthetic_manifest(review)
+        secret_delta = manifest["secret_delta"]
+
+        self.assertEqual(secret_delta["status"], "violations")
+        self.assertEqual(len(secret_delta["violations"]), 1)
+        self.assertEqual(
+            secret_delta["violations"][0]["value_sha256"],
+            hashlib.sha256(snapshot_value).hexdigest(),
+        )
+        self.assertEqual(
+            (
+                secret_delta["violations"][0]["base_count"],
+                secret_delta["violations"][0]["head_count"],
+            ),
+            (0, 1),
+        )
+        self.assertEqual(
+            [entry["value_sha256"] for entry in manifest["secret_reductions"]],
+            [hashlib.sha256(snapshot_value).hexdigest()],
+        )
+
+    def test_source_wip_legacy_unembedded_growth_uses_raw_count_only(
+        self,
+    ) -> None:
+        legacy_value = b"legacy-unembedded-candidate-" + b"A" * 24
+        containing_value = b"prefix-" + legacy_value + b"-suffix"
+        catalog = self.catalog_with_legacy_values(
+            (legacy_value, containing_value),
+            rule="generic-secret-assignment",
+        )
+        legacy_base = self.commit_bytes(
+            "legacy-secret.txt",
+            containing_value,
+            "Add containing legacy credential",
+        )
+        source_head = self.commit_bytes(
+            "legacy-secret.txt",
+            legacy_value,
+            "Expose embedded legacy credential",
+        )
+        (self.repo / "unrelated-wip.txt").write_text(
+            "unrelated WIP\n",
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(
+            workspace_runtime,
+            "load_catalog",
+            return_value=catalog,
+        ):
+            review = prepare_workspace(
+                repo=self.repo,
+                base_ref=legacy_base,
+                head_ref=source_head,
+                include_source_wip=True,
+            )
+            self.reviews.append(review)
+            evidence = validate_external_workspace(review)
+        manifest = self.public_synthetic_manifest(review)
+        secret_delta = manifest["secret_delta"]
+        entries = {
+            entry["value_sha256"]: entry for entry in manifest["entries"]
+        }
+        legacy_entry = entries[hashlib.sha256(legacy_value).hexdigest()]
+
+        self.assertEqual(secret_delta["status"], "clean")
+        self.assertEqual(evidence["secret_delta"]["status"], "clean")
+        self.assertEqual(secret_delta["violations"], [])
+        self.assertEqual(
+            (
+                legacy_entry["base_count"],
+                legacy_entry["head_count"],
+                legacy_entry["source_head_count"],
+            ),
+            (1, 1, 1),
+        )
+        self.assertEqual(
+            (
+                legacy_entry["base_unembedded_count"],
+                legacy_entry["head_unembedded_count"],
+                legacy_entry["source_head_unembedded_count"],
+            ),
+            (0, 1, 1),
+        )
 
     def test_unregistered_secret_addition_is_raw_with_violation_evidence(
         self,

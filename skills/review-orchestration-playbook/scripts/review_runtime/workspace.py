@@ -816,10 +816,6 @@ class LegacyCountState:
     source_head_unembedded_count: int
 
 
-class _SourceHeadSecretCountIncrease(ReviewError):
-    pass
-
-
 class _IncompleteSecretScanSuffix(Exception):
     def __init__(self, retention_start: int | None = None) -> None:
         super().__init__()
@@ -7151,22 +7147,12 @@ def _secret_count_manifests(
             source_head_unembedded_count = (
                 source_head_scan.unembedded_occurrence_counts[descriptor]
             )
-            if source_head_sha is not None and source_head_count > base_count:
-                raise _SourceHeadSecretCountIncrease(
-                    "legacy synthetic fixture count increased in source HEAD for "
-                    f"{token.identifier}: base={base_count}, "
-                    f"source_head={source_head_count}"
-                )
             if (
                 source_head_sha is not None
-                and source_head_unembedded_count > base_unembedded_count
+                and source_head_count > base_count
+                and head_count <= base_count
             ):
-                raise _SourceHeadSecretCountIncrease(
-                    "legacy synthetic fixture unembedded count increased in "
-                    f"source HEAD for {token.identifier}: "
-                    f"base={base_unembedded_count}, "
-                    f"source_head={source_head_unembedded_count}"
-                )
+                source_head_exact_growth_hidden = True
             if head_count > base_count:
                 violations[descriptor] = (base_count, head_count)
             entries.append(
@@ -10024,10 +10010,14 @@ def _validate_external_workspace(
         for count_state in legacy_counts.values()
     ):
         raise ReviewError("synthetic secret manifest head counts are inconsistent")
-    if review.content_variant == "source-wip" and any(
-        count_state.source_head_count > count_state.base_count
-        or count_state.source_head_unembedded_count > count_state.base_unembedded_count
-        for count_state in legacy_counts.values()
+    if (
+        review.content_variant == "source-wip"
+        and secret_delta_evidence["status"] == "clean"
+        and any(
+            count_state.source_head_count > count_state.base_count
+            and count_state.head_count <= count_state.base_count
+            for count_state in legacy_counts.values()
+        )
     ):
         raise ReviewError(
             "synthetic secret manifest source HEAD counts are inconsistent"
@@ -16417,8 +16407,6 @@ def prepare_workspace(
                 catalog=catalog,
                 evidence_head_ref=head_sha,
             )
-        except _SourceHeadSecretCountIncrease:
-            raise
         except (OSError, ReviewError):
             (
                 synthetic_manifest,
