@@ -115,6 +115,57 @@ def _call_followup_offset(
     )
 
 
+class ProcessStartIdentityTests(unittest.TestCase):
+    def test_darwin_libproc_esrch_is_distinct_from_malformed_identity(self) -> None:
+        class SyntheticProcPidInfo:
+            argtypes: object = None
+            restype: object = None
+
+            def __init__(self, error_number: int) -> None:
+                self.error_number = error_number
+
+            def __call__(self, *_args: object) -> int:
+                process_module.ctypes.set_errno(self.error_number)
+                return 0
+
+        class SyntheticLibproc:
+            def __init__(self, error_number: int) -> None:
+                self.proc_pidinfo = SyntheticProcPidInfo(error_number)
+
+        pid = 2_147_483_647
+        with (
+            mock.patch.object(
+                process_module.pathlib.Path, "is_file", return_value=False
+            ),
+            mock.patch.object(process_module.platform, "system", return_value="Darwin"),
+            mock.patch.object(
+                process_module.ctypes,
+                "CDLL",
+                return_value=SyntheticLibproc(errno.ESRCH),
+            ),
+            self.assertRaises(ProcessLookupError) as missing,
+        ):
+            process_start_identity(pid)
+        self.assertEqual(errno.ESRCH, missing.exception.errno)
+
+        with (
+            mock.patch.object(
+                process_module.pathlib.Path, "is_file", return_value=False
+            ),
+            mock.patch.object(process_module.platform, "system", return_value="Darwin"),
+            mock.patch.object(
+                process_module.ctypes,
+                "CDLL",
+                return_value=SyntheticLibproc(errno.EINVAL),
+            ),
+            self.assertRaisesRegex(
+                ValueError,
+                "cannot obtain Darwin process-start identity",
+            ),
+        ):
+            process_start_identity(pid)
+
+
 @unittest.skipUnless(os.name == "posix", "POSIX process groups are required")
 class AnchoredProcessGroupTests(unittest.TestCase):
     def test_post_fork_identity_failure_retains_receipt_after_cleanup_gap(

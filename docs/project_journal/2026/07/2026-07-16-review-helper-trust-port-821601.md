@@ -1379,3 +1379,26 @@ metadata behavior.
   final tree. Signed commit, exact-head secret admission, replacement
   fresh-context Codex review, hosted CI, and the unavailable Claude/GitHub
   lanes remain. No local Python 3.10 run was performed.
+- Hosted CI run `30092522058` exposed a fail-closed signature drift on the
+  pinned macOS 26.4 runner: `libproc` reported `ESRCH` after a short-lived
+  probe leader exited, but `process_start_identity()` collapsed that missing
+  process into a generic `ValueError`. The runtime now raises
+  `ProcessLookupError` only for exact Darwin `ESRCH`, preserving other malformed
+  or unreadable identity failures as `ValueError`. The existing closed hosted
+  matcher can therefore retain its normalized
+  `probe-leader-exited-before-binding` contract without admitting arbitrary
+  error text. A cross-platform synthetic regression distinguishes exact
+  `ESRCH` from `EINVAL`; it increases the deterministic supervisor identity to
+  531 tests with SHA-256
+  `2877cdedeeb49b1c48292642737a514d35cefec0aed6acc35ad8e8c724b68ca4`.
+  The interrupted fresh-context review of head `9eec408` produced no findings
+  and is explicitly invalid for the replacement head. Full local gates,
+  signed commit, exact-head admission, new formal review, and hosted CI remain.
+- Replacement-head validation is complete on Python 3.13. The deterministic
+  supervisor suite passed 531/531 and the repository contract suite passed
+  97/97. Full discovery completed 2,815 tests with six skips and one failure:
+  the broker integration was denied by Codex Desktop's nested
+  `sandbox-exec`. The exact broker test then passed 1/1 outside that outer
+  sandbox, and the required live no-child profile passed 9/9 in the same host
+  execution context. This leaves no unexplained product-test failure. No local
+  Python 3.10 run was performed.

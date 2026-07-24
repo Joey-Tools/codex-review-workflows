@@ -830,6 +830,12 @@ def process_start_identity(pid: int) -> str:
             or value.pbi_start_tvusec >= 1_000_000
         ):
             error_number = ctypes.get_errno()
+            if error_number == errno.ESRCH:
+                raise ProcessLookupError(
+                    error_number,
+                    os.strerror(error_number),
+                    pid,
+                )
             raise ValueError(
                 "cannot obtain Darwin process-start identity"
                 + (f": {os.strerror(error_number)}" if error_number else "")
