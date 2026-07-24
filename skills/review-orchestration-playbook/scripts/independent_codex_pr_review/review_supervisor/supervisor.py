@@ -51,7 +51,7 @@ from .evidence import (
 )
 from .gitraw import (
     GitProcessClosureUnproven,
-    enumerate_tree,
+    authenticated_range_manifests,
     inspect_repository,
     manifest_digest,
     retry_git_process_closure,
@@ -391,8 +391,7 @@ def prepare_run(
         git_executable=git_executable,
         temporary_control_parent=retention_root,
     )
-    base_manifest = enumerate_tree(repository, base_sha)
-    head_manifest = enumerate_tree(repository, head_sha)
+    base_manifest, head_manifest = authenticated_range_manifests(repository)
     admission = calculate_admission(
         snapshot=snapshot,
         retention_root=retention_root,

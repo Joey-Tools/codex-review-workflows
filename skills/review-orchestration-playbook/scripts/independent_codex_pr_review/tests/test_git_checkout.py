@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
 import pathlib
@@ -14,6 +15,7 @@ import time
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 
 import review_supervisor.gitraw as gitraw
@@ -38,6 +40,7 @@ from review_supervisor.gitraw import (
     RepositoryInfo,
     _parse_tree_record,
     add_detached_worktree,
+    authenticated_range_manifests,
     check_attributes,
     create_sanitized_view,
     enumerate_tree,
@@ -1990,9 +1993,130 @@ class RawGitProtocolTests(unittest.TestCase):
                 finally:
                     _close_protocol_batch(batch, request_reader)
 
+    def test_cat_file_rehashes_commit_and_tree_payloads(self) -> None:
+        payloads = {
+            "commit": (
+                b"tree " + b"1" * 40 + b"\n"
+                b"author Fixture <fixture@example.invalid> 0 +0000\n"
+                b"committer Fixture <fixture@example.invalid> 0 +0000\n"
+                b"\nmessage\n"
+            ),
+            "tree": b"100644 file\0" + bytes.fromhex("2" * 40),
+        }
+        for object_type, payload in payloads.items():
+            with self.subTest(object_type=object_type):
+                digest = hashlib.sha1(
+                    f"{object_type} {len(payload)}\0".encode() + payload
+                ).hexdigest()
+                replacement = bytearray(payload)
+                replacement[-1] ^= 1
+                batch, request_reader = _protocol_batch(
+                    f"{digest} {object_type} {len(payload)}\n".encode()
+                    + bytes(replacement)
+                    + b"\n"
+                )
+                try:
+                    with self.assertRaisesRegex(ValueError, "digest mismatch"):
+                        batch.verify_object(
+                            digest,
+                            allowed_types=frozenset({"commit", "tree", "tag"}),
+                            maximum_size=len(payload),
+                            deadline=time.monotonic() + 2,
+                        )
+                finally:
+                    _close_protocol_batch(batch, request_reader)
+
+    def test_private_git_commands_disable_auxiliary_object_indexes(self) -> None:
+        info = SimpleNamespace(git_executable=str(GIT))
+        control = SimpleNamespace(path=pathlib.Path("/private/control"))
+        argv = gitraw._git_control_argv(info, control, "rev-list", "HEAD")
+        self.assertIn("core.commitGraph=false", argv)
+        self.assertIn("core.multiPackIndex=false", argv)
+        self.assertIn("pack.useBitmaps=false", argv)
+
 
 @unittest.skipUnless(GIT.is_file(), "/usr/bin/git is required")
 class RawGitCheckoutTests(unittest.TestCase):
+    def test_authenticated_range_rejects_commit_content_mismatch(self) -> None:
+        with owned_temporary_directory("git-metadata-content-mismatch-") as root:
+            repo, base, head = _build_repository(root)
+            info = inspect_repository(
+                repo=repo,
+                base_sha=base,
+                head_sha=head,
+                git_executable=str(GIT),
+            )
+            original_verify = CatFileBatch.verify_object
+
+            def reject_head_commit(
+                batch: CatFileBatch,
+                object_id: str,
+                *,
+                allowed_types: frozenset[str],
+                maximum_size: int,
+                deadline: float,
+            ) -> tuple[str, int]:
+                if object_id == head:
+                    raise ValueError("raw Git object digest mismatch")
+                return original_verify(
+                    batch,
+                    object_id,
+                    allowed_types=allowed_types,
+                    maximum_size=maximum_size,
+                    deadline=deadline,
+                )
+
+            with (
+                mock.patch.object(
+                    CatFileBatch,
+                    "verify_object",
+                    new=reject_head_commit,
+                ),
+                self.assertRaises(SupervisorError) as raised,
+            ):
+                authenticated_range_manifests(info)
+            self.assertEqual(
+                raised.exception.failure.code,
+                "range-object-verification-failed",
+            )
+
+    def test_authenticated_range_rejects_ls_tree_aba_view(self) -> None:
+        with owned_temporary_directory("git-metadata-ls-tree-aba-") as root:
+            repo, base, head = _build_repository(root)
+            info = inspect_repository(
+                repo=repo,
+                base_sha=base,
+                head_sha=head,
+                git_executable=str(GIT),
+            )
+            original_run = gitraw.run_bounded
+            substituted = False
+
+            def run_with_substituted_head_tree(
+                argv: tuple[str, ...],
+                **kwargs: Any,
+            ) -> tuple[int, bytes, bytes]:
+                nonlocal substituted
+                if "ls-tree" in argv and argv[-1] == head:
+                    substituted = True
+                    argv = (*argv[:-1], base)
+                return original_run(argv, **kwargs)
+
+            with (
+                mock.patch.object(
+                    gitraw,
+                    "run_bounded",
+                    side_effect=run_with_substituted_head_tree,
+                ),
+                self.assertRaises(SupervisorError) as raised,
+            ):
+                authenticated_range_manifests(info)
+            self.assertTrue(substituted)
+            self.assertEqual(
+                raised.exception.failure.code,
+                "range-tree-manifest-mismatch",
+            )
+
     def test_worktree_cleanup_does_not_write_after_unproven_git_closure(
         self,
     ) -> None:
@@ -2446,8 +2570,7 @@ class RawGitCheckoutTests(unittest.TestCase):
         expected_hex_length = 64 if object_format == "sha256" else 40
         self.assertEqual(len(base_sha), expected_hex_length)
         self.assertEqual(len(head_sha), expected_hex_length)
-        base = enumerate_tree(info, base_sha)
-        head = enumerate_tree(info, head_sha)
+        base, head = authenticated_range_manifests(info)
         self.assertEqual(
             tuple(entry.path for entry in head.entries),
             (

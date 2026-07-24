@@ -264,9 +264,10 @@ fixtures/runtime，创建 disposable local Git repositories；不启动 Codex、
 不读取认证配置：
 
 ```bash
-/opt/homebrew/bin/python3.13 -B -m tests.run_required_deterministic_supervisor
-CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE=1 /opt/homebrew/bin/python3.13 -B -m tests.run_required_no_child_profile
-/opt/homebrew/bin/python3.13 -B independent-codex-pr-review --help
+TRUSTED_PYTHON=/absolute/path/to/parent-validated/python3.13
+PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_required_deterministic_supervisor
+CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE=1 PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_required_no_child_profile
+PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B independent-codex-pr-review --help
 ```
 
 第一条命令是跨 Hosted Runner 的确定性零跳过测试；第二条命令只允许在匹配生产 pin、

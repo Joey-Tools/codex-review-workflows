@@ -68,18 +68,24 @@ combined probes bind the leader and then terminate with `SIGKILL` before probe
 evidence. When the frozen range changes the independent supervisor's Darwin
 isolation implementation, its live-test runner, or the covered integration
 tests, the delivery operator must run this command on a trusted Mac that
-matches the production runtime pin after the final commit exists. Start from
-the repository root and enter the self-contained tool directory before invoking
-the package-local test runner:
+matches the production runtime pin after the final commit exists. First resolve
+and record a parent-validated absolute Python 3.13 interpreter whose entire
+resolved execution path satisfies the no-group-write/no-other-write access
+policy. A convenience symlink through a standard group-writable Homebrew
+`Cellar` does not satisfy that policy. Start from the repository root and enter
+the self-contained tool directory before invoking the package-local test
+runner:
 
 ```bash
+TRUSTED_PYTHON=/absolute/path/to/parent-validated/python3.13
 cd skills/review-orchestration-playbook/scripts/independent_codex_pr_review
-CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE=1 PYTHONDONTWRITEBYTECODE=1 /opt/homebrew/bin/python3.13 -B -m tests.run_required_no_child_profile
+CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE=1 PYTHONDONTWRITEBYTECODE=1 "$TRUSTED_PYTHON" -B -m tests.run_required_no_child_profile
 ```
 
-Record the exact `head_sha`, nine tests run, zero skips, and terminal result in
-the PR delivery evidence. Any push invalidates that evidence. Missing, skipped,
-old-head, sandbox-blocked, or nonmatching-host evidence blocks merge-readiness;
+Record the interpreter's absolute path and digest and exact `head_sha`; record
+nine tests run, zero skips, and the terminal result in the PR delivery evidence.
+Any push invalidates that evidence. Missing, skipped, old-head, sandbox-blocked,
+or nonmatching-host evidence blocks merge-readiness;
 Hosted CI's blocker-signature probe is not a substitute.
 
 This is an operator-enforced exact-head gate, not a GitHub check run, branch

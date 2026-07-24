@@ -3,7 +3,7 @@ id: 20260720-7f2001
 title: Review Policy Migration
 status: completed
 created: 2026-07-20
-updated: 2026-07-22
+updated: 2026-07-23
 branch: codex/review-policy-semantic-cleanup
 pr: https://github.com/Joey-Tools/codex-review-workflows/pull/71
 supersedes:
@@ -77,3 +77,4 @@ superseded_by:
 - Final whole-range review also closed partial selected-PR scope: authenticated base/head metadata and one locally computed merge base must match the full explicit range before local results count as whole-PR readiness or triple evidence. A same-head/different-base range remains caller-owned partial evidence and blocks PR-specific completion instead of being silently rewritten.
 - The named Claude lane now has an executable pre-input floating stable-version gate. It ignores caller `PATH`, accepts only publisher-verified strict stable Claude Code `>=2.1.211,<3.0.0`, binds the selected release to its exact signed per-version manifest, and requires credential-free `--version` and `--help` probes against the same private digest-verified executable snapshot. The workflow never installs or switches Claude automatically; acquiring a missing eligible release is a separately authorized official-installer workflow. Until then, requested double remains double-but-blocked, and an independently effective-double triple remains incomplete because the actual Claude Code lane did not complete.
 - Exact-version reporting now distinguishes version evidence from provenance evidence: only a stable declared or probed wrong version is `exact-version-mismatch`; deterministic invalid signed metadata, signer identity, signature, manifest, or artifact provenance is `publisher-verification-failed`, while dependency, snapshot, identity, and probe uncertainty remains inconclusive.
+- A fresh current-head review found that the retained low-level helper authenticated endpoint manifests only from `ls-tree` output, so a stale or forged object mapping could make parent and worker agree on the same wrong tree. Raw-checkout controls now disable commit-graph, multi-pack-index, and bitmap consumption; both parent and worker raw-rehash the bounded reachable commit/tree/tag closure, derive endpoint path/mode/type/OID structure from separately raw-rehashed commit/tree payloads, and require `ls-tree` to match it exactly. SHA-1/SHA-256 integration coverage plus commit/tree digest and substituted-`ls-tree` regressions exercise the new content-stability gate.

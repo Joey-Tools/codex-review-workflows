@@ -17,10 +17,15 @@ from typing import Callable, Iterator
 
 from .constants import (
     MAX_BLOB_BYTES,
+    MAX_RANGE_METADATA_AGGREGATE_BYTES,
+    MAX_RANGE_METADATA_LIST_BYTES,
+    MAX_RANGE_METADATA_OBJECT_BYTES,
+    MAX_RANGE_METADATA_OBJECTS,
     MAX_RAW_BLOB_BYTES,
     MAX_SYMLINK_BYTES,
     MAX_TREE_ENTRIES,
     MAX_TREE_METADATA_BYTES,
+    RANGE_METADATA_VERIFY_SECONDS,
     REGISTRATION_DESCENDANT_COUNT_CAP,
     REGISTRATION_PATH_BYTES_CAP,
 )
@@ -206,6 +211,22 @@ class WorktreeRegistration:
     marker_identity: Identity
     descendant_count: int
     descendant_path_bytes: int
+
+
+@dataclass(frozen=True)
+class RangeMetadataReceipt:
+    object_count: int
+    aggregate_bytes: int
+    sha256: str
+    object_ids: frozenset[str]
+
+
+@dataclass(frozen=True)
+class AuthenticatedTreeEntry:
+    mode: int
+    object_type: str
+    object_id: str
+    path: bytes
 
 
 def sanitized_git_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -1032,6 +1053,12 @@ def _git_control_argv(
         "core.hooksPath=/dev/null",
         "-c",
         "core.fsmonitor=false",
+        "-c",
+        "core.commitGraph=false",
+        "-c",
+        "core.multiPackIndex=false",
+        "-c",
+        "pack.useBitmaps=false",
         *arguments,
     )
 
@@ -1484,16 +1511,88 @@ class CatFileBatch:
     ) -> bytes | None:
         if self.closed or entry.size is None or entry.object_type != "blob":
             raise ValueError("invalid cat-file blob request")
-        request = entry.object_id.encode("ascii") + b"\n"
-        expected_header = f"{entry.object_id} blob {entry.size}".encode("ascii")
-        digest = hashlib.new(self.info.object_format)
-        digest.update(f"blob {entry.size}\0".encode("ascii"))
-        payload_remaining = entry.size
+        _, _, payload = self._read_object(
+            entry.object_id,
+            allowed_types=frozenset({"blob"}),
+            expected_type="blob",
+            expected_size=entry.size,
+            maximum_size=entry.size,
+            deadline=time.monotonic() + CAT_FILE_READ_TIMEOUT_SECONDS,
+            consumer=consumer,
+            capture=capture,
+        )
+        return payload
+
+    def verify_object(
+        self,
+        object_id: str,
+        *,
+        allowed_types: frozenset[str],
+        maximum_size: int,
+        deadline: float,
+    ) -> tuple[str, int]:
+        object_type, size, _ = self._read_object(
+            object_id,
+            allowed_types=allowed_types,
+            expected_type=None,
+            expected_size=None,
+            maximum_size=maximum_size,
+            deadline=deadline,
+            consumer=None,
+            capture=False,
+        )
+        return object_type, size
+
+    def read_object_payload(
+        self,
+        object_id: str,
+        *,
+        allowed_types: frozenset[str],
+        maximum_size: int,
+        deadline: float,
+    ) -> tuple[str, bytes]:
+        object_type, _, payload = self._read_object(
+            object_id,
+            allowed_types=allowed_types,
+            expected_type=None,
+            expected_size=None,
+            maximum_size=maximum_size,
+            deadline=deadline,
+            consumer=None,
+            capture=True,
+        )
+        assert payload is not None
+        return object_type, payload
+
+    def _read_object(
+        self,
+        object_id: str,
+        *,
+        allowed_types: frozenset[str],
+        expected_type: str | None,
+        expected_size: int | None,
+        maximum_size: int,
+        deadline: float,
+        consumer: Callable[[bytes], None] | None,
+        capture: bool,
+    ) -> tuple[str, int, bytes | None]:
+        if (
+            self.closed
+            or not allowed_types
+            or maximum_size < 0
+            or len(object_id) != self.info.object_hex_length
+            or any(character not in "0123456789abcdef" for character in object_id)
+        ):
+            raise ValueError("invalid cat-file object request")
+        request = object_id.encode("ascii") + b"\n"
+        observed_type: str | None = None
+        observed_size: int | None = None
+        digest = None
+        payload_remaining: int | None = None
         captured = bytearray() if capture else None
         header = bytearray()
         request_offset = 0
         protocol_state = "header"
-        deadline = time.monotonic() + CAT_FILE_READ_TIMEOUT_SECONDS
         selector = selectors.DefaultSelector()
         stdin_fd = self.process.stdin.fileno()
         stdout_fd = self.process.stdout.fileno()
@@ -1509,7 +1608,7 @@ class CatFileBatch:
                 checkpoint_bound_signal_interrupt(force=True)
                 remaining_time = deadline - time.monotonic()
                 if remaining_time <= 0:
-                    raise TimeoutError("cat-file blob request timed out")
+                    raise TimeoutError("cat-file object request timed out")
                 events = selector.select(min(remaining_time, 0.25))
                 checkpoint_bound_signal_interrupt(force=True)
                 events.sort(key=lambda event: event[0].data != "stderr")
@@ -1554,6 +1653,7 @@ class CatFileBatch:
                     if protocol_state == "header":
                         read_size = 257 - len(header)
                     elif protocol_state == "payload":
+                        assert payload_remaining is not None
                         read_size = min(64 * 1024, payload_remaining)
                     else:
                         read_size = 1
@@ -1587,10 +1687,52 @@ class CatFileBatch:
                                 raise ValueError(
                                     "cat-file emitted an invalid bounded header"
                                 )
-                            if header != expected_header:
+                            try:
+                                (
+                                    observed_id_raw,
+                                    observed_type_raw,
+                                    observed_size_raw,
+                                ) = header.split(b" ")
+                                candidate_type = observed_type_raw.decode(
+                                    "ascii",
+                                    "strict",
+                                )
+                            except (UnicodeDecodeError, ValueError) as error:
+                                raise ValueError(
+                                    f"cat-file header mismatch: {bytes(header)!r}"
+                                ) from error
+                            if (
+                                observed_id_raw != object_id.encode("ascii")
+                                or candidate_type not in allowed_types
+                                or not observed_size_raw.isdigit()
+                                or (
+                                    len(observed_size_raw) > 1
+                                    and observed_size_raw.startswith(b"0")
+                                )
+                            ):
                                 raise ValueError(
                                     f"cat-file header mismatch: {bytes(header)!r}"
                                 )
+                            candidate_size = int(observed_size_raw, 10)
+                            if (
+                                expected_type is not None
+                                and candidate_type != expected_type
+                            ) or (
+                                expected_size is not None
+                                and candidate_size != expected_size
+                            ):
+                                raise ValueError(
+                                    f"cat-file header mismatch: {bytes(header)!r}"
+                                )
+                            if candidate_size > maximum_size:
+                                raise ValueError("cat-file object exceeds its byte cap")
+                            observed_type = candidate_type
+                            observed_size = candidate_size
+                            payload_remaining = candidate_size
+                            digest = hashlib.new(self.info.object_format)
+                            digest.update(
+                                f"{candidate_type} {candidate_size}\0".encode("ascii")
+                            )
                             offset = newline + 1
                             protocol_state = (
                                 "payload" if payload_remaining else "delimiter"
@@ -1598,6 +1740,8 @@ class CatFileBatch:
                             continue
 
                         if protocol_state == "payload":
+                            assert payload_remaining is not None
+                            assert digest is not None
                             chunk_size = min(
                                 len(chunk) - offset,
                                 payload_remaining,
@@ -1629,11 +1773,20 @@ class CatFileBatch:
                     )
 
             if time.monotonic() >= deadline:
-                raise TimeoutError("cat-file blob request timed out")
-            if digest.hexdigest() != entry.object_id:
-                raise ValueError("raw Git blob digest mismatch")
+                raise TimeoutError("cat-file object request timed out")
+            if (
+                digest is None
+                or observed_type is None
+                or observed_size is None
+                or digest.hexdigest() != object_id
+            ):
+                raise ValueError("raw Git object digest mismatch")
             self.requests += 1
-            return bytes(captured) if captured is not None else None
+            return (
+                observed_type,
+                observed_size,
+                bytes(captured) if captured is not None else None,
+            )
         except BaseException:
             self.abort()
             raise
@@ -1752,6 +1905,331 @@ class CatFileBatch:
             self.close()
         else:
             self.abort()
+
+
+def _parse_commit_tree_id(info: RepositoryInfo, payload: bytes) -> str:
+    headers, separator, _ = payload.partition(b"\n\n")
+    if not separator:
+        raise ValueError("commit object has no header terminator")
+    lines = headers.split(b"\n")
+    if not lines or not lines[0].startswith(b"tree "):
+        raise ValueError("commit object has no leading tree header")
+    if any(line.startswith(b"tree ") for line in lines[1:]):
+        raise ValueError("commit object has duplicate tree headers")
+    raw_tree_id = lines[0][len(b"tree ") :]
+    if len(raw_tree_id) != info.object_hex_length or any(
+        byte not in b"0123456789abcdef" for byte in raw_tree_id
+    ):
+        raise ValueError("commit object has a malformed tree ID")
+    return raw_tree_id.decode("ascii")
+
+
+def _parse_raw_tree(
+    info: RepositoryInfo,
+    payload: bytes,
+) -> tuple[AuthenticatedTreeEntry, ...]:
+    raw_oid_bytes = info.object_hex_length // 2
+    cursor = 0
+    entries: list[AuthenticatedTreeEntry] = []
+    names: set[bytes] = set()
+    previous_key: bytes | None = None
+    mode_types = {
+        b"40000": (0o040000, "tree"),
+        b"100644": (0o100644, "blob"),
+        b"100755": (0o100755, "blob"),
+        b"120000": (0o120000, "blob"),
+        b"160000": (0o160000, "commit"),
+    }
+    while cursor < len(payload):
+        mode_end = payload.find(b" ", cursor)
+        if mode_end <= cursor:
+            raise ValueError("tree object has a malformed mode")
+        name_end = payload.find(b"\0", mode_end + 1)
+        if name_end <= mode_end + 1:
+            raise ValueError("tree object has a malformed name")
+        object_end = name_end + 1 + raw_oid_bytes
+        if object_end > len(payload):
+            raise ValueError("tree object has a truncated object ID")
+        mode_raw = payload[cursor:mode_end]
+        try:
+            mode, object_type = mode_types[mode_raw]
+        except KeyError as error:
+            raise ValueError("tree object has an unsupported mode") from error
+        name = payload[mode_end + 1 : name_end]
+        if b"/" in name or name in {b".", b".."}:
+            raise ValueError("tree object has an invalid path component")
+        if name in names:
+            raise ValueError("tree object has a duplicate path component")
+        names.add(name)
+        sort_key = name + (b"/" if object_type == "tree" else b"\0")
+        if previous_key is not None and sort_key <= previous_key:
+            raise ValueError("tree object entries are not in canonical order")
+        previous_key = sort_key
+        entries.append(
+            AuthenticatedTreeEntry(
+                mode=mode,
+                object_type=object_type,
+                object_id=payload[name_end + 1 : object_end].hex(),
+                path=name,
+            )
+        )
+        cursor = object_end
+    return tuple(entries)
+
+
+def _authenticated_tree_entries(
+    info: RepositoryInfo,
+    batch: CatFileBatch,
+    *,
+    commit: str,
+    closure_ids: frozenset[str],
+    deadline: float,
+) -> tuple[AuthenticatedTreeEntry, ...]:
+    object_type, commit_payload = batch.read_object_payload(
+        commit,
+        allowed_types=frozenset({"commit"}),
+        maximum_size=MAX_RANGE_METADATA_OBJECT_BYTES,
+        deadline=deadline,
+    )
+    if object_type != "commit":
+        raise ValueError("frozen endpoint object is not a commit")
+    root_tree = _parse_commit_tree_id(info, commit_payload)
+    if root_tree not in closure_ids:
+        raise ValueError("metadata closure omits an endpoint root tree")
+
+    tree_cache: dict[str, tuple[AuthenticatedTreeEntry, ...]] = {}
+    aggregate_tree_bytes = 0
+
+    def load_tree(tree_id: str) -> tuple[AuthenticatedTreeEntry, ...]:
+        nonlocal aggregate_tree_bytes
+        cached = tree_cache.get(tree_id)
+        if cached is not None:
+            return cached
+        if tree_id not in closure_ids:
+            raise ValueError("metadata closure omits a reachable subtree")
+        remaining = MAX_TREE_METADATA_BYTES - aggregate_tree_bytes
+        candidate_type, tree_payload = batch.read_object_payload(
+            tree_id,
+            allowed_types=frozenset({"tree"}),
+            maximum_size=min(
+                MAX_RANGE_METADATA_OBJECT_BYTES,
+                max(0, remaining),
+            ),
+            deadline=deadline,
+        )
+        if candidate_type != "tree":
+            raise ValueError("reachable subtree object is not a tree")
+        aggregate_tree_bytes += len(tree_payload)
+        if aggregate_tree_bytes > MAX_TREE_METADATA_BYTES:
+            raise ValueError("authenticated tree metadata exceeds its byte cap")
+        parsed = _parse_raw_tree(info, tree_payload)
+        tree_cache[tree_id] = parsed
+        return parsed
+
+    flattened: list[AuthenticatedTreeEntry] = []
+    active: set[str] = set()
+    accounted_bytes = 0
+    stack: list[tuple[bool, str, bytes]] = [(True, root_tree, b"")]
+    while stack:
+        entering, tree_id, prefix = stack.pop()
+        if not entering:
+            active.remove(tree_id)
+            continue
+        if tree_id in active:
+            raise ValueError("authenticated tree graph contains a cycle")
+        active.add(tree_id)
+        stack.append((False, tree_id, prefix))
+        entries = load_tree(tree_id)
+        for entry in reversed(entries):
+            path = entry.path if not prefix else prefix + b"/" + entry.path
+            validate_raw_path(path)
+            accounted_bytes += len(path) + 128
+            if accounted_bytes > MAX_TREE_METADATA_BYTES:
+                raise ValueError(
+                    "authenticated flattened tree exceeds its metadata cap"
+                )
+            if entry.object_type == "tree":
+                stack.append((True, entry.object_id, path))
+                continue
+            flattened.append(
+                AuthenticatedTreeEntry(
+                    mode=entry.mode,
+                    object_type=entry.object_type,
+                    object_id=entry.object_id,
+                    path=path,
+                )
+            )
+            if len(flattened) > MAX_TREE_ENTRIES:
+                raise ValueError("authenticated tree exceeds its entry cap")
+    flattened.sort(key=lambda entry: entry.path)
+    if any(
+        current.path <= previous.path
+        for previous, current in zip(flattened, flattened[1:])
+    ):
+        raise ValueError("authenticated flattened paths are not unique")
+    return tuple(flattened)
+
+
+def _require_manifest_matches_authenticated_tree(
+    manifest: TreeManifest,
+    authenticated: tuple[AuthenticatedTreeEntry, ...],
+) -> None:
+    observed = tuple(
+        AuthenticatedTreeEntry(
+            mode=entry.mode,
+            object_type=entry.object_type,
+            object_id=entry.object_id,
+            path=entry.path,
+        )
+        for entry in manifest.entries
+    )
+    if observed != authenticated:
+        raise blocked(
+            "ls-tree manifest differs from raw authenticated tree objects",
+            stage="range-object-verification",
+            code="range-tree-manifest-mismatch",
+        )
+
+
+def _verify_reachable_metadata_objects(
+    info: RepositoryInfo,
+) -> RangeMetadataReceipt:
+    deadline = time.monotonic() + RANGE_METADATA_VERIFY_SECONDS
+    try:
+        with temporary_git_control(info) as control:
+            argv = _git_control_argv(
+                info,
+                control,
+                "rev-list",
+                "--objects",
+                "--no-object-names",
+                "--filter=blob:none",
+                info.base_sha,
+                info.head_sha,
+                "--",
+            )
+            code, stdout, stderr = run_bounded(
+                argv,
+                cwd=control.path.parent,
+                environment=_git_control_environment(info, control),
+                timeout=max(0.001, deadline - time.monotonic()),
+                stdout_limit=MAX_RANGE_METADATA_LIST_BYTES,
+                stderr_limit=8192,
+            )
+        if code != 0:
+            raise ValueError(_git_error(argv, stderr))
+        if stderr:
+            raise ValueError("metadata closure enumeration emitted diagnostics")
+        if not stdout or not stdout.endswith(b"\n"):
+            raise ValueError("metadata closure output is not line-terminated")
+        raw_ids = stdout[:-1].split(b"\n")
+        if len(raw_ids) > MAX_RANGE_METADATA_OBJECTS:
+            raise ValueError("metadata closure exceeds its object-count cap")
+
+        object_ids: list[str] = []
+        seen: set[str] = set()
+        for raw_id in raw_ids:
+            if len(raw_id) != info.object_hex_length or any(
+                byte not in b"0123456789abcdef" for byte in raw_id
+            ):
+                raise ValueError("metadata closure contains a malformed object ID")
+            object_id = raw_id.decode("ascii")
+            if object_id in seen:
+                raise ValueError("metadata closure contains a duplicate object ID")
+            seen.add(object_id)
+            object_ids.append(object_id)
+        if info.base_sha not in seen or info.head_sha not in seen:
+            raise ValueError("metadata closure omits a frozen endpoint commit")
+        object_ids.sort()
+
+        aggregate_bytes = 0
+        endpoint_types: dict[str, str] = {}
+        receipt = hashlib.sha256()
+        with CatFileBatch(info) as batch:
+            for object_id in object_ids:
+                remaining = MAX_RANGE_METADATA_AGGREGATE_BYTES - aggregate_bytes
+                object_type, size = batch.verify_object(
+                    object_id,
+                    allowed_types=frozenset({"commit", "tree", "tag"}),
+                    maximum_size=min(
+                        MAX_RANGE_METADATA_OBJECT_BYTES,
+                        max(0, remaining),
+                    ),
+                    deadline=deadline,
+                )
+                aggregate_bytes += size
+                if aggregate_bytes > MAX_RANGE_METADATA_AGGREGATE_BYTES:
+                    raise ValueError("metadata closure exceeds its aggregate byte cap")
+                if object_id in {info.base_sha, info.head_sha}:
+                    endpoint_types[object_id] = object_type
+                receipt.update(f"{object_id} {object_type} {size}\0".encode("ascii"))
+        if any(
+            endpoint_types.get(endpoint) != "commit"
+            for endpoint in {info.base_sha, info.head_sha}
+        ):
+            raise ValueError("frozen endpoint object is not a commit")
+        return RangeMetadataReceipt(
+            object_count=len(object_ids),
+            aggregate_bytes=aggregate_bytes,
+            sha256=receipt.hexdigest(),
+            object_ids=frozenset(object_ids),
+        )
+    except GitProcessClosureUnproven:
+        raise
+    except (TimeoutError, OverflowError) as error:
+        raise inconclusive(
+            f"reachable metadata verification did not complete safely: {error}",
+            stage="range-object-verification",
+            code="range-object-verification-bounded-failure",
+        ) from error
+    except (OSError, UnicodeError, ValueError) as error:
+        raise blocked(
+            f"reachable metadata verification failed: {error}",
+            stage="range-object-verification",
+            code="range-object-verification-failed",
+        ) from error
+
+
+def authenticated_range_manifests(
+    info: RepositoryInfo,
+) -> tuple[TreeManifest, TreeManifest]:
+    closure = _verify_reachable_metadata_objects(info)
+    deadline = time.monotonic() + RANGE_METADATA_VERIFY_SECONDS
+    try:
+        with CatFileBatch(info) as batch:
+            authenticated_base = _authenticated_tree_entries(
+                info,
+                batch,
+                commit=info.base_sha,
+                closure_ids=closure.object_ids,
+                deadline=deadline,
+            )
+            authenticated_head = _authenticated_tree_entries(
+                info,
+                batch,
+                commit=info.head_sha,
+                closure_ids=closure.object_ids,
+                deadline=deadline,
+            )
+    except GitProcessClosureUnproven:
+        raise
+    except (TimeoutError, OverflowError) as error:
+        raise inconclusive(
+            f"endpoint tree authentication did not complete safely: {error}",
+            stage="range-object-verification",
+            code="range-tree-authentication-bounded-failure",
+        ) from error
+    except (OSError, UnicodeError, ValueError) as error:
+        raise blocked(
+            f"endpoint tree authentication failed: {error}",
+            stage="range-object-verification",
+            code="range-tree-authentication-failed",
+        ) from error
+    base = enumerate_tree(info, info.base_sha)
+    head = enumerate_tree(info, info.head_sha)
+    _require_manifest_matches_authenticated_tree(base, authenticated_base)
+    _require_manifest_matches_authenticated_tree(head, authenticated_head)
+    return base, head
 
 
 def control_git_dir_for_worktree(path: pathlib.Path) -> pathlib.Path:

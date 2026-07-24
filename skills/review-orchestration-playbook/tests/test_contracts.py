@@ -1667,7 +1667,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
         self.assertIn("expected_count != 9", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 545", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 549", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
@@ -1710,7 +1710,10 @@ class RepositoryContractTest(unittest.TestCase):
             "Hosted CI's blocker-signature probe is not a substitute",
             "cd skills/review-orchestration-playbook/scripts/"
             "independent_codex_pr_review",
-            "/opt/homebrew/bin/python3.13 -B -m tests.run_required_no_child_profile",
+            "TRUSTED_PYTHON=/absolute/path/to/parent-validated/python3.13",
+            '"$TRUSTED_PYTHON" -B -m tests.run_required_no_child_profile',
+            "no-group-write/no-other-write",
+            "interpreter's absolute path and digest",
             "tests.run_required_no_child_profile",
         ):
             self.assertIn(requirement, pr_readiness)

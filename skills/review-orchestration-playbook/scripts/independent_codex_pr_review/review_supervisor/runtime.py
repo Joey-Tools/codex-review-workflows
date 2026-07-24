@@ -50,10 +50,10 @@ from .gitraw import (
     RepositoryInfo,
     WorktreeRegistration,
     add_detached_worktree,
+    authenticated_range_manifests,
     create_sanitized_view,
     enumerate_registration,
     enumerate_registration_fd,
-    enumerate_tree,
     initialize_index,
     inspect_repository,
     manifest_digest,
@@ -2699,8 +2699,7 @@ def checkout_worker_main(
             git_executable=state["git_executable"],
             temporary_control_parent=attempt.path,
         )
-        base = enumerate_tree(info, info.base_sha)
-        head = enumerate_tree(info, info.head_sha)
+        base, head = authenticated_range_manifests(info)
         if (
             manifest_digest(base) != state["base_manifest_sha256"]
             or manifest_digest(head) != state["head_manifest_sha256"]
