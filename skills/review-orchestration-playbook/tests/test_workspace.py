@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from collections import Counter
 from unittest import mock
 
 
@@ -8890,6 +8891,203 @@ class WorkspaceTest(unittest.TestCase):
         evidence = validate_external_workspace(review)
         self.assertEqual(evidence["secret_delta"], secret_delta)
 
+    def test_unextractable_container_budget_charges_unique_path_identity_once(
+        self,
+    ) -> None:
+        raw_path = b'password = "' + b"P" * 32
+        counts: Counter[tuple[str, bytes]] = Counter()
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES",
+                1,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES",
+                len(raw_path),
+            ),
+        ):
+            budget = workspace_runtime._UnextractableContainerBudget.default()
+            budget.record(counts, surface="path", identity=raw_path)
+            budget.record(counts, surface="path", identity=raw_path)
+
+            self.assertEqual(counts[("path", raw_path)], 2)
+            self.assertEqual(budget.remaining_identities, 0)
+            self.assertEqual(budget.remaining_path_identity_bytes, 0)
+            with self.assertRaisesRegex(ReviewError, "container identity limit"):
+                budget.record(
+                    counts,
+                    surface="path",
+                    identity=raw_path + b"-different",
+                )
+
+    def test_unextractable_blob_identity_budget_is_total_and_preserves_multiplicity(
+        self,
+    ) -> None:
+        payload = b'password = "' + b"B" * 32
+        first = self.repo / "opaque-a.bin"
+        second = self.repo / "opaque-b.bin"
+        first.write_bytes(payload)
+        second.write_bytes(payload)
+        git(self.repo, "add", first.name, second.name)
+        git(self.repo, "commit", "-m", "Add duplicate opaque blobs")
+        opaque_base = git(self.repo, "rev-parse", "HEAD")
+        unchanged_head = self.commit_bytes(
+            "unrelated-budget.txt",
+            b"unrelated\n",
+            "Retain duplicate opaque blobs",
+        )
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES",
+                2,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES",
+                0,
+            ),
+        ):
+            exit_code, summary = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=opaque_base,
+                head_ref=unchanged_head,
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["secret_delta"]["status"], "clean")
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES",
+                1,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES",
+                0,
+            ),
+        ):
+            exit_code, summary = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=opaque_base,
+                head_ref=unchanged_head,
+            )
+        self.assertEqual(exit_code, 75)
+        self.assertEqual(summary["status"], "inconclusive")
+        self.assertEqual(
+            summary["failure_class"],
+            "exact-value-scan-incomplete",
+        )
+        self.assertEqual(summary["temporary_cleanup_status"], "complete")
+
+    def test_unextractable_path_identity_byte_budget_boundary_and_overflow(
+        self,
+    ) -> None:
+        opaque_path = 'password = "' + "Q" * 32
+        opaque_base = self.commit_bytes(
+            opaque_path,
+            b"ordinary content\n",
+            "Add opaque credential path",
+        )
+        unchanged_head = self.commit_bytes(
+            "unrelated-path-budget.txt",
+            b"unrelated\n",
+            "Retain opaque credential path",
+        )
+        total_path_identity_bytes = 2 * len(os.fsencode(opaque_path))
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES",
+                2,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES",
+                total_path_identity_bytes,
+            ),
+        ):
+            exit_code, summary = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=opaque_base,
+                head_ref=unchanged_head,
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["secret_delta"]["status"], "clean")
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES",
+                2,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES",
+                total_path_identity_bytes - 1,
+            ),
+        ):
+            exit_code, summary = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=opaque_base,
+                head_ref=unchanged_head,
+            )
+        self.assertEqual(exit_code, 75)
+        self.assertEqual(summary["status"], "inconclusive")
+        self.assertEqual(
+            summary["failure_class"],
+            "exact-value-scan-incomplete",
+        )
+        self.assertEqual(summary["temporary_cleanup_status"], "complete")
+
+    def test_unextractable_blob_does_not_charge_its_long_path_to_path_budget(
+        self,
+    ) -> None:
+        long_relative = "/".join(
+            (
+                "nested-" + "a" * 80,
+                "nested-" + "b" * 80,
+                "nested-" + "c" * 80,
+                "opaque.bin",
+            )
+        )
+        opaque_base = self.commit_bytes(
+            long_relative,
+            b'password = "' + b"L" * 32,
+            "Add opaque blob at a long path",
+        )
+        unchanged_head = self.commit_bytes(
+            "unrelated-long-path.txt",
+            b"unrelated\n",
+            "Retain opaque blob at a long path",
+        )
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES",
+                2,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES",
+                0,
+            ),
+        ):
+            exit_code, summary = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=opaque_base,
+                head_ref=unchanged_head,
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["secret_delta"]["status"], "clean")
+        self.assertEqual(summary["temporary_cleanup_status"], "complete")
+
     def test_unclosed_secret_assignment_at_eof_marks_admission_inconclusive(
         self,
     ) -> None:
@@ -9177,6 +9375,74 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(
             violation["value_sha256"],
             hashlib.sha256(exact_value).hexdigest(),
+        )
+
+    def test_source_wip_unextractable_identity_budget_covers_all_endpoints(
+        self,
+    ) -> None:
+        opaque_base = self.commit_bytes(
+            "opaque-secret.txt",
+            b'password = "' + b"M" * 32,
+            "Add retained opaque credential container",
+        )
+        source_head = self.commit_bytes(
+            "source-head.txt",
+            b"source HEAD\n",
+            "Retain opaque credential in source HEAD",
+        )
+        (self.repo / "source-wip.txt").write_text(
+            "source WIP\n",
+            encoding="utf-8",
+        )
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES",
+                3,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES",
+                0,
+            ),
+        ):
+            review = prepare_workspace(
+                repo=self.repo,
+                base_ref=opaque_base,
+                head_ref=source_head,
+                include_source_wip=True,
+            )
+        self.reviews.append(review)
+        self.assertEqual(
+            self.public_synthetic_manifest(review)["secret_delta"]["status"],
+            "clean",
+        )
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES",
+                2,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES",
+                0,
+            ),
+        ):
+            review = prepare_workspace(
+                repo=self.repo,
+                base_ref=opaque_base,
+                head_ref=source_head,
+                include_source_wip=True,
+            )
+        self.reviews.append(review)
+        secret_delta = self.public_synthetic_manifest(review)["secret_delta"]
+        self.assertEqual(secret_delta["status"], "inconclusive")
+        self.assertEqual(
+            secret_delta["failure_class"],
+            "exact-value-scan-incomplete",
         )
 
     def test_source_wip_cannot_delete_source_head_exact_growth(

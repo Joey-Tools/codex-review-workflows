@@ -315,6 +315,12 @@ MAX_SECRET_REDUCTION_CANDIDATES = 128
 MAX_SECRET_REDUCTION_CANDIDATE_BYTES = 32 * 1024
 MAX_SECRET_REDUCTION_PROVENANCE_OCCURRENCES = 512
 MAX_SECRET_DELTA_ADDITION_LOCATIONS = 256
+# Opaque candidates retain only their final comparison identity. Bound the
+# aggregate endpoint maps separately from Git's tree-entry and metadata limits
+# so a base/head/source-WIP scan cannot turn otherwise bounded input into an
+# unbounded Python object graph.
+MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES = MAX_SNAPSHOT_ENTRIES
+MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES = 16 * 1024 * 1024
 MAX_LEGACY_OCCURRENCE_EVENTS = 1_000_000
 MAX_LEGACY_SEARCH_BYTES = 16 * 1024 * 1024 * 1024
 MAX_LEGACY_CONTAINMENT_CHECKS = 10_000_000
@@ -830,7 +836,7 @@ _UNEXTRACTABLE_SECRET_CANDIDATE_END = -1
 class SecretScanResult:
     blocking_rule: str | None
     unextractable_rule: str | None
-    unextractable_container_counts: Counter[tuple[str, bytes, bytes | None]]
+    unextractable_container_counts: Counter[tuple[str, bytes]]
     accepted_counts: Counter[AcceptedSyntheticValue]
     accepted_candidates: dict[AcceptedSyntheticValue, set[bytes]]
     blocking_candidates: dict[bytes, set[str]]
@@ -863,13 +869,14 @@ class SecretScanResult:
         )
 
     def merge(self, other: "SecretScanResult") -> None:
+        if other.unextractable_container_counts:
+            raise ReviewError(
+                "endpoint-local unextractable container counts cannot be merged"
+            )
         if self.blocking_rule is None:
             self.blocking_rule = other.blocking_rule
         if self.unextractable_rule is None:
             self.unextractable_rule = other.unextractable_rule
-        self.unextractable_container_counts.update(
-            other.unextractable_container_counts
-        )
         self.accepted_counts.update(other.accepted_counts)
         self.raw_occurrence_counts.update(other.raw_occurrence_counts)
         self.unembedded_occurrence_counts.update(other.unembedded_occurrence_counts)
@@ -929,6 +936,64 @@ class SecretScanResult:
             raise ReviewError(
                 "external review secret-reduction candidates exceed the byte limit"
             )
+
+    def discard_unextractable_container_evidence(self) -> None:
+        self.unextractable_rule = None
+        self.unextractable_container_counts.clear()
+
+
+@dataclass
+class _UnextractableContainerBudget:
+    remaining_identities: int
+    remaining_path_identity_bytes: int
+
+    @classmethod
+    def default(cls) -> "_UnextractableContainerBudget":
+        return cls(
+            MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES,
+            MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES,
+        )
+
+    def record(
+        self,
+        counts: Counter[tuple[str, bytes]],
+        *,
+        surface: str,
+        identity: bytes,
+    ) -> None:
+        if not identity:
+            raise ReviewError(
+                "an unextractable exact secret container identity is invalid"
+            )
+        if surface == "path":
+            path_identity_bytes = len(identity)
+        elif (
+            surface == "blob"
+            and re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", identity)
+            is not None
+        ):
+            path_identity_bytes = 0
+        else:
+            raise ReviewError(
+                "an unextractable exact secret container identity is invalid"
+            )
+        key = (surface, identity)
+        if key in counts:
+            counts[key] += 1
+            return
+        if self.remaining_identities <= 0:
+            raise ReviewError(
+                "external review content exceeds the unextractable secret "
+                "container identity limit"
+            )
+        if path_identity_bytes > self.remaining_path_identity_bytes:
+            raise ReviewError(
+                "external review content exceeds the unextractable secret path "
+                "identity byte limit"
+            )
+        counts[key] = 1
+        self.remaining_identities -= 1
+        self.remaining_path_identity_bytes -= path_identity_bytes
 
 
 @dataclass
@@ -5989,6 +6054,7 @@ def _scan_frozen_tree_values(
     reduced_secret_values: frozenset[bytes] = frozenset(),
     exact_only: bool = False,
     _continue_after_blocking: bool = False,
+    _unextractable_container_budget: _UnextractableContainerBudget | None = None,
 ) -> SecretScanResult:
     accepted = tuple(accepted_values)
     raw_occurrences = tuple(raw_occurrence_values)
@@ -5996,6 +6062,11 @@ def _scan_frozen_tree_values(
     exact_index = _index_exact_values(raw_occurrences)
     event_budget = SecretScanBudget.default()
     occurrence_budget = LegacyOccurrenceBudget.default()
+    unextractable_container_budget = (
+        _unextractable_container_budget
+        if _unextractable_container_budget is not None
+        else _UnextractableContainerBudget.default()
+    )
     result = SecretScanResult.empty()
     with (
         _temporary_review_file() as tree_metadata,
@@ -6040,9 +6111,11 @@ def _scan_frozen_tree_values(
             )
             result.merge(path_scan)
             if path_scan.unextractable_rule is not None:
-                result.unextractable_container_counts[
-                    ("path", raw_path, None)
-                ] += 1
+                unextractable_container_budget.record(
+                    result.unextractable_container_counts,
+                    surface="path",
+                    identity=raw_path,
+                )
             if mode == "160000" and object_type == "commit":
                 continue
             if object_type != "blob":
@@ -6093,9 +6166,11 @@ def _scan_frozen_tree_values(
                 _continue_after_blocking=_continue_after_blocking,
             )
             if scan.unextractable_rule is not None:
-                result.unextractable_container_counts[
-                    ("blob", raw_path, object_id.encode("ascii"))
-                ] += 1
+                unextractable_container_budget.record(
+                    result.unextractable_container_counts,
+                    surface="blob",
+                    identity=object_id.encode("ascii"),
+                )
             if capture_reduction_identities:
                 for descriptor, offsets in scan.reduction_occurrence_offsets.items():
                     identities = scan.reduction_occurrence_identities.setdefault(
@@ -6962,7 +7037,6 @@ def _unextractable_container_nonincrease(
     base_discovery: SecretScanResult,
     head_discovery: SecretScanResult,
 ) -> bool:
-    projected_counts: list[Counter[tuple[str, bytes]]] = []
     for discovery in (base_discovery, head_discovery):
         has_unextractable_rule = discovery.unextractable_rule is not None
         has_container_counts = bool(discovery.unextractable_container_counts)
@@ -6970,32 +7044,26 @@ def _unextractable_container_nonincrease(
             raise ReviewError(
                 "an unextractable exact secret candidate lost its container identity"
             )
-        projected: Counter[tuple[str, bytes]] = Counter()
-        for (
-            surface,
-            raw_path,
-            object_id,
-        ), count in discovery.unextractable_container_counts.items():
-            if not raw_path or count <= 0:
+        for (surface, identity), count in (
+            discovery.unextractable_container_counts.items()
+        ):
+            if not identity or count <= 0:
                 raise ReviewError(
                     "an unextractable exact secret container identity is invalid"
                 )
-            if surface == "path" and object_id is None:
-                identity = (surface, raw_path)
-            elif (
+            if surface == "path":
+                continue
+            if (
                 surface == "blob"
-                and object_id is not None
-                and re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", object_id)
+                and re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", identity)
                 is not None
             ):
-                identity = (surface, object_id)
-            else:
-                raise ReviewError(
-                    "an unextractable exact secret container identity is invalid"
-                )
-            projected[identity] += count
-        projected_counts.append(projected)
-    base_counts, head_counts = projected_counts
+                continue
+            raise ReviewError(
+                "an unextractable exact secret container identity is invalid"
+            )
+    base_counts = base_discovery.unextractable_container_counts
+    head_counts = head_discovery.unextractable_container_counts
     return all(
         head_count <= base_counts[identity]
         for identity, head_count in head_counts.items()
@@ -7026,6 +7094,7 @@ def _secret_count_manifests(
         for descriptor in legacy_accepted
         if descriptor.value is not None
     )
+    unextractable_container_budget = _UnextractableContainerBudget.default()
     base_discovery = _scan_frozen_tree_values(
         git_view=git_view,
         object_directory=object_directory,
@@ -7034,6 +7103,7 @@ def _secret_count_manifests(
         capture_blocking_candidates=True,
         reduced_secret_values=legacy_raw_values,
         _continue_after_blocking=True,
+        _unextractable_container_budget=unextractable_container_budget,
     )
     head_discovery = _scan_frozen_tree_values(
         git_view=git_view,
@@ -7043,11 +7113,13 @@ def _secret_count_manifests(
         capture_blocking_candidates=True,
         reduced_secret_values=legacy_raw_values,
         _continue_after_blocking=True,
+        _unextractable_container_budget=unextractable_container_budget,
     )
     opaque_containers_nonincreasing = _unextractable_container_nonincrease(
         base_discovery=base_discovery,
         head_discovery=head_discovery,
     )
+    head_discovery.discard_unextractable_container_evidence()
     source_head_discovery: SecretScanResult | None = None
     if source_head_sha is not None and source_head_sha != head_sha:
         source_head_discovery = _scan_frozen_tree_values(
@@ -7058,6 +7130,7 @@ def _secret_count_manifests(
             capture_blocking_candidates=True,
             reduced_secret_values=legacy_raw_values,
             _continue_after_blocking=True,
+            _unextractable_container_budget=unextractable_container_budget,
         )
         source_opaque_containers_nonincreasing = (
             _unextractable_container_nonincrease(
@@ -7069,6 +7142,8 @@ def _secret_count_manifests(
             opaque_containers_nonincreasing
             and source_opaque_containers_nonincreasing
         )
+        source_head_discovery.discard_unextractable_container_evidence()
+    base_discovery.discard_unextractable_container_evidence()
     discovery = SecretScanResult.empty()
     discovery.merge(base_discovery)
     discovery.merge(head_discovery)
