@@ -9,13 +9,162 @@ import platform
 import resource
 import selectors
 import signal
+import struct
 import subprocess
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 
 PROCESS_GROUP_MEMBER_CAP = 262_144
+_FORK_PID_RECEIPT = struct.Struct("!8sQ")
+_FORK_PID_RECEIPT_MAGIC = b"FXPIDv1\0"
+_FORK_PID_RECEIPT_SECONDS = 2.0
+
+
+@dataclass(slots=True)
+class ForkExecReceipt:
+    """Caller-owned proof of child and acknowledgement descriptor custody.
+
+    The protected property is child-process ownership and termination
+    convergence. Descriptor metadata records cleanup obligations, but an
+    ambiguous close outcome is never promoted to known closure.
+    """
+
+    creator_pid: int
+    own_process_group: bool
+    acknowledgement_read_fd: int
+    acknowledgement_write_fd: int
+    passed_fd_numbers: tuple[int, ...] = ()
+    fork_call_started: bool = False
+    fork_call_completed: bool = False
+    fork_failure_proven: bool = False
+    returned_pid: int | None = None
+    child_pid: int | None = None
+    child_pid_receipt_attempted: bool = False
+    child_pid_receipt_published: bool = False
+    child_pid_receipt_received: bool = False
+    child_pid_receipt_error: BaseException | None = None
+    acknowledgement_read_close_outcome: str = "owned"
+    acknowledgement_write_close_outcome: str = "owned"
+    descriptor_close_errors: dict[str, BaseException] = field(default_factory=dict)
+
+    @property
+    def in_child_process(self) -> bool:
+        return os.getpid() != self.creator_pid
+
+    @property
+    def acknowledgement_descriptors_closed(self) -> bool:
+        closed_outcomes = {"closed", "missing"}
+        return (
+            self.acknowledgement_read_fd < 0
+            and self.acknowledgement_write_fd < 0
+            and self.acknowledgement_read_close_outcome in closed_outcomes
+            and self.acknowledgement_write_close_outcome in closed_outcomes
+        )
+
+    def publish_returned_pid(self, pid: int) -> None:
+        if pid <= 0:
+            raise ValueError("fork returned an invalid process identifier")
+        if self.returned_pid is not None and self.returned_pid != pid:
+            raise ValueError("fork return receipt was rebound")
+        self.returned_pid = pid
+
+    def publish_child_pid(self, pid: int, *, received: bool) -> None:
+        if pid <= 0:
+            raise ValueError("child PID receipt is invalid")
+        if self.child_pid is not None and self.child_pid != pid:
+            raise ValueError("child PID receipt was rebound")
+        self.child_pid = pid
+        if received:
+            self.child_pid_receipt_received = True
+        else:
+            self.child_pid_receipt_published = True
+
+    def close_acknowledgement_read(
+        self,
+        failures: list[BaseException] | None = None,
+    ) -> bool:
+        return self._close_descriptor(
+            descriptor_attribute="acknowledgement_read_fd",
+            outcome_attribute="acknowledgement_read_close_outcome",
+            role="acknowledgement-read",
+            failures=failures,
+        )
+
+    def close_acknowledgement_write(
+        self,
+        failures: list[BaseException] | None = None,
+    ) -> bool:
+        return self._close_descriptor(
+            descriptor_attribute="acknowledgement_write_fd",
+            outcome_attribute="acknowledgement_write_close_outcome",
+            role="acknowledgement-write",
+            failures=failures,
+        )
+
+    def _close_descriptor(
+        self,
+        *,
+        descriptor_attribute: str,
+        outcome_attribute: str,
+        role: str,
+        failures: list[BaseException] | None,
+    ) -> bool:
+        descriptor = getattr(self, descriptor_attribute)
+        outcome = getattr(self, outcome_attribute)
+        if descriptor < 0:
+            return outcome in {"closed", "missing"}
+        if outcome in {"closed", "missing"}:
+            setattr(self, descriptor_attribute, -1)
+            return True
+        if outcome == "close-outcome-unproven":
+            return False
+        if outcome != "owned":
+            error = ChildProcessError(
+                f"{role} descriptor has invalid close state: {outcome}"
+            )
+            self.descriptor_close_errors[role] = error
+            if failures is None:
+                raise error
+            failures.append(error)
+            return False
+
+        # Publish uncertainty before the syscall. If delivery is interrupted
+        # after close, retrying this integer could close a reused descriptor.
+        setattr(self, outcome_attribute, "close-outcome-unproven")
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            if error.errno == errno.EBADF:
+                setattr(self, outcome_attribute, "missing")
+                setattr(self, descriptor_attribute, -1)
+                self.descriptor_close_errors.pop(role, None)
+                return True
+            self.descriptor_close_errors[role] = error
+            try:
+                setattr(error, "fork_exec_receipt", self)
+            except BaseException:
+                pass
+            if failures is None:
+                raise
+            failures.append(error)
+            return False
+        except BaseException as error:
+            self.descriptor_close_errors[role] = error
+            try:
+                setattr(error, "fork_exec_receipt", self)
+            except BaseException:
+                pass
+            if failures is None:
+                raise
+            failures.append(error)
+            return False
+        setattr(self, outcome_attribute, "closed")
+        setattr(self, descriptor_attribute, -1)
+        self.descriptor_close_errors.pop(role, None)
+        return True
 
 
 @dataclass(frozen=True)
@@ -25,6 +174,86 @@ class SpawnedProcess:
     acknowledgement_fd: int
     passed_fd_numbers: tuple[int, ...]
     start_identity: str | None = None
+    fork_exec_receipt: ForkExecReceipt | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+
+
+@dataclass(slots=True)
+class ForkExecResultOwner:
+    """Caller-visible owner for one fork result until explicit transfer."""
+
+    receipt: ForkExecReceipt | None = None
+    process: SpawnedProcess | None = None
+    transferred: bool = False
+    termination_proven: bool = False
+
+    def publish_receipt(self, receipt: ForkExecReceipt) -> None:
+        if self.receipt is None:
+            self.receipt = receipt
+        elif self.receipt is not receipt:
+            raise ValueError("fork-exec receipt owner was rebound")
+
+    def owns_receipt(self, receipt: ForkExecReceipt) -> bool:
+        return self.receipt is receipt
+
+    def publish(self, process: SpawnedProcess) -> None:
+        receipt = self.receipt
+        if receipt is None or process.fork_exec_receipt is not receipt:
+            raise ValueError("fork-exec process is not bound to the owned receipt")
+        if self.process is None:
+            self.process = process
+        elif self.process is not process:
+            raise ValueError("fork-exec process owner was rebound")
+
+    def owns(self, process: SpawnedProcess) -> bool:
+        return self.process is process
+
+    def transfer(self, process: SpawnedProcess) -> SpawnedProcess:
+        if self.process is not process or self.termination_proven:
+            raise ValueError("fork-exec process transfer is inconsistent")
+        self.transferred = True
+        return process
+
+    def mark_termination_proven(self, process: SpawnedProcess) -> None:
+        if self.process is None:
+            self.process = process
+        elif self.process is not process:
+            raise ValueError("fork-exec settlement process was rebound")
+        self.termination_proven = True
+
+    def __enter__(self) -> ForkExecResultOwner:
+        return self
+
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: object,
+    ) -> bool:
+        del exception_type, traceback
+        if self.transferred or self.termination_proven:
+            return False
+        source = exception
+        while source is not None:
+            if (
+                isinstance(
+                    source,
+                    (ForkedProcessClosureUnproven, ForkedProcessOwnershipUnproven),
+                )
+                and source.result_owner is self
+            ):
+                return False
+            source = source.__cause__
+        trigger = exception or RuntimeError(
+            "fork-exec result owner exited without transferring the process"
+        )
+        settle_untransferred_fork_exec(self, trigger=trigger)
+        if exception is None:
+            raise trigger
+        return False
 
 
 class ForkedProcessClosureUnproven(RuntimeError):
@@ -33,13 +262,33 @@ class ForkedProcessClosureUnproven(RuntimeError):
         process: SpawnedProcess,
         identity_error: BaseException,
         cleanup_error: BaseException,
+        *,
+        result_owner: ForkExecResultOwner | None = None,
     ) -> None:
         self.process = process
+        self.result_owner = result_owner
+        self.receipt = result_owner.receipt if result_owner is not None else None
         super().__init__(
             "post-fork process closure is unproven: "
             f"pid={process.pid}, "
             f"identity_error={type(identity_error).__name__}, "
             f"cleanup_error={type(cleanup_error).__name__}"
+        )
+
+
+class ForkedProcessOwnershipUnproven(RuntimeError):
+    def __init__(
+        self,
+        result_owner: ForkExecResultOwner,
+        trigger: BaseException,
+        recovery_error: BaseException,
+    ) -> None:
+        self.result_owner = result_owner
+        self.receipt = result_owner.receipt
+        super().__init__(
+            "post-fork child ownership is unproven: "
+            f"trigger={type(trigger).__name__}, "
+            f"recovery_error={type(recovery_error).__name__}"
         )
 
 
@@ -117,6 +366,116 @@ def _safe_duplicates(fds: Sequence[int]) -> list[int]:
     return duplicates
 
 
+_FORK_EXEC_RECEIPT_CONTEXT = threading.local()
+_FORK_EXEC_HOOK_LOCK = threading.Lock()
+_FORK_EXEC_HOOK_REGISTERED = False
+
+
+def _active_fork_exec_receipt() -> ForkExecReceipt | None:
+    receipt = getattr(_FORK_EXEC_RECEIPT_CONTEXT, "receipt", None)
+    return receipt if isinstance(receipt, ForkExecReceipt) else None
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        try:
+            written = os.write(descriptor, payload[offset:])
+        except InterruptedError:
+            continue
+        if written <= 0:
+            raise OSError(errno.EIO, "fork PID receipt write made no progress")
+        offset += written
+
+
+def _publish_child_pid_receipt(receipt: ForkExecReceipt) -> None:
+    child_pid = os.getpid()
+    _write_all(
+        receipt.acknowledgement_write_fd,
+        _FORK_PID_RECEIPT.pack(_FORK_PID_RECEIPT_MAGIC, child_pid),
+    )
+    receipt.publish_child_pid(child_pid, received=False)
+
+
+def _after_fork_exec_in_parent() -> None:
+    receipt = _active_fork_exec_receipt()
+    if receipt is not None:
+        receipt.fork_call_completed = True
+
+
+def _after_fork_exec_in_child() -> None:
+    receipt = _active_fork_exec_receipt()
+    if receipt is None:
+        return
+    receipt.fork_call_completed = True
+    if receipt.child_pid_receipt_attempted:
+        return
+    receipt.child_pid_receipt_attempted = True
+    try:
+        _publish_child_pid_receipt(receipt)
+    except BaseException as error:
+        receipt.child_pid_receipt_error = error
+
+
+def _ensure_fork_exec_hooks() -> None:
+    global _FORK_EXEC_HOOK_REGISTERED
+
+    if _FORK_EXEC_HOOK_REGISTERED:
+        return
+    with _FORK_EXEC_HOOK_LOCK:
+        if _FORK_EXEC_HOOK_REGISTERED:
+            return
+        os.register_at_fork(
+            after_in_parent=_after_fork_exec_in_parent,
+            after_in_child=_after_fork_exec_in_child,
+        )
+        _FORK_EXEC_HOOK_REGISTERED = True
+
+
+def _clear_active_fork_exec_receipt(receipt: ForkExecReceipt) -> None:
+    if _active_fork_exec_receipt() is receipt:
+        del _FORK_EXEC_RECEIPT_CONTEXT.receipt
+
+
+def _read_child_pid_receipt(
+    receipt: ForkExecReceipt,
+    *,
+    deadline: float,
+) -> int:
+    if receipt.child_pid_receipt_received and receipt.child_pid is not None:
+        return receipt.child_pid
+    descriptor = receipt.acknowledgement_read_fd
+    if descriptor < 0 or receipt.acknowledgement_read_close_outcome != "owned":
+        raise ChildProcessError("fork PID receipt descriptor is unavailable")
+
+    selector = selectors.DefaultSelector()
+    payload = bytearray()
+    try:
+        os.set_blocking(descriptor, False)
+        selector.register(descriptor, selectors.EVENT_READ)
+        while len(payload) < _FORK_PID_RECEIPT.size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("fork PID receipt deadline expired")
+            if not selector.select(min(remaining, 0.1)):
+                continue
+            try:
+                chunk = os.read(descriptor, _FORK_PID_RECEIPT.size - len(payload))
+            except BlockingIOError:
+                continue
+            if not chunk:
+                raise ChildProcessError("fork PID receipt pipe closed early")
+            payload.extend(chunk)
+    finally:
+        selector.close()
+
+    magic, child_pid = _FORK_PID_RECEIPT.unpack(payload)
+    if magic != _FORK_PID_RECEIPT_MAGIC or child_pid <= 0:
+        raise ChildProcessError("fork PID receipt is invalid")
+    receipt.publish_child_pid(child_pid, received=True)
+    return child_pid
+
+
 def _settle_unidentified_fork(
     process: SpawnedProcess,
     *,
@@ -143,6 +502,104 @@ def _settle_unidentified_fork(
     reap(process.pid, deadline=deadline)
 
 
+def _receipt_process(
+    result_owner: ForkExecResultOwner,
+    *,
+    trigger: BaseException,
+) -> SpawnedProcess:
+    if result_owner.process is not None:
+        return result_owner.process
+    receipt = result_owner.receipt
+    if receipt is None:
+        raise ForkedProcessOwnershipUnproven(
+            result_owner,
+            trigger,
+            ChildProcessError("fork-exec receipt was not published"),
+        )
+
+    pid = receipt.returned_pid
+    if pid is None:
+        close_failures: list[BaseException] = []
+        receipt.close_acknowledgement_write(close_failures)
+        try:
+            pid = _read_child_pid_receipt(
+                receipt,
+                deadline=time.monotonic() + _FORK_PID_RECEIPT_SECONDS,
+            )
+        except BaseException as recovery_error:
+            raise ForkedProcessOwnershipUnproven(
+                result_owner,
+                trigger,
+                recovery_error,
+            ) from recovery_error
+    process = SpawnedProcess(
+        pid=pid,
+        pgid=pid if receipt.own_process_group else os.getpgrp(),
+        acknowledgement_fd=-1,
+        passed_fd_numbers=receipt.passed_fd_numbers,
+        start_identity=None,
+        fork_exec_receipt=receipt,
+    )
+    result_owner.publish(process)
+    return process
+
+
+def settle_untransferred_fork_exec(
+    result_owner: ForkExecResultOwner,
+    *,
+    trigger: BaseException,
+) -> None:
+    """Converge a child that was created before result transfer completed."""
+
+    try:
+        setattr(trigger, "fork_exec_result_owner", result_owner)
+    except BaseException:
+        pass
+    if result_owner.transferred or result_owner.termination_proven:
+        return
+    receipt = result_owner.receipt
+    if receipt is None:
+        return
+
+    may_have_child = receipt.fork_call_started and not receipt.fork_failure_proven
+    descriptor_failures: list[BaseException] = []
+    if not may_have_child:
+        receipt.close_acknowledgement_write(descriptor_failures)
+        receipt.close_acknowledgement_read(descriptor_failures)
+        result_owner.termination_proven = True
+        return
+
+    process = _receipt_process(result_owner, trigger=trigger)
+    receipt.close_acknowledgement_write(descriptor_failures)
+    receipt.close_acknowledgement_read(descriptor_failures)
+
+    cleanup_error: BaseException | None = None
+    cleanup_control_flow: BaseException | None = None
+    for cleanup_seconds in (2.0, 5.0):
+        try:
+            _settle_unidentified_fork(
+                process,
+                own_process_group=receipt.own_process_group,
+                deadline=time.monotonic() + cleanup_seconds,
+            )
+        except BaseException as error:
+            cleanup_error = error
+            if not isinstance(error, Exception):
+                cleanup_control_flow = error
+            continue
+        result_owner.mark_termination_proven(process)
+        if cleanup_control_flow is not None:
+            raise cleanup_control_flow
+        return
+    assert cleanup_error is not None
+    raise ForkedProcessClosureUnproven(
+        process,
+        trigger,
+        cleanup_error,
+        result_owner=result_owner,
+    ) from cleanup_error
+
+
 def fork_exec(
     argv: Sequence[str],
     *,
@@ -153,57 +610,69 @@ def fork_exec(
     pass_fds: Sequence[int] = (),
     own_process_group: bool,
     search_path: bool = False,
+    result_owner: ForkExecResultOwner,
 ) -> SpawnedProcess:
     ack_read, ack_write = cloexec_pipe()
     passed_targets = tuple(range(3, 3 + len(pass_fds)))
+    receipt = ForkExecReceipt(
+        creator_pid=os.getpid(),
+        own_process_group=own_process_group,
+        acknowledgement_read_fd=ack_read,
+        acknowledgement_write_fd=ack_write,
+        passed_fd_numbers=passed_targets,
+    )
+    result_owner.publish_receipt(receipt)
+    if not result_owner.owns_receipt(receipt):
+        raise ChildProcessError("fork-exec receipt owner did not retain the receipt")
     ack_target = 3 + len(pass_fds)
-    pid = os.fork()
-    if pid != 0:
-        os.close(ack_write)
+    try:
+        _ensure_fork_exec_hooks()
         try:
+            _FORK_EXEC_RECEIPT_CONTEXT.receipt = receipt
+            receipt.fork_call_started = True
+            try:
+                pid = os.fork()
+            except OSError:
+                if not receipt.fork_call_completed:
+                    receipt.fork_failure_proven = True
+                raise
+        finally:
+            _clear_active_fork_exec_receipt(receipt)
+
+        receipt.fork_call_completed = True
+        if pid != 0:
+            receipt.publish_returned_pid(pid)
+            receipt.close_acknowledgement_write()
+            child_pid = _read_child_pid_receipt(
+                receipt,
+                deadline=time.monotonic() + _FORK_PID_RECEIPT_SECONDS,
+            )
+            if child_pid != pid:
+                raise ChildProcessError(
+                    "fork return does not match the child PID receipt"
+                )
             start_identity = process_start_identity(pid)
-        except BaseException as identity_error:
-            os.close(ack_read)
             process = SpawnedProcess(
                 pid=pid,
                 pgid=pid if own_process_group else os.getpgrp(),
-                acknowledgement_fd=-1,
+                acknowledgement_fd=receipt.acknowledgement_read_fd,
                 passed_fd_numbers=passed_targets,
-                start_identity=None,
+                start_identity=start_identity,
+                fork_exec_receipt=receipt,
             )
-            cleanup_error: BaseException | None = None
-            cleanup_control_flow: BaseException | None = None
-            for cleanup_seconds in (2.0, 5.0):
-                try:
-                    _settle_unidentified_fork(
-                        process,
-                        own_process_group=own_process_group,
-                        deadline=time.monotonic() + cleanup_seconds,
-                    )
-                except BaseException as error:
-                    cleanup_error = error
-                    if not isinstance(error, Exception):
-                        cleanup_control_flow = error
-                    continue
-                if cleanup_control_flow is not None:
-                    raise cleanup_control_flow
-                raise identity_error
-            assert cleanup_error is not None
-            raise ForkedProcessClosureUnproven(
-                process,
-                identity_error,
-                cleanup_error,
-            ) from cleanup_error
-        return SpawnedProcess(
-            pid=pid,
-            pgid=pid if own_process_group else os.getpgrp(),
-            acknowledgement_fd=ack_read,
-            passed_fd_numbers=passed_targets,
-            start_identity=start_identity,
-        )
+            result_owner.publish(process)
+            if not result_owner.owns(process):
+                raise ChildProcessError(
+                    "fork-exec result owner did not retain the spawned process"
+                )
+            return process
 
-    try:
-        os.close(ack_read)
+        if receipt.child_pid_receipt_error is not None:
+            raise receipt.child_pid_receipt_error
+        if not receipt.child_pid_receipt_published:
+            receipt.child_pid_receipt_attempted = True
+            _publish_child_pid_receipt(receipt)
+        receipt.close_acknowledgement_read()
         sources = [stdin_fd, stdout_fd, stderr_fd, *pass_fds, ack_write]
         safe = _safe_duplicates(sources)
         for target, source in zip((0, 1, 2), safe[:3], strict=True):
@@ -227,6 +696,9 @@ def fork_exec(
         else:
             os.execv(argv[0], list(argv))
     except BaseException as error:
+        if not receipt.in_child_process:
+            settle_untransferred_fork_exec(result_owner, trigger=error)
+            raise
         try:
             payload = f"{getattr(error, 'errno', errno.EIO)}:{type(error).__name__}:{error}".encode(
                 "utf-8", "replace"
@@ -284,8 +756,14 @@ def await_exec(process: SpawnedProcess, *, deadline: float) -> None:
                 )
             return
     finally:
-        selector.close()
-        os.close(process.acknowledgement_fd)
+        try:
+            selector.close()
+        finally:
+            receipt = process.fork_exec_receipt
+            if receipt is None:
+                os.close(process.acknowledgement_fd)
+            else:
+                receipt.close_acknowledgement_read()
 
 
 def process_start_identity(pid: int) -> str:

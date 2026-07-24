@@ -72,6 +72,7 @@ from .ledger import (
 from .models import HelperCustody, Identity, TreeEntry, TreeManifest
 from .no_child_profile import LaunchedNoChildProcess
 from .process import (
+    ForkExecResultOwner,
     ForkedProcessClosureUnproven,
     SpawnedProcess,
     TerminationSchedule,
@@ -87,6 +88,7 @@ from .process import (
 from .prompt import prompt_evidence
 from .review_execution import AuthenticatedReviewResult, run_authenticated_review
 from .recovery_cleanup import (
+    CustodiedDeletionResultOwner,
     CustodiedManifest,
     RootSpec,
     build_custodied_manifest,
@@ -1071,6 +1073,7 @@ def _spawn_internal(
     cwd: pathlib.Path,
     pass_fds: tuple[int, ...],
     own_process_group: bool,
+    result_owner: ForkExecResultOwner,
 ) -> SpawnedProcess:
     require_direct_process_closure_proven()
     devnull = _open_devnull()
@@ -1085,6 +1088,7 @@ def _spawn_internal(
                 stderr_fd=devnull,
                 pass_fds=pass_fds,
                 own_process_group=own_process_group,
+                result_owner=result_owner,
             )
         except ForkedProcessClosureUnproven as error:
             failure = latch_direct_process_closure_unproven(error.process)
@@ -2013,33 +2017,37 @@ def commit_via_helper(
     parent, child = socket_pair()
     token = os.urandom(32).hex()
     process: SpawnedProcess | None = None
+    process_owner = ForkExecResultOwner()
     try:
-        process = _spawn_internal(
-            entrypoint=entrypoint,
-            mode="_phase-helper",
-            arguments=(
-                "--attempt-dir",
-                str(attempt.path),
-                "--control-fd",
-                "3",
-                "--lease-fd",
-                "4",
-                "--root-fd",
-                "5",
-                "--attempt-fd",
-                "6",
-                "--token",
-                token,
-            ),
-            cwd=attempt.path,
-            pass_fds=(
-                child.fileno(),
-                attempt.retention.fd,
-                attempt.retention.root_fd,
-                attempt.fd,
-            ),
-            own_process_group=False,
-        )
+        with process_owner:
+            process = _spawn_internal(
+                entrypoint=entrypoint,
+                mode="_phase-helper",
+                arguments=(
+                    "--attempt-dir",
+                    str(attempt.path),
+                    "--control-fd",
+                    "3",
+                    "--lease-fd",
+                    "4",
+                    "--root-fd",
+                    "5",
+                    "--attempt-fd",
+                    "6",
+                    "--token",
+                    token,
+                ),
+                cwd=attempt.path,
+                pass_fds=(
+                    child.fileno(),
+                    attempt.retention.fd,
+                    attempt.retention.root_fd,
+                    attempt.fd,
+                ),
+                own_process_group=False,
+                result_owner=process_owner,
+            )
+            process_owner.transfer(process)
         child.close()
         await_exec(process, deadline=deadline)
         _authenticate_attempt_transfer(
@@ -2100,33 +2108,37 @@ def settle_process_via_helper(
     parent, child = socket_pair()
     token = os.urandom(32).hex()
     process: SpawnedProcess | None = None
+    process_owner = ForkExecResultOwner()
     try:
-        process = _spawn_internal(
-            entrypoint=entrypoint,
-            mode="_phase-helper",
-            arguments=(
-                "--attempt-dir",
-                str(attempt.path),
-                "--control-fd",
-                "3",
-                "--lease-fd",
-                "4",
-                "--root-fd",
-                "5",
-                "--attempt-fd",
-                "6",
-                "--token",
-                token,
-            ),
-            cwd=attempt.path,
-            pass_fds=(
-                child.fileno(),
-                attempt.retention.fd,
-                attempt.retention.root_fd,
-                attempt.fd,
-            ),
-            own_process_group=False,
-        )
+        with process_owner:
+            process = _spawn_internal(
+                entrypoint=entrypoint,
+                mode="_phase-helper",
+                arguments=(
+                    "--attempt-dir",
+                    str(attempt.path),
+                    "--control-fd",
+                    "3",
+                    "--lease-fd",
+                    "4",
+                    "--root-fd",
+                    "5",
+                    "--attempt-fd",
+                    "6",
+                    "--token",
+                    token,
+                ),
+                cwd=attempt.path,
+                pass_fds=(
+                    child.fileno(),
+                    attempt.retention.fd,
+                    attempt.retention.root_fd,
+                    attempt.fd,
+                ),
+                own_process_group=False,
+                result_owner=process_owner,
+            )
+            process_owner.transfer(process)
         child.close()
         await_exec(process, deadline=deadline)
         _authenticate_attempt_transfer(
@@ -2279,33 +2291,37 @@ def publish_prompt_via_helper(
     parent, child = socket_pair()
     token = os.urandom(32).hex()
     process: SpawnedProcess | None = None
+    process_owner = ForkExecResultOwner()
     try:
-        process = _spawn_internal(
-            entrypoint=entrypoint,
-            mode="_prompt-helper",
-            arguments=(
-                "--attempt-dir",
-                str(attempt.path),
-                "--control-fd",
-                "3",
-                "--lease-fd",
-                "4",
-                "--root-fd",
-                "5",
-                "--attempt-fd",
-                "6",
-                "--token",
-                token,
-            ),
-            cwd=attempt.path,
-            pass_fds=(
-                child.fileno(),
-                attempt.retention.fd,
-                attempt.retention.root_fd,
-                attempt.fd,
-            ),
-            own_process_group=False,
-        )
+        with process_owner:
+            process = _spawn_internal(
+                entrypoint=entrypoint,
+                mode="_prompt-helper",
+                arguments=(
+                    "--attempt-dir",
+                    str(attempt.path),
+                    "--control-fd",
+                    "3",
+                    "--lease-fd",
+                    "4",
+                    "--root-fd",
+                    "5",
+                    "--attempt-fd",
+                    "6",
+                    "--token",
+                    token,
+                ),
+                cwd=attempt.path,
+                pass_fds=(
+                    child.fileno(),
+                    attempt.retention.fd,
+                    attempt.retention.root_fd,
+                    attempt.fd,
+                ),
+                own_process_group=False,
+                result_owner=process_owner,
+            )
+            process_owner.transfer(process)
         child.close()
         await_exec(process, deadline=deadline)
         _authenticate_attempt_transfer(
@@ -3408,33 +3424,37 @@ def verify_prompt_via_helper(
     parent, child = socket_pair()
     token = os.urandom(32).hex()
     process: SpawnedProcess | None = None
+    process_owner = ForkExecResultOwner()
     try:
-        process = _spawn_internal(
-            entrypoint=entrypoint,
-            mode="_prompt-verifier",
-            arguments=(
-                "--attempt-dir",
-                str(attempt.path),
-                "--control-fd",
-                "3",
-                "--lease-fd",
-                "4",
-                "--root-fd",
-                "5",
-                "--attempt-fd",
-                "6",
-                "--token",
-                token,
-            ),
-            cwd=attempt.path,
-            pass_fds=(
-                child.fileno(),
-                attempt.retention.fd,
-                attempt.retention.root_fd,
-                attempt.fd,
-            ),
-            own_process_group=False,
-        )
+        with process_owner:
+            process = _spawn_internal(
+                entrypoint=entrypoint,
+                mode="_prompt-verifier",
+                arguments=(
+                    "--attempt-dir",
+                    str(attempt.path),
+                    "--control-fd",
+                    "3",
+                    "--lease-fd",
+                    "4",
+                    "--root-fd",
+                    "5",
+                    "--attempt-fd",
+                    "6",
+                    "--token",
+                    token,
+                ),
+                cwd=attempt.path,
+                pass_fds=(
+                    child.fileno(),
+                    attempt.retention.fd,
+                    attempt.retention.root_fd,
+                    attempt.fd,
+                ),
+                own_process_group=False,
+                result_owner=process_owner,
+            )
+            process_owner.transfer(process)
         child.close()
         await_exec(process, deadline=deadline)
         _authenticate_attempt_transfer(
@@ -3676,36 +3696,40 @@ def authorize_terminal_via_helper(
     parent, child = socket_pair()
     token = os.urandom(32).hex()
     process: SpawnedProcess | None = None
+    process_owner = ForkExecResultOwner()
     try:
-        process = _spawn_internal(
-            entrypoint=entrypoint,
-            mode="_authorization-helper",
-            arguments=(
-                "--attempt-dir",
-                str(attempt.path),
-                "--control-fd",
-                "3",
-                "--lease-fd",
-                "4",
-                "--root-fd",
-                "5",
-                "--attempt-fd",
-                "6",
-                "--outer-liveness-fd",
-                "7",
-                "--token",
-                token,
-            ),
-            cwd=attempt.path,
-            pass_fds=(
-                child.fileno(),
-                attempt.retention.fd,
-                attempt.retention.root_fd,
-                attempt.fd,
-                outer.fileno(),
-            ),
-            own_process_group=False,
-        )
+        with process_owner:
+            process = _spawn_internal(
+                entrypoint=entrypoint,
+                mode="_authorization-helper",
+                arguments=(
+                    "--attempt-dir",
+                    str(attempt.path),
+                    "--control-fd",
+                    "3",
+                    "--lease-fd",
+                    "4",
+                    "--root-fd",
+                    "5",
+                    "--attempt-fd",
+                    "6",
+                    "--outer-liveness-fd",
+                    "7",
+                    "--token",
+                    token,
+                ),
+                cwd=attempt.path,
+                pass_fds=(
+                    child.fileno(),
+                    attempt.retention.fd,
+                    attempt.retention.root_fd,
+                    attempt.fd,
+                    outer.fileno(),
+                ),
+                own_process_group=False,
+                result_owner=process_owner,
+            )
+            process_owner.transfer(process)
         child.close()
         await_exec(process, deadline=deadline)
         _authenticate_attempt_transfer(
@@ -4049,6 +4073,7 @@ def _run_checkout(
     )
     parent, child = socket_pair()
     worker: SpawnedProcess | None = None
+    worker_owner = ForkExecResultOwner()
 
     def load_durable_closure_receipt(
         failed_worker: SpawnedProcess,
@@ -4153,35 +4178,38 @@ def _run_checkout(
         )
 
     try:
-        worker = _spawn_internal(
-            entrypoint=entrypoint,
-            mode="_checkout-worker",
-            arguments=(
-                "--attempt-dir",
-                str(attempt.path),
-                "--control-fd",
-                "3",
-                "--lease-fd",
-                "4",
-                "--root-fd",
-                "5",
-                "--attempt-fd",
-                "6",
-                "--source-fd",
-                "7",
-                "--token",
-                token,
-            ),
-            cwd=attempt.path,
-            pass_fds=(
-                child.fileno(),
-                attempt.retention.fd,
-                attempt.retention.root_fd,
-                attempt.fd,
-                source_fd,
-            ),
-            own_process_group=True,
-        )
+        with worker_owner:
+            worker = _spawn_internal(
+                entrypoint=entrypoint,
+                mode="_checkout-worker",
+                arguments=(
+                    "--attempt-dir",
+                    str(attempt.path),
+                    "--control-fd",
+                    "3",
+                    "--lease-fd",
+                    "4",
+                    "--root-fd",
+                    "5",
+                    "--attempt-fd",
+                    "6",
+                    "--source-fd",
+                    "7",
+                    "--token",
+                    token,
+                ),
+                cwd=attempt.path,
+                pass_fds=(
+                    child.fileno(),
+                    attempt.retention.fd,
+                    attempt.retention.root_fd,
+                    attempt.fd,
+                    source_fd,
+                ),
+                own_process_group=True,
+                result_owner=worker_owner,
+            )
+            worker_owner.transfer(worker)
         child.close()
         await_exec(worker, deadline=deadline)
         _authenticate_attempt_transfer(
@@ -4548,6 +4576,80 @@ def _manual_worktree_recovery(
     )
 
 
+def _deletion_owner_progress(
+    *,
+    operation: str,
+    intent: dict[str, Any],
+    deletion_owner: CustodiedDeletionResultOwner,
+    expected_root_count: int,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    if deletion_owner.proof is not None:
+        aggregate_proof = deletion_owner.finish()
+    else:
+        aggregate_proof = None
+    ownership_evidence = deletion_owner.recovery_evidence(
+        expected_root_count=expected_root_count
+    )
+    if aggregate_proof is not None:
+        deletion_proof = {"branch": operation, **aggregate_proof}
+        progress = deletion_proof
+        stage = "deletion-proven"
+    else:
+        deletion_proof = {}
+        progress = {
+            "branch": operation,
+            "result": "partial-or-unproven",
+            "deletion_result_ownership": ownership_evidence,
+        }
+        stage = "deletion-result-partial"
+    progressed_intent = {
+        **intent,
+        "stage": stage,
+        "deletion_result_ownership": ownership_evidence,
+    }
+    if deletion_proof:
+        progressed_intent["deletion_proof"] = deletion_proof
+    return progressed_intent, progress, ownership_evidence
+
+
+def _persist_deletion_owner_progress(
+    *,
+    entrypoint: pathlib.Path,
+    attempt: AttemptLease,
+    state: dict[str, Any],
+    state_digest: str,
+    operation: str,
+    intent: dict[str, Any],
+    deletion_owner: CustodiedDeletionResultOwner,
+    expected_root_count: int,
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    progressed_intent, progress, ownership_evidence = _deletion_owner_progress(
+        operation=operation,
+        intent=intent,
+        deletion_owner=deletion_owner,
+        expected_root_count=expected_root_count,
+    )
+    if (
+        state.get("worktree_cleanup_intent") == progressed_intent
+        and state.get("targeted_cleanup") == progressed_intent
+        and state.get("checkout_cleanup_progress") == progress
+    ):
+        return state, state_digest, ownership_evidence
+    state, state_digest = commit_via_helper(
+        entrypoint=entrypoint,
+        attempt=attempt,
+        state=state,
+        state_digest=state_digest,
+        updates={
+            "worktree_cleanup_intent": progressed_intent,
+            "targeted_cleanup": progressed_intent,
+            "checkout_cleanup_progress": progress,
+        },
+        deadline=time.monotonic() + 30,
+    )
+    return state, state_digest, ownership_evidence
+
+
 def _cleanup_worktree(
     *,
     entrypoint: pathlib.Path,
@@ -4565,6 +4667,9 @@ def _cleanup_worktree(
     git_control_fd: int | None = None
     registration_parent_fd: int | None = None
     manifest: CustodiedManifest | None = None
+    deletion_owner = CustodiedDeletionResultOwner()
+    operation: str | None = None
+    intent: dict[str, Any] | None = None
     try:
         existing_intent = state.get("worktree_cleanup_intent")
         if isinstance(existing_intent, dict) and existing_intent.get("outstanding"):
@@ -4963,18 +5068,30 @@ def _cleanup_worktree(
                 "parent_fsync_complete": True,
                 "exact_names_absent": True,
             }
+            progressed_intent = {
+                **intent,
+                "stage": "deletion-proven",
+                "deletion_proof": deletion_proof,
+            }
+            deletion_progress = deletion_proof
         else:
             assert manifest is not None
-            deletion_proof = {
-                "branch": operation,
-                **delete_custodied_roots(manifest),
-            }
-
-        progressed_intent = {
-            **intent,
-            "stage": "deletion-proven",
-            "deletion_proof": deletion_proof,
-        }
+            deletion_result = delete_custodied_roots(
+                manifest,
+                result_owner=deletion_owner,
+            )
+            deletion_owner.transfer(deletion_result)
+            (
+                progressed_intent,
+                deletion_progress,
+                _deletion_ownership_evidence,
+            ) = _deletion_owner_progress(
+                operation=operation,
+                intent=intent,
+                deletion_owner=deletion_owner,
+                expected_root_count=len(manifest.roots),
+            )
+            deletion_proof = deletion_progress
         state, state_digest = commit_via_helper(
             entrypoint=entrypoint,
             attempt=attempt,
@@ -4985,7 +5102,7 @@ def _cleanup_worktree(
                 "targeted_cleanup": (
                     progressed_intent if manifest_seal is not None else None
                 ),
-                "checkout_cleanup_progress": deletion_proof,
+                "checkout_cleanup_progress": deletion_progress,
             },
             deadline=time.monotonic() + 30,
         )
@@ -5049,6 +5166,14 @@ def _cleanup_worktree(
         )
         return state, state_digest
     except BaseException as error:
+        has_deletion_result = deletion_owner.proof is not None or bool(
+            deletion_owner.root_outcomes
+        )
+        if has_deletion_result:
+            try:
+                setattr(error, "custodied_deletion_result_owner", deletion_owner)
+            except BaseException:
+                pass
         if isinstance(error, UnprovenDirectHelperClosure):
             raise
         if isinstance(error, GitProcessClosureUnproven):
@@ -5058,6 +5183,42 @@ def _cleanup_worktree(
             checkpoint_bound_signal_interrupt(force=True)
         require_direct_process_closure_proven()
         disk_state, _, disk_digest = read_bound_attempt_state(attempt)
+        deletion_recovery_evidence: dict[str, Any] | None = None
+        if (
+            has_deletion_result
+            and operation is not None
+            and intent is not None
+            and manifest is not None
+        ):
+            try:
+                (
+                    disk_state,
+                    disk_digest,
+                    deletion_recovery_evidence,
+                ) = _persist_deletion_owner_progress(
+                    entrypoint=entrypoint,
+                    attempt=attempt,
+                    state=disk_state,
+                    state_digest=disk_digest,
+                    operation=operation,
+                    intent=intent,
+                    deletion_owner=deletion_owner,
+                    expected_root_count=len(manifest.roots),
+                )
+            except BaseException as persistence_error:
+                try:
+                    setattr(
+                        persistence_error,
+                        "custodied_deletion_result_owner",
+                        deletion_owner,
+                    )
+                    persistence_error.add_note(
+                        "deletion proof persistence failed after "
+                        f"{type(error).__name__}: {error}"
+                    )
+                except BaseException:
+                    pass
+                raise
         return _manual_worktree_recovery(
             entrypoint=entrypoint,
             attempt=attempt,
@@ -5065,6 +5226,11 @@ def _cleanup_worktree(
             state_digest=disk_digest,
             stage="worktree-cleanup",
             error=error,
+            evidence=(
+                {"deletion_result_ownership": deletion_recovery_evidence}
+                if deletion_recovery_evidence is not None
+                else None
+            ),
         )
     finally:
         if manifest is not None:

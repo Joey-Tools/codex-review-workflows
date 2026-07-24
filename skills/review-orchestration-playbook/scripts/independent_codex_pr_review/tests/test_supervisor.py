@@ -28,7 +28,12 @@ from review_supervisor.ledger import (
     read_attempt_state,
     reconcile_ledger,
 )
-from review_supervisor.process import SpawnedProcess, await_exec, fork_exec
+from review_supervisor.process import (
+    ForkExecResultOwner,
+    SpawnedProcess,
+    await_exec,
+    fork_exec,
+)
 from review_supervisor.runtime import (
     DirectProcessClosureUnproven,
     _compact_terminal,
@@ -1133,12 +1138,17 @@ class RecoverySettlementTests(unittest.TestCase):
                 manifest: object,
                 *,
                 deadline: float | None = None,
+                result_owner: object,
             ) -> dict[str, object]:
                 nonlocal delete_calls
                 delete_calls += 1
                 if delete_calls == 2:
                     raise RuntimeError("synthetic cleanup batch interruption")
-                return real_delete(manifest, deadline=deadline)
+                return real_delete(
+                    manifest,
+                    deadline=deadline,
+                    result_owner=result_owner,
+                )
 
             with (
                 mock.patch(
@@ -2386,16 +2396,20 @@ while True:
         read_fd, write_fd = os.pipe()
         devnull = os.open("/dev/null", os.O_RDWR | os.O_CLOEXEC)
         process = None
+        process_owner = ForkExecResultOwner()
         try:
-            process = fork_exec(
-                (sys.executable, "-c", script),
-                cwd=TOOL_ROOT,
-                stdin_fd=devnull,
-                stdout_fd=devnull,
-                stderr_fd=devnull,
-                pass_fds=(write_fd,),
-                own_process_group=True,
-            )
+            with process_owner:
+                process = fork_exec(
+                    (sys.executable, "-c", script),
+                    cwd=TOOL_ROOT,
+                    stdin_fd=devnull,
+                    stdout_fd=devnull,
+                    stderr_fd=devnull,
+                    pass_fds=(write_fd,),
+                    own_process_group=True,
+                    result_owner=process_owner,
+                )
+                process_owner.transfer(process)
             os.close(write_fd)
             write_fd = -1
             await_exec(process, deadline=time.monotonic() + 5)

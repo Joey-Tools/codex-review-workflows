@@ -1694,6 +1694,146 @@ class TargetedRecoveryTests(unittest.TestCase):
             self.assertTrue(proof["parent_fsync_complete"])
             self.assertTrue(proof["exact_names_absent"])
 
+    def test_production_deletion_call_to_store_persists_aggregate_owner(
+        self,
+    ) -> None:
+        with owned_temporary_directory("registration-result-owner-") as root:
+            (
+                retention,
+                attempt,
+                worktree,
+                registration,
+                _,
+                state,
+                digest,
+            ) = self._prepare(root)
+            shutil.rmtree(worktree)
+            target_offset = _call_followup_offset(
+                runtime._cleanup_worktree,
+                called_name="delete_custodied_roots",
+                following_opname="STORE_FAST",
+                following_argval="deletion_result",
+            )
+            interruption = KeyboardInterrupt(
+                "injected production deletion CALL-to-STORE interrupt"
+            )
+            injected = False
+
+            def interrupt_result_store(
+                frame: object,
+                event: str,
+                _argument: object,
+            ) -> object:
+                nonlocal injected
+                if getattr(frame, "f_code", None) is runtime._cleanup_worktree.__code__:
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        raise interruption
+                return interrupt_result_store
+
+            previous_trace = sys.gettrace()
+            try:
+                sys.settrace(interrupt_result_store)
+                state, _ = self._cleanup(retention, attempt, state, digest)
+            finally:
+                sys.settrace(previous_trace)
+
+            self.assertTrue(injected)
+            self.assertEqual(state["worktree_status"], "manual-recovery-required")
+            self.assertEqual(state["checkout_settlement"], "outstanding")
+            self.assertFalse(registration.registration.exists())
+            self.assertEqual(
+                state["worktree_cleanup_intent"]["stage"],
+                "deletion-proven",
+            )
+            progress = state["checkout_cleanup_progress"]
+            self.assertEqual(progress["branch"], "registration-only")
+            self.assertTrue(progress["parent_fsync_complete"])
+            self.assertTrue(progress["exact_names_absent"])
+            ownership = state["cleanup_recovery_evidence"]["deletion_result_ownership"]
+            self.assertEqual(ownership["aggregate_result_state"], "published")
+            self.assertEqual(ownership["expected_root_count"], 1)
+            self.assertEqual(ownership["completed_root_count"], 1)
+            self.assertTrue(ownership["result_transferred"])
+            self.assertTrue(ownership["result_finished"])
+            self.assertEqual(
+                ownership,
+                state["targeted_cleanup"]["deletion_result_ownership"],
+            )
+
+    def test_production_partial_deletion_persists_per_root_owner(self) -> None:
+        with owned_temporary_directory("registration-root-owner-") as root:
+            (
+                retention,
+                attempt,
+                worktree,
+                registration,
+                _,
+                state,
+                digest,
+            ) = self._prepare(root)
+            shutil.rmtree(worktree)
+            target_offset = _call_followup_offset(
+                delete_custodied_roots,
+                called_name="_remove_quarantined_empty_root",
+                following_opname="POP_TOP",
+            )
+            interruption = SystemExit("injected production per-root proof interruption")
+            injected = False
+
+            def interrupt_root_result(
+                frame: object,
+                event: str,
+                _argument: object,
+            ) -> object:
+                nonlocal injected
+                if getattr(frame, "f_code", None) is delete_custodied_roots.__code__:
+                    setattr(frame, "f_trace_opcodes", True)
+                    if (
+                        not injected
+                        and event == "opcode"
+                        and getattr(frame, "f_lasti", None) == target_offset
+                    ):
+                        injected = True
+                        raise interruption
+                return interrupt_root_result
+
+            previous_trace = sys.gettrace()
+            try:
+                sys.settrace(interrupt_root_result)
+                state, _ = self._cleanup(retention, attempt, state, digest)
+            finally:
+                sys.settrace(previous_trace)
+
+            self.assertTrue(injected)
+            self.assertEqual(state["worktree_status"], "manual-recovery-required")
+            self.assertFalse(registration.registration.exists())
+            self.assertEqual(
+                state["worktree_cleanup_intent"]["stage"],
+                "deletion-result-partial",
+            )
+            progress = state["checkout_cleanup_progress"]
+            self.assertEqual(progress["result"], "partial-or-unproven")
+            ownership = progress["deletion_result_ownership"]
+            self.assertEqual(ownership["aggregate_result_state"], "not-published")
+            self.assertEqual(ownership["expected_root_count"], 1)
+            self.assertEqual(ownership["completed_root_count"], 1)
+            self.assertFalse(ownership["result_finished"])
+            self.assertEqual(len(ownership["roots"]), 1)
+            root_proof = ownership["roots"][0]
+            self.assertEqual(root_proof["state"], "complete")
+            self.assertTrue(root_proof["proof"]["exact_name_absent"])
+            self.assertTrue(root_proof["proof"]["quarantine_name_absent"])
+            self.assertEqual(
+                ownership,
+                state["cleanup_recovery_evidence"]["deletion_result_ownership"],
+            )
+
     def test_absent_registration_record_rejects_alias_before_settlement(self) -> None:
         with owned_temporary_directory("registration-alias-") as root:
             retention, attempt, worktree, registration, _, state, digest = (

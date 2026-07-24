@@ -29,6 +29,8 @@ from review_supervisor.ledger import (
 )
 from review_supervisor.models import TreeEntry, TreeManifest
 from review_supervisor.process import (
+    ForkExecReceipt,
+    ForkExecResultOwner,
     ForkedProcessClosureUnproven,
     SpawnedProcess,
     TerminationSchedule,
@@ -362,6 +364,14 @@ class RuntimeHelperTests(unittest.TestCase):
             acknowledgement_fd=-1,
             passed_fd_numbers=(),
             start_identity="darwin-proc-start:123:456",
+            fork_exec_receipt=ForkExecReceipt(
+                creator_pid=os.getpid(),
+                own_process_group=True,
+                acknowledgement_read_fd=-1,
+                acknowledgement_write_fd=-1,
+                acknowledgement_read_close_outcome="closed",
+                acknowledgement_write_close_outcome="closed",
+            ),
         )
         parent = mock.Mock()
         child = mock.Mock()
@@ -450,6 +460,15 @@ class RuntimeHelperTests(unittest.TestCase):
             "registration": registration_value,
         }
 
+        def spawn_worker(*args: object, **kwargs: object) -> SpawnedProcess:
+            del args
+            result_owner = kwargs["result_owner"]
+            assert isinstance(result_owner, ForkExecResultOwner)
+            assert worker.fork_exec_receipt is not None
+            result_owner.publish_receipt(worker.fork_exec_receipt)
+            result_owner.publish(worker)
+            return worker
+
         with (
             mock.patch(
                 "review_supervisor.runtime.socket_pair",
@@ -460,7 +479,7 @@ class RuntimeHelperTests(unittest.TestCase):
             ),
             mock.patch(
                 "review_supervisor.runtime._spawn_internal",
-                return_value=worker,
+                side_effect=spawn_worker,
             ),
             mock.patch("review_supervisor.runtime.await_exec"),
             mock.patch(
@@ -550,6 +569,7 @@ class RuntimeHelperTests(unittest.TestCase):
                     cwd=ENTRYPOINT.parent,
                     pass_fds=(),
                     own_process_group=False,
+                    result_owner=ForkExecResultOwner(),
                 )
             fork_exec.assert_not_called()
 
@@ -593,6 +613,7 @@ class RuntimeHelperTests(unittest.TestCase):
                 cwd=ENTRYPOINT.parent,
                 pass_fds=(),
                 own_process_group=False,
+                result_owner=ForkExecResultOwner(),
             )
         self.assertIs(raised.exception.process, process)
         self.assertIs(raised.exception.__cause__, fork_failure)

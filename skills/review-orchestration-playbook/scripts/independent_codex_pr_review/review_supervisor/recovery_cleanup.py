@@ -703,6 +703,53 @@ class CustodiedDeletionResultOwner:
         self.finished = True
         return self.proof
 
+    def recovery_evidence(self, *, expected_root_count: int) -> dict[str, Any]:
+        """Return durable proof ownership without persisting live descriptors."""
+
+        if type(expected_root_count) is not int or expected_root_count < 0:
+            raise ValueError("expected custodied root count is invalid")
+        ordered = sorted(self.root_outcomes, key=lambda outcome: outcome.root_index)
+        if len(ordered) > expected_root_count or any(
+            outcome.root_index != index for index, outcome in enumerate(ordered)
+        ):
+            raise ValueError("custodied root deletion outcome sequence is invalid")
+        valid_states = {"armed", "remove-outcome-unproven", "complete"}
+        if any(outcome.state not in valid_states for outcome in ordered):
+            raise ValueError("custodied root deletion outcome state is invalid")
+        completed_count = sum(
+            outcome.state == "complete" and outcome.proof is not None
+            for outcome in ordered
+        )
+        if self.proof is not None and (
+            len(ordered) != expected_root_count
+            or completed_count != expected_root_count
+        ):
+            raise ValueError("aggregate deletion proof has incomplete root ownership")
+        return {
+            "protected_property": ("destructive-deletion-proof-and-result-ownership"),
+            "expected_root_count": expected_root_count,
+            "published_root_count": len(ordered),
+            "completed_root_count": completed_count,
+            "aggregate_result_state": (
+                "published" if self.proof is not None else "not-published"
+            ),
+            "aggregate_proof": self.proof,
+            "result_transferred": self.transferred,
+            "result_finished": self.finished,
+            "roots": [
+                {
+                    "root_index": outcome.root_index,
+                    "label": outcome.label,
+                    "original_name_hex": outcome.original_name.hex(),
+                    "quarantine_name_hex": outcome.quarantine_name.hex(),
+                    "state": outcome.state,
+                    "proof": outcome.proof,
+                    "protected_property": outcome.protected_property,
+                }
+                for outcome in ordered
+            ],
+        }
+
 
 def _require_parent_custody(spec: RootSpec) -> None:
     actual = identity_from_stat(os.fstat(spec.parent_fd))

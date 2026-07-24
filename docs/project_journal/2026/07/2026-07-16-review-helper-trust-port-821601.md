@@ -1146,3 +1146,23 @@ metadata behavior.
   ordinary helper success on Python 3.13 and the exact version rejection on
   older matrix interpreters while preserving the zero-bytecode assertion in
   both cases. The production Python 3.13 requirement is unchanged.
+- The current-head P1 repair closes the final low-level `fork_exec` and
+  production deletion-result publication windows. A caller-owned fork receipt
+  is published before `fork`, receives the exact child PID from the child-side
+  at-fork hook, and remains able to terminate and reap that child when either
+  the `fork()` result or returned `SpawnedProcess` is interrupted before its
+  caller-local store. An ambiguous acknowledgement-pipe close is never retried
+  against a potentially reused descriptor integer. Every production
+  `delete_custodied_roots` call now supplies a pre-existing result owner;
+  complete aggregate proof or partial per-root proof is persisted before
+  manual recovery, and incomplete proof cannot become deletion success.
+- The fixed deterministic supervisor identity is now 519 tests with SHA-256
+  `72ceaeb0d2f063a8316b812ed405805bcc381f674b12df5fa9c16d3218e3255f`;
+  all 519 passed in 191.303 seconds under Python 3.13.0 with bytecode disabled.
+  The four directly affected modules passed 100 tests in 105.895 seconds, and
+  all 93 repository contract tests passed in 5.137 seconds. The contract set
+  includes ordinary installed helper, reviewer, preflight, validator, and
+  package-import execution with ambient bytecode overrides removed and rejects
+  any new `__pycache__`, `.pyc`, or `.pyo` entry in the copied immutable release.
+  Ruff lint and format checks pass for all ten changed Python files, and
+  `git diff --check` passes. No local Python 3.10 run was performed.

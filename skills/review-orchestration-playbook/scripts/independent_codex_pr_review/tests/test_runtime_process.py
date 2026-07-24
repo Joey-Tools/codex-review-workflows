@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import dis
+import errno
 import os
 import pathlib
 import select
 import signal
+import sys
 import time
 import unittest
 from unittest import mock
@@ -12,6 +15,7 @@ from review_supervisor import gitraw
 import review_supervisor.process as process_module
 from review_supervisor.gitraw import run_bounded, sanitized_git_environment
 from review_supervisor.process import (
+    ForkExecResultOwner,
     ForkedProcessClosureUnproven,
     SpawnedProcess,
     fork_exec,
@@ -87,6 +91,30 @@ def _wait_for_identity_exit(pid: int, identity: str, *, timeout: float) -> bool:
     return False
 
 
+def _call_followup_offset(
+    function: object,
+    *,
+    called_name: str,
+    following_opname: str,
+    following_argval: str | None = None,
+) -> int:
+    instructions = tuple(dis.get_instructions(function))
+    for index, instruction in enumerate(instructions):
+        if not instruction.opname.startswith("CALL"):
+            continue
+        prior = instructions[max(0, index - 64) : index]
+        if not any(candidate.argval == called_name for candidate in prior):
+            continue
+        following = instructions[index + 1]
+        if following.opname != following_opname:
+            continue
+        if following_argval is None or following.argval == following_argval:
+            return following.offset
+    raise AssertionError(
+        f"cannot find {called_name} CALL-to-{following_opname} boundary"
+    )
+
+
 @unittest.skipUnless(os.name == "posix", "POSIX process groups are required")
 class AnchoredProcessGroupTests(unittest.TestCase):
     def test_post_fork_identity_failure_retains_receipt_after_cleanup_gap(
@@ -103,11 +131,17 @@ class AnchoredProcessGroupTests(unittest.TestCase):
             ),
             mock.patch.object(
                 process_module,
+                "_read_child_pid_receipt",
+                return_value=123,
+            ),
+            mock.patch.object(
+                process_module,
                 "_settle_unidentified_fork",
                 side_effect=PermissionError("synthetic cleanup failure"),
             ) as settle,
             self.assertRaises(ForkedProcessClosureUnproven) as raised,
         ):
+            result_owner = ForkExecResultOwner()
             fork_exec(
                 ("/usr/bin/false",),
                 cwd=pathlib.Path("/tmp"),
@@ -115,6 +149,7 @@ class AnchoredProcessGroupTests(unittest.TestCase):
                 stdout_fd=1,
                 stderr_fd=2,
                 own_process_group=True,
+                result_owner=result_owner,
             )
 
         self.assertEqual(settle.call_count, 2)
@@ -122,6 +157,203 @@ class AnchoredProcessGroupTests(unittest.TestCase):
         self.assertEqual(raised.exception.process.pgid, 123)
         self.assertEqual(raised.exception.process.acknowledgement_fd, -1)
         self.assertIsNone(raised.exception.process.start_identity)
+        self.assertIs(raised.exception.result_owner, result_owner)
+
+    def test_fork_call_to_pid_store_interrupt_settles_receipted_child(self) -> None:
+        target_offset = _call_followup_offset(
+            fork_exec,
+            called_name="fork",
+            following_opname="STORE_FAST",
+            following_argval="pid",
+        )
+        parent_pid = os.getpid()
+        interruption = KeyboardInterrupt("injected fork CALL-to-STORE interrupt")
+        injected = False
+        owner = ForkExecResultOwner()
+        devnull = os.open(os.devnull, os.O_RDWR | os.O_CLOEXEC)
+
+        def trace(frame: object, event: str, _argument: object) -> object:
+            nonlocal injected
+            if (
+                os.getpid() == parent_pid
+                and getattr(frame, "f_code", None) is fork_exec.__code__
+            ):
+                setattr(frame, "f_trace_opcodes", True)
+                if (
+                    not injected
+                    and event == "opcode"
+                    and getattr(frame, "f_lasti", None) == target_offset
+                ):
+                    injected = True
+                    raise interruption
+            return trace
+
+        previous_trace = sys.gettrace()
+        try:
+            sys.settrace(trace)
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                with owner:
+                    process = fork_exec(
+                        ("/bin/sleep", "30"),
+                        cwd=pathlib.Path("/"),
+                        stdin_fd=devnull,
+                        stdout_fd=devnull,
+                        stderr_fd=devnull,
+                        own_process_group=True,
+                        result_owner=owner,
+                    )
+                    owner.transfer(process)
+        finally:
+            sys.settrace(previous_trace)
+            os.close(devnull)
+
+        self.assertTrue(injected)
+        self.assertIs(caught.exception, interruption)
+        self.assertTrue(owner.termination_proven)
+        self.assertIsNotNone(owner.receipt)
+        self.assertIsNotNone(owner.process)
+        assert owner.receipt is not None and owner.process is not None
+        self.assertTrue(owner.receipt.fork_call_completed)
+        self.assertTrue(owner.receipt.child_pid_receipt_received)
+        self.assertEqual(owner.receipt.child_pid, owner.process.pid)
+        self.assertTrue(owner.receipt.acknowledgement_descriptors_closed)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(owner.process.pid, os.WNOHANG)
+
+    def test_fork_exec_return_call_to_store_uses_caller_owner(self) -> None:
+        owner = ForkExecResultOwner()
+        devnull = os.open(os.devnull, os.O_RDWR | os.O_CLOEXEC)
+
+        def caller() -> SpawnedProcess:
+            with owner:
+                process = fork_exec(
+                    ("/bin/sleep", "30"),
+                    cwd=pathlib.Path("/"),
+                    stdin_fd=devnull,
+                    stdout_fd=devnull,
+                    stderr_fd=devnull,
+                    own_process_group=True,
+                    result_owner=owner,
+                )
+                owner.transfer(process)
+                return process
+
+        target_offset = _call_followup_offset(
+            caller,
+            called_name="fork_exec",
+            following_opname="STORE_FAST",
+            following_argval="process",
+        )
+        interruption = SystemExit("injected fork_exec CALL-to-STORE interrupt")
+        injected = False
+
+        def trace(frame: object, event: str, _argument: object) -> object:
+            nonlocal injected
+            if getattr(frame, "f_code", None) is caller.__code__:
+                setattr(frame, "f_trace_opcodes", True)
+                if (
+                    not injected
+                    and event == "opcode"
+                    and getattr(frame, "f_lasti", None) == target_offset
+                ):
+                    injected = True
+                    raise interruption
+            return trace
+
+        previous_trace = sys.gettrace()
+        try:
+            sys.settrace(trace)
+            with self.assertRaises(SystemExit) as caught:
+                caller()
+        finally:
+            sys.settrace(previous_trace)
+            os.close(devnull)
+
+        self.assertTrue(injected)
+        self.assertIs(caught.exception, interruption)
+        self.assertTrue(owner.termination_proven)
+        self.assertIsNotNone(owner.process)
+        assert owner.process is not None
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(owner.process.pid, os.WNOHANG)
+
+    def test_ambiguous_ack_write_close_never_closes_reused_fd(self) -> None:
+        owner = ForkExecResultOwner()
+        parent_pid = os.getpid()
+        original_close = os.close
+        devnull = os.open(os.devnull, os.O_RDWR | os.O_CLOEXEC)
+        replacement_fd: int | None = None
+        injected = False
+
+        def close_reuse_then_interrupt(descriptor: int) -> None:
+            nonlocal injected, replacement_fd
+            receipt = owner.receipt
+            if (
+                os.getpid() == parent_pid
+                and receipt is not None
+                and descriptor == receipt.acknowledgement_write_fd
+                and not injected
+            ):
+                injected = True
+                self.assertEqual(
+                    receipt.acknowledgement_write_close_outcome,
+                    "close-outcome-unproven",
+                )
+                original_close(descriptor)
+                opened = os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+                if opened != descriptor:
+                    os.dup2(opened, descriptor, inheritable=False)
+                    original_close(opened)
+                replacement_fd = descriptor
+                raise OSError(
+                    errno.EINTR,
+                    "injected post-close OSError after immediate FD reuse",
+                )
+            original_close(descriptor)
+
+        try:
+            with (
+                mock.patch.object(
+                    process_module.os,
+                    "close",
+                    side_effect=close_reuse_then_interrupt,
+                ),
+                self.assertRaisesRegex(OSError, "injected post-close OSError"),
+            ):
+                with owner:
+                    process = fork_exec(
+                        ("/bin/sleep", "30"),
+                        cwd=pathlib.Path("/"),
+                        stdin_fd=devnull,
+                        stdout_fd=devnull,
+                        stderr_fd=devnull,
+                        own_process_group=True,
+                        result_owner=owner,
+                    )
+                    owner.transfer(process)
+
+            self.assertTrue(injected)
+            self.assertTrue(owner.termination_proven)
+            self.assertIsNotNone(owner.receipt)
+            assert owner.receipt is not None
+            self.assertEqual(
+                owner.receipt.acknowledgement_write_close_outcome,
+                "close-outcome-unproven",
+            )
+            self.assertEqual(
+                owner.receipt.acknowledgement_write_fd,
+                replacement_fd,
+            )
+            assert replacement_fd is not None
+            os.fstat(replacement_fd)
+            self.assertIsNotNone(owner.process)
+            assert owner.process is not None
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(owner.process.pid, os.WNOHANG)
+        finally:
+            if replacement_fd is not None:
+                original_close(replacement_fd)
+            original_close(devnull)
 
     def test_checkout_worker_signal_settles_independent_git_session(self) -> None:
         for signal_phase in ("active", "binding", "cleanup"):

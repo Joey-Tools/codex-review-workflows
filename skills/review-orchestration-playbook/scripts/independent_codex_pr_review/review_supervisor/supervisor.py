@@ -64,6 +64,7 @@ from .ledger import (
 )
 from .models import HelperCustody, Identity
 from .process import (
+    ForkExecResultOwner,
     ForkedProcessClosureUnproven,
     SpawnedProcess,
     anchored_group_members,
@@ -84,6 +85,7 @@ from .prompt import (
     validate_final_message,
 )
 from .recovery_cleanup import (
+    CustodiedDeletionResultOwner,
     RootSpec,
     build_custodied_manifest,
     delete_custodied_roots,
@@ -516,6 +518,7 @@ def _spawn_attempt_supervisor(
     attempt: AttemptLease,
     control_child: socket.socket,
     token: str,
+    result_owner: ForkExecResultOwner,
 ) -> SpawnedProcess:
     require_direct_process_closure_proven()
     devnull = os.open("/dev/null", os.O_RDWR | os.O_CLOEXEC)
@@ -554,6 +557,7 @@ def _spawn_attempt_supervisor(
                     attempt.fd,
                 ),
                 own_process_group=True,
+                result_owner=result_owner,
             )
         except ForkedProcessClosureUnproven as error:
             failure = latch_direct_process_closure_unproven(error.process)
@@ -614,6 +618,7 @@ def _acquire_source_custody_via_helper(
     parent, child = socket_pair()
     token = os.urandom(32).hex()
     process: SpawnedProcess | None = None
+    process_owner = ForkExecResultOwner()
     received_fds: tuple[int, ...] = ()
     devnull = os.open("/dev/null", os.O_RDWR | os.O_CLOEXEC)
     try:
@@ -636,15 +641,18 @@ def _acquire_source_custody_via_helper(
             token,
         )
         try:
-            process = fork_exec(
-                argv,
-                cwd=prepared.attempt_dir,
-                stdin_fd=devnull,
-                stdout_fd=devnull,
-                stderr_fd=devnull,
-                pass_fds=(child.fileno(),),
-                own_process_group=False,
-            )
+            with process_owner:
+                process = fork_exec(
+                    argv,
+                    cwd=prepared.attempt_dir,
+                    stdin_fd=devnull,
+                    stdout_fd=devnull,
+                    stderr_fd=devnull,
+                    pass_fds=(child.fileno(),),
+                    own_process_group=False,
+                    result_owner=process_owner,
+                )
+                process_owner.transfer(process)
         except ForkedProcessClosureUnproven as error:
             failure = latch_direct_process_closure_unproven(error.process)
             raise failure from error
@@ -1353,6 +1361,7 @@ def run(
     attempt_dir: pathlib.Path | None = None
     attempt: AttemptLease | None = None
     supervisor: SpawnedProcess | None = None
+    supervisor_owner = ForkExecResultOwner()
     supervisor_binding: dict[str, Any] | None = None
     parent, child = socket_pair()
     custody = None
@@ -1406,12 +1415,15 @@ def run(
         )
         handoff_deadline = time.monotonic() + HANDOFF_SECONDS
         token = os.urandom(32).hex()
-        supervisor = _spawn_attempt_supervisor(
-            entrypoint=entrypoint,
-            attempt=attempt,
-            control_child=child,
-            token=token,
-        )
+        with supervisor_owner:
+            supervisor = _spawn_attempt_supervisor(
+                entrypoint=entrypoint,
+                attempt=attempt,
+                control_child=child,
+                token=token,
+                result_owner=supervisor_owner,
+            )
+            supervisor_owner.transfer(supervisor)
         incomplete_handoff_writers_stopped = False
         child.close()
         await_exec(supervisor, deadline=handoff_deadline)
@@ -2352,12 +2364,18 @@ def _remove_recovery_artifacts(
                 deadline=time.monotonic() + 30,
             )
             deleted = False
+            deletion_owner = CustodiedDeletionResultOwner()
             try:
                 runtime_cleanup = delete_custodied_roots(
                     manifest,
                     deadline=time.monotonic() + 30,
+                    result_owner=deletion_owner,
                 )
+                deletion_owner.transfer(runtime_cleanup)
                 deleted = True
+            except BaseException as error:
+                setattr(error, "custodied_deletion_result_owner", deletion_owner)
+                raise
             finally:
                 manifest.close()
                 if deleted:
@@ -2397,12 +2415,22 @@ def _remove_recovery_artifacts(
                         deadline=cleanup_deadline,
                     )
                     deleted = False
+                    deletion_owner = CustodiedDeletionResultOwner()
                     try:
                         batch_cleanup = delete_custodied_roots(
                             manifest,
                             deadline=cleanup_deadline,
+                            result_owner=deletion_owner,
                         )
+                        deletion_owner.transfer(batch_cleanup)
                         deleted = True
+                    except BaseException as error:
+                        setattr(
+                            error,
+                            "custodied_deletion_result_owner",
+                            deletion_owner,
+                        )
+                        raise
                     finally:
                         manifest.close()
                         if deleted:
@@ -2519,12 +2547,18 @@ def _remove_exact_settled_runtime(
                 deadline=time.monotonic() + 30,
             )
             deleted = False
+            deletion_owner = CustodiedDeletionResultOwner()
             try:
                 runtime_cleanup = delete_custodied_roots(
                     manifest,
                     deadline=time.monotonic() + 30,
+                    result_owner=deletion_owner,
                 )
+                deletion_owner.transfer(runtime_cleanup)
                 deleted = True
+            except BaseException as error:
+                setattr(error, "custodied_deletion_result_owner", deletion_owner)
+                raise
             finally:
                 manifest.close()
                 if deleted:
