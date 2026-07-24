@@ -4,6 +4,8 @@ import pathlib
 import sys
 
 
+sys.dont_write_bytecode = True
+
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 

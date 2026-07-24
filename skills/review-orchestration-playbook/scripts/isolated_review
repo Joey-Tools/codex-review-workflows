@@ -7,6 +7,8 @@ if sys.version_info < (3, 10):
     print("isolated_review requires Python 3.10 or newer", file=sys.stderr)
     raise SystemExit(2)
 
+sys.dont_write_bytecode = True
+
 from review_runtime import main
 
 

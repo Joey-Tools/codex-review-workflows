@@ -315,6 +315,12 @@ MAX_SECRET_REDUCTION_CANDIDATES = 128
 MAX_SECRET_REDUCTION_CANDIDATE_BYTES = 32 * 1024
 MAX_SECRET_REDUCTION_PROVENANCE_OCCURRENCES = 512
 MAX_SECRET_DELTA_ADDITION_LOCATIONS = 256
+# Opaque candidates retain only their final comparison identity. Bound the
+# aggregate endpoint maps separately from Git's tree-entry and metadata limits
+# so a base/head/source-WIP scan cannot turn otherwise bounded input into an
+# unbounded Python object graph.
+MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES = MAX_SNAPSHOT_ENTRIES
+MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES = 16 * 1024 * 1024
 MAX_LEGACY_OCCURRENCE_EVENTS = 1_000_000
 MAX_LEGACY_SEARCH_BYTES = 16 * 1024 * 1024 * 1024
 MAX_LEGACY_CONTAINMENT_CHECKS = 10_000_000
@@ -816,10 +822,6 @@ class LegacyCountState:
     source_head_unembedded_count: int
 
 
-class _SourceHeadSecretCountIncrease(ReviewError):
-    pass
-
-
 class _IncompleteSecretScanSuffix(Exception):
     def __init__(self, retention_start: int | None = None) -> None:
         super().__init__()
@@ -834,6 +836,7 @@ _UNEXTRACTABLE_SECRET_CANDIDATE_END = -1
 class SecretScanResult:
     blocking_rule: str | None
     unextractable_rule: str | None
+    unextractable_container_counts: Counter[tuple[str, bytes]]
     accepted_counts: Counter[AcceptedSyntheticValue]
     accepted_candidates: dict[AcceptedSyntheticValue, set[bytes]]
     blocking_candidates: dict[bytes, set[str]]
@@ -852,6 +855,7 @@ class SecretScanResult:
             None,
             None,
             Counter(),
+            Counter(),
             {},
             {},
             Counter(),
@@ -865,6 +869,10 @@ class SecretScanResult:
         )
 
     def merge(self, other: "SecretScanResult") -> None:
+        if other.unextractable_container_counts:
+            raise ReviewError(
+                "endpoint-local unextractable container counts cannot be merged"
+            )
         if self.blocking_rule is None:
             self.blocking_rule = other.blocking_rule
         if self.unextractable_rule is None:
@@ -928,6 +936,64 @@ class SecretScanResult:
             raise ReviewError(
                 "external review secret-reduction candidates exceed the byte limit"
             )
+
+    def discard_unextractable_container_evidence(self) -> None:
+        self.unextractable_rule = None
+        self.unextractable_container_counts.clear()
+
+
+@dataclass
+class _UnextractableContainerBudget:
+    remaining_identities: int
+    remaining_path_identity_bytes: int
+
+    @classmethod
+    def default(cls) -> "_UnextractableContainerBudget":
+        return cls(
+            MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES,
+            MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES,
+        )
+
+    def record(
+        self,
+        counts: Counter[tuple[str, bytes]],
+        *,
+        surface: str,
+        identity: bytes,
+    ) -> None:
+        if not identity:
+            raise ReviewError(
+                "an unextractable exact secret container identity is invalid"
+            )
+        if surface == "path":
+            path_identity_bytes = len(identity)
+        elif (
+            surface == "blob"
+            and re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", identity)
+            is not None
+        ):
+            path_identity_bytes = 0
+        else:
+            raise ReviewError(
+                "an unextractable exact secret container identity is invalid"
+            )
+        key = (surface, identity)
+        if key in counts:
+            counts[key] += 1
+            return
+        if self.remaining_identities <= 0:
+            raise ReviewError(
+                "external review content exceeds the unextractable secret "
+                "container identity limit"
+            )
+        if path_identity_bytes > self.remaining_path_identity_bytes:
+            raise ReviewError(
+                "external review content exceeds the unextractable secret path "
+                "identity byte limit"
+            )
+        counts[key] = 1
+        self.remaining_identities -= 1
+        self.remaining_path_identity_bytes -= path_identity_bytes
 
 
 @dataclass
@@ -5988,6 +6054,7 @@ def _scan_frozen_tree_values(
     reduced_secret_values: frozenset[bytes] = frozenset(),
     exact_only: bool = False,
     _continue_after_blocking: bool = False,
+    _unextractable_container_budget: _UnextractableContainerBudget | None = None,
 ) -> SecretScanResult:
     accepted = tuple(accepted_values)
     raw_occurrences = tuple(raw_occurrence_values)
@@ -5995,6 +6062,11 @@ def _scan_frozen_tree_values(
     exact_index = _index_exact_values(raw_occurrences)
     event_budget = SecretScanBudget.default()
     occurrence_budget = LegacyOccurrenceBudget.default()
+    unextractable_container_budget = (
+        _unextractable_container_budget
+        if _unextractable_container_budget is not None
+        else _UnextractableContainerBudget.default()
+    )
     result = SecretScanResult.empty()
     with (
         _temporary_review_file() as tree_metadata,
@@ -6038,6 +6110,12 @@ def _scan_frozen_tree_values(
                 _continue_after_blocking=_continue_after_blocking,
             )
             result.merge(path_scan)
+            if path_scan.unextractable_rule is not None:
+                unextractable_container_budget.record(
+                    result.unextractable_container_counts,
+                    surface="path",
+                    identity=raw_path,
+                )
             if mode == "160000" and object_type == "commit":
                 continue
             if object_type != "blob":
@@ -6087,6 +6165,12 @@ def _scan_frozen_tree_values(
                 exact_only=exact_only,
                 _continue_after_blocking=_continue_after_blocking,
             )
+            if scan.unextractable_rule is not None:
+                unextractable_container_budget.record(
+                    result.unextractable_container_counts,
+                    surface="blob",
+                    identity=object_id.encode("ascii"),
+                )
             if capture_reduction_identities:
                 for descriptor, offsets in scan.reduction_occurrence_offsets.items():
                     identities = scan.reduction_occurrence_identities.setdefault(
@@ -6252,123 +6336,6 @@ def _all_catalog_sensitive_values(
         catalog,
         catalog.legacy_exemptions,
     )
-
-
-def _iter_changed_blob_sides(
-    raw_output: BinaryIO,
-) -> Iterator[tuple[str, str, bytes]]:
-    raw_output.seek(0)
-    records = iter(
-        _iter_nul_records(
-            raw_output,
-            byte_limit=MAX_CHANGED_METADATA_BYTES,
-            record_limit=MAX_CHANGED_ENTRIES * 2,
-            label="changed blob metadata",
-        )
-    )
-    for metadata in records:
-        if not metadata.startswith(b":"):
-            raise ReviewError(f"invalid raw Git diff record: {metadata!r}")
-        fields = metadata[1:].split()
-        if len(fields) != 5:
-            raise ReviewError(f"invalid raw Git diff metadata: {metadata!r}")
-        old_mode, new_mode, old_object, new_object, _status = fields
-        try:
-            raw_path = next(records)
-        except StopIteration as error:
-            raise ReviewError("raw Git diff is missing a changed path") from error
-        for side, mode, raw_object in (
-            ("base", old_mode, old_object),
-            ("head", new_mode, new_object),
-        ):
-            if mode in {b"000000", b"160000"}:
-                continue
-            try:
-                object_id = raw_object.decode("ascii")
-            except UnicodeDecodeError as error:
-                raise ReviewError(
-                    f"invalid changed Git object id: {raw_object!r}"
-                ) from error
-            yield side, object_id, raw_path
-
-
-def _scan_source_head_wip_delta(
-    *,
-    git_view: pathlib.Path,
-    object_directory: pathlib.Path,
-    source_head_sha: str,
-    snapshot_tree_sha: str,
-    accepted_values: Iterable[AcceptedSyntheticValue],
-    raw_occurrence_values: Iterable[AcceptedSyntheticValue],
-    accepted_index: AcceptedValueIndex,
-    event_budget: SecretScanBudget,
-    exact_index: ExactValueIndex,
-    occurrence_budget: LegacyOccurrenceBudget,
-    path_callback: Callable[[bytes], None],
-    blob_callback: Callable[[bytes, SecretScanResult], None],
-) -> None:
-    accepted = tuple(accepted_values)
-    raw_occurrences = tuple(raw_occurrence_values)
-    with (
-        _temporary_review_file() as raw_output,
-        _temporary_review_file() as batch_input,
-        _temporary_review_file() as batch_output,
-    ):
-        _write_limited_diff_metadata(
-            git_view=git_view,
-            object_directory=object_directory,
-            args=(
-                "diff",
-                "--raw",
-                "-z",
-                "--no-abbrev",
-                "--no-renames",
-                source_head_sha,
-                snapshot_tree_sha,
-            ),
-            output=raw_output,
-            label="source HEAD to WIP snapshot blob metadata",
-            record_limit=MAX_CHANGED_ENTRIES * 2,
-        )
-        blob_count = 0
-        for side, object_id, raw_path in _iter_changed_blob_sides(raw_output):
-            if side != "base":
-                continue
-            path_callback(raw_path)
-            batch_input.write(object_id.encode("ascii") + b"\n")
-            blob_count += 1
-        if blob_count:
-            batch_input.seek(0)
-            _run_bounded_process_to_file(
-                _frozen_command(git_view=git_view, args=("cat-file", "--batch")),
-                environment=_git_environment(object_directory=object_directory),
-                input_handle=batch_input,
-                destination=batch_output,
-                label="source HEAD WIP delta blob batch",
-                byte_limit=MAX_CHANGED_BLOB_SCAN_BYTES + MAX_CHANGED_METADATA_BYTES,
-            )
-        batch_output.seek(0)
-        scanned_bytes = 0
-        for side, object_id, raw_path in _iter_changed_blob_sides(raw_output):
-            if side != "base":
-                continue
-            scan, scanned_bytes = _scan_batch_blob(
-                cat_input=None,
-                cat_output=batch_output,
-                object_id=object_id,
-                scanned_bytes=scanned_bytes,
-                accepted_values=accepted,
-                raw_occurrence_values=raw_occurrences,
-                accepted_index=accepted_index,
-                event_budget=event_budget,
-                exact_index=exact_index,
-                occurrence_budget=occurrence_budget,
-            )
-            blob_callback(raw_path, scan)
-        if batch_output.read(1):
-            raise ReviewError(
-                "source HEAD WIP delta blob batch contains unexpected trailing data"
-            )
 
 
 def _secret_reduction_descriptor(
@@ -6948,6 +6915,44 @@ def _shard_catalog_count_manifest(
     return committed_shards[0], committed_shards[1]
 
 
+def _unextractable_container_nonincrease(
+    *,
+    base_discovery: SecretScanResult,
+    head_discovery: SecretScanResult,
+) -> bool:
+    for discovery in (base_discovery, head_discovery):
+        has_unextractable_rule = discovery.unextractable_rule is not None
+        has_container_counts = bool(discovery.unextractable_container_counts)
+        if has_unextractable_rule != has_container_counts:
+            raise ReviewError(
+                "an unextractable exact secret candidate lost its container identity"
+            )
+        for (surface, identity), count in (
+            discovery.unextractable_container_counts.items()
+        ):
+            if not identity or count <= 0:
+                raise ReviewError(
+                    "an unextractable exact secret container identity is invalid"
+                )
+            if surface == "path":
+                continue
+            if (
+                surface == "blob"
+                and re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", identity)
+                is not None
+            ):
+                continue
+            raise ReviewError(
+                "an unextractable exact secret container identity is invalid"
+            )
+    base_counts = base_discovery.unextractable_container_counts
+    head_counts = head_discovery.unextractable_container_counts
+    return all(
+        head_count <= base_counts[identity]
+        for identity, head_count in head_counts.items()
+    )
+
+
 def _secret_count_manifests(
     *,
     git_view: pathlib.Path,
@@ -6972,6 +6977,7 @@ def _secret_count_manifests(
         for descriptor in legacy_accepted
         if descriptor.value is not None
     )
+    unextractable_container_budget = _UnextractableContainerBudget.default()
     base_discovery = _scan_frozen_tree_values(
         git_view=git_view,
         object_directory=object_directory,
@@ -6980,6 +6986,7 @@ def _secret_count_manifests(
         capture_blocking_candidates=True,
         reduced_secret_values=legacy_raw_values,
         _continue_after_blocking=True,
+        _unextractable_container_budget=unextractable_container_budget,
     )
     head_discovery = _scan_frozen_tree_values(
         git_view=git_view,
@@ -6989,11 +6996,42 @@ def _secret_count_manifests(
         capture_blocking_candidates=True,
         reduced_secret_values=legacy_raw_values,
         _continue_after_blocking=True,
+        _unextractable_container_budget=unextractable_container_budget,
     )
-    if head_discovery.unextractable_rule is not None:
-        raise ReviewError("an exact secret candidate could not be extracted completely")
-    discovery = base_discovery
+    opaque_containers_nonincreasing = _unextractable_container_nonincrease(
+        base_discovery=base_discovery,
+        head_discovery=head_discovery,
+    )
+    head_discovery.discard_unextractable_container_evidence()
+    source_head_discovery: SecretScanResult | None = None
+    if source_head_sha is not None and source_head_sha != head_sha:
+        source_head_discovery = _scan_frozen_tree_values(
+            git_view=git_view,
+            object_directory=object_directory,
+            commit=source_head_sha,
+            accepted_values=scan_accepted,
+            capture_blocking_candidates=True,
+            reduced_secret_values=legacy_raw_values,
+            _continue_after_blocking=True,
+            _unextractable_container_budget=unextractable_container_budget,
+        )
+        source_opaque_containers_nonincreasing = (
+            _unextractable_container_nonincrease(
+                base_discovery=base_discovery,
+                head_discovery=source_head_discovery,
+            )
+        )
+        opaque_containers_nonincreasing = (
+            opaque_containers_nonincreasing
+            and source_opaque_containers_nonincreasing
+        )
+        source_head_discovery.discard_unextractable_container_evidence()
+    base_discovery.discard_unextractable_container_evidence()
+    discovery = SecretScanResult.empty()
+    discovery.merge(base_discovery)
     discovery.merge(head_discovery)
+    if source_head_discovery is not None:
+        discovery.merge(source_head_discovery)
     # Non-exact expressions have no stable byte identity and intentionally do
     # not enter the counter. Scanner resource failures still raise and are
     # recorded by the caller as an inconclusive merge gate.
@@ -7050,6 +7088,7 @@ def _secret_count_manifests(
         source_head_scan = head_scan
     entries: list[dict[str, Any]] = []
     violations: dict[AcceptedSyntheticValue, tuple[int, int]] = {}
+    source_head_exact_growth_hidden = False
     for exemption in catalog.legacy_exemptions:
         for token in exemption.values:
             descriptor = next(
@@ -7066,22 +7105,12 @@ def _secret_count_manifests(
             source_head_unembedded_count = (
                 source_head_scan.unembedded_occurrence_counts[descriptor]
             )
-            if source_head_sha is not None and source_head_count > base_count:
-                raise _SourceHeadSecretCountIncrease(
-                    "legacy synthetic fixture count increased in source HEAD for "
-                    f"{token.identifier}: base={base_count}, "
-                    f"source_head={source_head_count}"
-                )
             if (
                 source_head_sha is not None
-                and source_head_unembedded_count > base_unembedded_count
+                and source_head_count > base_count
+                and head_count <= base_count
             ):
-                raise _SourceHeadSecretCountIncrease(
-                    "legacy synthetic fixture unembedded count increased in "
-                    f"source HEAD for {token.identifier}: "
-                    f"base={base_unembedded_count}, "
-                    f"source_head={source_head_unembedded_count}"
-                )
+                source_head_exact_growth_hidden = True
             if head_count > base_count:
                 violations[descriptor] = (base_count, head_count)
             entries.append(
@@ -7105,7 +7134,14 @@ def _secret_count_manifests(
     for descriptor in reduction_descriptors:
         base_count = base_scan.raw_occurrence_counts[descriptor]
         head_count = head_scan.raw_occurrence_counts[descriptor]
+        source_head_count = source_head_scan.raw_occurrence_counts[descriptor]
         rules = sorted(discovery.blocking_candidates[descriptor.value])
+        if (
+            source_head_sha is not None
+            and source_head_count > base_count
+            and head_count <= base_count
+        ):
+            source_head_exact_growth_hidden = True
         if head_count > base_count:
             violations[descriptor] = (base_count, head_count)
         reduction_entries.append(
@@ -7227,6 +7263,18 @@ def _secret_count_manifests(
         private_manifest,
         label="synthetic secret helper-private state",
     )
+    if source_head_exact_growth_hidden and not violation_entries:
+        return _inconclusive_secret_count_manifests(
+            base_sha=base_sha,
+            head_sha=head_sha,
+            catalog=catalog,
+            failure_class="source-head-exact-growth",
+            evidence_head_ref=evidence_head_ref,
+        )
+    if not opaque_containers_nonincreasing and not violation_entries:
+        raise ReviewError(
+            "an exact secret candidate could not be extracted completely"
+        )
     return public_manifest, private_manifest, reduction_descriptors
 
 
@@ -9920,10 +9968,14 @@ def _validate_external_workspace(
         for count_state in legacy_counts.values()
     ):
         raise ReviewError("synthetic secret manifest head counts are inconsistent")
-    if review.content_variant == "source-wip" and any(
-        count_state.source_head_count > count_state.base_count
-        or count_state.source_head_unembedded_count > count_state.base_unembedded_count
-        for count_state in legacy_counts.values()
+    if (
+        review.content_variant == "source-wip"
+        and secret_delta_evidence["status"] == "clean"
+        and any(
+            count_state.source_head_count > count_state.base_count
+            and count_state.head_count <= count_state.base_count
+            for count_state in legacy_counts.values()
+        )
     ):
         raise ReviewError(
             "synthetic secret manifest source HEAD counts are inconsistent"
@@ -10020,71 +10072,9 @@ def _validate_external_workspace(
                     f"preparation for {descriptor.identifier}"
                 )
 
-    if review.content_variant == "source-wip":
-        source_head_findings: list[str] = []
-        source_head_finding_count = 0
-        source_head_event_budget = SecretScanBudget.default()
-        accepted_index = _index_accepted_values(accepted_values)
-        legacy_exact_index = _index_exact_values(legacy_values)
-
-        def record_source_head_finding(value: str) -> None:
-            nonlocal source_head_finding_count
-            source_head_finding_count += 1
-            if len(source_head_findings) < 10:
-                source_head_findings.append(value)
-
-        def inspect_source_head_path(raw_path: bytes) -> None:
-            rule = _value_secret_rule(
-                raw_path,
-                event_budget=source_head_event_budget,
-            )
-            path = os.fsdecode(raw_path)
-            if rule is None:
-                rule = _sensitive_path_rule(path)
-            if rule is not None:
-                path_display = _redact_secret_path(path, "source HEAD path")
-                record_source_head_finding(f"{path_display} ({rule}; source-head-path)")
-
-        def inspect_source_head_blob(
-            raw_path: bytes,
-            scan: SecretScanResult,
-        ) -> None:
-            if scan.blocking_rule is None:
-                return
-            path_display = _redact_secret_path(
-                os.fsdecode(raw_path),
-                "source HEAD blob path",
-            )
-            record_source_head_finding(
-                f"{path_display} ({scan.blocking_rule}; source-head-blob)"
-            )
-
-        _scan_source_head_wip_delta(
-            git_view=git_dir,
-            object_directory=git_dir / "objects",
-            source_head_sha=review.head_ref,
-            snapshot_tree_sha=review.snapshot_tree_sha,
-            accepted_values=accepted_values,
-            raw_occurrence_values=legacy_values,
-            accepted_index=accepted_index,
-            event_budget=source_head_event_budget,
-            exact_index=legacy_exact_index,
-            occurrence_budget=occurrence_budget,
-            path_callback=inspect_source_head_path,
-            blob_callback=inspect_source_head_blob,
-        )
-        if source_head_finding_count:
-            summary = ", ".join(source_head_findings)
-            if source_head_finding_count > len(source_head_findings):
-                summary += (
-                    f", and {source_head_finding_count - len(source_head_findings)} "
-                    "more"
-                )
-            raise ReviewError(
-                "sensitive content preflight blocked external review; remove or "
-                f"narrow these paths before egress: {summary}"
-            )
-
+    # Secret-delta status is admission evidence, never a reviewer-egress gate.
+    # Source-WIP growth remains visible in that evidence after the integrity
+    # checks above, but it must not suppress reviewer launch.
     changed_path_digests_file = (
         review.workspace_root / ".codex-review" / CHANGED_PATH_DIGESTS_NAME
     )
@@ -16313,8 +16303,6 @@ def prepare_workspace(
                 catalog=catalog,
                 evidence_head_ref=head_sha,
             )
-        except _SourceHeadSecretCountIncrease:
-            raise
         except (OSError, ReviewError):
             (
                 synthetic_manifest,

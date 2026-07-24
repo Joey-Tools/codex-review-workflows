@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 import zlib
+from collections import Counter
 from unittest import mock
 
 
@@ -619,6 +620,15 @@ class WorkspaceTest(unittest.TestCase):
             {"complete", "inconclusive"},
         )
         return secret_delta
+
+    def public_synthetic_manifest(self, review) -> dict:
+        return json.loads(
+            (
+                review.workspace_root
+                / ".codex-review"
+                / workspace_runtime.SYNTHETIC_MANIFEST_NAME
+            ).read_text(encoding="utf-8")
+        )
 
     def assert_secret_violation(
         self,
@@ -8681,7 +8691,7 @@ class WorkspaceTest(unittest.TestCase):
         self.assertEqual(list(materialized.iterdir()), [])
         self.assertNotIn(secret.encode("ascii"), review.diff_file.read_bytes())
 
-    def test_wip_deleting_secret_from_original_head_still_blocks_review(
+    def test_wip_deleted_source_head_secret_allows_inconclusive_validation(
         self,
     ) -> None:
         secret = ("sk-" + "A" * 40).encode()
@@ -8700,15 +8710,16 @@ class WorkspaceTest(unittest.TestCase):
         )
         self.reviews.append(review)
         self.assertFalse((review.workspace_root / "opaque.bin").exists())
+        secret_delta = self.public_synthetic_manifest(review)["secret_delta"]
+        self.assertEqual(secret_delta["status"], "inconclusive")
+        self.assertEqual(
+            secret_delta["failure_class"],
+            "source-head-exact-growth",
+        )
+        self.assertEqual(secret_delta["violations"], [])
 
-        with self.assertRaises(ReviewError) as raised:
-            validate_external_workspace(review)
-
-        diagnostic = str(raised.exception)
-        self.assertIn("sensitive content preflight blocked external review", diagnostic)
-        self.assertIn("opaque.bin", diagnostic)
-        self.assertIn("openai-key", diagnostic)
-        self.assertNotIn(secret.decode("ascii"), diagnostic)
+        evidence = validate_external_workspace(review)
+        self.assertEqual(evidence["secret_delta"], secret_delta)
 
     def test_oauth_refresh_token_is_detected_in_head_content(self) -> None:
         credential = pathlib.Path(self.temporary.name) / "oauth.json"
@@ -8881,6 +8892,203 @@ class WorkspaceTest(unittest.TestCase):
         evidence = validate_external_workspace(review)
         self.assertEqual(evidence["secret_delta"], secret_delta)
 
+    def test_unextractable_container_budget_charges_unique_path_identity_once(
+        self,
+    ) -> None:
+        raw_path = b'password = "' + b"P" * 32
+        counts: Counter[tuple[str, bytes]] = Counter()
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES",
+                1,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES",
+                len(raw_path),
+            ),
+        ):
+            budget = workspace_runtime._UnextractableContainerBudget.default()
+            budget.record(counts, surface="path", identity=raw_path)
+            budget.record(counts, surface="path", identity=raw_path)
+
+            self.assertEqual(counts[("path", raw_path)], 2)
+            self.assertEqual(budget.remaining_identities, 0)
+            self.assertEqual(budget.remaining_path_identity_bytes, 0)
+            with self.assertRaisesRegex(ReviewError, "container identity limit"):
+                budget.record(
+                    counts,
+                    surface="path",
+                    identity=raw_path + b"-different",
+                )
+
+    def test_unextractable_blob_identity_budget_is_total_and_preserves_multiplicity(
+        self,
+    ) -> None:
+        payload = b'password = "' + b"B" * 32
+        first = self.repo / "opaque-a.bin"
+        second = self.repo / "opaque-b.bin"
+        first.write_bytes(payload)
+        second.write_bytes(payload)
+        git(self.repo, "add", first.name, second.name)
+        git(self.repo, "commit", "-m", "Add duplicate opaque blobs")
+        opaque_base = git(self.repo, "rev-parse", "HEAD")
+        unchanged_head = self.commit_bytes(
+            "unrelated-budget.txt",
+            b"unrelated\n",
+            "Retain duplicate opaque blobs",
+        )
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES",
+                2,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES",
+                0,
+            ),
+        ):
+            exit_code, summary = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=opaque_base,
+                head_ref=unchanged_head,
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["secret_delta"]["status"], "clean")
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES",
+                1,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES",
+                0,
+            ),
+        ):
+            exit_code, summary = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=opaque_base,
+                head_ref=unchanged_head,
+            )
+        self.assertEqual(exit_code, 75)
+        self.assertEqual(summary["status"], "inconclusive")
+        self.assertEqual(
+            summary["failure_class"],
+            "exact-value-scan-incomplete",
+        )
+        self.assertEqual(summary["temporary_cleanup_status"], "complete")
+
+    def test_unextractable_path_identity_byte_budget_boundary_and_overflow(
+        self,
+    ) -> None:
+        opaque_path = 'password = "' + "Q" * 32
+        opaque_base = self.commit_bytes(
+            opaque_path,
+            b"ordinary content\n",
+            "Add opaque credential path",
+        )
+        unchanged_head = self.commit_bytes(
+            "unrelated-path-budget.txt",
+            b"unrelated\n",
+            "Retain opaque credential path",
+        )
+        total_path_identity_bytes = 2 * len(os.fsencode(opaque_path))
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES",
+                2,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES",
+                total_path_identity_bytes,
+            ),
+        ):
+            exit_code, summary = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=opaque_base,
+                head_ref=unchanged_head,
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["secret_delta"]["status"], "clean")
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES",
+                2,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES",
+                total_path_identity_bytes - 1,
+            ),
+        ):
+            exit_code, summary = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=opaque_base,
+                head_ref=unchanged_head,
+            )
+        self.assertEqual(exit_code, 75)
+        self.assertEqual(summary["status"], "inconclusive")
+        self.assertEqual(
+            summary["failure_class"],
+            "exact-value-scan-incomplete",
+        )
+        self.assertEqual(summary["temporary_cleanup_status"], "complete")
+
+    def test_unextractable_blob_does_not_charge_its_long_path_to_path_budget(
+        self,
+    ) -> None:
+        long_relative = "/".join(
+            (
+                "nested-" + "a" * 80,
+                "nested-" + "b" * 80,
+                "nested-" + "c" * 80,
+                "opaque.bin",
+            )
+        )
+        opaque_base = self.commit_bytes(
+            long_relative,
+            b'password = "' + b"L" * 32,
+            "Add opaque blob at a long path",
+        )
+        unchanged_head = self.commit_bytes(
+            "unrelated-long-path.txt",
+            b"unrelated\n",
+            "Retain opaque blob at a long path",
+        )
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES",
+                2,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES",
+                0,
+            ),
+        ):
+            exit_code, summary = workspace_runtime.secret_admission(
+                repo=self.repo,
+                base_ref=opaque_base,
+                head_ref=unchanged_head,
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["secret_delta"]["status"], "clean")
+        self.assertEqual(summary["temporary_cleanup_status"], "complete")
+
     def test_unclosed_secret_assignment_at_eof_marks_admission_inconclusive(
         self,
     ) -> None:
@@ -8902,6 +9110,602 @@ class WorkspaceTest(unittest.TestCase):
         self.assertIn(payload, review.diff_file.read_bytes())
         evidence = validate_external_workspace(review)
         self.assertEqual(evidence["secret_delta"], secret_delta)
+
+    def test_unextractable_container_nonincrease_is_clean_for_unchanged_move_and_delete(
+        self,
+    ) -> None:
+        payload = (
+            b"({accessToken:0},0);\n"
+            b"({accessToken:0});\n"
+            b'/"/;\n'
+            + b"U" * 13
+        )
+        scan = workspace_runtime._scan_secret_value(
+            payload,
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+        self.assertEqual(scan.unextractable_rule, "generic-secret-assignment")
+
+        opaque_base = self.commit_bytes(
+            "opaque-secret.txt",
+            payload,
+            "Add opaque credential container",
+        )
+        unchanged_head = self.commit_bytes(
+            "unrelated.txt",
+            b"unrelated change\n",
+            "Retain opaque credential container",
+        )
+        base_blob = git(
+            self.repo,
+            "rev-parse",
+            f"{opaque_base}:opaque-secret.txt",
+        )
+        unchanged_blob = git(
+            self.repo,
+            "rev-parse",
+            f"{unchanged_head}:opaque-secret.txt",
+        )
+        self.assertEqual(unchanged_blob, base_blob)
+        git(self.repo, "mv", "opaque-secret.txt", "moved-opaque-secret.txt")
+        git(self.repo, "commit", "-m", "Move opaque credential container")
+        moved_head = git(self.repo, "rev-parse", "HEAD")
+        moved_blob = git(
+            self.repo,
+            "rev-parse",
+            f"{moved_head}:moved-opaque-secret.txt",
+        )
+        self.assertEqual(moved_blob, base_blob)
+        deleted_head = self.remove_and_commit(
+            "moved-opaque-secret.txt",
+            "Delete opaque credential container",
+        )
+
+        cases = (
+            ("unchanged", opaque_base, unchanged_head),
+            ("moved", unchanged_head, moved_head),
+            ("deleted", moved_head, deleted_head),
+        )
+        for label, base_ref, head_ref in cases:
+            with self.subTest(transition=label):
+                exit_code, summary = workspace_runtime.secret_admission(
+                    repo=self.repo,
+                    base_ref=base_ref,
+                    head_ref=head_ref,
+                )
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(summary["status"], "clean")
+                self.assertEqual(summary["secret_delta"]["status"], "clean")
+                self.assertEqual(summary["temporary_cleanup_status"], "complete")
+
+    def test_unextractable_container_new_duplicate_and_change_remain_inconclusive(
+        self,
+    ) -> None:
+        first_payload = b'password = "' + b"V" * 32
+        second_payload = b'password = "' + b"W" * 32
+        for payload in (first_payload, second_payload):
+            scan = workspace_runtime._scan_secret_value(
+                payload,
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+            self.assertEqual(scan.unextractable_rule, "generic-secret-assignment")
+
+        clean_base = self.head
+        opaque_base = self.commit_bytes(
+            "opaque-source.txt",
+            first_payload,
+            "Add opaque credential container",
+        )
+        duplicate_head = self.commit_bytes(
+            "opaque-copy.txt",
+            first_payload,
+            "Duplicate opaque credential container",
+        )
+        git(self.repo, "rm", "opaque-copy.txt")
+        (self.repo / "opaque-source.txt").write_bytes(second_payload)
+        git(self.repo, "add", "opaque-source.txt")
+        git(self.repo, "commit", "-m", "Change opaque credential container")
+        changed_head = git(self.repo, "rev-parse", "HEAD")
+
+        cases = (
+            ("new", clean_base, opaque_base),
+            ("duplicate", opaque_base, duplicate_head),
+            ("changed", opaque_base, changed_head),
+        )
+        for label, base_ref, head_ref in cases:
+            with self.subTest(transition=label):
+                exit_code, summary = workspace_runtime.secret_admission(
+                    repo=self.repo,
+                    base_ref=base_ref,
+                    head_ref=head_ref,
+                )
+                self.assertEqual(exit_code, 75)
+                self.assertEqual(summary["status"], "inconclusive")
+                self.assertEqual(
+                    summary["failure_class"],
+                    "exact-value-scan-incomplete",
+                )
+                self.assertEqual(
+                    summary["secret_delta"]["status"],
+                    "inconclusive",
+                )
+
+    def test_unextractable_path_rename_remains_inconclusive(self) -> None:
+        base_path = 'password = "' + "P" * 32
+        head_path = 'renamed-password = "' + "P" * 32
+        for raw_path in (base_path, head_path):
+            scan = workspace_runtime._scan_secret_value(
+                raw_path.encode("ascii"),
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+            self.assertEqual(scan.unextractable_rule, "generic-secret-assignment")
+
+        opaque_base = self.commit_bytes(
+            base_path,
+            b"ordinary content\n",
+            "Add opaque credential path",
+        )
+        git(self.repo, "mv", base_path, head_path)
+        git(self.repo, "commit", "-m", "Rename opaque credential path")
+        renamed_head = git(self.repo, "rev-parse", "HEAD")
+
+        exit_code, summary = workspace_runtime.secret_admission(
+            repo=self.repo,
+            base_ref=opaque_base,
+            head_ref=renamed_head,
+        )
+        self.assertEqual(exit_code, 75)
+        self.assertEqual(summary["status"], "inconclusive")
+        self.assertEqual(
+            summary["failure_class"],
+            "exact-value-scan-incomplete",
+        )
+        self.assertEqual(summary["secret_delta"]["status"], "inconclusive")
+
+    def test_retained_unextractable_container_does_not_hide_exact_growth(
+        self,
+    ) -> None:
+        opaque_base = self.commit_bytes(
+            "opaque-secret.txt",
+            b'password = "' + b"X" * 32,
+            "Add opaque credential container",
+        )
+        exact_value = unregistered_generic_credential()
+        exact_head = self.commit_bytes(
+            "exact-secret.txt",
+            b'password = "' + exact_value + b'"\n',
+            "Add exact credential",
+        )
+
+        exit_code, summary = workspace_runtime.secret_admission(
+            repo=self.repo,
+            base_ref=opaque_base,
+            head_ref=exact_head,
+        )
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(summary["status"], "violations")
+        self.assertEqual(summary["secret_delta"]["status"], "violations")
+        self.assertEqual(
+            summary["secret_delta"]["violations"][0]["base_count"],
+            0,
+        )
+        self.assertEqual(
+            summary["secret_delta"]["violations"][0]["head_count"],
+            1,
+        )
+
+    def test_new_unextractable_container_does_not_hide_exact_growth(
+        self,
+    ) -> None:
+        opaque_payload = b'password = "' + b"Y" * 32
+        scan = workspace_runtime._scan_secret_value(
+            opaque_payload,
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+        self.assertEqual(scan.unextractable_rule, "generic-secret-assignment")
+
+        exact_value = unregistered_generic_credential()
+        (self.repo / "opaque-secret.txt").write_bytes(opaque_payload)
+        (self.repo / "exact-secret.txt").write_bytes(
+            b'password = "' + exact_value + b'"\n'
+        )
+        git(self.repo, "add", "opaque-secret.txt", "exact-secret.txt")
+        git(self.repo, "commit", "-m", "Add opaque and exact credentials")
+        mixed_head = git(self.repo, "rev-parse", "HEAD")
+
+        exit_code, summary = workspace_runtime.secret_admission(
+            repo=self.repo,
+            base_ref=self.head,
+            head_ref=mixed_head,
+        )
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(summary["status"], "violations")
+        self.assertEqual(summary["secret_delta"]["status"], "violations")
+        self.assertEqual(len(summary["secret_delta"]["violations"]), 1)
+        violation = summary["secret_delta"]["violations"][0]
+        self.assertEqual(violation["base_count"], 0)
+        self.assertEqual(violation["head_count"], 1)
+        self.assertEqual(
+            violation["value_sha256"],
+            hashlib.sha256(exact_value).hexdigest(),
+        )
+
+    def test_changed_unextractable_container_does_not_hide_exact_growth(
+        self,
+    ) -> None:
+        first_payload = b'password = "' + b"Y" * 32
+        second_payload = b'password = "' + b"Z" * 32
+        for payload in (first_payload, second_payload):
+            scan = workspace_runtime._scan_secret_value(
+                payload,
+                capture_blocking_candidates=True,
+                _continue_after_blocking=True,
+            )
+            self.assertEqual(scan.unextractable_rule, "generic-secret-assignment")
+
+        opaque_base = self.commit_bytes(
+            "opaque-secret.txt",
+            first_payload,
+            "Add opaque credential container",
+        )
+        exact_value = unregistered_generic_credential()
+        (self.repo / "opaque-secret.txt").write_bytes(second_payload)
+        (self.repo / "exact-secret.txt").write_bytes(
+            b'password = "' + exact_value + b'"\n'
+        )
+        git(self.repo, "add", "opaque-secret.txt", "exact-secret.txt")
+        git(self.repo, "commit", "-m", "Change opaque and add exact credential")
+        mixed_head = git(self.repo, "rev-parse", "HEAD")
+
+        exit_code, summary = workspace_runtime.secret_admission(
+            repo=self.repo,
+            base_ref=opaque_base,
+            head_ref=mixed_head,
+        )
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(summary["status"], "violations")
+        self.assertEqual(summary["secret_delta"]["status"], "violations")
+        self.assertEqual(len(summary["secret_delta"]["violations"]), 1)
+        violation = summary["secret_delta"]["violations"][0]
+        self.assertEqual(violation["base_count"], 0)
+        self.assertEqual(violation["head_count"], 1)
+        self.assertEqual(
+            violation["value_sha256"],
+            hashlib.sha256(exact_value).hexdigest(),
+        )
+
+    def test_source_wip_unextractable_identity_budget_covers_all_endpoints(
+        self,
+    ) -> None:
+        opaque_base = self.commit_bytes(
+            "opaque-secret.txt",
+            b'password = "' + b"M" * 32,
+            "Add retained opaque credential container",
+        )
+        source_head = self.commit_bytes(
+            "source-head.txt",
+            b"source HEAD\n",
+            "Retain opaque credential in source HEAD",
+        )
+        (self.repo / "source-wip.txt").write_text(
+            "source WIP\n",
+            encoding="utf-8",
+        )
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES",
+                3,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES",
+                0,
+            ),
+        ):
+            review = prepare_workspace(
+                repo=self.repo,
+                base_ref=opaque_base,
+                head_ref=source_head,
+                include_source_wip=True,
+            )
+        self.reviews.append(review)
+        self.assertEqual(
+            self.public_synthetic_manifest(review)["secret_delta"]["status"],
+            "clean",
+        )
+
+        with (
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES",
+                2,
+            ),
+            mock.patch.object(
+                workspace_runtime,
+                "MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES",
+                0,
+            ),
+        ):
+            review = prepare_workspace(
+                repo=self.repo,
+                base_ref=opaque_base,
+                head_ref=source_head,
+                include_source_wip=True,
+            )
+        self.reviews.append(review)
+        secret_delta = self.public_synthetic_manifest(review)["secret_delta"]
+        self.assertEqual(secret_delta["status"], "inconclusive")
+        self.assertEqual(
+            secret_delta["failure_class"],
+            "exact-value-scan-incomplete",
+        )
+
+    def test_source_wip_deleted_source_head_exact_growth_allows_validation(
+        self,
+    ) -> None:
+        opaque_payload = b'password = "' + b"R" * 32
+        scan = workspace_runtime._scan_secret_value(
+            opaque_payload,
+            capture_blocking_candidates=True,
+            _continue_after_blocking=True,
+        )
+        self.assertEqual(scan.unextractable_rule, "generic-secret-assignment")
+        opaque_base = self.commit_bytes(
+            "opaque-secret.txt",
+            opaque_payload,
+            "Add retained opaque credential container",
+        )
+
+        exact_value = unregistered_generic_credential()
+        source_head = self.commit_bytes(
+            "exact-secret.txt",
+            b'password = "' + exact_value + b'"\n',
+            "Add exact credential to source HEAD",
+        )
+        git(self.repo, "rm", "exact-secret.txt")
+
+        review = prepare_workspace(
+            repo=self.repo,
+            base_ref=opaque_base,
+            head_ref=source_head,
+            include_source_wip=True,
+        )
+        self.reviews.append(review)
+        manifest = json.loads(
+            (
+                review.workspace_root
+                / ".codex-review"
+                / workspace_runtime.SYNTHETIC_MANIFEST_NAME
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["secret_delta"]["status"], "inconclusive")
+        self.assertEqual(
+            manifest["secret_delta"]["failure_class"],
+            "source-head-exact-growth",
+        )
+        self.assertEqual(manifest["secret_delta"]["violations"], [])
+
+        evidence = validate_external_workspace(review)
+        self.assertEqual(evidence["secret_delta"], manifest["secret_delta"])
+
+    def test_source_wip_retained_legacy_growth_is_violation(self) -> None:
+        legacy_value = unregistered_provider_credential()
+        catalog = self.catalog_with_legacy_values(
+            (legacy_value,),
+            rule="github-token",
+        )
+        source_head = self.commit_bytes(
+            "legacy-secret.txt",
+            b'password = "' + legacy_value + b'"\n',
+            "Add legacy credential to source HEAD",
+        )
+        (self.repo / "unrelated-wip.txt").write_text(
+            "unrelated WIP\n",
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(
+            workspace_runtime,
+            "load_catalog",
+            return_value=catalog,
+        ):
+            review = prepare_workspace(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=source_head,
+                include_source_wip=True,
+            )
+            self.reviews.append(review)
+            evidence = validate_external_workspace(review)
+        manifest = self.public_synthetic_manifest(review)
+        secret_delta = manifest["secret_delta"]
+
+        self.assertEqual(secret_delta["status"], "violations")
+        self.assertEqual(len(secret_delta["violations"]), 1)
+        violation = secret_delta["violations"][0]
+        self.assertEqual(
+            violation["value_sha256"],
+            hashlib.sha256(legacy_value).hexdigest(),
+        )
+        self.assertEqual(
+            (violation["base_count"], violation["head_count"]),
+            (0, 1),
+        )
+        self.assertEqual(manifest["secret_reductions"], [])
+        self.assertEqual(evidence["synthetic_tokens"]["secret_reductions"], [])
+        matching_entries = [
+            entry
+            for entry in manifest["entries"]
+            if entry["value_sha256"] == hashlib.sha256(legacy_value).hexdigest()
+        ]
+        self.assertEqual(len(matching_entries), 1)
+        self.assertEqual(
+            (
+                matching_entries[0]["base_count"],
+                matching_entries[0]["head_count"],
+                matching_entries[0]["source_head_count"],
+            ),
+            (0, 1, 1),
+        )
+
+    def test_source_wip_deleted_legacy_growth_is_inconclusive(self) -> None:
+        legacy_value = unregistered_generic_credential()
+        catalog = self.catalog_with_legacy_values(
+            (legacy_value,),
+            rule="generic-secret-assignment",
+        )
+        source_head = self.commit_bytes(
+            "legacy-secret.txt",
+            b'password = "' + legacy_value + b'"\n',
+            "Add legacy credential to source HEAD",
+        )
+        git(self.repo, "rm", "legacy-secret.txt")
+
+        with mock.patch.object(
+            workspace_runtime,
+            "load_catalog",
+            return_value=catalog,
+        ):
+            review = prepare_workspace(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=source_head,
+                include_source_wip=True,
+            )
+            self.reviews.append(review)
+            evidence = validate_external_workspace(review)
+        secret_delta = self.public_synthetic_manifest(review)["secret_delta"]
+
+        self.assertEqual(secret_delta["status"], "inconclusive")
+        self.assertEqual(
+            secret_delta["failure_class"],
+            "source-head-exact-growth",
+        )
+        self.assertEqual(secret_delta["violations"], [])
+        self.assertEqual(evidence["secret_delta"], secret_delta)
+
+    def test_source_wip_deleted_legacy_growth_does_not_hide_snapshot_violation(
+        self,
+    ) -> None:
+        legacy_value = unregistered_generic_credential()
+        snapshot_value = second_unregistered_generic_credential()
+        catalog = self.catalog_with_legacy_values(
+            (legacy_value,),
+            rule="generic-secret-assignment",
+        )
+        source_head = self.commit_bytes(
+            "legacy-secret.txt",
+            b'password = "' + legacy_value + b'"\n',
+            "Add legacy credential to source HEAD",
+        )
+        git(self.repo, "rm", "legacy-secret.txt")
+        (self.repo / "snapshot-secret.txt").write_bytes(
+            b'password = "' + snapshot_value + b'"\n'
+        )
+        git(self.repo, "add", "snapshot-secret.txt")
+
+        with mock.patch.object(
+            workspace_runtime,
+            "load_catalog",
+            return_value=catalog,
+        ):
+            review = prepare_workspace(
+                repo=self.repo,
+                base_ref=self.head,
+                head_ref=source_head,
+                include_source_wip=True,
+            )
+        self.reviews.append(review)
+        manifest = self.public_synthetic_manifest(review)
+        secret_delta = manifest["secret_delta"]
+
+        self.assertEqual(secret_delta["status"], "violations")
+        self.assertEqual(len(secret_delta["violations"]), 1)
+        self.assertEqual(
+            secret_delta["violations"][0]["value_sha256"],
+            hashlib.sha256(snapshot_value).hexdigest(),
+        )
+        self.assertEqual(
+            (
+                secret_delta["violations"][0]["base_count"],
+                secret_delta["violations"][0]["head_count"],
+            ),
+            (0, 1),
+        )
+        self.assertEqual(
+            [entry["value_sha256"] for entry in manifest["secret_reductions"]],
+            [hashlib.sha256(snapshot_value).hexdigest()],
+        )
+
+    def test_source_wip_legacy_unembedded_growth_uses_raw_count_only(
+        self,
+    ) -> None:
+        legacy_value = b"legacy-unembedded-candidate-" + b"A" * 24
+        containing_value = b"prefix-" + legacy_value + b"-suffix"
+        catalog = self.catalog_with_legacy_values(
+            (legacy_value, containing_value),
+            rule="generic-secret-assignment",
+        )
+        legacy_base = self.commit_bytes(
+            "legacy-secret.txt",
+            containing_value,
+            "Add containing legacy credential",
+        )
+        source_head = self.commit_bytes(
+            "legacy-secret.txt",
+            legacy_value,
+            "Expose embedded legacy credential",
+        )
+        (self.repo / "unrelated-wip.txt").write_text(
+            "unrelated WIP\n",
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(
+            workspace_runtime,
+            "load_catalog",
+            return_value=catalog,
+        ):
+            review = prepare_workspace(
+                repo=self.repo,
+                base_ref=legacy_base,
+                head_ref=source_head,
+                include_source_wip=True,
+            )
+            self.reviews.append(review)
+            evidence = validate_external_workspace(review)
+        manifest = self.public_synthetic_manifest(review)
+        secret_delta = manifest["secret_delta"]
+        entries = {
+            entry["value_sha256"]: entry for entry in manifest["entries"]
+        }
+        legacy_entry = entries[hashlib.sha256(legacy_value).hexdigest()]
+
+        self.assertEqual(secret_delta["status"], "clean")
+        self.assertEqual(evidence["secret_delta"]["status"], "clean")
+        self.assertEqual(secret_delta["violations"], [])
+        self.assertEqual(
+            (
+                legacy_entry["base_count"],
+                legacy_entry["head_count"],
+                legacy_entry["source_head_count"],
+            ),
+            (1, 1, 1),
+        )
+        self.assertEqual(
+            (
+                legacy_entry["base_unembedded_count"],
+                legacy_entry["head_unembedded_count"],
+                legacy_entry["source_head_unembedded_count"],
+            ),
+            (0, 1, 1),
+        )
 
     def test_unregistered_secret_addition_is_raw_with_violation_evidence(
         self,

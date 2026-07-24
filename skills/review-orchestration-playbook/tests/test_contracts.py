@@ -4,7 +4,9 @@ import hashlib
 import inspect
 import json
 import math
+import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -414,6 +416,41 @@ class RepositoryContractTest(unittest.TestCase):
                 "only detectable additions for a candidate whose global count grows",
                 journal,
             )
+
+    def test_opaque_container_contract_uses_bounded_final_identities(
+        self,
+    ) -> None:
+        policies = {
+            "SKILL.md": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"),
+            "helper-contract.md": (
+                SKILL_ROOT / "references/helper-contract.md"
+            ).read_text(encoding="utf-8"),
+            "synthetic-token-fixtures.md": (
+                SKILL_ROOT / "references/synthetic-token-fixtures.md"
+            ).read_text(encoding="utf-8"),
+        }
+        for name, content in policies.items():
+            with self.subTest(policy=name):
+                self.assertIn("canonical blob OID alone", content)
+                self.assertIn("blob paths are not retained", content)
+                self.assertIn("100,000", content)
+                self.assertIn("16 MiB", content)
+                self.assertIn("base", content)
+                self.assertIn("head", content)
+                self.assertIn("source-WIP", content)
+                self.assertNotIn("raw path plus blob OID", content)
+                self.assertNotIn("retains raw path plus", content)
+
+        runtime = (RUNTIME / "workspace.py").read_text(encoding="utf-8")
+        self.assertIn(
+            "MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES = "
+            "MAX_SNAPSHOT_ENTRIES",
+            runtime,
+        )
+        self.assertIn(
+            "MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES = 16 * 1024 * 1024",
+            runtime,
+        )
 
     def test_direct_secret_admission_is_required_without_a_reviewer(self) -> None:
         repository_policy = _secret_admission_repository_policy_files(
@@ -1525,6 +1562,36 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn('python-version: "3.10"', workflow)
         self.assertIn("tomli==2.2.1", workflow)
         self.assertIn("requires Python 3.10 or later", readme)
+
+    def test_helper_entrypoint_does_not_write_import_bytecode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            copied_scripts = pathlib.Path(temp_dir) / "scripts"
+            shutil.copytree(
+                SCRIPTS,
+                copied_scripts,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+            environment = os.environ.copy()
+            environment.pop("PYTHONDONTWRITEBYTECODE", None)
+            environment.pop("PYTHONPYCACHEPREFIX", None)
+
+            completed = subprocess.run(
+                (str(copied_scripts / "isolated_review"), "--help"),
+                cwd=copied_scripts,
+                env=environment,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            bytecode_artifacts = sorted(
+                path.relative_to(copied_scripts).as_posix()
+                for path in copied_scripts.rglob("*")
+                if path.name == "__pycache__" or path.suffix == ".pyc"
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(bytecode_artifacts, [])
 
     def test_core_policy_defines_progressive_provider_strict_review_shapes(
         self,
