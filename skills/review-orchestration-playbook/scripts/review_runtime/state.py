@@ -2251,7 +2251,6 @@ def start(
     prompt_file: pathlib.Path | None,
     keep_workspace: bool,
     egress_consent: str | None,
-    synthetic_secret_exemptions: tuple[str, ...] = (),
     include_source_wip: bool = False,
     publisher: Callable[[pathlib.Path], None] | None = None,
 ) -> pathlib.Path:
@@ -2300,7 +2299,6 @@ def start(
             head_ref=head_ref,
             ownership_handoff=accept_workspace,
             preparation_cleanup_handoff=(preparation_guard.accept_preparation_cleanup),
-            synthetic_secret_exemptions=synthetic_secret_exemptions,
             prompt_override=prompt_file,
             include_source_wip=include_source_wip,
         )
@@ -2322,7 +2320,6 @@ def start(
             "workspace": review.to_json(),
             "keep_workspace": keep_workspace,
             "egress_consent": egress_consent,
-            "synthetic_secret_exemptions": list(synthetic_secret_exemptions),
             "include_source_wip": include_source_wip,
             "stdout_path": str(stdout_path),
             "stderr_path": str(stderr_path),

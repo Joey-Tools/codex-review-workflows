@@ -96,7 +96,7 @@ _CATALOG_BOOTSTRAP_SOURCES = (
     ("review_runtime.catalog_bootstrap", "catalog_bootstrap.py", False),
 )
 _CATALOG_RUNTIME_MANIFEST_SHA256 = (
-    "d248352963b21e1bbe116be6ea3a398d6b3f15a6cd3e4837210586b921665d40"
+    "058c2d85f1ec687d3b337c3f58141b9fee50cb284660c6606c5206ec3e798d8d"
 )
 _SourceIdentity = tuple[int, int, int, int, int]
 _CompanionBinding = bytes

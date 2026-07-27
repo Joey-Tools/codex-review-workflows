@@ -21,6 +21,7 @@ SKILL = SKILL_ROOT / "SKILL.md"
 TEMPLATES = SKILL_ROOT / "references" / "fixture-templates.md"
 BINDING_RESOLVER = SKILL_ROOT / "scripts" / "active_catalog_binding.py"
 BINDING_GUARD = REVIEW_SKILL_ROOT / "scripts" / "named_lane_guard"
+REVIEW_REFERENCE = REVIEW_SKILL_ROOT / "references" / "synthetic-token-fixtures.md"
 RELEASE_ID = "a" * 40
 RUNTIME_MANIFEST_RELATIVE = (
     Path("scripts") / "review_runtime" / "synthetic-catalog-runtime-manifest.json"
@@ -170,6 +171,7 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
     def test_skill_routes_only_bound_authoring_catalog_surface(self) -> None:
         skill = SKILL.read_text(encoding="utf-8")
         templates = TEMPLATES.read_text(encoding="utf-8")
+        review_reference = REVIEW_REFERENCE.read_text(encoding="utf-8")
         normalized_skill = " ".join(skill.split())
         normalized_templates = " ".join(templates.split())
         for anchor in (
@@ -211,11 +213,46 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
             self.assertIn(command, normalized_templates)
         self.assertNotIn("synthetic-tokens list-exemptions", normalized_skill)
         self.assertNotIn("synthetic-tokens audit-master", normalized_skill)
+        for retired_surface in (
+            "--synthetic-secret-exemption",
+            "synthetic-tokens list-exemptions",
+            "synthetic-tokens audit-master",
+            "## Legacy Compatibility Boundary",
+            "| `access-a` |",
+        ):
+            self.assertNotIn(retired_surface, skill)
+            self.assertNotIn(retired_surface, review_reference)
         self.assertNotIn("${CODEX_HOME", skill)
         self.assertNotIn("${HOME", skill)
         self.assertTrue(BINDING_RESOLVER.is_file())
         self.assertTrue(BINDING_GUARD.is_file())
         self.assertFalse((SKILL_ROOT / "synthetic-token-catalog.json").exists())
+
+    def test_catalog_values_are_not_handwritten_outside_the_catalog(self) -> None:
+        catalog_path = (
+            REVIEW_SKILL_ROOT
+            / "scripts"
+            / "review_runtime"
+            / "synthetic-token-catalog.json"
+        )
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        tokens = tuple(
+            (item["id"], item["value"]) for item in catalog["authoring_pool"]["tokens"]
+        )
+        sources = (
+            *REVIEW_SKILL_ROOT.rglob("*.py"),
+            *REVIEW_SKILL_ROOT.rglob("*.md"),
+            *SKILL_ROOT.rglob("*.py"),
+            *SKILL_ROOT.rglob("*.md"),
+        )
+        for source in sources:
+            text = source.read_text(encoding="utf-8")
+            for token_id, value in tokens:
+                self.assertNotIn(
+                    value,
+                    text,
+                    f"catalog value {token_id} is duplicated in {source}",
+                )
 
     def test_release_binding_drives_authoritative_validate_list_and_get(
         self,
@@ -396,7 +433,7 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
             self.assertTrue(payload["token"]["value"])
             self.assertNotIn(payload["token"]["value"], json.dumps(listing))
 
-    def test_helper_bytecode_cache_is_ignored_by_closed_authoring_loader(
+    def test_decoy_bytecode_cache_is_ignored_by_closed_authoring_loader(
         self,
     ) -> None:
         with self.installed_release() as release_root:
@@ -404,29 +441,13 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
             synthetic_root = skills_root / "synthetic-token-fixtures"
             review_root = skills_root / "review-orchestration-playbook"
             resolver = synthetic_root / "scripts" / "active_catalog_binding.py"
-            helper = review_root / "scripts" / "isolated_review"
-            environment = dict(os.environ)
-            environment.pop("PYTHONDONTWRITEBYTECODE", None)
-            environment.pop("PYTHONPYCACHEPREFIX", None)
-            generated = subprocess.run(
-                (
-                    str(Path(sys.executable).resolve()),
-                    str(helper),
-                    "synthetic-tokens",
-                    "validate",
-                ),
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=30,
-                env=environment,
+            cache_root = review_root / "scripts" / "review_runtime" / "__pycache__"
+            cache_root.mkdir()
+            cache_file = cache_root / "cli.cpython-313.pyc"
+            cache_file.write_bytes(
+                b"untrusted-bytecode-must-never-be-loaded",
             )
-            self.assertEqual(generated.returncode, 0, generated.stderr)
-            cache_files = sorted(
-                (review_root / "scripts" / "review_runtime").rglob("*.pyc")
-            )
-            self.assertTrue(cache_files)
+            self.assertTrue(cache_file.is_file())
 
             captured = self.run_binding(resolver)
             self.assertEqual(captured.returncode, 0, captured.stderr)

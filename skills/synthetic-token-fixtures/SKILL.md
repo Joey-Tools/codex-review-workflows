@@ -134,8 +134,8 @@ values from documentation or source.
 2. Run bound `validate`, then metadata-only `list`, requiring the same
    `binding_sha256` inside each completed transaction envelope.
 3. Read `pool_version` and each token's `id`, `role`, `state`, `rule`, and
-   `value_sha256`. Supported roles are `access`, `refresh`, `id`, `api-key`, and
-   `bearer`; supported states are `active`, `expired`, and `consumed`.
+   `value_sha256`. Treat the returned records as authoritative; do not
+   duplicate the available IDs, roles, or lifecycle states in prose.
 4. Reuse token IDs already named by the project when their role and state still
    fit. Otherwise filter by role and state, sort by ID, and choose the first
    compatible entry. Choose distinct IDs for fixtures that model distinct
@@ -157,15 +157,6 @@ code, restructure the fixture rather than changing the token.
 
 Read [fixture-templates.md](references/fixture-templates.md) when creating a fixture shape. The templates deliberately contain placeholders only.
 
-## Legacy Compatibility Boundary
-
-Legacy exemption selection and pinned-master audit remain review-helper
-compatibility surfaces only. They are not fixture-authoring operations, do not
-extend the authoring catalog, and are intentionally not routed by this skill.
-Replace new or branch-only values with an authoring token in an ordinary forward
-commit; hand an unavoidable historical-range review to
-`$review-orchestration-playbook`.
-
 ## Guardrails
 
 - Never copy token literals into this skill, templates, project instructions, or an allocator.
@@ -175,4 +166,3 @@ commit; hand an unavoidable historical-range review to
 - Never select the catalog through `CODEX_HOME`, `HOME`, `PATH`, a repository copy, or a caller-provided path.
 - Never invent IDs, suffixes, reservations, counters, or regex namespaces.
 - Never treat words such as `synthetic`, `test`, `fixture`, or `sentinel` as proof that a value is safe.
-- Never use a legacy compatibility exemption for prompts, new fixtures, or a net increase in repository occurrences.

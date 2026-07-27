@@ -666,28 +666,3 @@ def authoring_metadata(catalog: SyntheticTokenCatalog) -> list[dict[str, Any]]:
         }
         for token in sorted(catalog.authoring_tokens, key=lambda item: item.identifier)
     ]
-
-
-def legacy_metadata(catalog: SyntheticTokenCatalog) -> list[dict[str, Any]]:
-    return [
-        {
-            "id": exemption.identifier,
-            "match": exemption.match,
-            "repository": exemption.repository,
-            "values": [
-                {
-                    "containing_commit": token.containing_commit,
-                    "id": token.identifier,
-                    "rule": token.rule,
-                    "source_occurrences": token.source_occurrences,
-                    "value_sha256": token.value_sha256,
-                    "value_length": token.value_length,
-                }
-                for token in sorted(exemption.values, key=lambda item: item.identifier)
-            ],
-            "verified_master_tip": exemption.verified_master_tip,
-        }
-        for exemption in sorted(
-            catalog.legacy_exemptions, key=lambda item: item.identifier
-        )
-    ]

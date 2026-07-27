@@ -3,7 +3,7 @@ id: 20260724-dpf001
 title: Unify Delivery Profiles And Retire Standalone Agile Delivery
 status: completed
 created: 2026-07-24
-updated: 2026-07-25
+updated: 2026-07-27
 branch: codex/delivery-profiles-agile-retirement-20260724
 pr:
 supersedes: []
@@ -21,6 +21,9 @@ superseded_by:
 - `synthetic-token-fixtures` routes authoring through the existing review
   helper's authoritative catalog CLI through a trusted exact runtime manifest,
   without defining a second pool or broad executable runtime.
+- The post-#53 integration removes the deprecated exemption flag and legacy
+  list/audit commands. Historical catalog records remain automatic exact-value
+  admission inputs, not caller-selectable authority.
 
 ## Current State
 
@@ -182,6 +185,18 @@ superseded_by:
   mutable pathname is executed later.
   `CODEX_HOME`, `HOME`, repository shadows, caller-selected catalog paths, and
   same-byte inode replacement cannot select or release a result.
+- The authoring catalog exposes only `validate`, metadata-only `list`, and
+  exact single-ID `get`, with one shared result implementation. The deprecated
+  exemption-selection flag, exemption-list command, pinned-master audit
+  command, audit runtime, and handwritten ID table are absent. Historical
+  schema-v1 state can still be parsed for bounded status/cleanup recovery, and
+  historical catalog values still participate automatically in the same
+  complete-tree `head_count <= base_count` admission rule.
+- `master` at `b3d593315b2b6e9310914bd8b2af8a41aa46e08b` (including PR #53)
+  was integrated with the signed merge commit
+  `bd9266dec9cae76de662795368c6080b8909b3c5`. Conflict resolution preserved
+  GitHub-request ordering, Trusted Mac evidence, and complete CI/conversation
+  pagination contracts.
 
 ## Next Steps
 
@@ -190,49 +205,33 @@ superseded_by:
 ## Evidence
 
 - `python3 -B -m unittest discover -s skills/change-delivery-workflow/tests
-  -p 'test_*.py'` passed (`45` tests). The suite keeps the exact 18-success
-  matrix and now also covers the 26 closed blocker rows, mode-specific
-  no-commit/read-only blockers, false succeeded-gate rejection, exact
-  frozen-head signature verification for both 40- and 64-hex object IDs,
-  policy-promoted focused-checkpoint blockers with a no-gate terminal, their
-  profile/mode/phase cross-products, ordinary PR-readiness receiver admission,
-  snapshot- and
-  ordered-content-bound CI pages, complete paginated review threads, global
-  `StatusContext` creator/context identity, and fail-closed delivery-v2/report-v6
-  migration.
-- `python3 -B skills/synthetic-token-fixtures/tests/test_skill_contract.py -v`
-  passed (`13` tests), including co-release binding, isolated-import shadows,
-  raw-leaf and intermediate cross-release symlinks, unsafe parent modes,
-  bound validate/list/get operations, manifest/source/catalog tampering,
-  unlisted modules and import substitution, parent replacement, same-byte
-  entry inode replacement, valid trusted manifest rotation, and fail-closed
-  source/layout drift.
-- `python3 -B skills/review-orchestration-playbook/tests/test_synthetic_tokens.py -q`
-  passed the complete `190`-test synthetic runtime suite.
-- `python3 -B skills/review-orchestration-playbook/tests/test_contracts.py -q`
-  passed (`88` tests), including the semantic helper's canonical-manifest
-  binding, self-contained receiver schema closure, and absence of an external
-  delivery-schema dependency without widening a formal named-lane source
-  closure.
+  -p 'test_*.py' -q` passed (`45` tests).
+- `python3 -B -m unittest` over the synthetic skill contract, synthetic runtime,
+  and Claude Linux credential tests passed (`453` tests, `1` platform skip).
+  This includes the catalog-value non-duplication contract and exact
+  metadata-bound fixture selection.
+- `python3 -B -m unittest tests/test_auth_carrier.py -q`, from the independent
+  supervisor root, passed (`37` tests). Its credential fixture is obtained
+  through the canonical catalog entrypoint and validates ID, role, state,
+  ASCII encoding, and digest without copying a raw value.
+- Six directly affected provider authentication and egress tests passed.
+- `python3 -B -m unittest
+  skills/review-orchestration-playbook/tests/test_contracts.py -q` passed
+  (`99` tests).
 - `python3 -B -m unittest discover -s
-  skills/review-orchestration-playbook/tests -p 'test_*.py'` passed the complete
-  review-helper suite outside the filesystem sandbox (`2,401` tests, `5`
-  platform skips). The unsandboxed run was required only for existing
-  loopback-broker tests that bind an ephemeral `127.0.0.1` port.
-- `python3 -B skills/review-orchestration-playbook/tests/test_cli.py -q`
-  passed (`17` tests).
-- The system `quick_validate.py` and Joey `codex_skill_validate.py` could not
-  run because local PyYAML is absent and the unapproved PyPI dependency fetch
-  was denied. The documented offline fallback passed for both modified skills:
-  Ruby/Psych parsed closed frontmatter and `agents/openai.yaml`, checked the
-  quick-validator name/description constraints, and resolved every relative
-  Markdown link target.
-- `jq empty` passed for both schemas and all three changed fixture files.
-  Draft 2020-12 `jsonschema` validation accepted both schema definitions;
-  the delivery suite validated all `13` profile-selection cases, all `8`
-  formal-review terminal cases, and all four terminal read-only report states.
+  skills/review-orchestration-playbook/tests -p 'test_*.py' -q` passed the
+  complete review-helper suite outside the outer workspace sandbox (`2,818`
+  tests, `6` platform skips). Native macOS `sandbox-exec` coverage required
+  that environment; the exact previously sandbox-blocked test also passed in
+  isolation before the full rerun.
+- Joey's installed `codex_skill_validate.py` accepted
+  `change-delivery-workflow`, `synthetic-token-fixtures`, and
+  `review-orchestration-playbook`.
+- `jq empty` passed for the catalog and trusted runtime manifest.
 - `python3 -B /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo .`
   passed.
-- Ruff checks, `ruff format --check`, and `py_compile` passed for the three
-  modified Python runtime/test files.
+- Ruff checks passed for every modified Python file. Ruff format checks passed
+  for the modified files that were not already part of the inherited #53
+  formatting baseline; the repository-wide check still identifies seven
+  inherited files from that baseline.
 - `git diff --check` passed for tracked changes.

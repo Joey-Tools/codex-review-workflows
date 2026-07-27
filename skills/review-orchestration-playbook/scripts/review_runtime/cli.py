@@ -16,8 +16,8 @@ from .common import (
     restore_signal_mask,
 )
 from .synthetic_tokens import (
+    SyntheticTokenCatalog,
     authoring_metadata,
-    legacy_metadata,
     load_catalog,
 )
 
@@ -149,15 +149,6 @@ def _add_review_arguments(parser: argparse.ArgumentParser) -> None:
             "compatibility-fallback consent."
         ),
     )
-    parser.add_argument(
-        "--synthetic-secret-exemption",
-        action="append",
-        default=[],
-        help=(
-            "Deprecated compatibility option. Known legacy IDs are validated, "
-            "but selection no longer changes secret-delta admission."
-        ),
-    )
 
 
 def _validate_review_arguments(args: argparse.Namespace) -> None:
@@ -214,12 +205,6 @@ def _build_synthetic_tokens_parser() -> argparse.ArgumentParser:
     get_parser = actions.add_parser("get")
     get_parser.add_argument("id")
     get_parser.add_argument("--json", action="store_true")
-    exemptions_parser = actions.add_parser("list-exemptions")
-    exemptions_parser.add_argument("--json", action="store_true")
-    audit_parser = actions.add_parser("audit-master")
-    audit_parser.add_argument("--repo", required=True)
-    audit_parser.add_argument("--ref", required=True)
-    audit_parser.add_argument("--exemption", required=True)
     return parser
 
 
@@ -246,6 +231,19 @@ def _run_synthetic_tokens(argv: list[str]) -> int:
     args = _build_synthetic_tokens_parser().parse_args(argv)
     catalog = load_catalog()
     validate_authoring_catalog_scanner_contract(catalog)
+    return _emit_authoring_catalog_action(
+        args,
+        catalog,
+        unknown_label="synthetic-tokens",
+    )
+
+
+def _emit_authoring_catalog_action(
+    args: argparse.Namespace,
+    catalog: SyntheticTokenCatalog,
+    *,
+    unknown_label: str,
+) -> int:
     if args.action == "validate":
         print(
             json.dumps(
@@ -289,31 +287,7 @@ def _run_synthetic_tokens(argv: list[str]) -> int:
         else:
             print(payload["token"]["value"])
         return 0
-    if args.action == "list-exemptions":
-        payload = {
-            "exemptions": legacy_metadata(catalog),
-            "pool_version": catalog.pool_version,
-        }
-        if args.json:
-            print(json.dumps(payload, indent=2, sort_keys=True))
-        else:
-            for exemption in payload["exemptions"]:
-                print(
-                    f"{exemption['id']}\t{exemption['repository']}\t"
-                    f"{len(exemption['values'])}"
-                )
-        return 0
-    if args.action == "audit-master":
-        from .workspace import audit_legacy_exemption
-
-        evidence = audit_legacy_exemption(
-            repo=pathlib.Path(args.repo),
-            ref=args.ref,
-            exemption=catalog.legacy_exemption(args.exemption),
-        )
-        print(json.dumps(evidence, indent=2, sort_keys=True))
-        return 0
-    raise ReviewError(f"unknown synthetic-tokens action: {args.action}")
+    raise ReviewError(f"unknown {unknown_label} action: {args.action}")
 
 
 def _build_catalog_parser() -> argparse.ArgumentParser:
@@ -333,50 +307,11 @@ def catalog_main(argv: list[str] | None = None) -> int:
 
     args = _build_catalog_parser().parse_args(argv)
     catalog = load_catalog()
-    if args.action == "validate":
-        print(
-            json.dumps(
-                {
-                    "pool_version": catalog.pool_version,
-                    "schema_version": catalog.schema_version,
-                    "status": "valid",
-                },
-                sort_keys=True,
-            )
-        )
-        return 0
-    if args.action == "list":
-        payload = {
-            "pool_version": catalog.pool_version,
-            "tokens": authoring_metadata(catalog),
-        }
-        if args.json:
-            print(json.dumps(payload, indent=2, sort_keys=True))
-        else:
-            for token in payload["tokens"]:
-                print(
-                    f"{token['id']}\t{token['role']}\t{token['state']}\t{token['rule']}"
-                )
-        return 0
-    if args.action == "get":
-        token = catalog.authoring_token(args.id)
-        payload = {
-            "pool_version": catalog.pool_version,
-            "token": {
-                "id": token.identifier,
-                "role": token.role,
-                "rule": token.rule,
-                "state": token.state,
-                "value": token.value.decode("ascii"),
-                "value_sha256": token.value_sha256,
-            },
-        }
-        if args.json:
-            print(json.dumps(payload, indent=2, sort_keys=True))
-        else:
-            print(payload["token"]["value"])
-        return 0
-    raise ReviewError(f"unknown catalog action: {args.action}")
+    return _emit_authoring_catalog_action(
+        args,
+        catalog,
+        unknown_label="catalog",
+    )
 
 
 def _run_foreground(args: argparse.Namespace) -> int:
@@ -408,9 +343,6 @@ def _run_foreground(args: argparse.Namespace) -> int:
             head_ref=args.head_ref,
             ownership_handoff=accept_workspace,
             preparation_cleanup_handoff=(preparation_guard.accept_preparation_cleanup),
-            synthetic_secret_exemptions=tuple(
-                getattr(args, "synthetic_secret_exemption", ())
-            ),
             prompt_override=(
                 pathlib.Path(args.prompt_file) if args.prompt_file else None
             ),
@@ -492,9 +424,6 @@ def _run_stateful(argv: list[str], *, script_path: pathlib.Path) -> int:
             prompt_file=pathlib.Path(args.prompt_file) if args.prompt_file else None,
             keep_workspace=args.keep_workspace,
             egress_consent=args.egress_consent,
-            synthetic_secret_exemptions=tuple(
-                getattr(args, "synthetic_secret_exemption", ())
-            ),
             include_source_wip=bool(getattr(args, "include_source_wip", False)),
             publisher=lambda created: print(created, flush=True),
         )

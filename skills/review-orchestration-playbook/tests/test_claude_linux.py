@@ -27,10 +27,21 @@ from unittest import mock
 SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from review_runtime import claude_linux, claude_refresh_lock  # noqa: E402
-from independent_codex_pr_review.tests.synthetic_fixtures import (  # noqa: E402
-    SYNTHETIC_REFRESH_TOKEN,
+from review_runtime import (  # noqa: E402
+    claude_linux,
+    claude_refresh_lock,
+    synthetic_tokens,
 )
+
+
+_SYNTHETIC_CATALOG = synthetic_tokens.load_catalog()
+
+
+def _catalog_fixture(token_id: str, *, role: str, state: str) -> str:
+    token = _SYNTHETIC_CATALOG.authoring_token(token_id)
+    if (token.role, token.state) != (role, state):
+        raise RuntimeError(f"synthetic catalog metadata changed for {token_id}")
+    return token.value.decode("ascii")
 
 
 _AMBIENT_TOOL_ENV_POISON = {
@@ -2268,13 +2279,23 @@ class RuntimeLibraryTrustTest(unittest.TestCase):
 class CredentialStagingTest(unittest.TestCase):
     PROTOCOL = claude_refresh_lock.CLAUDE_REFRESH_LOCK_PROTOCOL_2_1_211
 
-    # synthetic-token-fixtures IDs: access-expired, access-a, access-b,
-    # refresh-a, refresh-b (pool joey-private-v3).
-    SYNTH_ACCESS_EXPIRED = "codex_synth_v1_access_expired"
-    SYNTH_ACCESS_A = "codex_synth_v1_access_a"
-    SYNTH_ACCESS_B = "codex_synth_v1_access_b"
-    SYNTH_REFRESH_A = SYNTHETIC_REFRESH_TOKEN
-    SYNTH_REFRESH_B = "codex_synth_v1_refresh_b"
+    SYNTH_ACCESS_EXPIRED = _catalog_fixture(
+        "access-expired",
+        role="access",
+        state="expired",
+    )
+    SYNTH_ACCESS_A = _catalog_fixture("access-a", role="access", state="active")
+    SYNTH_ACCESS_B = _catalog_fixture("access-b", role="access", state="active")
+    SYNTH_REFRESH_A = _catalog_fixture(
+        "refresh-a",
+        role="refresh",
+        state="active",
+    )
+    SYNTH_REFRESH_B = _catalog_fixture(
+        "refresh-b",
+        role="refresh",
+        state="active",
+    )
 
     @staticmethod
     def _explicit_cause_nodes(
