@@ -52,7 +52,13 @@ jobs:
         run: |
           python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -v
           python3 -m unittest discover -s skills/change-delivery-workflow/tests -p 'test_*.py' -v
-          python3 -m unittest discover -s skills/synthetic-token-fixtures/tests -p 'test_*.py' -v
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            # setup-python is rooted under the hosted runner's writable /opt.
+            # Catalog binding must keep rejecting that mutable interpreter chain.
+            /usr/bin/python3 -m unittest discover -s skills/synthetic-token-fixtures/tests -p 'test_*.py' -v
+          else
+            python3 -m unittest discover -s skills/synthetic-token-fixtures/tests -p 'test_*.py' -v
+          fi
       - name: Run real Linux isolation integration test
         if: runner.os == 'Linux'
         env:

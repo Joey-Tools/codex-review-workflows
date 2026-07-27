@@ -5,7 +5,7 @@ status: completed
 created: 2026-07-24
 updated: 2026-07-27
 branch: codex/delivery-profiles-agile-retirement-20260724
-pr:
+pr: 83
 supersedes: []
 superseded_by:
 ---
@@ -192,6 +192,12 @@ superseded_by:
   schema-v1 state can still be parsed for bounded status/cleanup recovery, and
   historical catalog values still participate automatically in the same
   complete-tree `head_count <= base_count` admission rule.
+- Linux hosted CI runs the synthetic catalog contract with the root-owned
+  system `/usr/bin/python3`. The setup-python interpreter lives below the
+  hosted runner's group/world-writable `/opt`, so the catalog binder correctly
+  rejects that mutable parent chain instead of adding a CI-only trust bypass.
+  Review-helper and delivery tests continue to use the requested setup-python
+  version.
 - `master` at `b3d593315b2b6e9310914bd8b2af8a41aa46e08b` (including PR #53)
   was integrated with the signed merge commit
   `bd9266dec9cae76de662795368c6080b8909b3c5`. Conflict resolution preserved
@@ -235,3 +241,7 @@ superseded_by:
   formatting baseline; the repository-wide check still identifies seven
   inherited files from that baseline.
 - `git diff --check` passed for tracked changes.
+- PR #83's first Ubuntu run proved the setup-python `/opt` rejection. The
+  workflow now preserves that fail-closed production property and selects
+  `/usr/bin/python3` only for the stdlib-only synthetic catalog contract on
+  Linux; local focused validation covers the same command shape.
