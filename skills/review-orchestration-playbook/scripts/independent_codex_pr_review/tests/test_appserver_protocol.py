@@ -724,18 +724,35 @@ class AppServerProtocolTests(unittest.TestCase):
             }
         )
         complete(protocol, prior_items=(completed_reasoning,))
-        protocol.accept_message(
+        trailing_notifications = (
+            {
+                "method": "thread/tokenUsage/updated",
+                "params": {
+                    "threadId": "thread-1",
+                    "tokenUsage": {
+                        "last": token_breakdown,
+                        "modelContextWindow": 100_000,
+                        "total": token_breakdown,
+                    },
+                    "turnId": "turn-1",
+                },
+            },
             {
                 "method": "account/rateLimits/updated",
                 "params": {"rateLimits": {}},
-            }
-        )
-        protocol.accept_message(
+            },
             {
                 "method": "thread/status/changed",
                 "params": {"status": {"type": "idle"}, "threadId": "thread-1"},
-            }
+            },
         )
+        for notification in trailing_notifications:
+            with (
+                self.subTest(method=notification["method"]),
+                self.assertRaises(AppServerProtocolError) as trailing,
+            ):
+                protocol.accept_message(notification)
+            self.assertEqual(trailing.exception.code, "trailing-record")
         result = protocol.finish_eof()
         self.assertEqual(result.final_text, "No findings.")
         self.assertNotIn("ephemeral rationale", repr(result))

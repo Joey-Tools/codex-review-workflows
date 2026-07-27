@@ -3,7 +3,7 @@ id: 20260716-821601
 title: Review Helper Trust Hardening Port
 status: completed
 created: 2026-07-16
-updated: 2026-07-23
+updated: 2026-07-24
 branch: wip/review-helper-trust-port
 pr: 53
 supersedes: []
@@ -1465,3 +1465,36 @@ metadata behavior.
   the changed Python test. A signed fix head, exact-head admission, hosted CI,
   the trusted-Mac live gate, and replacement formal lanes remain. No local
   Python 3.10 run was performed.
+- The exact-head GitHub Codex terminal review on `47f34bc4d6` found that
+  token-usage, rate-limit, and thread-status notifications bypassed the generic
+  trailing-record guard after `turn/completed`. The protocol now rejects every
+  notification before dispatch when the session is terminal, and the three
+  telemetry handlers no longer accept terminal state as a direct internal
+  call. The existing bounded telemetry regression retains its fixed test
+  identity while proving all three valid notification shapes fail with
+  `trailing-record` after the trusted result. Its focused test and the complete
+  21-test app-server protocol module pass under Python 3.13.0 with bytecode
+  disabled.
+- The same provider review claimed the hosted macOS deterministic job would
+  always fail because synthetic managed-auth tests require the unavailable live
+  no-child profile. Exact-head hosted run `30128442703` directly disproves that
+  claim: the macOS-26 job first passed `Match hosted no-child blocker
+  signature`, then ran the fixed deterministic suite 550/550, and the aggregate
+  `test` job succeeded. Those managed-auth unit tests use a synthetic launch
+  capability and intentionally remain in the deterministic coverage set; only
+  the nine exact live no-child tests are excluded. The invalid finding does not
+  justify weakening coverage. Replacement-head full gates, signature,
+  admission, hosted CI, and formal review remain required. No local Python 3.10
+  run was performed.
+- The replacement tree passed the fixed deterministic suite 550/550 in
+  183.783 seconds, the complete discovered Python suite 2817/2817 with six
+  expected skips in 1033.487 seconds, repository contracts 97/97 in 12.386
+  seconds, the shared runtime suite 200/200 with one expected skip in 15.127
+  seconds, the no-bytecode suite 4/4 in 3.786 seconds, and the trusted-Mac live
+  no-child gate 9/9 in 8.594 seconds. Ruff check and format check, the project
+  journal validator, and `git diff --check` also passed. Every Python command
+  used the trusted Python 3.13.0 interpreter with `-B`; no local Python 3.10 run
+  was performed. One repo-root focused-test invocation used an invalid dotted
+  import root and failed with `ModuleNotFoundError`; the helper-root command was
+  run immediately afterward and passed the complete app-server protocol module
+  21/21 in 0.070 seconds.

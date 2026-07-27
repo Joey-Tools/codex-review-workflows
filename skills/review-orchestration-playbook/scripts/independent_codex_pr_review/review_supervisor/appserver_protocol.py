@@ -978,6 +978,11 @@ class AppServerProtocol:
     ) -> tuple[dict[str, Any], ...]:
         _exact_keys(message, required={"method", "params"}, label="notification")
         method = _bounded_string(message["method"], "notification method", limit=128)
+        if self._state == "terminal":
+            raise AppServerProtocolError(
+                f"notification arrived after the terminal review result: {method}",
+                code="trailing-record",
+            )
         params = _object(message["params"], f"{method} params")
 
         if method == "thread/tokenUsage/updated":
@@ -989,11 +994,6 @@ class AppServerProtocol:
         if method == "thread/status/changed":
             self._accept_thread_status_changed(params)
             return ()
-        if self._state == "terminal":
-            raise AppServerProtocolError(
-                f"notification arrived after the terminal review result: {method}",
-                code="trailing-record",
-            )
 
         if method == "remoteControl/status/changed":
             self._accept_remote_control_status(params)
@@ -1433,7 +1433,7 @@ class AppServerProtocol:
             )
 
     def _accept_token_usage_updated(self, params: dict[str, Any]) -> None:
-        if self._state not in {"running", "terminal"}:
+        if self._state != "running":
             raise AppServerProtocolError(
                 "token-usage notification arrived outside the active turn",
                 code="protocol-order",
@@ -1457,7 +1457,6 @@ class AppServerProtocol:
             "thread",
             "turn",
             "running",
-            "terminal",
         }:
             raise AppServerProtocolError(
                 "rate-limit notification arrived before initialization",
@@ -1474,7 +1473,7 @@ class AppServerProtocol:
         )
 
     def _accept_thread_status_changed(self, params: dict[str, Any]) -> None:
-        if self._state not in {"thread", "turn", "running", "terminal"}:
+        if self._state not in {"thread", "turn", "running"}:
             raise AppServerProtocolError(
                 "thread-status notification arrived before thread creation",
                 code="protocol-order",
