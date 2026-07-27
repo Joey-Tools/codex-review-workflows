@@ -46,8 +46,9 @@ REPO=/absolute/path/to/repo
 BASE_SHA=<full-base-commit-oid>
 HEAD_SHA=<full-head-commit-oid>
 PR_URL=https://github.com/OWNER/REPO/pull/NUMBER
-RETENTION="$TOOL_DIR/runtime/retention"
-CHECKOUTS="$TOOL_DIR/runtime/checkouts"
+STATE_ROOT=/absolute/current-account-home/.codex/review-runtime/independent-codex-pr-review
+RETENTION="$STATE_ROOT/retention"
+CHECKOUTS="$STATE_ROOT/checkouts"
 
 HELPER_STATE="$($HELPER stateful start \
   --repo "$REPO" \
@@ -60,6 +61,11 @@ $HELPER stateful status --state-dir "$HELPER_STATE"
 $HELPER stateful wait --state-dir "$HELPER_STATE" --timeout-seconds 60
 $HELPER stateful final --state-dir "$HELPER_STATE"
 ```
+
+The CLI resolves the same default state root from the current POSIX account
+database, not from `$HOME`, so installed release trees remain immutable and
+retained evidence survives release replacement. Explicit `--retention-root` and
+`--checkout-parent` values remain available for task-scoped isolated runs.
 
 仅在 helper 已 terminal 后运行独立 preflight。它验证 exact repo/base/head、helper
 runner completion、primary-diff 双重 attestation、control directory 完整性、source

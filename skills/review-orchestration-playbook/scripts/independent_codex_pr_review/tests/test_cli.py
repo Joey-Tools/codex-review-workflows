@@ -5,6 +5,7 @@ import io
 import json
 import os
 import pathlib
+import pwd
 import subprocess
 import sys
 import unittest
@@ -14,6 +15,9 @@ from review_supervisor.constants import (
     LOW_LEVEL_HELPER_REVIEW_CONTRACT,
     NAMED_LANE_ELIGIBLE,
     SCHEMA_VERSION,
+    default_checkout_parent,
+    default_retention_root,
+    default_state_root,
 )
 from review_supervisor.secureio import (
     allocated_bytes,
@@ -271,6 +275,23 @@ def _authorize_final(attempt: pathlib.Path, content: bytes) -> dict[str, object]
 
 
 class CliLifecycleTests(unittest.TestCase):
+    def test_default_state_roots_are_host_local(self) -> None:
+        account_home = pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir)
+        expected = (
+            account_home / ".codex" / "review-runtime" / "independent-codex-pr-review"
+        )
+
+        self.assertEqual(default_state_root(), expected)
+        self.assertEqual(default_retention_root(), expected / "retention")
+        self.assertEqual(default_checkout_parent(), expected / "checkouts")
+        for path in (
+            default_state_root(),
+            default_retention_root(),
+            default_checkout_parent(),
+        ):
+            with self.subTest(path=path):
+                self.assertFalse(path.resolve().is_relative_to(TOOL_ROOT.resolve()))
+
     def test_emit_overrides_conflicting_contract_metadata(self) -> None:
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
