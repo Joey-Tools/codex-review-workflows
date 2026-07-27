@@ -1554,6 +1554,9 @@ class RepositoryContractTest(unittest.TestCase):
         }
         for profile, (workflow, skill_prefix) in profiles.items():
             with self.subTest(profile=profile):
+                normalized_workflow = " ".join(
+                    workflow.replace("\\\n", "").split()
+                )
                 for anchor in (
                     "jsonschema==4.26.0",
                     f"{skill_prefix}/synthetic-token-fixtures/scripts/active_catalog_binding.py",
@@ -1561,9 +1564,22 @@ class RepositoryContractTest(unittest.TestCase):
                     f"{skill_prefix}/synthetic-token-fixtures/tests",
                 ):
                     self.assertIn(anchor, workflow)
+                self.assertIn('if [[ "$RUNNER_OS" == "Linux" ]]; then', workflow)
+                self.assertIn(
+                    (
+                        "/usr/bin/python3 -m unittest discover "
+                        f"-s {skill_prefix}/synthetic-token-fixtures/tests"
+                    ),
+                    normalized_workflow,
+                )
+                self.assertIn(
+                    "setup-python is rooted under the hosted runner's writable /opt.",
+                    workflow,
+                )
 
         workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertEqual(workflow, profiles[CI_PROFILE][0])
+
     def test_completed_trust_port_journal_uses_current_claude_range(self) -> None:
         if CI_PROFILE != "canonical":
             self.skipTest("completed canonical project journal is not mirrored")

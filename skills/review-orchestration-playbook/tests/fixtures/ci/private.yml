@@ -65,9 +65,17 @@ jobs:
           python3 -m unittest discover \
             -s personal_codex/skills/change-delivery-workflow/tests \
             -p 'test_*.py'
-          python3 -m unittest discover \
-            -s personal_codex/skills/synthetic-token-fixtures/tests \
-            -p 'test_*.py'
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            # setup-python is rooted under the hosted runner's writable /opt.
+            # Catalog binding must keep rejecting that mutable interpreter chain.
+            /usr/bin/python3 -m unittest discover \
+              -s personal_codex/skills/synthetic-token-fixtures/tests \
+              -p 'test_*.py'
+          else
+            python3 -m unittest discover \
+              -s personal_codex/skills/synthetic-token-fixtures/tests \
+              -p 'test_*.py'
+          fi
       - name: Verify private overlay sync on macOS
         if: runner.os == 'macOS'
         run: |

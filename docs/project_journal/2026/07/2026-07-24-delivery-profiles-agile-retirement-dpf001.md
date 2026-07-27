@@ -197,7 +197,9 @@ superseded_by:
   hosted runner's group/world-writable `/opt`, so the catalog binder correctly
   rejects that mutable parent chain instead of adding a CI-only trust bypass.
   Review-helper and delivery tests continue to use the requested setup-python
-  version.
+  version. Both reviewed CI profile snapshots carry the same branch, and the
+  contract suite asserts that the canonical and private profiles select the
+  system interpreter for this Linux-only command.
 - `master` at `b3d593315b2b6e9310914bd8b2af8a41aa46e08b` (including PR #53)
   was integrated with the signed merge commit
   `bd9266dec9cae76de662795368c6080b8909b3c5`. Conflict resolution preserved
@@ -244,4 +246,7 @@ superseded_by:
 - PR #83's first Ubuntu run proved the setup-python `/opt` rejection. The
   workflow now preserves that fail-closed production property and selects
   `/usr/bin/python3` only for the stdlib-only synthetic catalog contract on
-  Linux; local focused validation covers the same command shape.
+  Linux. A fresh-context review then found the canonical and private CI
+  snapshots had not yet inherited that branch; both snapshots and the explicit
+  profile contract are now updated. `actionlint`, the byte-for-byte canonical
+  workflow comparison, and the focused profile contract passed locally.
