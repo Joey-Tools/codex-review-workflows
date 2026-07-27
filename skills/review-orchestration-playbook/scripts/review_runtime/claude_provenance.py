@@ -27,6 +27,7 @@ from .common import (
     ReviewProcessLeakError,
     ReviewTimeoutError,
     run_bounded_capture,
+    strict_json_loads,
 )
 from .claude_version_policy import (
     CLAUDE_COMPATIBILITY_SPEC,
@@ -184,10 +185,6 @@ class _TrustedGpgTempRoot:
 ClaudeReleaseFetcher = Callable[..., bytes]
 
 
-class _DuplicateManifestKey(ValueError):
-    pass
-
-
 class _FetchDeadlineExpired(TimeoutError):
     pass
 
@@ -214,10 +211,6 @@ def _add_deadline_cleanup_note(
     elif not error.__suppress_context__ and error.__context__ is not None:
         diagnostic.__context__ = error.__context__
     error.__cause__ = diagnostic
-
-
-def _reject_json_constant(value: str) -> object:
-    raise ValueError(f"non-standard JSON constant {value!r}")
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -322,22 +315,16 @@ def _enforce_fetch_deadline(timeout_seconds: float):  # type: ignore[no-untyped-
 
 def _decode_strict_json(payload: bytes, *, label: str) -> object:
     try:
-        text = payload.decode("utf-8")
-        return json.loads(
-            text,
-            object_pairs_hook=_strict_object,
-            parse_constant=_reject_json_constant,
-        )
+        return strict_json_loads(payload)
     except UnicodeDecodeError as error:
         raise ClaudeProvenanceInvalid(f"{label} is not UTF-8") from error
-    except _DuplicateManifestKey as error:
-        raise ClaudeProvenanceInvalid(
-            f"{label} contains duplicate key: {error.args[0]!r}"
-        ) from error
-    except (json.JSONDecodeError, ValueError) as error:
-        raise ClaudeProvenanceInvalid(
-            f"{label} is invalid JSON: {getattr(error, 'msg', str(error))}"
-        ) from error
+    except (json.JSONDecodeError, RecursionError, ValueError) as error:
+        message = getattr(error, "msg", str(error))
+        if message.startswith("duplicate JSON object key:"):
+            raise ClaudeProvenanceInvalid(
+                f"{label} contains duplicate key: {message.partition(':')[2].strip()}"
+            ) from error
+        raise ClaudeProvenanceInvalid(f"{label} is invalid JSON: {message}") from error
 
 
 def require_supported_release_version(version: str) -> tuple[int, int, int]:
@@ -555,15 +542,6 @@ def fetch_signed_manifest(
         manifest=manifest,
         signature=signature,
     )
-
-
-def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise _DuplicateManifestKey(key)
-        result[key] = value
-    return result
 
 
 def parse_signed_manifest_artifact(

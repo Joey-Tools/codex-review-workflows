@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import contextlib
+import ctypes
+import datetime
 import enum
 import errno
 import hashlib
@@ -12,6 +15,7 @@ import json
 import math
 import os
 import pathlib
+import plistlib
 import re
 import secrets
 import select
@@ -29,7 +33,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field, replace
-from typing import Any, BinaryIO, Callable, Iterable, Iterator, Mapping
+from typing import Any, BinaryIO, Callable, Iterable, Iterator, Mapping, TypeVar
 
 from .claude_capabilities import (
     CLAUDE_REQUIRED_OPTIONS,
@@ -41,6 +45,7 @@ from .claude_capabilities import (
     validate_claude_help,
 )
 from .claude_provenance import (
+    CLAUDE_BINARY_MAX_BYTES,
     CLAUDE_RELEASE_KEY_FINGERPRINT,
     ClaudeProvenanceDependencyUnavailable,
     ClaudeProvenanceInconclusive,
@@ -91,6 +96,7 @@ from .claude_linux import (
     validate_claude_executable as validate_claude_linux_executable,
 )
 from .common import (
+    BoundedCapture,
     Completed,
     ForwardedSignal,
     InvalidReviewerExecutable,
@@ -112,6 +118,7 @@ from .common import (
     restore_signal_mask,
     run,
     run_bounded_capture,
+    strict_json_loads,
     write_json,
     write_json_atomic_at,
     write_text_atomic,
@@ -130,6 +137,8 @@ from .workspace import (
     write_bound_review_json,
     write_bound_runner_error,
 )
+
+_CaptureResult = TypeVar("_CaptureResult")
 
 
 def _load_claude_stream_validator() -> Any:
@@ -212,19 +221,48 @@ CLAUDE_REVIEW_BASE_MACH_SERVICES = (
     "com.apple.trustd",
     "com.apple.trustd.agent",
 )
-CLAUDE_KEYCHAIN_BROKER_COMPILER = pathlib.Path("/usr/bin/clang")
 CLAUDE_KEYCHAIN_CLIENT = pathlib.Path("/usr/bin/security")
-CLAUDE_KEYCHAIN_BROKER_SOURCE = pathlib.Path(__file__).with_name(
-    "claude_keychain_broker.c"
+CLAUDE_KEYCHAIN_BROKER_ARTIFACT = pathlib.Path(__file__).with_name(
+    "claude_keychain_broker"
+)
+CLAUDE_KEYCHAIN_BROKER_ARTIFACT_SHA256 = (
+    "fcdf6d473ec5c6fa76488da0b115d147fe5e5fa576ed33710ecd3fd7186e0b46"
+)
+CLAUDE_KEYCHAIN_BROKER_CDHASHES = frozenset(
+    {
+        bytes.fromhex("8af40bf4caf7e2398fb59182082ea57caa12ed9a"),
+        bytes.fromhex("a5de7fbd8785b8baddb34da1d8477aa4f741efa0"),
+    }
+)
+CLAUDE_KEYCHAIN_BROKER_INSTALL_ROOT = pathlib.Path(
+    "/Library/Joey-Tools/CodexReview/brokers"
+)
+CLAUDE_KEYCHAIN_BROKER_INSTALL_PATH = (
+    CLAUDE_KEYCHAIN_BROKER_INSTALL_ROOT
+    / CLAUDE_KEYCHAIN_BROKER_ARTIFACT_SHA256
+    / "security"
 )
 CLAUDE_KEYCHAIN_ACCOUNT = re.compile(r"^[A-Za-z0-9._-]+$")
 CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
 CLAUDE_KEYCHAIN_BROKER_PORT_ENV = "CODEX_CLAUDE_KEYCHAIN_BROKER_PORT"
-CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV = "CODEX_CLAUDE_KEYCHAIN_BROKER_CAPABILITY"
-CLAUDE_KEYCHAIN_BROKER_CAPABILITY = re.compile(r"^[0-9a-f]{64}$")
+CLAUDE_KEYCHAIN_BROKER_EXECUTABLE_ENV = "CODEX_CLAUDE_KEYCHAIN_BROKER_EXECUTABLE"
+CLAUDE_KEYCHAIN_BROKER_IDENTITY_SOCKET_ENV = (
+    "CODEX_CLAUDE_KEYCHAIN_BROKER_IDENTITY_SOCKET"
+)
+CLAUDE_KEYCHAIN_BROKER_IDENTITY_DIRECTORY_ENV = (
+    "CODEX_CLAUDE_KEYCHAIN_BROKER_IDENTITY_DIRECTORY"
+)
 CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES = 32
-CLAUDE_KEYCHAIN_BROKER_TIMEOUT_SECONDS = 20.0
 CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES = 64 * 1024
+CLAUDE_KEYCHAIN_BROKER_ARTIFACT_LIMIT_BYTES = 1024 * 1024
+CLAUDE_KEYCHAIN_BROKER_DIRECTORY_ATTEMPTS = 4
+CLAUDE_KEYCHAIN_BROKER_DIRECTORY_PREFIX = "keychain-identity-"
+CLAUDE_KEYCHAIN_BROKER_IDENTITY_SOCKET_NAME = "identity.sock"
+CLAUDE_KEYCHAIN_BROKER_LOCAL_SOCKET_LEVEL = 0
+CLAUDE_KEYCHAIN_BROKER_LOCAL_PEERPID = 2
+CLAUDE_MACOS_CS_OPS_CDHASH = 5
+CLAUDE_MACOS_CDHASH_BYTES = 20
+CLAUDE_MACOS_PATH_BUFFER_BYTES = 1024
 CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS = 5.0
 CLAUDE_KEYCHAIN_SERVER_START_TIMEOUT_SECONDS = 5.0
 CLAUDE_KEYCHAIN_SERVER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
@@ -232,6 +270,7 @@ CLAUDE_KEYCHAIN_RECOVERY_TIMEOUT_SECONDS = 5.0
 CLAUDE_KEYCHAIN_SERVER_POLL_INTERVAL_SECONDS = 0.05
 CLAUDE_CREDENTIAL_UPDATE_LOCK_TIMEOUT_SECONDS = 5.0
 CLAUDE_KEYCHAIN_CREDENTIAL_LIMIT_BYTES = 1024 * 1024
+CLAUDE_KEYCHAIN_ITEM_NOT_FOUND_STATUS = 44
 CLAUDE_KEYCHAIN_SECURITY_STDIN_LIMIT_BYTES = 4032
 CLAUDE_MACOS_DUAL_CARRIER_KEYCHAIN_ATTEMPTS = 2
 CLAUDE_CREDENTIAL_FILE_NAME = ".credentials.json"
@@ -253,6 +292,9 @@ CLAUDE_OAUTH_TOKEN_ACTION = (
 CLAUDE_REFRESH_PERSISTENCE_DIAGNOSTIC = (
     "Claude credential refresh persistence also failed; the selected host "
     "credential source changed or could not be safely updated."
+)
+CLAUDE_TRUST_EVIDENCE_WRITE_DIAGNOSTIC = (
+    "Claude trust policy evidence also failed to persist"
 )
 CLAUDE_REVIEW_TOOL_EXECUTABLE_CANDIDATES = (
     pathlib.Path("/opt/homebrew/bin/rg"),
@@ -281,11 +323,99 @@ CLAUDE_TLS_FILE_ENV_KEYS = (
     *CLAUDE_TLS_ADDITIVE_FILE_ENV_KEYS,
 )
 CLAUDE_TLS_DIR_ENV_KEYS = ("SSL_CERT_DIR",)
+CLAUDE_TLS_BYPASS_ENV_KEYS = (
+    "NODE_OPTIONS",
+    "NODE_TLS_REJECT_UNAUTHORIZED",
+)
 CLAUDE_CA_FILE_LIMIT_BYTES = 16 * 1024 * 1024
 CLAUDE_CA_DIR_LIMIT_BYTES = 64 * 1024 * 1024
 CLAUDE_CA_DIR_ENTRY_LIMIT = 4096
 CLAUDE_CA_SYMLINK_LIMIT = 32
 CLAUDE_CA_PATH_COMPONENT_LIMIT = 256
+CLAUDE_PROXY_CA_HASH_TIMEOUT_SECONDS = 20.0
+CLAUDE_PROXY_CA_HASH_CERTIFICATE_LIMIT = 512
+CLAUDE_PROXY_TLS_VERIFY_FLAGS = ssl.VERIFY_X509_STRICT | ssl.VERIFY_X509_PARTIAL_CHAIN
+CLAUDE_OPENSSL_CA_HASH_ENTRY_RE = re.compile(r"^([0-9a-f]{8})\.(0|[1-9][0-9]*)$")
+CLAUDE_EXECUTABLE_HASH_CHUNK_BYTES = 1024 * 1024
+CLAUDE_BUNDLED_CERTIFICATE_LIMIT_BYTES = 128 * 1024
+CLAUDE_BUNDLED_ROOT_LIMIT = 512
+CLAUDE_BUNDLED_ROOT_STORE_LIMIT_BYTES = 8 * 1024 * 1024
+CLAUDE_BUNDLED_ROOT_STORE_TRAILER = (
+    b"\x00NODE_EXTRA_CA_CERTS\x00"
+    b"unified/../../../packages/bun-usockets/src/crypto/root_certs.cpp\x00"
+    b"NODE_USE_SYSTEM_CA\x00"
+)
+CLAUDE_CERTIFICATE_SIGNATURE_DIGESTS = {
+    bytes.fromhex("2a864886f70d010105"): "sha1",
+    bytes.fromhex("2a864886f70d01010b"): "sha256",
+    bytes.fromhex("2a864886f70d01010c"): "sha384",
+    bytes.fromhex("2a864886f70d01010d"): "sha512",
+    bytes.fromhex("2a8648ce3d040302"): "sha256",
+    bytes.fromhex("2a8648ce3d040303"): "sha384",
+    bytes.fromhex("2a8648ce3d040304"): "sha512",
+}
+CLAUDE_OPENSSL_CLIENT = pathlib.Path("/usr/bin/openssl")
+CLAUDE_SYSTEM_CA_FILE = pathlib.Path("/private/etc/ssl/cert.pem")
+CLAUDE_SYSTEM_KEYCHAIN = pathlib.Path("/Library/Keychains/System.keychain")
+CLAUDE_SYSTEM_ROOT_KEYCHAIN = pathlib.Path(
+    "/System/Library/Keychains/SystemRootCertificates.keychain"
+)
+CLAUDE_TRUST_CERTIFICATE_SOURCES = (
+    ("default keychain search", ()),
+    ("system keychain", (str(CLAUDE_SYSTEM_KEYCHAIN),)),
+    ("system root keychain", (str(CLAUDE_SYSTEM_ROOT_KEYCHAIN),)),
+)
+CLAUDE_CA_BUNDLE_NAME = "trusted-ca-bundle.pem"
+CLAUDE_CALLER_CA_SNAPSHOT_NAME = ".caller-ca-snapshot.pem"
+CLAUDE_TRUST_POLICY_EVIDENCE_NAME = "claude-trust-policy.json"
+CLAUDE_CERT_STORE_ENV = "CLAUDE_CODE_CERT_STORE"
+CLAUDE_CERT_STORE = "bundled"
+CLAUDE_TRUST_DOMAINS = (
+    ("user", ()),
+    ("admin", ("-d",)),
+    ("system", ("-s",)),
+)
+CLAUDE_TRUST_NO_SETTINGS = (
+    "SecTrustSettingsExport: No Trust Settings were found.",
+    "SecTrustSettingsCreateExternalRepresentation: No Trust Settings were found.",
+)
+CLAUDE_TRUST_EXPORT_HELP_VARIANTS = (
+    (
+        "Usage: trust-settings-export [-s] [-d] settings_file",
+        "-s Export system trust settings (default is user)",
+        "-d Export admin trust settings (default is user)",
+    ),
+    (
+        "Usage: trust-settings-export [-s] [-d] settings_file",
+        "-s Export system Trust Settings; default is user.",
+        "-d Export admin Trust Settings; default is user.",
+    ),
+)
+CLAUDE_TRUST_FINGERPRINT = re.compile(r"^[0-9A-Fa-f]{40}$")
+CLAUDE_ACL_TYPE_EXTENDED = 0x00000100
+CLAUDE_TRUST_RESULT_KEY = "kSecTrustSettingsResult"
+CLAUDE_TRUST_RESULT_TRUST_ROOT = 1
+CLAUDE_TRUST_RESULT_TRUST_AS_ROOT = 2
+CLAUDE_TRUST_RESULT_DENY = 3
+CLAUDE_TRUST_RESULTS = frozenset({1, 2, 3, 4})
+CLAUDE_TRUST_UNCONSTRAINED_RESULTS = frozenset(
+    {CLAUDE_TRUST_RESULT_TRUST_ROOT, CLAUDE_TRUST_RESULT_TRUST_AS_ROOT}
+)
+CLAUDE_CALLER_CA_INPUT_LIMIT_BYTES = 8 * 1024 * 1024
+CLAUDE_CALLER_CA_SNAPSHOT_LIMIT_BYTES = CLAUDE_CALLER_CA_INPUT_LIMIT_BYTES + math.ceil(
+    CLAUDE_CALLER_CA_INPUT_LIMIT_BYTES / 32
+)
+CLAUDE_CA_BUNDLE_INPUT_LIMIT_BYTES = (
+    CLAUDE_CALLER_CA_INPUT_LIMIT_BYTES
+    + CLAUDE_CA_FILE_LIMIT_BYTES * (2 + len(CLAUDE_TRUST_CERTIFICATE_SOURCES))
+)
+CLAUDE_CA_BUNDLE_LIMIT_BYTES = CLAUDE_CA_BUNDLE_INPUT_LIMIT_BYTES + math.ceil(
+    CLAUDE_CA_BUNDLE_INPUT_LIMIT_BYTES / 32
+)
+CLAUDE_TRUST_SETTINGS_LIMIT_BYTES = 1024 * 1024
+CLAUDE_TRUST_ENTRY_LIMIT = 4096
+CLAUDE_ADDITIONAL_TRUST_ROOT_LIMIT = 256
+CLAUDE_TRUST_ROOT_VERIFY_TOTAL_SECONDS = 30.0
 CLAUDE_CERTIFICATE_BLOCK = re.compile(
     rb"-----BEGIN CERTIFICATE-----\r?\n.*?-----END CERTIFICATE-----",
     re.DOTALL,
@@ -440,6 +570,53 @@ STRUCTURED_AUTH_CODES = (
     "unauthorized",
 )
 STRUCTURED_AMBIGUOUS_MODEL_CODES = ("model_not_found", "not_found_error")
+CLAUDE_MODEL_ENTITLEMENT_TEXT_PATTERNS = (
+    re.compile(
+        r"\s*(?:error:\s*)?(?:(?:this|the|requested)\s+)?model\s+"
+        r"(?:is|was)\s+not\s+"
+        r"(?:available|enabled|allowed|included|supported|entitled)"
+        r"(?:\s+(?:for|to|on|in|with|by)\s+"
+        r"(?:(?:your|this|the)\s+)?"
+        r"(?:(?:chatgpt\s+)?account(?:\s+plan)?|user|organization|organisation|plan|"
+        r"current\s+plan|current\s+subscription))?\s*[.!]?\s*",
+        re.I,
+    ),
+    re.compile(
+        r"\s*(?:error:\s*)?(?:does not|do not|don't)\s+have access to\s+"
+        r"(?:(?:this|the|requested)\s+)?model\s*[.!]?\s*",
+        re.I,
+    ),
+    re.compile(
+        r"\s*(?:error:\s*)?(?:account|user|organization|organisation)\s+"
+        r"has no access to\s+(?:(?:this|the|requested)\s+)?model\s*[.!]?\s*",
+        re.I,
+    ),
+    re.compile(
+        r"\s*(?:error:\s*)?model access\s+"
+        r"(?:(?:is|has been)\s+)?(?:denied|disabled)\s*[.!]?\s*",
+        re.I,
+    ),
+    re.compile(
+        r"\s*(?:error:\s*)?model\s+is\s+"
+        r"(?:disabled|not allowed|not enabled)\s+(?:by|for)\s+"
+        r"(?:your|this)\s+(?:organization|organisation)\s*[.!]?\s*",
+        re.I,
+    ),
+    re.compile(
+        r"\s*(?:error:\s*)?not in\s+(?:your|this)\s+"
+        r"(?:organization|organisation)'s\s+allowed models\s*[.!]?\s*",
+        re.I,
+    ),
+    re.compile(
+        r"\s*(?:error:\s*)?unsupported model for\s+"
+        r"(?:this|your|the) account\s*[.!]?\s*",
+        re.I,
+    ),
+)
+CLAUDE_ENTITLEMENT_NEUTRAL_TEXT_PATTERN = re.compile(
+    r"\s*(?:error|request rejected)\s*",
+    re.I,
+)
 
 AUTH_FAILURE_FRAGMENTS = (
     "authentication failed",
@@ -459,6 +636,119 @@ AUTH_FAILURE_FRAGMENTS = (
     "http 401",
     "status 401",
 )
+CLAUDE_RESULT_AUTH_MESSAGES = frozenset(
+    {
+        "not logged in - please run /login",
+        "not logged in - please run `/login`",
+    }
+)
+CLAUDE_AUTH_WARMUP_SAFE_TYPES = frozenset({"result"})
+CLAUDE_AUTH_WARMUP_SAFE_SUBTYPES = frozenset({"error_during_execution", "success"})
+CLAUDE_AUTH_WARMUP_ERROR_FIELDS = frozenset(
+    {
+        "api_error_status",
+        "code",
+        "detail",
+        "error",
+        "errors",
+        "message",
+        "reason",
+    }
+)
+CLAUDE_FAILURE_ENVELOPE_FIELDS = (
+    frozenset(
+        {
+            "duration_api_ms",
+            "duration_ms",
+            "is_error",
+            "modelUsage",
+            "num_turns",
+            "permission_denials",
+            "result",
+            "session_id",
+            "subtype",
+            "total_cost_usd",
+            "type",
+            "usage",
+            "uuid",
+        }
+    )
+    | CLAUDE_AUTH_WARMUP_ERROR_FIELDS
+)
+CLAUDE_ERROR_PAYLOAD_FIELDS = frozenset(
+    {
+        "code",
+        "detail",
+        "error",
+        "errors",
+        "message",
+        "reason",
+        "status",
+        "subtype",
+        "type",
+    }
+)
+CLAUDE_MODEL_USAGE_FIELDS = frozenset(
+    {
+        "cacheCreationInputTokens",
+        "cacheReadInputTokens",
+        "contextWindow",
+        "costUSD",
+        "inputTokens",
+        "maxOutputTokens",
+        "outputTokens",
+        "webSearchRequests",
+    }
+)
+CLAUDE_USAGE_FIELDS = frozenset(
+    {
+        "cache_creation",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "input_tokens",
+        "output_tokens",
+        "server_tool_use",
+        "service_tier",
+    }
+)
+CLAUDE_USAGE_CACHE_CREATION_FIELDS = frozenset(
+    {"ephemeral_1h_input_tokens", "ephemeral_5m_input_tokens"}
+)
+CLAUDE_USAGE_SERVER_TOOL_FIELDS = frozenset(
+    {"web_fetch_requests", "web_search_requests"}
+)
+CLAUDE_FAILURE_METADATA_ITEM_LIMIT = 4096
+CLAUDE_AUTH_WARMUP_RESULT_SIGNAL_TERMS = {
+    "auth": (
+        "api key",
+        "authentication",
+        "credential",
+        "log in",
+        "logged in",
+        "login",
+        "oauth",
+        "sign in",
+        "token",
+        "unauthorized",
+    ),
+    "entitlement": (
+        "account",
+        "billing",
+        "model is not available",
+        "organization policy",
+        "plan",
+        "subscription",
+    ),
+    "transient": (
+        "connection",
+        "network",
+        "overloaded",
+        "rate limit",
+        "temporarily",
+        "timeout",
+        "try again",
+    ),
+}
 CODEX_ARG_TRANSPORT_NAME = re.compile(r"codex-arg0[A-Za-z0-9]+")
 _UNRESOLVED_CLAUDE_REFRESH_LOCK_PROTOCOL = object()
 
@@ -477,6 +767,10 @@ class ClaudeKeychainCredentialUnavailable(ReviewError):
 
 class ClaudeCredentialUnsafe(ClaudeKeychainCredentialUnavailable):
     """A configured Claude credential source failed closed safety validation."""
+
+
+class ClaudeKeychainCredentialIntegrityError(ClaudeCredentialUnsafe):
+    """Claude Keychain framing failed closed safety validation."""
 
 
 class ClaudeCredentialInspectionInconclusive(ReviewError):
@@ -1457,6 +1751,104 @@ class ClaudeExecutableInspectionInconclusive(ReviewError):
     """A Claude runtime file changed or became unreadable during inspection."""
 
 
+class ClaudeTrustPolicyUnavailable(ReviewError):
+    """Host trust policy is malformed or cannot be represented safely."""
+
+
+class ClaudeTrustToolUnavailable(ClaudeReviewToolUnavailable):
+    """The host cannot provide Apple's bounded trust export tooling."""
+
+
+class ClaudeTrustCertificateInvalid(ReviewError):
+    """An additional host trust certificate cannot be imported safely."""
+
+
+class ClaudeCACertificateNotFound(ReviewError):
+    """A bounded CA source contains no PEM certificate blocks."""
+
+
+class ClaudeTrustSettingsDeny(ReviewError):
+    """Host trust settings contain an explicit deny and require a hard stop."""
+
+
+class ClaudeTrustEvidenceWriteDiagnostic(Exception):
+    """Sanitized fallback for a secondary trust-evidence write failure."""
+
+    def __init__(self, message: str, *, original_suppress_context: bool) -> None:
+        super().__init__(message)
+        self.original_suppress_context = original_suppress_context
+
+
+def _attach_claude_trust_evidence_write_failure(primary: BaseException) -> None:
+    marker = "_codex_claude_trust_evidence_write_failed"
+    if getattr(primary, marker, False):
+        return
+    setattr(primary, marker, True)
+    note = CLAUDE_TRUST_EVIDENCE_WRITE_DIAGNOSTIC
+    add_note = getattr(primary, "add_note", None)
+    if callable(add_note):
+        add_note(note)
+        return
+    diagnostic = ClaudeTrustEvidenceWriteDiagnostic(
+        note,
+        original_suppress_context=primary.__suppress_context__,
+    )
+    if primary.__cause__ is not None:
+        diagnostic.__cause__ = primary.__cause__
+    elif primary.__context__ is not None:
+        diagnostic.__context__ = primary.__context__
+    primary.__cause__ = diagnostic
+
+
+def _clear_claude_trust_evidence_write_failure(primary: BaseException) -> None:
+    marker = "_codex_claude_trust_evidence_write_failed"
+    if hasattr(primary, marker):
+        delattr(primary, marker)
+    notes = getattr(primary, "__notes__", None)
+    if isinstance(notes, list):
+        notes[:] = [
+            note for note in notes if note != CLAUDE_TRUST_EVIDENCE_WRITE_DIAGNOSTIC
+        ]
+    diagnostic = primary.__cause__
+    if isinstance(diagnostic, ClaudeTrustEvidenceWriteDiagnostic) and (
+        diagnostic.args == (CLAUDE_TRUST_EVIDENCE_WRITE_DIAGNOSTIC,)
+    ):
+        primary.__cause__ = diagnostic.__cause__
+        primary.__suppress_context__ = diagnostic.original_suppress_context
+
+
+def _claude_trust_evidence_write_diagnostic(
+    error: BaseException,
+) -> str | None:
+    pending = [error]
+    seen: set[int] = set()
+    marker_found = False
+    while pending and len(seen) < 32:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if getattr(
+            current,
+            "_codex_claude_trust_evidence_write_failed",
+            False,
+        ):
+            marker_found = True
+        notes = getattr(current, "__notes__", ())
+        if isinstance(notes, (list, tuple)) and any(
+            note == CLAUDE_TRUST_EVIDENCE_WRITE_DIAGNOSTIC for note in notes
+        ):
+            return CLAUDE_TRUST_EVIDENCE_WRITE_DIAGNOSTIC
+        if isinstance(current, ClaudeTrustEvidenceWriteDiagnostic) and current.args == (
+            CLAUDE_TRUST_EVIDENCE_WRITE_DIAGNOSTIC,
+        ):
+            return CLAUDE_TRUST_EVIDENCE_WRITE_DIAGNOSTIC
+        for related in (current.__cause__, current.__context__):
+            if isinstance(related, BaseException):
+                pending.append(related)
+    return CLAUDE_TRUST_EVIDENCE_WRITE_DIAGNOSTIC if marker_found else None
+
+
 class ClaudeProvenanceVerifierUnavailable(ReviewError):
     """The host lacks a trusted publisher-provenance verifier."""
 
@@ -1515,6 +1907,89 @@ def _claude_linux_directory_identity(
     )
 
 
+def _validate_claude_runtime_directory_descriptor(
+    path: pathlib.Path,
+    descriptor: int,
+    *,
+    private: bool,
+) -> None:
+    try:
+        before = path.lstat()
+        opened = os.fstat(descriptor)
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot inspect Claude runtime directory {path}: {error}"
+        ) from error
+    mode = stat.S_IMODE(before.st_mode)
+    if not stat.S_ISDIR(before.st_mode):
+        raise ReviewError(f"Claude Linux runtime path must be a real directory: {path}")
+    if before.st_uid != os.geteuid():
+        raise ReviewError(f"Claude runtime directory has an unexpected owner: {path}")
+    if (private and mode != 0o700) or (not private and mode & 0o022):
+        requirement = "0700" if private else "not group- or world-writable"
+        raise ReviewError(f"Claude runtime directory must be {requirement}: {path}")
+    if _claude_linux_directory_identity(before) != _claude_linux_directory_identity(
+        opened
+    ):
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude runtime directory changed during validation"
+        )
+    _require_no_extended_acl(descriptor, label="Claude runtime directory")
+    try:
+        after = path.lstat()
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"Claude runtime directory changed during validation: {error}"
+        ) from error
+    if _claude_linux_directory_identity(opened) != _claude_linux_directory_identity(
+        after
+    ):
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude runtime directory changed during validation"
+        )
+
+
+def _require_existing_claude_runtime_directory(
+    path: pathlib.Path,
+    *,
+    private: bool,
+) -> pathlib.Path:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise ReviewError(
+                f"Claude Linux runtime path must be a real directory: {path}"
+            ) from error
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot open stable Claude runtime directory {path}: {error}"
+        ) from error
+    try:
+        _validate_claude_runtime_directory_descriptor(
+            path,
+            descriptor,
+            private=private,
+        )
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        raise
+    else:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot close stable Claude runtime directory {path}: {error}"
+            ) from error
+    return path
+
+
 def _create_or_validate_claude_runtime_directory(
     path: pathlib.Path,
     *,
@@ -1528,53 +2003,7 @@ def _create_or_validate_claude_runtime_directory(
         raise ReviewError(
             f"cannot create Claude runtime directory {path}: {error}"
         ) from error
-    try:
-        before = path.lstat()
-    except OSError as error:
-        raise ReviewError(
-            f"cannot inspect Claude runtime directory {path}: {error}"
-        ) from error
-    mode = stat.S_IMODE(before.st_mode)
-    if not stat.S_ISDIR(before.st_mode):
-        raise ReviewError(f"Claude runtime path must be a real directory: {path}")
-    if before.st_uid != os.geteuid():
-        raise ReviewError(f"Claude runtime directory has an unexpected owner: {path}")
-    if (private and mode != 0o700) or (not private and mode & 0o022):
-        requirement = "0700" if private else "not group- or world-writable"
-        raise ReviewError(f"Claude runtime directory must be {requirement}: {path}")
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as error:
-        raise ReviewError(
-            f"cannot open stable Claude runtime directory {path}: {error}"
-        ) from error
-    try:
-        opened = os.fstat(descriptor)
-        after = path.lstat()
-    except OSError as error:
-        raise ReviewError(
-            f"Claude runtime directory changed during validation: {error}"
-        ) from error
-    finally:
-        os.close(descriptor)
-    if (
-        len(
-            {
-                _claude_linux_directory_identity(before),
-                _claude_linux_directory_identity(opened),
-                _claude_linux_directory_identity(after),
-            }
-        )
-        != 1
-    ):
-        raise ReviewError("Claude runtime directory changed during validation")
-    return path
+    return _require_existing_claude_runtime_directory(path, private=private)
 
 
 def _sync_claude_credential_descriptor(descriptor: int) -> None:
@@ -1636,6 +2065,7 @@ class Attempt:
     final_text: str | None
     stdout_path: str
     stderr_path: str
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1643,6 +2073,63 @@ class Outcome:
     returncode: int
     final_text: str | None
     attempts: tuple[Attempt, ...]
+
+
+@dataclass(frozen=True)
+class ClaudeExecutableTrustEvidence:
+    executable_sha256: str
+    bundled_root_certificates: bytes
+    bundled_root_sha256_fingerprints: frozenset[bytes]
+
+    @property
+    def bundled_root_set_sha256(self) -> str:
+        return hashlib.sha256(
+            b"".join(sorted(self.bundled_root_sha256_fingerprints))
+        ).hexdigest()
+
+
+@dataclass(frozen=True)
+class ClaudeTrustFingerprints:
+    unconditional: tuple[str, ...]
+    trust_as_root: tuple[str, ...]
+    constrained: tuple[str, ...]
+    trust_root: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ClaudeSelectedTrustMaterial:
+    certificates: bytes
+    omitted_sha1_fingerprints: frozenset[str]
+
+
+@dataclass(frozen=True)
+class ClaudeTrustMaterial:
+    certificates: bytes
+    excluded_sha1_fingerprints: frozenset[str]
+    evidence: dict[str, object]
+
+
+@dataclass
+class ClaudeTrustSessionState:
+    caller_ca_snapshot_sha256: str | None = None
+    caller_ca_source_snapshot_sha256: tuple[tuple[str, int, str, str], ...] | None = (
+        None
+    )
+    final_ca_bundle_sha256: str | None = None
+    proxy_tls_env: dict[str, str] | None = None
+    proxy_ssl_context: ssl.SSLContext | None = None
+    proxy_tls_snapshot_sha256: tuple[tuple[str, int, str, str], ...] | None = None
+
+
+class _DuplicatePlistKey(ValueError):
+    pass
+
+
+class _UniquePlistDict(dict[Any, Any]):
+    def __setitem__(self, key: Any, value: Any) -> None:
+        if key in self:
+            raise _DuplicatePlistKey
+        super().__setitem__(key, value)
 
 
 def _bound_metadata_state(metadata: os.stat_result) -> tuple[int, ...]:
@@ -2163,12 +2650,17 @@ def _native_macho_dependencies(
     resolved = candidates[-1]
     try:
         with resolved.open("rb") as handle:
+            metadata = os.fstat(handle.fileno())
             magic = handle.read(4)
     except OSError as error:
         raise ClaudeExecutableInspectionInconclusive(
             f"cannot inspect {label} executable: {error}"
         ) from error
-    if magic not in MACHO_MAGICS or not os.access(resolved, os.X_OK):
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or not metadata.st_mode & 0o111
+        or magic not in MACHO_MAGICS
+    ):
         raise InvalidReviewerExecutable(
             f"{label} must be a native Mach-O executable, not a script or wrapper"
         )
@@ -2239,6 +2731,1385 @@ def _require_trusted_claude_release(
         raise ClaudeExecutableInspectionInconclusive(str(error)) from error
 
 
+def _canonical_ca_certificate(block: bytes, *, source: str) -> tuple[bytes, bytes]:
+    lines = block.strip().splitlines()
+    if len(lines) < 3:
+        raise ReviewError(
+            f"Claude review CA source contains an invalid certificate: {source}"
+        )
+    try:
+        der = base64.b64decode(b"".join(lines[1:-1]), validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ReviewError(
+            f"Claude review CA source contains an invalid certificate: {source}"
+        ) from error
+    if not der:
+        raise ReviewError(
+            f"Claude review CA source contains an invalid certificate: {source}"
+        )
+    canonical = ssl.DER_cert_to_PEM_cert(der).encode("ascii")
+    return der, canonical
+
+
+def _der_tlv(
+    data: bytes,
+    offset: int,
+    limit: int,
+) -> tuple[int, int, int, int]:
+    if offset < 0 or offset + 2 > limit or limit > len(data):
+        raise ValueError("truncated DER element")
+    tag = data[offset]
+    first_length = data[offset + 1]
+    cursor = offset + 2
+    if first_length & 0x80:
+        length_octets = first_length & 0x7F
+        if (
+            length_octets == 0
+            or length_octets > 4
+            or cursor + length_octets > limit
+            or data[cursor] == 0
+        ):
+            raise ValueError("invalid DER length")
+        length = int.from_bytes(data[cursor : cursor + length_octets], "big")
+        if length < 0x80:
+            raise ValueError("non-minimal DER length")
+        cursor += length_octets
+    else:
+        length = first_length
+    content_end = cursor + length
+    if content_end > limit:
+        raise ValueError("truncated DER content")
+    return tag, cursor, content_end, content_end
+
+
+def _der_certificate_time(tag: int, value: bytes) -> datetime.datetime:
+    if not value.endswith(b"Z"):
+        raise ValueError("certificate time is not UTC")
+    digits = value[:-1]
+    if not digits.isdigit():
+        raise ValueError("certificate time is not numeric")
+    if tag == 0x17 and len(digits) == 12:
+        year = int(digits[:2])
+        year += 2000 if year < 50 else 1900
+        offset = 2
+    elif tag == 0x18 and len(digits) == 14:
+        year = int(digits[:4])
+        offset = 4
+    else:
+        raise ValueError("certificate time has an unsupported encoding")
+    return datetime.datetime(
+        year,
+        int(digits[offset : offset + 2]),
+        int(digits[offset + 2 : offset + 4]),
+        int(digits[offset + 4 : offset + 6]),
+        int(digits[offset + 6 : offset + 8]),
+        int(digits[offset + 8 : offset + 10]),
+        tzinfo=datetime.timezone.utc,
+    )
+
+
+def _canonical_x509_name(name: bytes) -> tuple[tuple[object, ...], bool]:
+    string_decoders: dict[int, tuple[str, str]] = {
+        0x0C: ("utf-8", "strict"),
+        0x13: ("ascii", "strict"),
+        0x1C: ("utf-32-be", "strict"),
+        0x1E: ("utf-16-be", "strict"),
+    }
+    name_tag, name_start, name_end, name_next = _der_tlv(name, 0, len(name))
+    if name_tag != 0x30 or name_next != len(name):
+        raise ValueError("invalid X.509 name")
+    complete = True
+    rdns: list[tuple[object, ...]] = []
+    rdn_offset = name_start
+    while rdn_offset < name_end:
+        rdn_tag, rdn_start, rdn_end, rdn_offset = _der_tlv(
+            name,
+            rdn_offset,
+            name_end,
+        )
+        if rdn_tag != 0x31:
+            raise ValueError("invalid X.509 relative distinguished name")
+        attributes: list[tuple[bytes, object]] = []
+        attribute_offset = rdn_start
+        while attribute_offset < rdn_end:
+            attribute_tag, attribute_start, attribute_end, attribute_offset = _der_tlv(
+                name, attribute_offset, rdn_end
+            )
+            if attribute_tag != 0x30:
+                raise ValueError("invalid X.509 name attribute")
+            oid_tag, oid_start, oid_end, value_offset = _der_tlv(
+                name,
+                attribute_start,
+                attribute_end,
+            )
+            if oid_tag != 0x06:
+                raise ValueError("invalid X.509 name attribute identifier")
+            value_tag, value_start, value_end, value_next = _der_tlv(
+                name,
+                value_offset,
+                attribute_end,
+            )
+            if value_next != attribute_end:
+                raise ValueError("invalid X.509 name attribute value")
+            raw_value = name[value_start:value_end]
+            decoder = string_decoders.get(value_tag)
+            if decoder is None:
+                complete = False
+                normalized_value: object = (value_tag, raw_value)
+            else:
+                try:
+                    text = raw_value.decode(*decoder)
+                except UnicodeError as error:
+                    raise ValueError("invalid X.509 name string") from error
+                # Full RFC 4518 mapping is intentionally not reimplemented here.
+                # Only printable ASCII is complete enough to prove inequality.
+                if any(
+                    ord(character) < 0x20 or ord(character) > 0x7E for character in text
+                ):
+                    complete = False
+                normalized_value = " ".join(
+                    unicodedata.normalize("NFKC", text).casefold().split()
+                )
+            attributes.append((name[oid_start:oid_end], normalized_value))
+        rdns.append(
+            tuple(sorted(attributes, key=lambda item: (item[0], repr(item[1]))))
+        )
+    return tuple(rdns), complete
+
+
+def _require_unconditional_root_extensions(
+    der: bytes,
+    *,
+    require_critical: bool = True,
+    require_self_issued: bool = True,
+    require_non_self_issued: bool = False,
+) -> None:
+    if require_self_issued and require_non_self_issued:
+        raise ValueError("certificate cannot require both issuer relationships")
+    try:
+        outer_tag, outer_start, outer_end, outer_next = _der_tlv(der, 0, len(der))
+        if outer_tag != 0x30 or outer_next != len(der):
+            raise ValueError("invalid certificate sequence")
+
+        offset = outer_start
+        tbs_tag, tbs_start, tbs_end, offset = _der_tlv(der, offset, outer_end)
+        if tbs_tag != 0x30:
+            raise ValueError("invalid TBSCertificate")
+        signature_tag, _, _, offset = _der_tlv(der, offset, outer_end)
+        signature_value_tag, _, _, offset = _der_tlv(der, offset, outer_end)
+        if signature_tag != 0x30 or signature_value_tag != 0x03 or offset != outer_end:
+            raise ValueError("invalid certificate signature")
+
+        offset = tbs_start
+        if offset >= tbs_end or der[offset] != 0xA0:
+            raise ValueError("certificate does not declare X.509 v3")
+        _, version_start, version_end, offset = _der_tlv(der, offset, tbs_end)
+        version_tag, value_start, value_end, version_next = _der_tlv(
+            der,
+            version_start,
+            version_end,
+        )
+        if (
+            version_tag != 0x02
+            or der[value_start:value_end] != b"\x02"
+            or version_next != version_end
+        ):
+            raise ValueError("certificate does not declare X.509 v3")
+        for expected_tag in (0x02, 0x30):
+            tag, _, _, offset = _der_tlv(der, offset, tbs_end)
+            if tag != expected_tag:
+                raise ValueError("invalid TBSCertificate field")
+
+        issuer_offset = offset
+        issuer_tag, _, _, offset = _der_tlv(der, offset, tbs_end)
+        issuer = der[issuer_offset:offset]
+        validity_tag, validity_start, validity_end, offset = _der_tlv(
+            der,
+            offset,
+            tbs_end,
+        )
+        subject_offset = offset
+        subject_tag, _, _, offset = _der_tlv(der, offset, tbs_end)
+        subject = der[subject_offset:offset]
+        public_key_tag, _, _, offset = _der_tlv(der, offset, tbs_end)
+        issuer_name, issuer_name_complete = _canonical_x509_name(issuer)
+        subject_name, subject_name_complete = _canonical_x509_name(subject)
+        names_semantically_equal = issuer == subject or (
+            issuer_name_complete
+            and subject_name_complete
+            and issuer_name == subject_name
+        )
+        names_provably_different = (
+            issuer_name_complete
+            and subject_name_complete
+            and issuer_name != subject_name
+        )
+        if (
+            issuer_tag != 0x30
+            or validity_tag != 0x30
+            or subject_tag != 0x30
+            or public_key_tag != 0x30
+            or (require_self_issued and not names_semantically_equal)
+            or (require_non_self_issued and not names_provably_different)
+        ):
+            raise ValueError("certificate is not an admissible trust anchor")
+
+        validity_offset = validity_start
+        not_before_tag, not_before_start, not_before_end, validity_offset = _der_tlv(
+            der,
+            validity_offset,
+            validity_end,
+        )
+        not_after_tag, not_after_start, not_after_end, validity_offset = _der_tlv(
+            der,
+            validity_offset,
+            validity_end,
+        )
+        if validity_offset != validity_end:
+            raise ValueError("certificate validity has trailing data")
+        not_before = _der_certificate_time(
+            not_before_tag,
+            der[not_before_start:not_before_end],
+        )
+        not_after = _der_certificate_time(
+            not_after_tag,
+            der[not_after_start:not_after_end],
+        )
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if not_before > not_after or not_before > now or now > not_after:
+            raise ValueError("certificate is not currently valid")
+
+        extensions: tuple[int, int] | None = None
+        while offset < tbs_end:
+            tag, content_start, content_end, offset = _der_tlv(der, offset, tbs_end)
+            if tag in (0x81, 0x82):
+                continue
+            if tag != 0xA3 or extensions is not None:
+                raise ValueError("unsupported TBSCertificate field")
+            extensions = (content_start, content_end)
+        if extensions is None:
+            raise ValueError("missing certificate extensions")
+
+        extension_start, extension_end = extensions
+        sequence_tag, sequence_start, sequence_end, sequence_next = _der_tlv(
+            der,
+            extension_start,
+            extension_end,
+        )
+        if sequence_tag != 0x30 or sequence_next != extension_end:
+            raise ValueError("invalid extension sequence")
+
+        basic_constraints: tuple[bool, bytes] | None = None
+        key_usage: tuple[bool, bytes] | None = None
+        offset = sequence_start
+        while offset < sequence_end:
+            extension_tag, item_start, item_end, offset = _der_tlv(
+                der,
+                offset,
+                sequence_end,
+            )
+            if extension_tag != 0x30:
+                raise ValueError("invalid extension")
+            item_offset = item_start
+            oid_tag, oid_start, oid_end, item_offset = _der_tlv(
+                der,
+                item_offset,
+                item_end,
+            )
+            if oid_tag != 0x06:
+                raise ValueError("invalid extension identifier")
+            critical = False
+            if item_offset < item_end and der[item_offset] == 0x01:
+                _, value_start, value_end, item_offset = _der_tlv(
+                    der,
+                    item_offset,
+                    item_end,
+                )
+                if value_end - value_start != 1 or der[value_start] not in (0, 0xFF):
+                    raise ValueError("invalid extension critical flag")
+                critical = der[value_start] == 0xFF
+            value_tag, value_start, value_end, item_offset = _der_tlv(
+                der,
+                item_offset,
+                item_end,
+            )
+            if value_tag != 0x04 or item_offset != item_end:
+                raise ValueError("invalid extension value")
+            oid = der[oid_start:oid_end]
+            value = der[value_start:value_end]
+            if oid == b"\x55\x1d\x13":
+                if basic_constraints is not None:
+                    raise ValueError("duplicate basic constraints")
+                basic_constraints = (critical, value)
+            elif oid == b"\x55\x1d\x0f":
+                if key_usage is not None:
+                    raise ValueError("duplicate key usage")
+                key_usage = (critical, value)
+
+        if basic_constraints is None or (require_critical and not basic_constraints[0]):
+            raise ValueError("missing critical basic constraints")
+        basic = basic_constraints[1]
+        tag, content_start, content_end, next_offset = _der_tlv(basic, 0, len(basic))
+        if tag != 0x30 or next_offset != len(basic):
+            raise ValueError("invalid basic constraints")
+        tag, value_start, value_end, offset = _der_tlv(
+            basic,
+            content_start,
+            content_end,
+        )
+        if (
+            tag != 0x01
+            or basic[value_start:value_end] != b"\xff"
+            or (offset < content_end and basic[offset] != 0x02)
+        ):
+            raise ValueError("certificate is not a CA")
+        if offset < content_end:
+            _, _, _, offset = _der_tlv(basic, offset, content_end)
+        if offset != content_end:
+            raise ValueError("invalid basic constraints")
+
+        if key_usage is None:
+            if require_critical:
+                raise ValueError("missing critical key usage")
+        else:
+            if require_critical and not key_usage[0]:
+                raise ValueError("missing critical key usage")
+            usage = key_usage[1]
+            tag, value_start, value_end, next_offset = _der_tlv(
+                usage,
+                0,
+                len(usage),
+            )
+            value = usage[value_start:value_end]
+            if (
+                tag != 0x03
+                or next_offset != len(usage)
+                or len(value) < 2
+                or value[0] > 7
+                or not (value[1] & 0x04)
+                or (value[0] and value[-1] & ((1 << value[0]) - 1))
+            ):
+                raise ValueError("key usage does not permit certificate signing")
+    except (IndexError, ValueError) as error:
+        certificate_kind = (
+            "strict self-signed CA root"
+            if require_self_issued
+            else "strict CA trust anchor"
+        )
+        raise ClaudeTrustCertificateInvalid(
+            "Claude trust settings reference a certificate that is not a "
+            f"{certificate_kind}"
+        ) from error
+
+
+def _consume_sensitive_bounded_capture(
+    command: tuple[str, ...],
+    *,
+    cwd: pathlib.Path,
+    deadline: float,
+    consume: Callable[[BoundedCapture], _CaptureResult],
+) -> _CaptureResult:
+    previous_mask = block_forwarded_signals()
+    completed: BoundedCapture | None = None
+    try:
+        completed = run_bounded_capture(
+            command,
+            cwd=cwd,
+            env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+            deadline=deadline,
+            stdout_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+            stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+        )
+        return consume(completed)
+    finally:
+        if completed is not None:
+            completed.zeroize()
+        restore_signal_mask(previous_mask)
+
+
+def _verify_unconditional_trust_root(
+    der: bytes,
+    canonical: bytes,
+    *,
+    ca_root: pathlib.Path,
+    timeout_seconds: float | None = None,
+    deadline: float | None = None,
+    allow_non_self_signed: bool = False,
+) -> None:
+    if (timeout_seconds is None) == (deadline is None):
+        raise ValueError("exactly one trust-root timeout form is required")
+    if deadline is None:
+        assert timeout_seconds is not None
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+
+    def remaining_timeout() -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReviewTimeoutError(
+                "Claude TLS root verification exceeded its total timeout"
+            )
+        return remaining
+
+    _require_unconditional_root_extensions(
+        der,
+        require_self_issued=not allow_non_self_signed,
+        require_non_self_issued=allow_non_self_signed,
+    )
+    try:
+        openssl_metadata = CLAUDE_OPENSSL_CLIENT.stat()
+    except FileNotFoundError as error:
+        raise ClaudeTrustToolUnavailable(
+            "Claude TLS root verification tooling is unavailable"
+        ) from error
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot inspect Claude TLS root verification tooling"
+        ) from error
+    if not stat.S_ISREG(openssl_metadata.st_mode) or not (
+        openssl_metadata.st_mode & 0o111
+    ):
+        raise ClaudeTrustToolUnavailable(
+            "Claude TLS root verification tooling is unavailable"
+        )
+    try:
+        fd, temporary = tempfile.mkstemp(
+            prefix=".trust-root-",
+            suffix=".pem",
+            dir=ca_root,
+        )
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot prepare Claude trust verification input"
+        ) from error
+    certificate_path = pathlib.Path(temporary)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+            _require_no_extended_acl(fd, label="Claude trust verification input")
+            with os.fdopen(fd, "wb") as handle:
+                fd = -1
+                handle.write(canonical)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except ReviewError:
+            raise
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot prepare Claude trust verification input"
+            ) from error
+
+        try:
+            use_partial_chain = False
+            if allow_non_self_signed:
+                remaining_timeout()
+
+                def inspect_capabilities(capabilities: BoundedCapture) -> bool:
+                    remaining_timeout()
+                    if capabilities.returncode not in (0, 1):
+                        raise ClaudeExecutableInspectionInconclusive(
+                            "Claude TLS root verification capability probe was "
+                            "inconclusive"
+                        )
+
+                    def contains(value: bytes) -> bool:
+                        return (
+                            value in capabilities.stdout or value in capabilities.stderr
+                        )
+
+                    if not contains(b"-trusted") or not contains(b"-x509_strict"):
+                        raise ClaudeTrustToolUnavailable(
+                            "Claude TLS root verification tooling lacks required "
+                            "capabilities"
+                        )
+                    return contains(b"-partial_chain")
+
+                use_partial_chain = _consume_sensitive_bounded_capture(
+                    (str(CLAUDE_OPENSSL_CLIENT), "verify", "-help"),
+                    cwd=ca_root,
+                    deadline=deadline,
+                    consume=inspect_capabilities,
+                )
+
+            if allow_non_self_signed and not use_partial_chain:
+                verification_command = (
+                    str(CLAUDE_OPENSSL_CLIENT),
+                    "x509",
+                    "-in",
+                    certificate_path.name,
+                    "-pubkey",
+                    "-noout",
+                )
+                invalid_returncode: int | None = None
+            else:
+                verification_mode = (
+                    ("-partial_chain",) if allow_non_self_signed else ("-check_ss_sig",)
+                )
+                verification_command = (
+                    str(CLAUDE_OPENSSL_CLIENT),
+                    "verify",
+                    "-x509_strict",
+                    *verification_mode,
+                    "-purpose",
+                    "any",
+                    "-trusted",
+                    certificate_path.name,
+                    certificate_path.name,
+                )
+                invalid_returncode = 2
+            remaining_timeout()
+
+            def validate_verification(completed: BoundedCapture) -> None:
+                remaining_timeout()
+                public_key_invalid = (
+                    allow_non_self_signed
+                    and not use_partial_chain
+                    and b"-----BEGIN PUBLIC KEY-----" not in completed.stdout
+                )
+                if (
+                    invalid_returncode is not None
+                    and completed.returncode == invalid_returncode
+                ):
+                    certificate_kind = (
+                        "CA trust anchor"
+                        if allow_non_self_signed
+                        else "self-signed CA root"
+                    )
+                    raise ClaudeTrustCertificateInvalid(
+                        "Claude trust settings reference a certificate that is not a "
+                        f"currently valid {certificate_kind}"
+                    )
+                if completed.returncode != 0:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        "Claude TLS root verification failed inconclusively"
+                    )
+                if public_key_invalid:
+                    raise ClaudeTrustCertificateInvalid(
+                        "Claude trust settings reference a certificate that is not a "
+                        "currently valid CA trust anchor"
+                    )
+
+            _consume_sensitive_bounded_capture(
+                verification_command,
+                cwd=ca_root,
+                deadline=deadline,
+                consume=validate_verification,
+            )
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude TLS root verification launch was inconclusive"
+            ) from error
+    finally:
+        active_error = sys.exc_info()[0] is not None
+        cleanup_error: OSError | None = None
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError as error:
+                cleanup_error = error
+        try:
+            certificate_path.unlink(missing_ok=True)
+        except OSError as error:
+            cleanup_error = cleanup_error or error
+        if cleanup_error is not None and not active_error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot clean up Claude trust verification input"
+            ) from cleanup_error
+
+
+def _merge_ca_certificates(
+    materials: Iterable[tuple[str, bytes]],
+    *,
+    excluded_sha1_fingerprints: Iterable[str] = (),
+    allow_empty: bool = False,
+    limit_bytes: int,
+    label: str,
+) -> bytes:
+    if limit_bytes < 0:
+        raise ValueError("CA merge byte limit must not be negative")
+    merged = bytearray()
+    try:
+        seen: set[bytes] = set()
+        excluded = {fingerprint.upper() for fingerprint in excluded_sha1_fingerprints}
+        for source, data in materials:
+            if not data and allow_empty:
+                continue
+            normalized = _extract_ca_certificates(data, source=source)
+            for block in CLAUDE_CERTIFICATE_BLOCK.findall(normalized):
+                der, canonical = _canonical_ca_certificate(block, source=source)
+                sha1_fingerprint = (
+                    hashlib.sha1(
+                        der,
+                        usedforsecurity=False,
+                    )
+                    .hexdigest()
+                    .upper()
+                )
+                if sha1_fingerprint in excluded:
+                    continue
+                fingerprint = hashlib.sha256(der).digest()
+                if fingerprint in seen:
+                    continue
+                seen.add(fingerprint)
+                if len(merged) + len(canonical) > limit_bytes:
+                    raise ReviewError(f"{label} exceeds the size limit")
+                merged.extend(canonical)
+        if not merged and not allow_empty:
+            raise ReviewError("Claude review CA bundle contains no PEM certificate")
+        return bytes(merged)
+    except MemoryError as error:
+        raise ReviewError(f"{label} exceeded the bounded memory budget") from error
+
+
+def _ca_sha256_fingerprints(data: bytes, *, source: str) -> frozenset[bytes]:
+    normalized = _extract_ca_certificates(data, source=source)
+    return frozenset(
+        hashlib.sha256(_canonical_ca_certificate(block, source=source)[0]).digest()
+        for block in CLAUDE_CERTIFICATE_BLOCK.findall(normalized)
+    )
+
+
+def _ca_fingerprint_pairs(data: bytes, *, source: str) -> dict[str, bytes]:
+    normalized = _extract_ca_certificates(data, source=source)
+    result: dict[str, bytes] = {}
+    for block in CLAUDE_CERTIFICATE_BLOCK.findall(normalized):
+        der, _canonical = _canonical_ca_certificate(block, source=source)
+        result[hashlib.sha1(der, usedforsecurity=False).hexdigest().upper()] = (
+            hashlib.sha256(der).digest()
+        )
+    return result
+
+
+def _bundled_root_store_suffix(data: bytes) -> bytes:
+    begin_marker = b"-----BEGIN CERTIFICATE-----"
+    cursor = len(data)
+    reversed_blocks: list[bytes] = []
+    while cursor:
+        begin = data.rfind(begin_marker, 0, cursor)
+        if begin < 0:
+            break
+        block = data[begin:cursor]
+        if (
+            len(block) > CLAUDE_BUNDLED_CERTIFICATE_LIMIT_BYTES
+            or CLAUDE_CERTIFICATE_BLOCK.fullmatch(block) is None
+        ):
+            break
+        reversed_blocks.append(block)
+        if len(reversed_blocks) > CLAUDE_BUNDLED_ROOT_LIMIT:
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude executable bundled root count exceeds the inspection limit"
+            )
+        delimiter = begin - 1
+        if delimiter >= 0 and data[delimiter] == 0:
+            return b"\n".join(reversed(reversed_blocks))
+        if delimiter < 0 or data[delimiter] != 0x0A:
+            break
+        cursor = delimiter
+    raise ClaudeExecutableInspectionInconclusive(
+        "Claude executable bundled root store has an invalid representation"
+    )
+
+
+def _certificate_self_signature_evidence(
+    der: bytes,
+) -> tuple[bytes, bytes, str]:
+    try:
+        outer_tag, outer_start, outer_end, outer_next = _der_tlv(der, 0, len(der))
+        if outer_tag != 0x30 or outer_next != len(der):
+            raise ValueError("invalid certificate sequence")
+        tbs_offset = outer_start
+        tbs_tag, tbs_start, tbs_end, tbs_next = _der_tlv(
+            der,
+            tbs_offset,
+            outer_end,
+        )
+        algorithm_offset = tbs_next
+        algorithm_tag, algorithm_start, algorithm_end, algorithm_next = _der_tlv(
+            der,
+            algorithm_offset,
+            outer_end,
+        )
+        offset = algorithm_next
+        signature_tag, signature_start, signature_end, offset = _der_tlv(
+            der,
+            offset,
+            outer_end,
+        )
+        oid_tag, oid_start, oid_end, oid_next = _der_tlv(
+            der,
+            algorithm_start,
+            algorithm_end,
+        )
+        tbs_cursor = tbs_start
+        if tbs_cursor < tbs_end and der[tbs_cursor] == 0xA0:
+            _, _, _, tbs_cursor = _der_tlv(der, tbs_cursor, tbs_end)
+        _, _, _, tbs_cursor = _der_tlv(der, tbs_cursor, tbs_end)
+        tbs_algorithm_offset = tbs_cursor
+        tbs_algorithm_tag, _, _, tbs_cursor = _der_tlv(
+            der,
+            tbs_cursor,
+            tbs_end,
+        )
+        if (
+            tbs_tag != 0x30
+            or tbs_algorithm_tag != 0x30
+            or der[tbs_algorithm_offset:tbs_cursor]
+            != der[algorithm_offset:algorithm_next]
+            or algorithm_tag != 0x30
+            or signature_tag != 0x03
+            or offset != outer_end
+            or oid_tag != 0x06
+            or der[oid_next:algorithm_end] not in {b"", b"\x05\x00"}
+            or signature_start >= signature_end
+            or der[signature_start] != 0
+        ):
+            raise ValueError("invalid certificate signature encoding")
+        digest = CLAUDE_CERTIFICATE_SIGNATURE_DIGESTS.get(der[oid_start:oid_end])
+        if digest is None:
+            raise ValueError("unsupported certificate signature algorithm")
+        return (
+            der[tbs_offset:tbs_next],
+            der[signature_start + 1 : signature_end],
+            digest,
+        )
+    except (IndexError, ValueError) as error:
+        raise ClaudeTrustCertificateInvalid(
+            "Claude executable bundled root has an invalid self-signature"
+        ) from error
+
+
+def _write_private_verification_file(
+    path: pathlib.Path,
+    data: bytes | bytearray,
+) -> None:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot create Claude bundled root verification input"
+        ) from error
+    published = False
+    try:
+        _require_no_extended_acl(
+            descriptor,
+            label="Claude bundled root verification input",
+        )
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        published = True
+    except ReviewError:
+        raise
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot write Claude bundled root verification input"
+        ) from error
+    finally:
+        active_error = sys.exc_info()[0] is not None
+        cleanup_error: OSError | None = None
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                cleanup_error = error
+        if not published:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as error:
+                cleanup_error = cleanup_error or error
+        if cleanup_error is not None and not active_error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot clean up Claude bundled root verification input"
+            ) from cleanup_error
+
+
+def _require_bundled_root_deadline(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ReviewTimeoutError(
+            "Claude bundled root verification exceeded its total timeout"
+        )
+    return remaining
+
+
+def _run_with_bundled_root_deadline(
+    deadline: float,
+    operation: Callable[[], Any],
+) -> Any:
+    _require_bundled_root_deadline(deadline)
+    try:
+        result = operation()
+    except (ForwardedSignal, ReviewTimeoutError):
+        raise
+    except Exception:
+        _require_bundled_root_deadline(deadline)
+        raise
+    _require_bundled_root_deadline(deadline)
+    return result
+
+
+def _zeroize_bounded_capture(completed: BoundedCapture) -> None:
+    completed.zeroize()
+
+
+def _run_bundled_root_openssl(
+    command: tuple[str, ...],
+    *,
+    verification_root: pathlib.Path,
+    deadline: float,
+    consume: Callable[[BoundedCapture], _CaptureResult],
+) -> _CaptureResult:
+    try:
+        _require_bundled_root_deadline(deadline)
+        return _consume_sensitive_bounded_capture(
+            command,
+            cwd=verification_root,
+            deadline=deadline,
+            consume=lambda completed: _run_with_bundled_root_deadline(
+                deadline,
+                lambda: consume(completed),
+            ),
+        )
+    except (ForwardedSignal, ReviewTimeoutError):
+        raise
+    except FileNotFoundError as error:
+        _require_bundled_root_deadline(deadline)
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude bundled root verification tooling changed before launch"
+        ) from error
+    except OSError as error:
+        _require_bundled_root_deadline(deadline)
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude bundled root verification tooling could not be launched"
+        ) from error
+    except Exception:
+        _require_bundled_root_deadline(deadline)
+        raise
+
+
+def _require_bundled_root_self_signature(
+    der: bytes,
+    canonical: bytes,
+    *,
+    verification_root: pathlib.Path,
+    index: int,
+    deadline: float,
+) -> None:
+    try:
+        metadata = _run_with_bundled_root_deadline(
+            deadline,
+            CLAUDE_OPENSSL_CLIENT.lstat,
+        )
+    except FileNotFoundError as error:
+        raise ClaudeTrustToolUnavailable(
+            "Claude bundled root verification tooling is unavailable"
+        ) from error
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot inspect Claude bundled root verification tooling"
+        ) from error
+    openssl_accessible = _run_with_bundled_root_deadline(
+        deadline,
+        lambda: os.access(CLAUDE_OPENSSL_CLIENT, os.X_OK),
+    )
+    unsafe_metadata = _run_with_bundled_root_deadline(
+        deadline,
+        lambda: (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_mode & 0o6022
+            or not openssl_accessible
+        ),
+    )
+    if unsafe_metadata:
+        raise ClaudeTrustPolicyUnavailable(
+            "Claude bundled root verification tooling has unsafe metadata"
+        )
+    tbs, signature, digest = _run_with_bundled_root_deadline(
+        deadline,
+        lambda: _certificate_self_signature_evidence(der),
+    )
+    prefix = f"root-{index:04d}"
+    certificate_path = verification_root / f"{prefix}.pem"
+    tbs_path = verification_root / f"{prefix}.tbs"
+    signature_path = verification_root / f"{prefix}.sig"
+    public_key_path = verification_root / f"{prefix}.pub"
+    for path, payload in (
+        (certificate_path, canonical),
+        (tbs_path, tbs),
+        (signature_path, signature),
+    ):
+        _run_with_bundled_root_deadline(
+            deadline,
+            lambda path=path, payload=payload: _write_private_verification_file(
+                path,
+                payload,
+            ),
+        )
+
+    def validate_and_write_public_key(public_key: BoundedCapture) -> None:
+        def validate_and_write() -> None:
+            if (
+                public_key.returncode != 0
+                or b"-----BEGIN PUBLIC KEY-----" not in public_key.stdout
+                or b"PRIVATE KEY" in public_key.stdout
+            ):
+                raise ClaudeTrustCertificateInvalid(
+                    "Claude executable bundled root has an invalid public key"
+                )
+            _write_private_verification_file(public_key_path, public_key.stdout)
+
+        _run_with_bundled_root_deadline(deadline, validate_and_write)
+
+    _run_bundled_root_openssl(
+        (
+            str(CLAUDE_OPENSSL_CLIENT),
+            "x509",
+            "-in",
+            certificate_path.name,
+            "-pubkey",
+            "-noout",
+        ),
+        verification_root=verification_root,
+        deadline=deadline,
+        consume=validate_and_write_public_key,
+    )
+    _require_bundled_root_deadline(deadline)
+
+    def validate_self_signature(verified: BoundedCapture) -> None:
+        def validate() -> None:
+            if verified.returncode == 1:
+                raise ClaudeTrustCertificateInvalid(
+                    "Claude executable bundled root is not self-signed"
+                )
+            if verified.returncode != 0:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude bundled root verification tooling failed unexpectedly"
+                )
+
+        _run_with_bundled_root_deadline(deadline, validate)
+
+    _run_bundled_root_openssl(
+        (
+            str(CLAUDE_OPENSSL_CLIENT),
+            "dgst",
+            f"-{digest}",
+            "-verify",
+            public_key_path.name,
+            "-signature",
+            signature_path.name,
+            tbs_path.name,
+        ),
+        verification_root=verification_root,
+        deadline=deadline,
+        consume=validate_self_signature,
+    )
+    _require_bundled_root_deadline(deadline)
+
+
+def _validated_bundled_root_certificates(
+    data: bytes,
+    *,
+    executable: pathlib.Path,
+    verify_self_signatures: bool = True,
+) -> dict[bytes, bytes]:
+    deadline = time.monotonic() + CLAUDE_TRUST_ROOT_VERIFY_TOTAL_SECONDS
+    try:
+        blocks = CLAUDE_CERTIFICATE_BLOCK.findall(data)
+        _require_bundled_root_deadline(deadline)
+        if not blocks or len(blocks) > CLAUDE_BUNDLED_ROOT_LIMIT:
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude executable bundled root store has an invalid certificate count"
+            )
+        certificates: dict[bytes, bytes] = {}
+        verification_directory = _run_with_bundled_root_deadline(
+            deadline,
+            lambda: (
+                _bundled_root_verification_directory(executable)
+                if verify_self_signatures
+                else contextlib.nullcontext(None)
+            ),
+        )
+        with verification_directory as verification_root:
+            _require_bundled_root_deadline(deadline)
+            for index, block in enumerate(blocks):
+                der, canonical = _run_with_bundled_root_deadline(
+                    deadline,
+                    lambda block=block: _canonical_ca_certificate(
+                        block,
+                        source="publisher-verified Claude bundled root store",
+                    ),
+                )
+                _run_with_bundled_root_deadline(
+                    deadline,
+                    lambda: _require_unconditional_root_extensions(
+                        der,
+                        require_critical=False,
+                    ),
+                )
+                if verify_self_signatures:
+                    assert verification_root is not None
+                    _run_with_bundled_root_deadline(
+                        deadline,
+                        lambda: _require_bundled_root_self_signature(
+                            der,
+                            canonical,
+                            verification_root=verification_root,
+                            index=index,
+                            deadline=deadline,
+                        ),
+                    )
+                fingerprint = _run_with_bundled_root_deadline(
+                    deadline,
+                    lambda: hashlib.sha256(der).digest(),
+                )
+                existing = _run_with_bundled_root_deadline(
+                    deadline,
+                    lambda: certificates.get(fingerprint),
+                )
+                collision = _run_with_bundled_root_deadline(
+                    deadline,
+                    lambda: existing is not None and existing != canonical,
+                )
+                if collision:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        "Claude executable bundled roots contain a fingerprint collision"
+                    )
+                _run_with_bundled_root_deadline(
+                    deadline,
+                    lambda: certificates.__setitem__(fingerprint, canonical),
+                )
+            _require_bundled_root_deadline(deadline)
+        _require_bundled_root_deadline(deadline)
+    except (ForwardedSignal, ReviewTimeoutError):
+        raise
+    except Exception:
+        _require_bundled_root_deadline(deadline)
+        raise
+    _require_bundled_root_deadline(deadline)
+    return certificates
+
+
+@contextlib.contextmanager
+def _bundled_root_verification_directory(
+    executable: pathlib.Path,
+) -> Iterator[pathlib.Path]:
+    try:
+        directory = tempfile.TemporaryDirectory(
+            prefix=".claude-bundled-roots-",
+            dir=executable.parent,
+        )
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot create Claude bundled root verification directory"
+        ) from error
+    try:
+        verification_root = pathlib.Path(directory.__enter__())
+    except OSError as error:
+        active_error = sys.exc_info()
+        try:
+            directory.__exit__(*active_error)
+        except (ForwardedSignal, KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            pass
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot enter Claude bundled root verification directory"
+        ) from error
+    try:
+        yield verification_root
+    except BaseException:
+        active_error = sys.exc_info()
+        try:
+            directory.__exit__(*active_error)
+        except (ForwardedSignal, KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            pass
+        raise
+    else:
+        try:
+            directory.__exit__(None, None, None)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot clean up Claude bundled root verification directory"
+            ) from error
+
+
+@contextlib.contextmanager
+def _open_private_claude_snapshot_parent(
+    path: pathlib.Path,
+    *,
+    container_dir: pathlib.Path,
+) -> Iterator[int]:
+    container = container_dir.expanduser().absolute()
+    executable = path.expanduser().absolute()
+    if container != pathlib.Path(
+        os.path.normpath(container)
+    ) or executable != pathlib.Path(os.path.normpath(executable)):
+        raise ReviewError(
+            "Claude executable snapshot paths must be lexically normalized"
+        )
+    review_root = container.parent
+    try:
+        relative_parent = executable.parent.relative_to(container)
+    except ValueError as error:
+        raise ReviewError(
+            "Claude executable snapshot is outside the private review container"
+        ) from error
+    if len(relative_parent.parts) > 8:
+        raise ReviewError(
+            "Claude executable snapshot directory chain exceeds its depth limit"
+        )
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptors: list[int] = []
+    try:
+        try:
+            review_root_descriptor = os.open(review_root, flags)
+        except OSError as error:
+            if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise ReviewError(
+                    "Claude executable snapshot review root must be a real directory"
+                ) from error
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot open the Claude review root for snapshot validation"
+            ) from error
+        descriptors.append(review_root_descriptor)
+        try:
+            _validate_claude_runtime_directory_descriptor(
+                review_root,
+                review_root_descriptor,
+                private=False,
+            )
+            container_descriptor = os.open(
+                container.name,
+                flags,
+                dir_fd=review_root_descriptor,
+            )
+            descriptors.append(container_descriptor)
+            _validate_claude_runtime_directory_descriptor(
+                container,
+                container_descriptor,
+                private=True,
+            )
+            current = container
+            for component in relative_parent.parts:
+                descriptor = os.open(component, flags, dir_fd=descriptors[-1])
+                descriptors.append(descriptor)
+                current /= component
+                _validate_claude_runtime_directory_descriptor(
+                    current,
+                    descriptor,
+                    private=True,
+                )
+        except OSError as error:
+            if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise ReviewError(
+                    "Claude executable snapshot path must use real directories"
+                ) from error
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot inspect the Claude executable snapshot directory chain"
+            ) from error
+        yield descriptors[-1]
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        raise
+    else:
+        close_error: OSError | None = None
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                close_error = close_error or error
+        if close_error is not None:
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot close the Claude snapshot directory chain"
+            ) from close_error
+
+
+def _inspect_claude_executable_trust(
+    path: pathlib.Path,
+    *,
+    container_dir: pathlib.Path,
+    expected_sha256: str | None = None,
+    include_bundled_roots: bool,
+    validate_bundled_roots: bool = True,
+    required_mode: int | None = None,
+) -> ClaudeExecutableTrustEvidence:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude executable snapshot validation requires O_NOFOLLOW"
+        )
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | nofollow
+    )
+    digest = hashlib.sha256()
+    root_store_search = bytearray()
+    bundled_root_store: bytes | None = None
+
+    def consume_root_store_search() -> None:
+        nonlocal bundled_root_store
+        while True:
+            trailer = root_store_search.find(CLAUDE_BUNDLED_ROOT_STORE_TRAILER)
+            if trailer < 0:
+                break
+            if bundled_root_store is not None:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude executable contains multiple bundled root stores"
+                )
+            bundled_root_store = _bundled_root_store_suffix(
+                bytes(root_store_search[:trailer])
+            )
+            del root_store_search[: trailer + len(CLAUDE_BUNDLED_ROOT_STORE_TRAILER)]
+        retained_limit = CLAUDE_BUNDLED_ROOT_STORE_LIMIT_BYTES + len(
+            CLAUDE_BUNDLED_ROOT_STORE_TRAILER
+        )
+        if len(root_store_search) > retained_limit:
+            del root_store_search[: len(root_store_search) - retained_limit]
+
+    with _open_private_claude_snapshot_parent(
+        path,
+        container_dir=container_dir,
+    ) as parent_descriptor:
+        try:
+            descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+        except OSError as error:
+            if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise ReviewError(
+                    "Claude executable snapshot must be a real file"
+                ) from error
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot open Claude executable snapshot: {error}"
+            ) from error
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.geteuid()
+                or before.st_nlink != 1
+                or before.st_mode & 0o022
+                or (
+                    required_mode is not None
+                    and stat.S_IMODE(before.st_mode) != required_mode
+                )
+                or before.st_size <= 0
+                or before.st_size > CLAUDE_BINARY_MAX_BYTES
+            ):
+                raise ReviewError("Claude executable snapshot has unsafe file metadata")
+            _require_no_extended_acl(
+                descriptor,
+                label="Claude executable snapshot",
+            )
+            total = 0
+            while chunk := os.read(descriptor, CLAUDE_EXECUTABLE_HASH_CHUNK_BYTES):
+                total += len(chunk)
+                if total > CLAUDE_BINARY_MAX_BYTES:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        "Claude executable snapshot exceeds the inspection limit"
+                    )
+                digest.update(chunk)
+                if include_bundled_roots:
+                    root_store_search.extend(chunk)
+                    consume_root_store_search()
+            after = os.fstat(descriptor)
+            path_after = os.stat(
+                path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot inspect Claude executable snapshot: {error}"
+            ) from error
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+            raise
+        else:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                raise ClaudeExecutableInspectionInconclusive(
+                    f"cannot close Claude executable snapshot: {error}"
+                ) from error
+    if (
+        _ca_source_metadata(before) != _ca_source_metadata(after)
+        or _ca_source_metadata(after) != _ca_source_metadata(path_after)
+        or total != before.st_size
+    ):
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude executable snapshot changed during inspection"
+        )
+    actual_sha256 = digest.hexdigest()
+    if expected_sha256 is not None and not hmac.compare_digest(
+        actual_sha256,
+        expected_sha256,
+    ):
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude executable snapshot no longer matches signed provenance"
+        )
+    if include_bundled_roots and bundled_root_store is None:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude executable bundled root store is unavailable"
+        )
+    certificates_by_fingerprint = (
+        _validated_bundled_root_certificates(
+            bundled_root_store,
+            executable=path,
+            verify_self_signatures=validate_bundled_roots,
+        )
+        if bundled_root_store is not None
+        else {}
+    )
+    fingerprints = frozenset(certificates_by_fingerprint)
+    return ClaudeExecutableTrustEvidence(
+        executable_sha256=actual_sha256,
+        bundled_root_certificates=b"".join(
+            certificates_by_fingerprint[fingerprint]
+            for fingerprint in sorted(fingerprints)
+        ),
+        bundled_root_sha256_fingerprints=fingerprints,
+    )
+
+
+def _require_matching_claude_executable_snapshot(
+    executable: pathlib.Path,
+    expected: ClaudeExecutableTrustEvidence,
+    *,
+    container_dir: pathlib.Path,
+) -> None:
+    current = _inspect_claude_executable_trust(
+        executable,
+        container_dir=container_dir,
+        expected_sha256=expected.executable_sha256,
+        include_bundled_roots=_is_claude_macos_host(),
+        validate_bundled_roots=False,
+        required_mode=0o500,
+    )
+    if current != expected:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude executable snapshot trust evidence changed"
+        )
+
+
 def _claude_gpg_temp_root_validator(
     host: LinuxHost,
 ) -> Callable[[tuple[pathlib.Path, ...]], None]:
@@ -2271,6 +4142,448 @@ def _claude_keychain_account() -> str:
     return account
 
 
+def _require_claude_keychain_executable(
+    path: pathlib.Path,
+    *,
+    requirement: str,
+) -> None:
+    try:
+        metadata = path.stat()
+    except FileNotFoundError as error:
+        raise ClaudeKeychainBrokerUnavailable(requirement) from error
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot inspect required Claude Keychain executable {path}: {error}"
+        ) from error
+    if not stat.S_ISREG(metadata.st_mode) or not metadata.st_mode & 0o111:
+        raise ClaudeKeychainBrokerUnavailable(requirement)
+    try:
+        executable = os.access(path, os.X_OK)
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot check required Claude Keychain executable {path}: {error}"
+        ) from error
+    if not executable:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"required Claude Keychain executable is not accessible: {path}"
+        )
+
+
+def _claude_keychain_identity_directory_name() -> str:
+    try:
+        token = os.urandom(16)
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot allocate a Claude Keychain broker directory identity"
+        ) from error
+    if len(token) != 16:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude Keychain broker directory identity is incomplete"
+        )
+    return CLAUDE_KEYCHAIN_BROKER_DIRECTORY_PREFIX + token.hex()
+
+
+@contextlib.contextmanager
+def _open_or_create_claude_keychain_identity_directory(
+    review: ReviewWorkspace,
+) -> Iterator[tuple[pathlib.Path, int]]:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude Keychain broker preparation requires O_NOFOLLOW"
+        )
+    container = review.container_dir.expanduser().absolute()
+    if container != pathlib.Path(os.path.normpath(container)):
+        raise ReviewError("Claude Keychain broker container path is not normalized")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0) | nofollow
+    ancestors = contextlib.ExitStack()
+    try:
+        container_descriptor, _ancestor_identities = ancestors.enter_context(
+            _open_absolute_directory_chain_without_symlinks(container)
+        )
+    except OSError as error:
+        ancestors.close()
+        if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise ReviewError(
+                "Claude Keychain broker container path must use real directories"
+            ) from error
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot inspect the Claude Keychain broker container path"
+        ) from error
+    with ancestors:
+        _validate_claude_runtime_directory_descriptor(
+            container,
+            container_descriptor,
+            private=True,
+        )
+        descriptors: list[int] = []
+        current = container
+        try:
+            try:
+                os.mkdir("claude-runtime", 0o700, dir_fd=container_descriptor)
+            except FileExistsError:
+                pass
+            except OSError as error:
+                raise ClaudeExecutableInspectionInconclusive(
+                    f"cannot create the Claude Keychain runtime directory: {error}"
+                ) from error
+            try:
+                runtime_descriptor = os.open(
+                    "claude-runtime",
+                    flags,
+                    dir_fd=container_descriptor,
+                )
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise ReviewError(
+                        "Claude Keychain broker path must use real directories"
+                    ) from error
+                raise ClaudeExecutableInspectionInconclusive(
+                    "cannot open the Claude Keychain runtime directory"
+                ) from error
+            descriptors.append(runtime_descriptor)
+            current /= "claude-runtime"
+            _validate_claude_runtime_directory_descriptor(
+                current,
+                runtime_descriptor,
+                private=True,
+            )
+            broker_name: str | None = None
+            for _attempt in range(CLAUDE_KEYCHAIN_BROKER_DIRECTORY_ATTEMPTS):
+                candidate = _claude_keychain_identity_directory_name()
+                try:
+                    os.mkdir(candidate, 0o700, dir_fd=runtime_descriptor)
+                except FileExistsError:
+                    continue
+                except OSError as error:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        f"cannot create the Claude Keychain broker directory: {error}"
+                    ) from error
+                broker_name = candidate
+                break
+            if broker_name is None:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "cannot allocate a unique Claude Keychain broker directory"
+                )
+            try:
+                broker_descriptor = os.open(
+                    broker_name,
+                    flags,
+                    dir_fd=runtime_descriptor,
+                )
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise ReviewError(
+                        "Claude Keychain broker path must use real directories"
+                    ) from error
+                raise ClaudeExecutableInspectionInconclusive(
+                    "cannot open the Claude Keychain broker directory"
+                ) from error
+            descriptors.append(broker_descriptor)
+            current /= broker_name
+            _validate_claude_runtime_directory_descriptor(
+                current,
+                broker_descriptor,
+                private=True,
+            )
+            yield current, broker_descriptor
+        except BaseException:
+            for descriptor in reversed(descriptors):
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+            raise
+        else:
+            close_error: OSError | None = None
+            for descriptor in reversed(descriptors):
+                try:
+                    os.close(descriptor)
+                except OSError as error:
+                    close_error = close_error or error
+            if close_error is not None:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "cannot close the Claude Keychain broker directory chain"
+                ) from close_error
+
+
+def _read_verified_claude_keychain_broker(
+    path: pathlib.Path,
+    *,
+    require_root_owned: bool = False,
+) -> bytes:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude Keychain broker verification requires O_NOFOLLOW"
+        )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError as error:
+        raise ClaudeKeychainBrokerUnavailable(
+            "Claude Keychain broker is not installed"
+        ) from error
+    except OSError as error:
+        if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise ReviewError("Claude Keychain broker must be a real file") from error
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot open the Claude Keychain broker artifact: {error}"
+        ) from error
+    try:
+        before = os.fstat(descriptor)
+        if require_root_owned:
+            metadata_safe = (
+                before.st_uid == 0
+                and before.st_gid == 0
+                and stat.S_IMODE(before.st_mode) == 0o555
+            )
+        else:
+            metadata_safe = (
+                before.st_uid in {0, os.geteuid()}
+                and not stat.S_IMODE(before.st_mode) & 0o022
+            )
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or not metadata_safe
+            or before.st_nlink != 1
+            or not 0 < before.st_size <= CLAUDE_KEYCHAIN_BROKER_ARTIFACT_LIMIT_BYTES
+        ):
+            raise ReviewError("Claude Keychain broker artifact has unsafe metadata")
+        _require_no_extended_acl(
+            descriptor,
+            label="Claude Keychain broker artifact",
+        )
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude Keychain broker artifact was truncated while read"
+                )
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude Keychain broker artifact grew while read"
+            )
+        after = os.fstat(descriptor)
+        dirent = os.stat(path, follow_symlinks=False)
+        if (
+            (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            or dirent.st_dev != before.st_dev
+            or dirent.st_ino != before.st_ino
+            or not stat.S_ISREG(dirent.st_mode)
+        ):
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude Keychain broker artifact changed while verified"
+            )
+        payload = b"".join(chunks)
+        if (
+            hashlib.sha256(payload).hexdigest()
+            != CLAUDE_KEYCHAIN_BROKER_ARTIFACT_SHA256
+        ):
+            raise ReviewError("Claude Keychain broker artifact digest is invalid")
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        raise
+    else:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot close the Claude Keychain broker artifact"
+            ) from error
+    return payload
+
+
+def _validate_root_owned_claude_keychain_broker_directory(
+    path: pathlib.Path,
+    descriptor: int,
+) -> None:
+    try:
+        metadata = os.fstat(descriptor)
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot inspect installed Claude Keychain broker ancestor {path}"
+        ) from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise ReviewError(
+            "installed Claude Keychain broker ancestors must be root-owned and "
+            "not group- or world-writable"
+        )
+    _require_no_extended_acl(
+        descriptor,
+        label=f"installed Claude Keychain broker ancestor {path}",
+    )
+
+
+def _require_installed_claude_keychain_broker() -> None:
+    broker = CLAUDE_KEYCHAIN_BROKER_INSTALL_PATH
+    try:
+        with _open_absolute_directory_chain_without_symlinks(
+            broker.parent,
+            descriptor_validator=(
+                _validate_root_owned_claude_keychain_broker_directory
+            ),
+        ):
+            _read_verified_claude_keychain_broker(
+                broker,
+                require_root_owned=True,
+            )
+            _native_macho_dependencies(
+                broker,
+                label="installed Claude Keychain broker",
+            )
+    except FileNotFoundError as error:
+        raise ClaudeKeychainBrokerUnavailable(
+            "Claude Keychain broker is not installed"
+        ) from error
+    except ClaudeCredentialUnsafe as error:
+        raise ReviewError(
+            "installed Claude Keychain broker path must not contain symlinks"
+        ) from error
+
+
+def _darwin_volume_inode_path(metadata: os.stat_result) -> pathlib.Path:
+    if sys.platform != "darwin":
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude Keychain broker volume identities require macOS"
+        )
+    result = pathlib.Path("/.vol") / str(metadata.st_dev) / str(metadata.st_ino)
+    try:
+        resolved = os.stat(result, follow_symlinks=False)
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot resolve the Claude Keychain broker volume identity"
+        ) from error
+    if (resolved.st_dev, resolved.st_ino) != (metadata.st_dev, metadata.st_ino):
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude Keychain broker volume identity does not match its directory"
+        )
+    return result
+
+
+def _claude_macos_descriptor_path(descriptor: int) -> pathlib.Path:
+    try:
+        darwin_fcntl = importlib.import_module("fcntl")
+        getpath = darwin_fcntl.F_GETPATH
+        raw = darwin_fcntl.fcntl(
+            descriptor,
+            getpath,
+            b"\x00" * CLAUDE_MACOS_PATH_BUFFER_BYTES,
+        )
+    except (AttributeError, ImportError, OSError) as error:
+        raise ClaudeCredentialInspectionInconclusive(
+            "cannot resolve the Claude Keychain broker identity directory"
+        ) from error
+    if not isinstance(raw, bytes):
+        raise ClaudeCredentialInspectionInconclusive(
+            "Claude Keychain broker identity directory resolution is invalid"
+        )
+    encoded = raw.split(b"\x00", 1)[0]
+    if not encoded:
+        raise ClaudeCredentialInspectionInconclusive(
+            "Claude Keychain broker identity directory resolution is empty"
+        )
+    path = pathlib.Path(os.fsdecode(encoded))
+    if not path.is_absolute():
+        raise ClaudeCredentialInspectionInconclusive(
+            "Claude Keychain broker identity directory resolution is not absolute"
+        )
+    return path
+
+
+def _require_claude_keychain_identity_directory(path: pathlib.Path) -> pathlib.Path:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        directory_descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ClaudeCredentialInspectionInconclusive(
+            "cannot inspect the Claude Keychain broker identity directory"
+        ) from error
+    try:
+        _validate_claude_runtime_directory_descriptor(
+            path,
+            directory_descriptor,
+            private=True,
+        )
+        canonical_path = _claude_macos_descriptor_path(directory_descriptor)
+        descriptor_metadata = os.fstat(directory_descriptor)
+        canonical_metadata = os.stat(canonical_path, follow_symlinks=False)
+        if (
+            canonical_metadata.st_dev,
+            canonical_metadata.st_ino,
+        ) != (
+            descriptor_metadata.st_dev,
+            descriptor_metadata.st_ino,
+        ) or not stat.S_ISDIR(canonical_metadata.st_mode):
+            raise ClaudeCredentialInspectionInconclusive(
+                "Claude Keychain broker identity directory changed while resolved"
+            )
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(directory_descriptor)
+        raise
+    else:
+        try:
+            os.close(directory_descriptor)
+        except OSError as error:
+            raise ClaudeCredentialInspectionInconclusive(
+                "cannot close the Claude Keychain broker identity directory"
+            ) from error
+    return canonical_path
+
+
+def _require_claude_keychain_identity_socket(path: pathlib.Path) -> pathlib.Path:
+    canonical_directory = _require_claude_keychain_identity_directory(path.parent)
+    canonical_path = canonical_directory / path.name
+    try:
+        metadata = os.stat(path, follow_symlinks=False)
+        canonical_metadata = os.stat(canonical_path, follow_symlinks=False)
+    except OSError as error:
+        raise ClaudeCredentialInspectionInconclusive(
+            "cannot inspect the Claude Keychain broker identity socket"
+        ) from error
+    if (
+        not stat.S_ISSOCK(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or not stat.S_ISSOCK(canonical_metadata.st_mode)
+        or (metadata.st_dev, metadata.st_ino)
+        != (canonical_metadata.st_dev, canonical_metadata.st_ino)
+    ):
+        raise ReviewError(
+            "Claude local-login sandbox requires a valid Keychain broker "
+            "identity socket"
+        )
+    return canonical_path
+
+
+def _allocate_claude_keychain_identity_directory(
+    review: ReviewWorkspace,
+) -> pathlib.Path:
+    with _open_or_create_claude_keychain_identity_directory(review) as (
+        identity_dir,
+        identity_directory_descriptor,
+    ):
+        _validate_claude_runtime_directory_descriptor(
+            identity_dir,
+            identity_directory_descriptor,
+            private=True,
+        )
+        identity_directory_metadata = os.fstat(identity_directory_descriptor)
+        return _darwin_volume_inode_path(identity_directory_metadata)
+
+
 def _prepare_claude_keychain_broker(
     review: ReviewWorkspace,
     env: dict[str, str],
@@ -2278,65 +4591,31 @@ def _prepare_claude_keychain_broker(
     result = dict(env)
     if _claude_uses_explicit_auth(result):
         return result
-    if not CLAUDE_KEYCHAIN_CLIENT.is_file() or not os.access(
-        CLAUDE_KEYCHAIN_CLIENT, os.X_OK
-    ):
-        raise ClaudeKeychainBrokerUnavailable(
-            "Claude local-login review requires /usr/bin/security"
-        )
-    compiler = CLAUDE_KEYCHAIN_BROKER_COMPILER
-    if not compiler.is_file() or not os.access(compiler, os.X_OK):
-        raise ClaudeKeychainBrokerUnavailable(
-            "Claude local-login review requires /usr/bin/clang"
-        )
-    if not CLAUDE_KEYCHAIN_BROKER_SOURCE.is_file():
-        raise ReviewError("Claude Keychain broker source is unavailable")
+    _require_claude_keychain_executable(
+        CLAUDE_KEYCHAIN_CLIENT,
+        requirement="Claude local-login review requires /usr/bin/security",
+    )
     home_raw = result.get("HOME")
     if not home_raw:
         raise ReviewError("Claude Keychain broker requires an isolated HOME")
     home = pathlib.Path(home_raw).resolve()
     if not is_relative_to(home, review.container_dir.resolve()):
         raise ReviewError("Claude Keychain broker requires a helper-owned HOME")
-    broker_dir = review.container_dir.resolve() / "claude-runtime" / "keychain-broker"
-    broker_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    broker = broker_dir / "security"
-    broker.unlink(missing_ok=True)
-    stdout_path = broker_dir / "build.stdout.log"
-    stderr_path = broker_dir / "build.stderr.log"
-    try:
-        completed = run(
-            (
-                str(compiler),
-                "-Wall",
-                "-Wextra",
-                "-Werror",
-                "-Wno-deprecated-declarations",
-                str(CLAUDE_KEYCHAIN_BROKER_SOURCE),
-                "-o",
-                str(broker),
-            ),
-            cwd=broker_dir,
-            env=child_environment(container_dir=review.container_dir),
-            stdout_path=stdout_path,
-            stderr_path=stderr_path,
-            timeout_seconds=CLAUDE_KEYCHAIN_BROKER_TIMEOUT_SECONDS,
-            output_file_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
-        )
-    except OSError as error:
-        raise ClaudeExecutableInspectionInconclusive(
-            f"cannot build the Claude Keychain broker: {error}"
-        ) from error
-    if completed.returncode != 0:
-        detail = completed.stderr.decode("utf-8", errors="replace").strip()
-        raise ClaudeExecutableInspectionInconclusive(
-            "failed to build the Claude Keychain broker"
-            + (f": {detail}" if detail else "")
-        )
-    broker.chmod(0o700)
-    _native_macho_dependencies(broker, label="Claude Keychain broker")
+    _require_installed_claude_keychain_broker()
     result["USER"] = _claude_keychain_account()
+    result[CLAUDE_KEYCHAIN_BROKER_EXECUTABLE_ENV] = str(
+        CLAUDE_KEYCHAIN_BROKER_INSTALL_PATH
+    )
+    result.pop(CLAUDE_KEYCHAIN_BROKER_IDENTITY_DIRECTORY_ENV, None)
+    result.pop(CLAUDE_KEYCHAIN_BROKER_IDENTITY_SOCKET_ENV, None)
+    result.pop(CLAUDE_KEYCHAIN_BROKER_PORT_ENV, None)
     result["PATH"] = os.pathsep.join(
-        value for value in (str(broker_dir), result.get("PATH")) if value
+        value
+        for value in (
+            str(CLAUDE_KEYCHAIN_BROKER_INSTALL_PATH.parent),
+            result.get("PATH"),
+        )
+        if value
     )
     return result
 
@@ -2495,6 +4774,8 @@ def _open_absolute_directory_without_symlinks(path: pathlib.Path) -> int:
 @contextlib.contextmanager
 def _open_absolute_directory_chain_without_symlinks(
     path: pathlib.Path,
+    *,
+    descriptor_validator: Callable[[pathlib.Path, int], None] | None = None,
 ) -> Iterator[tuple[int, tuple[tuple[int, ...], ...]]]:
     if not path.is_absolute() or any(part in {".", ".."} for part in path.parts):
         raise ClaudeCredentialUnsafe(
@@ -2512,6 +4793,9 @@ def _open_absolute_directory_chain_without_symlinks(
         descriptors.append(root_descriptor)
         pending_descriptor = None
         identities.append(_claude_linux_directory_identity(os.fstat(root_descriptor)))
+        if descriptor_validator is not None:
+            descriptor_validator(pathlib.Path("/"), root_descriptor)
+        current = pathlib.Path("/")
         for component in components:
             parent_descriptor = descriptors[-1]
             before_metadata = os.stat(
@@ -2544,6 +4828,9 @@ def _open_absolute_directory_chain_without_symlinks(
                     "a retained Claude artifact ancestor changed while opened"
                 )
             identities.append(opened_identity)
+            current /= component
+            if descriptor_validator is not None:
+                descriptor_validator(current, next_descriptor)
         yield descriptors[-1], tuple(identities)
         if _claude_linux_directory_identity(os.fstat(descriptors[0])) != identities[0]:
             raise ClaudeCredentialInspectionInconclusive(
@@ -2844,13 +5131,15 @@ def _read_claude_macos_file_credential(
 
 def _read_claude_keychain_credential(
     review: ReviewWorkspace,
+    *,
+    account: str | None = None,
 ) -> bytearray | None:
     client = CLAUDE_KEYCHAIN_CLIENT
     if not client.is_file() or not os.access(client, os.X_OK):
         raise ClaudeCredentialInspectionInconclusive(
             "Claude local-login review requires /usr/bin/security"
         )
-    account = _claude_keychain_account()
+    account = account or _claude_keychain_account()
     security_env = child_environment(container_dir=review.container_dir)
     security_env["USER"] = account
     try:
@@ -2875,23 +5164,22 @@ def _read_claude_keychain_credential(
             f"Claude Keychain query failed: {error}"
         ) from error
     try:
-        if completed.returncode == 44:
+        if completed.returncode == CLAUDE_KEYCHAIN_ITEM_NOT_FOUND_STATUS:
             return None
         if completed.returncode != 0:
             raise ClaudeCredentialInspectionInconclusive(
-                "Claude Keychain query failed closed with status "
-                f"{completed.returncode}"
+                "Claude Keychain query failed without a deterministic missing-item "
+                "status"
             )
-        credential = bytearray(completed.stdout)
-        while credential and credential[-1] in b" \t\r\n":
-            credential[-1] = 0
-            credential.pop()
-        leading = 0
-        while leading < len(credential) and credential[leading] in b" \t\r\n":
-            credential[leading] = 0
-            leading += 1
-        if leading:
-            del credential[:leading]
+        if not completed.stdout.endswith(b"\n"):
+            raise ClaudeKeychainCredentialIntegrityError(
+                "Claude Keychain output is missing its command terminator"
+            )
+        credential = bytearray(completed.stdout[:-1])
+        if not credential:
+            raise ClaudeKeychainCredentialIntegrityError(
+                "Claude Keychain returned an empty credential after a successful query"
+            )
         return credential
     finally:
         completed.stdout[:] = b"\x00" * len(completed.stdout)
@@ -2976,11 +5264,7 @@ def _validate_claude_local_credential(
     require_unexpired: bool = False,
 ) -> float:
     try:
-        payload = json.loads(
-            credential,
-            parse_constant=_reject_nonstandard_json_constant,
-            object_pairs_hook=_strict_json_object_from_pairs,
-        )
+        payload = strict_json_loads(credential)
         if not isinstance(payload, dict):
             raise TypeError("credential JSON is not an object")
         oauth = payload["claudeAiOauth"]
@@ -3023,11 +5307,7 @@ def _claude_credential_refresh_digest(
     credential: bytes | bytearray,
 ) -> bytes:
     try:
-        payload = json.loads(
-            credential,
-            parse_constant=_reject_nonstandard_json_constant,
-            object_pairs_hook=_strict_json_object_from_pairs,
-        )
+        payload = strict_json_loads(credential)
         oauth = payload["claudeAiOauth"]
         refresh_token = oauth["refreshToken"]
         if not isinstance(refresh_token, str) or not refresh_token.strip():
@@ -6074,6 +8354,150 @@ def _update_claude_runtime_report_preserving_persistence(
         raise failure from report_error
 
 
+def _claude_macos_process_cdhash(process_id: int) -> bytes | None:
+    if sys.platform != "darwin":
+        raise ClaudeCredentialInspectionInconclusive(
+            "Claude Keychain broker process identity requires macOS"
+        )
+    if process_id <= 0:
+        return None
+    library = ctypes.CDLL(None, use_errno=True)
+    try:
+        csops = library.csops
+    except AttributeError as error:
+        raise ClaudeCredentialInspectionInconclusive(
+            "macOS csops is unavailable for Claude Keychain broker identity"
+        ) from error
+    csops.argtypes = (
+        ctypes.c_int,
+        ctypes.c_uint,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    )
+    csops.restype = ctypes.c_int
+    code_hash = (ctypes.c_ubyte * CLAUDE_MACOS_CDHASH_BYTES)()
+    ctypes.set_errno(0)
+    result = csops(
+        process_id,
+        CLAUDE_MACOS_CS_OPS_CDHASH,
+        ctypes.byref(code_hash),
+        ctypes.sizeof(code_hash),
+    )
+    if result == 0:
+        return bytes(code_hash)
+    error_number = ctypes.get_errno() or errno.EIO
+    if error_number == errno.ESRCH:
+        return None
+    raise ClaudeCredentialInspectionInconclusive(
+        "cannot inspect the running Claude Keychain broker code identity"
+    ) from OSError(error_number, os.strerror(error_number))
+
+
+def _claude_keychain_peer_process_id(connection: socket.socket) -> int | None:
+    if sys.platform != "darwin":
+        raise ClaudeCredentialInspectionInconclusive(
+            "Claude Keychain broker peer credentials require macOS"
+        )
+    peer_pid = connection.getsockopt(
+        CLAUDE_KEYCHAIN_BROKER_LOCAL_SOCKET_LEVEL,
+        CLAUDE_KEYCHAIN_BROKER_LOCAL_PEERPID,
+    )
+    if not isinstance(peer_pid, int) or peer_pid <= 0:
+        return None
+    library = ctypes.CDLL(None, use_errno=True)
+    try:
+        getpeereid = library.getpeereid
+    except AttributeError as error:
+        raise ClaudeCredentialInspectionInconclusive(
+            "macOS getpeereid is unavailable for Claude Keychain broker identity"
+        ) from error
+    getpeereid.argtypes = (
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_uint),
+        ctypes.POINTER(ctypes.c_uint),
+    )
+    getpeereid.restype = ctypes.c_int
+    peer_uid = ctypes.c_uint()
+    peer_gid = ctypes.c_uint()
+    ctypes.set_errno(0)
+    if (
+        getpeereid(
+            connection.fileno(),
+            ctypes.byref(peer_uid),
+            ctypes.byref(peer_gid),
+        )
+        != 0
+    ):
+        error_number = ctypes.get_errno() or errno.EIO
+        raise ClaudeCredentialInspectionInconclusive(
+            "cannot inspect the Claude Keychain broker peer credentials"
+        ) from OSError(error_number, os.strerror(error_number))
+    if peer_uid.value != os.geteuid() or peer_gid.value != os.getegid():
+        return None
+    return peer_pid
+
+
+class _ClaudeKeychainIdentityHandler(socketserver.BaseRequestHandler):
+    def handle(self) -> None:
+        server = self.server
+        if not isinstance(server, _ClaudeKeychainIdentityServer):
+            return
+        self.request.settimeout(2.0)
+        try:
+            peer_pid = _claude_keychain_peer_process_id(self.request)
+            if peer_pid is None:
+                return
+            if not server.credential_server.authorize_identity_peer(peer_pid):
+                return
+            self.request.sendall(server.credential_server.capability)
+        except (BrokenPipeError, ConnectionError, TimeoutError):
+            return
+        except BaseException as error:
+            server.credential_server.record_handler_error(error)
+
+
+class _ClaudeKeychainIdentityServer(socketserver.UnixStreamServer):
+    allow_reuse_address = False
+
+    def __init__(
+        self,
+        socket_path: pathlib.Path,
+        credential_server: _ClaudeKeychainCredentialServer,
+    ) -> None:
+        self.credential_server = credential_server
+        self._serve_condition = threading.Condition()
+        self._serving = False
+        self._serve_stopped = False
+        self._serve_error: BaseException | None = None
+        super().__init__(str(socket_path), _ClaudeKeychainIdentityHandler)
+
+    def service_actions(self) -> None:
+        with self._serve_condition:
+            if not self._serving:
+                self._serving = True
+                self._serve_condition.notify_all()
+
+    def record_serve_stopped(self, error: BaseException | None) -> None:
+        with self._serve_condition:
+            self._serve_stopped = True
+            self._serve_error = error
+            self._serve_condition.notify_all()
+
+    def wait_until_serving(self, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._serve_condition:
+            while not self._serving and not self._serve_stopped:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._serve_condition.wait(timeout=remaining)
+            return self._serving and not self._serve_stopped
+
+    def serve_error(self) -> BaseException | None:
+        with self._serve_condition:
+            return self._serve_error
+
+
 class _ClaudeKeychainCredentialHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         server = self.server
@@ -6089,6 +8513,12 @@ class _ClaudeKeychainCredentialHandler(socketserver.BaseRequestHandler):
         authorized = hmac.compare_digest(raw_capability, server.capability)
         raw_capability[:] = b"\x00" * len(raw_capability)
         if not authorized:
+            with contextlib.suppress(OSError):
+                self.request.sendall(b"\x01")
+            return
+        try:
+            self.request.sendall(b"\x00")
+        except OSError:
             return
         operation = _recv_exact(self.request, 1)
         if operation == b"R":
@@ -6160,6 +8590,34 @@ class _ClaudeKeychainCredentialHandler(socketserver.BaseRequestHandler):
             if pending_generation is not None:
                 server.clear_pending_update(pending_generation)
             updated_credential[:] = b"\x00" * len(updated_credential)
+
+
+@dataclass(frozen=True)
+class _ClaudeRuntimeProcessBinding:
+    process_id: int
+    session_id: int
+    process_group: int
+
+
+def _inspect_claude_runtime_process(process_id: int) -> _ClaudeRuntimeProcessBinding:
+    if process_id <= 0:
+        raise ReviewError("Claude Keychain broker runtime process is invalid")
+    try:
+        session_id = os.getsid(process_id)
+        process_group = os.getpgid(process_id)
+    except OSError as error:
+        raise ClaudeCredentialInspectionInconclusive(
+            "cannot inspect the Claude Keychain broker runtime process"
+        ) from error
+    if session_id != process_id or process_group != process_id:
+        raise ReviewError(
+            "Claude Keychain broker runtime must start as its own session"
+        )
+    return _ClaudeRuntimeProcessBinding(
+        process_id=process_id,
+        session_id=session_id,
+        process_group=process_group,
+    )
 
 
 class _ClaudeSignalMaskOwnerState(enum.Enum):
@@ -6545,32 +9003,112 @@ class _ClaudeKeychainCredentialServer(socketserver.ThreadingTCPServer):
         self,
         credential: bytearray | None,
         capability: bytes,
+        allowed_broker_cdhashes: frozenset[bytes],
         update_callback: Callable[..., bool] | None,
         write_observed_callback: Callable[[], int | None] | None = None,
     ) -> None:
-        super().__init__(("127.0.0.1", 0), _ClaudeKeychainCredentialHandler)
-        self.credential = bytearray(credential) if credential is not None else None
-        self.capability = capability
-        self.credential_lock = threading.Lock()
-        self.consumed = False
-        self.update_callback = update_callback
-        self.write_observed_callback = write_observed_callback
-        self.update_lock = threading.Lock()
-        self.updated = False
-        self._handler_condition = threading.Condition()
-        self._handler_threads: set[threading.Thread] = set()
-        self._handler_sockets: dict[threading.Thread, socket.socket] = {}
-        self._handler_errors: list[BaseException] = []
-        self._closing = False
-        self._abandoned = threading.Event()
-        self._pending_update_lock = threading.Lock()
-        self._pending_update: tuple[int, bytearray] | None = None
-        self._pending_generation = 0
-        self._updates_closed = False
-        self._serve_condition = threading.Condition()
-        self._serving = False
-        self._serve_stopped = False
-        self._serve_error: BaseException | None = None
+        if not allowed_broker_cdhashes or any(
+            len(code_hash) != CLAUDE_MACOS_CDHASH_BYTES
+            for code_hash in allowed_broker_cdhashes
+        ):
+            raise ReviewError("Claude Keychain broker code identities are unavailable")
+        self.credential: bytearray | None = None
+        try:
+            super().__init__(("127.0.0.1", 0), _ClaudeKeychainCredentialHandler)
+            self.credential = bytearray(credential) if credential is not None else None
+            self.capability = capability
+            self.credential_lock = threading.Lock()
+            self.consumed = False
+            self.update_callback = update_callback
+            self.write_observed_callback = write_observed_callback
+            self.update_lock = threading.Lock()
+            self.updated = False
+            self._handler_condition = threading.Condition()
+            self._handler_threads: set[threading.Thread] = set()
+            self._handler_sockets: dict[threading.Thread, socket.socket] = {}
+            self._handler_errors: list[BaseException] = []
+            self._closing = False
+            self._abandoned = threading.Event()
+            self._pending_update_lock = threading.Lock()
+            self._pending_update: tuple[int, bytearray] | None = None
+            self._pending_generation = 0
+            self._updates_closed = False
+            self._serve_condition = threading.Condition()
+            self._serving = False
+            self._serve_stopped = False
+            self._serve_error: BaseException | None = None
+            self._runtime_session_lock = threading.Lock()
+            self._runtime_session_id: int | None = None
+            self.allowed_broker_cdhashes = allowed_broker_cdhashes
+        except BaseException:
+            if self.credential is not None:
+                self.credential[:] = b"\x00" * len(self.credential)
+            with contextlib.suppress(BaseException):
+                self.server_close()
+            raise
+
+    def bind_runtime_process(self, binding: _ClaudeRuntimeProcessBinding) -> None:
+        if (
+            binding.process_id <= 0
+            or binding.session_id != binding.process_id
+            or binding.process_group != binding.process_id
+        ):
+            raise ReviewError(
+                "Claude Keychain broker runtime must start as its own session"
+            )
+        if not self._runtime_session_lock.acquire(blocking=False):
+            raise ClaudeCredentialInspectionInconclusive(
+                "Claude Keychain broker runtime binding is busy"
+            )
+        try:
+            if self._runtime_session_id is not None:
+                raise ReviewError(
+                    "Claude Keychain broker runtime process was already bound"
+                )
+            self._runtime_session_id = binding.process_id
+        finally:
+            self._runtime_session_lock.release()
+
+    def authorize_identity_peer(self, process_id: int) -> bool:
+        with self._runtime_session_lock:
+            expected_session = self._runtime_session_id
+        if expected_session is None:
+            return False
+        try:
+            session_before = os.getsid(process_id)
+            process_group_before = os.getpgid(process_id)
+        except ProcessLookupError:
+            return False
+        except OSError as error:
+            raise ClaudeCredentialInspectionInconclusive(
+                "cannot inspect the Claude Keychain broker peer session"
+            ) from error
+        if (
+            session_before != expected_session
+            or process_group_before != expected_session
+        ):
+            return False
+        code_hash = _claude_macos_process_cdhash(process_id)
+        if code_hash is None or not any(
+            hmac.compare_digest(code_hash, expected)
+            for expected in self.allowed_broker_cdhashes
+        ):
+            return False
+        try:
+            return (
+                os.getsid(process_id) == expected_session
+                and os.getpgid(process_id) == expected_session
+            )
+        except ProcessLookupError:
+            return False
+        except OSError as error:
+            raise ClaudeCredentialInspectionInconclusive(
+                "cannot revalidate the Claude Keychain broker peer session"
+            ) from error
+
+    def record_handler_error(self, error: BaseException) -> None:
+        with self._handler_condition:
+            self._handler_errors.append(error)
 
     def process_request(
         self,
@@ -7419,23 +9957,389 @@ def _bounded_claude_keychain_quiescence_recovery(
     )
 
 
+@dataclass(frozen=True)
+class _ClaudeKeychainBrokerEndpoint:
+    port: int
+    identity_socket: pathlib.Path
+    prepare_runtime_process: Callable[[int], _ClaudeRuntimeProcessBinding]
+    bind_runtime_process: Callable[[_ClaudeRuntimeProcessBinding], None]
+
+
+class _ClaudeKeychainRuntimeEnvironment(dict[str, str]):
+    def __init__(
+        self,
+        values: dict[str, str],
+        prepare_runtime_process: Callable[[int], _ClaudeRuntimeProcessBinding],
+        bind_runtime_process: Callable[[_ClaudeRuntimeProcessBinding], None],
+    ) -> None:
+        super().__init__(values)
+        self.prepare_runtime_process = prepare_runtime_process
+        self.bind_runtime_process = bind_runtime_process
+
+
+@dataclass(frozen=True)
+class _ClaudeKeychainIdentityRuntime:
+    server: _ClaudeKeychainIdentityServer
+    thread: threading.Thread
+    socket_path: pathlib.Path
+    socket_identity: tuple[int, int]
+
+
+def _verify_claude_keychain_identity_socket_for_cleanup(
+    socket_path: pathlib.Path,
+    socket_identity: tuple[int, int],
+    *,
+    missing_is_error: bool,
+) -> BaseException | None:
+    try:
+        current = os.stat(socket_path, follow_symlinks=False)
+    except FileNotFoundError:
+        if not missing_is_error:
+            return None
+        return ClaudeCredentialInspectionInconclusive(
+            "Claude Keychain broker identity socket disappeared during cleanup"
+        )
+    except OSError as error:
+        failure = ClaudeCredentialInspectionInconclusive(
+            "cannot inspect the Claude Keychain broker identity socket during cleanup"
+        )
+        failure.__cause__ = error
+        return failure
+    if (current.st_dev, current.st_ino) != socket_identity or not stat.S_ISSOCK(
+        current.st_mode
+    ):
+        return ClaudeCredentialInspectionInconclusive(
+            "Claude Keychain broker identity socket changed during cleanup"
+        )
+    return None
+
+
+def _close_unstarted_claude_keychain_identity_server(
+    server: _ClaudeKeychainIdentityServer,
+    socket_path: pathlib.Path,
+    socket_identity: tuple[int, int],
+) -> tuple[BaseException, ...]:
+    errors: list[BaseException] = []
+    try:
+        server.server_close()
+    except BaseException as error:
+        errors.append(error)
+    cleanup_error = _verify_claude_keychain_identity_socket_for_cleanup(
+        socket_path,
+        socket_identity,
+        missing_is_error=False,
+    )
+    if cleanup_error is not None:
+        errors.append(cleanup_error)
+    return tuple(errors)
+
+
+def _raise_claude_identity_cleanup_control_flow(
+    primary: BaseException | None,
+    cleanup_errors: tuple[BaseException, ...] | list[BaseException],
+) -> None:
+    selected = (
+        primary
+        if primary is not None and _is_claude_control_flow_error(primary)
+        else next(
+            (error for error in cleanup_errors if _is_claude_control_flow_error(error)),
+            None,
+        )
+    )
+    if selected is None:
+        return
+    for error in (primary, *cleanup_errors):
+        if error is None or error is selected:
+            continue
+        _attach_claude_credential_cleanup_failure(selected, error)
+    raise selected
+
+
+def _start_claude_keychain_identity_server(
+    credential_server: _ClaudeKeychainCredentialServer,
+    socket_path: pathlib.Path,
+) -> _ClaudeKeychainIdentityRuntime:
+    startup_deadline = time.monotonic() + CLAUDE_KEYCHAIN_SERVER_START_TIMEOUT_SECONDS
+    if not socket_path.is_absolute() or socket_path.name != (
+        CLAUDE_KEYCHAIN_BROKER_IDENTITY_SOCKET_NAME
+    ):
+        raise ReviewError("Claude Keychain broker identity socket path is invalid")
+    _require_claude_keychain_identity_directory(socket_path.parent)
+    try:
+        identity_server = _ClaudeKeychainIdentityServer(
+            socket_path,
+            credential_server,
+        )
+    except OSError as error:
+        raise ClaudeCredentialInspectionInconclusive(
+            f"Claude Keychain broker cannot bind its identity socket: {error}"
+        ) from error
+    socket_identity: tuple[int, int] | None = None
+    try:
+        initial_metadata = os.stat(socket_path, follow_symlinks=False)
+        if (
+            not stat.S_ISSOCK(initial_metadata.st_mode)
+            or initial_metadata.st_uid != os.geteuid()
+        ):
+            raise ReviewError(
+                "Claude Keychain broker identity endpoint must be a socket"
+            )
+        socket_identity = (initial_metadata.st_dev, initial_metadata.st_ino)
+        os.chmod(socket_path, 0o600, follow_symlinks=False)
+        socket_metadata = os.stat(socket_path, follow_symlinks=False)
+        if (
+            not stat.S_ISSOCK(socket_metadata.st_mode)
+            or socket_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(socket_metadata.st_mode) != 0o600
+            or (socket_metadata.st_dev, socket_metadata.st_ino) != socket_identity
+        ):
+            raise ReviewError(
+                "Claude Keychain broker identity endpoint must be a socket"
+            )
+    except BaseException as error:
+        if socket_identity is not None:
+            cleanup_errors = _close_unstarted_claude_keychain_identity_server(
+                identity_server,
+                socket_path,
+                socket_identity,
+            )
+        else:
+            cleanup_errors = ()
+            try:
+                identity_server.server_close()
+            except BaseException as cleanup_error:
+                cleanup_errors = (cleanup_error,)
+        _raise_claude_identity_cleanup_control_flow(error, cleanup_errors)
+        if isinstance(error, ReviewError):
+            for cleanup_error in cleanup_errors:
+                _attach_claude_credential_cleanup_failure(error, cleanup_error)
+            raise
+        failure = ClaudeCredentialInspectionInconclusive(
+            "Claude Keychain broker cannot secure its identity endpoint"
+        )
+        for cleanup_error in cleanup_errors:
+            _attach_claude_credential_cleanup_failure(failure, cleanup_error)
+        raise failure from error
+
+    def serve() -> None:
+        serve_error: BaseException | None = None
+        try:
+            identity_server.serve_forever(
+                poll_interval=CLAUDE_KEYCHAIN_SERVER_POLL_INTERVAL_SECONDS
+            )
+        except BaseException as error:
+            serve_error = error
+        finally:
+            identity_server.record_serve_stopped(serve_error)
+
+    try:
+        thread = threading.Thread(
+            target=serve,
+            daemon=True,
+            name="claude-review-keychain-identity",
+        )
+    except BaseException as error:
+        cleanup_errors = _close_unstarted_claude_keychain_identity_server(
+            identity_server,
+            socket_path,
+            socket_identity,
+        )
+        _raise_claude_identity_cleanup_control_flow(error, cleanup_errors)
+        failure = ClaudeCredentialInspectionInconclusive(
+            f"Claude Keychain broker identity service cannot construct: {error}"
+        )
+        for cleanup_error in cleanup_errors:
+            _attach_claude_credential_cleanup_failure(failure, cleanup_error)
+        raise failure from error
+    thread_start_owner = _ClaudeThreadStartOwner()
+    start_interruption: BaseException | None = None
+    try:
+        _start_claude_thread_inheriting_forwarded_signal_mask(
+            thread,
+            thread_start_owner=thread_start_owner,
+        )
+    except BaseException as error:
+        start_interruption = error
+    start_snapshot = thread_start_owner.snapshot
+    start_error = _select_claude_thread_start_related_error(
+        start_snapshot.error,
+        start_interruption,
+    )
+    if start_error is not None:
+        cleanup_errors: list[BaseException] = []
+        if start_snapshot.may_have_started:
+            cleanup_errors.extend(
+                _stop_claude_keychain_identity_server(
+                    _ClaudeKeychainIdentityRuntime(
+                        server=identity_server,
+                        thread=thread,
+                        socket_path=socket_path,
+                        socket_identity=socket_identity,
+                    ),
+                    deadline=startup_deadline,
+                )
+            )
+        else:
+            cleanup_errors.extend(
+                _close_unstarted_claude_keychain_identity_server(
+                    identity_server,
+                    socket_path,
+                    socket_identity,
+                )
+            )
+        _raise_claude_identity_cleanup_control_flow(start_error, cleanup_errors)
+        failure = ClaudeCredentialInspectionInconclusive(
+            f"Claude Keychain broker identity service cannot start: {start_error}"
+        )
+        for cleanup_error in cleanup_errors:
+            _attach_claude_credential_cleanup_failure(failure, cleanup_error)
+        raise failure from start_error
+    runtime = _ClaudeKeychainIdentityRuntime(
+        server=identity_server,
+        thread=thread,
+        socket_path=socket_path,
+        socket_identity=socket_identity,
+    )
+    try:
+        entered_serve_loop = identity_server.wait_until_serving(
+            max(0.0, startup_deadline - time.monotonic())
+        )
+    except BaseException as error:
+        cleanup_errors = _stop_claude_keychain_identity_server(
+            runtime,
+            deadline=startup_deadline,
+        )
+        _raise_claude_identity_cleanup_control_flow(error, cleanup_errors)
+        failure = ClaudeCredentialInspectionInconclusive(
+            "Claude Keychain broker identity service startup could not be observed"
+        )
+        for cleanup_error in cleanup_errors:
+            _attach_claude_credential_cleanup_failure(failure, cleanup_error)
+        raise failure from error
+    if not entered_serve_loop or time.monotonic() > startup_deadline:
+        failure = ClaudeCredentialInspectionInconclusive(
+            "Claude Keychain broker identity service did not enter its serve loop "
+            "before its startup deadline"
+        )
+        cleanup_errors = _stop_claude_keychain_identity_server(
+            runtime,
+            deadline=startup_deadline,
+        )
+        _raise_claude_identity_cleanup_control_flow(None, cleanup_errors)
+        for cleanup_error in cleanup_errors:
+            _attach_claude_credential_cleanup_failure(failure, cleanup_error)
+        serve_error = identity_server.serve_error()
+        if serve_error is not None:
+            failure.__cause__ = serve_error
+        raise failure
+    return runtime
+
+
+def _stop_claude_keychain_identity_server(
+    runtime: _ClaudeKeychainIdentityRuntime,
+    *,
+    deadline: float | None = None,
+) -> tuple[BaseException, ...]:
+    if deadline is None:
+        deadline = time.monotonic() + CLAUDE_KEYCHAIN_SERVER_SHUTDOWN_TIMEOUT_SECONDS
+    errors: list[BaseException] = []
+
+    def remaining() -> float:
+        return max(0.0, deadline - time.monotonic())
+
+    def request_shutdown() -> None:
+        try:
+            runtime.server.shutdown()
+        except BaseException as error:
+            errors.append(error)
+
+    shutdown_thread: threading.Thread | None = None
+    thread_start_owner = _ClaudeThreadStartOwner()
+    shutdown_start_interruption: BaseException | None = None
+    try:
+        shutdown_thread = threading.Thread(
+            target=request_shutdown,
+            daemon=True,
+            name="claude-review-keychain-identity-shutdown",
+        )
+        _start_claude_thread_inheriting_forwarded_signal_mask(
+            shutdown_thread,
+            thread_start_owner=thread_start_owner,
+        )
+    except BaseException as error:
+        shutdown_start_interruption = error
+    shutdown_start_snapshot = thread_start_owner.snapshot
+    shutdown_start_error = _select_claude_thread_start_related_error(
+        shutdown_start_snapshot.error,
+        shutdown_start_interruption,
+    )
+    if shutdown_start_error is not None:
+        errors.append(shutdown_start_error)
+    if shutdown_thread is not None and shutdown_start_snapshot.may_have_started:
+        shutdown_stopped, shutdown_error = _bounded_claude_thread_quiescence(
+            shutdown_thread,
+            shutdown_start_snapshot.state,
+            remaining(),
+        )
+        if shutdown_error is not None:
+            errors.append(shutdown_error)
+    else:
+        shutdown_stopped = False
+    try:
+        runtime.server.server_close()
+    except BaseException as error:
+        errors.append(error)
+    try:
+        runtime.thread.join(timeout=remaining())
+    except BaseException as error:
+        errors.append(error)
+    serve_stopped = False
+    try:
+        serve_stopped = not runtime.thread.is_alive()
+    except BaseException as error:
+        errors.append(error)
+    if not shutdown_stopped or not serve_stopped:
+        errors.append(
+            ClaudeCredentialInspectionInconclusive(
+                "Claude Keychain broker identity service did not stop"
+            )
+        )
+    try:
+        serve_error = runtime.server.serve_error()
+    except BaseException as error:
+        errors.append(error)
+    else:
+        if serve_error is not None:
+            errors.append(serve_error)
+    cleanup_error = _verify_claude_keychain_identity_socket_for_cleanup(
+        runtime.socket_path,
+        runtime.socket_identity,
+        missing_is_error=True,
+    )
+    if cleanup_error is not None:
+        errors.append(cleanup_error)
+    return tuple(errors)
+
+
 @contextlib.contextmanager
 def _claude_keychain_credential_server(
     credential: bytearray | None,
     capability: bytes,
-    update_callback: Callable[
-        [bytearray, Callable[[Callable[[], bool]], bool]],
-        bool,
-    ]
-    | None = None,
+    *,
+    identity_socket: pathlib.Path,
+    allowed_broker_cdhashes: frozenset[bytes] = CLAUDE_KEYCHAIN_BROKER_CDHASHES,
+    update_callback: Callable[..., bool] | None = None,
     quiescence_callbacks: _ClaudeKeychainQuiescenceCallbacks | None = None,
-) -> Iterator[int]:
+) -> Iterator[_ClaudeKeychainBrokerEndpoint]:
     if len(capability) != CLAUDE_KEYCHAIN_BROKER_CAPABILITY_BYTES:
+        if credential is not None:
+            credential[:] = b"\x00" * len(credential)
         raise ReviewError("Claude Keychain broker capability has an invalid length")
     try:
         server = _ClaudeKeychainCredentialServer(
             credential,
             capability,
+            allowed_broker_cdhashes,
             update_callback,
             (
                 quiescence_callbacks.write_observed
@@ -7443,15 +10347,36 @@ def _claude_keychain_credential_server(
                 else None
             ),
         )
-    except OSError as error:
-        failure_type = (
-            ClaudeLoopbackUnavailable
-            if _claude_loopback_bind_is_deterministically_unavailable(error)
-            else ClaudeCredentialInspectionInconclusive
+    except BaseException as error:
+        if credential is not None:
+            credential[:] = b"\x00" * len(credential)
+        if isinstance(error, OSError):
+            failure_type = (
+                ClaudeLoopbackUnavailable
+                if _claude_loopback_bind_is_deterministically_unavailable(error)
+                else ClaudeCredentialInspectionInconclusive
+            )
+            raise failure_type(
+                f"Claude Keychain broker cannot bind loopback: {error}"
+            ) from error
+        raise
+    try:
+        identity_runtime = _start_claude_keychain_identity_server(
+            server,
+            identity_socket,
         )
-        raise failure_type(
-            f"Claude Keychain broker cannot bind loopback: {error}"
-        ) from error
+    except BaseException as error:
+        try:
+            server.server_close()
+        except BaseException as cleanup_error:
+            _attach_claude_credential_cleanup_failure(error, cleanup_error)
+        try:
+            server.scrub_initial_credential()
+        except BaseException as cleanup_error:
+            _attach_claude_credential_cleanup_failure(error, cleanup_error)
+        if credential is not None:
+            credential[:] = b"\x00" * len(credential)
+        raise
     serve_gate = threading.Event()
     serve_cancelled = threading.Event()
 
@@ -7516,7 +10441,12 @@ def _claude_keychain_credential_server(
                 failure.__cause__ = serve_error
             raise failure
         runtime_exposed = True
-        yield int(server.server_address[1])
+        yield _ClaudeKeychainBrokerEndpoint(
+            port=int(server.server_address[1]),
+            identity_socket=identity_socket,
+            prepare_runtime_process=_inspect_claude_runtime_process,
+            bind_runtime_process=server.bind_runtime_process,
+        )
     except BaseException as error:
         primary_error = error
         raise
@@ -7536,6 +10466,12 @@ def _claude_keychain_credential_server(
                     serve_gate.set()
         except BaseException as error:
             start_handoff_error = error
+        try:
+            shutdown_errors.extend(
+                _stop_claude_keychain_identity_server(identity_runtime)
+            )
+        except BaseException as error:
+            shutdown_errors.append(error)
         snapshot_refresh_error: BaseException | None = None
         shutdown = _ClaudeKeychainServerShutdown(
             quiescent=True,
@@ -8431,6 +11367,23 @@ def _complete_claude_macos_terminal_handoff_with_coordination_translation(
 
 
 @contextlib.contextmanager
+def _owned_claude_macos_credentials(
+    review: ReviewWorkspace,
+) -> Iterator[tuple[_ClaudeLocalCredential, bytearray]]:
+    selected: _ClaudeLocalCredential | None = None
+    expected_credential: bytearray | None = None
+    try:
+        selected = _select_claude_macos_credential(review)
+        expected_credential = bytearray(selected.payload)
+        yield selected, expected_credential
+    finally:
+        if expected_credential is not None:
+            expected_credential[:] = b"\x00" * len(expected_credential)
+        if selected is not None:
+            selected.payload[:] = b"\x00" * len(selected.payload)
+
+
+@contextlib.contextmanager
 def _claude_keychain_runtime(
     review: ReviewWorkspace,
     env: dict[str, str],
@@ -8447,6 +11400,15 @@ def _claude_keychain_runtime(
         raise ClaudeExecutableInspectionInconclusive(
             "Claude local-login credential-lock protocol is unavailable"
         )
+    broker_raw = result.get(CLAUDE_KEYCHAIN_BROKER_EXECUTABLE_ENV)
+    if not broker_raw:
+        raise ReviewError("Claude Keychain broker executable identity is unavailable")
+    broker = pathlib.Path(broker_raw)
+    if not broker.is_absolute() or broker.name != "security":
+        raise ReviewError("Claude Keychain broker executable identity is invalid")
+    identity_directory = _allocate_claude_keychain_identity_directory(review)
+    result[CLAUDE_KEYCHAIN_BROKER_IDENTITY_DIRECTORY_ENV] = str(identity_directory)
+    identity_socket = identity_directory / CLAUDE_KEYCHAIN_BROKER_IDENTITY_SOCKET_NAME
     transaction = _ClaudeMacOSRefreshTransaction(
         process_started=process_started,
         process_quiescent=process_quiescent,
@@ -8468,6 +11430,7 @@ def _claude_keychain_runtime(
                     refresh_lock_protocol,
                     refresh_lock,
                     transaction,
+                    identity_socket,
                 ) as runtime_env:
                     yield runtime_env
             except BaseException as error:
@@ -8595,25 +11558,44 @@ def _claude_keychain_runtime_coordinated(
     refresh_lock_protocol: ClaudeRefreshLockProtocol,
     coordinated_refresh_lock: ClaudeRefreshLockLease,
     transaction: _ClaudeMacOSRefreshTransaction,
+    identity_socket: pathlib.Path,
 ) -> Iterator[dict[str, str]]:
     result = dict(env)
-    selected = _select_claude_macos_credential(review)
-    try:
+    with _owned_claude_macos_credentials(review) as (
+        selected,
+        expected_credential,
+    ):
         coordinated_refresh_lock.assert_held()
-    except BaseException:
-        selected.payload[:] = b"\x00" * len(selected.payload)
-        raise
-    expected_credential = bytearray(selected.payload)
+        with _claude_keychain_runtime_selected(
+            review,
+            result,
+            refresh_lock_protocol,
+            selected,
+            expected_credential,
+            identity_socket,
+            coordinated_refresh_lock,
+            transaction,
+        ) as runtime_environment:
+            yield runtime_environment
+
+
+@contextlib.contextmanager
+def _claude_keychain_runtime_selected(
+    review: ReviewWorkspace,
+    result: dict[str, str],
+    refresh_lock_protocol: ClaudeRefreshLockProtocol,
+    selected: _ClaudeLocalCredential,
+    expected_credential: bytearray,
+    identity_socket: pathlib.Path,
+    coordinated_refresh_lock: ClaudeRefreshLockLease,
+    transaction: _ClaudeMacOSRefreshTransaction,
+) -> Iterator[dict[str, str]]:
     carrier_snapshot = selected.carrier_snapshot
     if carrier_snapshot is None:
-        expected_credential[:] = b"\x00" * len(expected_credential)
-        selected.payload[:] = b"\x00" * len(selected.payload)
         raise ReviewError("Claude macOS carrier snapshot is unavailable")
     try:
         fail_closed_recovery_root = _claude_macos_recovery_root(review)
     except BaseException as error:
-        expected_credential[:] = b"\x00" * len(expected_credential)
-        selected.payload[:] = b"\x00" * len(selected.payload)
         if _is_claude_control_flow_error(error):
             raise
         failure = ClaudeCredentialInspectionInconclusive(
@@ -10697,6 +13679,7 @@ def _claude_keychain_runtime_coordinated(
         with _claude_keychain_credential_server(
             selected.payload,
             capability,
+            identity_socket=identity_socket,
             update_callback=stage_refreshed_credential,
             quiescence_callbacks=_ClaudeKeychainQuiescenceCallbacks(
                 abandon=abandon_unquiescent_handler,
@@ -10707,9 +13690,11 @@ def _claude_keychain_runtime_coordinated(
                 fail_closed_fallback_error=fail_closed_scope_failure,
                 write_observed=transaction.observe_refresh,
             ),
-        ) as port:
-            result[CLAUDE_KEYCHAIN_BROKER_PORT_ENV] = str(port)
-            result[CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV] = capability.hex()
+        ) as endpoint:
+            result[CLAUDE_KEYCHAIN_BROKER_PORT_ENV] = str(endpoint.port)
+            result[CLAUDE_KEYCHAIN_BROKER_IDENTITY_SOCKET_ENV] = str(
+                endpoint.identity_socket
+            )
             _update_claude_runtime_report(
                 review,
                 {
@@ -10721,7 +13706,11 @@ def _claude_keychain_runtime_coordinated(
                     }
                 },
             )
-            yield result
+            yield _ClaudeKeychainRuntimeEnvironment(
+                result,
+                endpoint.prepare_runtime_process,
+                endpoint.bind_runtime_process,
+            )
     except BaseException as error:
         primary_error = error
         raise
@@ -11600,10 +14589,152 @@ def _extract_ca_certificates(data: bytes, *, source: str) -> bytes:
         raise ReviewError(f"Claude review CA source contains a private key: {source}")
     blocks = CLAUDE_CERTIFICATE_BLOCK.findall(data)
     if not blocks:
-        raise ReviewError(
+        raise ClaudeCACertificateNotFound(
             f"Claude review CA source contains no PEM certificate: {source}"
         )
     return b"\n".join(block.strip() for block in blocks) + b"\n"
+
+
+def _require_no_extended_acl(descriptor: int, *, label: str) -> None:
+    if not _is_claude_macos_host():
+        return
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        acl_get_fd_np = libc.acl_get_fd_np
+        acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+        acl_get_fd_np.restype = ctypes.c_void_p
+        acl_get_entry = libc.acl_get_entry
+        acl_get_entry.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        acl_get_entry.restype = ctypes.c_int
+        acl_free = libc.acl_free
+        acl_free.argtypes = [ctypes.c_void_p]
+        acl_free.restype = ctypes.c_int
+    except (AttributeError, OSError) as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot inspect {label} access controls"
+        ) from error
+    ctypes.set_errno(0)
+    acl = acl_get_fd_np(descriptor, CLAUDE_ACL_TYPE_EXTENDED)
+    if not acl:
+        if ctypes.get_errno() == errno.ENOENT:
+            return
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot inspect {label} access controls"
+        )
+    try:
+        entry = ctypes.c_void_p()
+        ctypes.set_errno(0)
+        entry_status = acl_get_entry(acl, 0, ctypes.byref(entry))
+        entry_errno = ctypes.get_errno()
+        if entry_status == 0:
+            raise ReviewError(f"{label} has an extended access control list")
+        if entry_status != -1 or entry_errno != errno.EINVAL:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot inspect {label} access controls"
+            )
+    finally:
+        acl_free(acl)
+
+
+def _read_bounded_owner_file(
+    path: pathlib.Path,
+    *,
+    source: str,
+    limit_bytes: int,
+    label: str,
+    allow_empty: bool = False,
+) -> bytes:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ReviewError(f"{label} requires O_NOFOLLOW support")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | nofollow
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot inspect {label}: {source}"
+        ) from error
+    payload = bytearray()
+    try:
+        try:
+            before = os.fstat(descriptor)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot inspect {label}: {source}"
+            ) from error
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+            or before.st_mode & 0o077
+        ):
+            raise ReviewError(f"{label} has unsafe file metadata: {source}")
+        _require_no_extended_acl(descriptor, label=label)
+        if before.st_size > limit_bytes:
+            raise ReviewError(f"{label} exceeds the size limit: {source}")
+        while len(payload) <= limit_bytes:
+            try:
+                chunk = os.read(
+                    descriptor,
+                    min(64 * 1024, limit_bytes + 1 - len(payload)),
+                )
+            except OSError as error:
+                raise ClaudeExecutableInspectionInconclusive(
+                    f"cannot inspect {label}: {source}"
+                ) from error
+            if not chunk:
+                break
+            payload.extend(chunk)
+        try:
+            after = os.fstat(descriptor)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot inspect {label}: {source}"
+            ) from error
+        try:
+            path_after = path.lstat()
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"{label} changed while being read: {source}"
+            ) from error
+        if (
+            _ca_source_metadata(before) != _ca_source_metadata(after)
+            or _ca_source_metadata(after) != _ca_source_metadata(path_after)
+            or len(payload) != before.st_size
+        ):
+            raise ClaudeExecutableInspectionInconclusive(
+                f"{label} changed while being read: {source}"
+            )
+        if len(payload) > limit_bytes:
+            raise ReviewError(f"{label} exceeds the size limit: {source}")
+        if not payload and not allow_empty:
+            raise ReviewError(f"{label} is empty: {source}")
+        material = bytes(payload)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        raise
+    else:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot close {label}: {source}"
+            ) from error
+        return material
+    finally:
+        payload[:] = b"\x00" * len(payload)
 
 
 def _ca_source_metadata(metadata: os.stat_result) -> tuple[int, ...]:
@@ -11624,6 +14755,7 @@ def _require_safe_ca_source_metadata(
     metadata: os.stat_result,
     *,
     source: str,
+    descriptor: int | None = None,
 ) -> None:
     if not stat.S_ISREG(metadata.st_mode):
         raise ReviewError(f"Claude review CA source is not a regular file: {source}")
@@ -11633,6 +14765,20 @@ def _require_safe_ca_source_metadata(
         raise ReviewError(
             f"Claude review CA source is group- or world-writable: {source}"
         )
+    if _is_claude_macos_host():
+        if metadata.st_nlink != 1:
+            raise ReviewError(
+                f"Claude review CA source has an unsafe link count: {source}"
+            )
+        effective_uid = os.geteuid()
+        if (
+            effective_uid != 0
+            and metadata.st_uid == effective_uid
+            and metadata.st_mode & 0o077
+        ):
+            raise ReviewError(f"Claude review CA source is not owner-only: {source}")
+        if descriptor is not None:
+            _require_no_extended_acl(descriptor, label="Claude review CA source")
 
 
 def _require_safe_ca_symlink_metadata(
@@ -11692,6 +14838,10 @@ def _open_stable_ca_directory(path: pathlib.Path, *, source: str) -> int:
             f"cannot open a stable Claude review CA directory {source}: {error}"
         ) from error
     if stat.S_ISLNK(path_before.st_mode):
+        if _is_claude_macos_host():
+            raise ReviewError(
+                f"Claude review CA directory must not be a symlink: {source}"
+            )
         _require_safe_ca_symlink_metadata(path_before, source=source)
         try:
             target_before = os.readlink(path)
@@ -11715,6 +14865,10 @@ def _open_stable_ca_directory(path: pathlib.Path, *, source: str) -> int:
             descriptor = os.open(path, flags | directory_flag)
             opened = os.fstat(descriptor)
             _require_safe_ca_directory_metadata(opened, source=source)
+            _require_no_extended_acl(
+                descriptor,
+                label="Claude review CA directory",
+            )
             followed_after = path.stat()
             link_before_final_read = path.lstat()
             target_after = os.readlink(path)
@@ -11741,7 +14895,8 @@ def _open_stable_ca_directory(path: pathlib.Path, *, source: str) -> int:
             or target_before != target_after
         ):
             assert descriptor is not None
-            os.close(descriptor)
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
             raise ClaudeExecutableInspectionInconclusive(
                 f"Claude review CA directory symlink changed while being opened: "
                 f"{source}"
@@ -11759,19 +14914,26 @@ def _open_stable_ca_directory(path: pathlib.Path, *, source: str) -> int:
     try:
         opened = os.fstat(descriptor)
         _require_safe_ca_directory_metadata(opened, source=source)
+        _require_no_extended_acl(
+            descriptor,
+            label="Claude review CA directory",
+        )
         path_after = path.lstat()
     except ReviewError:
-        os.close(descriptor)
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
         raise
     except OSError as error:
-        os.close(descriptor)
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
         raise ClaudeExecutableInspectionInconclusive(
             f"cannot validate a stable Claude review CA directory {source}: {error}"
         ) from error
     if _ca_source_metadata(path_before) != _ca_source_metadata(
         opened
     ) or _ca_source_metadata(opened) != _ca_source_metadata(path_after):
-        os.close(descriptor)
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
         raise ClaudeExecutableInspectionInconclusive(
             f"Claude review CA directory changed while being opened: {source}"
         )
@@ -11786,7 +14948,11 @@ def _read_stable_ca_descriptor(
 ) -> tuple[bytes, int, os.stat_result]:
     try:
         before = os.fstat(descriptor)
-        _require_safe_ca_source_metadata(before, source=source)
+        _require_safe_ca_source_metadata(
+            before,
+            source=source,
+            descriptor=descriptor,
+        )
         if before.st_size > CLAUDE_CA_FILE_LIMIT_BYTES:
             raise ReviewError(
                 f"Claude review CA source exceeds the size limit: {source}"
@@ -11827,6 +14993,7 @@ def _read_ca_source_with_size(
     path: pathlib.Path,
     *,
     source: str,
+    extract_certificates: bool = True,
 ) -> tuple[bytes, int]:
     try:
         descriptor = os.open(path, _ca_nofollow_flags(directory=False))
@@ -11844,9 +15011,19 @@ def _read_ca_source_with_size(
         material, source_size, after = _read_stable_ca_descriptor(
             descriptor,
             source=source,
+            extract_certificates=extract_certificates,
         )
-    finally:
-        os.close(descriptor)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        raise
+    else:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot close a stable Claude review CA source {source}: {error}"
+            ) from error
     try:
         path_after = path.lstat()
     except OSError as error:
@@ -11893,8 +15070,17 @@ def _read_ca_source_at_with_size(
             source=source,
             extract_certificates=extract_certificates,
         )
-    finally:
-        os.close(descriptor)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        raise
+    else:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot close a stable Claude review CA source {source}: {error}"
+            ) from error
     try:
         entry_after = os.stat(
             name,
@@ -11917,12 +15103,176 @@ def _read_ca_source(path: pathlib.Path, *, source: str) -> bytes:
     return material
 
 
+def _read_proxy_system_ca_source(path: pathlib.Path) -> bytes:
+    source = "Claude proxy system CA bundle"
+    try:
+        descriptor = os.open(path, _ca_nofollow_flags(directory=False))
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot open a stable {source}"
+        ) from error
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid not in {0, os.geteuid()}
+            or (_is_claude_macos_host() and before.st_nlink != 1)
+            or before.st_mode & 0o022
+        ):
+            raise ReviewError(f"{source} has unsafe metadata")
+        _require_no_extended_acl(descriptor, label=source)
+        payload = bytearray()
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, CLAUDE_CA_FILE_LIMIT_BYTES + 1 - len(payload)),
+            )
+            if not chunk:
+                break
+            payload.extend(chunk)
+            if len(payload) > CLAUDE_CA_FILE_LIMIT_BYTES:
+                raise ReviewError(f"{source} exceeds the size limit")
+        after = os.fstat(descriptor)
+    except OSError as error:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot read a stable {source}"
+        ) from error
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        raise
+    else:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot close a stable {source}"
+            ) from error
+    try:
+        path_after = path.lstat()
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"{source} changed while being read"
+        ) from error
+    if (
+        _ca_source_metadata(before) != _ca_source_metadata(after)
+        or _ca_source_metadata(after) != _ca_source_metadata(path_after)
+        or len(payload) != before.st_size
+    ):
+        raise ClaudeExecutableInspectionInconclusive(
+            f"{source} changed while being read"
+        )
+    return _extract_ca_certificates(bytes(payload), source=source)
+
+
+def _read_proxy_system_ca_directory(path: pathlib.Path) -> dict[str, bytes]:
+    source = "Claude proxy system CA directory"
+    descriptor = _open_stable_ca_directory(path, source=source)
+    snapshots: dict[str, bytes] = {}
+    total_size = 0
+    try:
+        before = os.fstat(descriptor)
+        names = _bounded_ca_directory_names(
+            descriptor,
+            CLAUDE_CA_DIR_ENTRY_LIMIT,
+            too_many_message="Claude proxy system CA directory has too many entries",
+        )
+        for name in names:
+            if CLAUDE_OPENSSL_CA_HASH_ENTRY_RE.fullmatch(name) is None:
+                continue
+            metadata = os.stat(
+                name,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+            if stat.S_ISDIR(metadata.st_mode):
+                continue
+            raw_material, source_size = _read_ca_directory_entry_at_with_size(
+                descriptor,
+                name,
+                metadata,
+                source=f"{source}:{name}",
+                extract_certificates=False,
+            )
+            total_size += source_size
+            if total_size > CLAUDE_CA_DIR_LIMIT_BYTES:
+                raise ReviewError("Claude proxy system CA directory is too large")
+            try:
+                material = _extract_ca_certificates(
+                    raw_material,
+                    source=f"{source}:{name}",
+                )
+            except ClaudeCACertificateNotFound:
+                continue
+            snapshots[str(path / name)] = material
+        after = os.fstat(descriptor)
+        if _ca_source_metadata(before) != _ca_source_metadata(after):
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude proxy system CA directory changed while being read"
+            )
+    except OSError as error:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot read a stable Claude proxy system CA directory"
+        ) from error
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        raise
+    else:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot close a stable Claude proxy system CA directory"
+            ) from error
+    return snapshots
+
+
+def _release_uncommitted_ca_descriptor(
+    descriptor: int | None,
+    owned_descriptors: list[int],
+    original_count: int,
+) -> None:
+    if descriptor is None:
+        return
+    if len(owned_descriptors) > original_count:
+        owned_descriptors.pop()
+    with contextlib.suppress(OSError):
+        os.close(descriptor)
+
+
+def _acquire_owned_ca_descriptor(
+    opener: Callable[[], int],
+    owned_descriptors: list[int],
+) -> int:
+    descriptor: int | None = None
+    original_count = len(owned_descriptors)
+    try:
+        descriptor = opener()
+        owned_descriptors.append(descriptor)
+        return descriptor
+    except BaseException:
+        _release_uncommitted_ca_descriptor(
+            descriptor,
+            owned_descriptors,
+            original_count,
+        )
+        raise
+
+
 def _open_ca_directory_at(
     directory_descriptor: int,
     name: str,
     *,
     source: str,
+    owned_descriptors: list[int],
 ) -> tuple[int, os.stat_result]:
+    descriptor: int | None = None
+    original_count = len(owned_descriptors)
     try:
         before = os.stat(
             name,
@@ -11935,37 +15285,50 @@ def _open_ca_directory_at(
             _ca_nofollow_flags(directory=True),
             dir_fd=directory_descriptor,
         )
-    except ReviewError:
-        raise
-    except OSError as error:
-        raise ClaudeExecutableInspectionInconclusive(
-            f"cannot open a stable Claude review CA path directory {source}: {error}"
-        ) from error
-    try:
         opened = os.fstat(descriptor)
         _require_safe_ca_directory_metadata(opened, source=source)
+        _require_no_extended_acl(
+            descriptor,
+            label="Claude review CA path directory",
+        )
         after = os.stat(
             name,
             dir_fd=directory_descriptor,
             follow_symlinks=False,
         )
+        if _ca_source_metadata(before) != _ca_source_metadata(
+            opened
+        ) or _ca_source_metadata(opened) != _ca_source_metadata(after):
+            raise ClaudeExecutableInspectionInconclusive(
+                f"Claude review CA path directory changed while being opened: {source}"
+            )
+        owned_descriptors.append(descriptor)
+        return descriptor, opened
     except ReviewError:
-        os.close(descriptor)
+        _release_uncommitted_ca_descriptor(
+            descriptor,
+            owned_descriptors,
+            original_count,
+        )
         raise
     except OSError as error:
-        os.close(descriptor)
-        raise ClaudeExecutableInspectionInconclusive(
-            f"cannot validate a stable Claude review CA path directory {source}: "
-            f"{error}"
-        ) from error
-    if _ca_source_metadata(before) != _ca_source_metadata(
-        opened
-    ) or _ca_source_metadata(opened) != _ca_source_metadata(after):
-        os.close(descriptor)
-        raise ClaudeExecutableInspectionInconclusive(
-            f"Claude review CA path directory changed while being opened: {source}"
+        operation = "open" if descriptor is None else "validate"
+        _release_uncommitted_ca_descriptor(
+            descriptor,
+            owned_descriptors,
+            original_count,
         )
-    return descriptor, opened
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot {operation} a stable Claude review CA path directory "
+            f"{source}: {error}"
+        ) from error
+    except BaseException:
+        _release_uncommitted_ca_descriptor(
+            descriptor,
+            owned_descriptors,
+            original_count,
+        )
+        raise
 
 
 def _ca_symlink_target_components(raw_target: str) -> tuple[bool, list[str]]:
@@ -12037,13 +15400,20 @@ def _read_ca_path_at_with_size(
     seen_symlinks: set[tuple[int, int]] = set()
     symlink_count = 0
     component_count = 0
+    primary_error: BaseException | None = None
     try:
-        current_directory = os.dup(source_directory_descriptor)
-        owned_descriptors.append(current_directory)
+        current_directory = _acquire_owned_ca_descriptor(
+            lambda: os.dup(source_directory_descriptor),
+            owned_descriptors,
+        )
         source_directory_metadata = os.fstat(current_directory)
         _require_safe_ca_directory_metadata(
             source_directory_metadata,
             source=source,
+        )
+        _require_no_extended_acl(
+            current_directory,
+            label="Claude review CA path directory",
         )
         directory_records.append((current_directory, source_directory_metadata))
         _absolute, pending_components = _ca_symlink_target_components(entry_name)
@@ -12060,8 +15430,8 @@ def _read_ca_path_at_with_size(
                     current_directory,
                     "..",
                     source=source,
+                    owned_descriptors=owned_descriptors,
                 )
-                owned_descriptors.append(parent_descriptor)
                 directory_records.append((parent_descriptor, parent_metadata))
                 current_directory = parent_descriptor
                 continue
@@ -12132,11 +15502,13 @@ def _read_ca_path_at_with_size(
                         f"{source}"
                     )
                 if absolute:
-                    root_descriptor = _open_stable_ca_directory(
-                        pathlib.Path(os.sep),
-                        source=source,
+                    root_descriptor = _acquire_owned_ca_descriptor(
+                        lambda: _open_stable_ca_directory(
+                            pathlib.Path(os.sep),
+                            source=source,
+                        ),
+                        owned_descriptors,
                     )
-                    owned_descriptors.append(root_descriptor)
                     root_metadata = os.fstat(root_descriptor)
                     directory_records.append((root_descriptor, root_metadata))
                     current_directory = root_descriptor
@@ -12153,8 +15525,8 @@ def _read_ca_path_at_with_size(
                     current_directory,
                     component,
                     source=source,
+                    owned_descriptors=owned_descriptors,
                 )
-                owned_descriptors.append(next_directory)
                 directory_records.append((next_directory, next_metadata))
                 current_directory = next_directory
                 continue
@@ -12175,10 +15547,20 @@ def _read_ca_path_at_with_size(
         raise ReviewError(
             f"Claude review CA symlink does not resolve to a regular file: {source}"
         )
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
+        close_error: OSError | None = None
         for descriptor in reversed(owned_descriptors):
-            with contextlib.suppress(OSError):
+            try:
                 os.close(descriptor)
+            except OSError as error:
+                close_error = close_error or error
+        if primary_error is None and close_error is not None:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot close Claude review CA path descriptor chain: {source}"
+            ) from close_error
 
 
 def _read_ca_path_from_parent_with_size(
@@ -12189,14 +15571,24 @@ def _read_ca_path_from_parent_with_size(
 ) -> tuple[bytes, int]:
     source_directory = _open_stable_ca_directory(path.parent, source=source)
     try:
-        return _read_ca_path_at_with_size(
+        result = _read_ca_path_at_with_size(
             source_directory,
             path.name,
             source=source,
             extract_certificates=extract_certificates,
         )
-    finally:
-        os.close(source_directory)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(source_directory)
+        raise
+    else:
+        try:
+            os.close(source_directory)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot close Claude review CA source directory: {source}"
+            ) from error
+        return result
 
 
 def _read_absolute_ca_path_with_size(
@@ -12209,14 +15601,24 @@ def _read_absolute_ca_path_with_size(
         raise ReviewError(f"Claude review requires an absolute CA path: {source}")
     root_directory = _open_stable_ca_directory(pathlib.Path(os.sep), source=source)
     try:
-        return _read_ca_path_at_with_size(
+        result = _read_ca_path_at_with_size(
             root_directory,
             str(path),
             source=source,
             extract_certificates=extract_certificates,
         )
-    finally:
-        os.close(root_directory)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(root_directory)
+        raise
+    else:
+        try:
+            os.close(root_directory)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot close Claude review CA root directory: {source}"
+            ) from error
+        return result
 
 
 def _bounded_ca_directory_names(
@@ -12262,18 +15664,54 @@ def _read_ca_directory_entry_at_with_size(
 
 
 def _write_private_ca_file(path: pathlib.Path, data: bytes) -> None:
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot create a private Claude CA file"
+        ) from error
     temporary_path = pathlib.Path(temporary)
     try:
         os.fchmod(fd, 0o600)
+        metadata = os.fstat(fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o077
+        ):
+            raise ReviewError("cannot create a private Claude CA file")
+        _require_no_extended_acl(fd, label="Claude generated CA file")
         with os.fdopen(fd, "wb") as handle:
+            fd = -1
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
+    except ReviewError:
+        raise
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot write a private Claude CA file"
+        ) from error
     finally:
-        with contextlib.suppress(FileNotFoundError):
+        active_error = sys.exc_info()[0] is not None
+        cleanup_error: OSError | None = None
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError as error:
+                cleanup_error = error
+        try:
             temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            cleanup_error = cleanup_error or error
+        if cleanup_error is not None and not active_error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot clean up a private Claude CA file"
+            ) from cleanup_error
 
 
 def _validate_ca_file(path: pathlib.Path) -> None:
@@ -12283,15 +15721,769 @@ def _validate_ca_file(path: pathlib.Path) -> None:
         raise ReviewError(f"Claude review CA bundle is invalid: {path.name}") from error
 
 
-def _prepare_claude_tls_environment(
+def _classify_trust_fingerprints(
+    data: bytes,
+    *,
+    domain: str,
+) -> ClaudeTrustFingerprints:
+    label = f"Claude {domain} trust settings"
+    try:
+        payload = plistlib.loads(data, dict_type=_UniquePlistDict)
+    except (
+        _DuplicatePlistKey,
+        plistlib.InvalidFileException,
+        ValueError,
+        TypeError,
+        OverflowError,
+    ) as error:
+        raise ClaudeTrustPolicyUnavailable(f"{label} are invalid") from error
+    if not isinstance(payload, dict):
+        raise ClaudeTrustPolicyUnavailable(f"{label} have an unsupported format")
+    trust_list = payload.get("trustList")
+    if not isinstance(trust_list, dict):
+        raise ClaudeTrustPolicyUnavailable(f"{label} have an invalid trust list")
+
+    # An exact deny remains authoritative even when another entry is malformed.
+    for fingerprint, entry in trust_list.items():
+        if (
+            not isinstance(fingerprint, str)
+            or not CLAUDE_TRUST_FINGERPRINT.fullmatch(fingerprint)
+            or not isinstance(entry, dict)
+        ):
+            continue
+        settings = entry.get("trustSettings")
+        if not isinstance(settings, list):
+            continue
+        if any(
+            isinstance(setting, dict)
+            and type(setting.get(CLAUDE_TRUST_RESULT_KEY)) is int
+            and setting[CLAUDE_TRUST_RESULT_KEY] == CLAUDE_TRUST_RESULT_DENY
+            for setting in settings
+        ):
+            raise ClaudeTrustSettingsDeny(
+                f"{label} contain an explicit deny entry; refusing native Claude review"
+            )
+
+    if type(payload.get("trustVersion")) is not int or payload["trustVersion"] != 1:
+        raise ClaudeTrustPolicyUnavailable(f"{label} have an unsupported format")
+    if len(trust_list) > CLAUDE_TRUST_ENTRY_LIMIT:
+        raise ClaudeTrustPolicyUnavailable(f"{label} exceed the trust entry limit")
+    unconditional: set[str] = set()
+    trust_root: set[str] = set()
+    trust_as_root: set[str] = set()
+    constrained: set[str] = set()
+    for fingerprint, entry in trust_list.items():
+        if (
+            not isinstance(fingerprint, str)
+            or not CLAUDE_TRUST_FINGERPRINT.fullmatch(fingerprint)
+            or not isinstance(entry, dict)
+        ):
+            raise ClaudeTrustPolicyUnavailable(f"{label} contain an invalid entry")
+        normalized = fingerprint.upper()
+        if "trustSettings" not in entry:
+            raise ClaudeTrustPolicyUnavailable(f"{label} contain invalid constraints")
+        settings = entry["trustSettings"]
+        if not isinstance(settings, list):
+            raise ClaudeTrustPolicyUnavailable(f"{label} contain invalid constraints")
+        if not settings:
+            unconditional.add(normalized)
+            trust_root.add(normalized)
+            continue
+        has_unconditional_trust_root = False
+        has_unconditional_trust_as_root = False
+        for setting in settings:
+            if not isinstance(setting, dict):
+                raise ClaudeTrustPolicyUnavailable(
+                    f"{label} contain invalid constraints"
+                )
+            if "result" in setting:
+                raise ClaudeTrustPolicyUnavailable(
+                    f"{label} contain ambiguous constraints"
+                )
+            if CLAUDE_TRUST_RESULT_KEY not in setting:
+                # An empty constraints dictionary defaults to TrustRoot.
+                if not setting:
+                    has_unconditional_trust_root = True
+                continue
+            result = setting[CLAUDE_TRUST_RESULT_KEY]
+            if type(result) is not int or result not in CLAUDE_TRUST_RESULTS:
+                raise ClaudeTrustPolicyUnavailable(
+                    f"{label} contain invalid constraints"
+                )
+            if result in CLAUDE_TRUST_UNCONSTRAINED_RESULTS and set(setting) == {
+                CLAUDE_TRUST_RESULT_KEY
+            }:
+                if result == CLAUDE_TRUST_RESULT_TRUST_ROOT:
+                    has_unconditional_trust_root = True
+                else:
+                    has_unconditional_trust_as_root = True
+        if has_unconditional_trust_root or has_unconditional_trust_as_root:
+            unconditional.add(normalized)
+            if has_unconditional_trust_root:
+                trust_root.add(normalized)
+            if has_unconditional_trust_as_root:
+                trust_as_root.add(normalized)
+        else:
+            constrained.add(normalized)
+    return ClaudeTrustFingerprints(
+        unconditional=tuple(sorted(unconditional)),
+        trust_as_root=tuple(sorted(trust_as_root)),
+        constrained=tuple(sorted(constrained)),
+        trust_root=tuple(sorted(trust_root)),
+    )
+
+
+def _select_trust_certificates(
+    materials: Iterable[tuple[str, bytes | bytearray]],
+    fingerprints: Iterable[str],
+    *,
+    ca_root: pathlib.Path,
+    trust_as_root_fingerprints: Iterable[str] = (),
+    trust_root_fingerprints: Iterable[str] | None = None,
+) -> ClaudeSelectedTrustMaterial:
+    deadline = time.monotonic() + CLAUDE_TRUST_ROOT_VERIFY_TOTAL_SECONDS
+
+    def require_time_remaining() -> None:
+        now = time.monotonic()
+        if now >= deadline:
+            raise ReviewTimeoutError(
+                "Claude additional trust root verification exceeded its deadline"
+            )
+
+    requested = tuple(fingerprints)
+    requested_set = set(requested)
+    trust_as_root = set(trust_as_root_fingerprints)
+    trust_root = (
+        requested_set - trust_as_root
+        if trust_root_fingerprints is None
+        else set(trust_root_fingerprints)
+    )
+    if not trust_as_root.issubset(requested_set) or not trust_root.issubset(
+        requested_set
+    ):
+        raise ValueError("trust fingerprints must be selected trust anchors")
+    if trust_root | trust_as_root != requested_set:
+        raise ValueError("every selected trust anchor requires an authorization")
+    if len(requested) > CLAUDE_ADDITIONAL_TRUST_ROOT_LIMIT:
+        raise ClaudeTrustPolicyUnavailable(
+            "Claude additional trust roots exceed the verification limit"
+        )
+    certificates: dict[str, bytes] = {}
+    for source, data in materials:
+        if not data:
+            require_time_remaining()
+            continue
+        try:
+            normalized = _extract_ca_certificates(bytes(data), source=source)
+        except ReviewError:
+            require_time_remaining()
+            raise
+        require_time_remaining()
+        for block in CLAUDE_CERTIFICATE_BLOCK.findall(normalized):
+            try:
+                der, canonical = _canonical_ca_certificate(block, source=source)
+            except ReviewError:
+                require_time_remaining()
+                raise
+            require_time_remaining()
+            fingerprint = (
+                hashlib.sha1(
+                    der,
+                    usedforsecurity=False,
+                )
+                .hexdigest()
+                .upper()
+            )
+            existing = certificates.get(fingerprint)
+            if existing is not None and existing != canonical:
+                require_time_remaining()
+                raise ClaudeTrustPolicyUnavailable(
+                    "Claude trust certificates contain a fingerprint collision"
+                )
+            certificates[fingerprint] = canonical
+    selected: list[bytes] = []
+    omitted: set[str] = set()
+    for fingerprint in requested:
+        canonical = certificates.get(fingerprint)
+        if canonical is None:
+            require_time_remaining()
+            omitted.add(fingerprint)
+            continue
+        require_time_remaining()
+        try:
+            der, _ = _canonical_ca_certificate(
+                canonical,
+                source="Claude trust certificates",
+            )
+        except ReviewError:
+            require_time_remaining()
+            raise
+        require_time_remaining()
+        authorized = False
+        for allow_non_self_signed in ((False,) if fingerprint in trust_root else ()) + (
+            (True,) if fingerprint in trust_as_root else ()
+        ):
+            require_time_remaining()
+            try:
+                _verify_unconditional_trust_root(
+                    der,
+                    canonical,
+                    ca_root=ca_root,
+                    deadline=deadline,
+                    allow_non_self_signed=allow_non_self_signed,
+                )
+            except ClaudeTrustCertificateInvalid:
+                require_time_remaining()
+                continue
+            except ReviewError:
+                require_time_remaining()
+                raise
+            require_time_remaining()
+            authorized = True
+            break
+        if not authorized:
+            require_time_remaining()
+            omitted.add(fingerprint)
+            continue
+        selected.append(canonical)
+    require_time_remaining()
+    selected_material = ClaudeSelectedTrustMaterial(
+        certificates=b"".join(selected),
+        omitted_sha1_fingerprints=frozenset(omitted),
+    )
+    require_time_remaining()
+    return selected_material
+
+
+def _is_no_trust_settings(detail: str) -> bool:
+    lines = [line.strip() for line in detail.splitlines() if line.strip()]
+    return any(
+        lines in ([message], [f"security: {message}"])
+        for message in CLAUDE_TRUST_NO_SETTINGS
+    )
+
+
+@contextlib.contextmanager
+def _managed_claude_trust_export_path(path: pathlib.Path) -> Iterator[None]:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude trust export path could not be prepared"
+        ) from error
+    try:
+        yield
+    except BaseException:
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
+        raise
+    else:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude trust export path could not be cleaned"
+            ) from error
+
+
+def _read_claude_trust_domain(
+    client: pathlib.Path,
+    security_env: dict[str, str],
+    ca_root: pathlib.Path,
+    *,
+    domain: str,
+    options: tuple[str, ...],
+) -> ClaudeTrustFingerprints | None:
+    trust_path = ca_root / f".{domain}-trust.plist"
+    with _managed_claude_trust_export_path(trust_path):
+        try:
+            completed = run_bounded_capture(
+                (
+                    str(client),
+                    "trust-settings-export",
+                    *options,
+                    str(trust_path),
+                ),
+                cwd=ca_root,
+                env=security_env,
+                timeout_seconds=CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS,
+                stdout_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+                stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+                regular_file_limit_bytes=CLAUDE_TRUST_SETTINGS_LIMIT_BYTES,
+                regular_file_limit_path=trust_path,
+            )
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude TLS trust export tooling could not be inspected"
+            ) from error
+        try:
+            detail = (
+                (bytes(completed.stdout) + bytes(completed.stderr))
+                .decode("utf-8", errors="replace")
+                .strip()
+            )
+            if completed.returncode != 0:
+                if completed.returncode == 1 and _is_no_trust_settings(detail):
+                    return None
+                raise ClaudeExecutableInspectionInconclusive(
+                    f"Claude {domain} trust export failed inconclusively"
+                )
+        finally:
+            completed.stdout[:] = b"\x00" * len(completed.stdout)
+            completed.stderr[:] = b"\x00" * len(completed.stderr)
+        trust_data = _read_bounded_owner_file(
+            trust_path,
+            source=domain,
+            limit_bytes=CLAUDE_TRUST_SETTINGS_LIMIT_BYTES,
+            label="Claude trust export",
+        )
+        return _classify_trust_fingerprints(trust_data, domain=domain)
+
+
+def _require_claude_trust_export_tool(
+    review: ReviewWorkspace,
+    ca_root: pathlib.Path,
+) -> tuple[pathlib.Path, dict[str, str]]:
+    client = CLAUDE_KEYCHAIN_CLIENT
+    try:
+        client_metadata = client.stat()
+    except FileNotFoundError as error:
+        raise ClaudeTrustToolUnavailable(
+            "Claude TLS setup requires Apple's security trust export tool"
+        ) from error
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot inspect Apple's security trust export tool"
+        ) from error
+    if not stat.S_ISREG(client_metadata.st_mode) or not (
+        client_metadata.st_mode & 0o111
+    ):
+        raise ClaudeTrustToolUnavailable(
+            "Claude TLS setup requires Apple's security trust export tool"
+        )
+    security_env = child_environment(container_dir=review.container_dir)
+    security_env.update({"LANG": "C", "LC_ALL": "C"})
+    try:
+        completed = run_bounded_capture(
+            (str(client), "help", "trust-settings-export"),
+            cwd=ca_root,
+            env=security_env,
+            timeout_seconds=CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS,
+            stdout_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+            stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+        )
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude TLS trust export tooling could not be inspected"
+        ) from error
+    try:
+        detail = (bytes(completed.stdout) + b"\n" + bytes(completed.stderr)).decode(
+            "utf-8",
+            errors="replace",
+        )
+    finally:
+        completed.stdout[:] = b"\x00" * len(completed.stdout)
+        completed.stderr[:] = b"\x00" * len(completed.stderr)
+    normalized_lines = tuple(
+        normalized
+        for line in detail.splitlines()
+        if (normalized := " ".join(line.split()))
+    )
+    if completed.returncode != 0:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude TLS trust export capability probe failed inconclusively"
+        )
+    if normalized_lines not in CLAUDE_TRUST_EXPORT_HELP_VARIANTS:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude TLS trust export capability output was inconclusive"
+        )
+    return client, security_env
+
+
+def _new_claude_trust_policy_evidence(
+    executable_evidence: ClaudeExecutableTrustEvidence,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "generation": secrets.token_hex(16),
+        "policy": "require-publisher-verified-bundled-root-subset",
+        "status": "checking",
+        "executable_sha256": executable_evidence.executable_sha256,
+        "bundled_root_count": len(executable_evidence.bundled_root_sha256_fingerprints),
+        "bundled_root_set_sha256": executable_evidence.bundled_root_set_sha256,
+        "bundled_root_resolution": "pending",
+        "bundled_root_excluded_count": 0,
+        "domains": [],
+        "distinct_unconditional_count": 0,
+        "distinct_constrained_omitted_count": 0,
+        "additional_unconditional_candidate_count": 0,
+        "additional_root_resolution": "not-started",
+        "additional_unconditional_included_count": 0,
+        "additional_unconditional_omitted_count": 0,
+    }
+
+
+def _write_claude_trust_policy_evidence(
+    review: ReviewWorkspace,
+    evidence: dict[str, object],
+) -> None:
+    try:
+        write_json(
+            review.container_dir / CLAUDE_TRUST_POLICY_EVIDENCE_NAME,
+            evidence,
+        )
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude trust policy evidence write was inconclusive"
+        ) from error
+
+
+def _terminalize_claude_trust_policy_evidence(
+    review: ReviewWorkspace,
+    evidence: dict[str, object],
+    *,
+    status: str,
+    unresolved_resolution: str,
+    primary_error: BaseException | None = None,
+) -> None:
+    evidence["status"] = status
+    for key in ("bundled_root_resolution", "additional_root_resolution"):
+        if evidence.get(key) in {"not-started", "pending"}:
+            evidence[key] = unresolved_resolution
+    try:
+        _write_claude_trust_policy_evidence(review, evidence)
+    except (OSError, ClaudeExecutableInspectionInconclusive):
+        if primary_error is None:
+            raise
+        _attach_claude_trust_evidence_write_failure(primary_error)
+    else:
+        if primary_error is not None:
+            _clear_claude_trust_evidence_write_failure(primary_error)
+
+
+def _read_claude_trust_certificates(
+    review: ReviewWorkspace,
+    ca_root: pathlib.Path,
+    *,
+    evidence: dict[str, object],
+) -> ClaudeTrustMaterial:
+    try:
+        material = _read_claude_trust_certificates_impl(
+            review,
+            ca_root,
+            evidence=evidence,
+        )
+    except ClaudeTrustSettingsDeny as error:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="denied",
+            unresolved_resolution="blocked",
+            primary_error=error,
+        )
+        raise
+    except ClaudeTrustPolicyUnavailable as error:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="blocked",
+            unresolved_resolution="blocked",
+            primary_error=error,
+        )
+        raise
+    except ClaudeTrustToolUnavailable as error:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="unavailable",
+            unresolved_resolution="unavailable",
+            primary_error=error,
+        )
+        raise
+    except ClaudeExecutableInspectionInconclusive as error:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="inconclusive",
+            unresolved_resolution="inconclusive",
+            primary_error=error,
+        )
+        raise
+    except ReviewOutputLimitError as error:
+        if error.limit_kind == "regular-file":
+            failure = ClaudeTrustPolicyUnavailable(
+                "Claude trust policy exceeds the inspection limit"
+            )
+            failure.__cause__ = error
+            _terminalize_claude_trust_policy_evidence(
+                review,
+                evidence,
+                status="blocked",
+                unresolved_resolution="blocked",
+                primary_error=failure,
+            )
+            raise failure
+        failure = ClaudeExecutableInspectionInconclusive(
+            "Claude trust export stream exceeded the inspection limit"
+        )
+        failure.__cause__ = error
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="inconclusive",
+            unresolved_resolution="inconclusive",
+            primary_error=failure,
+        )
+        raise failure
+    except (
+        ReviewTimeoutError,
+        ReviewOutputDrainError,
+        ReviewProcessLeakError,
+    ) as error:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="inconclusive",
+            unresolved_resolution="inconclusive",
+            primary_error=error,
+        )
+        raise
+    except ReviewError as error:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="blocked",
+            unresolved_resolution="blocked",
+            primary_error=error,
+        )
+        raise
+    except BaseException as error:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="inconclusive",
+            unresolved_resolution="inconclusive",
+            primary_error=error,
+        )
+        raise
+    _write_claude_trust_policy_evidence(review, evidence)
+    return material
+
+
+def _read_claude_trust_certificates_impl(
+    review: ReviewWorkspace,
+    ca_root: pathlib.Path,
+    *,
+    evidence: dict[str, object],
+) -> ClaudeTrustMaterial:
+    client, security_env = _require_claude_trust_export_tool(review, ca_root)
+    unconditional: set[str] = set()
+    additional_unconditional: set[str] = set()
+    additional_trust_root: set[str] = set()
+    additional_trust_as_root: set[str] = set()
+    constrained: set[str] = set()
+    domain_evidence: list[dict[str, object]] = []
+    deferred_error: tuple[int, ReviewError] | None = None
+
+    def defer_error(priority: int, error: ReviewError) -> None:
+        nonlocal deferred_error
+        if deferred_error is None or priority > deferred_error[0]:
+            deferred_error = (priority, error)
+
+    def refresh_counts() -> None:
+        effective = additional_unconditional - constrained
+        evidence.update(
+            {
+                "domains": list(domain_evidence),
+                "distinct_unconditional_count": len(unconditional),
+                "distinct_constrained_omitted_count": len(constrained),
+                "additional_unconditional_candidate_count": len(effective),
+            }
+        )
+
+    def record_domain_failure(domain: str, status: str) -> None:
+        domain_evidence.append(
+            {
+                "domain": domain,
+                "status": status,
+                "unconditional_count": 0,
+                "constrained_omitted_count": 0,
+            }
+        )
+        refresh_counts()
+
+    for domain, options in CLAUDE_TRUST_DOMAINS:
+        try:
+            classified = _read_claude_trust_domain(
+                client,
+                security_env,
+                ca_root,
+                domain=domain,
+                options=options,
+            )
+            if classified is None:
+                domain_evidence.append(
+                    {
+                        "domain": domain,
+                        "status": "no-settings",
+                        "unconditional_count": 0,
+                        "constrained_omitted_count": 0,
+                    }
+                )
+                refresh_counts()
+                continue
+            # Domains are ordered from highest to lowest precedence.
+            resolved = additional_unconditional | constrained
+            domain_unconditional = set(classified.unconditional) - resolved
+            domain_constrained = (
+                set(classified.constrained) - resolved - domain_unconditional
+            )
+            unconditional.update(domain_unconditional)
+            additional_unconditional.update(domain_unconditional)
+            classified_trust_root = set(classified.trust_root) | (
+                set(classified.unconditional) - set(classified.trust_as_root)
+            )
+            additional_trust_root.update(classified_trust_root & domain_unconditional)
+            additional_trust_as_root.update(
+                set(classified.trust_as_root) & domain_unconditional
+            )
+            constrained.update(domain_constrained)
+            domain_evidence.append(
+                {
+                    "domain": domain,
+                    "status": "exported",
+                    "unconditional_count": len(classified.unconditional),
+                    "constrained_omitted_count": len(classified.constrained),
+                }
+            )
+            refresh_counts()
+        except ClaudeTrustSettingsDeny:
+            domain_evidence.append(
+                {
+                    "domain": domain,
+                    "status": "denied",
+                    "unconditional_count": 0,
+                    "constrained_omitted_count": 0,
+                }
+            )
+            refresh_counts()
+            raise
+        except ClaudeTrustToolUnavailable as error:
+            record_domain_failure(domain, "unavailable")
+            defer_error(0, error)
+        except ClaudeExecutableInspectionInconclusive as error:
+            record_domain_failure(domain, "inconclusive")
+            defer_error(1, error)
+        except (
+            ReviewTimeoutError,
+            ReviewOutputDrainError,
+            ReviewProcessLeakError,
+        ) as error:
+            record_domain_failure(domain, "inconclusive")
+            defer_error(1, error)
+        except ReviewOutputLimitError as error:
+            if error.limit_kind == "regular-file":
+                record_domain_failure(domain, "blocked")
+                failure = ClaudeTrustPolicyUnavailable(
+                    f"Claude {domain} trust export exceeds the inspection limit"
+                )
+                failure.__cause__ = error
+                defer_error(
+                    2,
+                    failure,
+                )
+            else:
+                record_domain_failure(domain, "inconclusive")
+                failure = ClaudeExecutableInspectionInconclusive(
+                    f"Claude {domain} trust export stream exceeded the inspection limit"
+                )
+                failure.__cause__ = error
+                defer_error(
+                    1,
+                    failure,
+                )
+        except ReviewError as error:
+            record_domain_failure(domain, "blocked")
+            defer_error(2, error)
+
+    if deferred_error is not None:
+        raise deferred_error[1]
+    effective_unconditional = additional_unconditional - constrained
+    effective_trust_root = additional_trust_root & effective_unconditional
+    effective_trust_as_root = additional_trust_as_root & effective_unconditional
+    evidence["additional_root_resolution"] = (
+        "pending" if effective_unconditional else "not-required"
+    )
+    if not effective_unconditional:
+        return ClaudeTrustMaterial(
+            certificates=b"",
+            excluded_sha1_fingerprints=frozenset(constrained),
+            evidence=evidence,
+        )
+
+    completed_exports: list[tuple[str, Any]] = []
+    try:
+        for source, arguments in CLAUDE_TRUST_CERTIFICATE_SOURCES:
+            try:
+                completed = run_bounded_capture(
+                    (
+                        str(client),
+                        "find-certificate",
+                        "-a",
+                        "-p",
+                        *arguments,
+                    ),
+                    cwd=ca_root,
+                    env=security_env,
+                    timeout_seconds=CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS,
+                    stdout_limit_bytes=CLAUDE_CA_FILE_LIMIT_BYTES,
+                    stderr_limit_bytes=CLAUDE_KEYCHAIN_BROKER_OUTPUT_LIMIT_BYTES,
+                )
+            except OSError as error:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude trust certificate export tooling could not be inspected"
+                ) from error
+            completed_exports.append((source, completed))
+            if completed.returncode != 0:
+                raise ClaudeExecutableInspectionInconclusive(
+                    f"Claude {source} certificate export failed inconclusively"
+                )
+        selected = _select_trust_certificates(
+            ((source, completed.stdout) for source, completed in completed_exports),
+            sorted(effective_unconditional),
+            ca_root=ca_root,
+            trust_as_root_fingerprints=sorted(effective_trust_as_root),
+            trust_root_fingerprints=sorted(effective_trust_root),
+        )
+        evidence["additional_root_resolution"] = "complete"
+        evidence["additional_unconditional_included_count"] = len(
+            effective_unconditional
+        ) - len(selected.omitted_sha1_fingerprints)
+        evidence["additional_unconditional_omitted_count"] = len(
+            selected.omitted_sha1_fingerprints
+        )
+        return ClaudeTrustMaterial(
+            certificates=selected.certificates,
+            excluded_sha1_fingerprints=frozenset(
+                constrained | selected.omitted_sha1_fingerprints
+            ),
+            evidence=evidence,
+        )
+    finally:
+        for _source, completed in completed_exports:
+            completed.stdout[:] = b"\x00" * len(completed.stdout)
+            completed.stderr[:] = b"\x00" * len(completed.stderr)
+
+
+def _snapshot_claude_tls_environment(
     review: ReviewWorkspace,
     env: dict[str, str],
-) -> dict[str, str]:
+    *,
+    ca_root: pathlib.Path,
+) -> tuple[dict[str, str], dict[str, bytes]]:
     result = dict(env)
-    ca_root = review.container_dir / "claude-ca"
-    ca_root.mkdir(mode=0o700, exist_ok=True)
-    if ca_root.is_symlink() or not ca_root.is_dir():
-        raise ReviewError("Claude review CA directory is not a real directory")
+    snapshots: dict[str, bytes] = {}
+    _require_private_claude_ca_root(ca_root)
     for key in CLAUDE_TLS_FILE_ENV_KEYS:
         raw = result.get(key)
         if not raw:
@@ -12300,12 +16492,11 @@ def _prepare_claude_tls_environment(
         if not source_path.is_absolute():
             raise ReviewError(f"Claude review requires valid absolute {key}")
         destination = ca_root / f"{key.lower()}.pem"
-        _write_private_ca_file(
-            destination,
-            _read_ca_source(source_path, source=key),
-        )
+        material = _read_ca_source(source_path, source=key)
+        _write_private_ca_file(destination, material)
         _validate_ca_file(destination)
         result[key] = str(destination)
+        snapshots[str(destination)] = material
 
     for key in CLAUDE_TLS_DIR_ENV_KEYS:
         raw_entries = [
@@ -12313,9 +16504,14 @@ def _prepare_claude_tls_environment(
         ]
         if not raw_entries:
             continue
-        destination_root = pathlib.Path(
-            tempfile.mkdtemp(prefix=f"{key.lower()}-", dir=ca_root)
-        )
+        try:
+            destination_root = pathlib.Path(
+                tempfile.mkdtemp(prefix=f"{key.lower()}-", dir=ca_root)
+            )
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot prepare Claude review {key} workspace"
+            ) from error
         prepared_dirs: list[pathlib.Path] = []
         total_size = 0
         entry_count = 0
@@ -12326,75 +16522,963 @@ def _prepare_claude_tls_environment(
                     f"Claude review requires valid absolute {key} entries"
                 )
             destination_dir = destination_root / f"{index:04d}"
-            destination_dir.mkdir(mode=0o700)
+            try:
+                destination_dir.mkdir(mode=0o700)
+            except OSError as error:
+                raise ClaudeExecutableInspectionInconclusive(
+                    f"cannot prepare Claude review {key} directory"
+                ) from error
             copied = False
             source_directory = _open_stable_ca_directory(source_dir, source=key)
             try:
-                directory_before = os.fstat(source_directory)
-                remaining_entries = CLAUDE_CA_DIR_ENTRY_LIMIT - entry_count
-                source_names = _bounded_ca_directory_names(
-                    source_directory,
-                    remaining_entries,
-                    too_many_message=(
-                        "Claude review CA directory has too many entries"
-                    ),
-                )
-                entry_count += len(source_names)
-                for source_name in source_names:
-                    try:
-                        entry_metadata = os.stat(
-                            source_name,
-                            dir_fd=source_directory,
-                            follow_symlinks=False,
-                        )
-                    except OSError as error:
-                        raise ClaudeExecutableInspectionInconclusive(
-                            f"cannot inspect Claude review CA directory entry: {error}"
-                        ) from error
-                    if stat.S_ISDIR(entry_metadata.st_mode):
-                        continue
-                    raw_material, source_size = _read_ca_directory_entry_at_with_size(
+                try:
+                    directory_before = os.fstat(source_directory)
+                    remaining_entries = CLAUDE_CA_DIR_ENTRY_LIMIT - entry_count
+                    source_names = _bounded_ca_directory_names(
                         source_directory,
-                        source_name,
-                        entry_metadata,
-                        source=f"{key}:{source_name}",
+                        remaining_entries,
+                        too_many_message=(
+                            "Claude review CA directory has too many entries"
+                        ),
+                    )
+                    entry_count += len(source_names)
+                    for source_name in source_names:
+                        try:
+                            entry_metadata = os.stat(
+                                source_name,
+                                dir_fd=source_directory,
+                                follow_symlinks=False,
+                            )
+                        except OSError as error:
+                            raise ClaudeExecutableInspectionInconclusive(
+                                "cannot inspect Claude review CA directory entry: "
+                                f"{error}"
+                            ) from error
+                        if stat.S_ISDIR(entry_metadata.st_mode):
+                            continue
+                        raw_material, source_size = (
+                            _read_ca_directory_entry_at_with_size(
+                                source_directory,
+                                source_name,
+                                entry_metadata,
+                                source=f"{key}:{source_name}",
+                                extract_certificates=False,
+                            )
+                        )
+                        total_size += source_size
+                        if total_size > CLAUDE_CA_DIR_LIMIT_BYTES:
+                            raise ReviewError(
+                                "Claude review CA directory exceeds the size limit"
+                            )
+                        try:
+                            material = _extract_ca_certificates(
+                                raw_material,
+                                source=f"{key}:{source_name}",
+                            )
+                        except ClaudeCACertificateNotFound:
+                            continue
+                        destination = destination_dir / source_name
+                        _write_private_ca_file(destination, material)
+                        _validate_ca_file(destination)
+                        snapshots[str(destination)] = material
+                        copied = True
+                    directory_after = os.fstat(source_directory)
+                    if _ca_source_metadata(directory_before) != _ca_source_metadata(
+                        directory_after
+                    ):
+                        raise ClaudeExecutableInspectionInconclusive(
+                            "Claude review CA directory changed while being read"
+                        )
+                except OSError as error:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        f"cannot inspect Claude review CA directory {key}"
+                    ) from error
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.close(source_directory)
+                raise
+            else:
+                try:
+                    os.close(source_directory)
+                except OSError as error:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        f"cannot close Claude review CA directory {key}"
+                    ) from error
+            if copied:
+                prepared_dirs.append(destination_dir)
+            else:
+                try:
+                    destination_dir.rmdir()
+                except OSError as error:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        f"cannot clean up Claude review {key} directory"
+                    ) from error
+        if not prepared_dirs:
+            raise ReviewError("Claude review CA directory contains no PEM certificates")
+        result[key] = os.pathsep.join(str(path) for path in prepared_dirs)
+    return result, snapshots
+
+
+def _prepare_claude_generic_tls_environment(
+    review: ReviewWorkspace,
+    env: dict[str, str],
+    *,
+    expected_snapshot_sha256: tuple[tuple[str, int, str, str], ...] | None = None,
+) -> dict[str, str]:
+    try:
+        result, snapshots = _snapshot_claude_tls_environment(
+            review,
+            env,
+            ca_root=review.container_dir / "claude-ca",
+        )
+    except ClaudeExecutableInspectionInconclusive:
+        raise
+    except ReviewError as error:
+        if expected_snapshot_sha256 is None:
+            raise
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy TLS snapshot changed between attempts"
+        ) from error
+    if expected_snapshot_sha256 is not None:
+        _require_matching_claude_tls_snapshot(
+            expected_snapshot_sha256,
+            _claude_tls_snapshot_sha256(result, snapshots),
+        )
+    return result
+
+
+def _claude_tls_snapshot_sha256(
+    env: dict[str, str],
+    snapshot_material: dict[str, bytes],
+) -> tuple[tuple[str, int, str, str], ...]:
+    bindings: list[tuple[str, int, str, str]] = []
+    consumed: set[str] = set()
+    for key in CLAUDE_TLS_FILE_ENV_KEYS:
+        raw = env.get(key)
+        if not raw:
+            continue
+        material = snapshot_material.get(raw)
+        if material is None:
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude TLS file snapshot binding is incomplete"
+            )
+        bindings.append((key, -1, "", hashlib.sha256(material).hexdigest()))
+        consumed.add(raw)
+    for key in CLAUDE_TLS_DIR_ENV_KEYS:
+        for index, raw in enumerate(
+            entry for entry in env.get(key, "").split(os.pathsep) if entry
+        ):
+            directory = pathlib.Path(raw)
+            entries = sorted(
+                (
+                    pathlib.Path(path).name,
+                    path,
+                    material,
+                )
+                for path, material in snapshot_material.items()
+                if pathlib.Path(path).parent == directory
+            )
+            if not entries:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude TLS directory snapshot binding is incomplete"
+                )
+            for name, path, material in entries:
+                bindings.append(
+                    (key, index, name, hashlib.sha256(material).hexdigest())
+                )
+                consumed.add(path)
+    if consumed != set(snapshot_material):
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude TLS snapshot binding contains unexpected material"
+        )
+    return tuple(sorted(bindings))
+
+
+def _require_matching_claude_tls_snapshot(
+    expected: tuple[tuple[str, int, str, str], ...],
+    current: tuple[tuple[str, int, str, str], ...],
+) -> None:
+    if len(expected) != len(current):
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy TLS snapshot changed between attempts"
+        )
+    for expected_entry, current_entry in zip(expected, current, strict=True):
+        if expected_entry[:3] != current_entry[:3] or not hmac.compare_digest(
+            expected_entry[3],
+            current_entry[3],
+        ):
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude proxy TLS snapshot changed between attempts"
+            )
+
+
+def _read_claude_tls_snapshot_material(env: dict[str, str]) -> dict[str, bytes]:
+    snapshots: dict[str, bytes] = {}
+    total_size = 0
+    for key in CLAUDE_TLS_FILE_ENV_KEYS:
+        raw = env.get(key)
+        if not raw:
+            continue
+        path = pathlib.Path(raw)
+        material, source_size = _read_ca_source_with_size(
+            path,
+            source=key,
+            extract_certificates=False,
+        )
+        total_size += source_size
+        if total_size > CLAUDE_CA_DIR_LIMIT_BYTES:
+            raise ReviewError("Claude TLS snapshot exceeds the size limit")
+        snapshots[str(path)] = material
+
+    entry_count = 0
+    for key in CLAUDE_TLS_DIR_ENV_KEYS:
+        for raw in (entry for entry in env.get(key, "").split(os.pathsep) if entry):
+            directory = pathlib.Path(raw)
+            descriptor = _open_stable_ca_directory(directory, source=key)
+            try:
+                before = os.fstat(descriptor)
+                names = _bounded_ca_directory_names(
+                    descriptor,
+                    CLAUDE_CA_DIR_ENTRY_LIMIT - entry_count,
+                    too_many_message="Claude TLS snapshot has too many entries",
+                )
+                entry_count += len(names)
+                for name in names:
+                    metadata = os.stat(
+                        name,
+                        dir_fd=descriptor,
+                        follow_symlinks=False,
+                    )
+                    if not stat.S_ISREG(metadata.st_mode):
+                        raise ClaudeExecutableInspectionInconclusive(
+                            "Claude proxy TLS snapshot directory changed between "
+                            "attempts"
+                        )
+                    material, source_size = _read_ca_source_at_with_size(
+                        descriptor,
+                        name,
+                        source=f"{key}:{name}",
                         extract_certificates=False,
                     )
                     total_size += source_size
                     if total_size > CLAUDE_CA_DIR_LIMIT_BYTES:
-                        raise ReviewError(
-                            "Claude review CA directory exceeds the size limit"
-                        )
-                    try:
-                        material = _extract_ca_certificates(
-                            raw_material,
-                            source=f"{key}:{source_name}",
-                        )
-                    except ReviewError as error:
-                        if "contains no PEM certificate" in str(error):
-                            continue
-                        raise
-                    destination = destination_dir / source_name
-                    _write_private_ca_file(destination, material)
-                    _validate_ca_file(destination)
-                    copied = True
-                directory_after = os.fstat(source_directory)
-                if _ca_source_metadata(directory_before) != _ca_source_metadata(
-                    directory_after
-                ):
+                        raise ReviewError("Claude TLS snapshot exceeds the size limit")
+                    snapshots[str(directory / name)] = material
+                after = os.fstat(descriptor)
+                if _ca_source_metadata(before) != _ca_source_metadata(after):
                     raise ClaudeExecutableInspectionInconclusive(
-                        "Claude review CA directory changed while being read"
+                        "Claude proxy TLS snapshot directory changed between attempts"
                     )
+            except OSError as error:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "cannot verify Claude proxy TLS snapshot directory"
+                ) from error
             finally:
-                os.close(source_directory)
-            if copied:
-                prepared_dirs.append(destination_dir)
-            else:
-                destination_dir.rmdir()
-        if not prepared_dirs:
-            raise ReviewError("Claude review CA directory contains no PEM certificates")
-        result[key] = os.pathsep.join(str(path) for path in prepared_dirs)
+                try:
+                    os.close(descriptor)
+                except OSError as error:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        "cannot close Claude proxy TLS snapshot directory"
+                    ) from error
+    return snapshots
+
+
+def _verify_claude_proxy_tls_snapshot(
+    env: dict[str, str],
+    expected: tuple[tuple[str, int, str, str], ...],
+) -> None:
+    try:
+        current = _claude_tls_snapshot_sha256(
+            env,
+            _read_claude_tls_snapshot_material(env),
+        )
+    except ClaudeExecutableInspectionInconclusive:
+        raise
+    except ReviewError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy TLS snapshot changed between attempts"
+        ) from error
+    _require_matching_claude_tls_snapshot(expected, current)
+
+
+def _prepare_claude_proxy_tls_environment(
+    review: ReviewWorkspace,
+    env: dict[str, str],
+) -> tuple[
+    dict[str, str],
+    ssl.SSLContext | None,
+    tuple[tuple[str, int, str, str], ...],
+]:
+    result, snapshots = _snapshot_claude_tls_environment(
+        review,
+        env,
+        ca_root=review.container_dir / "claude-proxy-ca",
+    )
+    snapshot_sha256 = _claude_tls_snapshot_sha256(result, snapshots)
+    context = (
+        _proxy_ssl_context(result, snapshot_material=snapshots)
+        if _claude_https_proxy_tls_required(result)
+        else None
+    )
+    return result, context, snapshot_sha256
+
+
+def _claude_proxy_tls_environment(
+    review: ReviewWorkspace,
+    env: dict[str, str],
+    *,
+    trust_state: ClaudeTrustSessionState,
+) -> tuple[dict[str, str], ssl.SSLContext | None]:
+    if trust_state.proxy_tls_env is None:
+        (
+            trust_state.proxy_tls_env,
+            trust_state.proxy_ssl_context,
+            trust_state.proxy_tls_snapshot_sha256,
+        ) = _prepare_claude_proxy_tls_environment(
+            review,
+            env,
+        )
+    else:
+        if trust_state.proxy_tls_snapshot_sha256 is None:
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude proxy TLS snapshot binding is unavailable"
+            )
+        _verify_claude_proxy_tls_snapshot(
+            trust_state.proxy_tls_env,
+            trust_state.proxy_tls_snapshot_sha256,
+        )
+    if (
+        _claude_https_proxy_tls_required(trust_state.proxy_tls_env)
+        and trust_state.proxy_ssl_context is None
+    ):
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy TLS context is unavailable"
+        )
+    return dict(trust_state.proxy_tls_env), trust_state.proxy_ssl_context
+
+
+def _with_claude_tls_snapshot_inputs(
+    env: dict[str, str],
+    snapshot_env: dict[str, str],
+) -> dict[str, str]:
+    result = dict(env)
+    for key in (*CLAUDE_TLS_FILE_ENV_KEYS, *CLAUDE_TLS_DIR_ENV_KEYS):
+        value = snapshot_env.get(key)
+        if value:
+            result[key] = value
+        else:
+            result.pop(key, None)
     return result
+
+
+def _require_private_claude_ca_root(path: pathlib.Path) -> None:
+    try:
+        path.mkdir(mode=0o700, exist_ok=True)
+    except OSError as error:
+        try:
+            existing = path.lstat()
+        except OSError:
+            existing = None
+        if existing is not None and (
+            not stat.S_ISDIR(existing.st_mode)
+            or existing.st_uid != os.geteuid()
+            or existing.st_mode & 0o077
+        ):
+            raise ReviewError("Claude review CA directory has unsafe metadata")
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot prepare Claude review CA directory"
+        ) from error
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory_flag is None:
+        raise ReviewError("Claude CA workspace requires descriptor-safe directories")
+    try:
+        before = path.lstat()
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot inspect Claude review CA directory"
+        ) from error
+    if (
+        not stat.S_ISDIR(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or before.st_mode & 0o077
+    ):
+        raise ReviewError("Claude review CA directory has unsafe metadata")
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | nofollow | directory_flag,
+        )
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot open Claude review CA directory"
+        ) from error
+    try:
+        try:
+            opened = os.fstat(descriptor)
+            after = path.lstat()
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot inspect Claude review CA directory"
+            ) from error
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or opened.st_mode & 0o077
+            or _ca_source_metadata(before) != _ca_source_metadata(opened)
+            or _ca_source_metadata(opened) != _ca_source_metadata(after)
+        ):
+            raise ReviewError("Claude review CA directory has unsafe metadata")
+        _require_no_extended_acl(descriptor, label="Claude review CA directory")
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        raise
+    else:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot close Claude review CA directory"
+            ) from error
+
+
+def _write_private_ca_snapshot(path: pathlib.Path, data: bytes) -> None:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+    except FileExistsError as error:
+        raise ReviewError(
+            "Claude caller CA snapshot already exists before trust binding"
+        ) from error
+    except OSError as error:
+        try:
+            existing = path.lstat()
+        except OSError:
+            existing = None
+        if existing is not None and (
+            not stat.S_ISREG(existing.st_mode)
+            or existing.st_uid != os.geteuid()
+            or existing.st_nlink != 1
+            or existing.st_mode & 0o077
+        ):
+            raise ReviewError("caller CA snapshot has unsafe metadata")
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot create immutable caller CA snapshot"
+        ) from error
+    published = False
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o077
+        ):
+            raise ReviewError("caller CA snapshot has unsafe metadata")
+        _require_no_extended_acl(descriptor, label="Claude caller CA snapshot")
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        published = True
+    except ReviewError:
+        raise
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot write immutable caller CA snapshot"
+        ) from error
+    finally:
+        active_error = sys.exc_info()[0] is not None
+        cleanup_error: OSError | None = None
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                cleanup_error = error
+        if not published:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as error:
+                cleanup_error = cleanup_error or error
+        if cleanup_error is not None and not active_error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot clean up immutable caller CA snapshot"
+            ) from cleanup_error
+
+
+def _read_claude_caller_ca_snapshot(path: pathlib.Path) -> bytes:
+    data = _read_bounded_owner_file(
+        path,
+        source="caller CA snapshot",
+        limit_bytes=CLAUDE_CALLER_CA_SNAPSHOT_LIMIT_BYTES,
+        label="Claude caller CA snapshot",
+        allow_empty=True,
+    )
+    return _extract_ca_certificates(data, source="caller CA snapshot") if data else b""
+
+
+def _collect_claude_caller_ca_material(
+    env: dict[str, str],
+    *,
+    expected_snapshot_sha256: tuple[tuple[str, int, str, str], ...] | None = None,
+) -> list[tuple[str, bytes]]:
+    materials: list[tuple[str, bytes]] = []
+    snapshot_material: dict[str, bytes] = {}
+    aggregate_size = 0
+
+    def charge_source(source_size: int) -> None:
+        nonlocal aggregate_size
+        aggregate_size += source_size
+        if aggregate_size > CLAUDE_CALLER_CA_INPUT_LIMIT_BYTES:
+            raise ReviewError("Claude caller CA material exceeds the aggregate limit")
+
+    def append_material(source: str, material: bytes) -> None:
+        materials.append((source, material))
+
+    for key in CLAUDE_TLS_FILE_ENV_KEYS:
+        raw = env.get(key)
+        if not raw:
+            continue
+        source_path = pathlib.Path(raw)
+        if not source_path.is_absolute():
+            raise ReviewError(f"Claude review requires valid absolute {key}")
+        raw_material, source_size = _read_ca_source_with_size(
+            source_path,
+            source=key,
+            extract_certificates=False,
+        )
+        charge_source(source_size)
+        material = _extract_ca_certificates(raw_material, source=key)
+        append_material(key, material)
+        snapshot_material[str(source_path)] = raw_material
+
+    directory_entry_count = 0
+    configured_directory = False
+    found_directory_certificate = False
+    for key in CLAUDE_TLS_DIR_ENV_KEYS:
+        raw_entries = [entry for entry in env.get(key, "").split(os.pathsep) if entry]
+        configured_directory = configured_directory or bool(raw_entries)
+        for raw in raw_entries:
+            source_dir = pathlib.Path(raw)
+            if not source_dir.is_absolute():
+                raise ReviewError(
+                    f"Claude review requires valid absolute {key} entries"
+                )
+            descriptor = _open_stable_ca_directory(source_dir, source=key)
+            try:
+                try:
+                    before = os.fstat(descriptor)
+                    names = _bounded_ca_directory_names(
+                        descriptor,
+                        CLAUDE_CA_DIR_ENTRY_LIMIT - directory_entry_count,
+                        too_many_message=(
+                            "Claude review CA directory has too many entries"
+                        ),
+                    )
+                    directory_entry_count += len(names)
+                    for name in names:
+                        metadata = os.stat(
+                            name,
+                            dir_fd=descriptor,
+                            follow_symlinks=False,
+                        )
+                        if stat.S_ISDIR(metadata.st_mode):
+                            continue
+                        if stat.S_ISLNK(metadata.st_mode):
+                            raise ReviewError(
+                                "Claude review CA directory must not contain symlinks"
+                            )
+                        raw_material, source_size = _read_ca_source_at_with_size(
+                            descriptor,
+                            name,
+                            source=f"{key}:{name}",
+                            extract_certificates=False,
+                        )
+                        charge_source(source_size)
+                        try:
+                            material = _extract_ca_certificates(
+                                raw_material,
+                                source=f"{key}:{name}",
+                            )
+                        except ClaudeCACertificateNotFound:
+                            continue
+                        append_material(f"{key}:{name}", material)
+                        snapshot_material[str(source_dir / name)] = raw_material
+                        found_directory_certificate = True
+                    after = os.fstat(descriptor)
+                    if _ca_source_metadata(before) != _ca_source_metadata(after):
+                        raise ClaudeExecutableInspectionInconclusive(
+                            "Claude review CA directory changed while being read"
+                        )
+                except ReviewError:
+                    raise
+                except OSError as error:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        f"cannot inspect Claude review CA directory {key}: {error}"
+                    ) from error
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+                raise
+            else:
+                try:
+                    os.close(descriptor)
+                except OSError as error:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        f"cannot close Claude review CA directory {key}: {error}"
+                    ) from error
+    if configured_directory and not found_directory_certificate:
+        raise ReviewError("Claude review CA directory contains no PEM certificates")
+    if expected_snapshot_sha256 is not None:
+        _require_matching_claude_tls_snapshot(
+            expected_snapshot_sha256,
+            _claude_tls_snapshot_sha256(env, snapshot_material),
+        )
+    return materials
+
+
+def _caller_ca_snapshot_material(
+    review: ReviewWorkspace,
+    env: dict[str, str],
+    *,
+    trust_state: ClaudeTrustSessionState,
+    expected_snapshot_sha256: tuple[tuple[str, int, str, str], ...] | None = None,
+) -> bytes:
+    snapshot = review.container_dir / "claude-ca" / CLAUDE_CALLER_CA_SNAPSHOT_NAME
+    expected_digest = trust_state.caller_ca_snapshot_sha256
+    if expected_digest is None:
+        try:
+            source_materials = _collect_claude_caller_ca_material(
+                env,
+                expected_snapshot_sha256=expected_snapshot_sha256,
+            )
+        except ClaudeExecutableInspectionInconclusive:
+            raise
+        except ReviewError as error:
+            if expected_snapshot_sha256 is None:
+                raise
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude proxy TLS snapshot changed between attempts"
+            ) from error
+        material = _merge_ca_certificates(
+            source_materials,
+            allow_empty=True,
+            limit_bytes=CLAUDE_CALLER_CA_SNAPSHOT_LIMIT_BYTES,
+            label="Claude caller CA snapshot",
+        )
+        _write_private_ca_snapshot(snapshot, material)
+        if _read_claude_caller_ca_snapshot(snapshot) != material:
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude caller CA snapshot changed during creation"
+            )
+        trust_state.caller_ca_snapshot_sha256 = hashlib.sha256(material).hexdigest()
+        trust_state.caller_ca_source_snapshot_sha256 = expected_snapshot_sha256
+        return material
+
+    bound_source_snapshot = trust_state.caller_ca_source_snapshot_sha256
+    if expected_snapshot_sha256 is not None:
+        if bound_source_snapshot is None:
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude caller CA snapshot source binding is unavailable"
+            )
+        _require_matching_claude_tls_snapshot(
+            expected_snapshot_sha256,
+            bound_source_snapshot,
+        )
+
+    material = _read_claude_caller_ca_snapshot(snapshot)
+    digest = hashlib.sha256(material).hexdigest()
+    if not hmac.compare_digest(expected_digest, digest):
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude caller CA snapshot changed between attempts"
+        )
+    return material
+
+
+def _prepare_claude_macos_tls_environment(
+    review: ReviewWorkspace,
+    env: dict[str, str],
+    *,
+    executable_evidence: ClaudeExecutableTrustEvidence,
+    trust_state: ClaudeTrustSessionState,
+    expected_snapshot_sha256: tuple[tuple[str, int, str, str], ...] | None = None,
+) -> dict[str, str]:
+    evidence = _new_claude_trust_policy_evidence(executable_evidence)
+    _write_claude_trust_policy_evidence(review, evidence)
+    try:
+        ca_root = review.container_dir / "claude-ca"
+        _require_private_claude_ca_root(ca_root)
+        bundled_certificates = executable_evidence.bundled_root_certificates
+        bundled_fingerprints = executable_evidence.bundled_root_sha256_fingerprints
+        actual_bundled_fingerprints = (
+            _ca_sha256_fingerprints(
+                bundled_certificates,
+                source="publisher-verified Claude bundled roots",
+            )
+            if bundled_certificates
+            else frozenset()
+        )
+        if actual_bundled_fingerprints != bundled_fingerprints:
+            raise ClaudeTrustPolicyUnavailable(
+                "Claude bundled root evidence does not match the signed snapshot"
+            )
+        trust_material = _read_claude_trust_certificates(
+            review,
+            ca_root,
+            evidence=evidence,
+        )
+        system_certificates = _read_ca_source(
+            CLAUDE_SYSTEM_CA_FILE,
+            source="system CA bundle",
+        )
+        caller_certificates = _caller_ca_snapshot_material(
+            review,
+            env,
+            trust_state=trust_state,
+            expected_snapshot_sha256=expected_snapshot_sha256,
+        )
+        materials = [("system CA bundle", system_certificates)]
+        if bundled_certificates:
+            materials.append(
+                ("publisher-verified Claude bundled roots", bundled_certificates)
+            )
+        if trust_material.certificates:
+            materials.append(
+                ("unconditional macOS trust roots", trust_material.certificates)
+            )
+        if caller_certificates:
+            materials.append(("caller CA snapshot", caller_certificates))
+        merged = _merge_ca_certificates(
+            materials,
+            excluded_sha1_fingerprints=trust_material.excluded_sha1_fingerprints,
+            limit_bytes=CLAUDE_CA_BUNDLE_LIMIT_BYTES,
+            label="Claude review CA bundle",
+        )
+        merged_fingerprints = _ca_sha256_fingerprints(
+            merged,
+            source="Claude review CA bundle",
+        )
+        bundled_pairs = (
+            _ca_fingerprint_pairs(
+                bundled_certificates,
+                source="publisher-verified Claude bundled roots",
+            )
+            if bundled_certificates
+            else {}
+        )
+        excluded_bundled = {
+            sha256
+            for sha1, sha256 in bundled_pairs.items()
+            if sha1 in trust_material.excluded_sha1_fingerprints
+        }
+        expected_bundled = bundled_fingerprints - excluded_bundled
+        actual_bundled = merged_fingerprints & bundled_fingerprints
+        evidence["bundled_root_excluded_count"] = len(excluded_bundled)
+        if actual_bundled != expected_bundled:
+            raise ClaudeTrustPolicyUnavailable(
+                "Claude merged CA bundle does not preserve the exact permitted "
+                "bundled root set"
+            )
+        if excluded_bundled:
+            raise ClaudeTrustPolicyUnavailable(
+                "Claude bundled certificate store contains a policy-excluded root"
+            )
+        evidence["bundled_root_resolution"] = "complete"
+        bundle = ca_root / CLAUDE_CA_BUNDLE_NAME
+        _write_private_ca_file(bundle, merged)
+        _validate_ca_file(bundle)
+        try:
+            bundle.chmod(0o400, follow_symlinks=False)
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "cannot make the Claude generated CA bundle read-only"
+            ) from error
+        bundle_material = _read_bounded_owner_file(
+            bundle,
+            source="generated bundle",
+            limit_bytes=CLAUDE_CA_BUNDLE_LIMIT_BYTES,
+            label="Claude generated CA bundle",
+        )
+        if bundle_material != merged:
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude generated CA bundle changed during creation"
+            )
+        bundle_sha256 = hashlib.sha256(bundle_material).hexdigest()
+        if trust_state.final_ca_bundle_sha256 is not None and not hmac.compare_digest(
+            trust_state.final_ca_bundle_sha256,
+            bundle_sha256,
+        ):
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude generated CA bundle changed between attempts"
+            )
+        trust_state.final_ca_bundle_sha256 = bundle_sha256
+        result = dict(env)
+        for key in CLAUDE_TLS_BYPASS_ENV_KEYS:
+            result.pop(key, None)
+        for key in CLAUDE_TLS_DIR_ENV_KEYS:
+            result.pop(key, None)
+        for key in CLAUDE_TLS_REPLACEMENT_FILE_ENV_KEYS:
+            result[key] = str(bundle)
+        if env.get("NODE_EXTRA_CA_CERTS"):
+            result["NODE_EXTRA_CA_CERTS"] = str(bundle)
+        else:
+            result.pop("NODE_EXTRA_CA_CERTS", None)
+        result[CLAUDE_CERT_STORE_ENV] = CLAUDE_CERT_STORE
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="complete",
+            unresolved_resolution="complete",
+        )
+        return result
+    except ClaudeTrustSettingsDeny as error:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="denied",
+            unresolved_resolution="blocked",
+            primary_error=error,
+        )
+        raise
+    except ClaudeTrustPolicyUnavailable as error:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="blocked",
+            unresolved_resolution="blocked",
+            primary_error=error,
+        )
+        raise
+    except ClaudeTrustToolUnavailable as error:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="unavailable",
+            unresolved_resolution="unavailable",
+            primary_error=error,
+        )
+        raise
+    except (
+        ReviewTimeoutError,
+        ReviewOutputDrainError,
+        ReviewOutputLimitError,
+        ReviewProcessLeakError,
+        ClaudeExecutableInspectionInconclusive,
+    ) as error:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="inconclusive",
+            unresolved_resolution="inconclusive",
+            primary_error=error,
+        )
+        raise
+    except ReviewError as error:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="blocked",
+            unresolved_resolution="blocked",
+            primary_error=error,
+        )
+        raise
+    except BaseException as error:
+        _terminalize_claude_trust_policy_evidence(
+            review,
+            evidence,
+            status="inconclusive",
+            unresolved_resolution="inconclusive",
+            primary_error=error,
+        )
+        raise
+
+
+def _prepare_claude_tls_environment(
+    review: ReviewWorkspace,
+    env: dict[str, str],
+    *,
+    executable_evidence: ClaudeExecutableTrustEvidence | None = None,
+    trust_state: ClaudeTrustSessionState | None = None,
+    expected_snapshot_sha256: tuple[tuple[str, int, str, str], ...] | None = None,
+) -> dict[str, str]:
+    if not _is_claude_macos_host():
+        return _prepare_claude_generic_tls_environment(
+            review,
+            env,
+            expected_snapshot_sha256=expected_snapshot_sha256,
+        )
+    if executable_evidence is None:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude macOS TLS preparation requires signed executable root evidence"
+        )
+    return _prepare_claude_macos_tls_environment(
+        review,
+        env,
+        executable_evidence=executable_evidence,
+        trust_state=trust_state or ClaudeTrustSessionState(),
+        expected_snapshot_sha256=expected_snapshot_sha256,
+    )
+
+
+def _require_matching_claude_macos_tls_bundle(
+    review: ReviewWorkspace,
+    env: dict[str, str],
+    *,
+    trust_state: ClaudeTrustSessionState,
+) -> None:
+    expected_sha256 = trust_state.final_ca_bundle_sha256
+    if expected_sha256 is None:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude generated CA bundle binding is unavailable"
+        )
+    bundle = review.container_dir / "claude-ca" / CLAUDE_CA_BUNDLE_NAME
+    expected_path = str(bundle)
+    if any(
+        env.get(key) != expected_path for key in CLAUDE_TLS_REPLACEMENT_FILE_ENV_KEYS
+    ):
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude generated CA bundle paths are inconsistent"
+        )
+    node_extra = env.get("NODE_EXTRA_CA_CERTS")
+    if node_extra is not None and node_extra != expected_path:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude generated CA bundle paths are inconsistent"
+        )
+    if any(
+        key in env for key in (*CLAUDE_TLS_DIR_ENV_KEYS, *CLAUDE_TLS_BYPASS_ENV_KEYS)
+    ):
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude generated CA bundle environment changed before runtime launch"
+        )
+    if env.get(CLAUDE_CERT_STORE_ENV) != CLAUDE_CERT_STORE:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude generated CA bundle environment changed before runtime launch"
+        )
+    material = _read_bounded_owner_file(
+        bundle,
+        source="generated bundle",
+        limit_bytes=CLAUDE_CA_BUNDLE_LIMIT_BYTES,
+        label="Claude generated CA bundle",
+    )
+    if not hmac.compare_digest(expected_sha256, hashlib.sha256(material).hexdigest()):
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude generated CA bundle changed before runtime launch"
+        )
+    try:
+        metadata = bundle.lstat()
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot inspect the Claude generated CA bundle mode"
+        ) from error
+    if stat.S_IMODE(metadata.st_mode) != 0o400:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude generated CA bundle mode changed before runtime launch"
+        )
 
 
 def _read_proxy_headers(sock: socket.socket) -> bytes:
@@ -12435,7 +17519,413 @@ def _upstream_proxy_url(
     return None
 
 
-def _proxy_ssl_context(env: dict[str, str]) -> ssl.SSLContext:
+def _proxy_ca_subject_hashes(
+    material: bytes,
+    *,
+    deadline: float,
+    certificate_limit: int,
+) -> tuple[frozenset[str], int]:
+    try:
+        openssl_metadata = CLAUDE_OPENSSL_CLIENT.lstat()
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy CA hash tooling is unavailable"
+        ) from error
+    if (
+        not stat.S_ISREG(openssl_metadata.st_mode)
+        or openssl_metadata.st_uid != 0
+        or openssl_metadata.st_nlink != 1
+        or openssl_metadata.st_mode & 0o6022
+        or not os.access(CLAUDE_OPENSSL_CLIENT, os.X_OK)
+    ):
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy CA hash tooling has unsafe metadata"
+        )
+    normalized = _extract_ca_certificates(
+        material,
+        source="Claude proxy CA hash entry",
+    )
+    blocks = CLAUDE_CERTIFICATE_BLOCK.findall(normalized)
+    if len(blocks) > certificate_limit:
+        raise ReviewError("Claude proxy CA hash certificate limit exceeded")
+    canonical_blocks: list[bytes] = []
+    for block in blocks:
+        _der, canonical = _canonical_ca_certificate(
+            block,
+            source="Claude proxy CA hash entry",
+        )
+        # Prove certificate content in-process before interpreting external
+        # subject-hash failures, whose diagnostics are operational evidence only.
+        _proxy_ssl_context_from_material(
+            canonical,
+            source="Claude proxy CA hash entry",
+        )
+        canonical_blocks.append(canonical)
+    hashes: set[str] = set()
+    for block in canonical_blocks:
+        call_started = time.monotonic()
+        remaining_seconds = deadline - call_started
+        if remaining_seconds <= 0:
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude proxy CA hash deadline expired"
+            )
+        call_deadline = min(
+            deadline,
+            call_started + CLAUDE_KEYCHAIN_QUERY_TIMEOUT_SECONDS,
+        )
+        try:
+            completed = run_bounded_capture(
+                (
+                    str(CLAUDE_OPENSSL_CLIENT),
+                    "x509",
+                    "-subject_hash",
+                    "-noout",
+                ),
+                env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+                stdin=block,
+                deadline=call_deadline,
+                stdout_limit_bytes=4096,
+                stderr_limit_bytes=4096,
+            )
+        except ReviewTimeoutError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude proxy CA subject hash timed out"
+            ) from error
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude proxy CA hash tooling could not be launched"
+            ) from error
+        try:
+            if time.monotonic() >= deadline:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude proxy CA hash deadline expired"
+                )
+            match = re.fullmatch(rb"([0-9a-f]{8})\r?\n", bytes(completed.stdout))
+            if completed.returncode != 0 or completed.stderr or match is None:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude proxy CA subject hash is inconclusive"
+                )
+            hashes.add(match.group(1).decode("ascii"))
+        finally:
+            completed.stdout[:] = b"\x00" * len(completed.stdout)
+            completed.stderr[:] = b"\x00" * len(completed.stderr)
+    if not hashes:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy CA hash entry contains no certificate"
+        )
+    return frozenset(hashes), len(blocks)
+
+
+def _new_proxy_ssl_context() -> ssl.SSLContext:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.verify_flags |= CLAUDE_PROXY_TLS_VERIFY_FLAGS
+    return context
+
+
+def _proxy_system_ca_directory_identity(
+    metadata: os.stat_result,
+) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+
+
+def _revalidate_proxy_system_ca_parent_chain(
+    descriptors: tuple[int, ...],
+    components: tuple[str, ...],
+    expected_identities: tuple[tuple[int, ...], ...],
+    expected_parent_metadata: tuple[int, ...],
+    *,
+    source: str,
+) -> None:
+    try:
+        for index, (descriptor, expected) in enumerate(
+            zip(descriptors, expected_identities, strict=True)
+        ):
+            if _proxy_system_ca_directory_identity(os.fstat(descriptor)) != expected:
+                raise ClaudeExecutableInspectionInconclusive(
+                    f"{source} parent path changed during inspection"
+                )
+            if index == 0:
+                continue
+            lexical = os.stat(
+                components[index - 1],
+                dir_fd=descriptors[index - 1],
+                follow_symlinks=False,
+            )
+            if _proxy_system_ca_directory_identity(lexical) != expected:
+                raise ClaudeExecutableInspectionInconclusive(
+                    f"{source} parent path changed during inspection"
+                )
+        if _ca_source_metadata(os.fstat(descriptors[-1])) != expected_parent_metadata:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"{source} parent path changed during inspection"
+            )
+        if components:
+            lexical_parent = os.stat(
+                components[-1],
+                dir_fd=descriptors[-2],
+                follow_symlinks=False,
+            )
+            if _ca_source_metadata(lexical_parent) != expected_parent_metadata:
+                raise ClaudeExecutableInspectionInconclusive(
+                    f"{source} parent path changed during inspection"
+                )
+    except ClaudeExecutableInspectionInconclusive:
+        raise
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            f"cannot revalidate the stable {source} parent path"
+        ) from error
+
+
+def _require_proxy_system_ca_absence_current(
+    descriptors: tuple[int, ...],
+    components: tuple[str, ...],
+    expected_identities: tuple[tuple[int, ...], ...],
+    expected_parent_metadata: tuple[int, ...],
+    entry_name: str,
+    *,
+    source: str,
+) -> None:
+    for _ in range(2):
+        try:
+            os.stat(
+                entry_name,
+                dir_fd=descriptors[-1],
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot recheck the stable absence of {source}"
+            ) from error
+        else:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"{source} appeared while the CA directory snapshot was bound"
+            )
+        _revalidate_proxy_system_ca_parent_chain(
+            descriptors,
+            components,
+            expected_identities,
+            expected_parent_metadata,
+            source=source,
+        )
+
+
+@contextlib.contextmanager
+def _proxy_system_ca_path_absence(
+    path: pathlib.Path,
+    *,
+    source: str,
+) -> Iterator[bool]:
+    if (
+        not path.is_absolute()
+        or not path.name
+        or any(part in {".", ".."} for part in path.parts)
+    ):
+        raise ClaudeExecutableInspectionInconclusive(
+            f"{source} path is not lexically absolute"
+        )
+    components = tuple(path.parts[1:-1])
+    descriptors: list[int] = []
+    expected_identities: list[tuple[int, ...]] = []
+    pending_descriptor: int | None = None
+    primary_error: BaseException | None = None
+    try:
+        try:
+            flags = _ca_nofollow_flags(directory=True)
+            pending_descriptor = os.open(os.sep, flags)
+            descriptors.append(pending_descriptor)
+            pending_descriptor = None
+            root_metadata = os.fstat(descriptors[0])
+            if not stat.S_ISDIR(root_metadata.st_mode):
+                raise ClaudeExecutableInspectionInconclusive(
+                    f"{source} root is not a stable directory"
+                )
+            expected_identities.append(
+                _proxy_system_ca_directory_identity(root_metadata)
+            )
+            for component in components:
+                parent_descriptor = descriptors[-1]
+                before = os.stat(
+                    component,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if not stat.S_ISDIR(before.st_mode):
+                    raise ClaudeExecutableInspectionInconclusive(
+                        f"{source} has an ambiguous parent path"
+                    )
+                pending_descriptor = os.open(
+                    component,
+                    flags,
+                    dir_fd=parent_descriptor,
+                )
+                descriptors.append(pending_descriptor)
+                pending_descriptor = None
+                opened = os.fstat(descriptors[-1])
+                after = os.stat(
+                    component,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                opened_identity = _proxy_system_ca_directory_identity(opened)
+                if (
+                    _proxy_system_ca_directory_identity(before) != opened_identity
+                    or _proxy_system_ca_directory_identity(after) != opened_identity
+                ):
+                    raise ClaudeExecutableInspectionInconclusive(
+                        f"{source} parent path changed while being opened"
+                    )
+                expected_identities.append(opened_identity)
+            descriptor_snapshot = tuple(descriptors)
+            identity_snapshot = tuple(expected_identities)
+            parent_metadata_snapshot = _ca_source_metadata(
+                os.fstat(descriptor_snapshot[-1])
+            )
+            _revalidate_proxy_system_ca_parent_chain(
+                descriptor_snapshot,
+                components,
+                identity_snapshot,
+                parent_metadata_snapshot,
+                source=source,
+            )
+            try:
+                os.stat(
+                    path.name,
+                    dir_fd=descriptor_snapshot[-1],
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                missing = True
+            else:
+                missing = False
+            if missing:
+                _require_proxy_system_ca_absence_current(
+                    descriptor_snapshot,
+                    components,
+                    identity_snapshot,
+                    parent_metadata_snapshot,
+                    path.name,
+                    source=source,
+                )
+            else:
+                _revalidate_proxy_system_ca_parent_chain(
+                    descriptor_snapshot,
+                    components,
+                    identity_snapshot,
+                    parent_metadata_snapshot,
+                    source=source,
+                )
+        except ClaudeExecutableInspectionInconclusive:
+            raise
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot establish a stable lexical inspection of {source}"
+            ) from error
+
+        yield missing
+
+        if missing:
+            _require_proxy_system_ca_absence_current(
+                descriptor_snapshot,
+                components,
+                identity_snapshot,
+                parent_metadata_snapshot,
+                path.name,
+                source=source,
+            )
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        cleanup_errors: list[OSError] = []
+        if pending_descriptor is not None and pending_descriptor not in descriptors:
+            try:
+                os.close(pending_descriptor)
+            except OSError as error:
+                cleanup_errors.append(error)
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                cleanup_errors.append(error)
+        if cleanup_errors and primary_error is None:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"cannot close the stable {source} parent path"
+            ) from cleanup_errors[0]
+
+
+def _proxy_ssl_context_from_material(
+    material: bytes,
+    *,
+    source: str,
+) -> ssl.SSLContext:
+    context = _new_proxy_ssl_context()
+    try:
+        context.load_verify_locations(cadata=material.decode("ascii"))
+    except (UnicodeDecodeError, binascii.Error, ValueError, ssl.SSLError) as error:
+        raise ReviewError(
+            f"Claude review CA source contains an invalid certificate: {source}"
+        ) from error
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy CA snapshot could not be loaded"
+        ) from error
+    return context
+
+
+def _proxy_ssl_context_from_system_capath(
+    default_capath: pathlib.Path,
+    *,
+    cafile_was_configured: bool,
+) -> ssl.SSLContext:
+    if not default_capath.is_absolute():
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy system CA directory is not absolute"
+        )
+    try:
+        default_capath.lstat()
+    except FileNotFoundError:
+        with _proxy_system_ca_path_absence(
+            default_capath,
+            source="Claude proxy system CA directory",
+        ) as capath_missing:
+            if not capath_missing:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude proxy system CA directory appeared while its absence "
+                    "was being proven"
+                )
+            if cafile_was_configured:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude proxy system CA file and directory are missing"
+                )
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude proxy system CA directory is missing"
+            )
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "cannot inspect Claude proxy system CA directory"
+        ) from error
+    default_snapshots = _read_proxy_system_ca_directory(default_capath)
+    return _proxy_ssl_context(
+        {"SSL_CERT_DIR": str(default_capath)},
+        snapshot_material=default_snapshots,
+    )
+
+
+def _proxy_ssl_context(
+    env: dict[str, str],
+    *,
+    snapshot_material: dict[str, bytes],
+) -> ssl.SSLContext:
     cafile = next(
         (
             env[key]
@@ -12449,10 +17939,164 @@ def _proxy_ssl_context(env: dict[str, str]) -> ssl.SSLContext:
         ),
         None,
     )
-    context = ssl.create_default_context(cafile=cafile)
-    for raw in env.get("SSL_CERT_DIR", "").split(os.pathsep):
-        if raw:
-            context.load_verify_locations(capath=raw)
+    configured_directories = [
+        pathlib.Path(raw)
+        for raw in env.get("SSL_CERT_DIR", "").split(os.pathsep)
+        if raw
+    ]
+    directory_material: list[bytes] = []
+    subject_hash_cache: dict[bytes, frozenset[str]] = {}
+    subject_hash_deadline = time.monotonic() + CLAUDE_PROXY_CA_HASH_TIMEOUT_SECONDS
+    remaining_hash_certificates = CLAUDE_PROXY_CA_HASH_CERTIFICATE_LIMIT
+    for directory in configured_directories:
+        indexed: dict[str, dict[int, bytes]] = {}
+        for path, material in snapshot_material.items():
+            snapshot_path = pathlib.Path(path)
+            if snapshot_path.parent != directory:
+                continue
+            match = CLAUDE_OPENSSL_CA_HASH_ENTRY_RE.fullmatch(snapshot_path.name)
+            if match is None:
+                continue
+            indexed.setdefault(match.group(1), {})[int(match.group(2))] = material
+        for subject_hash in sorted(indexed):
+            entries = indexed[subject_hash]
+            index = 0
+            while index in entries:
+                if time.monotonic() >= subject_hash_deadline:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        "Claude proxy CA hash deadline expired"
+                    )
+                material = entries[index]
+                digest = hashlib.sha256(material).digest()
+                material_hashes = subject_hash_cache.get(digest)
+                if material_hashes is None:
+                    material_hashes, consumed_certificates = _proxy_ca_subject_hashes(
+                        material,
+                        deadline=subject_hash_deadline,
+                        certificate_limit=remaining_hash_certificates,
+                    )
+                    remaining_hash_certificates -= consumed_certificates
+                    subject_hash_cache[digest] = material_hashes
+                if material_hashes == {subject_hash}:
+                    directory_material.append(material)
+                index += 1
+    if configured_directories and time.monotonic() >= subject_hash_deadline:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy CA hash deadline expired"
+        )
+    try:
+        replacement_configured = cafile is not None or bool(configured_directories)
+        if replacement_configured:
+            materials: list[bytes] = []
+            if cafile is not None:
+                file_material = snapshot_material.get(cafile)
+                if file_material is None:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        "Claude proxy CA file snapshot is incomplete"
+                    )
+                materials.append(file_material)
+            materials.extend(directory_material)
+            if not materials:
+                raise ReviewError(
+                    "Claude proxy CA replacement contains no indexed certificates"
+                )
+            context = _proxy_ssl_context_from_material(
+                b"".join(materials),
+                source="Claude proxy CA snapshot",
+            )
+        else:
+            if sys.platform == "darwin":
+                default_cafile = CLAUDE_SYSTEM_CA_FILE
+            else:
+                defaults = ssl.get_default_verify_paths()
+                openssl_cafile = getattr(defaults, "openssl_cafile", None)
+                openssl_capath = getattr(defaults, "openssl_capath", None)
+                default_cafile = (
+                    pathlib.Path(openssl_cafile)
+                    if isinstance(openssl_cafile, str) and openssl_cafile
+                    else None
+                )
+                if default_cafile is not None:
+                    if not default_cafile.is_absolute():
+                        raise ClaudeExecutableInspectionInconclusive(
+                            "Claude proxy system CA file is not absolute"
+                        )
+                    try:
+                        default_cafile_metadata = default_cafile.lstat()
+                    except FileNotFoundError:
+                        with _proxy_system_ca_path_absence(
+                            default_cafile,
+                            source="Claude proxy system CA file",
+                        ) as cafile_missing:
+                            if not cafile_missing:
+                                raise ClaudeExecutableInspectionInconclusive(
+                                    "Claude proxy system CA file appeared while its "
+                                    "absence was being proven"
+                                )
+                            if (
+                                not isinstance(openssl_capath, str)
+                                or not openssl_capath
+                            ):
+                                raise ClaudeExecutableInspectionInconclusive(
+                                    "Claude proxy system CA file is missing and no CA "
+                                    "directory is configured"
+                                )
+                            # Exiting this scope rechecks cafile absence after the
+                            # capath snapshot has been bound into the in-memory context.
+                            return _proxy_ssl_context_from_system_capath(
+                                pathlib.Path(openssl_capath),
+                                cafile_was_configured=True,
+                            )
+                    except OSError as error:
+                        raise ClaudeExecutableInspectionInconclusive(
+                            "cannot inspect Claude proxy system CA file"
+                        ) from error
+                    if stat.S_ISLNK(default_cafile_metadata.st_mode):
+                        if not isinstance(openssl_capath, str) or not openssl_capath:
+                            raise ClaudeExecutableInspectionInconclusive(
+                                "Claude proxy system CA file is a symlink and no CA "
+                                "directory is configured"
+                            )
+                        return _proxy_ssl_context_from_system_capath(
+                            pathlib.Path(openssl_capath),
+                            cafile_was_configured=True,
+                        )
+                    default_material = _read_proxy_system_ca_source(default_cafile)
+                    return _proxy_ssl_context_from_material(
+                        default_material,
+                        source="Claude proxy system CA bundle",
+                    )
+                if not isinstance(openssl_capath, str) or not openssl_capath:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        "Claude proxy system CA paths are unavailable"
+                    )
+                return _proxy_ssl_context_from_system_capath(
+                    pathlib.Path(openssl_capath),
+                    cafile_was_configured=False,
+                )
+            if not default_cafile.is_absolute():
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude proxy system CA file is not absolute"
+                )
+            try:
+                resolved_default_cafile = default_cafile.resolve(strict=True)
+            except OSError as error:
+                raise ClaudeExecutableInspectionInconclusive(
+                    "Claude proxy system CA file is unavailable"
+                ) from error
+            default_material = _read_proxy_system_ca_source(resolved_default_cafile)
+            context = _proxy_ssl_context_from_material(
+                default_material,
+                source="Claude proxy system CA bundle",
+            )
+    except OSError as error:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy CA snapshot could not be loaded"
+        ) from error
+    if configured_directories and time.monotonic() >= subject_hash_deadline:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy CA hash deadline expired"
+        )
     return context
 
 
@@ -12477,11 +18121,27 @@ def _parse_upstream_proxy_url(
     return parsed, proxy_port
 
 
+def _claude_https_proxy_tls_required(
+    env: dict[str, str],
+    *,
+    allowed_targets: frozenset[tuple[str, int]] = CLAUDE_PROXY_TARGETS,
+) -> bool:
+    requires_tls = False
+    for host, port in allowed_targets:
+        upstream_url = _upstream_proxy_url(env, host=host, port=port)
+        if upstream_url is None:
+            continue
+        parsed, _proxy_port = _parse_upstream_proxy_url(upstream_url)
+        requires_tls = requires_tls or parsed.scheme == "https"
+    return requires_tls
+
+
 def _open_proxy_target(
     host: str,
     port: int,
     *,
     env: dict[str, str],
+    upstream_ssl_context: ssl.SSLContext | None,
 ) -> socket.socket:
     upstream_url = _upstream_proxy_url(env, host=host, port=port)
     if upstream_url is None:
@@ -12495,7 +18155,12 @@ def _open_proxy_target(
         timeout=CLAUDE_PROXY_CONNECT_TIMEOUT_SECONDS,
     )
     if parsed.scheme == "https":
-        connection = _proxy_ssl_context(env).wrap_socket(
+        if upstream_ssl_context is None:
+            connection.close()
+            raise ClaudeExecutableInspectionInconclusive(
+                "Claude proxy TLS context is unavailable"
+            )
+        connection = upstream_ssl_context.wrap_socket(
             connection,
             server_hostname=parsed.hostname,
         )
@@ -12571,7 +18236,11 @@ class _ClaudeProxyHandler(socketserver.BaseRequestHandler):
             if target not in server.allowed_targets:
                 client.sendall(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
                 return
-            upstream = _open_proxy_target(*target, env=server.upstream_env)
+            upstream = _open_proxy_target(
+                *target,
+                env=server.upstream_env,
+                upstream_ssl_context=server.upstream_ssl_context,
+            )
             client.sendall(
                 b"HTTP/1.1 200 Connection Established\r\nConnection: close\r\n\r\n"
             )
@@ -12635,9 +18304,11 @@ class _ClaudeProxyServer(
         *,
         allowed_targets: frozenset[tuple[str, int]],
         upstream_env: dict[str, str],
+        upstream_ssl_context: ssl.SSLContext | None,
     ) -> None:
         self.allowed_targets = allowed_targets
         self.upstream_env = dict(upstream_env)
+        self.upstream_ssl_context = upstream_ssl_context
         super().__init__(("127.0.0.1", 0), _ClaudeProxyHandler)
         self._initialize_serve_state()
 
@@ -12655,9 +18326,11 @@ class _ClaudeUnixProxyServer(
         *,
         allowed_targets: frozenset[tuple[str, int]],
         upstream_env: dict[str, str],
+        upstream_ssl_context: ssl.SSLContext | None,
     ) -> None:
         self.allowed_targets = allowed_targets
         self.upstream_env = dict(upstream_env)
+        self.upstream_ssl_context = upstream_ssl_context
         super().__init__(str(socket_path), _ClaudeProxyHandler)
         self._initialize_serve_state()
 
@@ -12745,16 +18418,21 @@ def _shutdown_claude_proxy_server(
 def _claude_connect_proxy(
     env: dict[str, str],
     *,
+    upstream_ssl_context: ssl.SSLContext | None,
     allowed_targets: frozenset[tuple[str, int]] = CLAUDE_PROXY_TARGETS,
 ) -> Iterator[int]:
-    for host, port in allowed_targets:
-        upstream_url = _upstream_proxy_url(env, host=host, port=port)
-        if upstream_url is not None:
-            _parse_upstream_proxy_url(upstream_url)
+    if (
+        _claude_https_proxy_tls_required(env, allowed_targets=allowed_targets)
+        and upstream_ssl_context is None
+    ):
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy TLS context is unavailable"
+        )
     try:
         server = _ClaudeProxyServer(
             allowed_targets=allowed_targets,
             upstream_env=env,
+            upstream_ssl_context=upstream_ssl_context,
         )
     except OSError as error:
         failure_type = (
@@ -12899,12 +18577,16 @@ def _claude_unix_connect_proxy(
     _review: ReviewWorkspace,
     env: dict[str, str],
     *,
+    upstream_ssl_context: ssl.SSLContext | None,
     allowed_targets: frozenset[tuple[str, int]] = CLAUDE_PROXY_TARGETS,
 ) -> Iterator[pathlib.Path]:
-    for host, port in allowed_targets:
-        upstream_url = _upstream_proxy_url(env, host=host, port=port)
-        if upstream_url is not None:
-            _parse_upstream_proxy_url(upstream_url)
+    if (
+        _claude_https_proxy_tls_required(env, allowed_targets=allowed_targets)
+        and upstream_ssl_context is None
+    ):
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy TLS context is unavailable"
+        )
     with tempfile.TemporaryDirectory(
         prefix="codex-claude-proxy-",
         dir="/tmp",
@@ -12925,6 +18607,7 @@ def _claude_unix_connect_proxy(
                 socket_path,
                 allowed_targets=allowed_targets,
                 upstream_env=env,
+                upstream_ssl_context=upstream_ssl_context,
             )
         except OSError as error:
             failure_type = (
@@ -13441,15 +19124,19 @@ def _with_claude_review_tool_path(
             raise ClaudeReviewToolUnavailable(str(error)) from error
     entries: list[pathlib.Path] = []
     if not _is_claude_linux_host() and not _claude_uses_explicit_auth(env):
-        broker_dir = (
-            review.container_dir.resolve() / "claude-runtime" / "keychain-broker"
-        )
-        security = broker_dir / "security"
-        if not security.is_file() or not os.access(security, os.X_OK):
+        broker_raw = env.get(CLAUDE_KEYCHAIN_BROKER_EXECUTABLE_ENV)
+        security = pathlib.Path(broker_raw) if broker_raw else None
+        if (
+            security is None
+            or not security.is_absolute()
+            or security.name != "security"
+            or security != CLAUDE_KEYCHAIN_BROKER_INSTALL_PATH
+        ):
             raise ReviewError(
                 "Claude local-login sandbox requires the restricted Keychain broker"
             )
-        entries.append(broker_dir)
+        _require_installed_claude_keychain_broker()
+        entries.append(security.parent)
     entries.append(rg.absolute().parent)
     result = dict(env)
     result["PATH"] = os.pathsep.join(dict.fromkeys(str(entry) for entry in entries))
@@ -13516,10 +19203,8 @@ def _claude_linux_ca_bundle(
             raise ReviewError("Claude Linux CA input exceeds the size limit")
         try:
             certificates = _extract_ca_certificates(material, source=source)
-        except ReviewError as error:
-            if "contains no PEM certificate" in str(error):
-                return
-            raise
+        except ClaudeCACertificateNotFound:
+            return
         for block in CLAUDE_CERTIFICATE_BLOCK.findall(certificates):
             normalized = block.strip() + b"\n"
             if normalized in seen:
@@ -13859,33 +19544,35 @@ def _claude_review_sandbox_profile(
             tls_dirs.update((path.absolute(), resolved))
     auth_executables: tuple[pathlib.Path, ...] = ()
     keychain_broker_port: int | None = None
+    keychain_broker_identity_socket: pathlib.Path | None = None
+    canonical_keychain_broker_identity_socket: pathlib.Path | None = None
     if not _claude_uses_explicit_auth(env):
-        broker_dir = container / "claude-runtime" / "keychain-broker"
-        security_candidate = next(
-            (
-                pathlib.Path(entry) / "security"
-                for entry in env.get("PATH", "").split(os.pathsep)
-                if entry
-                and (pathlib.Path(entry) / "security").is_file()
-                and os.access(pathlib.Path(entry) / "security", os.X_OK)
-            ),
-            None,
+        broker_raw = env.get(CLAUDE_KEYCHAIN_BROKER_EXECUTABLE_ENV)
+        if not broker_raw:
+            raise ReviewError(
+                "Claude local-login sandbox requires the restricted Keychain broker"
+            )
+        security_candidate = pathlib.Path(broker_raw)
+        path_entries = tuple(
+            pathlib.Path(entry)
+            for entry in env.get("PATH", "").split(os.pathsep)
+            if entry
         )
         if (
-            security_candidate is None
-            or security_candidate.resolve() != (broker_dir / "security").resolve()
+            not security_candidate.is_absolute()
+            or security_candidate.name != "security"
+            or security_candidate != CLAUDE_KEYCHAIN_BROKER_INSTALL_PATH
+            or not path_entries
+            or path_entries[0] != security_candidate.parent
         ):
             raise ReviewError(
                 "Claude local-login sandbox requires the restricted Keychain broker"
             )
+        _require_installed_claude_keychain_broker()
         auth_executables = _native_macho_dependencies(
-            broker_dir / "security",
+            security_candidate,
             label="Claude Keychain broker",
         )
-        if any(
-            not is_relative_to(path.resolve(), container) for path in auth_executables
-        ):
-            raise ReviewError("Claude Keychain broker must be helper-owned")
         try:
             keychain_broker_port = int(env[CLAUDE_KEYCHAIN_BROKER_PORT_ENV])
         except (KeyError, ValueError) as error:
@@ -13896,12 +19583,31 @@ def _claude_review_sandbox_profile(
             raise ReviewError(
                 "Claude local-login sandbox requires a valid Keychain broker port"
             )
-        if not CLAUDE_KEYCHAIN_BROKER_CAPABILITY.fullmatch(
-            env.get(CLAUDE_KEYCHAIN_BROKER_CAPABILITY_ENV, "")
+        identity_socket_raw = env.get(CLAUDE_KEYCHAIN_BROKER_IDENTITY_SOCKET_ENV)
+        if not identity_socket_raw:
+            raise ReviewError(
+                "Claude local-login sandbox requires a Keychain broker identity socket"
+            )
+        keychain_broker_identity_socket = pathlib.Path(identity_socket_raw)
+        identity_directory_raw = env.get(CLAUDE_KEYCHAIN_BROKER_IDENTITY_DIRECTORY_ENV)
+        identity_directory = (
+            pathlib.Path(identity_directory_raw) if identity_directory_raw else None
+        )
+        if (
+            not keychain_broker_identity_socket.is_absolute()
+            or identity_directory is None
+            or not identity_directory.is_absolute()
+            or keychain_broker_identity_socket.parent != identity_directory
+            or keychain_broker_identity_socket.name
+            != CLAUDE_KEYCHAIN_BROKER_IDENTITY_SOCKET_NAME
         ):
             raise ReviewError(
-                "Claude local-login sandbox requires a valid Keychain broker capability"
+                "Claude local-login sandbox requires a valid Keychain broker "
+                "identity socket"
             )
+        canonical_keychain_broker_identity_socket = (
+            _require_claude_keychain_identity_socket(keychain_broker_identity_socket)
+        )
     rg_candidate = _trusted_claude_ripgrep()
     if rg_candidate is None:
         raise ClaudeReviewToolUnavailable(
@@ -13972,6 +19678,11 @@ def _claude_review_sandbox_profile(
     network_filters = f'(remote ip "localhost:{proxy_port}")'
     if keychain_broker_port is not None:
         network_filters += f'(remote ip "localhost:{keychain_broker_port}")'
+    if canonical_keychain_broker_identity_socket is not None:
+        network_filters += _sandbox_path_filter(
+            "literal",
+            canonical_keychain_broker_identity_socket,
+        )
     return (
         CLAUDE_PROBE_SANDBOX_PROFILE
         + f"(allow file-read-metadata {metadata_filters})"
@@ -14026,16 +19737,21 @@ def _run_claude_probe(
     probe_cwd = _claude_probe_cwd(env)
     with tempfile.TemporaryDirectory(prefix=".claude-probe-", dir=probe_cwd) as raw:
         output_dir = pathlib.Path(raw)
-        return run(
-            _claude_probe_command(executable, probe_cwd, *args),
-            cwd=probe_cwd,
-            env=env,
-            stdout_path=output_dir / "stdout.log",
-            stderr_path=output_dir / "stderr.log",
-            capture_limit_bytes=CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
-            timeout_seconds=CLAUDE_PROBE_TIMEOUT_SECONDS,
-            output_file_limit_bytes=CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
-        )
+        try:
+            return run(
+                _claude_probe_command(executable, probe_cwd, *args),
+                cwd=probe_cwd,
+                env=env,
+                stdout_path=output_dir / "stdout.log",
+                stderr_path=output_dir / "stderr.log",
+                capture_limit_bytes=CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
+                timeout_seconds=CLAUDE_PROBE_TIMEOUT_SECONDS,
+                output_file_limit_bytes=CLAUDE_PROBE_OUTPUT_LIMIT_BYTES,
+            )
+        except OSError as error:
+            raise ClaudeExecutableInspectionInconclusive(
+                f"Claude executable probe launch was inconclusive: {error}"
+            ) from error
 
 
 def _require_claude_identity(
@@ -14081,7 +19797,10 @@ def _require_claude_safe_mode(
     return ClaudeCapabilities(version, required_options, safe_mode_summary)
 
 
-def classify_failure(stdout: bytes | str, stderr: bytes | str) -> str:
+def _failure_evidence_categories(
+    stdout: bytes | str,
+    stderr: bytes | str,
+) -> dict[str, str]:
     def decode(value: bytes | str) -> str:
         return (
             value.decode("utf-8", errors="replace")
@@ -14090,26 +19809,47 @@ def classify_failure(stdout: bytes | str, stderr: bytes | str) -> str:
         )
 
     stdout_bytes = stdout.encode() if isinstance(stdout, str) else stdout
-    structured_primary_error = _structured_error_text(stdout_bytes).lower()
-    primary_message = f"{decode(stderr)}\n{structured_primary_error}".lower()
-    if any(code in structured_primary_error for code in STRUCTURED_AUTH_CODES):
-        return "auth"
-    if any(fragment in primary_message for fragment in AUTH_FAILURE_FRAGMENTS):
-        return "auth"
-    if any(fragment in primary_message for fragment in TRANSIENT_FAILURE_FRAGMENTS):
-        return "transient"
-    if any(fragment in primary_message for fragment in ENTITLEMENT_FAILURE_FRAGMENTS):
-        return "entitlement"
-    if any(code in structured_primary_error for code in STRUCTURED_ENTITLEMENT_CODES):
-        return "entitlement"
-    if (
-        any(
-            code in structured_primary_error
-            for code in STRUCTURED_AMBIGUOUS_MODEL_CODES
+    structured_error = _structured_error_text(stdout_bytes).lower()
+    stderr_text = decode(stderr).lower()
+    message = f"{stderr_text}\n{structured_error}"
+    categories: dict[str, str] = {}
+    if any(code in structured_error for code in STRUCTURED_AUTH_CODES):
+        categories["auth"] = "structured-auth-code"
+    if any(fragment in message for fragment in TRANSIENT_FAILURE_FRAGMENTS):
+        source = (
+            "structured"
+            if any(
+                fragment in structured_error for fragment in TRANSIENT_FAILURE_FRAGMENTS
+            )
+            else "stderr"
         )
-        and "model" in structured_primary_error
+        categories["transient"] = f"{source}-transient"
+    if "auth" not in categories and any(
+        fragment in message for fragment in AUTH_FAILURE_FRAGMENTS
+    ):
+        source = (
+            "structured"
+            if any(fragment in structured_error for fragment in AUTH_FAILURE_FRAGMENTS)
+            else "stderr"
+        )
+        categories["auth"] = f"{source}-authentication"
+    if any(fragment in message for fragment in ENTITLEMENT_FAILURE_FRAGMENTS):
+        source = (
+            "structured"
+            if any(
+                fragment in structured_error
+                for fragment in ENTITLEMENT_FAILURE_FRAGMENTS
+            )
+            else "stderr"
+        )
+        categories["entitlement"] = f"{source}-entitlement"
+    elif any(code in structured_error for code in STRUCTURED_ENTITLEMENT_CODES):
+        categories["entitlement"] = "structured-entitlement-code"
+    elif (
+        any(code in structured_error for code in STRUCTURED_AMBIGUOUS_MODEL_CODES)
+        and "model" in structured_error
         and any(
-            marker in structured_primary_error
+            marker in structured_error
             for marker in (
                 "access",
                 "account",
@@ -14121,8 +19861,461 @@ def classify_failure(stdout: bytes | str, stderr: bytes | str) -> str:
             )
         )
     ):
-        return "entitlement"
-    return "other"
+        categories["entitlement"] = "structured-entitlement-context"
+    return categories
+
+
+def _classify_failure_evidence(
+    stdout: bytes | str,
+    stderr: bytes | str,
+) -> tuple[str, str]:
+    categories = _failure_evidence_categories(stdout, stderr)
+    for category in ("transient", "auth", "entitlement"):
+        if category in categories:
+            return category, categories[category]
+    return "other", "unclassified-failure"
+
+
+def _copilot_model_discovery_network_failure(stderr: bytes | str) -> bool:
+    raw = stderr.encode("utf-8") if isinstance(stderr, str) else stderr
+    discovery_markers = (
+        "failed to load models",
+        "could not retrieve the list of available models",
+    )
+    network_markers = (
+        "[enotfound]",
+        "client error (connect)",
+        "connection refused",
+        "dns error",
+        "failed to lookup address information",
+        "name or service not known",
+        "network error",
+        "nodename nor servname provided",
+    )
+    detail = raw[:COPILOT_PROBE_OUTPUT_LIMIT_BYTES].decode(
+        "utf-8",
+        errors="replace",
+    )
+    for raw_line in detail.splitlines():
+        line = " ".join(raw_line.lower().split())
+        if any(marker in line for marker in discovery_markers) and any(
+            marker in line for marker in network_markers
+        ):
+            return True
+    return False
+
+
+def classify_failure(stdout: bytes | str, stderr: bytes | str) -> str:
+    category, _reason = _classify_failure_evidence(stdout, stderr)
+    return category
+
+
+def _safe_claude_auth_warmup_enum(value: Any, allowed: frozenset[str]) -> str:
+    if value is None:
+        return "missing"
+    if not isinstance(value, str):
+        return "invalid"
+    return value if value in allowed else "other"
+
+
+def _nonnegative_json_number(value: Any) -> bool:
+    if type(value) is int:
+        return value >= 0
+    return type(value) is float and math.isfinite(value) and value >= 0
+
+
+def _claude_error_payload_is_supported(value: Any) -> bool:
+    pending = [value]
+    remaining = CLAUDE_FAILURE_METADATA_ITEM_LIMIT
+    while pending:
+        remaining -= 1
+        if remaining < 0:
+            return False
+        item = pending.pop()
+        if item is None or isinstance(item, str) or type(item) is int:
+            continue
+        if isinstance(item, list):
+            pending.extend(item)
+            continue
+        if isinstance(item, dict):
+            if not all(
+                isinstance(key, str) and key in CLAUDE_ERROR_PAYLOAD_FIELDS
+                for key in item
+            ):
+                return False
+            pending.extend(item.values())
+            continue
+        return False
+    return True
+
+
+def _claude_model_usage_shape_is_supported(value: Any) -> bool:
+    if not isinstance(value, dict) or len(value) > 256:
+        return False
+    for model, usage in value.items():
+        if (
+            not isinstance(model, str)
+            or not model
+            or not isinstance(usage, dict)
+            or not set(usage) <= CLAUDE_MODEL_USAGE_FIELDS
+        ):
+            return False
+        for key, metric in usage.items():
+            if key == "costUSD":
+                if not _nonnegative_json_number(metric):
+                    return False
+            elif type(metric) is not int or metric < 0:
+                return False
+    return True
+
+
+def _claude_usage_shape_is_supported(value: Any) -> bool:
+    if not isinstance(value, dict) or not set(value) <= CLAUDE_USAGE_FIELDS:
+        return False
+    for key, metric in value.items():
+        if key == "service_tier":
+            if not isinstance(metric, str) or not metric:
+                return False
+        elif key == "cache_creation":
+            if (
+                not isinstance(metric, dict)
+                or not set(metric) <= CLAUDE_USAGE_CACHE_CREATION_FIELDS
+                or any(type(item) is not int or item < 0 for item in metric.values())
+            ):
+                return False
+        elif key == "server_tool_use":
+            if (
+                not isinstance(metric, dict)
+                or not set(metric) <= CLAUDE_USAGE_SERVER_TOOL_FIELDS
+                or any(type(item) is not int or item < 0 for item in metric.values())
+            ):
+                return False
+        elif type(metric) is not int or metric < 0:
+            return False
+    return True
+
+
+def _claude_failure_metadata_is_supported(result: dict[str, Any]) -> bool:
+    if not set(result) <= CLAUDE_FAILURE_ENVELOPE_FIELDS:
+        return False
+    if "result" in result and not isinstance(result["result"], str):
+        return False
+    for key in ("duration_api_ms", "duration_ms", "num_turns"):
+        if key in result and (type(result[key]) is not int or result[key] < 0):
+            return False
+    for key in ("session_id", "uuid"):
+        if key in result and (not isinstance(result[key], str) or not result[key]):
+            return False
+    if "total_cost_usd" in result and not _nonnegative_json_number(
+        result["total_cost_usd"]
+    ):
+        return False
+    if "permission_denials" in result and result["permission_denials"] != []:
+        return False
+    if "usage" in result and not _claude_usage_shape_is_supported(result["usage"]):
+        return False
+    if "modelUsage" in result and not _claude_model_usage_shape_is_supported(
+        result["modelUsage"]
+    ):
+        return False
+    api_error_status = result.get("api_error_status")
+    if "api_error_status" in result and not (
+        api_error_status is None
+        or (isinstance(api_error_status, str) and not api_error_status.strip())
+        or (type(api_error_status) is int and 100 <= api_error_status <= 599)
+    ):
+        return False
+    return all(
+        _claude_error_payload_is_supported(result[key])
+        for key in CLAUDE_AUTH_WARMUP_ERROR_FIELDS - {"api_error_status"}
+        if key in result
+    )
+
+
+def _claude_auth_warmup_output_shape(stdout: bytes) -> dict[str, object]:
+    result = _strict_json_object(stdout)
+    if result is None:
+        return {"json_shape": "invalid-or-non-object"}
+    api_error_status = result.get("api_error_status")
+    safe_api_error_status = (
+        api_error_status
+        if type(api_error_status) is int and 100 <= api_error_status <= 599
+        else None
+    )
+    raw_result = result.get("result")
+    normalized_result = (
+        " ".join(raw_result.lower().split())
+        if isinstance(raw_result, str)
+        and "\r" not in raw_result
+        and "\n" not in raw_result
+        else None
+    )
+    model_usage = result.get("modelUsage")
+    model_usage_valid = _claude_model_usage_shape_is_supported(model_usage)
+    safe_type = _safe_claude_auth_warmup_enum(
+        result.get("type"),
+        CLAUDE_AUTH_WARMUP_SAFE_TYPES,
+    )
+    safe_subtype = _safe_claude_auth_warmup_enum(
+        result.get("subtype"),
+        CLAUDE_AUTH_WARMUP_SAFE_SUBTYPES,
+    )
+    is_error = result["is_error"] if type(result.get("is_error")) is bool else None
+    known_error_fields = sorted(
+        key for key in CLAUDE_AUTH_WARMUP_ERROR_FIELDS if key in result
+    )
+    unknown_fields = set(result) - CLAUDE_FAILURE_ENVELOPE_FIELDS
+    unknown_field_count = len(unknown_fields)
+    known_error_payloads_empty = all(
+        result[key] is None
+        or (isinstance(result[key], str) and not result[key].strip())
+        or (isinstance(result[key], (list, dict)) and not result[key])
+        for key in known_error_fields
+    )
+    result_shape = (
+        "missing"
+        if "result" not in result
+        else "string"
+        if isinstance(raw_result, str)
+        else "non-string"
+    )
+    supported_result_error = (
+        safe_type == "result"
+        and safe_subtype == "error_during_execution"
+        and is_error is True
+        and result_shape == "string"
+        and unknown_field_count == 0
+        and _claude_failure_metadata_is_supported(result)
+        and known_error_payloads_empty
+    )
+    supported_result_success = (
+        safe_type == "result"
+        and safe_subtype == "success"
+        and is_error is False
+        and raw_result == "OK"
+        and unknown_field_count == 0
+        and _claude_failure_metadata_is_supported(result)
+        and known_error_payloads_empty
+    )
+    return {
+        "api_error_status": safe_api_error_status,
+        "api_error_status_present": "api_error_status" in result,
+        "api_error_status_shape": (
+            "missing"
+            if "api_error_status" not in result
+            else "null"
+            if api_error_status is None
+            else "empty"
+            if isinstance(api_error_status, str) and not api_error_status.strip()
+            else "status"
+            if safe_api_error_status is not None
+            else "invalid"
+        ),
+        "event_shape": (
+            "supported-result-error"
+            if supported_result_error
+            else "supported-result-success"
+            if supported_result_success
+            else "unsupported"
+        ),
+        "is_error": is_error,
+        "json_shape": "object",
+        "known_error_fields_present": known_error_fields,
+        "model_usage_entry_count": (
+            min(len(model_usage), 256) if model_usage_valid else None
+        ),
+        "model_usage_present": "modelUsage" in result,
+        "model_usage_shape": (
+            "missing"
+            if "modelUsage" not in result
+            else "object"
+            if model_usage_valid
+            else "invalid"
+        ),
+        "result_matches_known_auth_message": (
+            normalized_result in CLAUDE_RESULT_AUTH_MESSAGES
+            if normalized_result is not None
+            else False
+        ),
+        "result_signal_categories": (
+            [
+                category
+                for category, terms in CLAUDE_AUTH_WARMUP_RESULT_SIGNAL_TERMS.items()
+                if any(term in normalized_result for term in terms)
+            ]
+            if normalized_result is not None
+            else []
+        ),
+        "result_shape": result_shape,
+        "subtype": safe_subtype,
+        "type": safe_type,
+        "unknown_field_count": min(unknown_field_count, 256),
+    }
+
+
+def _claude_nonzero_failure_reason(stdout: bytes) -> str:
+    if not stdout:
+        return "nonzero-without-structured-diagnostic"
+    result = _strict_json_object(stdout)
+    if result is None:
+        return "nonzero-invalid-strict-json"
+    if result.get("type") != "result":
+        return "nonzero-unsupported-event-type"
+    subtype = result.get("subtype")
+    if subtype not in CLAUDE_AUTH_WARMUP_SAFE_SUBTYPES:
+        return "nonzero-unsupported-result-subtype"
+    if type(result.get("is_error")) is not bool:
+        return "nonzero-invalid-result-error-flag"
+    _effective_model, model_evidence_consistent = _claude_model_usage_evidence(
+        result,
+        requested_model=None,
+    )
+    if not model_evidence_consistent:
+        return "nonzero-malformed-model-usage"
+    if result["is_error"] is False and subtype == "success":
+        return "nonzero-success-envelope"
+    if result["is_error"] is True:
+        return "nonzero-unclassified-result-error"
+    return "nonzero-contradictory-result-envelope"
+
+
+def _claude_entitlement_evidence_is_model_specific(
+    result: dict[str, Any],
+    *,
+    requested_model: str,
+) -> bool:
+    values: list[str] = []
+    codes: set[str] = set()
+    malformed_code = False
+
+    def collect(value: Any) -> None:
+        nonlocal malformed_code
+        if isinstance(value, str):
+            values.append(value)
+            return
+        if isinstance(value, list):
+            for item in value:
+                collect(item)
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key == "code":
+                    if not isinstance(item, str) or "\r" in item or "\n" in item:
+                        malformed_code = True
+                        continue
+                    codes.add(item.strip().lower())
+                    continue
+                collect(item)
+
+    for key in CLAUDE_AUTH_WARMUP_ERROR_FIELDS - {"api_error_status"}:
+        if key in result:
+            if key == "code":
+                if not isinstance(result[key], str) or (
+                    "\r" in result[key] or "\n" in result[key]
+                ):
+                    malformed_code = True
+                    continue
+                codes.add(result[key].strip().lower())
+                continue
+            collect(result[key])
+    if "result" in result:
+        collect(result["result"])
+    if malformed_code:
+        return False
+
+    explicit_codes = set(STRUCTURED_ENTITLEMENT_CODES)
+    ambiguous_codes = set(STRUCTURED_AMBIGUOUS_MODEL_CODES)
+    if codes - explicit_codes - ambiguous_codes:
+        return False
+    explicit_model_code = bool(codes & explicit_codes)
+
+    requested_literal = requested_model.lower()
+    requested_rejection = re.compile(
+        r"\s*(?:error:\s*)?(?:"
+        rf"{re.escape(requested_literal)}\s+(?:is|was)\s+not\s+"
+        r"(?:available|enabled|allowed|included|supported|entitled)"
+        r"(?:\s+(?:for|to|on|in|with|by)\s+"
+        r"(?:(?:your|this|the)\s+)?"
+        r"(?:(?:chatgpt\s+)?account(?:\s+plan)?|user|organization|organisation|plan|"
+        r"current\s+plan|current\s+subscription))?|"
+        r"(?:no access to|access (?:is )?denied for)\s+"
+        rf"{re.escape(requested_literal)})\s*[.!]?\s*",
+        re.I,
+    )
+    matched_model_rejection = False
+    for value in values:
+        if "\r" in value or "\n" in value:
+            return False
+        model_rejection = any(
+            pattern.fullmatch(value)
+            for pattern in CLAUDE_MODEL_ENTITLEMENT_TEXT_PATTERNS
+        ) or requested_rejection.fullmatch(value)
+        if model_rejection:
+            matched_model_rejection = True
+            continue
+        if (
+            value.strip()
+            and CLAUDE_ENTITLEMENT_NEUTRAL_TEXT_PATTERN.fullmatch(value) is None
+        ):
+            return False
+    return explicit_model_code or matched_model_rejection
+
+
+def _claude_supported_failure_category(
+    stdout: bytes,
+    *,
+    stderr: bytes = b"",
+    requested_model: str,
+) -> str | None:
+    result = _strict_json_object(stdout)
+    if (
+        result is None
+        or result.get("type") != "result"
+        or result.get("subtype") != "error_during_execution"
+        or result.get("is_error") is not True
+        or not _claude_failure_metadata_is_supported(result)
+    ):
+        return None
+    effective_model, model_usage_valid = _claude_model_usage_evidence(
+        result,
+        requested_model=requested_model,
+    )
+    if (
+        not model_usage_valid
+        or effective_model is None
+        or not _model_matches(requested_model, effective_model)
+    ):
+        return None
+    category, _reason = _classify_failure_evidence(stdout, stderr)
+    evidence_categories = _failure_evidence_categories(stdout, stderr)
+    if category in {"auth", "entitlement", "transient"} and set(
+        evidence_categories
+    ) != {category}:
+        return None
+    output_shape = _claude_auth_warmup_output_shape(stdout)
+    result_signal_categories = output_shape.get("result_signal_categories")
+    if category == "auth":
+        if not (
+            output_shape.get("event_shape") == "supported-result-error"
+            and output_shape.get("result_matches_known_auth_message") is True
+            and result_signal_categories == ["auth"]
+        ):
+            return None
+    elif category in {"entitlement", "transient"} and result_signal_categories not in (
+        [],
+        [category],
+    ):
+        return None
+    if category == "entitlement" and not _claude_entitlement_evidence_is_model_specific(
+        result,
+        requested_model=requested_model,
+    ):
+        return None
+    if category in {"entitlement", "transient"}:
+        category_source = evidence_categories.get(category, "")
+        if not category_source.startswith("structured-"):
+            return None
+    return category if category in {"auth", "entitlement", "transient"} else None
 
 
 def _normalize_model(value: str) -> str:
@@ -14136,45 +20329,39 @@ def _model_matches(requested: str, effective: str) -> bool:
 
 
 def _json_objects(stdout: bytes) -> list[dict[str, Any]]:
-    text = stdout.decode("utf-8", errors="replace").strip()
+    try:
+        text = stdout.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return []
     if not text:
         return []
-    values: list[dict[str, Any]] = []
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        parsed = None
-    if isinstance(parsed, dict):
-        values.append(parsed)
-        return values
-    for line in text.split("\n"):
+
+    def parse_object(value: str) -> dict[str, Any] | None:
         try:
-            parsed_line = json.loads(line)
-        except json.JSONDecodeError:
+            parsed = strict_json_loads(value)
+        except (UnicodeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    parsed = parse_object(text)
+    if parsed is not None:
+        return [parsed]
+
+    values: list[dict[str, Any]] = []
+    for line in text.split("\n"):
+        if not line.strip():
             continue
-        if isinstance(parsed_line, dict):
-            values.append(parsed_line)
+        parsed_line = parse_object(line)
+        if parsed_line is None:
+            return []
+        values.append(parsed_line)
     return values
-
-
-def _strict_json_object_from_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON object key: {key}")
-        result[key] = value
-    return result
 
 
 def _strict_json_object(stdout: bytes) -> dict[str, Any] | None:
     try:
-        text = stdout.decode("utf-8")
-        parsed = json.loads(
-            text,
-            parse_constant=_reject_nonstandard_json_constant,
-            object_pairs_hook=_strict_json_object_from_pairs,
-        )
-    except (UnicodeDecodeError, ValueError):
+        parsed = strict_json_loads(stdout)
+    except (UnicodeError, ValueError):
         return None
     return parsed if isinstance(parsed, dict) else None
 
@@ -14189,21 +20376,13 @@ def _strict_jsonl_objects(stdout: bytes) -> list[dict[str, Any]] | None:
         if not line.strip(" \t\r"):
             continue
         try:
-            parsed = json.loads(
-                line,
-                parse_constant=_reject_nonstandard_json_constant,
-                object_pairs_hook=_strict_json_object_from_pairs,
-            )
-        except ValueError:
+            parsed = strict_json_loads(line)
+        except (UnicodeError, ValueError):
             return None
         if not isinstance(parsed, dict):
             return None
         objects.append(parsed)
     return objects
-
-
-def _reject_nonstandard_json_constant(value: str) -> None:
-    raise ValueError(f"non-standard JSON constant: {value}")
 
 
 def _error_payload_text(value: Any) -> list[str]:
@@ -14255,12 +20434,27 @@ def _structured_error_item_text(
     if not explicit_error:
         return ""
     messages.append(f"event {' '.join(tokens) or 'explicit error'}")
+    payload_found = False
     for key in ("error", "errors", "message", "reason", "detail", "code"):
         if key in item:
-            messages.extend(_error_payload_text(item[key]))
+            payload_messages = _error_payload_text(item[key])
+            if payload_messages:
+                payload_found = True
+                messages.extend(payload_messages)
     api_error_status = item.get("api_error_status")
-    if isinstance(api_error_status, (int, str)):
+    if (
+        isinstance(api_error_status, int) and not isinstance(api_error_status, bool)
+    ) or (isinstance(api_error_status, str) and api_error_status.strip()):
+        payload_found = True
         messages.append(f"status {api_error_status}")
+    if (
+        not payload_found
+        and item.get("type") == "result"
+        and isinstance(item.get("result"), str)
+    ):
+        normalized_result = " ".join(item["result"].lower().split())
+        if normalized_result in CLAUDE_RESULT_AUTH_MESSAGES:
+            messages.append("not logged in")
     return "\n".join(messages)
 
 
@@ -14274,26 +20468,22 @@ def _structured_error_text(
     )
 
 
-def _parse_claude_output(
-    stdout: bytes, *, requested_model: str | None = None
-) -> tuple[str | None, str | None]:
-    result = _strict_json_object(stdout)
-    if result is None:
-        return None, None
-    if result.get("type") != "result":
-        return None, None
-    model_usage = result.get("modelUsage")
-    if not isinstance(model_usage, dict) or not model_usage:
-        return None, None
-    if any(
-        not isinstance(key, str) or not key or not isinstance(value, dict)
+def _claude_model_usage_evidence(
+    result: dict[str, Any],
+    *,
+    requested_model: str | None,
+) -> tuple[str | None, bool]:
+    if "modelUsage" not in result:
+        return None, True
+    model_usage = result["modelUsage"]
+    if not isinstance(model_usage, dict) or not all(
+        isinstance(key, str) and key and isinstance(value, dict)
         for key, value in model_usage.items()
     ):
-        return None, None
+        return None, False
     candidates = list(model_usage)
-    effective_model = None
     if requested_model is not None:
-        effective_model = next(
+        matching = next(
             (
                 candidate
                 for candidate in candidates
@@ -14301,11 +20491,27 @@ def _parse_claude_output(
             ),
             None,
         )
-    if effective_model is None and candidates:
-        effective_model = candidates[-1]
+        return matching or (candidates[-1] if candidates else None), True
+    return (candidates[-1] if candidates else None), True
+
+
+def _parse_claude_output_evidence(
+    stdout: bytes, *, requested_model: str | None = None
+) -> tuple[str | None, str | None, bool]:
+    result = _strict_json_object(stdout)
+    if result is None:
+        return None, None, True
+    if result.get("type") != "result":
+        return None, None, True
+    effective_model, model_evidence_consistent = _claude_model_usage_evidence(
+        result,
+        requested_model=requested_model,
+    )
     if result.get("subtype") != "success" or result.get("is_error") is not False:
-        return None, effective_model
-    for key in ("error", "errors"):
+        return None, effective_model, model_evidence_consistent
+    if not _claude_failure_metadata_is_supported(result):
+        return None, effective_model, model_evidence_consistent
+    for key in CLAUDE_AUTH_WARMUP_ERROR_FIELDS:
         if key not in result:
             continue
         value = result[key]
@@ -14315,16 +20521,25 @@ def _parse_claude_output(
             or (isinstance(value, (list, dict)) and not value)
         )
         if not explicitly_empty:
-            return None, effective_model
-    if "api_error_status" in result:
-        value = result["api_error_status"]
-        if value is not None and not (isinstance(value, str) and not value.strip()):
-            return None, effective_model
+            return None, effective_model, model_evidence_consistent
     final_text = result.get("result")
-    if not isinstance(final_text, str) or not final_text.strip() or not candidates:
-        return None, effective_model
+    if (
+        not isinstance(final_text, str)
+        or not final_text.strip()
+        or effective_model is None
+    ):
+        return None, effective_model, model_evidence_consistent
     if _structured_error_text(stdout).strip():
-        return None, effective_model
+        return None, effective_model, model_evidence_consistent
+    return final_text, effective_model, model_evidence_consistent
+
+
+def _parse_claude_output(
+    stdout: bytes, *, requested_model: str | None = None
+) -> tuple[str | None, str | None]:
+    final_text, effective_model, _model_evidence_consistent = (
+        _parse_claude_output_evidence(stdout, requested_model=requested_model)
+    )
     return final_text, effective_model
 
 
@@ -14718,11 +20933,7 @@ def _strict_jsonl_handle_objects(
         if not line.strip(b" \t\r"):
             continue
         text = line.decode("utf-8")
-        parsed = json.loads(
-            text,
-            parse_constant=_reject_nonstandard_json_constant,
-            object_pairs_hook=_strict_json_object_from_pairs,
-        )
+        parsed = strict_json_loads(text)
         if not isinstance(parsed, dict):
             raise ValueError("reviewer JSONL record is not an object")
         yield parsed
@@ -14845,8 +21056,8 @@ def _codex_session_metadata(
             with candidate.open("r", encoding="utf-8") as handle:
                 for line in handle:
                     try:
-                        item = json.loads(line)
-                    except json.JSONDecodeError:
+                        item = strict_json_loads(line)
+                    except (UnicodeError, ValueError):
                         continue
                     if not isinstance(item, dict) or item.get("type") != "turn_context":
                         continue
@@ -15225,7 +21436,9 @@ def _record_attempt(
     effective_effort: str | None,
     require_verified_model: bool = False,
     require_verified_effort: bool = False,
+    model_evidence_consistent: bool = True,
     output: AttemptOutput | None = None,
+    evidence_stdout: bytes | None = None,
 ) -> Attempt:
     if output is None:
         stdout_path, stderr_path = _attempt_paths(review, index, runtime, model)
@@ -15234,11 +21447,61 @@ def _record_attempt(
         stdout_path = output.stdout_path
         stderr_path = output.stderr_path
     output.ensure_captured(completed)
-    category = (
-        "success"
-        if completed.returncode == 0 and final_text
-        else classify_failure(completed.stdout, completed.stderr)
-    )
+    stdout_evidence = completed.stdout if evidence_stdout is None else evidence_stdout
+    if completed.returncode != 0:
+        final_text = None
+    if completed.returncode == 0 and final_text:
+        category = "success"
+        reason = None
+    elif runtime == "copilot" and completed.returncode == 0:
+        category = "inconclusive"
+        reason = "zero-exit-without-verified-final"
+    else:
+        category, reason = _classify_failure_evidence(
+            stdout_evidence,
+            completed.stderr,
+        )
+        if (
+            runtime == "copilot"
+            and completed.returncode != 0
+            and category not in {"auth", "entitlement"}
+            and _copilot_model_discovery_network_failure(completed.stderr)
+        ):
+            category = "transient"
+            reason = "stderr-model-discovery-network"
+            output.append_stderr(
+                "Copilot model discovery encountered a transient network failure",
+            )
+        if runtime == "claude":
+            if category in {"auth", "entitlement", "transient"} and (
+                _claude_supported_failure_category(
+                    stdout_evidence,
+                    stderr=completed.stderr,
+                    requested_model=model,
+                )
+                != category
+            ):
+                reason = f"unverified-{category}-failure-envelope"
+                category = "inconclusive"
+            elif completed.returncode != 0 and category == "other":
+                category = "inconclusive"
+                reason = _claude_nonzero_failure_reason(stdout_evidence)
+            elif completed.returncode == 0 and category == "other":
+                result = _strict_json_object(stdout_evidence)
+                if (
+                    result is not None
+                    and result.get("type") == "result"
+                    and (
+                        result.get("subtype") != "success"
+                        or result.get("is_error") is not False
+                    )
+                ):
+                    category = "inconclusive"
+                    reason = "zero-exit-unclassified-result-error"
+            if category == "inconclusive":
+                output.append_stderr(
+                    f"Claude structured failure was inconclusive: {reason}",
+                )
     attempt = Attempt(
         runtime=runtime,
         requested_model=model,
@@ -15250,7 +21513,48 @@ def _record_attempt(
         final_text=final_text,
         stdout_path=str(stdout_path),
         stderr_path=str(stderr_path),
+        reason=reason,
     )
+    if runtime == "claude" and not model_evidence_consistent:
+        detail = (
+            "Claude result exposed malformed modelUsage metadata; refusing to "
+            "classify authentication, entitlement, or final output"
+        )
+        output.append_stderr(detail)
+        return replace(
+            attempt,
+            returncode=65,
+            category="runtime-unverified",
+            final_text=None,
+            reason="malformed-model-usage",
+        )
+    if runtime == "claude" and completed.returncode == 0 and final_text is None:
+        result = _strict_json_object(stdout_evidence)
+        if result is None or result.get("type") != "result":
+            output.append_stderr(
+                "Claude successful process did not emit a supported strict result "
+                "envelope",
+            )
+            return replace(
+                attempt,
+                returncode=65,
+                category="runtime-unverified",
+                final_text=None,
+                reason="invalid-result-envelope",
+            )
+        if result.get("subtype") == "success" and result.get("is_error") is False:
+            detail = (
+                "Claude success result lacked verified requested-model evidence; "
+                "refusing to accept final output"
+            )
+            output.append_stderr(detail)
+            return replace(
+                attempt,
+                returncode=65,
+                category="runtime-unverified",
+                final_text=None,
+                reason="missing-requested-model-usage",
+            )
     if attempt.category in {"success", "entitlement"} and (
         (require_verified_model and effective_model is None)
         or (require_verified_effort and effective_effort is None)
@@ -15265,6 +21569,7 @@ def _record_attempt(
             returncode=65,
             category="runtime-unverified",
             final_text=None,
+            reason="missing-runtime-verification-metadata",
         )
     if effective_model and not _model_matches(model, effective_model):
         mismatch = (
@@ -15277,6 +21582,7 @@ def _record_attempt(
             returncode=65,
             category="model-mismatch",
             final_text=None,
+            reason="effective-model-mismatch",
         )
     if effective_effort and effective_effort.lower() != requested_effort.lower():
         mismatch = (
@@ -15289,6 +21595,7 @@ def _record_attempt(
             returncode=65,
             category="effort-mismatch",
             final_text=None,
+            reason="effective-effort-mismatch",
         )
     return attempt
 
@@ -15457,7 +21764,11 @@ def _resolve_validated_claude_executable(
     review: ReviewWorkspace,
     env: dict[str, str],
     runtime_binding_sink: list[Any] | None = None,
-) -> tuple[pathlib.Path | None, dict[str, str]]:
+) -> tuple[
+    pathlib.Path | None,
+    dict[str, str],
+    ClaudeExecutableTrustEvidence | None,
+]:
     linux_host = _claude_linux_host() if _is_claude_linux_host() else None
     if linux_host is not None:
         try:
@@ -15494,6 +21805,7 @@ def _resolve_validated_claude_executable(
     probe_home.chmod(0o700)
     runtime_reports: dict[str, dict[str, object]] = {}
     runtime_executables: dict[str, pathlib.Path] = {}
+    runtime_evidence: dict[str, ClaudeExecutableTrustEvidence] = {}
     runtime_bindings: dict[str, Any] = {}
 
     def validate_candidate(candidate: pathlib.Path) -> None:
@@ -15541,6 +21853,19 @@ def _resolve_validated_claude_executable(
             if isinstance(verified, VerifiedClaudeExecutable)
             else candidate
         )
+        executable_evidence = _inspect_claude_executable_trust(
+            verified_executable,
+            container_dir=review.container_dir,
+            expected_sha256=(
+                verified.artifact.checksum
+                if isinstance(verified, VerifiedClaudeExecutable)
+                else None
+            ),
+            include_bundled_roots=_is_claude_macos_host(),
+            required_mode=(
+                0o500 if isinstance(verified, VerifiedClaudeExecutable) else None
+            ),
+        )
         candidate_env = _claude_preflight_probe_environment(
             home=probe_home,
             tmp=claude_tmp,
@@ -15551,27 +21876,29 @@ def _resolve_validated_claude_executable(
             version=version,
         )
         runtime_executables[str(candidate.absolute())] = verified_executable
-        if isinstance(verified, VerifiedClaudeExecutable) and capabilities is not None:
-            try:
-                runtime_bindings[str(candidate.absolute())] = (
-                    _load_claude_stream_validator().runtime_binding_from_verified_executable(
-                        verified,
-                        capabilities=capabilities,
-                        authentication_source=_claude_authentication_source(
-                            prepared_env
-                        ),
-                        launch_profile=(
-                            "helper-linux"
-                            if linux_host is not None
-                            else "helper-darwin"
-                        ),
+        runtime_evidence[str(candidate.absolute())] = executable_evidence
+        if isinstance(verified, VerifiedClaudeExecutable):
+            if capabilities is not None:
+                try:
+                    runtime_bindings[str(candidate.absolute())] = (
+                        _load_claude_stream_validator().runtime_binding_from_verified_executable(
+                            verified,
+                            capabilities=capabilities,
+                            authentication_source=_claude_authentication_source(
+                                prepared_env
+                            ),
+                            launch_profile=(
+                                "helper-linux"
+                                if linux_host is not None
+                                else "helper-darwin"
+                            ),
+                        )
                     )
-                )
-            except (OSError, RuntimeError, TypeError, ValueError) as error:
-                raise ClaudeExecutableInspectionInconclusive(
-                    "cannot bind the verified Claude runtime to its canonical "
-                    "stream contract"
-                ) from error
+                except (OSError, RuntimeError, TypeError, ValueError) as error:
+                    raise ClaudeExecutableInspectionInconclusive(
+                        "cannot bind the verified Claude runtime to its canonical "
+                        "stream contract"
+                    ) from error
             lock_protocol = certified_claude_refresh_lock_protocol(
                 version=verified.artifact.version,
                 platform_key=verified.artifact.platform_key,
@@ -15589,6 +21916,11 @@ def _resolve_validated_claude_executable(
                 "manifest_url": verified.manifest_url,
                 "signature_url": verified.signature_url,
                 "sha256": verified.artifact.checksum,
+                "bundled_roots": {
+                    "count": len(executable_evidence.bundled_root_sha256_fingerprints),
+                    "set_sha256": executable_evidence.bundled_root_set_sha256,
+                    "source": "publisher-verified-executable-snapshot",
+                },
                 "gpg_verifier": str(verified.gpg_path),
                 "gpg_verifier_trust": "fixed-path-native-host-tool",
                 "capabilities": {
@@ -15623,14 +21955,16 @@ def _resolve_validated_claude_executable(
 
     try:
         executable = resolve_reviewer_executable(
-            "claude", candidate_validator=validate_candidate
+            "claude",
+            candidate_validator=validate_candidate,
+            inspection_error=ClaudeExecutableInspectionInconclusive,
         )
     except RejectedReviewerCandidates as error:
         raise ClaudeExecutableUnavailable(str(error)) from error
     if executable is None:
         if runtime_binding_sink is not None:
             runtime_binding_sink.clear()
-        return None, prepared_env
+        return None, prepared_env, None
     report = runtime_reports.get(str(executable.absolute()))
     if report is not None:
         write_json(review.container_dir / "claude-runtime.json", report)
@@ -15638,14 +21972,23 @@ def _resolve_validated_claude_executable(
         str(executable.absolute()),
         executable,
     )
+    evidence = runtime_evidence.get(str(executable.absolute()))
+    if evidence is None:
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude executable snapshot evidence is unavailable"
+        )
     if runtime_binding_sink is not None:
         runtime_binding_sink.clear()
         runtime_binding = runtime_bindings.get(str(executable.absolute()))
         if runtime_binding is not None:
             runtime_binding_sink.append(runtime_binding)
-    return runtime_executable, _with_executable_path(
-        prepared_env,
+    return (
         runtime_executable,
+        _with_executable_path(
+            prepared_env,
+            runtime_executable,
+        ),
+        evidence,
     )
 
 
@@ -15655,12 +21998,22 @@ def _claude_linux_review_runtime(
     executable: pathlib.Path,
     env: dict[str, str],
     arguments: tuple[str, ...],
-    refresh_lock_protocol: ClaudeRefreshLockProtocol | None = None,
     *,
+    proxy_env: dict[str, str] | None = None,
+    proxy_ssl_context: ssl.SSLContext | None = None,
+    refresh_lock_protocol: ClaudeRefreshLockProtocol | None = None,
     launch: ReviewLaunchBinding | None = None,
     writer_started: Callable[[], bool] | None = None,
     writer_quiescent: Callable[[], bool] | None = None,
 ) -> Iterator[Any]:
+    runtime_proxy_env = env if proxy_env is None else proxy_env
+    if (
+        _claude_https_proxy_tls_required(runtime_proxy_env)
+        and proxy_ssl_context is None
+    ):
+        raise ClaudeExecutableInspectionInconclusive(
+            "Claude proxy TLS context is unavailable"
+        )
     if launch is not None:
         launch.require_workspace_path(review.workspace_root)
     try:
@@ -15730,7 +22083,13 @@ def _claude_linux_review_runtime(
                 )
             )
             config_dir = staged.config_dir
-        proxy_socket = stack.enter_context(_claude_unix_connect_proxy(review, env))
+        proxy_socket = stack.enter_context(
+            _claude_unix_connect_proxy(
+                review,
+                runtime_proxy_env,
+                upstream_ssl_context=proxy_ssl_context,
+            )
+        )
         spec = SandboxSpec(
             host=host,
             toolchain=toolchain,
@@ -15991,6 +22350,8 @@ def _claude_attempt(
     index: int,
     env: dict[str, str],
     executable: pathlib.Path | None = None,
+    executable_evidence: ClaudeExecutableTrustEvidence | None = None,
+    trust_state: ClaudeTrustSessionState | None = None,
     runtime_binding: Any | None = None,
     launch: ReviewLaunchBinding | None = None,
     refresh_lock_protocol: ClaudeRefreshLockProtocol | None | object = (
@@ -16004,6 +22365,8 @@ def _claude_attempt(
             index=index,
             env=env,
             executable=executable,
+            executable_evidence=executable_evidence,
+            trust_state=trust_state,
             runtime_binding=runtime_binding,
             launch=launch,
             refresh_lock_protocol=refresh_lock_protocol,
@@ -16018,6 +22381,8 @@ def _claude_attempt_with_output(
     index: int,
     env: dict[str, str],
     executable: pathlib.Path | None,
+    executable_evidence: ClaudeExecutableTrustEvidence | None,
+    trust_state: ClaudeTrustSessionState | None,
     runtime_binding: Any | None = None,
     launch: ReviewLaunchBinding | None,
     refresh_lock_protocol: ClaudeRefreshLockProtocol | None | object,
@@ -16025,7 +22390,7 @@ def _claude_attempt_with_output(
 ) -> Attempt:
     if executable is None:
         runtime_binding_sink: list[Any] = []
-        executable, env = _resolve_validated_claude_executable(
+        executable, env, executable_evidence = _resolve_validated_claude_executable(
             review=review,
             env=env,
             runtime_binding_sink=runtime_binding_sink,
@@ -16033,10 +22398,21 @@ def _claude_attempt_with_output(
         runtime_binding = (
             runtime_binding_sink[0] if len(runtime_binding_sink) == 1 else None
         )
+    elif executable_evidence is None:
+        raise ClaudeExecutableInspectionInconclusive(
+            "validated Claude executable snapshot evidence is unavailable"
+        )
     if executable is None:
         raise FileNotFoundError(
             "claude is not available in a validated executable path"
         )
+    assert executable_evidence is not None
+    trust_state = trust_state or ClaudeTrustSessionState()
+    _require_matching_claude_executable_snapshot(
+        executable,
+        executable_evidence,
+        container_dir=review.container_dir,
+    )
     linux_host = _is_claude_linux_host()
     prompt = _claude_review_prompt(
         review,
@@ -16046,9 +22422,29 @@ def _claude_attempt_with_output(
     )
     if linux_host:
         _require_claude_linux_prompt_without_file_mentions(prompt)
-    env = _with_claude_review_tool_path(review, env)
-    env = _prepare_claude_tls_environment(review, env)
-    authentication_source = _claude_authentication_source(env)
+    proxy_env, proxy_ssl_context = _claude_proxy_tls_environment(
+        review,
+        env,
+        trust_state=trust_state,
+    )
+    attempt_env = _with_claude_review_tool_path(review, env)
+    attempt_env = _with_claude_tls_snapshot_inputs(
+        attempt_env,
+        proxy_env,
+    )
+    attempt_env = _prepare_claude_tls_environment(
+        review,
+        attempt_env,
+        executable_evidence=executable_evidence,
+        trust_state=trust_state,
+        expected_snapshot_sha256=trust_state.proxy_tls_snapshot_sha256,
+    )
+    _require_matching_claude_executable_snapshot(
+        executable,
+        executable_evidence,
+        container_dir=review.container_dir,
+    )
+    authentication_source = _claude_authentication_source(attempt_env)
     if authentication_source != "local-login":
         selected_refresh_lock_protocol = None
     elif refresh_lock_protocol is _UNRESOLVED_CLAUDE_REFRESH_LOCK_PROTOCOL:
@@ -16100,16 +22496,28 @@ def _claude_attempt_with_output(
         writer_start = ProcessStartOwner()
         writer_quiescent = threading.Event()
         try:
+            _require_matching_claude_executable_snapshot(
+                executable,
+                executable_evidence,
+                container_dir=review.container_dir,
+            )
             with _claude_linux_review_runtime(
                 review,
                 executable,
-                env,
+                attempt_env,
                 arguments,
-                selected_refresh_lock_protocol,
+                proxy_env=proxy_env,
+                proxy_ssl_context=proxy_ssl_context,
+                refresh_lock_protocol=selected_refresh_lock_protocol,
                 launch=launch,
                 writer_started=writer_start.may_have_started,
                 writer_quiescent=writer_quiescent.is_set,
             ) as sandbox_command:
+                _require_matching_claude_executable_snapshot(
+                    executable,
+                    executable_evidence,
+                    container_dir=review.container_dir,
+                )
                 completed = run(
                     sandbox_command.argv,
                     cwd=review.workspace_root if launch is None else None,
@@ -16369,17 +22777,30 @@ def _claude_attempt_with_output(
         process_quiescent = threading.Event()
         try:
             with contextlib.ExitStack() as stack:
-                env = stack.enter_context(
+                runtime_env = stack.enter_context(
                     _claude_keychain_runtime(
                         review,
-                        env,
+                        attempt_env,
                         selected_refresh_lock_protocol,
                         process_started=process_start.may_have_started,
                         process_quiescent=process_quiescent.is_set,
                     )
                 )
-                proxy_port = stack.enter_context(_claude_connect_proxy(env))
-                review_env = _with_claude_proxy_environment(env, proxy_port)
+                proxy_port = stack.enter_context(
+                    _claude_connect_proxy(
+                        proxy_env,
+                        upstream_ssl_context=proxy_ssl_context,
+                    )
+                )
+                review_env = _with_claude_proxy_environment(
+                    runtime_env,
+                    proxy_port,
+                )
+                _require_matching_claude_macos_tls_bundle(
+                    review,
+                    review_env,
+                    trust_state=trust_state,
+                )
                 bound_workspace = (
                     launch.require_workspace_path(review.workspace_root)
                     if launch is not None
@@ -16399,6 +22820,16 @@ def _claude_attempt_with_output(
                         "outer_sandbox": {"status": "profile-generated"},
                         "authentication": {"status": "sandbox-auth-staged"},
                     },
+                )
+                _require_matching_claude_executable_snapshot(
+                    executable,
+                    executable_evidence,
+                    container_dir=review.container_dir,
+                )
+                _require_matching_claude_macos_tls_bundle(
+                    review,
+                    review_env,
+                    trust_state=trust_state,
                 )
                 runtime_started = True
                 if launch is not None:
@@ -16425,6 +22856,16 @@ def _claude_attempt_with_output(
                     stdin=prompt,
                     timeout_seconds=REVIEW_ATTEMPT_TIMEOUT_SECONDS,
                     output_file_limit_bytes=REVIEW_ATTEMPT_OUTPUT_LIMIT_BYTES,
+                    prepare_process_spawned=getattr(
+                        runtime_env,
+                        "prepare_runtime_process",
+                        None,
+                    ),
+                    on_process_spawned=getattr(
+                        runtime_env,
+                        "bind_runtime_process",
+                        None,
+                    ),
                     redact_values=output_redact_values(
                         claude_output_redact_values(env)
                     ),
@@ -16749,6 +23190,7 @@ def _claude_attempt_with_output(
                 "requested_effort": CLAUDE_REASONING_EFFORT,
                 "effective_effort": attempt.effective_effort,
                 "category": attempt.category,
+                "reason": attempt.reason,
                 "returncode": attempt.returncode,
                 "stream_validation_classification": stream_validation.get(
                     "classification"
@@ -16926,6 +23368,21 @@ def _review_supervision_failure_class(error: Exception) -> str:
     return "supervision-inconclusive"
 
 
+def _format_claude_runner_error(
+    prefix: str,
+    error: BaseException,
+    *secondary_diagnostics: str | None,
+) -> str:
+    lines = [f"{prefix}{error}"]
+    for diagnostic in secondary_diagnostics:
+        if diagnostic is not None and diagnostic not in lines:
+            lines.append(diagnostic)
+    trust_diagnostic = _claude_trust_evidence_write_diagnostic(error)
+    if trust_diagnostic is not None and trust_diagnostic not in lines:
+        lines.append(trust_diagnostic)
+    return "\n".join(lines) + "\n"
+
+
 def _attempt_summary(attempt: Attempt) -> dict[str, Any]:
     return {
         "runtime": attempt.runtime,
@@ -16935,6 +23392,7 @@ def _attempt_summary(attempt: Attempt) -> dict[str, Any]:
         "effective_effort": attempt.effective_effort,
         "returncode": attempt.returncode,
         "category": attempt.category,
+        "reason": attempt.reason,
         "final_available": bool(attempt.final_text),
         "stdout_path": attempt.stdout_path,
         "stderr_path": attempt.stderr_path,
@@ -16984,7 +23442,12 @@ def _finish(
                 payload,
             )
         return Outcome(0, final_text, tuple(attempts))
-    if attempts and attempts[-1].category == "transient":
+    if not attempts:
+        return Outcome(1, None, tuple())
+    if attempts[-1].category in {
+        "inconclusive",
+        "transient",
+    }:
         return Outcome(75, None, tuple(attempts))
     return Outcome(1, None, tuple(attempts))
 
@@ -17127,6 +23590,7 @@ def _run_model_chain(
                     final_text=None,
                     stdout_path=str(stdout_path),
                     stderr_path=str(stderr_path),
+                    reason=_review_supervision_failure_class(error),
                 )
             )
             _write_attempts(review, attempts, launch=launch)
@@ -17394,16 +23858,35 @@ def _run_review_with_binding(
         )
         if linux_host:
             _require_claude_linux_prompt_without_file_mentions(prompt)
-        claude_executable, claude_env = _resolve_validated_claude_executable(
+        (
+            claude_executable,
+            claude_env,
+            claude_executable_evidence,
+        ) = _resolve_validated_claude_executable(
             review=review,
             env=claude_env,
             runtime_binding_sink=claude_runtime_binding_sink,
         )
         claude_available = claude_executable is not None
         if claude_available:
-            if not _is_claude_linux_host():
+            if not _is_claude_linux_host() and not _claude_uses_explicit_auth(
+                claude_env
+            ):
                 claude_env = _prepare_claude_keychain_broker(review, claude_env)
             claude_env = _with_claude_review_tool_path(review, claude_env)
+            _update_claude_runtime_report(
+                review,
+                {
+                    "phase": "attempt-preflight-ready",
+                    "authentication": {
+                        "status": (
+                            "configured"
+                            if _claude_uses_explicit_auth(claude_env)
+                            else "deferred-to-final-attempt"
+                        )
+                    },
+                },
+            )
     except ClaudeKeychainCredentialUnavailable as error:
         persistence_attempt = getattr(
             error,
@@ -17454,19 +23937,29 @@ def _run_review_with_binding(
     ) as error:
         _persist_failure_artifacts(
             review,
-            f"Claude Code validation was inconclusive: {error}\n",
-            [],
+            _format_claude_runner_error(
+                "Claude Code validation was inconclusive: ",
+                error,
+            ),
+            attempts,
         )
         return Outcome(75, None, tuple(attempts))
     except ReviewError as error:
         _persist_failure_artifacts(
             review,
-            "Claude Code executable validation failed; refusing Copilot fallback: "
-            f"{error}\n",
-            [],
+            _format_claude_runner_error(
+                "Claude Code executable validation failed; refusing Copilot fallback: ",
+                error,
+            ),
+            attempts,
         )
         return Outcome(2, None, tuple(attempts))
-    if claude_available and claude_executable is not None:
+    if (
+        claude_available
+        and claude_executable is not None
+        and claude_executable_evidence is not None
+    ):
+        claude_trust_state = ClaudeTrustSessionState()
 
         def run_claude_attempt_with_verified_executable(
             *,
@@ -17483,6 +23976,8 @@ def _run_review_with_binding(
                     index=index,
                     env=env,
                     executable=claude_executable,
+                    executable_evidence=claude_executable_evidence,
+                    trust_state=claude_trust_state,
                     runtime_binding=(
                         claude_runtime_binding_sink[0]
                         if len(claude_runtime_binding_sink) == 1
@@ -17546,11 +24041,10 @@ def _run_review_with_binding(
                 )
             _persist_failure_artifacts(
                 review,
-                initial_diagnostic
-                + (
-                    f"{persistence_diagnostic}\n"
-                    if persistence_diagnostic is not None
-                    else ""
+                _format_claude_runner_error(
+                    "Claude Code validation was inconclusive: ",
+                    error,
+                    persistence_diagnostic,
                 ),
                 attempts,
             )
@@ -17590,9 +24084,11 @@ def _run_review_with_binding(
             ):
                 _persist_failure_artifacts(
                     review,
-                    "Explicit CODEX_REVIEW_CLAUDE_PATH lacks a required secure "
-                    "runtime prerequisite; refusing Copilot fallback: "
-                    f"{error}\n",
+                    _format_claude_runner_error(
+                        "Explicit CODEX_REVIEW_CLAUDE_PATH lacks a required secure "
+                        "runtime prerequisite; refusing Copilot fallback: ",
+                        error,
+                    ),
                     attempts,
                 )
                 return Outcome(2, None, tuple(attempts))
@@ -17600,7 +24096,10 @@ def _run_review_with_binding(
             final_text = None
             write_text_atomic(
                 review.container_dir / "claude-skip.txt",
-                f"Claude Code local authentication became unavailable: {error}\n",
+                _format_claude_runner_error(
+                    "Claude Code local authentication became unavailable: ",
+                    error,
+                ),
             )
         except ReviewError as error:
             persistence_diagnostic = _record_claude_secondary_persistence_failure(
@@ -17609,12 +24108,11 @@ def _run_review_with_binding(
             )
             _persist_failure_artifacts(
                 review,
-                "Claude Code failed executable validation; "
-                f"refusing Copilot fallback: {error}\n"
-                + (
-                    f"{persistence_diagnostic}\n"
-                    if persistence_diagnostic is not None
-                    else ""
+                _format_claude_runner_error(
+                    "Claude Code failed executable validation; refusing Copilot "
+                    "fallback: ",
+                    error,
+                    persistence_diagnostic,
                 ),
                 attempts,
             )

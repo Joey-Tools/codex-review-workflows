@@ -10,6 +10,26 @@
     "legacy-base": ">=2.1.211,<2.1.216",
     "extended-2x": ">=2.1.216,<3.0.0"
   },
+  "version_adaptations": {
+    "2.1.216": {
+      "scope": "exact-selected-version",
+      "init_event": {
+        "optional_field_contracts": {
+          "estimated_tokens": {
+            "rule": "null",
+            "failure": "inconclusive"
+          },
+          "estimated_tokens_delta": {
+            "rule": "null",
+            "failure": "inconclusive"
+          }
+        }
+      },
+      "terminal_result": {
+        "optional_field_contracts": {}
+      }
+    }
+  },
   "launch_profiles": [
     "helper-darwin",
     "helper-linux",

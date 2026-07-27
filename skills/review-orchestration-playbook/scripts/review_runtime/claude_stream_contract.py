@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import stat
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,6 +20,24 @@ VERSION_POLICY_REFERENCE = (
 BASELINE_SCHEMA_NAME = "claude-2.1.212-stream-schema.json"
 BASELINE_VERSION = "2.1.212"
 PROFILE_SCHEMA_NAME = "claude-stream-schema.json"
+VERSION_ADAPTATIONS = {
+    "2.1.216": {
+        "scope": "exact-selected-version",
+        "init_event": {
+            "optional_field_contracts": {
+                "estimated_tokens": {
+                    "rule": "null",
+                    "failure": "inconclusive",
+                },
+                "estimated_tokens_delta": {
+                    "rule": "null",
+                    "failure": "inconclusive",
+                },
+            }
+        },
+        "terminal_result": {"optional_field_contracts": {}},
+    }
+}
 REFERENCE_ROOT = pathlib.Path(__file__).resolve().parents[2] / "references"
 COMPATIBILITY_PATH = REFERENCE_ROOT / "claude-stream-compatibility.json"
 BASELINE_PATH = REFERENCE_ROOT / BASELINE_SCHEMA_NAME
@@ -38,6 +57,13 @@ class ClaudeStreamContractBinding:
     compatibility_digest: str
     baseline_digest: str
     capability_digest: str
+
+
+def version_adaptation(version: str) -> dict[str, Any] | None:
+    """Return an isolated exact-version additive contract, when reviewed."""
+
+    adaptation = VERSION_ADAPTATIONS.get(version)
+    return deepcopy(adaptation) if adaptation is not None else None
 
 
 def _identity(metadata: os.stat_result) -> tuple[int, ...]:
@@ -175,6 +201,7 @@ def load_stream_contract(
             "legacy-base": ">=2.1.211,<2.1.216",
             "extended-2x": ">=2.1.216,<3.0.0",
         },
+        "version_adaptations": VERSION_ADAPTATIONS,
         "launch_profiles": ["helper-darwin", "helper-linux", "named-direct"],
         "fail_closed_surfaces": [
             "stream_envelope",
@@ -191,6 +218,26 @@ def load_stream_contract(
         raise ClaudeStreamContractError("stream compatibility profile does not match")
     if baseline.get("claude_code_version") != BASELINE_VERSION:
         raise ClaudeStreamContractError("stream baseline version does not match")
+    baseline_init = baseline.get("init_event")
+    baseline_terminal = baseline.get("terminal_result")
+    if type(baseline_init) is not dict or type(baseline_terminal) is not dict:
+        raise ClaudeStreamContractError("stream baseline field sets are invalid")
+    baseline_init_fields = set(baseline_init.get("required_fields", ())) | set(
+        baseline_init.get("optional_fields", ())
+    )
+    baseline_terminal_fields = set(baseline_terminal.get("required_fields", ())) | set(
+        baseline_terminal.get("optional_fields", ())
+    )
+    for adaptation in VERSION_ADAPTATIONS.values():
+        init_fields = set(adaptation["init_event"]["optional_field_contracts"])
+        terminal_fields = set(adaptation["terminal_result"]["optional_field_contracts"])
+        if (
+            init_fields & baseline_init_fields
+            or terminal_fields & baseline_terminal_fields
+        ):
+            raise ClaudeStreamContractError(
+                "version adaptation overrides a baseline field"
+            )
     version_contract = profile.get("claude_code_version")
     if version_contract != {
         "rule": "strict_release_semver_range",

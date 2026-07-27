@@ -3515,6 +3515,7 @@ def _claude_environment(
             "current POSIX account cannot be resolved safely"
         ) from error
     environment = {
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "GIT_ASKPASS": "/usr/bin/false",
         "GIT_ATTR_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,

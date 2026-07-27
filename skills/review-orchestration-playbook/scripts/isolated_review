@@ -2,14 +2,14 @@
 
 import sys
 
+sys.dont_write_bytecode = True
+
 
 if sys.version_info < (3, 10):
     print("isolated_review requires Python 3.10 or newer", file=sys.stderr)
     raise SystemExit(2)
 
-sys.dont_write_bytecode = True
-
-from review_runtime import main
+from review_runtime import main  # noqa: E402
 
 
 if __name__ == "__main__":

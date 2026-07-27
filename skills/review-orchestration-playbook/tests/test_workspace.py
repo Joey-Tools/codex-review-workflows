@@ -4220,7 +4220,11 @@ class WorkspaceTest(unittest.TestCase):
         git(self.repo, "rm", ".gitattributes")
         oid = "a" * 64
         (self.repo / "asset.bin").write_text(
-            f"version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize 1\n",
+            "version https://git-lfs.github.com/spec/v1\n"
+            f"ext-10-!opaque/name sha256:{oid}\n"
+            f"ext-10-!opaque/name sha256:{oid}\n"
+            f"oid sha256:{oid}\n"
+            "size 1\n",
             encoding="utf-8",
         )
         git(self.repo, "add", "asset.bin")

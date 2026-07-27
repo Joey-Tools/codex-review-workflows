@@ -41,6 +41,12 @@ class ReviewTimeoutError(ReviewError):
 class ReviewOutputLimitError(ReviewError):
     """A bounded reviewer subprocess exceeded its output allowance."""
 
+    def __init__(self, message: str, *, limit_kind: str = "stream") -> None:
+        if limit_kind not in {"stream", "regular-file"}:
+            raise ValueError("output limit kind must be stream or regular-file")
+        super().__init__(message)
+        self.limit_kind = limit_kind
+
 
 class ReviewOutputDrainError(ReviewError):
     """A reviewer output stream could not be drained completely."""
@@ -122,6 +128,10 @@ class BoundedCapture:
     returncode: int
     stdout: bytearray
     stderr: bytearray
+
+    def zeroize(self) -> None:
+        self.stdout[:] = b"\x00" * len(self.stdout)
+        self.stderr[:] = b"\x00" * len(self.stderr)
 
 
 class _BytearrayWriter:
@@ -321,6 +331,7 @@ TRUSTED_PATH = os.pathsep.join(
         "/sbin",
     )
 )
+REVIEWER_EXECUTABLE_PATH_COMPONENT_LIMIT = 64
 
 BASE_ENV_KEYS = (
     "ALL_PROXY",
@@ -352,6 +363,110 @@ BASE_ENV_KEYS = (
 PROCESS_GROUP_TERM_GRACE_SECONDS = 0.5
 PROCESS_GROUP_EXIT_GRACE_SECONDS = 0.5
 PROCESS_GROUP_POLL_SECONDS = 0.05
+_LINUX_TERMINAL_PROCESS_STATES = frozenset({"Z", "X", "x"})
+# A cancelled spawn worker can spend one poll handing off ownership, then all
+# three bounded phases in terminate_process_group(). Keep a separate budget so
+# its parent does not mistake expected cleanup for a leaked worker.
+PROCESS_SPAWN_CLEANUP_GRACE_SECONDS = (3 * PROCESS_GROUP_TERM_GRACE_SECONDS) + (
+    2 * PROCESS_GROUP_POLL_SECONDS
+)
+STRICT_JSON_MAX_NESTING_DEPTH = 64
+STRICT_JSON_MAX_INTEGER_DIGITS = 1024
+REGULAR_FILE_LIMIT_WRAPPER = """
+import errno
+import os
+import resource
+import signal
+import sys
+
+limit = int(sys.argv[1])
+status_fd = int(sys.argv[2])
+os.set_inheritable(status_fd, False)
+for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
+    candidate = getattr(signal, name, None)
+    if candidate is not None:
+        signal.signal(candidate, signal.SIG_DFL)
+resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+try:
+    os.execve(sys.argv[3], sys.argv[3:], os.environ)
+except OSError as error:
+    os.write(status_fd, str(error.errno or errno.EIO).encode("ascii"))
+    os._exit(127)
+""".strip()
+
+ABSOLUTE_DEADLINE_WRAPPER = """
+import errno
+import os
+import signal
+import sys
+import time
+
+deadline = float(sys.argv[1])
+status_fd = int(sys.argv[2])
+launch_fd = int(sys.argv[3])
+kernel_limit = None if sys.argv[4] == "-" else int(sys.argv[4])
+os.set_inheritable(status_fd, False)
+os.set_inheritable(launch_fd, False)
+
+def fail(payload, exit_code):
+    try:
+        os.write(status_fd, payload)
+    except OSError:
+        pass
+    os._exit(exit_code)
+
+def deadline_expired(_signum, _frame):
+    fail(b"T", 124)
+
+try:
+    signal.signal(signal.SIGALRM, deadline_expired)
+    unblocked = {signal.SIGALRM, signal.SIGTERM, signal.SIGINT}
+    for name in ("SIGHUP", "SIGQUIT"):
+        candidate = getattr(signal, name, None)
+        if candidate is not None:
+            unblocked.add(candidate)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, unblocked)
+except (AttributeError, OSError, ValueError):
+    fail(b"E" + str(errno.ENOTSUP).encode("ascii"), 127)
+remaining = deadline - time.monotonic()
+if remaining <= 0:
+    fail(b"T", 124)
+try:
+    signal.setitimer(signal.ITIMER_REAL, remaining)
+except (AttributeError, OSError, ValueError):
+    fail(b"E" + str(errno.ENOTSUP).encode("ascii"), 127)
+if time.monotonic() >= deadline:
+    fail(b"T", 124)
+
+try:
+    if kernel_limit is not None:
+        import resource
+
+        for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
+            candidate = getattr(signal, name, None)
+            if candidate is not None:
+                signal.signal(candidate, signal.SIG_DFL)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (kernel_limit, kernel_limit))
+    os.write(status_fd, b"R")
+    launch = os.read(launch_fd, 1)
+except OSError as error:
+    fail(b"E" + str(error.errno or errno.EIO).encode("ascii"), 127)
+except Exception:
+    fail(b"E" + str(errno.EIO).encode("ascii"), 127)
+if launch != b"L":
+    os._exit(126)
+try:
+    os.close(launch_fd)
+except OSError as error:
+    fail(b"E" + str(error.errno or errno.EIO).encode("ascii"), 127)
+if time.monotonic() >= deadline:
+    fail(b"T", 124)
+try:
+    os.execve(sys.argv[5], sys.argv[5:], os.environ)
+except OSError as error:
+    fail(b"E" + str(error.errno or errno.EIO).encode("ascii"), 127)
+""".strip()
+
 DESCRIPTOR_CWD_HANDOFF_TIMEOUT_SECONDS = 10.0
 GATED_ENVIRONMENT_MAGIC = b"CGR1"
 MAX_GATED_ENVIRONMENT_BYTES = 8 * 1024 * 1024
@@ -545,10 +660,104 @@ def write_json(path: pathlib.Path, value: Any) -> None:
     _write_text_atomic_unredacted(path, text)
 
 
+def json_nesting_is_bounded(
+    value: str,
+    *,
+    max_depth: int = STRICT_JSON_MAX_NESTING_DEPTH,
+) -> bool:
+    if max_depth <= 0:
+        raise ValueError("JSON maximum nesting depth must be positive")
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in value:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > max_depth:
+                return False
+        elif character in "]}":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0 and not in_string
+
+
+def _strict_json_object(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
+def _strict_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("non-finite JSON number")
+    return parsed
+
+
+def _strict_json_int(value: str) -> int:
+    digit_count = len(value) - int(value.startswith("-"))
+    if digit_count > STRICT_JSON_MAX_INTEGER_DIGITS:
+        raise ValueError("JSON integer exceeds the bounded parser limit")
+    return int(value)
+
+
+def _require_finite_json_numbers(value: Any) -> None:
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, float) and not math.isfinite(item):
+            raise ValueError("non-finite JSON number")
+        if isinstance(item, dict):
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+
+
+def strict_json_loads(payload: str | bytes | bytearray) -> Any:
+    if isinstance(payload, str):
+        text = payload
+    else:
+        text = bytes(payload).decode("utf-8")
+    if not json_nesting_is_bounded(text):
+        raise ValueError("JSON nesting exceeds the bounded parser limit")
+    try:
+        result = json.loads(
+            text,
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_json_constant,
+            parse_float=_strict_json_float,
+            parse_int=_strict_json_int,
+        )
+    except RecursionError as error:
+        raise ValueError("JSON nesting exceeds the bounded parser limit") from error
+    _require_finite_json_numbers(result)
+    return result
+
+
 def read_json(path: pathlib.Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        value = strict_json_loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as error:
         raise ReviewError(f"cannot read review state {path}: {error}") from error
     if not isinstance(value, dict):
         raise ReviewError(f"review state is not a JSON object: {path}")
@@ -594,6 +803,8 @@ def run(
     capture_limit_bytes: int = 4 * 1024 * 1024,
     timeout_seconds: float | None = None,
     output_file_limit_bytes: int | None = None,
+    prepare_process_spawned: Callable[[int], object] | None = None,
+    on_process_spawned: Callable[[object], None] | None = None,
     on_process_starting: Callable[[], None] | None = None,
     on_process_started: Callable[[], None] | None = None,
     on_process_quiescent: Callable[[], None] | None = None,
@@ -640,12 +851,26 @@ def run(
         raise ReviewError("output_file_limit_bytes requires logged output paths")
     if output_file_limit_bytes is not None and timeout_seconds is None:
         raise ReviewError("output_file_limit_bytes requires timeout_seconds")
+    if (prepare_process_spawned is None) != (on_process_spawned is None):
+        raise ReviewError(
+            "prepare_process_spawned and on_process_spawned must be provided together"
+        )
+    if prepare_process_spawned is not None and not logged_output:
+        raise ReviewError("process spawn preparation requires logged output paths")
     if timeout_seconds is not None and not logged_output:
         raise ReviewError("timeout_seconds requires logged output paths")
     if on_process_starting is not None and not logged_output:
         raise ReviewError("on_process_starting requires logged output paths")
     if on_process_started is not None and not logged_output:
         raise ReviewError("on_process_started requires logged output paths")
+    if prepare_process_spawned is not None and os.name != "posix":
+        raise ReviewError("process spawn preparation requires POSIX")
+    if prepare_process_spawned is not None and (
+        timeout_seconds is None or not math.isfinite(timeout_seconds)
+    ):
+        raise ReviewError(
+            "process spawn preparation requires a finite timeout or deadline"
+        )
     if on_process_quiescent is not None and not logged_output:
         raise ReviewError("on_process_quiescent requires logged output paths")
     if output_file_limit_bytes is not None and output_file_limit_bytes <= 0:
@@ -695,6 +920,8 @@ def run(
                     timeout_seconds=timeout_seconds,
                     stdout_file_limit_bytes=output_file_limit_bytes,
                     stderr_file_limit_bytes=output_file_limit_bytes,
+                    prepare_process_spawned=prepare_process_spawned,
+                    on_process_spawned=on_process_spawned,
                     on_process_starting=on_process_starting,
                     on_process_started=on_process_started,
                     on_process_quiescent=on_process_quiescent,
@@ -723,6 +950,8 @@ def run(
                 timeout_seconds=timeout_seconds,
                 stdout_file_limit_bytes=output_file_limit_bytes,
                 stderr_file_limit_bytes=output_file_limit_bytes,
+                prepare_process_spawned=prepare_process_spawned,
+                on_process_spawned=on_process_spawned,
                 on_process_starting=on_process_starting,
                 on_process_started=on_process_started,
                 on_process_quiescent=on_process_quiescent,
@@ -962,6 +1191,7 @@ def _descriptor_cwd_command(
         launcher_command = (
             sys.executable,
             "-I",
+            "-B",
             "-S",
             str(launcher),
         )
@@ -1030,19 +1260,45 @@ def run_bounded_capture(
     env: dict[str, str] | None = None,
     pass_fds: Iterable[int] = (),
     stdin: bytes | bytearray | None = None,
-    timeout_seconds: float,
+    timeout_seconds: float | None = None,
+    deadline: float | None = None,
     stdout_limit_bytes: int,
     stderr_limit_bytes: int,
+    regular_file_limit_bytes: int | None = None,
+    regular_file_limit_path: pathlib.Path | None = None,
 ) -> BoundedCapture:
     command = tuple(str(item) for item in argv)
     if not command:
         raise ReviewError("command must not be empty")
+    if (timeout_seconds is None) == (deadline is None):
+        raise ReviewError("exactly one bounded capture timeout form is required")
     inherited_fds = _validate_pass_fds(pass_fds)
     if stdout_limit_bytes <= 0 or stderr_limit_bytes <= 0:
         raise ReviewError("bounded capture limits must be positive")
+    if regular_file_limit_bytes is not None and regular_file_limit_bytes <= 0:
+        raise ReviewError("regular file limit must be positive")
+    if (regular_file_limit_bytes is None) != (regular_file_limit_path is None):
+        raise ReviewError(
+            "regular file limit bytes and target path must be provided together"
+        )
+    if regular_file_limit_bytes is not None:
+        if not command or not pathlib.Path(command[0]).is_absolute():
+            raise ReviewError("regular file limits require an absolute executable path")
+        assert regular_file_limit_path is not None
+        target_path = pathlib.Path(regular_file_limit_path)
+        if not target_path.is_absolute():
+            target_path = (cwd or pathlib.Path.cwd()) / target_path
+        regular_file_limit_path = target_path.absolute()
     stdout = _BytearrayWriter()
     stderr = _BytearrayWriter()
+
+    def zeroize_output() -> None:
+        stdout.data[:] = b"\x00" * len(stdout.data)
+        stderr.data[:] = b"\x00" * len(stderr.data)
+
     try:
+        if deadline is not None and deadline - time.monotonic() <= 0:
+            raise subprocess.TimeoutExpired(command, 0.0)
         returncode = _run_logged_process(
             command,
             cwd=cwd,
@@ -1052,18 +1308,34 @@ def run_bounded_capture(
             stdout_handle=stdout,
             stderr_handle=stderr,
             timeout_seconds=timeout_seconds,
+            deadline=deadline,
             stdout_file_limit_bytes=stdout_limit_bytes,
             stderr_file_limit_bytes=stderr_limit_bytes,
+            regular_file_limit_bytes=regular_file_limit_bytes,
+            regular_file_limit_path=regular_file_limit_path,
         )
+        if deadline is not None and deadline - time.monotonic() <= 0:
+            raise subprocess.TimeoutExpired(command, 0.0)
+    except ForwardedSignal:
+        zeroize_output()
+        raise
     except subprocess.TimeoutExpired as error:
-        stdout.data[:] = b"\x00" * len(stdout.data)
-        stderr.data[:] = b"\x00" * len(stderr.data)
-        raise ReviewTimeoutError(
-            f"command timed out after {timeout_seconds} seconds: {' '.join(command)}"
-        ) from error
-    except Exception:
-        stdout.data[:] = b"\x00" * len(stdout.data)
-        stderr.data[:] = b"\x00" * len(stderr.data)
+        zeroize_output()
+        message = (
+            f"command timed out after {timeout_seconds} seconds"
+            if timeout_seconds is not None
+            else "command exceeded its absolute deadline"
+        )
+        raise ReviewTimeoutError(f"{message}: {' '.join(command)}") from error
+    except Exception as error:
+        zeroize_output()
+        if deadline is not None and deadline - time.monotonic() <= 0:
+            raise ReviewTimeoutError(
+                f"command exceeded its absolute deadline: {' '.join(command)}"
+            ) from error
+        raise
+    except BaseException:
+        zeroize_output()
         raise
     return BoundedCapture(command, returncode, stdout.data, stderr.data)
 
@@ -1188,6 +1460,48 @@ def unblock_forwarded_signals() -> None:
         signal.pthread_sigmask(signal.SIG_UNBLOCK, forwarded_signals())
 
 
+def _regular_file_limit_wrapper_command(
+    command: tuple[str, ...],
+    *,
+    kernel_limit: int,
+    exec_status_write_fd: int,
+) -> tuple[str, ...]:
+    return (
+        str(pathlib.Path(sys.executable).resolve()),
+        "-B",
+        "-I",
+        "-S",
+        "-c",
+        REGULAR_FILE_LIMIT_WRAPPER,
+        str(kernel_limit),
+        str(exec_status_write_fd),
+        *command,
+    )
+
+
+def _absolute_deadline_wrapper_command(
+    command: tuple[str, ...],
+    *,
+    deadline: float,
+    exec_status_write_fd: int,
+    launch_read_fd: int,
+    kernel_limit: int | None,
+) -> tuple[str, ...]:
+    return (
+        str(pathlib.Path(sys.executable).resolve()),
+        "-B",
+        "-I",
+        "-S",
+        "-c",
+        ABSOLUTE_DEADLINE_WRAPPER,
+        repr(deadline),
+        str(exec_status_write_fd),
+        str(launch_read_fd),
+        "-" if kernel_limit is None else str(kernel_limit),
+        *command,
+    )
+
+
 def consume_pending_forwarded_signal() -> signal.Signals | None:
     if not hasattr(signal, "sigpending") or not hasattr(signal, "sigwait"):
         return None
@@ -1243,7 +1557,10 @@ def _linux_process_group_has_live_members(process_group: int) -> bool | None:
                     member_group = int(fields[2])
                 except (IndexError, ValueError):
                     return None
-                if member_group == process_group and state not in {"X", "Z"}:
+                if (
+                    member_group == process_group
+                    and state not in _LINUX_TERMINAL_PROCESS_STATES
+                ):
                     return True
     except OSError:
         return None
@@ -1284,16 +1601,22 @@ def terminate_process_group(
                 process.kill()
                 process.wait()
         return
+    group_exists = _process_group_exists(process.pid)
     # Linux may report a zombie-only process group as absent. Poll before
     # returning so the direct child is reaped and cannot leak a Popen warning.
-    if not _process_group_exists(process.pid) and process.poll() is not None:
+    if not group_exists and process.poll() is not None:
         return
     if not signal_already_sent:
         signal_process_group(process, initial_signal)
     deadline = time.monotonic() + grace_seconds
-    while _process_group_exists(process.pid) and time.monotonic() < deadline:
+    while group_exists and time.monotonic() < deadline:
         time.sleep(PROCESS_GROUP_POLL_SECONDS)
-    if _process_group_exists(process.pid):
+        # Reap an exited leader before probing the group again. On platforms
+        # where killpg(pid, 0) reports zombies, leaving it unreaped consumes the
+        # entire grace window even when no descendants remain.
+        process.poll()
+        group_exists = _process_group_exists(process.pid)
+    if group_exists:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -1306,7 +1629,14 @@ def terminate_process_group(
     try:
         process.wait(timeout=grace_seconds)
     except subprocess.TimeoutExpired:
-        pass
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def _await_descriptor_exec_handoff(
@@ -1457,6 +1787,17 @@ class _ProcessSpawnOwner:
         self.cleanup_completed.set()
 
 
+def _join_process_spawn_worker(
+    owner: _ProcessSpawnOwner,
+    thread: threading.Thread,
+) -> None:
+    """Wait for bounded spawn cancellation without hiding a blocked factory."""
+
+    thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
+    if thread.is_alive() and owner.completed.is_set():
+        thread.join(timeout=PROCESS_SPAWN_CLEANUP_GRACE_SECONDS)
+
+
 def _await_owned_process_spawn(
     owner: _ProcessSpawnOwner,
     thread: threading.Thread,
@@ -1543,8 +1884,13 @@ def _run_logged_process(
     stdout_handle: BinaryIO,
     stderr_handle: BinaryIO,
     timeout_seconds: float | None = None,
+    deadline: float | None = None,
     stdout_file_limit_bytes: int | None = None,
     stderr_file_limit_bytes: int | None = None,
+    regular_file_limit_bytes: int | None = None,
+    regular_file_limit_path: pathlib.Path | None = None,
+    prepare_process_spawned: Callable[[int], object] | None = None,
+    on_process_spawned: Callable[[object], None] | None = None,
     on_process_starting: Callable[[], None] | None = None,
     on_process_started: Callable[[], None] | None = None,
     on_process_quiescent: Callable[[], None] | None = None,
@@ -1552,8 +1898,30 @@ def _run_logged_process(
 ) -> int:
     if not command:
         raise ReviewError("command must not be empty")
+    if timeout_seconds is not None and deadline is not None:
+        raise ReviewError("logged process timeout forms are mutually exclusive")
+    if (prepare_process_spawned is None) != (on_process_spawned is None):
+        raise ReviewError(
+            "prepare_process_spawned and on_process_spawned must be provided together"
+        )
+    if prepare_process_spawned is not None:
+        if os.name != "posix":
+            raise ReviewError("process spawn preparation requires POSIX")
+        timeout_or_deadline = deadline if deadline is not None else timeout_seconds
+        if timeout_or_deadline is None or not math.isfinite(timeout_or_deadline):
+            raise ReviewError(
+                "process spawn preparation requires a finite timeout or deadline"
+            )
+        if deadline is None:
+            assert timeout_seconds is not None
+            deadline = time.monotonic() + timeout_seconds
+    deadline_supplied = deadline is not None
     operation_deadline = (
-        time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+        deadline
+        if deadline is not None
+        else (
+            time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+        )
     )
     process: subprocess.Popen[bytes] | None = None
     spawn_owner: _ProcessSpawnOwner | None = None
@@ -1568,6 +1936,10 @@ def _run_logged_process(
     signal_deferral_active = False
     io_threads: list[threading.Thread] = []
     stop_io = threading.Event()
+    regular_file_overflow = threading.Event()
+    effective_regular_file_limit: int | None = None
+    absolute_deadline_wrapper = deadline_supplied and os.name == "posix"
+    wrapper_status_buffer = bytearray()
     output_redactors: list[tuple[_StreamingBytesRedactor, BinaryIO]] = []
     drain_errors: list[Exception] = []
     process_cleanup_inconclusive = False
@@ -1577,7 +1949,96 @@ def _run_logged_process(
     handoff_write = _FileDescriptorOwner()
     gate_read = _FileDescriptorOwner()
     gate_write = _FileDescriptorOwner()
+    wrapper_status_read = _FileDescriptorOwner()
+    wrapper_status_write = _FileDescriptorOwner()
+    wrapper_launch_read = _FileDescriptorOwner()
+    wrapper_launch_write = _FileDescriptorOwner()
     gated_environment = bytearray()
+
+    def timeout_expired() -> subprocess.TimeoutExpired:
+        return subprocess.TimeoutExpired(
+            command,
+            timeout_seconds if timeout_seconds is not None else 0.0,
+        )
+
+    def remaining_before_deadline() -> float:
+        raise_pending_process_signal()
+        assert operation_deadline is not None
+        remaining = operation_deadline - time.monotonic()
+        if remaining <= 0:
+            raise_pending_process_signal()
+            raise timeout_expired()
+        return remaining
+
+    def prepare_and_commit_process_spawn(process_pid: int) -> None:
+        if prepare_process_spawned is None or on_process_spawned is None:
+            return
+        preparation_errors: list[BaseException] = []
+        preparation_results: list[object] = []
+        preparation_finished = threading.Event()
+
+        def prepare() -> None:
+            try:
+                preparation_results.append(prepare_process_spawned(process_pid))
+            except BaseException as error:
+                preparation_errors.append(error)
+            finally:
+                preparation_finished.set()
+
+        preparation_thread = threading.Thread(
+            target=prepare,
+            daemon=True,
+            name="codex-review-process-spawn-preparation",
+        )
+        preparation_thread.start()
+        while True:
+            remaining = remaining_before_deadline()
+            if preparation_finished.wait(
+                timeout=min(PROCESS_GROUP_POLL_SECONDS, remaining)
+            ):
+                break
+        # Late preparation is inert: only this parent thread can commit or authorize exec.
+        remaining_before_deadline()
+        if preparation_errors:
+            raise preparation_errors[0]
+        if len(preparation_results) != 1:
+            raise ReviewError("process spawn preparation returned no binding")
+        on_process_spawned(preparation_results[0])
+        remaining_before_deadline()
+
+    def read_wrapper_status(*, stop_after_ready: bool) -> bytearray:
+        assert wrapper_status_read.descriptor is not None
+        while True:
+            if stop_after_ready and wrapper_status_buffer[:1] == b"R":
+                del wrapper_status_buffer[:1]
+                return bytearray(b"R")
+            remaining = remaining_before_deadline()
+            readable = _wait_descriptor_ready(
+                wrapper_status_read.descriptor,
+                writable=False,
+                timeout_seconds=min(PROCESS_GROUP_POLL_SECONDS, remaining),
+            )
+            raise_pending_process_signal()
+            if not readable:
+                continue
+            chunk = os.read(wrapper_status_read.descriptor, 32)
+            raise_pending_process_signal()
+            if not chunk:
+                status = bytearray(wrapper_status_buffer)
+                wrapper_status_buffer.clear()
+                return status
+            wrapper_status_buffer.extend(chunk)
+            if len(wrapper_status_buffer) > 17:
+                raise ReviewError("process wrapper returned invalid exec status")
+
+    def raise_wrapper_failure(status: bytearray) -> None:
+        if status == b"T":
+            raise timeout_expired()
+        match = re.fullmatch(rb"E([0-9]{1,10})", status)
+        if match is not None:
+            errno_value = int(match.group(1))
+            raise OSError(errno_value, os.strerror(errno_value), command[0])
+        raise ReviewError("process wrapper returned invalid exec status")
 
     def forward_signal(signum: int, _frame: object) -> None:
         nonlocal forwarded_signal_sent, pending_signal
@@ -1623,13 +2084,19 @@ def _run_logged_process(
             raise subprocess.TimeoutExpired(command, timeout_seconds)
 
     previous_handlers: dict[signal.Signals, object] = {}
-    if os.name == "posix" and threading.current_thread() is threading.main_thread():
-        for forwarded in forwarded_signals():
-            previous_handlers[forwarded] = signal.getsignal(forwarded)
-            signal.signal(forwarded, forward_signal)
-
+    operation_signal_mask_owner = ForwardedSignalMaskOwner()
     cleanup_signal = signal.SIGTERM
     try:
+        if os.name == "posix" and threading.current_thread() is threading.main_thread():
+            previous_mask = block_forwarded_signals(
+                signal_mask_owner=operation_signal_mask_owner,
+            )
+            if not operation_signal_mask_owner.active and previous_mask is not None:
+                operation_signal_mask_owner.publish(previous_mask)
+            for forwarded in forwarded_signals():
+                previous_handlers[forwarded] = signal.getsignal(forwarded)
+                signal.signal(forwarded, forward_signal)
+            unblock_forwarded_signals()
         if pending_signal is not None:
             raise ForwardedSignal(pending_signal)
         gated_exec = os.name == "posix"
@@ -1649,6 +2116,37 @@ def _run_logged_process(
                     gate_read.descriptor,
                     gate_write.descriptor,
                 ) = _pipe_above_standard_descriptors()
+            kernel_limit: int | None = None
+            if regular_file_limit_bytes is not None:
+                try:
+                    import resource as posix_resource
+                except ImportError as error:
+                    raise ReviewError(
+                        "regular file limits are unavailable on this platform"
+                    ) from error
+                _soft_limit, hard_limit = posix_resource.getrlimit(
+                    posix_resource.RLIMIT_FSIZE
+                )
+                kernel_limit = regular_file_limit_bytes + 1
+                if (
+                    hard_limit != posix_resource.RLIM_INFINITY
+                    and int(hard_limit) < kernel_limit
+                ):
+                    raise ReviewError(
+                        "inherited regular file hard limit cannot preserve an "
+                        "overflow sentinel"
+                    )
+                effective_regular_file_limit = regular_file_limit_bytes
+            if absolute_deadline_wrapper or kernel_limit is not None:
+                (
+                    wrapper_status_read.descriptor,
+                    wrapper_status_write.descriptor,
+                ) = _pipe_above_standard_descriptors()
+            if absolute_deadline_wrapper:
+                (
+                    wrapper_launch_read.descriptor,
+                    wrapper_launch_write.descriptor,
+                ) = _pipe_above_standard_descriptors()
         finally:
             signal_deferral_active = previous_deferral
         if pending_signal is not None:
@@ -1659,14 +2157,43 @@ def _run_logged_process(
             status_fd=handoff_write.descriptor,
             gate_fd=gate_read.descriptor,
         )
-        spawn_pass_fds = _merge_pass_fds(pass_fds, cwd_pass_fds)
+        popen_command = spawn_command
+        wrapper_pass_fds: tuple[int, ...] = ()
+        if absolute_deadline_wrapper:
+            assert operation_deadline is not None
+            assert wrapper_status_write.descriptor is not None
+            assert wrapper_launch_read.descriptor is not None
+            wrapper_pass_fds = (
+                wrapper_status_write.descriptor,
+                wrapper_launch_read.descriptor,
+            )
+            popen_command = _absolute_deadline_wrapper_command(
+                spawn_command,
+                deadline=operation_deadline,
+                exec_status_write_fd=wrapper_status_write.descriptor,
+                launch_read_fd=wrapper_launch_read.descriptor,
+                kernel_limit=kernel_limit,
+            )
+        elif kernel_limit is not None:
+            assert wrapper_status_write.descriptor is not None
+            wrapper_pass_fds = (wrapper_status_write.descriptor,)
+            popen_command = _regular_file_limit_wrapper_command(
+                spawn_command,
+                kernel_limit=kernel_limit,
+                exec_status_write_fd=wrapper_status_write.descriptor,
+            )
+        spawn_pass_fds = _merge_pass_fds(
+            pass_fds,
+            cwd_pass_fds,
+            wrapper_pass_fds,
+        )
         if pending_signal is not None:
             raise ForwardedSignal(pending_signal)
         raise_if_operation_timed_out()
 
         def spawn_process() -> subprocess.Popen[bytes]:
             return subprocess.Popen(
-                spawn_command,
+                popen_command,
                 cwd=cwd,
                 pass_fds=spawn_pass_fds,
                 env={} if gated_exec else env,
@@ -1696,21 +2223,51 @@ def _run_logged_process(
                     spawn_worker_ready,
                     spawn_requested,
                     spawn_cancelled,
-                    (handoff_write, gate_read),
+                    (
+                        handoff_write,
+                        gate_read,
+                        wrapper_status_write,
+                        wrapper_launch_read,
+                    ),
                 ),
                 name="review-process-spawn",
                 daemon=True,
             )
             spawn_thread_start_attempted = True
+            spawn_thread_mask_owner = ForwardedSignalMaskOwner()
+            spawn_thread_start_error: BaseException | None = None
             try:
-                spawn_thread.start()
-            except ForwardedSignal:
+                if operation_signal_mask_owner.active:
+                    caller_mask = operation_signal_mask_owner.previous_mask
+                    if caller_mask is None:
+                        raise ReviewError(
+                            "caller signal mask is unavailable for process spawn"
+                        )
+                    current_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                    spawn_thread_mask_owner.publish(current_mask)
+                    signal.pthread_sigmask(signal.SIG_SETMASK, caller_mask)
+                try:
+                    spawn_thread.start()
+                except ForwardedSignal:
+                    raise
+                except RuntimeError as error:
+                    raise ReviewOutputDrainError(
+                        "command process-spawn worker could not start"
+                    ) from error
+                spawn_thread_start_confirmed = True
+            except BaseException as error:
+                spawn_thread_start_error = error
                 raise
-            except RuntimeError as error:
-                raise ReviewOutputDrainError(
-                    "command process-spawn worker could not start"
-                ) from error
-            spawn_thread_start_confirmed = True
+            finally:
+                spawn_thread_restore_failures = (
+                    _restore_forwarded_signal_mask_owner_bounded(
+                        spawn_thread_mask_owner,
+                    )
+                )
+                _propagate_signal_mask_restore_failures(
+                    spawn_thread_start_error,
+                    spawn_thread_restore_failures,
+                )
             while not spawn_worker_ready.wait(PROCESS_GROUP_POLL_SECONDS):
                 raise_pending_process_signal()
                 raise_if_operation_timed_out()
@@ -1744,13 +2301,53 @@ def _run_logged_process(
             )
         else:
             process = spawn_process()
-        close_launch_descriptor(handoff_write)
-        close_launch_descriptor(gate_read)
+        for child_owner in (
+            handoff_write,
+            gate_read,
+            wrapper_status_write,
+            wrapper_launch_read,
+        ):
+            close_launch_descriptor(child_owner)
         if pending_signal is not None:
             signal_process_group(process, pending_signal)
             forwarded_signal_sent = True
             raise ForwardedSignal(pending_signal)
         raise_if_operation_timed_out()
+        if absolute_deadline_wrapper:
+            assert operation_deadline is not None
+            ready_status = read_wrapper_status(stop_after_ready=True)
+            if ready_status != b"R":
+                raise_wrapper_failure(ready_status)
+            prepare_and_commit_process_spawn(process.pid)
+            assert wrapper_launch_write.descriptor is not None
+            try:
+                try:
+                    _write_exec_control(
+                        wrapper_launch_write.descriptor,
+                        b"L",
+                        deadline=operation_deadline,
+                    )
+                except ReviewError:
+                    wrapper_failure = read_wrapper_status(stop_after_ready=False)
+                    if wrapper_failure:
+                        raise_wrapper_failure(wrapper_failure)
+                    raise
+            finally:
+                close_launch_descriptor(wrapper_launch_write)
+            wrapper_result = read_wrapper_status(stop_after_ready=False)
+            close_launch_descriptor(wrapper_status_read)
+            if wrapper_result:
+                raise_wrapper_failure(wrapper_result)
+        elif wrapper_status_read.descriptor is not None:
+            wrapper_result = read_wrapper_status(stop_after_ready=False)
+            close_launch_descriptor(wrapper_status_read)
+            if wrapper_result:
+                if re.fullmatch(rb"[0-9]{1,10}", wrapper_result) is None:
+                    raise ReviewError(
+                        "regular-file wrapper returned invalid exec status"
+                    )
+                errno_value = int(wrapper_result)
+                raise OSError(errno_value, os.strerror(errno_value), command[0])
         if gate_write.descriptor is not None:
             launch_control_deadline = (
                 time.monotonic() + DESCRIPTOR_CWD_HANDOFF_TIMEOUT_SECONDS
@@ -1811,19 +2408,44 @@ def _run_logged_process(
             raise ForwardedSignal(pending_signal)
         raise_if_operation_timed_out()
         if stdout_file_limit_bytes is None or stderr_file_limit_bytes is None:
-            if timeout_seconds is None:
+            if operation_deadline is None:
                 process.communicate(input=stdin)
             else:
-                assert operation_deadline is not None
                 remaining = operation_deadline - time.monotonic()
                 if remaining <= 0:
-                    raise subprocess.TimeoutExpired(command, timeout_seconds)
+                    raise timeout_expired()
                 process.communicate(input=stdin, timeout=remaining)
             return int(process.returncode)
 
         assert process.stdout is not None
         assert process.stderr is not None
         output_overflow = threading.Event()
+
+        def regular_file_target_exceeded_limit() -> bool:
+            if effective_regular_file_limit is None:
+                return False
+            assert regular_file_limit_path is not None
+            try:
+                return (
+                    regular_file_limit_path.stat().st_size
+                    > effective_regular_file_limit
+                )
+            except FileNotFoundError:
+                return False
+
+        def monitor_regular_file_limit() -> None:
+            try:
+                while not stop_io.is_set():
+                    if regular_file_target_exceeded_limit():
+                        regular_file_overflow.set()
+                        signal_process_group(process, signal.SIGTERM)
+                        return
+                    if process.poll() is not None:
+                        return
+                    stop_io.wait(PROCESS_GROUP_POLL_SECONDS)
+            except Exception as error:
+                drain_errors.append(error)
+                signal_process_group(process, signal.SIGTERM)
 
         def drain_bounded(
             stream: BinaryIO,
@@ -1922,6 +2544,12 @@ def _run_logged_process(
                 )
                 if not thread_start_mask_owner.active and thread_start_mask is not None:
                     thread_start_mask_owner.publish(thread_start_mask)
+                if effective_regular_file_limit is not None:
+                    thread = threading.Thread(
+                        target=monitor_regular_file_limit,
+                        daemon=True,
+                    )
+                    start_io_thread(thread)
                 for stream, destination, limit_bytes in (
                     (process.stdout, stdout_handle, stdout_file_limit_bytes),
                     (process.stderr, stderr_handle, stderr_file_limit_bytes),
@@ -1955,25 +2583,39 @@ def _run_logged_process(
                 thread_start_error,
                 thread_start_restore_failures,
             )
-        assert timeout_seconds is not None
         assert operation_deadline is not None
         deadline = operation_deadline
         while True:
+            if regular_file_overflow.is_set() or regular_file_target_exceeded_limit():
+                regular_file_overflow.set()
+                try:
+                    terminate_process_group(process)
+                except BaseException as error:
+                    if _is_process_control_flow_error(error):
+                        raise
+                    process_cleanup_inconclusive = True
+                    cleanup_failures.append(
+                        ("terminating the supervised process group", error)
+                    )
+                break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise subprocess.TimeoutExpired(command, timeout_seconds)
+                raise timeout_expired()
             try:
                 process.wait(timeout=min(PROCESS_GROUP_POLL_SECONDS, remaining))
                 break
             except subprocess.TimeoutExpired:
-                if output_overflow.is_set() or drain_errors:
+                if (
+                    output_overflow.is_set()
+                    or regular_file_overflow.is_set()
+                    or drain_errors
+                ):
                     try:
                         terminate_process_group(process)
                     except BaseException as error:
-                        if isinstance(error, ForwardedSignal) or not isinstance(
-                            error, Exception
-                        ):
+                        if _is_process_control_flow_error(error):
                             raise
+                        process_cleanup_inconclusive = True
                         cleanup_failures.append(
                             ("terminating the supervised process group", error)
                         )
@@ -1988,7 +2630,14 @@ def _run_logged_process(
             leftover_process_group = _process_group_exists(process.pid)
         if leftover_process_group:
             process_cleanup_inconclusive = True
-            terminate_process_group(process)
+            try:
+                terminate_process_group(process)
+            except BaseException as error:
+                if _is_process_control_flow_error(error):
+                    raise
+                cleanup_failures.append(
+                    ("terminating the supervised process group", error)
+                )
         for thread in io_threads:
             thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
         if any(thread.is_alive() for thread in io_threads):
@@ -2000,7 +2649,20 @@ def _run_logged_process(
                 "command I/O streams remained open after bounded cleanup: "
                 f"{' '.join(command)}"
             )
-        if drain_errors:
+        regular_limit_exceeded = False
+        if effective_regular_file_limit is not None:
+            assert regular_file_limit_path is not None
+            file_size_signal = getattr(signal, "SIGXFSZ", None)
+            signal_overflow = (
+                file_size_signal is not None
+                and process.returncode == -int(file_size_signal)
+            )
+            regular_limit_exceeded = (
+                signal_overflow
+                or regular_file_overflow.is_set()
+                or regular_file_target_exceeded_limit()
+            )
+        if drain_errors and not regular_limit_exceeded:
             process_cleanup_inconclusive = True
             raise ReviewOutputDrainError(
                 f"command output drain failed: {' '.join(command)}"
@@ -2008,6 +2670,11 @@ def _run_logged_process(
         if output_overflow.is_set():
             raise ReviewOutputLimitError(
                 f"command output exceeded its bounded stream limit: {' '.join(command)}"
+            )
+        if regular_limit_exceeded:
+            raise ReviewOutputLimitError(
+                f"command exceeded its regular-file output limit: {' '.join(command)}",
+                limit_kind="regular-file",
             )
         if leftover_process_group:
             process_cleanup_inconclusive = True
@@ -2070,6 +2737,8 @@ def _run_logged_process(
             for context, owner in (
                 ("closing the reviewer launch gate", gate_write),
                 ("closing the reviewer exec-status reader", handoff_read),
+                ("closing the process-wrapper launch gate", wrapper_launch_write),
+                ("closing the process-wrapper status reader", wrapper_status_read),
             ):
                 try:
                     owner.close()
@@ -2100,7 +2769,8 @@ def _run_logged_process(
                         )
                 if worker_started:
                     try:
-                        spawn_thread.join(timeout=PROCESS_GROUP_TERM_GRACE_SECONDS)
+                        assert spawn_owner is not None
+                        _join_process_spawn_worker(spawn_owner, spawn_thread)
                     except BaseException as error:
                         process_cleanup_inconclusive = True
                         cleanup_failures.append(
@@ -2147,7 +2817,12 @@ def _run_logged_process(
                         ("cleaning the reviewer spawn worker", error)
                     )
             if not worker_started or not worker_alive:
-                for owner in (gate_read, handoff_write):
+                for owner in (
+                    gate_read,
+                    handoff_write,
+                    wrapper_status_write,
+                    wrapper_launch_read,
+                ):
                     try:
                         owner.close()
                     except BaseException as error:
@@ -2299,6 +2974,12 @@ def _run_logged_process(
                 cleanup_signal_mask_owner,
             ):
                 cleanup_failures.append(("restoring the forwarded-signal mask", error))
+            for error in _restore_forwarded_signal_mask_owner_bounded(
+                operation_signal_mask_owner,
+            ):
+                cleanup_failures.append(
+                    ("restoring the caller's forwarded-signal mask", error)
+                )
 
         effective_pending_signal = pending_cleanup_signal or pending_signal
         signal_error: ForwardedSignal | None = None
@@ -2554,10 +3235,390 @@ def _executable_identity_matches(
     return all(marker.lower() in output for marker in marker_values)
 
 
+def _executable_candidate_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _lexical_component_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+
+
+def _prove_reviewer_candidate_lexical_absence(
+    path: pathlib.Path,
+    *,
+    inspection_error: type[ReviewError],
+    allow_dangling_leaf_symlink: bool = False,
+) -> None:
+    if not path.is_absolute():
+        raise inspection_error(
+            f"reviewer executable candidate absence requires an absolute path: {path}"
+        )
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise inspection_error(
+            "reviewer executable candidate absence requires O_NOFOLLOW"
+        )
+    components = path.parts[1:]
+    if not components or len(components) > REVIEWER_EXECUTABLE_PATH_COMPONENT_LIMIT:
+        raise inspection_error(
+            f"reviewer executable candidate path has an invalid component count: {path}"
+        )
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | nofollow
+    )
+    symlink_directory_flags = directory_flags & ~nofollow
+    descriptors: list[int] = []
+    directory_records: list[
+        tuple[
+            int,
+            str,
+            os.stat_result,
+            str | None,
+            os.stat_result,
+        ]
+    ] = []
+    missing_component: tuple[int, str] | None = None
+    dangling_leaf: tuple[int, str, os.stat_result, str] | None = None
+    try:
+        try:
+            root_descriptor = os.open(path.anchor, directory_flags)
+        except OSError as error:
+            raise inspection_error(
+                f"cannot inspect reviewer executable path root for {path}: {error}"
+            ) from error
+        descriptors.append(root_descriptor)
+        current_directory = root_descriptor
+        for index, component in enumerate(components):
+            try:
+                metadata = os.lstat(component, dir_fd=current_directory)
+            except OSError as error:
+                if error.errno == errno.ENOENT:
+                    missing_component = (current_directory, component)
+                    break
+                raise inspection_error(
+                    f"cannot lstat reviewer executable path component for {path}: "
+                    f"{error}"
+                ) from error
+            if index == len(components) - 1:
+                if stat.S_ISLNK(metadata.st_mode):
+                    if not allow_dangling_leaf_symlink:
+                        raise inspection_error(
+                            "reviewer executable candidate ENOENT involves a "
+                            f"symlink: {path}"
+                        )
+                    try:
+                        target = os.readlink(
+                            component,
+                            dir_fd=current_directory,
+                        )
+                    except OSError as error:
+                        raise inspection_error(
+                            "cannot inspect dangling reviewer executable candidate "
+                            f"symlink for {path}: {error}"
+                        ) from error
+                    dangling_leaf = (
+                        current_directory,
+                        component,
+                        metadata,
+                        target,
+                    )
+                    break
+                raise inspection_error(
+                    f"reviewer executable candidate appeared during inspection: {path}"
+                )
+            symlink_target: str | None = None
+            if stat.S_ISLNK(metadata.st_mode):
+                try:
+                    symlink_target = os.readlink(
+                        component,
+                        dir_fd=current_directory,
+                    )
+                except OSError as error:
+                    raise inspection_error(
+                        f"cannot inspect reviewer executable candidate parent symlink "
+                        f"for {path}: {error}"
+                    ) from error
+            elif not stat.S_ISDIR(metadata.st_mode):
+                raise inspection_error(
+                    f"reviewer executable candidate parent is not a directory: {path}"
+                )
+            try:
+                next_directory = os.open(
+                    component,
+                    symlink_directory_flags
+                    if symlink_target is not None
+                    else directory_flags,
+                    dir_fd=current_directory,
+                )
+            except OSError as error:
+                if symlink_target is not None:
+                    raise inspection_error(
+                        f"reviewer executable candidate ENOENT involves a symlink "
+                        f"with an unresolved parent: {path}: {error}"
+                    ) from error
+                raise inspection_error(
+                    f"reviewer executable candidate parent changed during inspection: "
+                    f"{path}: {error}"
+                ) from error
+            descriptors.append(next_directory)
+            try:
+                opened = os.fstat(next_directory)
+            except OSError as error:
+                raise inspection_error(
+                    f"cannot inspect reviewer executable candidate parent for {path}: "
+                    f"{error}"
+                ) from error
+            if not stat.S_ISDIR(opened.st_mode):
+                raise inspection_error(
+                    f"reviewer executable candidate parent is not a directory: {path}"
+                )
+            if symlink_target is None and (
+                _lexical_component_identity(metadata)
+                != _lexical_component_identity(opened)
+            ):
+                raise inspection_error(
+                    f"reviewer executable candidate parent changed during inspection: "
+                    f"{path}"
+                )
+            directory_records.append(
+                (
+                    current_directory,
+                    component,
+                    metadata,
+                    symlink_target,
+                    opened,
+                )
+            )
+            current_directory = next_directory
+        if missing_component is None and dangling_leaf is None:
+            raise inspection_error(
+                f"reviewer executable candidate absence could not be proven: {path}"
+            )
+        for (
+            parent_descriptor,
+            component,
+            expected,
+            expected_symlink_target,
+            expected_opened,
+        ) in directory_records:
+            try:
+                current = os.lstat(component, dir_fd=parent_descriptor)
+            except OSError as error:
+                raise inspection_error(
+                    f"reviewer executable candidate parent changed during inspection: "
+                    f"{path}: {error}"
+                ) from error
+            current_is_symlink = stat.S_ISLNK(current.st_mode)
+            if current_is_symlink != (
+                expected_symlink_target is not None
+            ) or _lexical_component_identity(expected) != _lexical_component_identity(
+                current
+            ):
+                raise inspection_error(
+                    f"reviewer executable candidate parent changed during inspection: "
+                    f"{path}"
+                )
+            if expected_symlink_target is not None:
+                try:
+                    current_symlink_target = os.readlink(
+                        component,
+                        dir_fd=parent_descriptor,
+                    )
+                except OSError as error:
+                    raise inspection_error(
+                        f"cannot recheck reviewer executable candidate parent symlink "
+                        f"for {path}: {error}"
+                    ) from error
+                if current_symlink_target != expected_symlink_target:
+                    raise inspection_error(
+                        f"reviewer executable candidate parent changed during inspection: "
+                        f"{path}"
+                    )
+            try:
+                rechecked_directory = os.open(
+                    component,
+                    symlink_directory_flags
+                    if expected_symlink_target is not None
+                    else directory_flags,
+                    dir_fd=parent_descriptor,
+                )
+            except OSError as error:
+                raise inspection_error(
+                    f"reviewer executable candidate parent changed during inspection: "
+                    f"{path}: {error}"
+                ) from error
+            try:
+                try:
+                    rechecked_opened = os.fstat(rechecked_directory)
+                except OSError as error:
+                    raise inspection_error(
+                        f"cannot recheck reviewer executable candidate parent for "
+                        f"{path}: {error}"
+                    ) from error
+                if _lexical_component_identity(expected_opened) != (
+                    _lexical_component_identity(rechecked_opened)
+                ):
+                    raise inspection_error(
+                        f"reviewer executable candidate parent changed during inspection: "
+                        f"{path}"
+                    )
+            finally:
+                try:
+                    os.close(rechecked_directory)
+                except OSError as error:
+                    raise inspection_error(
+                        f"cannot close reviewer executable parent recheck for {path}: "
+                        f"{error}"
+                    ) from error
+        if dangling_leaf is not None:
+            leaf_parent, leaf_name, expected_leaf, expected_target = dangling_leaf
+            try:
+                current_leaf = os.lstat(leaf_name, dir_fd=leaf_parent)
+            except OSError as error:
+                raise inspection_error(
+                    f"dangling reviewer executable candidate changed during inspection: "
+                    f"{path}: {error}"
+                ) from error
+            if not stat.S_ISLNK(current_leaf.st_mode) or _lexical_component_identity(
+                expected_leaf
+            ) != _lexical_component_identity(current_leaf):
+                raise inspection_error(
+                    "dangling reviewer executable candidate changed during inspection: "
+                    f"{path}"
+                )
+            try:
+                current_target = os.readlink(leaf_name, dir_fd=leaf_parent)
+            except OSError as error:
+                raise inspection_error(
+                    "cannot recheck dangling reviewer executable candidate symlink "
+                    f"for {path}: {error}"
+                ) from error
+            if current_target != expected_target:
+                raise inspection_error(
+                    "dangling reviewer executable candidate changed during inspection: "
+                    f"{path}"
+                )
+            try:
+                path.stat()
+            except OSError as error:
+                if error.errno != errno.ENOENT:
+                    raise inspection_error(
+                        "cannot recheck dangling reviewer executable candidate for "
+                        f"{path}: {error}"
+                    ) from error
+            else:
+                raise inspection_error(
+                    f"reviewer executable candidate appeared during inspection: {path}"
+                )
+        else:
+            assert missing_component is not None
+            missing_parent, missing_name = missing_component
+            try:
+                os.lstat(missing_name, dir_fd=missing_parent)
+            except OSError as error:
+                if error.errno != errno.ENOENT:
+                    raise inspection_error(
+                        f"cannot recheck missing reviewer executable component for "
+                        f"{path}: {error}"
+                    ) from error
+            else:
+                raise inspection_error(
+                    f"reviewer executable candidate appeared during inspection: {path}"
+                )
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+    else:
+        close_error: OSError | None = None
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                close_error = close_error or error
+        if close_error is not None:
+            raise inspection_error(
+                f"cannot close reviewer executable path inspection for {path}: "
+                f"{close_error}"
+            ) from close_error
+
+
+def _reviewer_candidate_is_executable(
+    path: pathlib.Path,
+    *,
+    inspection_error: type[ReviewError],
+    allow_dangling_leaf_symlink: bool = False,
+) -> bool:
+    try:
+        before = path.stat()
+    except FileNotFoundError:
+        _prove_reviewer_candidate_lexical_absence(
+            path,
+            inspection_error=inspection_error,
+            allow_dangling_leaf_symlink=allow_dangling_leaf_symlink,
+        )
+        return False
+    except OSError as error:
+        if error.errno == errno.ENOENT:
+            _prove_reviewer_candidate_lexical_absence(
+                path,
+                inspection_error=inspection_error,
+                allow_dangling_leaf_symlink=allow_dangling_leaf_symlink,
+            )
+            return False
+        raise inspection_error(
+            f"cannot inspect reviewer executable candidate {path}: {error}"
+        ) from error
+    executable = stat.S_ISREG(before.st_mode) and bool(before.st_mode & 0o111)
+    if executable:
+        try:
+            executable = os.access(path, os.X_OK)
+        except OSError as error:
+            raise inspection_error(
+                f"cannot check reviewer executable candidate access for {path}: {error}"
+            ) from error
+    try:
+        after = path.stat()
+    except OSError as error:
+        raise inspection_error(
+            f"reviewer executable candidate changed during inspection: {path}"
+        ) from error
+    if _executable_candidate_identity(before) != _executable_candidate_identity(after):
+        raise inspection_error(
+            f"reviewer executable candidate changed during inspection: {path}"
+        )
+    return executable
+
+
 def resolve_reviewer_executable(
     name: str,
     *,
     candidate_validator: Callable[[pathlib.Path], None] | None = None,
+    inspection_error: type[ReviewError] = ReviewError,
 ) -> pathlib.Path | None:
     specs = {
         "codex": (
@@ -2591,7 +3652,10 @@ def resolve_reviewer_executable(
         override = pathlib.Path(override_value).expanduser()
         if not override.is_absolute():
             raise ReviewError(f"{override_key} must be an absolute executable path")
-        if not override.is_file() or not os.access(override, os.X_OK):
+        if not _reviewer_candidate_is_executable(
+            override,
+            inspection_error=inspection_error,
+        ):
             raise ReviewError(f"{override_key} is not executable: {override}")
         if defer_identity and candidate_validator is not None:
             try:
@@ -2610,6 +3674,11 @@ def resolve_reviewer_executable(
     candidates = [
         *(pathlib.Path(value) for value in system_paths),
         *_user_executable_candidates(name),
+        *(
+            pathlib.Path(entry) / name
+            for entry in TRUSTED_PATH.split(os.pathsep)
+            if entry
+        ),
     ]
     discovered = shutil.which(name, path=TRUSTED_PATH)
     if discovered:
@@ -2621,7 +3690,10 @@ def resolve_reviewer_executable(
         if key in seen:
             continue
         seen.add(key)
-        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+        if not _reviewer_candidate_is_executable(
+            candidate,
+            inspection_error=inspection_error,
+        ):
             continue
         absolute = candidate.absolute()
         if defer_identity:

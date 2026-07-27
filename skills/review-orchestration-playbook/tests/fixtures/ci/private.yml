@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
 jobs:
   platform_tests:
     name: platform-tests (${{ matrix.os }})
@@ -96,6 +99,57 @@ jobs:
             -s personal_codex/skills/waited-delivery/tests \
             -p 'test_*.py'
 
+  broker_reproducibility:
+    name: broker-reproducibility (macos-26)
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require hosted-runner byte reproduction
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+        run: |
+          /bin/bash \
+            personal_codex/skills/review-orchestration-playbook/scripts/build_claude_keychain_broker_macos.sh \
+            --check
+
+  independent_supervisor_tests:
+    name: independent-supervisor (python-3.13)
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Compile independent review supervisor
+        working-directory: personal_codex/skills/review-orchestration-playbook/scripts/independent_codex_pr_review
+        run: |
+          python3 -m compileall -q review_supervisor independent-codex-pr-review
+      - name: Report hosted no-child runtime fingerprint
+        run: |
+          /usr/bin/sw_vers -productVersion
+          /usr/bin/sw_vers -buildVersion
+          /usr/bin/uname -r
+          /usr/bin/uname -m
+          /usr/bin/shasum -a 256 /usr/bin/sandbox-exec
+      - name: Match hosted no-child blocker signature
+        working-directory: personal_codex/skills/review-orchestration-playbook/scripts/independent_codex_pr_review
+        env:
+          CODEX_REVIEW_LIVE_NO_CHILD_RUNTIME_PROFILE: github-macos-26-arm64-26.4-25E246
+          CODEX_REVIEW_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+          CODEX_REVIEW_RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          python3 -m tests.run_hosted_no_child_fail_closed
+      - name: Run deterministic independent supervisor tests
+        working-directory: personal_codex/skills/review-orchestration-playbook/scripts/independent_codex_pr_review
+        run: |
+          python3 -m tests.run_required_deterministic_supervisor
+      - name: Verify independent review supervisor CLI
+        working-directory: personal_codex/skills/review-orchestration-playbook/scripts/independent_codex_pr_review
+        run: |
+          python3 independent-codex-pr-review --help
+
   python-39-compatibility:
     runs-on: ubuntu-latest
     steps:
@@ -141,6 +195,8 @@ jobs:
       - platform_tests
       - python-39-compatibility
       - platform-safety
+      - broker_reproducibility
+      - independent_supervisor_tests
     runs-on: ubuntu-latest
     steps:
       - name: Require every platform test to pass
@@ -148,7 +204,11 @@ jobs:
           PLATFORM_TESTS_RESULT: ${{ needs.platform_tests.result }}
           PYTHON_39_RESULT: ${{ needs.python-39-compatibility.result }}
           PLATFORM_SAFETY_RESULT: ${{ needs.platform-safety.result }}
+          BROKER_REPRODUCIBILITY_RESULT: ${{ needs.broker_reproducibility.result }}
+          INDEPENDENT_SUPERVISOR_RESULT: ${{ needs.independent_supervisor_tests.result }}
         run: |
           test "$PLATFORM_TESTS_RESULT" = "success"
           test "$PYTHON_39_RESULT" = "success"
           test "$PLATFORM_SAFETY_RESULT" = "success"
+          test "$BROKER_REPRODUCIBILITY_RESULT" = "success"
+          test "$INDEPENDENT_SUPERVISOR_RESULT" = "success"
