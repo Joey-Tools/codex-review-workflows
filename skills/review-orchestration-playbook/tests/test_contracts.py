@@ -4362,7 +4362,7 @@ class RepositoryContractTest(unittest.TestCase):
             tuple(sorted(manifest_paths, key=lambda value: value.encode("utf-8"))),
         )
         for relative_path in manifest_paths:
-            payload = (REPO_ROOT / relative_path).read_bytes()
+            payload = (policy_scope_root / relative_path).read_bytes()
             for marker in (b"<<<<<<< ", b"=======\n", b">>>>>>> "):
                 self.assertNotIn(marker, payload, relative_path)
         manifest_clause = (
