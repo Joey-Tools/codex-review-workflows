@@ -141,6 +141,16 @@ After both local lanes are terminal on that exact whole-PR frozen range, post th
 @codex review
 ```
 
+Persist a parent-owned control-order record proving that both required local
+lanes had terminal artifacts before the request write. If an exact request was
+posted earlier, or that ordering cannot be proved, classify the GitHub lane as
+`triple-inconclusive` with reason
+`github-request-before-local-terminal`. Later local-lane completion does not
+cure the same-head request, its terminal payload cannot count, and a second
+request is forbidden while the head is unchanged. Eligibility returns only
+after a separately authorized ordinary change produces a new head; never
+manufacture an empty or anchor commit to regain eligibility.
+
 Posting the comment requests the third lane but does not complete it. Record the PR URL, triggered head, and complete terminal provider-authored current-head findings payload. Accept completion evidence only from exact REST `user.login == "chatgpt-codex-connector[bot]"` with exact `user.type == "Bot"`; exact `app.slug == "chatgpt-codex-connector"` check/run evidence can prove only current-head post-request service start. Unknown or lookalike identities are `triple-inconclusive` and prove neither rejection, start, nor completion. When a still-eligible PR's current `headRefOid` does not equal the frozen `head_sha`, that mismatch is not an availability fallback. Publish/freeze the intended head and rerun affected lanes only when the parent separately authorized PR mutation; otherwise leave the PR unchanged and report `requested: triple`, `effective: triple-inconclusive`, with GitHub lane status `blocked-authorization`. For the same mismatch on an already unsupported PR, keep `requested: triple`, `effective: double`, and report readiness `blocked-authorization`; do not treat the mismatch as making the already-unavailable lane triple-inconclusive or as permitting readiness to continue. If there is no existing PR or GitHub Codex is proved unsupported for the integration, host, or operating identity—including host `sqbu-github.cisco.com`, any other non-`github.com` host, and identity in `{hoteng, hoteng_cisco}`—do not create or mutate a PR to manufacture the lane. Report `requested: triple`, `effective: double` with the exact reason. An authenticated exact-bot provider rejection may prove no-start unavailability only when it is tied to the exact request/dispatch or satisfies the sole-unresolved/no-intervening fallback in [github-pr-probes.md](github-pr-probes.md#issue-comment-only-correlation); exact SHA alone does not bind a no-start rejection to one of multiple same-head requests. Missing response, unknown provider identity, incomplete history, or generic failure is `triple-inconclusive`.
 
 ## Low-Level Helper Results

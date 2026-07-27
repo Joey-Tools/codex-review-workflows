@@ -1,0 +1,13 @@
+#!/usr/bin/env python3.13
+from __future__ import annotations
+
+import pathlib
+import sys
+
+sys.dont_write_bytecode = True
+
+from review_supervisor.cli import main  # noqa: E402
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(entrypoint=pathlib.Path(__file__)))

@@ -153,7 +153,7 @@ For the accepted real-`HOME` native-sandbox review design, keep these layers dis
 - Native-sandbox `allowRead` entries are exceptions within a selected-deny policy, not a global host-read whitelist. Sandboxed Bash can technically read a host path that is outside the detached worktree when that path is not covered by `denyRead`. The prompt/model scope therefore explicitly forbids all outside-workspace reads; do not describe the selected-deny policy as re-opening only the current workspace or private Git view.
 - Capability probes and the first `system/init` event report only their documented fields. They do not prove the final merged native-sandbox configuration, merged admin-managed permission arrays, or path-rule evaluation; that limitation applies even to Claude Code 2.1.212 baseline output. Persist sandbox controls as requested configuration and do not promote init/capability output into independent evidence of effective enforcement.
 - For the canonical direct lane, require exactly one leading `system/init` and one trailing terminal `result`, plus the preflight-bound compatibility fields defined in `canonical-claude-lane.md`. Missing, duplicate, malformed, misordered, or mismatched observable evidence must fail closed. This strict envelope proves only reported invocation fields and still does not attest the merged sandbox, managed permission arrays, or path evaluation.
-- Select the closed `legacy-base` stream profile for `>=2.1.211,<2.1.216` and the closed `extended-2x` profile for `>=2.1.216,<3.0.0`. Both profiles validate every admitted intermediate event against a closed, session-bound contract; unknown init, intermediate, terminal, or nested fields fail closed. Both the direct lane and low-level helper pass captured Claude output through this canonical validator after their distinct workspace, sandbox, and authentication preparation.
+- Select the closed `legacy-base` stream profile for `>=2.1.211,<2.1.216` and the closed `extended-2x` profile for `>=2.1.216,<3.0.0`. Both profiles validate every admitted intermediate event against a closed, session-bound contract; unknown init, intermediate, terminal, or nested fields fail closed. In `extended-2x`, optional assistant `diagnostics` accepts only `null` or the exact closed object `{"cache_miss_reason":{"type":"unavailable"}}`; `legacy-base` forbids the field. Both the direct lane and low-level helper pass captured Claude output through this canonical validator after their distinct workspace, sandbox, and authentication preparation.
 - Post-attempt worktree validation can prove the inspected worktree and private Git state are unchanged at validation time. It cannot prove that no transient write or outside-workspace read/side effect occurred.
 
 This boundary is an accepted model-behavior tradeoff, not full host-read isolation. A stronger outer sandbox may add protection, but must not be inferred from selected `denyRead` / `allowRead` settings or init output.
@@ -267,7 +267,9 @@ explicitly configured Claude Code candidate:
    rehash the copy against the signed size and SHA-256, publish it atomically as
    a checksum-keyed `0500` executable, and revalidate it before reuse. The source
    candidate is not executed after this point, and the verified snapshot is
-   captured once for the complete Claude model-attempt chain.
+   captured once for the complete Claude model-attempt chain. Every later
+   descriptor-anchored revalidation requires exact mode `0500`; any owner,
+   group, or world write-bit drift rejects the snapshot before execution.
 7. On Linux and WSL2, only after the signed checksum passes, allow trusted
    root-owned `ldd` to collect the exact dynamic loader and shared-library files
    needed by the verified snapshot and final sandbox. Require each dependency to
@@ -284,11 +286,20 @@ explicitly configured Claude Code candidate:
    mentions, and deny every non-workspace synthetic-root mount with absolute
    double-slash rules. Command construction must fail closed when a mount lacks
    coverage or appears below `/workspace`.
-10. For local login at every model-attempt boundary, prepare one platform-
+10. On macOS, require one bounded Bun `root_certs.cpp` store in the publisher-
+    verified executable snapshot and accept only cryptographically self-signed
+    CA members whose KeyUsage, when present, permits certificate signing;
+    unrelated embedded PEM data is never promoted. Before every model attempt,
+    revalidate that snapshot and exact root evidence, export all authoritative
+    trust domains, apply explicit-deny precedence, omit constrained or invalid
+    roots, and rebuild a certificate-only helper bundle from current system,
+    bundled, permitted additional, and snapshotted caller material.
+11. For local login at every model-attempt boundary, prepare one platform-
     specific private credential carrier. On macOS, securely read the current-account Keychain
     item plus the empirically compatible file under the account's `pwd` home,
-    validate their structure, UTF-8 token encodability, and refresh-token presence, select the candidate
-    with the later access-token expiry, and load it into the restricted broker.
+    validate their structure, UTF-8 token encodability, and refresh-token
+    presence, select the candidate with the later access-token expiry, and load
+    it into the restricted broker.
     On Linux and WSL2, validate the host credential file and stage a private
     copy. An expired access token is accepted when a usable refresh token remains;
     there is no warmup or attempt-duration freshness gate. An explicit API key
@@ -296,7 +307,7 @@ explicitly configured Claude Code candidate:
     lock-protocol gate. Before local-login preparation, require the captured signed artifact
     to resolve to one exact certified lock protocol; an unknown artifact is
     inspection-inconclusive before credentials or review data are exposed.
-11. Launch only the one captured verified snapshot for every real model attempt
+12. Launch only the one captured verified snapshot for every real model attempt
     in a fresh outer sandbox; never rediscover or fall back to the mutable source
     installation between Opus attempts. The trusted runtime may refresh only
     inside the temporary carrier. On macOS, atomically reserve attempt-scoped
@@ -459,6 +470,18 @@ the lexical symlink chain and resolved file chain are captured. Homebrew parent
 directories may use only the explicit `admin` group-write exception above.
 After the fixed tool passes its metadata prerequisite, an `otool` launch error
 or nonzero inspection result is inconclusive and cannot authorize fallback.
+Executable discovery treats an initial `FileNotFoundError`/`ENOENT` as an absent
+automatic candidate only after a bounded, component-wise `lstat`/no-follow walk
+proves a stable missing component. A resolved parent symlink is accepted only
+when repeated no-follow metadata and target-directory identity checks bind the
+same resolution. A dangling final or parent symlink, a symlink or parent-path
+race, `EACCES`, `EIO`, `ESTALE`, or another metadata/access inspection failure
+is inconclusive.
+An existing symlink whose final `stat` succeeds remains a candidate; the full
+Claude provenance validator owns its lexical and resolved-chain policy. The same
+absence distinction applies to an explicit executable override, except that a
+proven absent or non-executable explicit override remains a blocking
+configuration error.
 
 On Linux and WSL2, the private snapshot copied from the root-owned fixed-path GPG
 source is inspected only after that source is trusted. Stable-descriptor ELF64
@@ -538,7 +561,8 @@ atomically with exact mode `0500`, and fully revalidated before reuse. This is
 the executable-stability boundary: the original installation path may be
 managed or replaced by a package manager, but it cannot be switched between
 provenance verification and the capability/final launches because those stages
-execute only the private snapshot.
+execute only the private snapshot. An owner-writable mode is not a valid private
+execution snapshot even when the bytes still match the signed digest.
 
 ## Capability Probes
 
@@ -723,11 +747,15 @@ Custom TLS sources are copied rather than mounted from their original paths.
 The Claude-only `NODE_EXTRA_CA_CERTS` input uses the same absolute-path, stable
 no-follow identity, owner/mode, bounded-read, PEM-only, private-key rejection,
 and private-`0600` materialization policy as the existing CA-file inputs. On
-macOS, the rewritten variable names only the exact helper-owned copy; the
-Seatbelt profile grants `file-read*` to that file literally, does not grant a
-parent-directory subpath read, and does not disclose the caller path through
-the profile or launch arguments. Literal ancestor metadata checks remain part
-of safe path traversal.
+macOS, the proxy snapshot digest binds the exact captured file bytes rather
+than only normalized certificate blocks. The final merged bundle is atomically
+materialized in helper-private storage and changed to exact `0400` mode. The
+helper verifies its exact path, mode, and digest while constructing the
+Seatbelt profile and repeats the same checks immediately before `sandbox-exec`
+launch. This detects ordinary
+path and content drift at the helper boundary. As with the Linux mount
+handoff, it does not claim protection from a malicious same-euid host process
+after the final check.
 `SSL_CERT_FILE` and `SSL_CERT_DIR` retain their existing handling. The latter is
 enumerated through a fixed directory descriptor with bounded entry counts and
 supports normal OpenSSL hash links, including the multi-hop relative/absolute
@@ -736,7 +764,73 @@ traversed link and directory plus the final no-follow regular file is
 owner/mode/identity checked and revalidated around a bounded read. Only PEM
 certificates are materialized, never private-key material. The helper keeps the
 original hash basename but writes a private `0600` regular file instead of
-recreating a symlink.
+recreating a symlink. Multiple configured directories form one certificate
+union: safe empty directories do not reject a later admissible certificate, but
+the complete union must contain at least one certificate. Every configured
+directory is still validated, so an unsafe member blocks even when another
+member supplies a valid certificate. Empty-certificate classification uses a
+dedicated exception type rather than source-path or error-message text; a file
+name therefore cannot disguise private-key or malformed-certificate rejection.
+
+On macOS, caller CA inputs use owner-only, single-link regular-file reads with
+no symlinks, FIFOs, extended ACL entries, or identity/growth races. The helper
+captures bounded certificate material once for the proxy while retaining an
+exact raw-byte digest binding for later runtime preparation. Before every
+attempt it re-exports user, admin, and system
+trust settings into bounded helper files. The exact no-settings response is
+accepted only with `security` status `1`; signal and other abnormal exits remain
+inconclusive. Explicit deny wins even when another
+domain or sibling entry is malformed. Constrained, missing, expired, non-root,
+or otherwise invalid additional certificates are excluded from the complete
+merged bundle, regardless of which input also contains them. The exact embedded
+root set is evidence derived from the publisher-verified snapshot; if a host
+policy excludes a root still reachable through Claude's bundled store, the lane
+blocks rather than weakening signed provenance. Every trust preparation writes
+a sanitized terminal `claude-trust-policy.json` record.
+
+Upstream HTTPS proxy trust is prepared separately from Claude runtime trust.
+Caller CA files and directories are copied once into a dedicated helper-owned
+snapshot for the complete model chain, preserving proxy CA precedence while
+excluding publisher-bundled and host-added Claude roots. The helper initializes
+one in-memory TLS context from the captured bytes and reuses it for every
+upstream proxy connection. Replacement directories contribute only canonical
+OpenSSL hash-index entries whose suffix sequence and certificate subject hash
+are verified with the fixed OpenSSL client under one shared 20-second deadline
+and a 512-certificate budget for the complete snapshot and replacement-context
+initialization. The deadline is rechecked after each subprocess and before
+acceptance; duplicate material is verified once. The in-memory context enables
+strict X.509 verification and partial-chain trust anchors without loading
+ambient roots. Default trust uses explicit compiled-in OpenSSL CA-file material
+captured through the same stable descriptor reader. On Linux, a symlinked
+compiled-in CA file is not followed; the helper instead snapshots and
+hash-validates the compiled-in CA directory when available. It never consults
+caller-controlled environment lookup or retains a lazy CA directory. Original
+caller paths are not reopened. Between model attempts, helper snapshot paths
+are reopened only to verify their exact raw-byte bindings; individual upstream
+connections continue to reuse the already prepared in-memory context without
+reloading trust material.
+An unconstrained `TrustRoot` entry must be a strict currently valid self-signed
+CA root. An unconstrained `TrustAsRoot` entry may instead be a non-self-issued
+CA or intermediate certificate: it must retain strict CA and certificate-signing
+extensions, a current strict DER validity window, and a parseable public key.
+When the selected highest-priority domain contains independent unconstrained
+`TrustRoot` and `TrustAsRoot` entries for one fingerprint, the helper preserves
+both authorizations. It accepts the certificate when either the strict
+self-signed-root validation or the non-self-issued TrustAsRoot validation
+succeeds; one authorization does not collapse or replace the other. A
+lower-priority domain cannot add, remove, or constrain those selected
+authorizations. Explicit deny, malformed policy, and constraints selected from
+the highest-priority domain retain their terminal precedence.
+The fixed OpenSSL client performs partial-chain validation when it advertises
+that capability. Apple's fixed LibreSSL omits partial-chain support, so that
+host uses the same deterministic DER policy plus bounded public-key extraction;
+the ignored issuer signature is not part of an explicitly selected trust
+anchor's authority.
+The fixed Security and OpenSSL tools are unavailable only when their inspected
+executable or a deterministically required capability is absent. A signal,
+unexpected nonzero exit, unknown help output, or failed `find-certificate` or
+certificate-verification operation is inspection-inconclusive and cannot
+authorize reviewer fallback.
 
 Linux and WSL2 coalesce validated certificates into the existing single private
 bundle mounted read-only at `/etc/ssl/certs/ca-certificates.crt`. If
@@ -763,6 +857,14 @@ context, pre-provenance candidate probe, GPG, and security-sensitive host-tool
 environments do not consult `NODE_EXTRA_CA_CERTS`. Arbitrary `NODE_*`,
 `NODE_TLS_REJECT_UNAUTHORIZED=0`, mTLS private-key inputs, and private-key
 material remain outside the contract.
+
+On macOS, each model attempt captures the parent/proxy TLS environment before
+building the Claude-only merged bundle. The final review proxy uses that
+pre-merge environment; only the sandboxed Claude process receives the merged
+bundle through the helper-private `0400` path admitted by the Seatbelt profile.
+A discovered fixed OpenSSL verifier that then fails to launch or
+returns an operating-system I/O error is inspection-inconclusive, never
+deterministic tool absence, and cannot authorize Copilot fallback.
 
 Linux and WSL2 fix cwd at `/workspace`, use `dontAsk`, expose only `Read`, and
 pre-approve only `Read(./**)`. Every other top-level path mounted into the
@@ -871,6 +973,114 @@ file owned by the current user with exact mode `0600`, bounded size, and valid
 credential JSON. This macOS file source is based on observed current Claude Code
 compatibility behavior; Anthropic's public authentication documentation does
 not guarantee it as the macOS storage contract.
+
+The broker is a reviewed, prebuilt universal Mach-O with arm64 and x86_64
+slices, hardened-runtime ad-hoc signatures, and a macOS 13.0 deployment target.
+Its source and tracked artifact live beside `providers.py`. Runtime code pins the
+artifact SHA-256 and both slice CDHashes, but never invokes a compiler or
+installer. The broker uses C11 `memset_s` to clear userspace credential,
+capability, script, and overflow-probe buffers before release or return. This
+does not claim that compiler registers, kernel buffers, or external process
+buffers are wiped. Before credential selection, it requires the exact artifact at
+`/Library/Joey-Tools/CodexReview/brokers/<sha256>/security`; every ancestor must
+be a real root-owned directory with no group/world write or extended ACL, and
+the leaf must be a root-owned single-link regular file with mode `0555`, no
+extended ACL, the pinned digest, and an accepted native dependency closure.
+Missing installation is runtime-unavailable. Unsafe metadata, identity drift,
+or a digest/code-identity mismatch is blocked or inspection-inconclusive and
+never exposes credentials or enables an authentication fallback.
+
+Build and install are explicit maintenance operations:
+
+```bash
+skills/review-orchestration-playbook/scripts/build_claude_keychain_broker_macos.sh \
+  --developer-check
+skills/review-orchestration-playbook/scripts/install_claude_keychain_broker_macos.sh \
+  --install \
+  < skills/review-orchestration-playbook/scripts/review_runtime/claude_keychain_broker
+```
+
+The build script has no artifact-output mode. It pins both source and artifact
+digests, compiles both slices with the fixed deployment target, combines them,
+applies the fixed identifier and hardened-runtime ad-hoc signature, and requires
+the rebuilt SHA-256 and bytes to equal the tracked artifact. It also pins Xcode
+26.6 build 17F113, the macOS 26.5 SDK, Apple clang/linker, codesign, and every
+build-tool digest, and rechecks those pins after compilation. Developer and
+GitHub-hosted runner tool digests are pinned separately because the hosted
+`macos-26-arm64` image repackages the same versioned Xcode toolchain; both modes
+must still reproduce the same tracked broker bytes.
+
+The mandatory `broker-reproducibility` job runs `--check` as the ordinary
+GitHub-hosted `macos-26` runner user. It requires the exact hosted-runner context,
+pinned toolchain and tool digests, source/artifact digests, and byte-for-byte
+reproduction, and never returns a skip code. This is a required reproducibility
+gate, not an independent trust root or security boundary. It establishes no
+trusted-builder, root-sealed, or root-owned provenance. Required review and
+branch protection protect changes to the workflow, build script, source,
+artifact, and pins that define the gate. `--developer-check` is only a local
+convenience for reproducing the pinned bytes; it is not the required hosted gate
+and establishes no provenance.
+
+The shell opens the tracked artifact for stdin before the non-root installer
+entry invokes `sudo`. The entry freezes the reviewed production functions into
+the root command value already held in memory; root therefore never resolves or
+reopens either the checkout script or artifact path. The root worker accepts no
+path or policy parameters and runs under a scrubbed environment. It writes the
+already-opened bytes into a private `0600` staging file inside the digest
+directory, verifies the exact size, pinned digest, and all-architecture code
+signature, then applies the final root-owned `0555`, single-link, no-ACL
+metadata before an atomic no-clobber rename. It creates missing digest-keyed
+directories with safe metadata but only validates existing shared parents; it
+never changes an existing directory's owner, mode, or ACL. An artifact rotation
+uses a separately reviewed release procedure to create the candidate and must
+update every coupled pin in the same reviewed change: `providers.py` runtime
+artifact SHA-256 and both slice CDHashes; installer expected SHA-256 and byte
+size; build-script source/artifact SHA-256, Xcode/SDK version and build pins,
+tool versions, and clang/ld/lipo/vtool/`codesign_allocate`/codesign digests; and
+`test_installer.py` expected SHA-256, size, and native architecture/signature
+identity expectations. The ordinary-user GitHub-hosted `macos-26` `--check`,
+macOS tests, required review/branch protection, and explicit digest-keyed
+installation must then pass. The verifier never emits or overwrites a candidate
+and must not replace or reinterpret a different installed digest in place.
+
+The capability is never placed in the Claude environment. A private Unix
+identity endpoint releases it only to a same-user/same-group process whose PID
+is in the committed Claude session and process group and whose running CDHash
+matches one pinned broker slice; session and process-group membership are
+rechecked after CDHash inspection. The Seatbelt rule uses the kernel canonical
+socket path obtained from the open directory descriptor, while the broker
+connects through the stable volume/inode path. The broker then presents the
+capability to the loopback credential server and must receive an authorization
+ACK before reading `security -i` stdin or requesting the initial credential.
+Replacing the Unix socket can therefore cause denial of service but cannot
+obtain a usable capability or credential payload.
+
+Runtime process binding is deliberately two phase. First, a deadline-bounded
+daemon worker performs only pure PID/session/process-group inspection and returns
+an immutable binding; it receives no credential-service object, owns no server
+lock, and cannot commit or retain service state. After that worker finishes in
+time, the parent thread rechecks the absolute attempt deadline and performs the
+nonblocking credential-server commit. A busy or changed binding fails closed.
+Only the parent thread can then send exec authorization, after another deadline
+check. A late inspection result is inert: it cannot mutate, authorize, or retain
+the credential service after the parent has timed out or begun cleanup.
+
+Credential selection and the immediate comparison copy live inside one outer
+`try/finally` zeroization owner. That owner is established before runtime locks,
+events, random capability material, durable-stage state, or broker initialization
+and scrubs both buffers on selection-copy failure, initialization failure,
+control-flow exit, and ordinary teardown.
+
+Identity-service startup observation and failure cleanup share one absolute
+deadline, including the shutdown request and joins. Once bind may have happened,
+every startup failure first runs bounded cleanup. Forwarded signals and other
+control-flow exceptions win over ordinary inspection/cleanup diagnostics, while
+the losing diagnostics remain attached. Every model attempt allocates a fresh
+private identity directory; no later attempt reuses the endpoint. Cleanup
+verifies the originally bound socket's device/inode identity but never unlinks
+that pathname after a separate stat; whole-run private-directory cleanup owns
+removal. A replaced or missing entry is inspection-inconclusive and is never
+deleted by name.
 
 For each structurally valid source, require non-empty access and refresh tokens
 that encode as UTF-8 without unpaired surrogates, and parse the access-token
@@ -1224,14 +1434,16 @@ reached:
    `outer_sandbox.status: isolation-probe-verified` and
    `authentication.status: sandbox-auth-staged`. macOS reports
    `runtime-launching` with `outer_sandbox.status: profile-generated` only when
-   the final one-shot broker and Seatbelt launch are prepared.
+   the restricted temporary broker and Seatbelt launch are prepared.
 5. `attempt-inconclusive`: a bounded supervisor timeout, output overflow, drain
    failure, or retained descendant interrupted an attempted model launch. The
    report records `attempt.category: inconclusive` and a stable `failure_class`
    rather than leaving an earlier readiness phase as the apparent terminal
    result.
 6. `attempt-complete`: the report records the final sandbox status, attempt
-   category and return code, and requested/effective model and effort.
+   category, bounded reason and return code, and requested/effective model and
+   effort. A separate `claude-trust-policy.json` generation records the terminal
+   trust/bundle result for the latest attempt.
 
 These records are evidence about which gates ran; an early phase must never be
 described as an enforced final launch.
@@ -1242,7 +1454,8 @@ described as an enforced final launch.
 | --- | --- | --- |
 | No automatic candidate, supported platform unavailable, or a shared-range automatic candidate in the low-level helper path cleanly lacks a required non-security capability or secure runtime dependency | `runtime-unavailable` | Only after a separate explicit supplemental Copilot request; never satisfies named double |
 | A helper-owned Keychain-broker, TCP-proxy, or Unix-proxy bind fails with an explicit OS policy or socket-capability errno | `runtime-unavailable` | Only after a separate explicit supplemental Copilot request; never satisfies named double |
-| The Keychain-broker source and compiler exist, but the compiler cannot start or the broker build returns nonzero | `inconclusive`; report the build gate and pause | No |
+| The pinned root-owned Keychain broker is missing | `runtime-unavailable` before credential selection | Only after a separate explicit supplemental Copilot request; never satisfies named double |
+| The installed Keychain broker or an ancestor has unsafe metadata, identity drift, an unexpected digest/CDHash, or an invalid native dependency closure | `blocked` or `inconclusive`; report the exact verification gate and pause | No |
 | Local/API/OAuth authentication is missing, malformed, unsafe, refresh-token-less when applicable, or actually rejected as `Login expired`, HTTP 401, or refresh failure | `blocked-authentication`; request `claude auth login` for local login or unset/replace the exact explicit API/OAuth variable, then pause | No |
 | Signed artifact has no exact credential-lock protocol entry, either macOS carrier changed, lock contention/heartbeat failed, or credential inspection was unstable | `inconclusive`; report the exact coordination/inspection gate and pause without a login prompt | No |
 | The current macOS update would consume the reserved eighth generation or final 1 MiB | `inconclusive`; atomically close later `W` admission, durably stage that current update in the terminal recovery slot, invalidate any older staged host-writeback candidate, and NACK without publication or host writeback; NACK later requests before their callbacks or filesystem work | No |
@@ -1252,8 +1465,14 @@ described as an enforced final launch.
 | A Linux/WSL2 staged rotation cannot be safely drained, recovered, or guarded-written to the host | `inconclusive`; retain the private recovery carrier, report its path, and pause | No |
 | Explicit override has the wrong version, platform, binary shape, capability contract, or lacks trusted GPG, probe sandbox, or trusted review tool prerequisites | `blocked` configuration error | No |
 | Wrong publisher fingerprint, invalid signature, checksum mismatch, contradictory safe-mode semantics, unsafe runtime metadata, or an isolation-boundary mismatch | `blocked` security error | No |
+| Authoritative macOS trust deny, malformed trust policy, excluded bundled root, private-key caller CA, or mismatched bundled-root evidence | `blocked` security error with terminal trust evidence | No |
 | Manifest/probe timeout, output overflow, executable resolve/stat I/O failure, other inspection I/O failure, file race, transient network failure, unknown/resource/capacity/address-contention bind failure, Unix-socket permissioning failure, broker/proxy thread-start or serve-start uncertainty, post-ready serve-loop failure, or missing trustworthy terminal artifact | `inconclusive` | No |
 | Explicit model entitlement or organization-policy denial from a final review invocation after exact effective-model verification | Existing same-Claude-runtime model fallback; a different backend is supplemental only | Only after a separate explicit supplemental Copilot request; never satisfies named double |
+
+If the primary runtime is unavailable and the authorized fallback executable is
+also absent before any model launch, the lane is deterministically blocked with
+non-retry exit `1`. A zero-attempt outcome never receives transient exit `75`;
+that code remains reserved for actual inconclusive or transient evidence.
 
 Authentication failure never becomes runtime unavailability. The helper reports
 `blocked-authentication`, tells the operator to run `claude auth login` for local
@@ -1290,14 +1509,49 @@ inconclusive inspection failure; so is a workspace-link identity race or I/O
 failure. Neither case is ordinary runtime unavailability, so neither can
 authorize Copilot fallback.
 
+Claude stdout can never provide a final artifact when the process exits
+nonzero. Strictly recognized failure envelopes may retain bounded structural
+classification, but malformed, duplicate-key, non-standard-constant, unknown,
+or success-looking nonzero envelopes are fail-closed and receive a sanitized
+machine-readable attempt reason. Authentication becomes deterministic only for
+the documented complete result shape, the exact known login result, no populated
+error payload, and exactly one authentication signal category. The final review
+invocation applies those checks to its complete supported envelope; the helper
+collects fallback signal categories across both stdout and stderr, and mixed
+authentication and entitlement/transient semantics remain inconclusive
+regardless of which stream or priority branch supplied them.
+Every supported authentication, entitlement, or transient category additionally
+requires a valid `modelUsage` entry matching the exact requested model.
+Entitlement also requires an explicit model-entitlement code or entitlement
+text that names a model or the requested model; account-level denial of an
+unrelated feature or tool remains inconclusive even with matching model usage.
+Every other non-empty recursive error-payload string and the top-level failure
+`result` must match the closed neutral grammar (`error` or `request rejected`).
+Raw code and text values reject CR/LF before normalization. Unknown identifiers,
+future denial variants, and mixed feature evidence therefore remain inconclusive
+even when an explicit model code is present.
+Transient classification follows the same exact failure-envelope allowlist;
+stderr-only or structurally ambiguous network text remains inconclusive.
+Missing, malformed, or wrong-model `modelUsage` never authorizes model or
+backend fallback.
+
 A verifier dependency is `runtime-unavailable` only when its fixed source is
 deterministically absent or the supported platform/capability is not present.
 A present but non-native, untrusted-owner, writable, set-id, non-executable, or
 otherwise unsafe GPG/`otool`/glibc-loader candidate is a blocked security error.
 A resolve, stat, open, copy, launch, or non-authentication I/O failure is
 inconclusive. A final-runtime credential refresh failure is instead
-`blocked-authentication`. The generic provenance-operation exception therefore
-never authorizes Copilot
+`blocked-authentication`.
+An operational `OSError` while creating, entering, or cleaning a helper-owned
+bundled-root verification directory, and an `OSError` while closing a CA source
+directory after an otherwise successful read, are likewise inconclusive.
+Arbitrary programmer exceptions are not reclassified. Cleanup failure never
+replaces an active trust-policy, certificate-parse, or other typed error. The
+final invocation treats entitlement as fallback evidence only when the strict
+structured result contains the entitlement signal; stderr-only account, plan,
+or model wording remains inconclusive even beside an otherwise valid result
+envelope and exact requested-model usage. The generic provenance-operation
+exception therefore never authorizes Copilot
 fallback; only its dedicated deterministic-dependency subtype may enter the
 compatibility path after a separate explicit supplemental Copilot request.
 

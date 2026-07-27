@@ -5793,6 +5793,7 @@ class NamedLaneGuardTest(unittest.TestCase):
         }
         denied = {
             "ANTHROPIC_API_KEY": "secret",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "0",
             "CLAUDE_CODE_OAUTH_TOKEN": "secret",
             "CLAUDE_CONFIG_DIR": "/private/claude",
             "GITHUB_TOKEN": "secret",
@@ -5842,7 +5843,18 @@ class NamedLaneGuardTest(unittest.TestCase):
         self.assertEqual(child["LOGNAME"], account.pw_name)
         self.assertEqual(child["SHELL"], account.pw_shell)
         self.assertEqual(child["PATH"], TRUSTED_PATH)
-        for key in denied.keys() - {"NODE_EXTRA_CA_CERTS"}:
+        self.assertEqual(
+            child["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"],
+            "1",
+        )
+        self.assertEqual(
+            default_child["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"],
+            "1",
+        )
+        for key in denied.keys() - {
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+            "NODE_EXTRA_CA_CERTS",
+        }:
             self.assertNotIn(key, child)
         self.assertNotIn("NODE_EXTRA_CA_CERTS", default_child)
         self.assertEqual(child["NODE_EXTRA_CA_CERTS"], str(node_extra_ca))

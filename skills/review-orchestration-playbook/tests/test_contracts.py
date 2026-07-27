@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import inspect
 import json
 import math
+import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,7 +24,9 @@ SKILL_SCOPE_ROOT = SKILL_ROOT.parents[1]
 SCRIPTS = SKILL_ROOT / "scripts"
 RUNTIME = SCRIPTS / "review_runtime"
 sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(SCRIPTS / "independent_codex_pr_review"))
 
+from review_supervisor import constants as independent_constants  # noqa: E402
 from review_runtime import (  # noqa: E402
     claude_capabilities,
     claude_linux,
@@ -80,6 +85,12 @@ REPOSITORY_POLICY_SCOPE_BY_PROFILE = {
     "canonical": pathlib.Path("."),
     "private": pathlib.Path("personal_codex"),
 }
+
+
+def _has_python_shebang(path: pathlib.Path) -> bool:
+    with path.open("rb") as handle:
+        first_line = handle.readline(256)
+    return first_line.startswith(b"#!") and b"python" in first_line.lower()
 
 
 def _ci_contract_context(skill_root: pathlib.Path) -> tuple[pathlib.Path, str]:
@@ -363,6 +374,40 @@ class RepositoryContractTest(unittest.TestCase):
                 journal,
             )
 
+    def test_opaque_container_contract_uses_bounded_final_identities(
+        self,
+    ) -> None:
+        policies = {
+            "SKILL.md": (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"),
+            "helper-contract.md": (
+                SKILL_ROOT / "references/helper-contract.md"
+            ).read_text(encoding="utf-8"),
+            "synthetic-token-fixtures.md": (
+                SKILL_ROOT / "references/synthetic-token-fixtures.md"
+            ).read_text(encoding="utf-8"),
+        }
+        for name, content in policies.items():
+            with self.subTest(policy=name):
+                self.assertIn("canonical blob OID alone", content)
+                self.assertIn("blob paths are not retained", content)
+                self.assertIn("100,000", content)
+                self.assertIn("16 MiB", content)
+                self.assertIn("base", content)
+                self.assertIn("head", content)
+                self.assertIn("source-WIP", content)
+                self.assertNotIn("raw path plus blob OID", content)
+                self.assertNotIn("retains raw path plus", content)
+
+        runtime = (RUNTIME / "workspace.py").read_text(encoding="utf-8")
+        self.assertIn(
+            "MAX_SECRET_UNEXTRACTABLE_CONTAINER_IDENTITIES = MAX_SNAPSHOT_ENTRIES",
+            runtime,
+        )
+        self.assertIn(
+            "MAX_SECRET_UNEXTRACTABLE_PATH_IDENTITY_BYTES = 16 * 1024 * 1024",
+            runtime,
+        )
+
     def test_direct_secret_admission_is_required_without_a_reviewer(self) -> None:
         repository_policy = _secret_admission_repository_policy_files(
             REPO_ROOT,
@@ -521,6 +566,25 @@ class RepositoryContractTest(unittest.TestCase):
             "supplied-diff-private-git",
         )
         self.assertFalse(providers.NAMED_LANE_ELIGIBLE)
+        self.assertEqual(
+            independent_constants.LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+            "supplied-diff-no-git",
+        )
+        self.assertFalse(independent_constants.NAMED_LANE_ELIGIBLE)
+        independent_readme = (
+            SCRIPTS / "independent_codex_pr_review" / "README.md"
+        ).read_text(encoding="utf-8")
+        helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("review_contract: supplied-diff-no-git", independent_readme)
+        self.assertIn("No findings.", independent_readme)
+        self.assertIn(
+            "review_contract: supplied-diff-private-git",
+            helper_contract,
+        )
+        for contract_text in (independent_readme, helper_contract):
+            self.assertIn("named_lane_eligible: false", contract_text)
         for candidate in (
             SKILL_ROOT / "SKILL.md",
             SKILL_ROOT / "references/helper-contract.md",
@@ -657,9 +721,11 @@ class RepositoryContractTest(unittest.TestCase):
         pwd_home_source = inspect.getsource(providers._claude_pwd_home)
         select_source = inspect.getsource(providers._select_claude_macos_credential)
         validate_source = inspect.getsource(providers._validate_claude_local_credential)
-        macos_runtime_source = inspect.getsource(
-            providers._claude_keychain_runtime
-        ) + inspect.getsource(providers._claude_keychain_runtime_coordinated)
+        macos_runtime_source = (
+            inspect.getsource(providers._claude_keychain_runtime)
+            + inspect.getsource(providers._claude_keychain_runtime_coordinated)
+            + inspect.getsource(providers._claude_keychain_runtime_selected)
+        )
         macos_persist_source = inspect.getsource(
             providers._persist_claude_macos_refreshed_credential
         ) + inspect.getsource(providers._persist_claude_macos_refreshed_credential_impl)
@@ -864,7 +930,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("refresh_lock_protocol", linux_write_source)
         self.assertIn("_certified_claude_refresh_lock_protocol", attempt_source)
         self.assertIn(
-            "authentication_source = _claude_authentication_source(env)",
+            "authentication_source = _claude_authentication_source(attempt_env)",
             attempt_source,
         )
         self.assertIn('authentication_source != "local-login"', attempt_source)
@@ -1426,14 +1492,21 @@ class RepositoryContractTest(unittest.TestCase):
             """  test:
     name: test
     if: ${{ always() }}
-    needs: platform_tests
+    needs:
+      - platform_tests
+      - broker_reproducibility
+      - independent_supervisor_tests
     runs-on: ubuntu-latest
     steps:
       - name: Require every platform test to pass
         env:
           PLATFORM_TESTS_RESULT: ${{ needs.platform_tests.result }}
+          BROKER_REPRODUCIBILITY_RESULT: ${{ needs.broker_reproducibility.result }}
+          INDEPENDENT_SUPERVISOR_RESULT: ${{ needs.independent_supervisor_tests.result }}
         run: |
           test "$PLATFORM_TESTS_RESULT" = "success"
+          test "$BROKER_REPRODUCIBILITY_RESULT" = "success"
+          test "$INDEPENDENT_SUPERVISOR_RESULT" = "success"
 """,
             canonical,
         )
@@ -1445,6 +1518,8 @@ class RepositoryContractTest(unittest.TestCase):
       - platform_tests
       - python-39-compatibility
       - platform-safety
+      - broker_reproducibility
+      - independent_supervisor_tests
     runs-on: ubuntu-latest
     steps:
       - name: Require every platform test to pass
@@ -1452,10 +1527,14 @@ class RepositoryContractTest(unittest.TestCase):
           PLATFORM_TESTS_RESULT: ${{ needs.platform_tests.result }}
           PYTHON_39_RESULT: ${{ needs.python-39-compatibility.result }}
           PLATFORM_SAFETY_RESULT: ${{ needs.platform-safety.result }}
+          BROKER_REPRODUCIBILITY_RESULT: ${{ needs.broker_reproducibility.result }}
+          INDEPENDENT_SUPERVISOR_RESULT: ${{ needs.independent_supervisor_tests.result }}
         run: |
           test "$PLATFORM_TESTS_RESULT" = "success"
           test "$PYTHON_39_RESULT" = "success"
           test "$PLATFORM_SAFETY_RESULT" = "success"
+          test "$BROKER_REPRODUCIBILITY_RESULT" = "success"
+          test "$INDEPENDENT_SUPERVISOR_RESULT" = "success"
 """,
             private,
         )
@@ -1485,7 +1564,227 @@ class RepositoryContractTest(unittest.TestCase):
 
         workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertEqual(workflow, profiles[CI_PROFILE][0])
+    def test_completed_trust_port_journal_uses_current_claude_range(self) -> None:
+        if CI_PROFILE != "canonical":
+            self.skipTest("completed canonical project journal is not mirrored")
+        journal = (
+            REPO_ROOT
+            / "docs/project_journal/2026/07/"
+            / "2026-07-16-review-helper-trust-port-821601.md"
+        ).read_text(encoding="utf-8")
 
+        self.assertIn("`>=2.1.211,<3.0.0`", journal)
+        self.assertNotIn(">=2.1.187", journal)
+
+    def test_broker_reproducibility_never_runs_checkout_code_as_root(self) -> None:
+        script = (SCRIPTS / "build_claude_keychain_broker_macos.sh").read_text(
+            encoding="utf-8"
+        )
+        for profile in ("canonical", "private"):
+            workflow = (CI_FIXTURE_ROOT / f"{profile}.yml").read_text(encoding="utf-8")
+            start = workflow.index("  broker_reproducibility:")
+            end = workflow.index("\n  independent_supervisor_tests:", start)
+            broker_job = workflow[start:end]
+            with self.subTest(profile=profile):
+                self.assertNotIn("sudo", broker_job)
+                self.assertNotIn("/private/var/root", broker_job)
+                self.assertIn("--check", broker_job)
+                self.assertIn("runs-on: macos-26", broker_job)
+
+        self.assertNotIn("require_root_sealed", script)
+        self.assertNotIn("EUID", script)
+        self.assertNotIn("--output", script)
+        self.assertIn("not a security boundary", script)
+        self.assertIn("byte-reproducible", script)
+        for mode in ("DEVELOPER", "HOSTED"):
+            for tool in (
+                "CLANG",
+                "LD",
+                "LIPO",
+                "VTOOL",
+                "CODESIGN_ALLOCATE",
+                "CODESIGN",
+            ):
+                self.assertIn(f'EXPECTED_{mode}_{tool}_SHA256="', script)
+        self.assertIn('if [[ "$mode" == "hosted-check" ]]', script)
+        self.assertIn("initialize_expected_tool_digests", script)
+
+    def test_independent_supervisor_ci_separates_hosted_and_live_gates(self) -> None:
+        live_runner = (
+            SCRIPTS
+            / "independent_codex_pr_review/tests/run_required_no_child_profile.py"
+        ).read_text(encoding="utf-8")
+        deterministic_runner = (
+            SCRIPTS / "independent_codex_pr_review/tests/"
+            "run_required_deterministic_supervisor.py"
+        ).read_text(encoding="utf-8")
+        hosted_probe = (
+            SCRIPTS / "independent_codex_pr_review/tests/"
+            "run_hosted_no_child_fail_closed.py"
+        ).read_text(encoding="utf-8")
+        pr_readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+        helper_contract = (SKILL_ROOT / "references/helper-contract.md").read_text(
+            encoding="utf-8"
+        )
+        for runner in (live_runner, deterministic_runner):
+            self.assertIn("result.skipped,", runner)
+            self.assertIn("result.wasSuccessful()", runner)
+            self.assertIn("result.testsRun !=", runner)
+            self.assertIn("result.expectedFailures", runner)
+            self.assertIn("result.unexpectedSuccesses", runner)
+        self.assertIn("NoChildProfileDarwinIntegrationTests", live_runner)
+        self.assertIn("CodexExecutableAuthenticationTests", live_runner)
+        self.assertIn("REQUIRE_LIVE_NO_CHILD_PROFILE_ENV", live_runner)
+        self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
+        self.assertIn("expected_count != 9", live_runner)
+        self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 550", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
+        self.assertIn("selected_identity_sha256 !=", deterministic_runner)
+        self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)
+        self.assertIn("if duplicate_keys:", deterministic_runner)
+        self.assertIn("expected_discovered_count", deterministic_runner)
+        self.assertIn("_test_key", deterministic_runner)
+        for contract in (
+            "return-before-ownership publisher",
+            "launch `CALL`-to-caller-`STORE`",
+            "pending custody containing the random name",
+            "`mkdir` syscall-result boundary",
+            "callee-return-to-caller-`STORE` interruption window",
+            "manifest `CALL`-to-`STORE` boundary",
+            "executable custody, and typed recovery evidence",
+            "Process evidence protects ownership and closure",
+            "Timestamp, link-count, and unrelated child-entry churn",
+            "explicit result-owner contract implemented by the real",
+            "only the caller settles the",
+            "closure recovery owner then holds the exact lease",
+            "`CustodiedManifestResultOwner.retained` becomes true only after",
+            "protects descriptor object identity and close",
+            "different reused object",
+            "never retries the close",
+        ):
+            self.assertIn(contract, helper_contract)
+        for contract in (
+            'platform.machine() != "arm64"',
+            "_matches_hosted_fail_closed_observations(evidence)",
+            "blockers == expected_blockers",
+            "len(blockers) == len(evidence.blockers)",
+            '"reviewed_fail_closed_signature": signature_matches',
+            "if evidence.compatible or evidence.production_capable",
+        ):
+            self.assertIn(contract, hosted_probe)
+        self.assertNotIn("sandbox_apply", hosted_probe)
+        for requirement in (
+            "operator-enforced exact-head gate",
+            "nine tests run, zero skips",
+            "Any push invalidates that evidence",
+            "Hosted CI's blocker-signature probe is not a substitute",
+            "cd skills/review-orchestration-playbook/scripts/"
+            "independent_codex_pr_review",
+            "TRUSTED_PYTHON=/absolute/path/to/parent-validated/python3.13",
+            '"$TRUSTED_PYTHON" -B -m tests.run_required_no_child_profile',
+            "no-group-write/no-other-write",
+            "interpreter's absolute path and digest",
+            "tests.run_required_no_child_profile",
+        ):
+            self.assertIn(requirement, pr_readiness)
+        integration_test = (
+            SCRIPTS / "independent_codex_pr_review/tests/test_no_child_profile.py"
+        ).read_text(encoding="utf-8")
+        production_profile = (
+            SCRIPTS
+            / "independent_codex_pr_review/review_supervisor/no_child_profile.py"
+        ).read_text(encoding="utf-8")
+        hosted_profile = "github-macos-26-arm64-26.4-25E246"
+        self.assertIn(hosted_profile, integration_test)
+        self.assertNotIn(hosted_profile, production_profile)
+        self.assertNotIn("25E246", production_profile)
+
+        profile_contracts = {
+            "canonical": (
+                "test",
+                "skills/review-orchestration-playbook",
+            ),
+            "private": (
+                "python-39-compatibility",
+                "personal_codex/skills/review-orchestration-playbook",
+            ),
+        }
+        for profile, (next_job, skill_root) in profile_contracts.items():
+            workflow = (CI_FIXTURE_ROOT / f"{profile}.yml").read_text(encoding="utf-8")
+            start = workflow.index("  independent_supervisor_tests:")
+            end = workflow.index(f"\n  {next_job}:", start)
+            supervisor_job = workflow[start:end]
+            with self.subTest(profile=profile):
+                self.assertIn("runs-on: macos-26", supervisor_job)
+                self.assertIn("timeout-minutes: 15", supervisor_job)
+                self.assertIn(
+                    """      - name: Report hosted no-child runtime fingerprint
+        run: |
+          /usr/bin/sw_vers -productVersion
+          /usr/bin/sw_vers -buildVersion
+          /usr/bin/uname -r
+          /usr/bin/uname -m
+          /usr/bin/shasum -a 256 /usr/bin/sandbox-exec
+""",
+                    supervisor_job,
+                )
+                self.assertIn(
+                    f"""      - name: Match hosted no-child blocker signature
+        working-directory: {skill_root}/scripts/independent_codex_pr_review
+        env:
+          CODEX_REVIEW_LIVE_NO_CHILD_RUNTIME_PROFILE: github-macos-26-arm64-26.4-25E246
+          CODEX_REVIEW_RUNNER_ENVIRONMENT: ${{{{ runner.environment }}}}
+          CODEX_REVIEW_RUNNER_ARCH: ${{{{ runner.arch }}}}
+        run: |
+          python3 -m tests.run_hosted_no_child_fail_closed
+      - name: Run deterministic independent supervisor tests
+        working-directory: {skill_root}/scripts/independent_codex_pr_review
+        run: |
+          python3 -m tests.run_required_deterministic_supervisor
+""",
+                    supervisor_job,
+                )
+                self.assertNotIn("tests.run_required_no_child_profile", supervisor_job)
+                self.assertNotIn(
+                    "CODEX_REVIEW_REQUIRE_LIVE_NO_CHILD_PROFILE",
+                    supervisor_job,
+                )
+
+    def test_independent_supervisor_remains_a_bounded_low_level_tool(self) -> None:
+        tool_root = SCRIPTS / "independent_codex_pr_review"
+        entrypoint = tool_root / "independent-codex-pr-review"
+        readme = (tool_root / "README.md").read_text(encoding="utf-8")
+        constants = (tool_root / "review_supervisor/constants.py").read_text(
+            encoding="utf-8"
+        )
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+        self.assertTrue(entrypoint.is_file())
+        self.assertTrue(entrypoint.stat().st_mode & 0o111)
+        self.assertEqual(
+            entrypoint.read_text(encoding="utf-8").splitlines()[0],
+            "#!/usr/bin/env python3.13",
+        )
+        self.assertIn('MODEL = "gpt-5.6-sol"', constants)
+        self.assertIn('REASONING_EFFORT = "xhigh"', constants)
+        self.assertIn("MAX_EVIDENCE_BUNDLE_BYTES", constants)
+        for anchor in (
+            "owner-only `CODEX_HOME`",
+            "bounded evidence bundle",
+            "app-server",
+            "sealed",
+            "settlement",
+        ):
+            self.assertIn(anchor, readme)
+        self.assertIn("independent_supervisor_tests", workflow)
+        self.assertIn('python-version: "3.13"', workflow)
+        self.assertIn(
+            "scripts/independent_codex_pr_review",
+            workflow,
+        )
     def test_helper_declares_and_tests_its_minimum_python_runtime(self) -> None:
         entrypoint = (SCRIPTS / "isolated_review").read_text(encoding="utf-8")
         workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
@@ -1499,6 +1798,36 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn('python-version: "3.10"', workflow)
         self.assertIn("tomli==2.2.1", workflow)
         self.assertIn("requires Python 3.10 or later", readme)
+
+    def test_helper_entrypoint_does_not_write_import_bytecode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            copied_scripts = pathlib.Path(temp_dir) / "scripts"
+            shutil.copytree(
+                SCRIPTS,
+                copied_scripts,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+            environment = os.environ.copy()
+            environment.pop("PYTHONDONTWRITEBYTECODE", None)
+            environment.pop("PYTHONPYCACHEPREFIX", None)
+
+            completed = subprocess.run(
+                (str(copied_scripts / "isolated_review"), "--help"),
+                cwd=copied_scripts,
+                env=environment,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            bytecode_artifacts = sorted(
+                path.relative_to(copied_scripts).as_posix()
+                for path in copied_scripts.rglob("*")
+                if path.name == "__pycache__" or path.suffix == ".pyc"
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(bytecode_artifacts, [])
 
     def test_core_policy_defines_progressive_provider_strict_review_shapes(
         self,
@@ -2617,6 +2946,7 @@ class RepositoryContractTest(unittest.TestCase):
             "--strict-mcp-config",
             "--tools Read,Grep,Glob,Bash",
             "--disallowedTools Edit,Write,NotebookEdit,WebFetch,WebSearch,Task",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
             "disableBundledSkills: true",
             '"disableBundledSkills": true',
             "`--safe-mode` alone is not evidence that bundled skills are absent",
@@ -3012,6 +3342,8 @@ class RepositoryContractTest(unittest.TestCase):
             "defined once in",
             "claude_version_policy.py",
             "Claude Code `2.1.212` is the audited per-version stream-schema baseline, not a global eligibility pin.",
+            "adapts the baseline `claude_code_version` constant to the exact accepted preflight-selected version",
+            "exact-version additive metadata contracts",
             "selects a reviewed closed profile by the exact preflight version",
             "`legacy-base` for `>=2.1.211,<2.1.216`",
             "`extended-2x` for `>=2.1.216,<3.0.0`",
@@ -3144,6 +3476,7 @@ class RepositoryContractTest(unittest.TestCase):
                     "legacy-base": ">=2.1.211,<2.1.216",
                     "extended-2x": ">=2.1.216,<3.0.0",
                 },
+                "version_adaptations": (claude_stream_contract.VERSION_ADAPTATIONS),
                 "launch_profiles": [
                     "helper-darwin",
                     "helper-linux",
@@ -3361,7 +3694,8 @@ class RepositoryContractTest(unittest.TestCase):
                     "failure": "inconclusive",
                 },
                 "analytics_disabled": {
-                    "rule": "boolean",
+                    "rule": "constant",
+                    "value": True,
                     "failure": "inconclusive",
                 },
                 "product_feedback_disabled": {
@@ -3460,23 +3794,6 @@ class RepositoryContractTest(unittest.TestCase):
                 "accepted_values": ["ANTHROPIC_API_KEY", "none"],
                 "malformed_failure": "inconclusive",
                 "mismatch_failure": "blocked",
-            },
-        )
-        intermediate_profiles = schema["intermediate_events"]["profiles"]
-        self.assertEqual(
-            intermediate_profiles["legacy-base"]["assistant_message_profile"],
-            {
-                "additional_required_fields": [],
-                "field_contracts": {},
-            },
-        )
-        self.assertEqual(
-            intermediate_profiles["extended-2x"]["assistant_message_profile"],
-            {
-                "additional_required_fields": ["diagnostics"],
-                "field_contracts": {
-                    "diagnostics": {"rule": "null"},
-                },
             },
         )
         identities = schema["model_identity"]
@@ -4108,6 +4425,10 @@ class RepositoryContractTest(unittest.TestCase):
             manifest_paths,
             tuple(sorted(manifest_paths, key=lambda value: value.encode("utf-8"))),
         )
+        for relative_path in manifest_paths:
+            payload = (REPO_ROOT / relative_path).read_bytes()
+            for marker in (b"<<<<<<< ", b"=======\n", b">>>>>>> "):
+                self.assertNotIn(marker, payload, relative_path)
         manifest_clause = (
             "; ".join(f"`{path}`" for path in manifest_paths[:-1])
             + f"; and `{manifest_paths[-1]}`."
@@ -5490,6 +5811,268 @@ class RepositoryContractTest(unittest.TestCase):
         )
         self.assertNotIn("render_success_envelope", cli_source)
 
+    def test_installed_bundle_entrypoints_do_not_create_bytecode(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="review-installed-no-bytecode-"
+        ) as temporary:
+            copied_skill = pathlib.Path(temporary) / "review-orchestration-playbook"
+            shutil.copytree(
+                SKILL_ROOT,
+                copied_skill,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            )
+            copied_scripts = copied_skill / "scripts"
+            environment = os.environ.copy()
+            environment.pop("PYTHONDONTWRITEBYTECODE", None)
+            environment.pop("PYTHONPYCACHEPREFIX", None)
+            environment.pop("PYTHONPATH", None)
+            entrypoints = {
+                copied_scripts / "isolated_review": 0,
+                copied_scripts / "named_claude_preflight": 2,
+                copied_scripts / "synthetic_catalog_entry": 0,
+                copied_scripts / "validate_claude_stream.py": 3,
+                copied_scripts
+                / "independent_codex_pr_review"
+                / "independent-codex-pr-review": 0,
+            }
+            discovered_entrypoints = {
+                path
+                for path in copied_scripts.rglob("*")
+                if path.is_file() and _has_python_shebang(path)
+            }
+            self.assertEqual(discovered_entrypoints, set(entrypoints))
+
+            for entrypoint, expected_returncode in entrypoints.items():
+                with self.subTest(entrypoint=entrypoint.name):
+                    completed = subprocess.run(
+                        (sys.executable, str(entrypoint), "--help"),
+                        cwd=copied_skill,
+                        env=environment,
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=30,
+                    )
+                    requires_python_313 = (
+                        entrypoint.name == "independent-codex-pr-review"
+                    )
+                    if requires_python_313 and sys.version_info < (3, 13):
+                        self.assertNotEqual(completed.returncode, 0)
+                        self.assertIn(
+                            "Python 3.13 is required; running",
+                            completed.stderr,
+                        )
+                    else:
+                        self.assertEqual(
+                            completed.returncode,
+                            expected_returncode,
+                            completed.stderr,
+                        )
+                    bytecode = sorted(
+                        path.relative_to(copied_skill)
+                        for path in copied_skill.rglob("*")
+                        if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}
+                    )
+                    self.assertEqual(bytecode, [])
+
+            import_probe = (
+                "import sys;"
+                f"sys.path.insert(0, {str(copied_scripts)!r});"
+                "import review_runtime;"
+                "sys.path.insert(0, "
+                f"{str(copied_scripts / 'independent_codex_pr_review')!r});"
+                "import review_supervisor"
+            )
+            imported = subprocess.run(
+                (sys.executable, "-B", "-c", import_probe),
+                cwd=copied_skill,
+                env=environment,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(imported.returncode, 0, imported.stderr)
+
+            bytecode = sorted(
+                path.relative_to(copied_skill)
+                for path in copied_skill.rglob("*")
+                if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}
+            )
+            self.assertEqual(bytecode, [])
+
+    def test_documented_validation_does_not_create_bundle_bytecode(self) -> None:
+        syntax_probe = (
+            "import pathlib, sys; "
+            '[compile(pathlib.Path(path).read_bytes(), path, "exec") '
+            "for path in sys.argv[1:]]"
+        )
+        if CI_PROFILE == "canonical":
+            readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+            self.assertIn(f"python3 -B -c '{syntax_probe}'", readme)
+            self.assertIn(
+                "python3 -B -m unittest discover "
+                "-s skills/review-orchestration-playbook/tests",
+                readme,
+            )
+
+        with tempfile.TemporaryDirectory(
+            prefix="review-documented-validation-"
+        ) as temporary:
+            copied_skill = pathlib.Path(temporary) / "review-orchestration-playbook"
+            shutil.copytree(
+                SKILL_ROOT,
+                copied_skill,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            )
+            copied_scripts = copied_skill / "scripts"
+            syntax_sources = [
+                copied_scripts / "isolated_review",
+                copied_scripts / "named_lane_guard",
+                *sorted((copied_scripts / "review_runtime").glob("*.py")),
+            ]
+            environment = os.environ.copy()
+            environment.pop("PYTHONDONTWRITEBYTECODE", None)
+            environment.pop("PYTHONPYCACHEPREFIX", None)
+            environment.pop("PYTHONPATH", None)
+
+            syntax_check = subprocess.run(
+                (
+                    sys.executable,
+                    "-B",
+                    "-c",
+                    syntax_probe,
+                    *(str(path) for path in syntax_sources),
+                ),
+                cwd=copied_skill,
+                env=environment,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(syntax_check.returncode, 0, syntax_check.stderr)
+
+            tests = subprocess.run(
+                (
+                    sys.executable,
+                    "-B",
+                    "-m",
+                    "unittest",
+                    "test_named_lane.NamedLaneGuardTest."
+                    "test_entrypoint_does_not_write_import_bytecode",
+                ),
+                cwd=copied_skill / "tests",
+                env=environment,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(tests.returncode, 0, tests.stderr)
+
+            bytecode = sorted(
+                path.relative_to(copied_skill)
+                for path in copied_skill.rglob("*")
+                if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}
+            )
+            self.assertEqual(bytecode, [])
+
+    def test_bare_direct_package_import_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="review-installed-bare-import-"
+        ) as temporary:
+            copied_skill = pathlib.Path(temporary) / "review-orchestration-playbook"
+            shutil.copytree(
+                SKILL_ROOT,
+                copied_skill,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+            )
+            copied_scripts = copied_skill / "scripts"
+            environment = os.environ.copy()
+            environment.pop("PYTHONDONTWRITEBYTECODE", None)
+            environment.pop("PYTHONPYCACHEPREFIX", None)
+            environment.pop("PYTHONPATH", None)
+            packages = {
+                "review_runtime": copied_scripts,
+                "review_supervisor": (copied_scripts / "independent_codex_pr_review"),
+            }
+
+            for package_name, import_root in packages.items():
+                with self.subTest(package=package_name):
+                    import_probe = (
+                        "import sys;"
+                        f"sys.path.insert(0, {str(import_root)!r});"
+                        f"import {package_name}"
+                    )
+                    completed = subprocess.run(
+                        (sys.executable, "-c", import_probe),
+                        cwd=copied_skill,
+                        env=environment,
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=30,
+                    )
+                    self.assertNotEqual(completed.returncode, 0)
+                    self.assertIn(
+                        f"{package_name} requires bytecode to be disabled before import",
+                        completed.stderr,
+                    )
+
+            bytecode = sorted(
+                path.relative_to(copied_skill) for path in copied_skill.rglob("*.pyc")
+            )
+            self.assertEqual(len(bytecode), 2)
+            self.assertTrue(
+                all(path.name.startswith("__init__.") for path in bytecode),
+                bytecode,
+            )
+            self.assertEqual(
+                {path.parent.parent.name for path in bytecode},
+                {"review_runtime", "review_supervisor"},
+            )
+
+    def test_installed_bundle_python_child_launchers_pass_no_bytecode(self) -> None:
+        launch_vectors: list[tuple[pathlib.Path, int, str]] = []
+        production_sources = [
+            path
+            for path in SCRIPTS.rglob("*")
+            if path.is_file()
+            and "tests" not in path.relative_to(SCRIPTS).parts
+            and (path.suffix == ".py" or _has_python_shebang(path))
+        ]
+        for source_path in sorted(production_sources):
+            source = source_path.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(source_path))
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.List, ast.Tuple)) or len(node.elts) < 2:
+                    continue
+                first = ast.unparse(node.elts[0])
+                if "sys.executable" not in first:
+                    continue
+                launch_vectors.append((source_path, node.lineno, first))
+                leading_flags: list[str] = []
+                for item in node.elts[1:]:
+                    if not (
+                        isinstance(item, ast.Constant)
+                        and isinstance(item.value, str)
+                        and item.value.startswith("-")
+                    ):
+                        break
+                    leading_flags.append(item.value)
+                self.assertIn(
+                    "-B",
+                    leading_flags,
+                    f"{source_path}:{node.lineno} must pass -B",
+                )
+        self.assertGreaterEqual(len(launch_vectors), 9)
+
     def test_review_prompts_do_not_use_unbounded_only_matching_samples(self) -> None:
         forbidden = "rg -o --max-count 80"
         candidates = [
@@ -5677,6 +6260,40 @@ class RepositoryContractTest(unittest.TestCase):
                 "explicit-range-only standalone single/double with no selected pr",
                 content.lower(),
             )
+
+    def test_github_request_requires_terminal_local_lanes(self) -> None:
+        documents = {
+            "skill": SKILL_ROOT / "SKILL.md",
+            "PR readiness": SKILL_ROOT / "references/pr-readiness.md",
+            "lane contracts": SKILL_ROOT / "references/review-lane-contracts.md",
+            "GitHub probes": SKILL_ROOT / "references/github-pr-probes.md",
+            "prompt templates": SKILL_ROOT / "references/review-prompt-templates.md",
+        }
+        if CI_PROFILE == "canonical":
+            documents["README"] = REPO_ROOT / "README.md"
+        for name, path in documents.items():
+            content = " ".join(path.read_text(encoding="utf-8").split()).lower()
+            with self.subTest(policy_document=name):
+                self.assertIn("github-request-before-local-terminal", content)
+                self.assertIn("later local-lane completion does not cure", content)
+                self.assertIn("terminal payload cannot count", content)
+                self.assertIn("empty or anchor commit", content)
+
+        interface = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
+        self.assertIn("github-request-before-local-terminal", interface)
+        self.assertIn("both local terminals preceded", interface)
+        self.assertIn("cannot be cured by later local completion", interface)
+        self.assertIn("cannot be repeated on the unchanged head", interface)
+
+        readiness = documents["PR readiness"].read_text(encoding="utf-8")
+        self.assertLess(
+            readiness.index("Run the requested local lanes"),
+            readiness.index("Otherwise post the one exact `@codex review` comment"),
+        )
+        self.assertIn(
+            "only after both local lanes are terminal",
+            readiness,
+        )
 
 
 if __name__ == "__main__":

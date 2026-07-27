@@ -28,6 +28,9 @@ SCRIPTS = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from review_runtime import claude_linux, claude_refresh_lock  # noqa: E402
+from independent_codex_pr_review.tests.synthetic_fixtures import (  # noqa: E402
+    SYNTHETIC_REFRESH_TOKEN,
+)
 
 
 _AMBIENT_TOOL_ENV_POISON = {
@@ -2270,7 +2273,7 @@ class CredentialStagingTest(unittest.TestCase):
     SYNTH_ACCESS_EXPIRED = "codex_synth_v1_access_expired"
     SYNTH_ACCESS_A = "codex_synth_v1_access_a"
     SYNTH_ACCESS_B = "codex_synth_v1_access_b"
-    SYNTH_REFRESH_A = "codex_synth_v1_refresh_a"
+    SYNTH_REFRESH_A = SYNTHETIC_REFRESH_TOKEN
     SYNTH_REFRESH_B = "codex_synth_v1_refresh_b"
 
     @staticmethod
@@ -7903,6 +7906,7 @@ class CredentialStagingTest(unittest.TestCase):
             completed = subprocess.run(
                 (
                     sys.executable,
+                    "-B",
                     "-c",
                     child,
                     str(SCRIPTS),
@@ -13320,7 +13324,7 @@ class CredentialStagingTest(unittest.TestCase):
                 expires_at_ms=(now + 7200) * 1000,
             )
             captured_payloads: list[bytearray] = []
-            real_loads = json.loads
+            real_loads = claude_linux.strict_json_loads
 
             def capture_loads(
                 payload: bytearray,
@@ -13332,8 +13336,8 @@ class CredentialStagingTest(unittest.TestCase):
 
             with (
                 mock.patch.object(
-                    claude_linux.json,
-                    "loads",
+                    claude_linux,
+                    "strict_json_loads",
                     side_effect=capture_loads,
                 ),
                 mock.patch.object(
@@ -13355,6 +13359,61 @@ class CredentialStagingTest(unittest.TestCase):
 
             self.assertEqual(len(captured_payloads), 1)
             self.assertEqual(set(captured_payloads[0]), {0})
+
+    def test_rejects_recursive_duplicate_keys_and_nonstandard_constants(
+        self,
+    ) -> None:
+        now = time.time()
+        payloads = (
+            b'{"claudeAiOauth":{"accessToken":"first",'
+            b'"accessToken":"second","refreshToken":"fixture",'
+            b'"expiresAt":9999999999999}}',
+            b'{"claudeAiOauth":{"accessToken":"fixture",'
+            b'"refreshToken":"fixture","expiresAt":NaN}}',
+            b'{"claudeAiOauth":{"accessToken":"fixture",'
+            b'"refreshToken":"fixture","expiresAt":Infinity}}',
+            b'{"claudeAiOauth":{"accessToken":"fixture",'
+            b'"refreshToken":"fixture","expiresAt":-Infinity}}',
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            source = pathlib.Path(temporary) / ".credentials.json"
+            for payload in payloads:
+                with self.subTest(payload=payload):
+                    source.write_bytes(payload)
+                    source.chmod(0o600)
+                    with self.assertRaisesRegex(
+                        claude_linux.LinuxCredentialUnsafe,
+                        "JSON is malformed",
+                    ):
+                        claude_linux._read_valid_credential(
+                            source,
+                            owner_uid=os.getuid(),
+                            now=now,
+                            required_validity_seconds=3600,
+                        )
+
+    def test_rejects_over_nested_credential_json(self) -> None:
+        now = time.time()
+        nested = "[" * 65 + "0" + "]" * 65
+        payload = (
+            '{"claudeAiOauth":{"accessToken":"fixture",'
+            '"refreshToken":"fixture","expiresAt":' + nested + "}}"
+        ).encode()
+        with tempfile.TemporaryDirectory() as temporary:
+            source = pathlib.Path(temporary) / ".credentials.json"
+            source.write_bytes(payload)
+            source.chmod(0o600)
+
+            with self.assertRaisesRegex(
+                claude_linux.LinuxCredentialUnsafe,
+                "JSON is malformed",
+            ):
+                claude_linux._read_valid_credential(
+                    source,
+                    owner_uid=os.getuid(),
+                    now=now,
+                    required_validity_seconds=3600,
+                )
 
     @unittest.skipUnless(
         hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"),

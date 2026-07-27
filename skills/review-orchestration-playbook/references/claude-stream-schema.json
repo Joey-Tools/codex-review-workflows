@@ -228,7 +228,8 @@
               "failure": "inconclusive"
             },
             "analytics_disabled": {
-              "rule": "boolean",
+              "rule": "constant",
+              "value": true,
               "failure": "inconclusive"
             },
             "product_feedback_disabled": {
@@ -334,6 +335,20 @@
                   "usage"
                 ],
                 "optional_fields": [],
+                "profile_optional_field_contracts": {
+                  "legacy-base": {},
+                  "extended-2x": {
+                    "diagnostics": {
+                      "rule": "null_or_exact_object",
+                      "object": {
+                        "cache_miss_reason": {
+                          "type": "unavailable"
+                        }
+                      },
+                      "failure": "inconclusive"
+                    }
+                  }
+                },
                 "additional_fields": false,
                 "fixed_values": {
                   "context_management": null,
@@ -548,28 +563,14 @@
           "minimum_inclusive": "2.1.211",
           "maximum_exclusive": "2.1.216"
         },
-        "event_contract": "reviewed-2x",
-        "assistant_message_profile": {
-          "additional_required_fields": [],
-          "field_contracts": {}
-        }
+        "event_contract": "reviewed-2x"
       },
       "extended-2x": {
         "version_range": {
           "minimum_inclusive": "2.1.216",
           "maximum_exclusive": "3.0.0"
         },
-        "event_contract": "reviewed-2x",
-        "assistant_message_profile": {
-          "additional_required_fields": [
-            "diagnostics"
-          ],
-          "field_contracts": {
-            "diagnostics": {
-              "rule": "null"
-            }
-          }
-        }
+        "event_contract": "reviewed-2x"
       }
     }
   },

@@ -521,7 +521,14 @@ class StatefulLifecycleTest(unittest.TestCase):
         )
 
         completed = subprocess.run(
-            (sys.executable, "-c", probe, str(SCRIPTS), str(self.review.container_dir)),
+            (
+                sys.executable,
+                "-B",
+                "-c",
+                probe,
+                str(SCRIPTS),
+                str(self.review.container_dir),
+            ),
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1161,7 +1168,12 @@ class StatefulLifecycleTest(unittest.TestCase):
                 current = dict(original)
                 current[field] = value
                 write_json(state_path, current)
-                with self.assertRaisesRegex(ReviewError, "legacy v1 review state"):
+                expected = (
+                    "non-standard JSON constant"
+                    if field == "started_at"
+                    else "legacy v1 review state"
+                )
+                with self.assertRaisesRegex(ReviewError, expected):
                     state.load_review_state(legacy_review.container_dir)
 
         compatible = dict(original)
@@ -1470,6 +1482,40 @@ class StatefulLifecycleTest(unittest.TestCase):
             self.assertNotIn(
                 "short",
                 (state_dir / state.STATE_FILE).read_text(encoding="utf-8"),
+            )
+        finally:
+            state._STARTED_PROCESSES.pop(process.pid, None)
+
+    def test_stateful_start_disables_bytecode_for_runner(self) -> None:
+        process = mock.Mock(pid=12345)
+        with (
+            mock.patch.object(
+                state,
+                "prepare_workspace",
+                side_effect=prepared_workspace(self.review),
+            ),
+            mock.patch.object(
+                state.subprocess,
+                "Popen",
+                return_value=process,
+            ) as popen,
+        ):
+            state.start(
+                script_path=pathlib.Path("runner.py"),
+                repo=self.repo,
+                reviewer="codex",
+                base_ref=self.base,
+                head_ref=self.head,
+                prompt_file=None,
+                keep_workspace=False,
+                egress_consent=None,
+            )
+
+        try:
+            runner_arguments = popen.call_args.args[0]
+            self.assertEqual(
+                runner_arguments[:3],
+                (sys.executable, "-B", "runner.py"),
             )
         finally:
             state._STARTED_PROCESSES.pop(process.pid, None)
@@ -3150,6 +3196,72 @@ class StatefulLifecycleTest(unittest.TestCase):
         self.assertFalse(self.review.workspace_root.exists())
         self.assertFalse(cleanup_error_path.exists())
 
+    def test_bounded_cleanup_disables_bytecode_for_worker(self) -> None:
+        worker = mock.Mock()
+        worker.poll.return_value = 0
+        lock_handoff = mock.Mock()
+        with mock.patch.object(
+            state.subprocess,
+            "Popen",
+            return_value=worker,
+        ) as popen:
+            completed, cleanup_error = state._cleanup_before_deadline(
+                self.review,
+                deadline=time.monotonic() + 1,
+                cleanup_lock_fds=(17, 23),
+                lock_handoff=lock_handoff,
+            )
+
+        self.assertTrue(completed)
+        self.assertIsNone(cleanup_error)
+        lock_handoff.assert_called_once_with()
+        worker_arguments = popen.call_args.args[0]
+        self.assertEqual(
+            worker_arguments[:3],
+            (
+                sys.executable,
+                "-B",
+                str(
+                    pathlib.Path(state.__file__)
+                    .resolve()
+                    .with_name("cleanup_worker.py")
+                ),
+            ),
+        )
+
+    def test_copied_stateful_cleanup_does_not_write_import_bytecode(self) -> None:
+        self.write_completed_state()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            copied_scripts = pathlib.Path(temp_dir) / "scripts"
+            shutil.copytree(
+                SCRIPTS,
+                copied_scripts,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+            environment = os.environ.copy()
+            environment.pop("PYTHONDONTWRITEBYTECODE", None)
+            environment.pop("PYTHONPYCACHEPREFIX", None)
+            copied_state = copied_scripts / "review_runtime" / "state.py"
+
+            with (
+                mock.patch.object(state, "__file__", str(copied_state)),
+                mock.patch.dict(os.environ, environment, clear=True),
+            ):
+                exit_code = state.wait(
+                    self.review.container_dir,
+                    timeout_seconds=5,
+                )
+
+            bytecode_artifacts = sorted(
+                path.relative_to(copied_scripts).as_posix()
+                for path in copied_scripts.rglob("*")
+                if path.name == "__pycache__" or path.suffix == ".pyc"
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertFalse(self.review.workspace_root.exists())
+        self.assertEqual(bytecode_artifacts, [])
+
     def test_cleanup_worker_lock_validator_accepts_exact_inherited_leases(
         self,
     ) -> None:
@@ -3294,6 +3406,42 @@ class StatefulLifecycleTest(unittest.TestCase):
                 )
         finally:
             os.umask(previous_umask)
+
+    def test_private_lock_creation_avoids_redundant_mode_transition(self) -> None:
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        previous_umask = os.umask(0)
+        try:
+            with mock.patch.object(state.os, "fchmod", wraps=os.fchmod) as fchmod:
+                with state.open_private_lock_file(
+                    lock_path,
+                    label="test cleanup lock",
+                ) as cleanup_lock:
+                    self.assertEqual(
+                        stat.S_IMODE(os.fstat(cleanup_lock.fileno()).st_mode),
+                        0o600,
+                    )
+        finally:
+            os.umask(previous_umask)
+
+        fchmod.assert_not_called()
+
+    def test_private_lock_creation_repairs_mode_restricted_by_umask(self) -> None:
+        lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
+        previous_umask = os.umask(0o700)
+        try:
+            with mock.patch.object(state.os, "fchmod", wraps=os.fchmod) as fchmod:
+                with state.open_private_lock_file(
+                    lock_path,
+                    label="test cleanup lock",
+                ) as cleanup_lock:
+                    self.assertEqual(
+                        stat.S_IMODE(os.fstat(cleanup_lock.fileno()).st_mode),
+                        0o600,
+                    )
+        finally:
+            os.umask(previous_umask)
+
+        fchmod.assert_called_once_with(mock.ANY, 0o600)
 
     def test_private_lock_existing_open_does_not_recreate_deleted_file(self) -> None:
         lock_path = self.review.container_dir / state.CLEANUP_LOCK_FILE
