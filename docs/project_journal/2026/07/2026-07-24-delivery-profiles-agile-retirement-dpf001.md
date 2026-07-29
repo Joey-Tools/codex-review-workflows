@@ -214,10 +214,11 @@ superseded_by:
   hosted runner's group/world-writable `/opt`, so the catalog binder correctly
   rejects that mutable parent chain instead of adding a CI-only trust bypass.
   On macOS, setup-python resolves through the fixed
-  `/Library/Frameworks/Python.framework/Versions` parent. Immediately after
-  setup-python completes, and before the first workflow `run:` step, Python
-  invocation, or repository-code execution, the workflow proves that exact
-  path is an ordinary directory and removes only its group/world write bits;
+  `/Library/Frameworks/Python.framework/Versions/3.10/bin` chain. Immediately
+  after setup-python completes, and before the first workflow `run:` step,
+  Python invocation, or repository-code execution, the workflow proves the
+  `Versions`, `3.10`, and `bin` components are ordinary directories and removes
+  only their group/world write bits;
   the catalog transaction still validates the full interpreter parent chain,
   executable bytes, identity, access policy, and terminal stability. A changed
   path, symlink, unsafe ACL, or other unsafe ancestor still fails closed.
@@ -323,3 +324,13 @@ superseded_by:
   all 26 blocker reasons across three delivery profiles and four candidate
   local-gate labels (`312` combinations). The complete delivery schema suite
   passed (`47` tests), and the review contract suite passed (`99` tests).
+- PR #83's `2fc9ec3` macOS run proved that sealing only `Versions` was
+  insufficient: setup-python also left the resolved `3.10` component
+  group/world writable. The first post-setup run step now proves and seals the
+  exact `Versions/3.10/bin` directory chain without weakening the production
+  interpreter check. The same head's GitHub Codex review also exposed a
+  Python-version test bug: the independent supervisor requires exactly Python
+  3.13, so every other minor version—including 3.14+—must exercise the
+  rejection path. The focused contract passed under Python 3.13 and 3.14; the
+  reviewed CI snapshot, `actionlint`, the `99` review contracts, `47` delivery
+  contracts, and `20` synthetic contracts (`1` Linux-only skip) pass locally.

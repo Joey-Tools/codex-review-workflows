@@ -1562,7 +1562,11 @@ class RepositoryContractTest(unittest.TestCase):
                     f"{skill_prefix}/synthetic-token-fixtures/tests",
                     "Seal hosted macOS Python framework parent",
                     "test ! -L /Library/Frameworks/Python.framework/Versions",
+                    "test ! -L /Library/Frameworks/Python.framework/Versions/3.10",
+                    "test ! -L /Library/Frameworks/Python.framework/Versions/3.10/bin",
                     "sudo /bin/chmod go-w /Library/Frameworks/Python.framework/Versions",
+                    "sudo /bin/chmod go-w /Library/Frameworks/Python.framework/Versions/3.10",
+                    "sudo /bin/chmod go-w /Library/Frameworks/Python.framework/Versions/3.10/bin",
                 ):
                     self.assertIn(anchor, workflow)
                 platform_job_start = workflow.index("  platform_tests:")
@@ -5903,7 +5907,7 @@ class RepositoryContractTest(unittest.TestCase):
                     requires_python_313 = (
                         entrypoint.name == "independent-codex-pr-review"
                     )
-                    if requires_python_313 and sys.version_info < (3, 13):
+                    if requires_python_313 and sys.version_info[:2] != (3, 13):
                         self.assertNotEqual(completed.returncode, 0)
                         self.assertIn(
                             "Python 3.13 is required; running",

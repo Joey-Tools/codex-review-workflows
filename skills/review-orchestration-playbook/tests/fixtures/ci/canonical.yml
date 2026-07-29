@@ -32,10 +32,16 @@ jobs:
         run: |
           test -d /Library/Frameworks/Python.framework/Versions
           test ! -L /Library/Frameworks/Python.framework/Versions
+          test -d /Library/Frameworks/Python.framework/Versions/3.10
+          test ! -L /Library/Frameworks/Python.framework/Versions/3.10
+          test -d /Library/Frameworks/Python.framework/Versions/3.10/bin
+          test ! -L /Library/Frameworks/Python.framework/Versions/3.10/bin
           # setup-python resolves through this otherwise group/world-writable
-          # framework parent. Remove only those mutation grants; the catalog
-          # binding still validates the complete interpreter parent chain.
+          # framework chain. Remove only those mutation grants; the catalog
+          # binding still validates every parent and the interpreter itself.
           sudo /bin/chmod go-w /Library/Frameworks/Python.framework/Versions
+          sudo /bin/chmod go-w /Library/Frameworks/Python.framework/Versions/3.10
+          sudo /bin/chmod go-w /Library/Frameworks/Python.framework/Versions/3.10/bin
       - name: Install Python test dependencies
         run: |
           python3 -m pip install --disable-pip-version-check --no-input 'jsonschema==4.26.0' 'tomli==2.2.1; python_version < "3.11"'
