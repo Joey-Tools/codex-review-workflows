@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 import review_supervisor.ledger as ledger_module
+import review_supervisor.secureio as secureio_module
 from review_supervisor.codex_executable import ExtendedMetadataEvidence
 from review_supervisor.errors import SupervisorError
 from review_supervisor.ledger import acquire_retention_lease
@@ -22,6 +23,7 @@ from review_supervisor.secureio import (
     canonical_json,
     decode_json_bytes,
     open_absolute_directory_chain,
+    open_directory_at,
     open_regular_nofollow,
     require_private_directory,
 )
@@ -159,6 +161,69 @@ class PrivateDirectoryAnchorTests(unittest.TestCase):
             ):
                 require_private_directory(target)
             self.assertIn("private ACL", caught.exception.failure.message)
+
+    def test_directory_at_rejects_private_acl(self) -> None:
+        with owned_temporary_directory("secureio-directory-at-acl-") as root:
+            child = root / "child"
+            child.mkdir(mode=0o700)
+            parent_fd, _ = open_absolute_directory_chain(root, private_leaf=True)
+            try:
+                with (
+                    mock.patch(
+                        "review_supervisor.secureio._verify_macos_metadata",
+                        side_effect=ValueError("private ACL"),
+                    ),
+                    self.assertRaisesRegex(ValueError, "private ACL"),
+                ):
+                    open_directory_at(
+                        parent_fd,
+                        b"child",
+                        path_hint=child,
+                        private=True,
+                    )
+            finally:
+                os.close(parent_fd)
+
+    def test_directory_at_rejects_path_replacement_during_validation(self) -> None:
+        with owned_temporary_directory("secureio-directory-at-replace-") as root:
+            child = root / "child"
+            child.mkdir(mode=0o700)
+            replacement = root / "replacement"
+            replacement.mkdir(mode=0o700)
+            parent_fd, _ = open_absolute_directory_chain(root, private_leaf=True)
+            original_validate = secureio_module._validate_directory_fd
+            replaced = False
+
+            def replace_path(
+                fd: int,
+                path: pathlib.Path,
+                *,
+                private: bool,
+            ) -> Identity:
+                nonlocal replaced
+                identity = original_validate(fd, path, private=private)
+                if not replaced:
+                    replaced = True
+                    child.rename(root / "displaced")
+                    replacement.rename(child)
+                return identity
+
+            try:
+                with (
+                    mock.patch(
+                        "review_supervisor.secureio._validate_directory_fd",
+                        side_effect=replace_path,
+                    ),
+                    self.assertRaisesRegex(OSError, "path identity changed"),
+                ):
+                    open_directory_at(
+                        parent_fd,
+                        b"child",
+                        path_hint=child,
+                        private=True,
+                    )
+            finally:
+                os.close(parent_fd)
 
     def test_retention_lease_detects_root_replacement(self) -> None:
         cases = (

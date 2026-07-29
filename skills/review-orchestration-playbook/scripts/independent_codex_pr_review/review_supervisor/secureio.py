@@ -228,6 +228,42 @@ def open_directory(path: pathlib.Path) -> int:
     return fd
 
 
+def open_directory_at(
+    parent_fd: int,
+    name: bytes,
+    *,
+    path_hint: pathlib.Path,
+    private: bool = False,
+) -> tuple[int, Identity]:
+    """Open one child without following links and bind identity plus access policy."""
+
+    if not name or b"/" in name or name in {b".", b".."} or b"\0" in name:
+        raise ValueError("invalid directory leaf name")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    fd = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        path_identity_before = identity_from_stat(
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        )
+        descriptor_identity = _validate_directory_fd(
+            fd,
+            path_hint,
+            private=private,
+        )
+        path_identity_after = identity_from_stat(
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        )
+        if not (
+            directory_identities_match(descriptor_identity, path_identity_before)
+            and directory_identities_match(descriptor_identity, path_identity_after)
+        ):
+            raise OSError(errno.ESTALE, "directory path identity changed while opening")
+        return fd, descriptor_identity
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def _canonical_directory_walk_path(path: pathlib.Path) -> pathlib.Path:
     if sys.platform != "darwin" or len(path.parts) < 2:
         return path

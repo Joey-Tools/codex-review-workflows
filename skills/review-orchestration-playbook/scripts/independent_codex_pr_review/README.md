@@ -47,9 +47,6 @@ REPO=/absolute/path/to/repo
 BASE_SHA=<full-base-commit-oid>
 HEAD_SHA=<full-head-commit-oid>
 PR_URL=https://github.com/OWNER/REPO/pull/NUMBER
-STATE_ROOT=/absolute/current-account-home/.codex/review-runtime/independent-codex-pr-review
-RETENTION="$STATE_ROOT/retention"
-CHECKOUTS="$STATE_ROOT/checkouts"
 
 HELPER_STATE="$($HELPER stateful start \
   --repo "$REPO" \
@@ -65,17 +62,21 @@ $HELPER stateful final --state-dir "$HELPER_STATE"
 
 The CLI resolves the same default state root from the current POSIX account
 database, not from `$HOME`, so installed release trees remain immutable and
-retained evidence survives release replacement. Explicit `--retention-root` and
-`--checkout-parent` values remain available for task-scoped isolated runs and
-bypass the account lookup. Default lookup is lazy and any failure is returned
-through the CLI's single-line JSON failure contract.
+retained evidence survives release replacement. Non-default explicit
+`--retention-root` and `--checkout-parent` values remain available for
+task-scoped isolated runs. An explicitly supplied path that is exactly the
+account-local default still uses the default migration gate. Default lookup is
+lazy and any failure is returned through the CLI's single-line JSON failure
+contract.
 
 从使用 release-local `runtime/retention` 的旧版本升级时，新版本会在 installed
 overlay 的 sibling releases 中只读扫描旧 retention roots。只要任一旧 root 仍有
-attempt，所有省略 `--retention-root` 的公共命令都会失败关闭并报告精确旧 root。使用
-该路径显式运行 `status`、`final`、`recover`、`release` 和 `cleanup`，直到旧 root
-drained；在此之前不得删除旧 release。扫描不会搬动活动 attempt，也不会把旧 attempt
-并入新的 account-local root。
+attempt，所有使用 account-local default 的公共命令都会失败关闭并报告精确旧 root。
+扫描逐级持有 no-follow descriptors，复用 ACL/xattr access-policy 检查，并对旧
+`retention.lock` 获取非阻塞 migration fence；活动旧 writer 会失败关闭，该 fence
+保持到本次默认-root 命令完成。使用报告的旧路径显式运行 `status`、`final`、
+`recover`、`release` 和 `cleanup`，直到旧 root drained；在此之前不得删除旧
+release。扫描不会搬动活动 attempt，也不会把旧 attempt 并入新的 account-local root。
 
 仅在 helper 已 terminal 后运行独立 preflight。它验证 exact repo/base/head、helper
 runner completion、primary-diff 双重 attestation、control directory 完整性、source
@@ -90,9 +91,7 @@ python3.13 -B "$SUPERVISOR" preflight \
   --repo "$REPO" \
   --base "$BASE_SHA" \
   --head "$HEAD_SHA" \
-  --pr-url "$PR_URL" \
-  --retention-root "$RETENTION" \
-  --checkout-parent "$CHECKOUTS"
+  --pr-url "$PR_URL"
 ```
 
 只有 preflight 返回一行 `{"status":"ready",...}` 后才运行 reviewer：
@@ -103,9 +102,7 @@ python3.13 -B "$SUPERVISOR" run \
   --repo "$REPO" \
   --base "$BASE_SHA" \
   --head "$HEAD_SHA" \
-  --pr-url "$PR_URL" \
-  --retention-root "$RETENTION" \
-  --checkout-parent "$CHECKOUTS"
+  --pr-url "$PR_URL"
 ```
 
 `run` 返回单行 JSON。保存其中的 `attempt_dir`，然后读取状态并重新验证唯一 sealed
@@ -115,11 +112,9 @@ final artifact；不要把 stdout/stderr JSONL、tail 或 keepalive 当成 findi
 ATTEMPT_DIR=<attempt_dir-from-run-json>
 
 python3.13 -B "$SUPERVISOR" status \
-  --retention-root "$RETENTION" \
   --attempt-dir "$ATTEMPT_DIR"
 
 python3.13 -B "$SUPERVISOR" final \
-  --retention-root "$RETENTION" \
   --attempt-dir "$ATTEMPT_DIR"
 ```
 
@@ -148,7 +143,6 @@ $HELPER stateful cleanup --state-dir "$HELPER_STATE"
 
 ```bash
 python3.13 -B "$SUPERVISOR" status \
-  --retention-root "$RETENTION" \
   --attempt-dir "$ATTEMPT_DIR"
 ```
 
@@ -158,7 +152,6 @@ owner。记录的 boot ID 与当前 boot ID 不同时，运行：
 
 ```bash
 python3.13 -B "$SUPERVISOR" recover \
-  --retention-root "$RETENTION" \
   --attempt-dir "$ATTEMPT_DIR"
 ```
 
@@ -184,14 +177,12 @@ terminal status 或年龄本身不会释放 evidence。parent 确认已经消费
 
 ```bash
 python3.13 -B "$SUPERVISOR" release \
-  --retention-root "$RETENTION" \
   --attempt-dir "$ATTEMPT_DIR" \
   --reason resolved
 ```
 
 ```bash
 python3.13 -B "$SUPERVISOR" release \
-  --retention-root "$RETENTION" \
   --attempt-dir "$ATTEMPT_DIR" \
   --reason handoff-complete
 ```
@@ -201,7 +192,6 @@ released 时，才可回收整个 attempt：
 
 ```bash
 python3.13 -B "$SUPERVISOR" cleanup \
-  --retention-root "$RETENTION" \
   --attempt-dir "$ATTEMPT_DIR"
 ```
 
