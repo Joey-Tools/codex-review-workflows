@@ -1,4 +1,4 @@
-"""Validate delivery handoffs and cross-field read-only PR report semantics."""
+"""Validate delivery handoffs and closed-schema read-only PR reports."""
 
 from __future__ import annotations
 
@@ -21,7 +21,11 @@ MAX_ERROR_CHARS = 240
 MAX_INTEGER_DIGITS = 128
 MAX_NUMBER_CHARS = 256
 MAX_JSON_DEPTH = 64
-MAX_JSON_NODES = 32_768
+# Every node counted by ``_validate_json_shape`` needs at least one retained
+# JSON byte (containers need two; object keys need quoted bytes).  The input
+# byte ceiling is therefore a conservative structural-node ceiling that still
+# admits every closed-schema report representable within the 1 MiB contract.
+MAX_JSON_NODES = MAX_REPORT_BYTES
 MAX_JSON_STRUCTURE_MARKERS = MAX_JSON_NODES * 2
 READ_CHUNK_BYTES = 64 * 1024
 MAX_CI_ROLLUP_ENTRIES = 1_000
@@ -32,7 +36,38 @@ MAX_REVIEW_THREAD_PAGES = 10
 MAX_REVIEW_THREAD_PAGE_ITEMS = 100
 MAX_CONNECTION_PROVIDER_CALLS = 22
 MAX_CONNECTION_DEADLINE_MS = 60_000
+REPORT_SCHEMA_VERSION = 8
+REPORT_SCHEMA_DRAFT = "https://json-schema.org/draft/2020-12/schema"
+REPORT_SCHEMA_ID = (
+    "https://joey-tools.invalid/review-orchestration-playbook/"
+    "pr-readiness-read-only-report.schema.json"
+)
+REPORT_SCHEMA_PATH = os.path.abspath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "references",
+        "pr-readiness-read-only-report.schema.json",
+    )
+)
+PAGE_DIGEST_ALGORITHM = "sha256-domain-json-v1"
 PAGE_DIGEST_DOMAIN = b"joey-tools:pr-readiness-page:v1\x00"
+PAGE_DIGEST_KINDS = frozenset({"ci-status", "review-threads"})
+PAGE_DIGEST_PAYLOAD_FIELDS = frozenset(
+    {
+        "connection",
+        "scan_role",
+        "observed_head_oid",
+        "snapshot_binding",
+        "snapshot_id",
+        "server_total_count",
+        "page_index",
+        "request_after",
+        "item_count",
+        "page_info",
+        "items",
+    }
+)
 IDENTIFIER_RE = re.compile(
     r"^(?P<kind>report|target|snapshot|observation):(?P<value>[0-9a-f]{32})$"
 )
@@ -287,20 +322,35 @@ def _is_github_node_id(value: object) -> bool:
     return isinstance(value, str) and GITHUB_NODE_ID_RE.fullmatch(value) is not None
 
 
-def _canonical_page_digest(kind: str, payload: object) -> str:
+def canonical_page_digest_bytes(kind: str, payload: object) -> bytes:
+    """Return the complete canonical byte string hashed for one page.
+
+    This is the single producer/receiver implementation.  The payload is
+    closed and includes ``scan_role``; primary and verification pages therefore
+    intentionally have different digests even when their ordered slices match.
+    """
+
+    if kind not in PAGE_DIGEST_KINDS:
+        raise ValueError("page digest kind is unsupported")
+    page = _mapping(payload)
+    if page is None or set(page) != PAGE_DIGEST_PAYLOAD_FIELDS:
+        raise ValueError("page digest payload fields do not match the closed contract")
+    if page.get("scan_role") not in {"primary", "verification"}:
+        raise ValueError("page digest scan_role is invalid")
     canonical = json.dumps(
-        payload,
+        page,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
         allow_nan=False,
     ).encode("utf-8")
-    digest = hashlib.sha256()
-    digest.update(PAGE_DIGEST_DOMAIN)
-    digest.update(kind.encode("ascii"))
-    digest.update(b"\x00")
-    digest.update(canonical)
-    return digest.hexdigest()
+    return PAGE_DIGEST_DOMAIN + kind.encode("ascii") + b"\x00" + canonical
+
+
+def canonical_page_digest(kind: str, payload: object) -> str:
+    """Return the canonical SHA-256 content digest for one provider page."""
+
+    return hashlib.sha256(canonical_page_digest_bytes(kind, payload)).hexdigest()
 
 
 def _mapping(value: object) -> Mapping[str, Any] | None:
@@ -726,6 +776,7 @@ def _validate_paginated_scan(
         page_slice = list(items[item_offset : item_offset + item_count])
         digest_payload = {
             "connection": dict(expected_connection),
+            "scan_role": page.get("scan_role"),
             "observed_head_oid": page_head_oid,
             "snapshot_binding": page_snapshot_binding,
             "snapshot_id": page_snapshot_id,
@@ -737,7 +788,7 @@ def _validate_paginated_scan(
             "items": page_slice,
         }
         content_sha256 = page.get("content_sha256")
-        if content_sha256 != _canonical_page_digest(digest_kind, digest_payload):
+        if content_sha256 != canonical_page_digest(digest_kind, digest_payload):
             errors.append(
                 f"{label} page {offset} content digest does not bind "
                 "its ordered flat-list slice"
@@ -751,7 +802,6 @@ def _validate_paginated_scan(
                 "item_count": item_count,
                 "server_total_count": server_total_count,
                 "page_info": dict(page_info),
-                "content_sha256": content_sha256,
             }
         )
         item_offset += item_count
@@ -862,7 +912,7 @@ def _validate_connection_stability(
     ):
         errors.append(
             f"{label} verification scan changed total, cursor, page slice, "
-            "or content digest; evidence must be unavailable"
+            "or page boundary; evidence must be unavailable"
         )
 
 
@@ -1979,6 +2029,91 @@ def _read_payload(path: str) -> object:
     return _strict_json_object(raw)
 
 
+def _local_schema_references(schema: object) -> tuple[str, ...]:
+    references: list[str] = []
+    stack = [schema]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            reference = value.get("$ref")
+            if isinstance(reference, str):
+                references.append(reference)
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+    return tuple(references)
+
+
+def _load_report_schema() -> tuple[object, object]:
+    """Load and compile the co-release closed Draft 2020-12 report schema."""
+
+    try:
+        from jsonschema import Draft202012Validator
+        from jsonschema.exceptions import SchemaError
+    except (ImportError, AttributeError) as exc:
+        raise ValueError(
+            "Draft 2020-12 schema validator dependency is unavailable"
+        ) from exc
+
+    try:
+        schema = _strict_json_object(_read_regular_path(REPORT_SCHEMA_PATH))
+    except (UnicodeDecodeError, json.JSONDecodeError, OSError, ValueError) as exc:
+        raise ValueError("co-release report schema could not be loaded") from exc
+    if schema.get("$schema") != REPORT_SCHEMA_DRAFT:
+        raise ValueError("co-release report schema uses an unexpected draft")
+    if schema.get("$id") != REPORT_SCHEMA_ID:
+        raise ValueError("co-release report schema identity is invalid")
+    properties = _mapping(schema.get("properties"))
+    schema_version = (
+        _mapping(properties.get("schema_version")) if properties is not None else None
+    )
+    if schema_version is None or schema_version.get("const") != REPORT_SCHEMA_VERSION:
+        raise ValueError("co-release report schema version is invalid")
+    references = _local_schema_references(schema)
+    if not references or any(
+        not reference.startswith("#/") for reference in references
+    ):
+        raise ValueError("co-release report schema is not self-contained")
+    try:
+        Draft202012Validator.check_schema(schema)
+        validator = Draft202012Validator(schema)
+    except (SchemaError, TypeError, ValueError) as exc:
+        raise ValueError("co-release report schema is invalid") from exc
+    return schema, validator
+
+
+def _schema_error_location(error: object) -> str:
+    path = getattr(error, "absolute_path", ())
+    parts = ["$"]
+    for component in path:
+        if isinstance(component, int):
+            parts.append(f"[{component}]")
+        elif isinstance(component, str) and re.fullmatch(r"[A-Za-z0-9_]+", component):
+            parts.append(f".{component}")
+        else:
+            parts.append("[field]")
+    return "".join(parts)
+
+
+def validate_report(report: object) -> None:
+    """Validate the co-release closed schema first, then semantic bindings."""
+
+    _schema, validator = _load_report_schema()
+    try:
+        error = next(validator.iter_errors(report), None)
+    except Exception as exc:
+        raise ValueError("closed report schema validation could not complete") from exc
+    if error is not None:
+        keyword = getattr(error, "validator", None)
+        if not isinstance(keyword, str) or not keyword:
+            keyword = "schema"
+        raise ValueError(
+            "closed report schema rejected the payload "
+            f"({_schema_error_location(error)}; {keyword})"
+        )
+    validate_semantics(report)
+
+
 def _safe_error_text(exc: BaseException) -> str:
     if isinstance(exc, MemoryError):
         return "validation resource limit exceeded"
@@ -2039,10 +2174,36 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _emit_rejection(exc)
         print(json.dumps(bindings, sort_keys=True))
         return 0
-    if len(args) == 2 and args[0] == "validate-semantics":
+    if len(args) == 3 and args[0] == "page-digest":
+        try:
+            payload = _read_payload(args[2])
+            content_sha256 = canonical_page_digest(args[1], payload)
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            RecursionError,
+            MemoryError,
+            OSError,
+            ValueError,
+            TypeError,
+            KeyError,
+            OverflowError,
+        ) as exc:
+            return _emit_rejection(exc)
+        print(
+            json.dumps(
+                {
+                    "algorithm": PAGE_DIGEST_ALGORITHM,
+                    "content_sha256": content_sha256,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    if len(args) == 2 and args[0] == "validate-report":
         try:
             payload = _read_payload(args[1])
-            validate_semantics(payload)
+            validate_report(payload)
         except (
             UnicodeDecodeError,
             json.JSONDecodeError,
@@ -2077,7 +2238,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     print(
         "usage: read_only_pr_report.py "
-        "{new-bindings|validate-semantics <report.json|->|"
+        "{new-bindings|page-digest <ci-status|review-threads> <payload.json|->|"
+        "validate-report <report.json|->|"
         "validate-delivery-handoff <delivery.json|->}",
         file=sys.stderr,
     )

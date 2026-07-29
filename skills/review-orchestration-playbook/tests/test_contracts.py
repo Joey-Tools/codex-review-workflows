@@ -4376,6 +4376,12 @@ class RepositoryContractTest(unittest.TestCase):
         )
         ci_pagination = schema["$defs"]["ciPaginationEvidence"]
         self.assertIn("stability", ci_pagination["required"])
+        self.assertIn(
+            "scan_role",
+            schema["$defs"]["ciPaginationPage"]["properties"]["content_sha256"][
+                "description"
+            ],
+        )
         ci_stability = schema["$defs"]["ciPaginationStability"]
         self.assertEqual(
             ci_stability["properties"]["strategy"]["const"],
@@ -4417,8 +4423,14 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("signature_verified_head_oid", content)
             self.assertIn("head_sha", content)
             self.assertIn("double-scan", content)
+            self.assertIn("validate-report", content)
+            self.assertIn("page-digest", content)
+            self.assertIn("scan_role", content)
         self.assertIn("schema-v8 bytes", contracts)
         self.assertIn("canonical bundle digest", contracts)
+        self.assertIn("applies it before semantics", contracts)
+        self.assertIn("role-specific input includes `scan_role`", contracts)
+        self.assertNotIn("validate-semantics", skill + readiness + contracts)
         self.assertNotIn(
             "../../change-delivery-workflow/references/delivery-result.schema.json",
             readiness,

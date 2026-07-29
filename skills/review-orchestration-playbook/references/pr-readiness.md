@@ -70,8 +70,21 @@ The receiving sequence is closed:
    end cursors, per-page item counts, and `pageInfo.hasNextPage`. Each page
    repeats its `primary` or `verification` scan role, returned provider head,
    report snapshot binding, observation ID, and server total, then records the
-   canonical SHA-256 of those fields and its exact ordered flat-list slice
-   using the schema's domain-separated canonical JSON contract. The
+   canonical SHA-256 of those fields and its exact ordered flat-list slice.
+   Generate it only with the co-release
+   `read_only_pr_report.py page-digest <ci-status|review-threads> -`
+   entrypoint through Python `-I -B -S`. Its complete
+   `sha256-domain-json-v1` input is the ASCII domain
+   `joey-tools:pr-readiness-page:v1`, one NUL byte, the exact ASCII kind, one
+   NUL byte, then UTF-8 JSON for an object containing exactly `connection`,
+   `scan_role`, `observed_head_oid`, `snapshot_binding`, `snapshot_id`,
+   `server_total_count`, `page_index`, `request_after`, `item_count`,
+   `page_info`, and `items`, serialized with recursively sorted keys, no
+   insignificant whitespace, literal non-ASCII characters, and finite JSON
+   numbers only. `scan_role` is included, so otherwise identical primary and
+   verification pages intentionally have different digests. Stability compares
+   their role-neutral page projections and complete ordered lists after each
+   role-specific digest has independently validated. The
    verification scan retains its own complete ordered items so the receiver
    recomputes every page digest instead of trusting a second self-reported
    summary.
@@ -147,10 +160,16 @@ The receiving sequence is closed:
    `unavailable_evidence` and have exactly one blocker whose `evidence` field
    names that kind. An `observed` kind must appear in neither summary. Every
    action field remains `false`.
-8. After closed-schema validation, run the installed
-   same-release `read_only_pr_report.py validate-semantics -` validator over
-   the exact in-memory JSON through stdin with Python `-I -B -S`. It must
-   accept before emission. This second gate binds all instance IDs by equality
+8. Run the installed same-release
+   `read_only_pr_report.py validate-report -` receiver once over the exact
+   in-memory JSON through stdin with Python `-I -B`. The receiver derives and
+   descriptor-safely loads its co-release schema-v8 path, requires its exact
+   Draft 2020-12 identity/version and local-only `$ref` closure, checks the
+   schema itself, applies that closed schema first, and only then applies
+   runtime semantics. A missing, replaced, unreadable, cross-release, malformed,
+   unsupported, or dependency-unloadable schema fails closed; there is no
+   executable semantic-only report entrypoint. It must accept before emission.
+   The semantic phase binds all instance IDs by equality
    and rejects contradictions that JSON Schema cannot express, including
    delivery `head_sha` versus both its verified-signature OID and target head,
    target-identity mismatch, stable provider/object identity collisions,

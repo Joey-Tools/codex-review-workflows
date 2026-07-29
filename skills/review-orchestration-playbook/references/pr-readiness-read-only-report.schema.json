@@ -2794,7 +2794,8 @@
         },
         "content_sha256": {
           "type": "string",
-          "pattern": "^[0-9a-f]{64}$"
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256 from the co-release page-digest entrypoint over the v1 domain prefix, kind, NUL separator, and canonical JSON payload. The payload includes scan_role, so primary and verification digests intentionally differ."
         }
       },
       "additionalProperties": false
@@ -3071,7 +3072,8 @@
         },
         "content_sha256": {
           "type": "string",
-          "pattern": "^[0-9a-f]{64}$"
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256 from the co-release page-digest entrypoint over the v1 domain prefix, kind, NUL separator, and canonical JSON payload. The payload includes scan_role, so primary and verification digests intentionally differ."
         },
         "page_info": {
           "type": "object",

@@ -47,8 +47,13 @@ new_read_only_report_bindings = READ_ONLY_PR_REPORT_RUNTIME_API["new_bindings"]
 validate_read_only_report_semantics = READ_ONLY_PR_REPORT_RUNTIME_API[
     "validate_semantics"
 ]
+validate_read_only_report = READ_ONLY_PR_REPORT_RUNTIME_API["validate_report"]
 validate_delivery_handoff_semantics = READ_ONLY_PR_REPORT_RUNTIME_API[
     "validate_delivery_handoff"
+]
+canonical_page_digest = READ_ONLY_PR_REPORT_RUNTIME_API["canonical_page_digest"]
+canonical_page_digest_bytes = READ_ONLY_PR_REPORT_RUNTIME_API[
+    "canonical_page_digest_bytes"
 ]
 READ_ONLY_DELIVERY_SUCCESS_MATRIX = READ_ONLY_PR_REPORT_RUNTIME_API[
     "READ_ONLY_DELIVERY_SUCCESS_MATRIX"
@@ -194,7 +199,6 @@ READ_ONLY_ACTION_FIELDS = {
 }
 FIXTURE_HEAD_OID = "dddddddddddddddddddddddddddddddddddddddd"
 ALTERNATE_HEAD_OID = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-PAGE_DIGEST_DOMAIN = b"joey-tools:pr-readiness-page:v1\x00"
 
 
 def success_evidence(
@@ -473,22 +477,6 @@ def status_context_rollup(
     }
 
 
-def canonical_page_digest(kind: str, payload: object) -> str:
-    canonical = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
-    digest = hashlib.sha256()
-    digest.update(PAGE_DIGEST_DOMAIN)
-    digest.update(kind.encode("ascii"))
-    digest.update(b"\x00")
-    digest.update(canonical)
-    return digest.hexdigest()
-
-
 def bind_ci_pagination(
     report: dict[str, object],
     observed: dict[str, object],
@@ -547,6 +535,7 @@ def bind_ci_pagination(
                 "ci-status",
                 {
                     "connection": connection,
+                    "scan_role": scan_role,
                     "observed_head_oid": head["oid"],
                     "snapshot_binding": snapshot_binding,
                     "snapshot_id": snapshot_id,
@@ -661,6 +650,7 @@ def bind_review_thread_pagination(
                 "review-threads",
                 {
                     "connection": connection,
+                    "scan_role": scan_role,
                     "observed_head_oid": head["oid"],
                     "snapshot_binding": snapshot_binding,
                     "snapshot_id": snapshot_id,
@@ -1346,7 +1336,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
             "never a named-review artifact",
             "pre-target-blocked",
             "target-resolution-blocked",
-            "validate-semantics",
+            "validate-report",
         ):
             self.assertIn(anchor, self.normalized_pr_readiness)
 
@@ -1606,6 +1596,93 @@ class DeliveryProfileContractTest(unittest.TestCase):
             )
         self.assertIs(schema["properties"]["merge_ready"]["const"], False)
         self.assertEqual(schema["properties"]["next_handoff"]["const"], "none")
+
+    def test_read_only_pr_receiver_runs_closed_schema_before_semantics(
+        self,
+    ) -> None:
+        valid = copy.deepcopy(
+            next(
+                case["expected"]["terminal_result"]
+                for case in fixture_cases(
+                    READ_ONLY_PR_PROBE_CASES,
+                    "read-only-pr-probe",
+                )
+                if case["name"] == "selected-pr-base-head-blocked"
+            )
+        )
+        for name, mutate in (
+            (
+                "schema-version",
+                lambda report: report.__setitem__("schema_version", 999),
+            ),
+            (
+                "terminal",
+                lambda report: report.__setitem__("terminal", "forged-terminal"),
+            ),
+            (
+                "local-lanes-started",
+                lambda report: report["actions"].__setitem__(
+                    "local_lanes_started", True
+                ),
+            ),
+            (
+                "merge-ready",
+                lambda report: report.__setitem__("merge_ready", True),
+            ),
+            (
+                "next-handoff",
+                lambda report: report.__setitem__(
+                    "next_handoff", "pr-readiness-handoff"
+                ),
+            ),
+        ):
+            candidate = copy.deepcopy(valid)
+            mutate(candidate)
+            semantic_gate = mock.Mock()
+            with (
+                self.subTest(forgery=name),
+                mock.patch.dict(
+                    READ_ONLY_PR_REPORT_GLOBALS,
+                    {
+                        "_read_payload": mock.Mock(return_value=candidate),
+                        "validate_semantics": semantic_gate,
+                    },
+                ),
+            ):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    return_code = read_only_report_main(["validate-report", "ignored"])
+                self.assertEqual(return_code, 2)
+                self.assertEqual(
+                    json.loads(stdout.getvalue())["classification"],
+                    "rejected",
+                )
+                semantic_gate.assert_not_called()
+
+        with mock.patch.dict(
+            READ_ONLY_PR_REPORT_GLOBALS,
+            {
+                "_read_payload": mock.Mock(return_value=valid),
+                "REPORT_SCHEMA_PATH": "/definitely/missing/co-release-schema.json",
+                "validate_semantics": mock.Mock(),
+            },
+        ):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                return_code = read_only_report_main(["validate-report", "ignored"])
+        self.assertEqual(return_code, 2)
+        rejection = json.loads(stdout.getvalue())
+        self.assertEqual(rejection["classification"], "rejected")
+        self.assertIn("co-release report schema", rejection["error"])
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(
+                read_only_report_main(["validate-semantics", "ignored"]),
+                64,
+            )
+        self.assertIn("validate-report", stderr.getvalue())
+        self.assertNotIn("validate-semantics", stderr.getvalue())
 
     def test_read_only_pr_report_schema_rejects_inconsistent_summaries(
         self,
@@ -1917,6 +1994,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 "ci-status",
                 {
                     "connection": connection,
+                    "scan_role": first_page["scan_role"],
                     "observed_head_oid": first_page["observed_head_oid"],
                     "snapshot_binding": first_page["snapshot_binding"],
                     "snapshot_id": first_page["snapshot_id"],
@@ -1947,6 +2025,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 "ci-status",
                 {
                     "connection": connection,
+                    "scan_role": second_page["scan_role"],
                     "observed_head_oid": second_page["observed_head_oid"],
                     "snapshot_binding": second_page["snapshot_binding"],
                     "snapshot_id": second_page["snapshot_id"],
@@ -2040,6 +2119,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 "ci-status",
                 {
                     "connection": observed["pagination"]["connection"],
+                    "scan_role": page["scan_role"],
                     "observed_head_oid": page["observed_head_oid"],
                     "snapshot_binding": page["snapshot_binding"],
                     "snapshot_id": page["snapshot_id"],
@@ -2178,6 +2258,82 @@ class DeliveryProfileContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "globally unique"):
             validate_read_only_report_semantics(duplicate)
 
+    def test_page_digest_entrypoint_publishes_canonical_role_bound_bytes(
+        self,
+    ) -> None:
+        payload = {
+            "connection": {
+                "provider": "github-graphql",
+                "field": "pullRequest.reviewThreads",
+                "repository_node_id": "REPO",
+                "pull_request_node_id": "PR",
+                "head_oid": "a" * 40,
+            },
+            "scan_role": "primary",
+            "observed_head_oid": "a" * 40,
+            "snapshot_binding": f"snapshot:{'b' * 32}",
+            "snapshot_id": f"observation:{'c' * 32}",
+            "server_total_count": 1,
+            "page_index": 1,
+            "request_after": None,
+            "item_count": 1,
+            "page_info": {
+                "end_cursor": "CURSOR",
+                "has_next_page": False,
+            },
+            "items": [{"node_id": "THREAD", "is_resolved": False}],
+        }
+        expected_json = (
+            b'{"connection":{"field":"pullRequest.reviewThreads",'
+            b'"head_oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+            b'"provider":"github-graphql","pull_request_node_id":"PR",'
+            b'"repository_node_id":"REPO"},"item_count":1,'
+            b'"items":[{"is_resolved":false,"node_id":"THREAD"}],'
+            b'"observed_head_oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+            b'"page_index":1,"page_info":{"end_cursor":"CURSOR",'
+            b'"has_next_page":false},"request_after":null,"scan_role":"primary",'
+            b'"server_total_count":1,'
+            b'"snapshot_binding":"snapshot:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",'
+            b'"snapshot_id":"observation:cccccccccccccccccccccccccccccccc"}'
+        )
+        expected_bytes = (
+            b"joey-tools:pr-readiness-page:v1\x00review-threads\x00" + expected_json
+        )
+        self.assertEqual(
+            canonical_page_digest_bytes("review-threads", payload),
+            expected_bytes,
+        )
+        expected_digest = hashlib.sha256(expected_bytes).hexdigest()
+        self.assertEqual(
+            canonical_page_digest("review-threads", payload),
+            expected_digest,
+        )
+
+        verification_payload = copy.deepcopy(payload)
+        verification_payload["scan_role"] = "verification"
+        self.assertNotEqual(
+            canonical_page_digest("review-threads", verification_payload),
+            expected_digest,
+        )
+
+        with mock.patch.dict(
+            READ_ONLY_PR_REPORT_GLOBALS,
+            {"_read_payload": mock.Mock(return_value=payload)},
+        ):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                return_code = read_only_report_main(
+                    ["page-digest", "review-threads", "ignored"]
+                )
+        self.assertEqual(return_code, 0)
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {
+                "algorithm": "sha256-domain-json-v1",
+                "content_sha256": expected_digest,
+            },
+        )
+
     def test_paginated_provider_evidence_requires_a_stable_double_scan(
         self,
     ) -> None:
@@ -2224,6 +2380,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 digest_kind,
                 {
                     "connection": pagination["connection"],
+                    "scan_role": page["scan_role"],
                     "observed_head_oid": page["observed_head_oid"],
                     "snapshot_binding": page["snapshot_binding"],
                     "snapshot_id": page["snapshot_id"],
@@ -3270,7 +3427,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                     stdout = io.StringIO()
                     with contextlib.redirect_stdout(stdout):
                         return_code = read_only_report_main(
-                            ["validate-semantics", "ignored"]
+                            ["validate-report", "ignored"]
                         )
                 self.assertEqual(return_code, 2)
                 result = json.loads(stdout.getvalue())
@@ -3293,7 +3450,84 @@ class DeliveryProfileContractTest(unittest.TestCase):
                     {"_read_payload": mock.Mock(side_effect=interrupt)},
                 ):
                     with self.assertRaises(type(interrupt)):
-                        read_only_report_main(["validate-semantics", "ignored"])
+                        read_only_report_main(["validate-report", "ignored"])
+
+    def test_read_only_pr_report_accepts_declared_ci_item_boundary(
+        self,
+    ) -> None:
+        base = copy.deepcopy(
+            next(
+                case["expected"]["terminal_result"]
+                for case in fixture_cases(
+                    READ_ONLY_PR_PROBE_CASES,
+                    "read-only-pr-probe",
+                )
+                if case["name"] == "selected-pr-base-head-blocked"
+            )
+        )
+
+        def report_with_ci_items(count: int) -> dict[str, object]:
+            report = copy.deepcopy(base)
+            observed = report["evidence"]["ci_status"]["observed"][0]
+            rollup = [
+                status_context_rollup(
+                    node_id=f"STATUS_CONTEXT_{index}",
+                    context=f"required/check-{index}",
+                    state="SUCCESS",
+                )
+                for index in range(count)
+            ]
+            observed.update(
+                {
+                    "state": "success",
+                    "total": count,
+                    "successful": count,
+                    "failed": 0,
+                    "pending": 0,
+                    "cancelled": 0,
+                    "status_check_rollup": rollup,
+                }
+            )
+            bind_ci_pagination(report, observed)
+            return report
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            at_limit = report_with_ci_items(1_000)
+            at_limit_path = root / "ci-1000.json"
+            at_limit_raw = json.dumps(
+                at_limit,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            self.assertLessEqual(len(at_limit_raw), READ_ONLY_REPORT_MAX_BYTES)
+            at_limit_path.write_bytes(at_limit_raw)
+            parsed = read_only_report_payload(str(at_limit_path))
+            self.assertEqual(
+                len(
+                    parsed["evidence"]["ci_status"]["observed"][0][
+                        "status_check_rollup"
+                    ]
+                ),
+                1_000,
+            )
+            validate_read_only_report(parsed)
+
+            over_limit = report_with_ci_items(1_001)
+            over_limit_path = root / "ci-1001.json"
+            over_limit_raw = json.dumps(
+                over_limit,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            self.assertLessEqual(len(over_limit_raw), READ_ONLY_REPORT_MAX_BYTES)
+            over_limit_path.write_bytes(over_limit_raw)
+            parsed_over_limit = read_only_report_payload(str(over_limit_path))
+            with self.assertRaisesRegex(
+                ValueError,
+                "closed report schema rejected",
+            ):
+                validate_read_only_report(parsed_over_limit)
 
     def test_runtime_validator_rejects_splicing_and_cross_field_conflicts(
         self,

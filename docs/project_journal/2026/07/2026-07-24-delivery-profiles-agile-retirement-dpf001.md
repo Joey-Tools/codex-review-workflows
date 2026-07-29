@@ -56,8 +56,12 @@ superseded_by:
   Every selection, lifecycle, CI, and conversation observation repeats the
   applicable target identity exactly, including PR Node ID/base ref and current
   head, so cross-PR splicing, head races, and stale-green CI fail closed. The
-  standalone semantic validator equality-binds every evidence record to that
-  instance and requires the exact canonical URL derived from the structured
+  manifest-bound receiver descriptor-safely loads its same-release closed
+  Draft 2020-12 schema-v8, applies that schema before semantics, and
+  equality-binds every evidence record to that instance. Missing, malformed,
+  cross-release, or dependency-unloadable schema state fails closed, and no
+  executable semantic-only report gate remains. The receiver also requires the
+  exact canonical URL derived from the structured
   repository and PR number. It preserves GitHub `statusCheckRollup` as an exact
   provider-discriminated union: `CheckRun` binds its Node/database IDs, name,
   GitHub App Node/database IDs and slug plus complete raw status/conclusion
@@ -75,11 +79,15 @@ superseded_by:
   after the verification scan; every page also returns that exact head. Both
   scans bind the GraphQL connection and every page to the same repository Node
   ID, PR Node ID, and target head OID. Server `totalCount`, page counts,
-  ordered flat content, page boundaries, cursor chains, canonical
-  domain-separated page digests, and aggregate total must agree across both
-  scans. The verification scan retains its own complete ordered items, so the
-  semantic receiver recomputes its page digests rather than trusting a second
-  self-reported summary. Each connection acquisition has one monotonic
+  ordered flat content, page boundaries, cursor chains, and aggregate total
+  must agree across both scans. The co-release `page-digest` entrypoint is the
+  single producer/receiver implementation for canonical domain-separated page
+  digests. Its exact canonical JSON includes `scan_role`, so primary and
+  verification digests intentionally differ; each role-specific digest is
+  validated before role-neutral projections and complete ordered content are
+  compared. The verification scan retains its own complete ordered items, so
+  the receiver does not trust a second self-reported summary. Each connection
+  acquisition has one monotonic
   deadline of at most 60 seconds and exactly two head reads plus one call per
   page, capped at 22 provider calls. Each scan admits at most 1,000 entries
   across at most ten 100-item pages, subject to the tighter independent
@@ -97,10 +105,14 @@ superseded_by:
   The validator also rejects lifecycle, selector, CI-rollup,
   conversation-count, and endpoint contradictions that JSON Schema cannot
   express. The schema embeds its complete closed delivery-v3 receiver
-  definition and has no external `$ref`. The schema and semantic helper remain
+  definition and has no external `$ref`. The schema and receiver runtime remain
   direct records in the canonical control manifest, so the release digest
   binds the complete v8 receiving closure without loading an external or
-  candidate-head delivery schema. Its binding generator
+  candidate-head delivery schema. The 1 MiB retained-input ceiling now also
+  supplies the conservative JSON node ceiling: every counted node consumes at
+  least one retained JSON byte, so the declared 1,000-item CI profile and its
+  complete verification copy fit without weakening the existing byte bound.
+  Its binding generator
   retries collisions, while file input uses no-follow/nonblocking/close-on-exec
   descriptor admission, regular-file and byte ceilings, exact identity/size
   revalidation, and two identical complete reads. Strict UTF-8 JSON parsing
@@ -113,7 +125,7 @@ superseded_by:
   and handoff profile. A verified `signature_verified_head_oid` must
   byte-for-byte equal `head_sha` for both SHA-1 and SHA-256; the ordinary and
   read-only PR-readiness receivers enforce that equality through the
-  same-release semantic helper, and the read-only report additionally binds
+  same-release runtime, and the read-only report additionally binds
   the delivery head to its exact target head. A
   blocked PR-readiness run retains its requested profile but forces both
   handoff fields to `none`. A commit-allowed PR handoff requires a succeeded
@@ -354,3 +366,20 @@ superseded_by:
   (`148` tests), and the Python 3.13/3.14 review contracts pass (`99` tests
   each). Ruff check/format, Python compilation, `actionlint`, both modified
   skill validators, project-journal validation, and `git diff --check` pass.
+- The next fresh whole-range review on `37ffa04` found three receiver boundary
+  gaps. The executable `validate-report` path now loads and validates the
+  co-release closed schema before semantics and rejects forged root version,
+  terminal, action, merge-ready, and handoff fields; schema packaging/loading
+  failure is also fail-closed. The JSON node budget is conservatively derived
+  from the existing 1 MiB byte ceiling, with a real 1,000-record CI report
+  accepted and 1,001 records rejected by schema. The published `page-digest`
+  algorithm now binds `scan_role` in exact canonical bytes, gives primary and
+  verification pages distinct role-specific digests, and compares their
+  role-neutral projections only after both digests validate. Delivery
+  contracts pass under Python 3.13 (`52` tests), and the combined
+  delivery/review matrix passes under isolated Python 3.10 and 3.14 (`151`
+  tests each); Python 3.13 review contracts pass (`99` tests). The actual
+  `python -I -B ... validate-report -` entrypoint accepted a valid schema-v8
+  fixture. Ruff check/format, Python compilation, `actionlint`, both modified
+  skill validators, project-journal validation, JSON parsing, and
+  `git diff --check` pass.

@@ -50,9 +50,12 @@ retains that PR and current head, and omits only the unresolved base. Only
 
 Each observed evidence kind contains exactly one closed kind-specific record
 whose report, target, and snapshot bindings equal the enclosing instance;
-unavailable or blocked kinds contain none. Validate both the closed JSON
-Schema and the runtime cross-field semantics in
-[`read_only_pr_report.py`](scripts/read_only_pr_report.py), which rejects
+unavailable or blocked kinds contain none. Invoke the manifest-bound
+[`read_only_pr_report.py`](scripts/read_only_pr_report.py) `validate-report`
+receiver once: it descriptor-safely loads and checks the same-release closed
+Draft 2020-12 schema-v8, applies that schema first, and then runs cross-field
+semantics. Schema packaging/loading or validator-dependency failure is
+fail-closed, and no executable semantic-only report entrypoint exists. It rejects
 cross-report splicing and contradictory selection, lifecycle, CI,
 conversation, or endpoint evidence. The target binds provider, immutable
 repository and PR identities, base ref, current head repository/ref/OID, and
@@ -63,10 +66,15 @@ requires a no-cache, read-only stable double-scan for each CI and review-thread
 connection. Independently reread provider `headRefOid` before the primary scan
 and after the verification scan, return that head with every page, and bind
 each page to its exact connection, report snapshot binding and observation ID,
-server total, ordered flat-list slice, and canonical domain-separated SHA-256
-digest. The verification scan repeats the complete ordered content and must
-match the primary scan's total, page boundaries, cursors, and content digests
-under the same repository, PR, and head. Conversation evidence
+scan role, server total, page boundary, and ordered flat-list slice. Generate
+page digests only through the same-release
+`page-digest` entrypoint; `scan_role` is part of the canonical bytes, so the
+two roles intentionally have different digests while their role-neutral
+projections and complete ordered lists must match.
+The verification scan repeats the complete ordered content, and each
+role-specific digest must validate before its total, page boundaries, cursors,
+role-neutral projection, and ordered list can match under the same repository,
+PR, and head. Conversation evidence
 contains the complete paginated review-thread list with immutable Node IDs and
 raw `is_resolved` values; totals and unresolved counts are recomputed from that
 list. Any content, order, cursor, target, or mid-pagination total drift makes
