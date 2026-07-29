@@ -47,12 +47,10 @@ def _add_source_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--retention-root",
         type=_absolute,
-        default=default_retention_root(),
     )
     parser.add_argument(
         "--checkout-parent",
         type=_absolute,
-        default=default_checkout_parent(),
     )
     parser.add_argument("--git", dest="git_executable", default="/usr/bin/git")
     parser.add_argument("--codex", dest="codex_executable")
@@ -84,7 +82,6 @@ def _public_parser() -> argparse.ArgumentParser:
     status_parser.add_argument(
         "--retention-root",
         type=_absolute,
-        default=default_retention_root(),
     )
     status_parser.add_argument("--attempt-dir", type=_absolute)
 
@@ -95,7 +92,6 @@ def _public_parser() -> argparse.ArgumentParser:
     final_parser.add_argument(
         "--retention-root",
         type=_absolute,
-        default=default_retention_root(),
     )
     final_parser.add_argument("--attempt-dir", required=True, type=_absolute)
 
@@ -106,7 +102,6 @@ def _public_parser() -> argparse.ArgumentParser:
     recover_parser.add_argument(
         "--retention-root",
         type=_absolute,
-        default=default_retention_root(),
     )
     recover_parser.add_argument("--attempt-dir", required=True, type=_absolute)
 
@@ -117,7 +112,6 @@ def _public_parser() -> argparse.ArgumentParser:
     release_parser.add_argument(
         "--retention-root",
         type=_absolute,
-        default=default_retention_root(),
     )
     release_parser.add_argument("--attempt-dir", required=True, type=_absolute)
     release_parser.add_argument(
@@ -133,10 +127,16 @@ def _public_parser() -> argparse.ArgumentParser:
     cleanup_parser.add_argument(
         "--retention-root",
         type=_absolute,
-        default=default_retention_root(),
     )
     cleanup_parser.add_argument("--attempt-dir", required=True, type=_absolute)
     return parser
+
+
+def _resolve_public_default_roots(arguments: argparse.Namespace) -> None:
+    if arguments.retention_root is None:
+        arguments.retention_root = default_retention_root()
+    if hasattr(arguments, "checkout_parent") and arguments.checkout_parent is None:
+        arguments.checkout_parent = default_checkout_parent()
 
 
 def _internal_parser(mode: str) -> argparse.ArgumentParser:
@@ -322,8 +322,9 @@ def main(
         return _run_internal(values[0], values[1:])
     parser = _public_parser()
     arguments = parser.parse_args(values)
-    executable = (entrypoint or pathlib.Path(sys.argv[0])).resolve(strict=True)
     try:
+        _resolve_public_default_roots(arguments)
+        executable = (entrypoint or pathlib.Path(sys.argv[0])).resolve(strict=True)
         if arguments.command == "preflight":
             result = preflight(
                 helper_state=arguments.helper_state,

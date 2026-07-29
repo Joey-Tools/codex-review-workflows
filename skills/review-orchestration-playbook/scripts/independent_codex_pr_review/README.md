@@ -65,7 +65,9 @@ $HELPER stateful final --state-dir "$HELPER_STATE"
 The CLI resolves the same default state root from the current POSIX account
 database, not from `$HOME`, so installed release trees remain immutable and
 retained evidence survives release replacement. Explicit `--retention-root` and
-`--checkout-parent` values remain available for task-scoped isolated runs.
+`--checkout-parent` values remain available for task-scoped isolated runs and
+bypass the account lookup. Default lookup is lazy and any failure is returned
+through the CLI's single-line JSON failure contract.
 
 仅在 helper 已 terminal 后运行独立 preflight。它验证 exact repo/base/head、helper
 runner completion、primary-diff 双重 attestation、control directory 完整性、source

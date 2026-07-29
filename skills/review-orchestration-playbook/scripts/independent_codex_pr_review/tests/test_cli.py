@@ -9,7 +9,9 @@ import pwd
 import subprocess
 import sys
 import unittest
+from unittest import mock
 
+from review_supervisor import cli as cli_module
 from review_supervisor.cli import _emit
 from review_supervisor.constants import (
     LOW_LEVEL_HELPER_REVIEW_CONTRACT,
@@ -291,6 +293,78 @@ class CliLifecycleTests(unittest.TestCase):
         ):
             with self.subTest(path=path):
                 self.assertFalse(path.resolve().is_relative_to(TOOL_ROOT.resolve()))
+
+    def test_default_account_lookup_failure_uses_json_failure_contract(self) -> None:
+        output = io.StringIO()
+        with (
+            mock.patch(
+                "review_supervisor.constants.pwd.getpwuid",
+                side_effect=KeyError("account unavailable"),
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            code = cli_module.main(("status",), entrypoint=ENTRYPOINT)
+
+        self.assertEqual(code, 2)
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        payload = json.loads(lines[0])
+        _assert_low_level_contract(self, payload)
+        self.assertEqual(payload["failure_stage"], "cli")
+        self.assertEqual(payload["failure_code"], "cli-failed")
+        self.assertIn("current POSIX account home is unavailable", payload["message"])
+
+    def test_explicit_roots_skip_default_account_lookup(self) -> None:
+        with owned_temporary_directory("cli-explicit-roots-") as root:
+            retention = root / "retention"
+            checkout = root / "checkouts"
+            helper_state = root / "helper"
+            repo = root / "repo"
+            output = io.StringIO()
+            with (
+                mock.patch.object(
+                    cli_module,
+                    "default_retention_root",
+                    side_effect=AssertionError("retention default must stay lazy"),
+                ),
+                mock.patch.object(
+                    cli_module,
+                    "default_checkout_parent",
+                    side_effect=AssertionError("checkout default must stay lazy"),
+                ),
+                mock.patch.object(
+                    cli_module,
+                    "preflight",
+                    return_value={"status": "admitted"},
+                ) as preflight_mock,
+                contextlib.redirect_stdout(output),
+            ):
+                code = cli_module.main(
+                    (
+                        "preflight",
+                        "--helper-state",
+                        str(helper_state),
+                        "--repo",
+                        str(repo),
+                        "--base",
+                        "a" * 40,
+                        "--head",
+                        "b" * 40,
+                        "--pr-url",
+                        "https://github.com/owner/repo/pull/1",
+                        "--retention-root",
+                        str(retention),
+                        "--checkout-parent",
+                        str(checkout),
+                    ),
+                    entrypoint=ENTRYPOINT,
+                )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        preflight_mock.assert_called_once()
+        self.assertEqual(preflight_mock.call_args.kwargs["retention_root"], retention)
+        self.assertEqual(preflight_mock.call_args.kwargs["checkout_parent"], checkout)
 
     def test_emit_overrides_conflicting_contract_metadata(self) -> None:
         output = io.StringIO()
