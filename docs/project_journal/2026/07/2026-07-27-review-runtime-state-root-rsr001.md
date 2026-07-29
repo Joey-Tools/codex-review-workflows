@@ -23,9 +23,11 @@ superseded_by:
 - Default state resolves from the current POSIX account database to
   `~/.codex/review-runtime/independent-codex-pr-review/`, without trusting
   ambient `$HOME`.
-- Default account lookup is lazy, remains inside the CLI failure boundary, and
-  is skipped for non-default task-scoped roots. Supplying the exact
-  account-local default explicitly still runs the migration gate.
+- Every explicit retention root resolves and proves stable equivalence against
+  the account-local default inside the CLI failure boundary. Proven distinct
+  roots skip the migration gate, equivalent aliases use it, and unavailable
+  proof fails closed. Explicit checkout-parent lookup remains independent and
+  lazy.
 - Installed overlays fail closed when any sibling release still has a
   release-local retained attempt. Operators must explicitly select that old
   retention root and drain it before using the account-local default.
@@ -36,10 +38,13 @@ superseded_by:
   skipped only in the sibling pass to avoid duplicate locking.
 - Releases that use account-local retention carry a source-controlled
   `ACCOUNT_LOCAL_RETENTION_V1` capability marker. The scanner validates its
-  exact bytes, owner, mode, link count, ACL/xattr policy, and stable read.
-  An unmarked installed helper without an existing legacy lock is blocked
-  before the public command can run, rather than treating one absent-path
-  observation as proof that an old version cannot start later.
+  exact bytes, owner, mode, link count, ACL/xattr policy, and object identity,
+  then rereads the held descriptor in full and requires identical bytes.
+  Same-inode same-size writes are rejected even when the path is restored;
+  benign timestamp drift is ignored. An unmarked installed helper without an
+  existing legacy lock is blocked before the public command can run, rather
+  than treating one absent-path observation as proof that an old version
+  cannot start later.
 - The legacy scan walks from an ACL/xattr-validated releases-root descriptor
   through `O_NOFOLLOW` child descriptors. It binds object identity and access
   policy with device, inode, type, owner, and mode while deliberately ignoring
@@ -79,14 +84,14 @@ superseded_by:
   attempts in older installed releases and that the README still documented the
   obsolete release-local default. The explicit drain gate, cross-version
   regression, and corrected README close both findings.
-- The final deterministic independent-supervisor gate passed 577/577 in
-  205.656 seconds with the reviewed 586-test discovery identity and SHA-256
-  `9df7a064b0cf5122ad7cc4612a82b8026979b36fd084694adbf4a787e81285ac`.
-- The final platform suite ran 2,819 tests with 6 skips in 1,055.703 seconds.
+- The final deterministic independent-supervisor gate passed 582/582 in
+  176.726 seconds with the reviewed 591-test discovery identity and SHA-256
+  `bf7a3f7476d7e08d51f2b20354bb074034ec92f5a97c6e81cf43e98abb1c4967`.
+- The final platform suite ran 2,819 tests with 6 skips in 1,041.337 seconds.
   Its only failure was the known parent-sandbox denial of nested
   `sandbox-exec`; that exact broker test passed 1/1 outside the parent sandbox
-  in 2.385 seconds.
-- The complete 99-test contract module passed in 7.696 seconds.
+  in 2.363 seconds.
+- The complete 99-test contract module passed in 6.930 seconds.
 - Focused installed-symlink immutability, default state-root, CI snapshot, and
   no-bytecode entrypoint regressions passed. The new cross-version tests also
   prove explicit old-root visibility and fail-closed release replacement.
@@ -115,8 +120,15 @@ superseded_by:
   snapshots could interpret a concurrent target creation or replacement as a
   stable custom retention root. Held descriptor revalidation and deterministic
   creation/replacement race tests close that bypass.
-- The focused post-fix CLI and secure-I/O modules passed 56/56 tests on Python
-  3.13.
+- The next trusted-release Fresh Codex review found that a same-inode,
+  same-length capability-marker rewrite could retain stale first-read bytes,
+  and that a lexical suffix prefilter could skip equivalence for filesystem
+  aliases. The marker is now reread from the held descriptor after complete
+  path/access-policy revalidation, with primary and cleanup errors separated.
+  Every explicit retention root now performs stable equivalence; unavailable
+  proof fails closed and only a proven distinct root skips migration.
+- The focused post-fix CLI and secure-I/O modules passed 61/61 tests in 19.690
+  seconds on Python 3.13.
 - Ruff lint/format, actionlint for canonical and private CI profiles,
   source-only syntax checks, project-journal validation, `git diff --check`,
   and the zero-bytecode inventory passed.

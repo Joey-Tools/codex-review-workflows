@@ -6,6 +6,7 @@ import os
 import pathlib
 import re
 import stat
+import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
 
@@ -161,6 +162,19 @@ class _LegacyRetentionProbe:
     uses_account_local_retention: bool
 
 
+def _close_inspection_fd(fd: int, *, label: str) -> None:
+    primary_error = sys.exception()
+    try:
+        os.close(fd)
+    except OSError as cleanup_error:
+        if primary_error is None:
+            raise
+        primary_error.add_note(
+            f"{label} descriptor cleanup failed: "
+            f"{type(cleanup_error).__name__}: {cleanup_error}"
+        )
+
+
 def _release_uses_account_local_retention(
     tool_fd: int,
     tool_path: pathlib.Path,
@@ -215,13 +229,28 @@ def _release_uses_account_local_retention(
                 raise RuntimeError(
                     "installed retention policy marker changed while being inspected"
                 )
+            final_content = read_fd_exact(
+                marker_fd,
+                max_bytes=len(_ACCOUNT_LOCAL_RETENTION_MARKER_CONTENT),
+                expected_size=strict_identity.size,
+            )
+            if content != _ACCOUNT_LOCAL_RETENTION_MARKER_CONTENT:
+                raise RuntimeError("installed retention policy marker is invalid")
+            if final_content != content:
+                raise RuntimeError(
+                    "installed retention policy marker changed while being inspected"
+                )
         finally:
-            os.close(probe_fd)
-        if content != _ACCOUNT_LOCAL_RETENTION_MARKER_CONTENT:
-            raise RuntimeError("installed retention policy marker is invalid")
+            _close_inspection_fd(
+                probe_fd,
+                label="installed retention policy marker path",
+            )
         return True
     finally:
-        os.close(marker_fd)
+        _close_inspection_fd(
+            marker_fd,
+            label="installed retention policy marker",
+        )
 
 
 def _open_legacy_retention_root(

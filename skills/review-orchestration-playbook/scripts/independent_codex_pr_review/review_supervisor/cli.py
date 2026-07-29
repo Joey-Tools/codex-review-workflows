@@ -139,28 +139,10 @@ def _public_parser() -> argparse.ArgumentParser:
     return parser
 
 
-_ACCOUNT_LOCAL_RETENTION_SUFFIX = (
-    ".codex",
-    "review-runtime",
-    "independent-codex-pr-review",
-    "retention",
-)
-
-
 def _uses_account_local_retention_root(arguments: argparse.Namespace) -> bool:
     if arguments.retention_root is None:
         arguments.retention_root = default_retention_root()
         return True
-    requested_suffix = tuple(
-        part.casefold()
-        for part in arguments.retention_root.parts[
-            -len(_ACCOUNT_LOCAL_RETENTION_SUFFIX) :
-        ]
-    )
-    if requested_suffix != tuple(
-        part.casefold() for part in _ACCOUNT_LOCAL_RETENTION_SUFFIX
-    ):
-        return False
     return directory_paths_equivalent(
         arguments.retention_root,
         default_retention_root(),

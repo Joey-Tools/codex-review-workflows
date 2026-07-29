@@ -64,15 +64,17 @@ The CLI resolves the same default state root from the current POSIX account
 database, not from `$HOME`, so installed release trees remain immutable and
 retained evidence survives release replacement. Non-default explicit
 `--retention-root` and `--checkout-parent` values remain available for
-task-scoped isolated runs. An explicitly supplied path that resolves through
-the secure descriptor walk to the account-local default still uses the default
-migration gate; existing prefixes are compared by object identity and missing
-suffixes use a conservative case-insensitive policy. The comparison retains
-the existing-prefix descriptors and reopens both paths before returning, so
-object or access-policy replacement and missing-suffix creation observed
-between the initial snapshots and final revalidation fail closed instead of
-selecting custom-root behavior. Default lookup is lazy and any failure is
-returned through the CLI's single-line JSON failure contract.
+task-scoped isolated runs. Every explicitly supplied retention root is compared
+with the account-local default through the secure descriptor walk before the
+tool can select custom-root behavior. Existing prefixes are compared by object
+identity and missing suffixes use a conservative case-insensitive policy. The
+comparison retains the existing-prefix descriptors and reopens both paths
+before returning, so object or access-policy replacement and missing-suffix
+creation observed between the initial snapshots and final revalidation fail
+closed. A proven distinct retention root skips the default migration gate; an
+equivalent alias uses it, and an unavailable proof fails through the CLI's
+single-line JSON failure contract. Explicit checkout-parent lookup remains
+independent and lazy.
 
 从使用 release-local `runtime/retention` 的旧版本升级时，新版本始终先扫描当前
 helper 根下的旧 retention root，因此 self-contained 或非标准安装布局不会绕过迁移
@@ -85,9 +87,11 @@ helper 根下的旧 retention root，因此 self-contained 或非标准安装布
 旧 release。扫描不会搬动活动 attempt，也不会把旧 attempt 并入新的 account-local
 root。
 采用 account-local retention 的 release 必须携带经过内容、身份与访问策略校验的
-`ACCOUNT_LOCAL_RETENTION_V1` 标记。若仍包含 helper 的未标记旧 release 没有可获取的
-legacy retention lock，新命令会在执行公共命令前失败关闭；需要先停用或移除该旧
-release，不能用一次“路径暂时不存在”的探测推断它之后不会启动。
+`ACCOUNT_LOCAL_RETENTION_V1` 标记。扫描先精确读取标记，再完成 held descriptor、
+reopened path、ACL/xattr 和对象身份复验，随后从原 descriptor 第二次完整读取；两次
+bytes 必须完全一致。时间戳变化不构成内容变化。若仍包含 helper 的未标记旧 release
+没有可获取的 legacy retention lock，新命令会在执行公共命令前失败关闭；需要先停用
+或移除该旧 release，不能用一次“路径暂时不存在”的探测推断它之后不会启动。
 
 仅在 helper 已 terminal 后运行独立 preflight。它验证 exact repo/base/head、helper
 runner completion、primary-diff 双重 attestation、control directory 完整性、source

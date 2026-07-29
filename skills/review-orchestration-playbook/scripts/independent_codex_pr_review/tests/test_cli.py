@@ -143,6 +143,20 @@ def _write_account_local_marker(tool: pathlib.Path) -> pathlib.Path:
     return marker
 
 
+def _release_uses_account_local_retention(tool: pathlib.Path) -> bool:
+    tool_fd = os.open(
+        tool,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    try:
+        return legacy_retention_module._release_uses_account_local_retention(
+            tool_fd,
+            tool,
+        )
+    finally:
+        os.close(tool_fd)
+
+
 def _installed_upgrade_layout(
     root: pathlib.Path,
 ) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path, pathlib.Path]:
@@ -358,9 +372,12 @@ class CliLifecycleTests(unittest.TestCase):
         self.assertEqual(payload["failure_code"], "cli-failed")
         self.assertIn("current POSIX account home is unavailable", payload["message"])
 
-    def test_explicit_roots_skip_default_account_lookup(self) -> None:
+    def test_explicit_distinct_roots_skip_only_the_legacy_scan(self) -> None:
         with owned_temporary_directory("cli-explicit-roots-") as root:
             retention = root / "retention"
+            retention.mkdir(mode=0o700)
+            account_default = root / "account-default"
+            account_default.mkdir(mode=0o700)
             checkout = root / "checkouts"
             helper_state = root / "helper"
             repo = root / "repo"
@@ -369,8 +386,8 @@ class CliLifecycleTests(unittest.TestCase):
                 mock.patch.object(
                     cli_module,
                     "default_retention_root",
-                    side_effect=AssertionError("retention default must stay lazy"),
-                ),
+                    return_value=account_default,
+                ) as default_retention_mock,
                 mock.patch.object(
                     cli_module,
                     "default_checkout_parent",
@@ -411,6 +428,7 @@ class CliLifecycleTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(len(output.getvalue().splitlines()), 1)
+        default_retention_mock.assert_called_once()
         preflight_mock.assert_called_once()
         self.assertEqual(preflight_mock.call_args.kwargs["retention_root"], retention)
         self.assertEqual(preflight_mock.call_args.kwargs["checkout_parent"], checkout)
@@ -589,6 +607,7 @@ class CliLifecycleTests(unittest.TestCase):
                 / "independent-codex-pr-review"
                 / "retention"
             )
+            opaque_alias = root / "mounted-account-state"
             output = io.StringIO()
             with (
                 mock.patch.object(
@@ -615,7 +634,7 @@ class CliLifecycleTests(unittest.TestCase):
                     (
                         "status",
                         "--retention-root",
-                        str(account_default),
+                        str(opaque_alias),
                     ),
                     entrypoint=ENTRYPOINT,
                 )
@@ -628,6 +647,35 @@ class CliLifecycleTests(unittest.TestCase):
             )
             status_mock.assert_not_called()
             fence_mock.assert_not_called()
+
+    def test_nonmatching_lexical_alias_uses_equivalence_and_legacy_fence(
+        self,
+    ) -> None:
+        explicit_alias = pathlib.Path("/opaque/account-state")
+        account_default = pathlib.Path("/account/default-retention")
+        arguments = argparse.Namespace(retention_root=explicit_alias)
+        with (
+            mock.patch.object(
+                cli_module,
+                "default_retention_root",
+                return_value=account_default,
+            ),
+            mock.patch.object(
+                cli_module,
+                "directory_paths_equivalent",
+                return_value=True,
+            ) as equivalence_mock,
+            mock.patch.object(
+                cli_module,
+                "installed_legacy_retention_fence",
+                return_value=contextlib.nullcontext(()),
+            ) as fence_mock,
+            cli_module._resolve_public_default_roots(arguments),
+        ):
+            pass
+
+        equivalence_mock.assert_called_once_with(explicit_alias, account_default)
+        fence_mock.assert_called_once()
 
     def test_darwin_root_alias_still_identifies_explicit_account_default(
         self,
@@ -1063,6 +1111,213 @@ class CliLifecycleTests(unittest.TestCase):
                 "installed retention policy marker is invalid",
                 payload["message"],
             )
+
+    def test_policy_marker_rejects_same_inode_same_length_mutation(self) -> None:
+        with owned_temporary_directory("cli-policy-marker-mutate-") as root:
+            tool = root / "tool"
+            tool.mkdir(mode=0o700)
+            marker = _write_account_local_marker(tool)
+            original_identity = os.stat(marker)
+            original_read = legacy_retention_module.read_fd_exact
+            read_count = 0
+
+            def read_then_mutate(
+                fd: int,
+                *,
+                max_bytes: int,
+                expected_size: int | None = None,
+            ) -> bytes:
+                nonlocal read_count
+                content = original_read(
+                    fd,
+                    max_bytes=max_bytes,
+                    expected_size=expected_size,
+                )
+                read_count += 1
+                if read_count == 1:
+                    marker.write_bytes(b"account-local-retention-v2\n")
+                return content
+
+            with (
+                mock.patch.object(
+                    legacy_retention_module,
+                    "read_fd_exact",
+                    side_effect=read_then_mutate,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "marker changed while being inspected",
+                ),
+            ):
+                _release_uses_account_local_retention(tool)
+
+            changed_identity = os.stat(marker)
+            self.assertEqual(read_count, 2)
+            self.assertEqual(
+                (
+                    changed_identity.st_dev,
+                    changed_identity.st_ino,
+                    changed_identity.st_size,
+                ),
+                (
+                    original_identity.st_dev,
+                    original_identity.st_ino,
+                    original_identity.st_size,
+                ),
+            )
+
+    def test_policy_marker_rejects_mutation_restored_after_final_read(
+        self,
+    ) -> None:
+        with owned_temporary_directory("cli-policy-marker-restore-") as root:
+            tool = root / "tool"
+            tool.mkdir(mode=0o700)
+            marker = _write_account_local_marker(tool)
+            expected = marker.read_bytes()
+            original_read = legacy_retention_module.read_fd_exact
+            read_count = 0
+
+            def read_mutate_then_restore(
+                fd: int,
+                *,
+                max_bytes: int,
+                expected_size: int | None = None,
+            ) -> bytes:
+                nonlocal read_count
+                content = original_read(
+                    fd,
+                    max_bytes=max_bytes,
+                    expected_size=expected_size,
+                )
+                read_count += 1
+                if read_count == 1:
+                    marker.write_bytes(b"account-local-retention-v2\n")
+                elif read_count == 2:
+                    marker.write_bytes(expected)
+                return content
+
+            with (
+                mock.patch.object(
+                    legacy_retention_module,
+                    "read_fd_exact",
+                    side_effect=read_mutate_then_restore,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "marker changed while being inspected",
+                ),
+            ):
+                _release_uses_account_local_retention(tool)
+
+            self.assertEqual(read_count, 2)
+            self.assertEqual(marker.read_bytes(), expected)
+
+    def test_policy_marker_preserves_mutation_error_when_probe_close_fails(
+        self,
+    ) -> None:
+        with owned_temporary_directory("cli-policy-marker-cleanup-") as root:
+            tool = root / "tool"
+            tool.mkdir(mode=0o700)
+            marker = _write_account_local_marker(tool)
+            original_open = legacy_retention_module.open_regular_at
+            original_read = legacy_retention_module.read_fd_exact
+            original_close = os.close
+            marker_fds: list[int] = []
+            read_count = 0
+
+            def tracked_open(*args: object, **kwargs: object) -> tuple[int, object]:
+                result = original_open(*args, **kwargs)
+                marker_fds.append(result[0])
+                return result
+
+            def read_then_mutate(
+                fd: int,
+                *,
+                max_bytes: int,
+                expected_size: int | None = None,
+            ) -> bytes:
+                nonlocal read_count
+                content = original_read(
+                    fd,
+                    max_bytes=max_bytes,
+                    expected_size=expected_size,
+                )
+                read_count += 1
+                if read_count == 1:
+                    marker.write_bytes(b"account-local-retention-v2\n")
+                return content
+
+            def close_probe_with_error(fd: int) -> None:
+                original_close(fd)
+                if len(marker_fds) >= 2 and fd == marker_fds[1]:
+                    raise OSError(errno.EIO, "simulated probe close failure")
+
+            with (
+                mock.patch.object(
+                    legacy_retention_module,
+                    "open_regular_at",
+                    side_effect=tracked_open,
+                ),
+                mock.patch.object(
+                    legacy_retention_module,
+                    "read_fd_exact",
+                    side_effect=read_then_mutate,
+                ),
+                mock.patch.object(
+                    legacy_retention_module.os,
+                    "close",
+                    side_effect=close_probe_with_error,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "marker changed while being inspected",
+                ) as raised,
+            ):
+                _release_uses_account_local_retention(tool)
+
+            self.assertEqual(read_count, 2)
+            self.assertIn(
+                "marker path descriptor cleanup failed",
+                "\n".join(raised.exception.__notes__),
+            )
+
+    def test_policy_marker_allows_benign_timestamp_change(self) -> None:
+        with owned_temporary_directory("cli-policy-marker-metadata-") as root:
+            tool = root / "tool"
+            tool.mkdir(mode=0o700)
+            marker = _write_account_local_marker(tool)
+            original_read = legacy_retention_module.read_fd_exact
+            read_count = 0
+
+            def read_then_touch(
+                fd: int,
+                *,
+                max_bytes: int,
+                expected_size: int | None = None,
+            ) -> bytes:
+                nonlocal read_count
+                content = original_read(
+                    fd,
+                    max_bytes=max_bytes,
+                    expected_size=expected_size,
+                )
+                read_count += 1
+                if read_count == 1:
+                    metadata = os.stat(marker)
+                    os.utime(
+                        marker,
+                        ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000),
+                    )
+                return content
+
+            with mock.patch.object(
+                legacy_retention_module,
+                "read_fd_exact",
+                side_effect=read_then_touch,
+            ):
+                self.assertTrue(_release_uses_account_local_retention(tool))
+
+            self.assertEqual(read_count, 2)
 
     def test_legacy_migration_fence_revalidates_after_command_failure(self) -> None:
         with owned_temporary_directory("cli-legacy-failed-command-") as root:
