@@ -103,7 +103,7 @@ def copy_guard_bundle(root: Path) -> Path:
 def rotate_control_manifest(bundle: Path) -> str:
     manifest_path = bundle / "references" / "read-only-pr-report-control-manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    for artifact in manifest["artifacts"]:
+    for artifact in (*manifest["control_sources"], *manifest["artifacts"]):
         artifact["sha256"] = hashlib.sha256(
             (bundle / artifact["path"]).read_bytes()
         ).hexdigest()
@@ -130,6 +130,37 @@ def add_receiver_test_hook(bundle: Path) -> None:
         encoding="utf-8",
     )
     rotate_control_manifest(bundle)
+
+
+def add_pre_execution_replacement_hook(bundle: Path) -> None:
+    guard = bundle / "scripts" / "named_lane_guard"
+    source = guard.read_text(encoding="utf-8")
+    admission = "    records = _read_only_report_control_records(manifest_bytes)\n"
+    capture_end = "    schema_bytes = _validate_bound_companion(schema_path)\n"
+    if source.count(admission) != 1 or source.count(capture_end) != 1:
+        raise AssertionError("guard capture anchors are not unique")
+    source = source.replace(
+        admission,
+        admission
+        + """    _test_target = os.environ.get("CODEX_CONTROL_CAPTURE_TARGET")
+    _test_replacement = os.environ.get("CODEX_CONTROL_CAPTURE_REPLACEMENT")
+    _test_backup = os.environ.get("CODEX_CONTROL_CAPTURE_BACKUP")
+    if _test_target and _test_replacement and _test_backup:
+        os.replace(_test_target, _test_backup)
+        os.replace(_test_replacement, _test_target)
+""",
+        1,
+    )
+    source = source.replace(
+        capture_end,
+        capture_end
+        + """    if _test_target and _test_replacement and _test_backup:
+        os.replace(_test_target, _test_replacement)
+        os.replace(_test_backup, _test_target)
+""",
+        1,
+    )
+    guard.write_text(source, encoding="utf-8")
 
 
 def run_guard(
@@ -258,9 +289,9 @@ class ReadOnlyPrReportGuardTest(unittest.TestCase):
             )
             rotate_control_manifest(bundle)
             completed = run_guard(bundle, report)
-        self.assertEqual(completed.returncode, 2)
-        self.assertEqual(json.loads(completed.stdout)["classification"], "rejected")
-        self.assertIn(b"loader/version binding is invalid", completed.stdout)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertNotIn(b'"classification": "accepted"', completed.stdout)
+        self.assertIn(b"control manifest loader is invalid", completed.stderr)
         self.assertNotIn(b"Traceback", completed.stderr)
 
     def test_relaxed_schema_replacement_and_restore_cannot_accept_forgery(
@@ -344,6 +375,50 @@ class ReadOnlyPrReportGuardTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(json.loads(completed.stdout)["classification"], "accepted")
 
+    def test_manifest_to_execution_control_replacement_is_rejected(self) -> None:
+        report = valid_report()
+        for relative in (
+            "scripts/review_runtime/__init__.py",
+            "scripts/review_runtime/catalog_bootstrap.py",
+            "scripts/review_runtime/read_only_report_guard.py",
+        ):
+            with self.subTest(target=relative):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory).resolve()
+                    bundle = copy_guard_bundle(root)
+                    add_pre_execution_replacement_hook(bundle)
+                    target = bundle / relative
+                    original = target.read_bytes()
+                    marker = root / f"{target.name}.executed"
+                    malicious = (
+                        "from pathlib import Path\n"
+                        f"Path({str(marker)!r}).write_text('executed')\n"
+                    ).encode("utf-8")
+                    self.assertLess(len(malicious), len(original))
+                    replacement = target.with_name(f"malicious-{target.name}")
+                    backup = target.with_name(f"trusted-{target.name}.backup")
+                    replacement.write_bytes(
+                        malicious + b" " * (len(original) - len(malicious))
+                    )
+                    replacement.chmod(stat.S_IMODE(target.stat().st_mode))
+                    completed = run_guard(
+                        bundle,
+                        report,
+                        test_environment={
+                            "CODEX_CONTROL_CAPTURE_TARGET": str(target),
+                            "CODEX_CONTROL_CAPTURE_REPLACEMENT": str(replacement),
+                            "CODEX_CONTROL_CAPTURE_BACKUP": str(backup),
+                        },
+                    )
+                    self.assertEqual(target.read_bytes(), original)
+                    self.assertFalse(marker.exists())
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertNotIn(
+                    b'"classification": "accepted"',
+                    completed.stdout,
+                )
+                self.assertIn(b"digest does not match", completed.stderr)
+
     def test_terminal_content_and_access_drift_withhold_acceptance(self) -> None:
         report = valid_report()
         for mode, relative in (
@@ -409,6 +484,13 @@ class ReadOnlyPrReportGuardTest(unittest.TestCase):
         self.assertEqual(manifest["schema_version"], 1)
         self.assertEqual(manifest["profile"], PROFILE)
         self.assertEqual(
+            manifest["external_trust_root"],
+            {
+                "path": "scripts/named_lane_guard",
+                "authority": "prior-trusted-canonical-bundle",
+            },
+        )
+        self.assertEqual(
             manifest["loader"],
             {
                 "path": "scripts/named_lane_guard",
@@ -418,6 +500,23 @@ class ReadOnlyPrReportGuardTest(unittest.TestCase):
                 "runtime_version": 1,
                 "schema_evaluator": "closed-draft-2020-12-v1",
             },
+        )
+        self.assertEqual(
+            [
+                (source["path"], source["role"])
+                for source in manifest["control_sources"]
+            ],
+            [
+                ("scripts/review_runtime/__init__.py", "runtime-package"),
+                (
+                    "scripts/review_runtime/catalog_bootstrap.py",
+                    "binding-runtime",
+                ),
+                (
+                    "scripts/review_runtime/read_only_report_guard.py",
+                    "report-guard-runtime",
+                ),
+            ],
         )
         self.assertEqual(
             [
@@ -432,7 +531,7 @@ class ReadOnlyPrReportGuardTest(unittest.TestCase):
                 ("scripts/read_only_pr_report.py", "receiver"),
             ],
         )
-        for artifact in manifest["artifacts"]:
+        for artifact in (*manifest["control_sources"], *manifest["artifacts"]):
             self.assertEqual(
                 artifact["sha256"],
                 hashlib.sha256(

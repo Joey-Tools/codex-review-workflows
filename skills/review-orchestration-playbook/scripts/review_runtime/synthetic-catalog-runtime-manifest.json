@@ -2,6 +2,30 @@
   "schema_version": 1,
   "profile": "synthetic-catalog-authoring-v1",
   "runtime_version": 1,
+  "external_trust_root": {
+    "path": "scripts/named_lane_guard",
+    "authority": "prior-trusted-canonical-bundle"
+  },
+  "control_sources": [
+    {
+      "path": "scripts/review_runtime/__init__.py",
+      "role": "runtime-package",
+      "sha256": "ee5b564d67a63b53ba44532ea95416407700f66651699705be1cc5f9305a3ba0"
+    },
+    {
+      "path": "scripts/review_runtime/catalog_bootstrap.py",
+      "role": "binding-runtime",
+      "sha256": "71a22341899557fbccffb3ae0c0f17a2247eb2a02e0b73a3188ba5e593204194"
+    }
+  ],
+  "co_release_sources": [
+    {
+      "skill": "synthetic-token-fixtures",
+      "path": "scripts/active_catalog_binding.py",
+      "role": "catalog-resolver",
+      "sha256": "2956ae70bb1a507a0eab6c4bcda6c9e81f7c38a5629a91db53250a6f359c961a"
+    }
+  ],
   "entrypoint": {
     "path": "scripts/synthetic_catalog_entry",
     "sha256": "3b634a6343a4aacfdc1a6d5eb0ab0017223ac1c66bad4815827d63f576093a66"

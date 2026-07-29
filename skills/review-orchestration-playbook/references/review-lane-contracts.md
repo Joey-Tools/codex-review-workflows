@@ -12,9 +12,14 @@ The bundle identity is operational evidence, not a free-form label:
   separate canonical manifest records. Changing either stable-double-scan
   contract therefore changes the canonical bundle digest; a candidate cannot
   retain the previous trusted digest by updating only prose or fixtures.
-  A separate machine control manifest binds both exact SHA-256 values plus the
-  `named_lane_guard` profile, runtime path, profile/runtime version, required
-  `-I -B -S` flags, and stdlib-only schema-evaluator profile. The formal
+  A separate machine control manifest binds both exact SHA-256 values, every
+  source in the three-module runtime closure, the `named_lane_guard` profile,
+  runtime path, profile/runtime version, required `-I -B -S` flags, and
+  stdlib-only schema-evaluator profile. The prior-trusted canonical bundle
+  manifest—not the self-referential machine manifest—binds the exact
+  `named_lane_guard` bytes as the external trust root. That guard validates the
+  fixed machine-manifest digest and every runtime/receiver/schema digest before
+  any profile source is compiled. The formal
   report-validation entrypoint belongs only to a parent-validated prior
   trusted bundle: it compiles the retained receiver bytes, injects the
   retained schema bytes, verifies the exact Draft 2020-12 identity/version and
@@ -33,6 +38,9 @@ The bundle identity is operational evidence, not a free-form label:
 - The optional profiles must not widen this control-plane closure to `review_runtime.workspace`, `review_runtime.prompt`, or `review_runtime.synthetic_tokens`.
 - The manifest-bound read-only PR report schema is self-contained: it contains its complete closed delivery-v3 receiver definition and has no external `$ref`. Formal receiving uses `<trusted-python-absolute-path> -I -B -S <prior-trusted-bundle>/skills/review-orchestration-playbook/scripts/named_lane_guard validate-read-only-pr-report -`; direct receiver execution is load-and-route compatibility only and rejects without guard-bound bytes. This profile has the exact three-source raw-loader closure `review_runtime`, `review_runtime.catalog_bootstrap`, and `review_runtime.read_only_report_guard`, with the receiver and schema retained as non-imported manifest companions. It uses the binding transaction to hold the complete ancestor chain and every guard/runtime/bootstrap/manifest/receiver/schema descriptor through schema-first and semantic validation. The protected object-identity property is stable device/inode/file type for each retained descriptor and its terminal parent entry; the protected content property is exact retained bytes and digest; the protected access property is trusted ownership with no non-owner mutation grant, including macOS mutating ACL/security flags and only the Linux filesystem types whose POSIX ACL semantics are proved. Size is a bound and consistency signal, never a content substitute. `mtime`, `ctime`, `nlink`, and directory child churn alone are outside those properties. A persistent leaf replacement, byte drift, unsafe mode/ACL, parent-entry replacement, or unreadable final state fails closed before acceptance; a temporary replacement restored to the originally bound object cannot change validation because the consumer never reopens either companion. The profile never resolves an external or candidate-head delivery schema, imports site packages, or exposes a semantic-only executable report gate. Candidate code may be exercised only by ordinary tests; self-policy migration remains under the previous trusted release and the candidate profile cannot become formal control until merge, release, and canonical-manifest verification. Delivery-v2 and read-only-report-v7 inputs fail closed after this atomic migration.
 - That embedded receiver accepts only its exact reason/mode/evidence matrix. Its CI observation is complete only when the repository/PR/head-bound GraphQL connection carries matching server `totalCount`, every page repeats the exact report snapshot binding and observation ID and digest-binds its ordered flat-rollup slice, cursors are contiguous, the final page has `hasNextPage=false`, and counts equal the complete flat rollup; incomplete, drifted, or over-cap pagination is unavailable/blocked rather than truncated.
+
+- The report machine manifest's fixed digest covers the exact `review_runtime`, `catalog_bootstrap`, and `read_only_report_guard` source SHA-256 values before the guard compiles that three-source closure. The catalog runtime manifest likewise covers the exact runtime-package, bootstrap, and co-release resolver SHA-256 values before bootstrap or resolver compilation. `named_lane_guard` is deliberately the external trust root rather than a self-hash: its exact bytes are bound by the prior-trusted canonical bundle manifest, avoiding a circular manifest/loader digest. A source captured after machine-manifest admission but before execution must still match its independently recorded digest; temporary replacement and restoration cannot self-authorize new code.
+- After that pre-execution admission, the report transaction descriptor-binds and terminally revalidates the guard, runtime package, bootstrap, report runtime, manifest, receiver, and schema. This sequencing closes both pre-execution substitution and post-capture drift; a same-UID process cannot make replacement bytes become their own expected digest.
 
 ## Shared Frozen-Range Contract
 

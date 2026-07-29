@@ -164,8 +164,12 @@ The receiving sequence is closed:
    `named_lane_guard validate-read-only-pr-report -` profile once over the
    exact in-memory JSON through stdin with the canonical Python `-I -B -S`
    launcher and clean environment. The guard's machine control manifest binds
-   its loader/profile version plus the exact receiver and schema SHA-256
-   values. The profile raw-loads only the manifest-bound stdlib transaction
+   its loader/profile version plus exact SHA-256 values for `review_runtime`,
+   the binding runtime, the report-guard runtime, the receiver, and the schema.
+   The prior-trusted canonical bundle manifest separately binds
+   `named_lane_guard` as the external trust root. The guard validates its fixed
+   machine-manifest digest and each source digest before compiling the profile.
+   The profile raw-loads only the manifest-bound stdlib transaction
    runtime, retains descriptor-bound guard/runtime/bootstrap/manifest/receiver/
    schema bytes, compiles only the retained receiver, and injects only the
    retained schema bytes. Its closed Draft 2020-12 evaluator requires the

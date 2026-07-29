@@ -27,7 +27,8 @@ superseded_by:
   admission inputs, not caller-selectable authority.
 - Read-only PR reports are accepted only by a prior-trusted
   `named_lane_guard validate-read-only-pr-report` profile whose machine
-  manifest binds the exact receiver and schema bytes.
+  manifest binds the complete runtime-source closure plus the exact receiver
+  and schema bytes.
 
 ## Current State
 
@@ -63,7 +64,13 @@ superseded_by:
   with Python `-I -B -S`, raw-loads only its manifest-bound stdlib runtime,
   and retains complete guard/runtime/bootstrap/manifest/receiver/schema
   descriptors through validation. Its machine control manifest binds the
-  loader/runtime profile plus the exact receiver and schema SHA-256 values.
+  loader/runtime profile plus exact SHA-256 values for the runtime package,
+  binding runtime, report runtime, receiver, and schema. The prior-trusted
+  canonical bundle manifest is the external trust root for the guard itself.
+  The guard checks its fixed machine-manifest digest and every source digest
+  before compiling the profile, so a same-UID runtime/bootstrap/package
+  replacement captured after manifest admission cannot self-authorize even if
+  the original path is restored before terminal revalidation.
   Only the retained receiver bytes are compiled, only the retained schema bytes
   are injected, and the closed Draft 2020-12 evaluator applies schema-v8 before
   semantics and equality-binds every evidence record to that instance.
@@ -125,7 +132,8 @@ superseded_by:
   express. The schema embeds its complete closed delivery-v3 receiver
   definition and has no external `$ref`. The schema and receiver runtime remain
   direct records in the canonical control manifest, while the new machine
-  manifest binds their exact digests and the loader/runtime version. The
+  manifest binds their exact digests, all executed runtime-source digests, and
+  the loader/runtime version. The
   release digest therefore binds the complete v8 receiving closure without
   loading an external or candidate-head delivery schema. The 1 MiB
   retained-input ceiling now also
@@ -224,7 +232,10 @@ superseded_by:
   modules, catalog, and parent-directory descriptors through snapshot
   execution, result validation, namespace cleanup, and final close. The
   trusted guard pins the manifest SHA-256; that manifest pins every executable
-  source and data byte in the exact import closure. The closed loader rejects
+  source and data byte in the exact import closure, including the runtime
+  package, catalog bootstrap, and co-release resolver before either bootstrap
+  or resolver compilation. The prior canonical bundle manifest independently
+  binds the guard trust root. The closed loader rejects
   unlisted modules and imports, while candidate changes require explicit
   manifest rotation reviewed under the previous trusted release. No validated
   mutable pathname is executed later.
@@ -430,3 +441,27 @@ superseded_by:
   while the direct candidate receiver returned a bounded machine rejection.
   Joey waived the direct Claude review lane through 2026-08-01 because of
   quota; no other reviewer is counted as that lane.
+- The next prior-release-materialized fresh whole-range Codex review found that
+  runtime/bootstrap bytes captured after manifest admission were previously
+  compared only with themselves, allowing a same-UID replacement to
+  self-authorize before restoration. Both control paths now separate their
+  trust layers explicitly. The prior canonical bundle manifest externally
+  binds `named_lane_guard`; its fixed machine-manifest digests bind the exact
+  report runtime package/bootstrap/report-runtime/receiver/schema closure and
+  the catalog runtime package/bootstrap/co-release-resolver closure before any
+  profile source or resolver is compiled. Descriptor transactions still retain
+  and terminally revalidate every source, ancestor, content byte, and protected
+  access-policy signal. New deterministic tests replace and restore each report
+  control source between manifest parsing and capture, plus the catalog
+  resolver before execution; every substitution is rejected and no marker
+  executes. The final focused matrix passed `182` tests with one platform
+  skip, and the report guard passed all `8` tests under Python 3.14. The
+  complete review-helper suite ran `2,828` tests with `6` platform skips; its
+  sole outer-sandbox failure was again the native macOS nested
+  `sandbox-exec` boundary, and that exact test passed outside the outer
+  sandbox. An independent follow-up audit found one catalog-manifest parser
+  mismatch: JSON `true` could compare equal to version `1`. Guard, bootstrap,
+  and resolver now require exact integer version types; guard admission also
+  closes the complete root field set. Boolean schema/runtime versions and an
+  extra root field are explicit fail-before-compile tests. Ruff check and
+  format passed for every touched Python file.

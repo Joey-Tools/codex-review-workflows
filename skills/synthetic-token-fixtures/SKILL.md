@@ -88,11 +88,16 @@ catalog_guard="$trusted_bundle_root/skills/review-orchestration-playbook/scripts
    `pool_version`, and one canonical `binding_sha256`.
 
    The trusted runtime manifest uses profile
-   `synthetic-catalog-authoring-v1`. It binds the dedicated catalog entry,
-   `review_runtime/__init__.py`, `common.py`, `cli.py`,
-   `synthetic_tokens.py`, and `synthetic-token-catalog.json` by exact path and
-   SHA-256. The resolver rejects every other module, path, profile, or import;
-   it does not inventory or authorize the surrounding review scripts tree.
+   `synthetic-catalog-authoring-v1`. Before bootstrap execution, the
+   prior-trusted guard's fixed manifest digest binds the exact
+   `review_runtime/__init__.py`, `catalog_bootstrap.py`, and co-release
+   `active_catalog_binding.py` control-source SHA-256 values. The same manifest
+   then binds the dedicated catalog entry, runtime `__init__.py`, `common.py`,
+   `cli.py`, `synthetic_tokens.py`, and `synthetic-token-catalog.json` by exact
+   path and SHA-256. The prior-trusted canonical bundle manifest separately
+   binds `named_lane_guard` as the external trust root. The resolver rejects
+   every other module, path, profile, or import; it does not inventory or
+   authorize the surrounding review scripts tree.
 3. Stop on a non-release layout, loaded-skill mismatch, cross-release symlink,
    missing sibling, bytecode/native import substitute, package shadow, unsafe
    ownership or write policy, invalid catalog, ambiguous source, or digest

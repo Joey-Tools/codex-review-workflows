@@ -89,6 +89,14 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
         manifest_path = review_root / RUNTIME_MANIFEST_RELATIVE
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         changed = {path.as_posix() for path in changed_relative_paths}
+        for record in manifest["control_sources"]:
+            record["sha256"] = hashlib.sha256(
+                (review_root / record["path"]).read_bytes()
+            ).hexdigest()
+        for record in manifest["co_release_sources"]:
+            record["sha256"] = hashlib.sha256(
+                (review_root.parent / record["skill"] / record["path"]).read_bytes()
+            ).hexdigest()
         records = [manifest["entrypoint"], *manifest["sources"], *manifest["data"]]
         for record in records:
             if record["path"] in changed:
@@ -176,6 +184,7 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
         expected: str | None = None,
         loaded_skill_root: Path | None = None,
         cwd: Path | None = None,
+        environment_overrides: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         guard = (
             resolver.parents[2]
@@ -206,6 +215,8 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
                 "PYTHONPATH": "/decoy/pythonpath",
             }
         )
+        if environment_overrides:
+            environment.update(environment_overrides)
         return subprocess.run(
             arguments,
             check=False,
@@ -536,6 +547,33 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
                 binding["catalog_bootstrap"]["resolver_sha256"],
                 binding["binding_resolver_sha256"],
             )
+            runtime_manifest = json.loads(
+                Path(binding["catalog_runtime_manifest_path"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                runtime_manifest["external_trust_root"],
+                {
+                    "path": "scripts/named_lane_guard",
+                    "authority": "prior-trusted-canonical-bundle",
+                },
+            )
+            control_records = {
+                record["role"]: record for record in runtime_manifest["control_sources"]
+            }
+            self.assertEqual(
+                binding["catalog_bootstrap"]["catalog_runtime_package_sha256"],
+                control_records["runtime-package"]["sha256"],
+            )
+            self.assertEqual(
+                binding["catalog_bootstrap"]["catalog_bootstrap_source_sha256"],
+                control_records["binding-runtime"]["sha256"],
+            )
+            self.assertEqual(
+                binding["catalog_bootstrap"]["resolver_sha256"],
+                runtime_manifest["co_release_sources"][0]["sha256"],
+            )
             self.assertEqual(
                 binding["execution_mode"],
                 "trusted-manifest-bound-source-snapshot",
@@ -848,6 +886,112 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
                 "runtime manifest is not provisioned by this trusted guard",
                 manifest_drift.stderr,
             )
+
+    def test_manifest_to_resolver_execution_replacement_is_rejected(self) -> None:
+        with self.installed_release() as release_root:
+            skills_root = release_root / "personal_codex" / "skills"
+            synthetic_root = skills_root / "synthetic-token-fixtures"
+            review_root = skills_root / "review-orchestration-playbook"
+            resolver = synthetic_root / "scripts" / "active_catalog_binding.py"
+            original = resolver.read_bytes()
+            marker = release_root / "malicious-resolver-executed"
+            malicious = (
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text('executed')\n"
+            ).encode("utf-8")
+            self.assertLess(len(malicious), len(original))
+            replacement = resolver.with_name("malicious-catalog-resolver.py")
+            backup = resolver.with_name("trusted-catalog-resolver.backup")
+            replacement.write_bytes(malicious + b" " * (len(original) - len(malicious)))
+            replacement.chmod(resolver.stat().st_mode)
+
+            guard = review_root / "scripts" / "named_lane_guard"
+            source = guard.read_text(encoding="utf-8")
+            admission = (
+                "    control_records, co_release_records = "
+                "_catalog_control_records(\n"
+                "        runtime_manifest_bytes\n"
+                "    )\n"
+            )
+            capture = "    resolver_bytes = _validate_bound_companion(resolver_path)\n"
+            self.assertEqual(source.count(admission), 1)
+            self.assertEqual(source.count(capture), 1)
+            source = source.replace(
+                admission,
+                admission
+                + """    _test_target = os.environ.get("CODEX_CATALOG_CAPTURE_TARGET")
+    _test_replacement = os.environ.get("CODEX_CATALOG_CAPTURE_REPLACEMENT")
+    _test_backup = os.environ.get("CODEX_CATALOG_CAPTURE_BACKUP")
+    if _test_target and _test_replacement and _test_backup:
+        os.replace(_test_target, _test_backup)
+        os.replace(_test_replacement, _test_target)
+""",
+                1,
+            )
+            source = source.replace(
+                capture,
+                capture
+                + """    if _test_target and _test_replacement and _test_backup:
+        os.replace(_test_target, _test_replacement)
+        os.replace(_test_backup, _test_target)
+""",
+                1,
+            )
+            guard.write_text(source, encoding="utf-8")
+            completed = self.run_binding(
+                resolver,
+                environment_overrides={
+                    "CODEX_CATALOG_CAPTURE_TARGET": str(resolver),
+                    "CODEX_CATALOG_CAPTURE_REPLACEMENT": str(replacement),
+                    "CODEX_CATALOG_CAPTURE_BACKUP": str(backup),
+                },
+            )
+            self.assertEqual(resolver.read_bytes(), original)
+            self.assertFalse(marker.exists())
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn(
+                "catalog resolver digest does not match the runtime manifest",
+                completed.stderr,
+            )
+
+    def test_runtime_manifest_versions_and_root_are_strict_before_compile(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "boolean-schema-version",
+                lambda manifest: manifest.__setitem__("schema_version", True),
+                "profile or version is invalid",
+            ),
+            (
+                "boolean-runtime-version",
+                lambda manifest: manifest.__setitem__("runtime_version", True),
+                "profile or version is invalid",
+            ),
+            (
+                "extra-root-field",
+                lambda manifest: manifest.__setitem__("unexpected", "value"),
+                "fields are not closed",
+            ),
+        )
+        for name, mutation, expected_error in cases:
+            with self.subTest(case=name), self.installed_release() as release_root:
+                skills_root = release_root / "personal_codex" / "skills"
+                review_root = skills_root / "review-orchestration-playbook"
+                resolver = (
+                    skills_root
+                    / "synthetic-token-fixtures"
+                    / "scripts"
+                    / "active_catalog_binding.py"
+                )
+                self.rotate_runtime_manifest(
+                    review_root,
+                    mutate_manifest=mutation,
+                )
+                completed = self.run_binding(resolver)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(expected_error, completed.stderr)
+                self.assertNotIn("Traceback", completed.stderr)
 
     def test_runtime_manifest_rejects_unlisted_modules_and_import_substitution(
         self,

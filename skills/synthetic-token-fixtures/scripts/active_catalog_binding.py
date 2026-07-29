@@ -56,6 +56,9 @@ RUNTIME_MANIFEST_SCHEMA_VERSION = 1
 RUNTIME_PROFILE = "synthetic-catalog-authoring-v1"
 RUNTIME_MANIFEST_LEAF = "synthetic-catalog-runtime-manifest.json"
 RUNTIME_ENTRY_PATH = "scripts/synthetic_catalog_entry"
+CONTROL_RUNTIME_INIT_PATH = "scripts/review_runtime/__init__.py"
+CONTROL_BOOTSTRAP_PATH = "scripts/review_runtime/catalog_bootstrap.py"
+CONTROL_RESOLVER_PATH = "scripts/active_catalog_binding.py"
 RUNTIME_SOURCE_PATHS = {
     "review_runtime": ("scripts/review_runtime/__init__.py", True),
     "review_runtime.common": ("scripts/review_runtime/common.py", False),
@@ -1037,6 +1040,9 @@ def _parse_runtime_manifest(
         "schema_version",
         "profile",
         "runtime_version",
+        "external_trust_root",
+        "control_sources",
+        "co_release_sources",
         "entrypoint",
         "sources",
         "data",
@@ -1044,13 +1050,17 @@ def _parse_runtime_manifest(
     }
     if set(manifest) != expected_fields:
         raise BindingError("catalog runtime manifest fields are not closed")
-    if manifest.get("schema_version") != RUNTIME_MANIFEST_SCHEMA_VERSION:
+    if (
+        type(manifest.get("schema_version")) is not int
+        or manifest.get("schema_version") != RUNTIME_MANIFEST_SCHEMA_VERSION
+    ):
         raise BindingError("catalog runtime manifest schema is unsupported")
     if manifest.get("profile") != RUNTIME_PROFILE:
         raise BindingError("catalog runtime manifest profile is unsupported")
     runtime_version = manifest.get("runtime_version")
     if type(runtime_version) is not int or runtime_version != 1:
         raise BindingError("catalog runtime manifest version is unsupported")
+    _manifest_control_digests(manifest)
 
     entrypoint = manifest.get("entrypoint")
     if not isinstance(entrypoint, dict) or set(entrypoint) != {"path", "sha256"}:
@@ -1137,6 +1147,62 @@ def _parse_runtime_manifest(
         label="catalog runtime data",
     )
     return sources, entry_path, entry_sha256, data_path, data_sha256
+
+
+def _manifest_control_digests(
+    manifest: dict[str, Any],
+) -> tuple[dict[str, str], str]:
+    if manifest.get("external_trust_root") != {
+        "path": "scripts/named_lane_guard",
+        "authority": "prior-trusted-canonical-bundle",
+    }:
+        raise BindingError("catalog runtime external trust root is invalid")
+    control_sources = manifest.get("control_sources")
+    expected = (
+        (CONTROL_RUNTIME_INIT_PATH, "runtime-package"),
+        (CONTROL_BOOTSTRAP_PATH, "binding-runtime"),
+    )
+    if not isinstance(control_sources, list) or len(control_sources) != len(expected):
+        raise BindingError(
+            "catalog runtime control source set is not the exact closure"
+        )
+    control: dict[str, str] = {}
+    for record, (path, role) in zip(control_sources, expected, strict=True):
+        if not isinstance(record, dict) or set(record) != {
+            "path",
+            "role",
+            "sha256",
+        }:
+            raise BindingError("catalog runtime control source fields are invalid")
+        if record.get("path") != path or record.get("role") != role:
+            raise BindingError(
+                "catalog runtime control source ordering/role is invalid"
+            )
+        digest = record.get("sha256")
+        if not isinstance(digest, str) or SHA256.fullmatch(digest) is None:
+            raise BindingError("catalog runtime control source digest is invalid")
+        control[path] = digest
+
+    co_release = manifest.get("co_release_sources")
+    if (
+        not isinstance(co_release, list)
+        or len(co_release) != 1
+        or not isinstance(co_release[0], dict)
+        or set(co_release[0]) != {"skill", "path", "role", "sha256"}
+        or co_release[0].get("skill") != "synthetic-token-fixtures"
+        or co_release[0].get("path") != CONTROL_RESOLVER_PATH
+        or co_release[0].get("role") != "catalog-resolver"
+    ):
+        raise BindingError(
+            "catalog runtime co-release source set is not the exact closure"
+        )
+    resolver_digest = co_release[0].get("sha256")
+    if (
+        not isinstance(resolver_digest, str)
+        or SHA256.fullmatch(resolver_digest) is None
+    ):
+        raise BindingError("catalog runtime resolver digest is invalid")
+    return control, resolver_digest
 
 
 def _runtime_snapshot(
@@ -1657,6 +1723,7 @@ def _validated_bootstrap_binding(
         "sync_manifest_path",
         "sync_manifest_sha256",
         "catalog_bootstrap_source_sha256",
+        "catalog_runtime_package_sha256",
         "runtime_manifest_path",
         "runtime_manifest_sha256",
         "runtime_manifest_identity",
@@ -1678,6 +1745,7 @@ def _validated_bootstrap_binding(
         "resolver_sha256",
         "sync_manifest_sha256",
         "catalog_bootstrap_source_sha256",
+        "catalog_runtime_package_sha256",
         "runtime_manifest_sha256",
     ):
         value = binding.get(field)
@@ -1812,6 +1880,23 @@ def _build_binding(
         != bootstrap_binding["runtime_manifest_identity"]
     ):
         raise BindingError("trusted catalog runtime manifest binding changed")
+    runtime_manifest_object = _load_json_object(
+        trusted_runtime_manifest_bytes,
+        label="catalog runtime manifest",
+    )
+    control_digests, resolver_digest = _manifest_control_digests(
+        runtime_manifest_object
+    )
+    if (
+        bootstrap_binding["catalog_runtime_package_sha256"]
+        != control_digests[CONTROL_RUNTIME_INIT_PATH]
+        or bootstrap_binding["catalog_bootstrap_source_sha256"]
+        != control_digests[CONTROL_BOOTSTRAP_PATH]
+        or bootstrap_binding["resolver_sha256"] != resolver_digest
+    ):
+        raise BindingError(
+            "trusted catalog bootstrap control digests changed from the manifest"
+        )
 
     source_specs, entry_bound, catalog_bound, runtime_records = _runtime_snapshot(
         review_root=review_root,

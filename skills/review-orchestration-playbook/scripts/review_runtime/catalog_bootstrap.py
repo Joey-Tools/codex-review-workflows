@@ -25,6 +25,9 @@ SYNTHETIC_SKILL_NAME = "synthetic-token-fixtures"
 REVIEW_SKILL_NAME = "review-orchestration-playbook"
 RUNTIME_MANIFEST_LEAF = "synthetic-catalog-runtime-manifest.json"
 RUNTIME_PROFILE = "synthetic-catalog-authoring-v1"
+RUNTIME_INIT_RELATIVE_PATH = "scripts/review_runtime/__init__.py"
+BOOTSTRAP_RELATIVE_PATH = "scripts/review_runtime/catalog_bootstrap.py"
+RESOLVER_RELATIVE_PATH = "scripts/active_catalog_binding.py"
 # These local filesystems expose either no ACL or Linux POSIX ACL semantics,
 # where the ACL mask is the inode's group mode class. Remote, programmable,
 # and unclassified stacked filesystems are deliberately absent because
@@ -1028,6 +1031,70 @@ def _validate_sync_manifest(content: bytes) -> None:
         )
 
 
+def _manifest_control_digests(
+    manifest: dict[str, Any],
+) -> tuple[dict[str, str], str]:
+    if manifest.get("external_trust_root") != {
+        "path": "scripts/named_lane_guard",
+        "authority": "prior-trusted-canonical-bundle",
+    }:
+        raise CatalogBootstrapError("catalog runtime external trust root is invalid")
+    raw_control = manifest.get("control_sources")
+    expected_control = (
+        (RUNTIME_INIT_RELATIVE_PATH, "runtime-package"),
+        (BOOTSTRAP_RELATIVE_PATH, "binding-runtime"),
+    )
+    if not isinstance(raw_control, list) or len(raw_control) != len(expected_control):
+        raise CatalogBootstrapError(
+            "catalog runtime control source set is not the exact closure"
+        )
+    control: dict[str, str] = {}
+    for record, (expected_path, expected_role) in zip(
+        raw_control,
+        expected_control,
+        strict=True,
+    ):
+        if not isinstance(record, dict) or set(record) != {
+            "path",
+            "role",
+            "sha256",
+        }:
+            raise CatalogBootstrapError(
+                "catalog runtime control source record is invalid"
+            )
+        if record.get("path") != expected_path or record.get("role") != expected_role:
+            raise CatalogBootstrapError(
+                "catalog runtime control source ordering/role is invalid"
+            )
+        digest = record.get("sha256")
+        if not isinstance(digest, str) or SHA256.fullmatch(digest) is None:
+            raise CatalogBootstrapError(
+                "catalog runtime control source digest is invalid"
+            )
+        control[expected_path] = digest
+
+    co_release = manifest.get("co_release_sources")
+    if (
+        not isinstance(co_release, list)
+        or len(co_release) != 1
+        or not isinstance(co_release[0], dict)
+        or set(co_release[0]) != {"skill", "path", "role", "sha256"}
+        or co_release[0].get("skill") != SYNTHETIC_SKILL_NAME
+        or co_release[0].get("path") != RESOLVER_RELATIVE_PATH
+        or co_release[0].get("role") != "catalog-resolver"
+    ):
+        raise CatalogBootstrapError(
+            "catalog runtime co-release source set is not the exact closure"
+        )
+    resolver_digest = co_release[0].get("sha256")
+    if (
+        not isinstance(resolver_digest, str)
+        or SHA256.fullmatch(resolver_digest) is None
+    ):
+        raise CatalogBootstrapError("catalog runtime resolver digest is invalid")
+    return control, resolver_digest
+
+
 def _loaded_skill_root_from_argv(argv: tuple[str, ...]) -> Path:
     values: list[str] = []
     index = 0
@@ -1100,6 +1167,8 @@ def _main(
     trusted_resolver_path: Path | None = None,
     trusted_resolver_bytes: bytes | None = None,
     trusted_skill_bytes: bytes | None = None,
+    trusted_runtime_init_path: Path | None = None,
+    trusted_runtime_init_bytes: bytes | None = None,
     catalog_bootstrap_source_sha256: str | None = None,
     trusted_runtime_manifest_path: Path | None = None,
     trusted_runtime_manifest_bytes: bytes | None = None,
@@ -1113,6 +1182,8 @@ def _main(
         or trusted_resolver_path is None
         or trusted_resolver_bytes is None
         or trusted_skill_bytes is None
+        or trusted_runtime_init_path is None
+        or trusted_runtime_init_bytes is None
         or catalog_bootstrap_source_sha256 is None
         or trusted_runtime_manifest_path is None
         or trusted_runtime_manifest_bytes is None
@@ -1134,6 +1205,25 @@ def _main(
     expected_runtime_manifest = (
         trusted_review_skill_root / "scripts" / "review_runtime" / RUNTIME_MANIFEST_LEAF
     )
+    expected_runtime_init = trusted_review_skill_root / RUNTIME_INIT_RELATIVE_PATH
+    _require_canonical_absolute(
+        trusted_runtime_init_path,
+        label="trusted catalog runtime package",
+    )
+    if trusted_runtime_init_path != expected_runtime_init:
+        raise CatalogBootstrapError(
+            "trusted catalog runtime package path is not canonical"
+        )
+    if (
+        type(trusted_runtime_init_bytes) is not bytes
+        or not trusted_runtime_init_bytes
+        or len(trusted_runtime_init_bytes) > MAX_SOURCE_BYTES
+        or not isinstance(catalog_bootstrap_source_sha256, str)
+        or SHA256.fullmatch(catalog_bootstrap_source_sha256) is None
+    ):
+        raise CatalogBootstrapError(
+            "trusted catalog control source bytes are not guard-bound"
+        )
     _require_canonical_absolute(
         trusted_runtime_manifest_path,
         label="trusted catalog runtime manifest",
@@ -1186,6 +1276,28 @@ def _main(
         if review_root.path != trusted_review_skill_root:
             raise CatalogBootstrapError("trusted review skill binding changed")
 
+        runtime_init_parent = transaction.bind_parent_chain(
+            trusted_runtime_init_path.parent,
+            label="catalog runtime package absolute parent chain",
+        )
+        runtime_init_bound = transaction.bind_file(
+            trusted_runtime_init_path,
+            label="catalog runtime package",
+            limit=MAX_SOURCE_BYTES,
+            parent=runtime_init_parent,
+            expected_payload=trusted_runtime_init_bytes,
+        )
+        bootstrap_path = trusted_review_skill_root / BOOTSTRAP_RELATIVE_PATH
+        bootstrap_parent = transaction.bind_parent_chain(
+            bootstrap_path.parent,
+            label="catalog binding runtime absolute parent chain",
+        )
+        bootstrap_bound = transaction.bind_file(
+            bootstrap_path,
+            label="catalog binding runtime",
+            limit=MAX_SOURCE_BYTES,
+            parent=bootstrap_parent,
+        )
         resolver_bound = transaction.bind_file(
             trusted_resolver_path,
             label="catalog resolver",
@@ -1227,11 +1339,30 @@ def _main(
             label="catalog runtime manifest",
         )
         if (
-            runtime_manifest.get("schema_version") != 1
+            type(runtime_manifest.get("schema_version")) is not int
+            or runtime_manifest.get("schema_version") != 1
             or runtime_manifest.get("profile") != RUNTIME_PROFILE
+            or type(runtime_manifest.get("runtime_version")) is not int
+            or runtime_manifest.get("runtime_version") != 1
         ):
             raise CatalogBootstrapError(
-                "catalog runtime manifest profile is unsupported"
+                "catalog runtime manifest profile or version is unsupported"
+            )
+        control_digests, resolver_digest = _manifest_control_digests(runtime_manifest)
+        if runtime_init_bound.sha256 != control_digests[RUNTIME_INIT_RELATIVE_PATH]:
+            raise CatalogBootstrapError(
+                "catalog runtime package digest does not match the runtime manifest"
+            )
+        if (
+            bootstrap_bound.sha256 != control_digests[BOOTSTRAP_RELATIVE_PATH]
+            or bootstrap_bound.sha256 != catalog_bootstrap_source_sha256
+        ):
+            raise CatalogBootstrapError(
+                "catalog binding runtime digest does not match the runtime manifest"
+            )
+        if resolver_bound.sha256 != resolver_digest:
+            raise CatalogBootstrapError(
+                "catalog resolver digest does not match the runtime manifest"
             )
 
         bootstrap_binding: dict[str, object] = {
@@ -1247,6 +1378,7 @@ def _main(
             "sync_manifest_path": str(manifest_bound.path),
             "sync_manifest_sha256": manifest_bound.sha256,
             "catalog_bootstrap_source_sha256": catalog_bootstrap_source_sha256,
+            "catalog_runtime_package_sha256": runtime_init_bound.sha256,
             "runtime_manifest_path": str(runtime_manifest_bound.path),
             "runtime_manifest_sha256": runtime_manifest_bound.sha256,
             "runtime_manifest_identity": list(runtime_manifest_bound.identity),
@@ -1330,6 +1462,8 @@ def main(
     trusted_resolver_path: Path | None = None,
     trusted_resolver_bytes: bytes | None = None,
     trusted_skill_bytes: bytes | None = None,
+    trusted_runtime_init_path: Path | None = None,
+    trusted_runtime_init_bytes: bytes | None = None,
     catalog_bootstrap_source_sha256: str | None = None,
     trusted_runtime_manifest_path: Path | None = None,
     trusted_runtime_manifest_bytes: bytes | None = None,
@@ -1344,6 +1478,8 @@ def main(
             trusted_resolver_path=trusted_resolver_path,
             trusted_resolver_bytes=trusted_resolver_bytes,
             trusted_skill_bytes=trusted_skill_bytes,
+            trusted_runtime_init_path=trusted_runtime_init_path,
+            trusted_runtime_init_bytes=trusted_runtime_init_bytes,
             catalog_bootstrap_source_sha256=catalog_bootstrap_source_sha256,
             trusted_runtime_manifest_path=trusted_runtime_manifest_path,
             trusted_runtime_manifest_bytes=trusted_runtime_manifest_bytes,

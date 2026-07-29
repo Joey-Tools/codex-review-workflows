@@ -23,6 +23,7 @@ if not (
 import hashlib
 import importlib.machinery
 import importlib.util
+import json
 import os
 import pathlib
 import stat
@@ -105,10 +106,34 @@ _READ_ONLY_REPORT_SOURCES = (
     ),
 )
 _CATALOG_RUNTIME_MANIFEST_SHA256 = (
-    "24536adf294ea90bece398a3fe9f8a5c045ddfbb6e2b9d2a74ef9efee954a67a"
+    "e9c9f31b2f5db17b2763ac135cd33e382e7711c20ebb09466eb68a643296bc97"
 )
 _READ_ONLY_REPORT_CONTROL_MANIFEST_SHA256 = (
-    "dc12fd1fe0bb450190956a3e4220d6f46231471d6688bf38b59c30eae23e645b"
+    "22b4882a3419317b9a0a617a85fb8dc5c8e462360ee27b416a24a696be304e7b"
+)
+_SHA256_CHARACTERS = frozenset("0123456789abcdef")
+_READ_ONLY_REPORT_CONTROL_SOURCES = (
+    ("scripts/review_runtime/__init__.py", "runtime-package"),
+    ("scripts/review_runtime/catalog_bootstrap.py", "binding-runtime"),
+    (
+        "scripts/review_runtime/read_only_report_guard.py",
+        "report-guard-runtime",
+    ),
+)
+_READ_ONLY_REPORT_ARTIFACTS = (
+    ("references/pr-readiness-read-only-report.schema.json", "schema"),
+    ("scripts/read_only_pr_report.py", "receiver"),
+)
+_CATALOG_CONTROL_SOURCES = (
+    ("scripts/review_runtime/__init__.py", "runtime-package"),
+    ("scripts/review_runtime/catalog_bootstrap.py", "binding-runtime"),
+)
+_CATALOG_CO_RELEASE_SOURCES = (
+    (
+        "synthetic-token-fixtures",
+        "scripts/active_catalog_binding.py",
+        "catalog-resolver",
+    ),
 )
 _SourceIdentity = tuple[int, int, int, int, int]
 _CompanionBinding = bytes
@@ -147,6 +172,203 @@ def _fail(message: str, error: BaseException | None = None) -> SystemExit:
     if error is not None:
         failure.__cause__ = error
     return failure
+
+
+def _strict_manifest_object(payload: bytes, *, label: str) -> dict[str, object]:
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"{label} contains a duplicate key")
+            result[key] = value
+        return result
+
+    def reject_constant(_value: str) -> None:
+        raise ValueError(f"{label} contains a non-finite number")
+
+    def reject_float(_value: str) -> None:
+        raise ValueError(f"{label} contains an unsupported floating-point number")
+
+    try:
+        value = json.loads(
+            payload.decode("utf-8", errors="strict"),
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+            parse_float=reject_float,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+        raise _fail(f"{label} is not valid strict JSON", error)
+    if not isinstance(value, dict):
+        raise _fail(f"{label} root must be an object")
+    return value
+
+
+def _manifest_digest(value: object, *, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in _SHA256_CHARACTERS for character in value)
+    ):
+        raise _fail(f"{label} digest is invalid")
+    return value
+
+
+def _closed_path_digest_records(
+    value: object,
+    *,
+    expected: tuple[tuple[str, str], ...],
+    label: str,
+) -> dict[str, str]:
+    if not isinstance(value, list) or len(value) != len(expected):
+        raise _fail(f"{label} set is not the exact closure")
+    records: dict[str, str] = {}
+    for item, (expected_path, expected_role) in zip(value, expected, strict=True):
+        if not isinstance(item, dict) or set(item) != {"path", "role", "sha256"}:
+            raise _fail(f"{label} record is invalid")
+        if item.get("path") != expected_path or item.get("role") != expected_role:
+            raise _fail(f"{label} ordering or role is invalid")
+        records[expected_path] = _manifest_digest(
+            item.get("sha256"),
+            label=f"{label} {expected_role}",
+        )
+    return records
+
+
+def _read_only_report_control_records(payload: bytes) -> dict[str, str]:
+    manifest = _strict_manifest_object(
+        payload,
+        label="read-only report control manifest",
+    )
+    if set(manifest) != {
+        "schema_version",
+        "profile",
+        "external_trust_root",
+        "loader",
+        "control_sources",
+        "artifacts",
+    }:
+        raise _fail("read-only report control manifest fields are not closed")
+    if (
+        type(manifest.get("schema_version")) is not int
+        or manifest.get("schema_version") != 1
+        or manifest.get("profile") != "validate-read-only-pr-report"
+    ):
+        raise _fail("read-only report control manifest profile is invalid")
+    if manifest.get("external_trust_root") != {
+        "path": "scripts/named_lane_guard",
+        "authority": "prior-trusted-canonical-bundle",
+    }:
+        raise _fail("read-only report external trust root is invalid")
+    if manifest.get("loader") != {
+        "path": "scripts/named_lane_guard",
+        "profile_version": 1,
+        "python_flags": ["-I", "-B", "-S"],
+        "runtime": "scripts/review_runtime/read_only_report_guard.py",
+        "runtime_version": 1,
+        "schema_evaluator": "closed-draft-2020-12-v1",
+    }:
+        raise _fail("read-only report control manifest loader is invalid")
+    records = _closed_path_digest_records(
+        manifest.get("control_sources"),
+        expected=_READ_ONLY_REPORT_CONTROL_SOURCES,
+        label="read-only report control source",
+    )
+    records.update(
+        _closed_path_digest_records(
+            manifest.get("artifacts"),
+            expected=_READ_ONLY_REPORT_ARTIFACTS,
+            label="read-only report artifact",
+        )
+    )
+    return records
+
+
+def _catalog_control_records(
+    payload: bytes,
+) -> tuple[dict[str, str], dict[tuple[str, str], str]]:
+    manifest = _strict_manifest_object(
+        payload,
+        label="catalog runtime manifest",
+    )
+    if set(manifest) != {
+        "schema_version",
+        "profile",
+        "runtime_version",
+        "external_trust_root",
+        "control_sources",
+        "co_release_sources",
+        "entrypoint",
+        "sources",
+        "data",
+        "allowed_modules",
+    }:
+        raise _fail("catalog runtime manifest fields are not closed")
+    if (
+        type(manifest.get("schema_version")) is not int
+        or manifest.get("schema_version") != 1
+        or manifest.get("profile") != "synthetic-catalog-authoring-v1"
+        or type(manifest.get("runtime_version")) is not int
+        or manifest.get("runtime_version") != 1
+    ):
+        raise _fail("catalog runtime manifest profile or version is invalid")
+    if manifest.get("external_trust_root") != {
+        "path": "scripts/named_lane_guard",
+        "authority": "prior-trusted-canonical-bundle",
+    }:
+        raise _fail("catalog runtime external trust root is invalid")
+    control = _closed_path_digest_records(
+        manifest.get("control_sources"),
+        expected=_CATALOG_CONTROL_SOURCES,
+        label="catalog control source",
+    )
+    raw_co_release = manifest.get("co_release_sources")
+    if not isinstance(raw_co_release, list) or len(raw_co_release) != len(
+        _CATALOG_CO_RELEASE_SOURCES
+    ):
+        raise _fail("catalog co-release source set is not the exact closure")
+    co_release: dict[tuple[str, str], str] = {}
+    for item, (skill, path, role) in zip(
+        raw_co_release,
+        _CATALOG_CO_RELEASE_SOURCES,
+        strict=True,
+    ):
+        if not isinstance(item, dict) or set(item) != {
+            "skill",
+            "path",
+            "role",
+            "sha256",
+        }:
+            raise _fail("catalog co-release source record is invalid")
+        if (
+            item.get("skill") != skill
+            or item.get("path") != path
+            or item.get("role") != role
+        ):
+            raise _fail("catalog co-release source ordering or role is invalid")
+        co_release[(skill, path)] = _manifest_digest(
+            item.get("sha256"),
+            label=f"catalog co-release source {role}",
+        )
+    return control, co_release
+
+
+def _require_manifest_digest(
+    path: pathlib.Path,
+    payload: bytes,
+    records: dict[str, str],
+    *,
+    skill_root: pathlib.Path,
+    label: str,
+) -> None:
+    try:
+        relative = path.relative_to(skill_root).as_posix()
+    except ValueError as error:
+        raise _fail(f"{label} path escapes its trusted skill root", error)
+    expected = records.get(relative)
+    if expected is None:
+        raise _fail(f"{label} is absent from the control manifest")
+    if hashlib.sha256(payload).hexdigest() != expected:
+        raise _fail(f"{label} digest does not match the control manifest")
 
 
 def _source_identity(
@@ -728,26 +950,53 @@ def _load_review_result_entrypoint(scripts_root: pathlib.Path) -> object:
 
 def _load_catalog_bootstrap_entrypoint(scripts_root: pathlib.Path) -> object:
     runtime_root = scripts_root / "review_runtime"
+    runtime_init_path = runtime_root / "__init__.py"
     bootstrap_path = runtime_root / "catalog_bootstrap.py"
     runtime_manifest_path = runtime_root / "synthetic-catalog-runtime-manifest.json"
-    bootstrap_bytes = _validate_bound_companion(bootstrap_path)
     runtime_manifest_bytes = _validate_bound_companion(runtime_manifest_path)
     runtime_manifest_sha256 = hashlib.sha256(runtime_manifest_bytes).hexdigest()
     if runtime_manifest_sha256 != _CATALOG_RUNTIME_MANIFEST_SHA256:
         raise _fail("catalog runtime manifest is not provisioned by this trusted guard")
     review_skill_root = scripts_root.parent
+    control_records, co_release_records = _catalog_control_records(
+        runtime_manifest_bytes
+    )
+    runtime_init_bytes = _validate_bound_companion(runtime_init_path)
+    bootstrap_bytes = _validate_bound_companion(bootstrap_path)
+    for path, payload, label in (
+        (runtime_init_path, runtime_init_bytes, "catalog runtime package"),
+        (bootstrap_path, bootstrap_bytes, "catalog binding runtime"),
+    ):
+        _require_manifest_digest(
+            path,
+            payload,
+            control_records,
+            skill_root=review_skill_root,
+            label=label,
+        )
     skills_root = review_skill_root.parent
     synthetic_skill_root = skills_root / "synthetic-token-fixtures"
     resolver_path = synthetic_skill_root / "scripts" / "active_catalog_binding.py"
     synthetic_skill_path = synthetic_skill_root / "SKILL.md"
     resolver_bytes = _validate_bound_companion(resolver_path)
+    resolver_expected = co_release_records.get(
+        ("synthetic-token-fixtures", "scripts/active_catalog_binding.py")
+    )
+    if (
+        resolver_expected is None
+        or hashlib.sha256(resolver_bytes).hexdigest() != resolver_expected
+    ):
+        raise _fail("catalog resolver digest does not match the runtime manifest")
     synthetic_skill_bytes = _validate_bound_companion(synthetic_skill_path)
     entrypoint = _load_bound_sources(
         runtime_root,
         _CATALOG_BOOTSTRAP_SOURCES,
         namespace_root="review_runtime",
         entry_module_name="review_runtime.catalog_bootstrap",
-        source_byte_bindings=(("review_runtime.catalog_bootstrap", bootstrap_bytes),),
+        source_byte_bindings=(
+            ("review_runtime", runtime_init_bytes),
+            ("review_runtime.catalog_bootstrap", bootstrap_bytes),
+        ),
     )
     _remove_bound_namespace("review_runtime")
 
@@ -759,6 +1008,8 @@ def _load_catalog_bootstrap_entrypoint(scripts_root: pathlib.Path) -> object:
             trusted_resolver_path=resolver_path,
             trusted_resolver_bytes=resolver_bytes,
             trusted_skill_bytes=synthetic_skill_bytes,
+            trusted_runtime_init_path=runtime_init_path,
+            trusted_runtime_init_bytes=runtime_init_bytes,
             catalog_bootstrap_source_sha256=hashlib.sha256(bootstrap_bytes).hexdigest(),
             trusted_runtime_manifest_path=runtime_manifest_path,
             trusted_runtime_manifest_bytes=runtime_manifest_bytes,
@@ -768,6 +1019,7 @@ def _load_catalog_bootstrap_entrypoint(scripts_root: pathlib.Path) -> object:
     return _guard_companions(
         guarded_catalog_bootstrap,
         (
+            (runtime_init_path, runtime_init_bytes),
             (bootstrap_path, bootstrap_bytes),
             (resolver_path, resolver_bytes),
             (synthetic_skill_path, synthetic_skill_bytes),
@@ -780,6 +1032,7 @@ def _load_read_only_report_entrypoint(scripts_root: pathlib.Path) -> object:
     runtime_root = scripts_root / "review_runtime"
     review_skill_root = scripts_root.parent
     guard_path = scripts_root / "named_lane_guard"
+    runtime_init_path = runtime_root / "__init__.py"
     runtime_path = runtime_root / "read_only_report_guard.py"
     bootstrap_path = runtime_root / "catalog_bootstrap.py"
     manifest_path = (
@@ -789,12 +1042,7 @@ def _load_read_only_report_entrypoint(scripts_root: pathlib.Path) -> object:
     schema_path = (
         review_skill_root / "references" / "pr-readiness-read-only-report.schema.json"
     )
-    guard_bytes = _validate_bound_companion(guard_path)
-    runtime_bytes = _validate_bound_companion(runtime_path)
-    bootstrap_bytes = _validate_bound_companion(bootstrap_path)
     manifest_bytes = _validate_bound_companion(manifest_path)
-    receiver_bytes = _validate_bound_companion(receiver_path)
-    schema_bytes = _validate_bound_companion(schema_path)
     if (
         hashlib.sha256(manifest_bytes).hexdigest()
         != _READ_ONLY_REPORT_CONTROL_MANIFEST_SHA256
@@ -802,12 +1050,34 @@ def _load_read_only_report_entrypoint(scripts_root: pathlib.Path) -> object:
         raise _fail(
             "read-only report control manifest is not provisioned by this trusted guard"
         )
+    records = _read_only_report_control_records(manifest_bytes)
+    guard_bytes = _validate_bound_companion(guard_path)
+    runtime_init_bytes = _validate_bound_companion(runtime_init_path)
+    runtime_bytes = _validate_bound_companion(runtime_path)
+    bootstrap_bytes = _validate_bound_companion(bootstrap_path)
+    receiver_bytes = _validate_bound_companion(receiver_path)
+    schema_bytes = _validate_bound_companion(schema_path)
+    for path, payload, label in (
+        (runtime_init_path, runtime_init_bytes, "read-only report runtime package"),
+        (runtime_path, runtime_bytes, "read-only report guard runtime"),
+        (bootstrap_path, bootstrap_bytes, "read-only report binding runtime"),
+        (receiver_path, receiver_bytes, "read-only report receiver"),
+        (schema_path, schema_bytes, "read-only report schema"),
+    ):
+        _require_manifest_digest(
+            path,
+            payload,
+            records,
+            skill_root=review_skill_root,
+            label=label,
+        )
     entrypoint = _load_bound_sources(
         runtime_root,
         _READ_ONLY_REPORT_SOURCES,
         namespace_root="review_runtime",
         entry_module_name="review_runtime.read_only_report_guard",
         source_byte_bindings=(
+            ("review_runtime", runtime_init_bytes),
             ("review_runtime.catalog_bootstrap", bootstrap_bytes),
             ("review_runtime.read_only_report_guard", runtime_bytes),
         ),
@@ -820,6 +1090,8 @@ def _load_read_only_report_entrypoint(scripts_root: pathlib.Path) -> object:
             trusted_review_skill_root=review_skill_root,
             trusted_guard_path=guard_path,
             trusted_guard_bytes=guard_bytes,
+            trusted_runtime_init_path=runtime_init_path,
+            trusted_runtime_init_bytes=runtime_init_bytes,
             trusted_runtime_path=runtime_path,
             trusted_runtime_bytes=runtime_bytes,
             trusted_bootstrap_path=bootstrap_path,
@@ -837,6 +1109,7 @@ def _load_read_only_report_entrypoint(scripts_root: pathlib.Path) -> object:
         guarded_read_only_report,
         (
             (guard_path, guard_bytes),
+            (runtime_init_path, runtime_init_bytes),
             (runtime_path, runtime_bytes),
             (bootstrap_path, bootstrap_bytes),
             (manifest_path, manifest_bytes),

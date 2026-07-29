@@ -4417,6 +4417,13 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertEqual(control["schema_version"], 1)
         self.assertEqual(control["profile"], "validate-read-only-pr-report")
         self.assertEqual(
+            control["external_trust_root"],
+            {
+                "path": "scripts/named_lane_guard",
+                "authority": "prior-trusted-canonical-bundle",
+            },
+        )
+        self.assertEqual(
             control["loader"],
             {
                 "path": "scripts/named_lane_guard",
@@ -4428,6 +4435,20 @@ class RepositoryContractTest(unittest.TestCase):
             },
         )
         self.assertEqual(
+            [(source["path"], source["role"]) for source in control["control_sources"]],
+            [
+                ("scripts/review_runtime/__init__.py", "runtime-package"),
+                (
+                    "scripts/review_runtime/catalog_bootstrap.py",
+                    "binding-runtime",
+                ),
+                (
+                    "scripts/review_runtime/read_only_report_guard.py",
+                    "report-guard-runtime",
+                ),
+            ],
+        )
+        self.assertEqual(
             [(artifact["path"], artifact["role"]) for artifact in control["artifacts"]],
             [
                 (
@@ -4437,7 +4458,7 @@ class RepositoryContractTest(unittest.TestCase):
                 ("scripts/read_only_pr_report.py", "receiver"),
             ],
         )
-        for artifact in control["artifacts"]:
+        for artifact in (*control["control_sources"], *control["artifacts"]):
             self.assertEqual(
                 artifact["sha256"],
                 hashlib.sha256(
@@ -4470,6 +4491,8 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("schema-v8 bytes", contracts)
         self.assertIn("canonical bundle digest", contracts)
         self.assertIn("machine control manifest", contracts)
+        self.assertIn("external trust root", contracts)
+        self.assertIn("before compiling", contracts)
         self.assertIn("previous trusted release", contracts)
         self.assertIn("validate-read-only-pr-report", contracts)
         self.assertIn("applies it before semantics", contracts)

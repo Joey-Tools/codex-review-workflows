@@ -27,6 +27,7 @@ MAX_SOURCE_BYTES = 1024 * 1024
 MAX_ERROR_CHARS = 240
 MANIFEST_LEAF = "read-only-pr-report-control-manifest.json"
 GUARD_RELATIVE_PATH = "scripts/named_lane_guard"
+RUNTIME_INIT_RELATIVE_PATH = "scripts/review_runtime/__init__.py"
 RUNTIME_RELATIVE_PATH = "scripts/review_runtime/read_only_report_guard.py"
 BOOTSTRAP_RELATIVE_PATH = "scripts/review_runtime/catalog_bootstrap.py"
 RECEIVER_RELATIVE_PATH = "scripts/read_only_pr_report.py"
@@ -80,7 +81,9 @@ def _strict_manifest(payload: bytes, expected_sha256: str) -> Mapping[str, Any]:
     if not isinstance(manifest, dict) or set(manifest) != {
         "schema_version",
         "profile",
+        "external_trust_root",
         "loader",
+        "control_sources",
         "artifacts",
     }:
         raise ReadOnlyReportGuardError(
@@ -92,6 +95,13 @@ def _strict_manifest(payload: bytes, expected_sha256: str) -> Mapping[str, Any]:
         or manifest.get("profile") != PROFILE
     ):
         raise ReadOnlyReportGuardError("control manifest profile is invalid")
+    if manifest.get("external_trust_root") != {
+        "path": GUARD_RELATIVE_PATH,
+        "authority": "prior-trusted-canonical-bundle",
+    }:
+        raise ReadOnlyReportGuardError(
+            "control manifest external trust root is invalid"
+        )
     expected_loader = {
         "path": GUARD_RELATIVE_PATH,
         "profile_version": PROFILE_VERSION,
@@ -111,43 +121,57 @@ def _strict_manifest(payload: bytes, expected_sha256: str) -> Mapping[str, Any]:
             "control manifest loader/version binding is invalid"
         )
 
-    artifacts = manifest.get("artifacts")
-    if not isinstance(artifacts, list) or len(artifacts) != 2:
-        raise ReadOnlyReportGuardError("control manifest artifact set is invalid")
-    expected = (
-        (SCHEMA_RELATIVE_PATH, "schema"),
-        (RECEIVER_RELATIVE_PATH, "receiver"),
+    expected_sets = (
+        (
+            "control_sources",
+            (
+                (RUNTIME_INIT_RELATIVE_PATH, "runtime-package"),
+                (BOOTSTRAP_RELATIVE_PATH, "binding-runtime"),
+                (RUNTIME_RELATIVE_PATH, "report-guard-runtime"),
+            ),
+        ),
+        (
+            "artifacts",
+            (
+                (SCHEMA_RELATIVE_PATH, "schema"),
+                (RECEIVER_RELATIVE_PATH, "receiver"),
+            ),
+        ),
     )
     records: dict[str, str] = {}
-    for artifact, (expected_path, expected_role) in zip(
-        artifacts,
-        expected,
-        strict=True,
-    ):
-        if not isinstance(artifact, dict) or set(artifact) != {
-            "path",
-            "role",
-            "sha256",
-        }:
-            raise ReadOnlyReportGuardError(
-                "control manifest artifact record is invalid"
-            )
-        path = artifact.get("path")
-        role = artifact.get("role")
-        digest = artifact.get("sha256")
-        if path != expected_path or role != expected_role:
-            raise ReadOnlyReportGuardError(
-                "control manifest artifact ordering/role is invalid"
-            )
-        if (
-            not isinstance(digest, str)
-            or len(digest) != 64
-            or any(character not in "0123456789abcdef" for character in digest)
+    for field, expected in expected_sets:
+        values = manifest.get(field)
+        if not isinstance(values, list) or len(values) != len(expected):
+            raise ReadOnlyReportGuardError(f"control manifest {field} set is invalid")
+        for artifact, (expected_path, expected_role) in zip(
+            values,
+            expected,
+            strict=True,
         ):
-            raise ReadOnlyReportGuardError(
-                "control manifest artifact digest is invalid"
-            )
-        records[path] = digest
+            if not isinstance(artifact, dict) or set(artifact) != {
+                "path",
+                "role",
+                "sha256",
+            }:
+                raise ReadOnlyReportGuardError(
+                    f"control manifest {field} record is invalid"
+                )
+            path = artifact.get("path")
+            role = artifact.get("role")
+            digest = artifact.get("sha256")
+            if path != expected_path or role != expected_role:
+                raise ReadOnlyReportGuardError(
+                    f"control manifest {field} ordering/role is invalid"
+                )
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise ReadOnlyReportGuardError(
+                    f"control manifest {field} digest is invalid"
+                )
+            records[path] = digest
     return records
 
 
@@ -183,6 +207,7 @@ def _validate_inputs(
     *,
     trusted_review_skill_root: Path,
     trusted_guard_path: Path,
+    trusted_runtime_init_path: Path,
     trusted_runtime_path: Path,
     trusted_bootstrap_path: Path,
     trusted_manifest_path: Path,
@@ -200,6 +225,11 @@ def _validate_inputs(
             trusted_guard_path,
             trusted_review_skill_root / GUARD_RELATIVE_PATH,
             "trusted named-lane guard",
+        ),
+        (
+            trusted_runtime_init_path,
+            trusted_review_skill_root / RUNTIME_INIT_RELATIVE_PATH,
+            "trusted report runtime package",
         ),
         (
             trusted_runtime_path,
@@ -251,6 +281,8 @@ def _main(
     trusted_review_skill_root: Path | None = None,
     trusted_guard_path: Path | None = None,
     trusted_guard_bytes: bytes | None = None,
+    trusted_runtime_init_path: Path | None = None,
+    trusted_runtime_init_bytes: bytes | None = None,
     trusted_runtime_path: Path | None = None,
     trusted_runtime_bytes: bytes | None = None,
     trusted_bootstrap_path: Path | None = None,
@@ -273,6 +305,8 @@ def _main(
         trusted_review_skill_root,
         trusted_guard_path,
         trusted_guard_bytes,
+        trusted_runtime_init_path,
+        trusted_runtime_init_bytes,
         trusted_runtime_path,
         trusted_runtime_bytes,
         trusted_bootstrap_path,
@@ -292,6 +326,8 @@ def _main(
     assert trusted_review_skill_root is not None
     assert trusted_guard_path is not None
     assert trusted_guard_bytes is not None
+    assert trusted_runtime_init_path is not None
+    assert trusted_runtime_init_bytes is not None
     assert trusted_runtime_path is not None
     assert trusted_runtime_bytes is not None
     assert trusted_bootstrap_path is not None
@@ -305,6 +341,7 @@ def _main(
     assert trusted_schema_bytes is not None
     trusted_payloads = (
         trusted_guard_bytes,
+        trusted_runtime_init_bytes,
         trusted_runtime_bytes,
         trusted_bootstrap_bytes,
         trusted_manifest_bytes,
@@ -314,6 +351,7 @@ def _main(
     _validate_inputs(
         trusted_review_skill_root=trusted_review_skill_root,
         trusted_guard_path=trusted_guard_path,
+        trusted_runtime_init_path=trusted_runtime_init_path,
         trusted_runtime_path=trusted_runtime_path,
         trusted_bootstrap_path=trusted_bootstrap_path,
         trusted_manifest_path=trusted_manifest_path,
@@ -337,6 +375,12 @@ def _main(
             trusted_guard_path,
             trusted_guard_bytes,
             "trusted named-lane guard",
+            MAX_SOURCE_BYTES,
+        ),
+        (
+            trusted_runtime_init_path,
+            trusted_runtime_init_bytes,
+            "trusted report runtime package",
             MAX_SOURCE_BYTES,
         ),
         (
@@ -386,6 +430,27 @@ def _main(
             )
         receiver_bound = bound_files[trusted_receiver_path]
         schema_bound = bound_files[trusted_schema_path]
+        for path, relative_path, label in (
+            (
+                trusted_runtime_init_path,
+                RUNTIME_INIT_RELATIVE_PATH,
+                "trusted report runtime package",
+            ),
+            (
+                trusted_runtime_path,
+                RUNTIME_RELATIVE_PATH,
+                "trusted report guard runtime",
+            ),
+            (
+                trusted_bootstrap_path,
+                BOOTSTRAP_RELATIVE_PATH,
+                "trusted binding runtime",
+            ),
+        ):
+            if getattr(bound_files[path], "sha256", None) != records[relative_path]:
+                raise ReadOnlyReportGuardError(
+                    f"{label} digest does not match the control manifest"
+                )
         receiver_sha256 = getattr(receiver_bound, "sha256", None)
         schema_sha256 = getattr(schema_bound, "sha256", None)
         if receiver_sha256 != records[RECEIVER_RELATIVE_PATH]:

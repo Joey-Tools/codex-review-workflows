@@ -54,9 +54,12 @@ unavailable or blocked kinds contain none. Invoke the parent-validated,
 previously trusted bundle's absolute
 `named_lane_guard validate-read-only-pr-report -` profile once through the
 canonical Python `-I -B -S` launcher. Its machine control manifest binds the
-loader/profile version and exact SHA-256 of both
-[`read_only_pr_report.py`](scripts/read_only_pr_report.py) and the closed
-schema-v8. The profile retains descriptor-bound receiver/schema bytes,
+loader/profile version and exact SHA-256 of the three-source runtime closure,
+[`read_only_pr_report.py`](scripts/read_only_pr_report.py), and the closed
+schema-v8. The prior-trusted canonical bundle manifest is the external trust
+root for `named_lane_guard` itself; the guard validates its fixed machine
+manifest digest and every listed source digest before compiling any profile
+runtime. The profile retains descriptor-bound control/receiver/schema bytes,
 raw-compiles only the retained receiver, injects only the retained schema,
 applies its stdlib-only closed Draft 2020-12 evaluator first, and then runs
 cross-field semantics. It withholds acceptance until terminal content,
@@ -331,7 +334,7 @@ The `isolated_review` helper retains a frozen supplied-diff runtime backed by a 
 - [named_claude_preflight](scripts/named_claude_preflight): compatibility wrapper for the required publisher-first compatible-version and advertised-capability selector loaded by the formal guard `preflight-claude` profile.
 - [read_only_pr_report.py](scripts/read_only_pr_report.py): closed delivery-handoff validator plus fresh instance-binding generator and manifest-bound schema/semantic receiver for terminal read-only PR probe reports.
 - [read_only_report_guard.py](scripts/review_runtime/read_only_report_guard.py): `-S`-compatible transaction runtime behind the trusted `validate-read-only-pr-report` guard profile.
-- [read-only-pr-report-control-manifest.json](references/read-only-pr-report-control-manifest.json): machine binding for the report guard profile, receiver, and schema digests.
+- [read-only-pr-report-control-manifest.json](references/read-only-pr-report-control-manifest.json): machine binding for the report guard profile, complete runtime-source closure, receiver, and schema digests; the prior-trusted canonical bundle remains the external guard trust root.
 - [pr-readiness.md](references/pr-readiness.md): PR authorization, current-head GitHub Codex, CI/comments, fix loop, and merge-ready reporting.
 - [pr-readiness-read-only-report.schema.json](references/pr-readiness-read-only-report.schema.json): closed terminal result for the delivery read-only PR evidence probe.
 - [review-prompt-templates.md](references/review-prompt-templates.md): fresh-context prompt templates.
