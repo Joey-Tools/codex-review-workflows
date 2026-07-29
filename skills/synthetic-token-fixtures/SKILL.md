@@ -44,16 +44,42 @@ catalog_guard="$trusted_bundle_root/skills/review-orchestration-playbook/scripts
    caller-provided catalog path for the review skill.
 2. Require a successful versioned-release binding. The guard derives the
    resolver from its own manifest-bound co-release instead of accepting a
-   resolver path. Before any resolver byte executes, the trusted bootstrap
-   opens every target with POSIX `O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`, validates
-   regular-file type, current-user ownership, non-writable access policy,
-   descriptor/path identity, stable complete content, the co-release
-   `sync-manifest.json`, and exact equality with the control-manifest source
-   bytes. It then compiles and executes those same bound resolver bytes
-   in-process, retains the descriptors, and withholds stdout and raw values
-   until final identity/content revalidation succeeds. A symlink, malicious
-   leaf replacement, or loaded-skill root from another release therefore
-   cannot run through the resolver path or publish a result.
+   resolver path. Before the bootstrap compiles any co-release resolver byte,
+   and before that resolver compiles any catalog-runtime byte, the responsible
+   layer opens the complete absolute ancestor chain and every leaf with POSIX
+   `O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`. It validates regular-file type,
+   current-user ownership, descriptor/path identity, stable complete content,
+   the co-release `sync-manifest.json`, and exact equality with the
+   control-manifest source bytes.
+
+   Access-policy validation is property-scoped: the protected property is that
+   no non-owner can write, append, delete, replace, add a child, change
+   security, or take ownership of a bound release object. On macOS the guard
+   resolves the file owner's UUID and rejects any extended-ACL allow entry for
+   another principal that carries one of those mutation rights, even when the
+   POSIX mode remains `0755` or `0644`. Owner-only mutation entries, read-only
+   entries, and deny entries remain admissible. On Linux the guard first uses
+   descriptor-scoped `fstatfs` to admit only a closed set of local filesystems
+   whose access model is either mode-only or Linux POSIX ACL, where the ACL
+   mask is represented by the group mode bits. The admitted set is ext2/3/4,
+   XFS, Btrfs, F2FS, tmpfs, and ramfs. NFS/NFSv4, CIFS/SMB, FUSE, ZFS, 9P,
+   overlayfs, and unknown filesystem types fail closed because mode bits alone
+   do not prove their ACL semantics or the access model of a stacked lower
+   layer. ACL lookup, filesystem-model inspection, enumeration, owner mapping,
+   or permission decoding failure is a distinct fail-closed access-policy
+   error.
+
+   The guard also binds BSD flags that change write, unlink, namespace, or
+   protected-data semantics and requires those selected flags to remain exact.
+   It deliberately ignores unrelated metadata flags such as hidden, archived,
+   tracked, compressed, and no-dump, as well as timestamp and directory-entry
+   churn that does not change object identity, content, or the protected access
+   property. It then compiles and executes only the already bound resolver
+   bytes in-process, retains every release leaf and ancestor descriptor, and
+   withholds stdout and raw values until terminal identity, content,
+   access-policy, and selected-flag revalidation succeeds. A symlink,
+   malicious leaf replacement, unsafe ACL, or loaded-skill root from another
+   release therefore cannot run through the resolver path or publish a result.
 
    The resolver independently repeats the release-to-leaf binding, validates
    the explicitly loaded skill root and sibling review skill from the same
@@ -86,15 +112,17 @@ catalog_guard="$trusted_bundle_root/skills/review-orchestration-playbook/scripts
    value.
 
    Each invocation is one controlled in-process transaction. It retains the
-   active interpreter, trusted bootstrap, resolver, trusted runtime manifest,
-   dedicated catalog entry, four source modules, and catalog descriptor
-   bindings; executes the resolver and catalog entry only from
+   active interpreter, trusted bootstrap, resolver, loaded synthetic skill,
+   release sync manifest, trusted runtime manifest, dedicated catalog entry,
+   four source modules, catalog, and every absolute ancestor-directory
+   descriptor binding; executes the resolver and catalog entry only from
    manifest-bound source snapshots through closed source loaders that ignore
    `__pycache__` and never load bytecode; captures and validates the operation
    result and `pool_version`; removes the temporary module namespace; and
-   closes the bound descriptors before publishing the result envelope. It
-   never executes the resolver or returned CLI as a path, and there is no
-   validate-path / execute-path / revalidate-path window.
+   revalidates access policy, selected security flags, object identity, and
+   retained content before closing the descriptors and publishing the result
+   envelope. It never executes the resolver or returned CLI as a path, and
+   there is no validate-path / execute-path / revalidate-path window.
 
 The resolver is an execution guard, not a second token CLI. It never accepts a
 catalog or review-skill path, never defines token values, and exposes raw value

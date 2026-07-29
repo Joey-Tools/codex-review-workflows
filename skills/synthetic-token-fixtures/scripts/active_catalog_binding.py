@@ -29,6 +29,7 @@ if not (
 # current-directory json.py/argparse.py must never execute before validation.
 import argparse
 import contextlib
+import errno
 import hashlib
 import importlib
 import importlib.machinery
@@ -67,10 +68,307 @@ RUNTIME_SOURCE_PATHS = {
 RUNTIME_DATA_PATHS = {
     "synthetic-token-catalog": ("scripts/review_runtime/synthetic-token-catalog.json"),
 }
+# These local filesystems expose either no ACL or Linux POSIX ACL semantics,
+# where the ACL mask is the inode's group mode class. Remote, programmable,
+# and unclassified stacked filesystems are deliberately absent because
+# fstatfs alone cannot prove that richer ACLs are constrained by those bits.
+_LINUX_POSIX_ACL_FILESYSTEMS = {
+    0x0000EF53: "ext2/ext3/ext4",
+    0x01021994: "tmpfs",
+    0x58465342: "XFS",
+    0x858458F6: "ramfs",
+    0x9123683E: "Btrfs",
+    0xF2F52010: "F2FS",
+}
+_LINUX_UNVERIFIED_ACL_FILESYSTEMS = {
+    0x01021997: "9P",
+    0x2FC12FC1: "ZFS",
+    0x5346414F: "AFS",
+    0x65735546: "FUSE",
+    0x00006969: "NFS/NFSv4",
+    0x73757245: "CODA",
+    0x794C7630: "overlayfs",
+    0xFF534D42: "CIFS/SMB",
+}
+_DARWIN_ACL_TYPE_EXTENDED = 0x00000100
+_DARWIN_ACL_FIRST_ENTRY = 0
+_DARWIN_ACL_NEXT_ENTRY = -1
+_DARWIN_ACL_EXTENDED_ALLOW = 1
+_DARWIN_ACL_EXTENDED_DENY = 2
+_DARWIN_MUTATING_ACL_PERMISSIONS = (
+    (1 << 2)  # WRITE_DATA / ADD_FILE
+    | (1 << 4)  # DELETE
+    | (1 << 5)  # APPEND_DATA / ADD_SUBDIRECTORY
+    | (1 << 6)  # DELETE_CHILD
+    | (1 << 8)  # WRITE_ATTRIBUTES
+    | (1 << 10)  # WRITE_EXTATTRIBUTES
+    | (1 << 12)  # WRITE_SECURITY
+    | (1 << 13)  # CHANGE_OWNER
+)
+# Bind only flags that change write, unlink, namespace, or protected-data
+# semantics. NODUMP, COMPRESSED, TRACKED, HIDDEN, and ARCHIVED are deliberately
+# excluded because their churn does not change the protected access property.
+_DARWIN_ACCESS_POLICY_FLAGS = (
+    0x00000002  # UF_IMMUTABLE
+    | 0x00000004  # UF_APPEND
+    | 0x00000008  # UF_OPAQUE
+    | 0x00000010  # UF_NOUNLINK
+    | 0x00000080  # UF_DATAVAULT
+    | 0x00020000  # SF_IMMUTABLE
+    | 0x00040000  # SF_APPEND
+    | 0x00080000  # SF_RESTRICTED
+    | 0x00100000  # SF_NOUNLINK
+    | 0x00200000  # SF_SNAPSHOT
+    | 0x00800000  # SF_FIRMLINK
+    | 0xC0000000  # SF_SYNTHETIC, including SF_DATALESS
+)
+_DARWIN_BENIGN_METADATA_FLAGS = (
+    0x00000001  # UF_NODUMP
+    | 0x00000020  # UF_COMPRESSED
+    | 0x00000040  # UF_TRACKED
+    | 0x00008000  # UF_HIDDEN
+    | 0x00010000  # SF_ARCHIVED
+)
+_DARWIN_KNOWN_STAT_FLAGS = _DARWIN_ACCESS_POLICY_FLAGS | _DARWIN_BENIGN_METADATA_FLAGS
+_LINUX_STATFS_API: tuple[Any, Any] | None = None
+_DARWIN_ACL_API: tuple[Any, Any] | None = None
 
 
 class BindingError(RuntimeError):
     pass
+
+
+def _linux_statfs_api() -> tuple[Any, Any]:
+    global _LINUX_STATFS_API
+    if not sys.platform.startswith("linux"):
+        raise BindingError(
+            "Linux filesystem inspection was requested on another platform"
+        )
+    if _LINUX_STATFS_API is not None:
+        return _LINUX_STATFS_API
+    try:
+        import ctypes
+
+        library = ctypes.CDLL(None, use_errno=True)
+        library.fstatfs.argtypes = (ctypes.c_int, ctypes.c_void_p)
+        library.fstatfs.restype = ctypes.c_int
+    except (AttributeError, ImportError, OSError) as error:
+        raise BindingError(
+            f"Linux filesystem inspection primitives are unavailable: {error}"
+        ) from error
+    _LINUX_STATFS_API = ctypes, library
+    return _LINUX_STATFS_API
+
+
+def _linux_filesystem_type(descriptor: int, *, label: str) -> int:
+    ctypes, library = _linux_statfs_api()
+    # Linux struct statfs is smaller than this aligned buffer on every
+    # supported libc ABI. Its first __fsword_t is the filesystem magic.
+    storage = (ctypes.c_long * 128)()
+    ctypes.set_errno(0)
+    if library.fstatfs(descriptor, ctypes.byref(storage)) != 0:
+        error_number = ctypes.get_errno()
+        detail = os.strerror(error_number) if error_number else "unknown error"
+        raise BindingError(
+            f"{label} filesystem ACL semantics cannot be inspected: "
+            f"fstatfs failed: {detail}"
+        )
+    return int(storage[0]) & 0xFFFFFFFF
+
+
+def _require_linux_posix_acl_filesystem(
+    filesystem_type: int,
+    *,
+    label: str,
+) -> None:
+    normalized = filesystem_type & 0xFFFFFFFF
+    if normalized in _LINUX_POSIX_ACL_FILESYSTEMS:
+        return
+    filesystem_name = _LINUX_UNVERIFIED_ACL_FILESYSTEMS.get(
+        normalized,
+        "unknown",
+    )
+    raise BindingError(
+        f"{label} filesystem {filesystem_name} (0x{normalized:08x}) "
+        "has unverified ACL semantics"
+    )
+
+
+def _darwin_acl_api() -> tuple[Any, Any]:
+    global _DARWIN_ACL_API
+    if sys.platform != "darwin":
+        raise BindingError("Darwin ACL inspection was requested on another platform")
+    if _DARWIN_ACL_API is not None:
+        return _DARWIN_ACL_API
+    try:
+        import ctypes
+
+        library = ctypes.CDLL(None, use_errno=True)
+        library.acl_get_fd_np.argtypes = (ctypes.c_int, ctypes.c_int)
+        library.acl_get_fd_np.restype = ctypes.c_void_p
+        library.acl_valid.argtypes = (ctypes.c_void_p,)
+        library.acl_valid.restype = ctypes.c_int
+        library.acl_get_entry.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_void_p),
+        )
+        library.acl_get_entry.restype = ctypes.c_int
+        library.acl_get_tag_type.argtypes = (
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int),
+        )
+        library.acl_get_tag_type.restype = ctypes.c_int
+        library.acl_get_permset_mask_np.argtypes = (
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint64),
+        )
+        library.acl_get_permset_mask_np.restype = ctypes.c_int
+        library.acl_get_qualifier.argtypes = (ctypes.c_void_p,)
+        library.acl_get_qualifier.restype = ctypes.c_void_p
+        library.acl_free.argtypes = (ctypes.c_void_p,)
+        library.acl_free.restype = ctypes.c_int
+        library.mbr_uid_to_uuid.argtypes = (
+            ctypes.c_uint,
+            ctypes.POINTER(ctypes.c_ubyte),
+        )
+        library.mbr_uid_to_uuid.restype = ctypes.c_int
+    except (AttributeError, ImportError, OSError) as error:
+        raise BindingError(
+            f"Darwin ACL inspection primitives are unavailable: {error}"
+        ) from error
+    _DARWIN_ACL_API = ctypes, library
+    return _DARWIN_ACL_API
+
+
+def _darwin_acl_error(operation: str) -> str:
+    ctypes, _library = _darwin_acl_api()
+    error_number = ctypes.get_errno()
+    detail = os.strerror(error_number) if error_number else "unknown error"
+    return f"{operation} failed: {detail}"
+
+
+def _darwin_owner_uuid(uid: int, *, label: str) -> bytes:
+    ctypes, library = _darwin_acl_api()
+    owner_uuid = (ctypes.c_ubyte * 16)()
+    result = library.mbr_uid_to_uuid(uid, owner_uuid)
+    if result != 0:
+        detail = os.strerror(result) if result > 0 else f"status {result}"
+        raise BindingError(f"{label} owner UUID cannot be resolved: {detail}")
+    return bytes(owner_uuid)
+
+
+def _validate_darwin_acl(
+    descriptor: int,
+    *,
+    owner_uid: int,
+    label: str,
+) -> None:
+    ctypes, library = _darwin_acl_api()
+    ctypes.set_errno(0)
+    acl = library.acl_get_fd_np(descriptor, _DARWIN_ACL_TYPE_EXTENDED)
+    if not acl:
+        if ctypes.get_errno() == errno.ENOENT:
+            return
+        raise BindingError(
+            f"{label} access policy cannot be inspected: "
+            f"{_darwin_acl_error('acl_get_fd_np')}"
+        )
+    try:
+        if library.acl_valid(acl) != 0:
+            raise BindingError(
+                f"{label} access policy is invalid: {_darwin_acl_error('acl_valid')}"
+            )
+        entry = ctypes.c_void_p()
+        entry_id = _DARWIN_ACL_FIRST_ENTRY
+        while True:
+            ctypes.set_errno(0)
+            result = library.acl_get_entry(acl, entry_id, ctypes.byref(entry))
+            if result == -1 and ctypes.get_errno() == errno.EINVAL:
+                break
+            if result != 0:
+                raise BindingError(
+                    f"{label} access policy cannot be enumerated: "
+                    f"{_darwin_acl_error('acl_get_entry')}"
+                )
+            tag = ctypes.c_int()
+            if library.acl_get_tag_type(entry, ctypes.byref(tag)) != 0:
+                raise BindingError(
+                    f"{label} access policy tag cannot be inspected: "
+                    f"{_darwin_acl_error('acl_get_tag_type')}"
+                )
+            if tag.value not in {
+                _DARWIN_ACL_EXTENDED_ALLOW,
+                _DARWIN_ACL_EXTENDED_DENY,
+            }:
+                raise BindingError(f"{label} access policy has an unknown ACL tag")
+            permissions = ctypes.c_uint64()
+            if (
+                library.acl_get_permset_mask_np(
+                    entry,
+                    ctypes.byref(permissions),
+                )
+                != 0
+            ):
+                raise BindingError(
+                    f"{label} access policy permissions cannot be inspected: "
+                    f"{_darwin_acl_error('acl_get_permset_mask_np')}"
+                )
+            if (
+                tag.value == _DARWIN_ACL_EXTENDED_ALLOW
+                and permissions.value & _DARWIN_MUTATING_ACL_PERMISSIONS
+            ):
+                ctypes.set_errno(0)
+                qualifier = library.acl_get_qualifier(entry)
+                if not qualifier:
+                    raise BindingError(
+                        f"{label} access policy qualifier cannot be inspected: "
+                        f"{_darwin_acl_error('acl_get_qualifier')}"
+                    )
+                try:
+                    subject_uuid = ctypes.string_at(qualifier, 16)
+                finally:
+                    library.acl_free(qualifier)
+                if subject_uuid != _darwin_owner_uuid(owner_uid, label=label):
+                    raise BindingError(
+                        f"{label} grants non-owner mutation through an extended ACL"
+                    )
+            entry_id = _DARWIN_ACL_NEXT_ENTRY
+    finally:
+        library.acl_free(acl)
+
+
+def _validate_access_policy(
+    metadata: os.stat_result,
+    descriptor: int,
+    *,
+    label: str,
+) -> int:
+    """Validate the non-owner mutation property and bind security flags."""
+    if sys.platform.startswith("linux"):
+        filesystem_type = _linux_filesystem_type(descriptor, label=label)
+        _require_linux_posix_acl_filesystem(filesystem_type, label=label)
+        # On the closed filesystem set, a POSIX ACL mutation grant is bounded
+        # by the group mode class already rejected by the mode-policy check.
+        return 0
+    if sys.platform != "darwin":
+        raise BindingError(
+            f"{label} access policy cannot be verified on {sys.platform}"
+        )
+    raw_flags = getattr(metadata, "st_flags", None)
+    if not isinstance(raw_flags, int) or isinstance(raw_flags, bool):
+        raise BindingError(f"{label} security flags cannot be inspected")
+    unknown_flags = raw_flags & ~_DARWIN_KNOWN_STAT_FLAGS
+    if unknown_flags:
+        raise BindingError(
+            f"{label} has unknown security-relevant flags 0x{unknown_flags:x}"
+        )
+    _validate_darwin_acl(
+        descriptor,
+        owner_uid=metadata.st_uid,
+        label=label,
+    )
+    return raw_flags & _DARWIN_ACCESS_POLICY_FLAGS
 
 
 def _require_safe_file_primitives() -> None:
@@ -150,11 +448,13 @@ class _BoundDirectory:
         path: Path,
         descriptor: int,
         identity: tuple[int, int, int, int],
+        access_policy_flags: int,
         parent: _BoundDirectory | None,
     ) -> None:
         self.path = path
         self.descriptor = descriptor
         self.identity = identity
+        self.access_policy_flags = access_policy_flags
         self.parent = parent
 
     def close(self, *, revalidate: bool = False) -> None:
@@ -174,6 +474,17 @@ class _BoundDirectory:
                     raise BindingError(
                         f"bound directory identity changed for {self.path}"
                     )
+                if (
+                    _validate_access_policy(
+                        current,
+                        descriptor,
+                        label=f"bound directory {self.path}",
+                    )
+                    != self.access_policy_flags
+                ):
+                    raise BindingError(
+                        f"bound directory security flags changed for {self.path}"
+                    )
                 if self.parent is not None:
                     lexical = os.stat(
                         self.path.name,
@@ -188,6 +499,26 @@ class _BoundDirectory:
                         raise BindingError(
                             f"bound parent entry identity changed for {self.path}"
                         )
+                final = os.fstat(descriptor)
+                _validate_directory_policy(
+                    final,
+                    label=f"final bound directory {self.path}",
+                )
+                if _directory_identity(final) != self.identity:
+                    raise BindingError(
+                        f"bound directory identity changed for {self.path}"
+                    )
+                if (
+                    _validate_access_policy(
+                        final,
+                        descriptor,
+                        label=f"final bound directory {self.path}",
+                    )
+                    != self.access_policy_flags
+                ):
+                    raise BindingError(
+                        f"bound directory security flags changed for {self.path}"
+                    )
         except (BindingError, OSError) as error:
             validation_error = (
                 error
@@ -213,6 +544,7 @@ class _BoundFile:
         path: Path,
         descriptor: int,
         identity: tuple[int, int, int, int, int],
+        access_policy_flags: int,
         payload: bytes | None,
         sha256: str,
         limit: int,
@@ -221,6 +553,7 @@ class _BoundFile:
         self.path = path
         self.descriptor = descriptor
         self.identity = identity
+        self.access_policy_flags = access_policy_flags
         self.payload = payload
         self.sha256 = sha256
         self.limit = limit
@@ -238,6 +571,17 @@ class _BoundFile:
                 if _file_identity(metadata) != self.identity:
                     raise BindingError(
                         f"bound descriptor identity changed for {self.path}"
+                    )
+                if (
+                    _validate_access_policy(
+                        metadata,
+                        descriptor,
+                        label=f"bound descriptor {self.path}",
+                    )
+                    != self.access_policy_flags
+                ):
+                    raise BindingError(
+                        f"bound descriptor security flags changed for {self.path}"
                     )
                 _payload, digest, size = _read_descriptor(
                     descriptor,
@@ -263,6 +607,22 @@ class _BoundFile:
                         raise BindingError(
                             f"bound parent entry identity changed for {self.path}"
                         )
+                final = os.fstat(descriptor)
+                if _file_identity(final) != self.identity:
+                    raise BindingError(
+                        f"bound descriptor identity changed for {self.path}"
+                    )
+                if (
+                    _validate_access_policy(
+                        final,
+                        descriptor,
+                        label=f"final bound descriptor {self.path}",
+                    )
+                    != self.access_policy_flags
+                ):
+                    raise BindingError(
+                        f"bound descriptor security flags changed for {self.path}"
+                    )
         except (BindingError, OSError) as error:
             validation_error = (
                 error
@@ -362,6 +722,11 @@ def _open_bound_file(
             raise BindingError(f"{label} is group/world writable")
         if opened.st_size > limit:
             raise BindingError(f"{label} exceeds its byte limit")
+        access_policy_flags = _validate_access_policy(
+            opened,
+            descriptor,
+            label=label,
+        )
 
         payload, digest, size = _read_descriptor(
             descriptor,
@@ -379,6 +744,15 @@ def _open_bound_file(
         if _file_identity(final) != _file_identity(opened):
             raise BindingError(f"{label} identity changed during the validated read")
         if (
+            _validate_access_policy(
+                final,
+                descriptor,
+                label=f"final {label}",
+            )
+            != access_policy_flags
+        ):
+            raise BindingError(f"{label} security flags changed during binding")
+        if (
             size != opened.st_size
             or repeated_size != size
             or repeated_digest != digest
@@ -389,6 +763,7 @@ def _open_bound_file(
             path=path,
             descriptor=descriptor,
             identity=_file_identity(opened),
+            access_policy_flags=access_policy_flags,
             payload=payload,
             sha256=digest,
             limit=limit,
@@ -427,14 +802,24 @@ class _BindingTransaction:
                 | os.O_NOFOLLOW
                 | os.O_NONBLOCK,
             )
-            metadata = os.fstat(descriptor)
-            _validate_directory_policy(metadata, label="absolute path root")
-            root = _BoundDirectory(
-                path=root_path,
-                descriptor=descriptor,
-                identity=_directory_identity(metadata),
-                parent=None,
-            )
+            try:
+                metadata = os.fstat(descriptor)
+                _validate_directory_policy(metadata, label="absolute path root")
+                access_policy_flags = _validate_access_policy(
+                    metadata,
+                    descriptor,
+                    label="absolute path root",
+                )
+                root = _BoundDirectory(
+                    path=root_path,
+                    descriptor=descriptor,
+                    identity=_directory_identity(metadata),
+                    access_policy_flags=access_policy_flags,
+                    parent=None,
+                )
+            except BaseException:
+                os.close(descriptor)
+                raise
             self._directories.append(root)
             self._directories_by_path[root_path] = root
 
@@ -478,18 +863,44 @@ class _BindingTransaction:
                 raise BindingError(
                     f"{label} component {current} cannot be opened: {error}"
                 ) from error
-            opened = os.fstat(descriptor)
-            if _directory_identity(opened) != _directory_identity(lexical):
-                os.close(descriptor)
-                raise BindingError(
-                    f"{label} component {current} changed before binding"
+            try:
+                opened = os.fstat(descriptor)
+                if _directory_identity(opened) != _directory_identity(lexical):
+                    raise BindingError(
+                        f"{label} component {current} changed before binding"
+                    )
+                access_policy_flags = _validate_access_policy(
+                    opened,
+                    descriptor,
+                    label=f"{label} component {current}",
                 )
-            bound = _BoundDirectory(
-                path=current,
-                descriptor=descriptor,
-                identity=_directory_identity(opened),
-                parent=parent,
-            )
+                final = os.fstat(descriptor)
+                if _directory_identity(final) != _directory_identity(opened):
+                    raise BindingError(
+                        f"{label} component {current} changed during binding"
+                    )
+                if (
+                    _validate_access_policy(
+                        final,
+                        descriptor,
+                        label=f"final {label} component {current}",
+                    )
+                    != access_policy_flags
+                ):
+                    raise BindingError(
+                        f"{label} component {current} security flags changed "
+                        "during binding"
+                    )
+                bound = _BoundDirectory(
+                    path=current,
+                    descriptor=descriptor,
+                    identity=_directory_identity(opened),
+                    access_policy_flags=access_policy_flags,
+                    parent=parent,
+                )
+            except BaseException:
+                os.close(descriptor)
+                raise
             self._directories.append(bound)
             self._directories_by_path[current] = bound
             parent = bound
@@ -1345,6 +1756,7 @@ def _build_binding(
     synthetic_skill = transaction.bind(
         synthetic_root / "SKILL.md",
         label="loaded synthetic skill",
+        retain_descriptor=True,
         parent=transaction.directory(synthetic_root),
     )
 
@@ -1353,6 +1765,7 @@ def _build_binding(
     manifest_bound = transaction.bind(
         sync_manifest,
         label="release sync manifest",
+        retain_descriptor=True,
         parent=transaction.directory(payload_root),
     )
     if manifest_bound.payload is None:

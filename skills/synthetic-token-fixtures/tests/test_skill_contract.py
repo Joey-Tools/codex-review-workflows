@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import ast
 import contextlib
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import shutil
 import subprocess
@@ -21,6 +24,9 @@ SKILL = SKILL_ROOT / "SKILL.md"
 TEMPLATES = SKILL_ROOT / "references" / "fixture-templates.md"
 BINDING_RESOLVER = SKILL_ROOT / "scripts" / "active_catalog_binding.py"
 BINDING_GUARD = REVIEW_SKILL_ROOT / "scripts" / "named_lane_guard"
+CATALOG_BOOTSTRAP = (
+    REVIEW_SKILL_ROOT / "scripts" / "review_runtime" / "catalog_bootstrap.py"
+)
 REVIEW_REFERENCE = REVIEW_SKILL_ROOT / "references" / "synthetic-token-fixtures.md"
 RELEASE_ID = "a" * 40
 RUNTIME_MANIFEST_RELATIVE = (
@@ -29,6 +35,49 @@ RUNTIME_MANIFEST_RELATIVE = (
 
 
 class SyntheticTokenSkillContractTest(unittest.TestCase):
+    def load_catalog_bootstrap(self):
+        spec = importlib.util.spec_from_file_location(
+            "_synthetic_token_test_catalog_bootstrap",
+            CATALOG_BOOTSTRAP,
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def literal_assignment(self, source: Path, name: str):
+        syntax = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        for statement in syntax.body:
+            if not isinstance(statement, ast.Assign):
+                continue
+            if any(
+                isinstance(target, ast.Name) and target.id == name
+                for target in statement.targets
+            ):
+                return ast.literal_eval(statement.value)
+        self.fail(f"{source} does not define {name}")
+
+    def normalized_function_ast(self, source: Path, name: str) -> str:
+        syntax = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        function = next(
+            (
+                statement
+                for statement in syntax.body
+                if isinstance(statement, ast.FunctionDef) and statement.name == name
+            ),
+            None,
+        )
+        self.assertIsNotNone(function, f"{source} does not define {name}")
+        normalized = ast.unparse(function).replace(
+            "BindingError",
+            "CatalogBootstrapError",
+        )
+        return ast.dump(
+            ast.parse(normalized).body[0],
+            include_attributes=False,
+        )
+
     def rotate_runtime_manifest(
         self,
         review_root: Path,
@@ -168,6 +217,40 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
             cwd=cwd,
         )
 
+    def add_macos_acl(self, path: Path, rule: str) -> None:
+        completed = subprocess.run(
+            ("/bin/chmod", "+a", rule, str(path)),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+        if completed.returncode != 0 and "not supported" in completed.stderr.lower():
+            self.skipTest(
+                f"test filesystem does not support macOS ACLs: {completed.stderr}"
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def remove_macos_acl(self, path: Path) -> None:
+        completed = subprocess.run(
+            ("/bin/chmod", "-N", str(path)),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    @contextlib.contextmanager
+    def macos_acl(self, path: Path, rule: str):
+        self.add_macos_acl(path, rule)
+        try:
+            yield
+        finally:
+            self.remove_macos_acl(path)
+
     def test_skill_routes_only_bound_authoring_catalog_surface(self) -> None:
         skill = SKILL.read_text(encoding="utf-8")
         templates = TEMPLATES.read_text(encoding="utf-8")
@@ -194,6 +277,11 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
             "never accepts a catalog or review-skill path",
             "O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC",
             "one controlled in-process transaction",
+            "extended-ACL allow entry",
+            "owner's UUID",
+            "descriptor-scoped `fstatfs`",
+            "selected security flags",
+            "timestamp and directory-entry churn",
             "`--expect-binding-sha256` is mandatory",
             "only `bind` may omit it",
             "manifest-bound source snapshots",
@@ -227,6 +315,138 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
         self.assertTrue(BINDING_RESOLVER.is_file())
         self.assertTrue(BINDING_GUARD.is_file())
         self.assertFalse((SKILL_ROOT / "synthetic-token-catalog.json").exists())
+
+    def test_linux_acl_filesystem_classification_is_closed_and_co_release(self) -> None:
+        expected_posix = {
+            0x0000EF53: "ext2/ext3/ext4",
+            0x01021994: "tmpfs",
+            0x58465342: "XFS",
+            0x858458F6: "ramfs",
+            0x9123683E: "Btrfs",
+            0xF2F52010: "F2FS",
+        }
+        expected_unverified = {
+            0x01021997: "9P",
+            0x2FC12FC1: "ZFS",
+            0x5346414F: "AFS",
+            0x65735546: "FUSE",
+            0x00006969: "NFS/NFSv4",
+            0x73757245: "CODA",
+            0x794C7630: "overlayfs",
+            0xFF534D42: "CIFS/SMB",
+        }
+        for function_name in (
+            "_linux_statfs_api",
+            "_linux_filesystem_type",
+            "_require_linux_posix_acl_filesystem",
+            "_validate_access_policy",
+        ):
+            with self.subTest(shared_function=function_name):
+                self.assertEqual(
+                    self.normalized_function_ast(
+                        BINDING_RESOLVER,
+                        function_name,
+                    ),
+                    self.normalized_function_ast(
+                        CATALOG_BOOTSTRAP,
+                        function_name,
+                    ),
+                )
+        for source in (BINDING_RESOLVER, CATALOG_BOOTSTRAP):
+            with self.subTest(source=source.name):
+                self.assertEqual(
+                    self.literal_assignment(
+                        source,
+                        "_LINUX_POSIX_ACL_FILESYSTEMS",
+                    ),
+                    expected_posix,
+                )
+                self.assertEqual(
+                    self.literal_assignment(
+                        source,
+                        "_LINUX_UNVERIFIED_ACL_FILESYSTEMS",
+                    ),
+                    expected_unverified,
+                )
+                syntax = ast.parse(
+                    source.read_text(encoding="utf-8"),
+                    filename=str(source),
+                )
+                access_policy = next(
+                    statement
+                    for statement in syntax.body
+                    if isinstance(statement, ast.FunctionDef)
+                    and statement.name == "_validate_access_policy"
+                )
+                called_names = {
+                    node.func.id
+                    for node in ast.walk(access_policy)
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                }
+                self.assertIn("_linux_filesystem_type", called_names)
+                self.assertIn(
+                    "_require_linux_posix_acl_filesystem",
+                    called_names,
+                )
+
+        bootstrap = self.load_catalog_bootstrap()
+        for filesystem_type in expected_posix:
+            with self.subTest(allowed=hex(filesystem_type)):
+                bootstrap._require_linux_posix_acl_filesystem(
+                    filesystem_type,
+                    label="release object",
+                )
+        for filesystem_type, filesystem_name in expected_unverified.items():
+            with self.subTest(rejected=filesystem_name):
+                with self.assertRaisesRegex(
+                    bootstrap.CatalogBootstrapError,
+                    rf"filesystem {re.escape(filesystem_name)} .*"
+                    r"has unverified ACL semantics",
+                ):
+                    bootstrap._require_linux_posix_acl_filesystem(
+                        filesystem_type,
+                        label="release object",
+                    )
+        with self.assertRaisesRegex(
+            bootstrap.CatalogBootstrapError,
+            r"filesystem unknown \(0xdeadbeef\) has unverified ACL semantics",
+        ):
+            bootstrap._require_linux_posix_acl_filesystem(
+                0xDEADBEEF,
+                label="release object",
+            )
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"),
+        "Linux descriptor-scoped fstatfs contract",
+    )
+    def test_linux_descriptor_filesystem_acl_model_fails_closed(self) -> None:
+        bootstrap = self.load_catalog_bootstrap()
+        descriptor = os.open(
+            CATALOG_BOOTSTRAP,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        try:
+            filesystem_type = bootstrap._linux_filesystem_type(
+                descriptor,
+                label="catalog bootstrap",
+            )
+        finally:
+            os.close(descriptor)
+        if filesystem_type in bootstrap._LINUX_POSIX_ACL_FILESYSTEMS:
+            bootstrap._require_linux_posix_acl_filesystem(
+                filesystem_type,
+                label="catalog bootstrap",
+            )
+        else:
+            with self.assertRaisesRegex(
+                bootstrap.CatalogBootstrapError,
+                r"has unverified ACL semantics",
+            ):
+                bootstrap._require_linux_posix_acl_filesystem(
+                    filesystem_type,
+                    label="catalog bootstrap",
+                )
 
     def test_catalog_values_are_not_handwritten_outside_the_catalog(self) -> None:
         catalog_path = (
@@ -975,6 +1195,226 @@ class SyntheticTokenSkillContractTest(unittest.TestCase):
                 f"{scripts_root} is group/world writable",
                 rejected.stderr,
             )
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS extended ACLs")
+    def test_macos_mutating_acl_grants_fail_closed_without_mode_changes(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "ancestor-delete-child",
+                lambda release: (
+                    release
+                    / "personal_codex"
+                    / "skills"
+                    / "synthetic-token-fixtures"
+                    / "scripts"
+                ),
+                "everyone allow add_file,delete_child",
+                0o755,
+            ),
+            (
+                "runtime-file-write",
+                lambda release: (
+                    release
+                    / "personal_codex"
+                    / "skills"
+                    / "review-orchestration-playbook"
+                    / "scripts"
+                    / "review_runtime"
+                    / "synthetic-token-catalog.json"
+                ),
+                "everyone allow write",
+                0o644,
+            ),
+        )
+        for case, target_for_release, rule, expected_mode in cases:
+            with self.subTest(case=case), self.installed_release() as release_root:
+                resolver = (
+                    release_root
+                    / "personal_codex"
+                    / "skills"
+                    / "synthetic-token-fixtures"
+                    / "scripts"
+                    / "active_catalog_binding.py"
+                )
+                target = target_for_release(release_root)
+                self.assertEqual(target.stat().st_mode & 0o777, expected_mode)
+                with self.macos_acl(target, rule):
+                    self.assertEqual(target.stat().st_mode & 0o777, expected_mode)
+
+                    rejected = self.run_binding(resolver)
+
+                    self.assertEqual(rejected.returncode, 2)
+                    self.assertEqual(rejected.stdout, "")
+                    self.assertIn(
+                        "grants non-owner mutation through an extended ACL",
+                        rejected.stderr,
+                    )
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS extended ACLs")
+    def test_macos_nonmutating_acl_entries_remain_admissible(self) -> None:
+        owner = pwd.getpwuid(os.geteuid()).pw_name
+        for rule in (
+            "everyone deny delete",
+            "everyone allow read",
+            f"user:{owner} allow write",
+        ):
+            with self.subTest(rule=rule), self.installed_release() as release_root:
+                resolver = (
+                    release_root
+                    / "personal_codex"
+                    / "skills"
+                    / "synthetic-token-fixtures"
+                    / "scripts"
+                    / "active_catalog_binding.py"
+                )
+                catalog = (
+                    release_root
+                    / "personal_codex"
+                    / "skills"
+                    / "review-orchestration-playbook"
+                    / "scripts"
+                    / "review_runtime"
+                    / "synthetic-token-catalog.json"
+                )
+                with self.macos_acl(catalog, rule):
+                    completed = self.run_binding(resolver)
+
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS extended ACLs")
+    def test_macos_acl_revalidation_is_property_scoped_at_transaction_end(
+        self,
+    ) -> None:
+        cases = (
+            ("everyone allow write", False),
+            ("everyone deny delete", True),
+        )
+        for rule, should_succeed in cases:
+            with self.subTest(rule=rule), self.installed_release() as release_root:
+                skills_root = release_root / "personal_codex" / "skills"
+                synthetic_root = skills_root / "synthetic-token-fixtures"
+                review_root = skills_root / "review-orchestration-playbook"
+                resolver = synthetic_root / "scripts" / "active_catalog_binding.py"
+                catalog = (
+                    review_root
+                    / "scripts"
+                    / "review_runtime"
+                    / "synthetic-token-catalog.json"
+                )
+                entry = review_root / "scripts" / "synthetic_catalog_entry"
+                entry.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "import subprocess\n\n"
+                    f"target = {str(catalog)!r}\n"
+                    f"rule = {rule!r}\n"
+                    "completed = subprocess.run(\n"
+                    "    ('/bin/chmod', '+a', rule, target),\n"
+                    "    check=False,\n"
+                    "    stdout=subprocess.PIPE,\n"
+                    "    stderr=subprocess.PIPE,\n"
+                    "    text=True,\n"
+                    ")\n"
+                    "if completed.returncode != 0:\n"
+                    "    raise RuntimeError(completed.stderr)\n\n"
+                    "from review_runtime.cli import catalog_main as main\n",
+                    encoding="utf-8",
+                )
+                self.rotate_runtime_manifest(
+                    review_root,
+                    changed_relative_paths=(Path("scripts/synthetic_catalog_entry"),),
+                )
+                bound = self.run_binding(resolver)
+                self.assertEqual(bound.returncode, 0, bound.stderr)
+                binding = json.loads(bound.stdout)
+
+                try:
+                    completed = self.run_binding(
+                        resolver,
+                        action="list",
+                        expected=binding["binding_sha256"],
+                    )
+                    if should_succeed:
+                        self.assertEqual(completed.returncode, 0, completed.stderr)
+                    else:
+                        self.assertEqual(completed.returncode, 2)
+                        self.assertEqual(completed.stdout, "")
+                        self.assertIn(
+                            "grants non-owner mutation through an extended ACL",
+                            completed.stderr,
+                        )
+                finally:
+                    self.remove_macos_acl(catalog)
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS BSD flags")
+    def test_macos_security_flags_are_bound_but_metadata_flags_are_ignored(
+        self,
+    ) -> None:
+        cases = (
+            ("opaque", "noopaque", "runtime-directory", False),
+            ("hidden", "nohidden", "catalog-file", True),
+        )
+        for flag, clear_flag, target_kind, should_succeed in cases:
+            with self.subTest(flag=flag), self.installed_release() as release_root:
+                skills_root = release_root / "personal_codex" / "skills"
+                synthetic_root = skills_root / "synthetic-token-fixtures"
+                review_root = skills_root / "review-orchestration-playbook"
+                resolver = synthetic_root / "scripts" / "active_catalog_binding.py"
+                runtime_root = review_root / "scripts" / "review_runtime"
+                target = (
+                    runtime_root
+                    if target_kind == "runtime-directory"
+                    else runtime_root / "synthetic-token-catalog.json"
+                )
+                entry = review_root / "scripts" / "synthetic_catalog_entry"
+                entry.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "import subprocess\n\n"
+                    f"target = {str(target)!r}\n"
+                    f"flag = {flag!r}\n"
+                    "completed = subprocess.run(\n"
+                    "    ('/usr/bin/chflags', flag, target),\n"
+                    "    check=False,\n"
+                    "    stdout=subprocess.PIPE,\n"
+                    "    stderr=subprocess.PIPE,\n"
+                    "    text=True,\n"
+                    ")\n"
+                    "if completed.returncode != 0:\n"
+                    "    raise RuntimeError(completed.stderr)\n\n"
+                    "from review_runtime.cli import catalog_main as main\n",
+                    encoding="utf-8",
+                )
+                self.rotate_runtime_manifest(
+                    review_root,
+                    changed_relative_paths=(Path("scripts/synthetic_catalog_entry"),),
+                )
+                bound = self.run_binding(resolver)
+                self.assertEqual(bound.returncode, 0, bound.stderr)
+                binding = json.loads(bound.stdout)
+
+                try:
+                    completed = self.run_binding(
+                        resolver,
+                        action="list",
+                        expected=binding["binding_sha256"],
+                    )
+                    if should_succeed:
+                        self.assertEqual(completed.returncode, 0, completed.stderr)
+                    else:
+                        self.assertEqual(completed.returncode, 2)
+                        self.assertEqual(completed.stdout, "")
+                        self.assertIn("security flags changed", completed.stderr)
+                finally:
+                    cleared = subprocess.run(
+                        ("/usr/bin/chflags", clear_flag, str(target)),
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(cleared.returncode, 0, cleared.stderr)
 
     def test_resolver_leaf_replacement_after_guard_binding_is_not_executed(
         self,

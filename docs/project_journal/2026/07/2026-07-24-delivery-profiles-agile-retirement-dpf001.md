@@ -3,7 +3,7 @@ id: 20260724-dpf001
 title: Unify Delivery Profiles And Retire Standalone Agile Delivery
 status: completed
 created: 2026-07-24
-updated: 2026-07-27
+updated: 2026-07-29
 branch: codex/delivery-profiles-agile-retirement-20260724
 pr: 83
 supersedes: []
@@ -174,6 +174,14 @@ superseded_by:
   Python interpreter starts it with `-I -B -S`, rejects a raw resolver leaf or
   parent-chain symlink before resolution, and binds the loaded-skill and
   co-release identity through the release `sync-manifest.json`.
+- The catalog bootstrap and active resolver now protect the release's effective
+  access policy in addition to owner/mode. macOS descriptors reject mutating
+  extended ACL entries for non-owner UUIDs and bind selected BSD security
+  flags, while harmless metadata/ACL churn remains outside the protected
+  property. Linux descriptors admit only an explicit local POSIX ACL
+  filesystem set through `fstatfs`; NFS/NFSv4, CIFS/SMB, FUSE, ZFS, 9P,
+  overlayfs, and unknown models fail closed instead of treating mode bits as
+  complete access evidence.
 - Each catalog bind, validation, metadata listing, or single-ID retrieval is
   one in-process transaction. It retains and revalidates the resolver,
   interpreter, trusted runtime manifest, dedicated catalog entry, four source
@@ -221,6 +229,19 @@ superseded_by:
 
 ## Evidence
 
+- The 2026-07-29 access-policy follow-up passed the synthetic fixture contract
+  (`20` tests, `1` Linux-only skip), focused review contracts (`99` tests),
+  delivery contracts (`45` tests), and the complete module-bounded
+  review-helper suite (`2,820` tests, `8` platform skips). The provider module
+  passed outside the outer sandbox (`947` tests, `3` skips) because its local
+  identity socket is intentionally unavailable inside that sandbox. The
+  workspace module passed outside the outer sandbox (`286` tests, `1` skip)
+  without the log runner's process-wide file-size limit, which otherwise
+  blocked its intentional 256 MiB+1 sparse-file boundary fixture.
+- Joey's installed skill validator accepted both changed skills; the project
+  journal validator, Ruff check/format, and `git diff --check` passed. A second
+  independent implementation review reported no findings after overlayfs was
+  removed from the Linux POSIX ACL allowlist.
 - `python3 -B -m unittest discover -s skills/change-delivery-workflow/tests
   -p 'test_*.py' -q` passed (`45` tests).
 - `python3 -B -m unittest` over the synthetic skill contract, synthetic runtime,

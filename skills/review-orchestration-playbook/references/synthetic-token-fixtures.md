@@ -130,6 +130,30 @@ specified by `synthetic-token-fixtures`; the shorthand above shows only the
 action contract. `list` returns authoring metadata only. `get` returns the raw
 value for exactly one selected authoring ID.
 
+Before the bootstrap compiles co-release resolver bytes, and before that
+resolver compiles catalog-runtime bytes, the responsible layer binds the full
+absolute ancestor chain and every release leaf through no-follow descriptors.
+The protected access property is narrow: no non-owner may write, append,
+delete, replace, add a child, change security, or take ownership. On macOS,
+descriptor-scoped extended ACLs are decoded against the owner UUID and any
+non-owner allow entry with a mutation right is rejected even when mode remains
+`0755` or `0644`; read-only, deny, and owner-only mutation entries remain
+valid. On Linux, descriptor-scoped `fstatfs` admits only ext2/3/4, XFS,
+Btrfs, F2FS, tmpfs, and ramfs, whose mode-only or POSIX ACL model reflects the
+effective ACL mask in group mode. NFS/NFSv4, CIFS/SMB, FUSE, ZFS, 9P,
+overlayfs, and unknown filesystem types fail closed because mode alone does
+not prove their ACL semantics or a stacked lower layer's access model.
+Access-policy inspection failures are neither missing-object nor
+identity-mismatch results and fail closed.
+
+BSD flags that alter write, unlink, namespace, or protected-data semantics are
+bound and must remain stable. Hidden, archived, tracked, compressed, and
+no-dump flags are ordinary metadata for this property and are not compared.
+Every retained leaf and ancestor descriptor is checked again after catalog
+execution and before buffered output is released; harmless timestamp,
+child-entry, read-only ACL, or deny-ACL churn does not masquerade as object or
+content replacement.
+
 `isolated_review synthetic-tokens ...` and direct
 `scripts/synthetic_catalog_entry` execution are unsupported and rejected before
 catalog loading or output. The entry remains an internal manifest companion
