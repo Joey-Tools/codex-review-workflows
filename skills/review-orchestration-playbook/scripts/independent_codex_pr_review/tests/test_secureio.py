@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import fcntl
 import os
 import pathlib
@@ -22,6 +23,7 @@ from review_supervisor.secureio import (
     atomic_write_json,
     canonical_json,
     decode_json_bytes,
+    directory_paths_equivalent,
     open_absolute_directory_chain,
     open_directory_at,
     open_regular_nofollow,
@@ -224,6 +226,66 @@ class PrivateDirectoryAnchorTests(unittest.TestCase):
                     )
             finally:
                 os.close(parent_fd)
+
+    def test_directory_equivalence_rejects_missing_leaf_creation(self) -> None:
+        with owned_temporary_directory("secureio-equivalence-create-") as root:
+            target = root / "retention"
+            original_open = secureio_module._open_directory_path_equivalence_snapshot
+            calls = 0
+
+            def open_then_create(
+                path: pathlib.Path,
+            ) -> secureio_module._DirectoryPathEquivalenceSnapshot:
+                nonlocal calls
+                snapshot = original_open(path)
+                calls += 1
+                if calls == 1:
+                    target.mkdir(mode=0o700)
+                return snapshot
+
+            with (
+                mock.patch.object(
+                    secureio_module,
+                    "_open_directory_path_equivalence_snapshot",
+                    side_effect=open_then_create,
+                ),
+                self.assertRaises(OSError) as caught,
+            ):
+                directory_paths_equivalent(target, target)
+
+            self.assertEqual(caught.exception.errno, errno.ESTALE)
+
+    def test_directory_equivalence_rejects_existing_target_replacement(self) -> None:
+        with owned_temporary_directory("secureio-equivalence-replace-") as root:
+            target = root / "retention"
+            target.mkdir(mode=0o700)
+            replacement = root / "replacement"
+            replacement.mkdir(mode=0o700)
+            original_open = secureio_module._open_directory_path_equivalence_snapshot
+            calls = 0
+
+            def open_then_replace(
+                path: pathlib.Path,
+            ) -> secureio_module._DirectoryPathEquivalenceSnapshot:
+                nonlocal calls
+                snapshot = original_open(path)
+                calls += 1
+                if calls == 1:
+                    target.rename(root / "displaced")
+                    replacement.rename(target)
+                return snapshot
+
+            with (
+                mock.patch.object(
+                    secureio_module,
+                    "_open_directory_path_equivalence_snapshot",
+                    side_effect=open_then_replace,
+                ),
+                self.assertRaises(OSError) as caught,
+            ):
+                directory_paths_equivalent(target, target)
+
+            self.assertEqual(caught.exception.errno, errno.ESTALE)
 
     def test_retention_lease_detects_root_replacement(self) -> None:
         cases = (

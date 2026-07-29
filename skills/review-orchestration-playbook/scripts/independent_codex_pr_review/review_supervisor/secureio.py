@@ -14,6 +14,7 @@ import sys
 import time
 import uuid
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 
 from .errors import inconclusive
@@ -282,9 +283,27 @@ def canonical_directory_walk_path(path: pathlib.Path) -> pathlib.Path:
     return pathlib.Path("/") / target / pathlib.Path(*path.parts[2:])
 
 
-def _directory_path_equivalence_key(
+@dataclass(slots=True)
+class _DirectoryPathEquivalenceSnapshot:
+    path: pathlib.Path
+    prefix: pathlib.Path
+    fd: int
+    identity: Identity
+    remaining: tuple[str, ...]
+
+    @property
+    def key(self) -> tuple[int, int, tuple[str, ...]]:
+        return self.identity.device, self.identity.inode, self.remaining
+
+    def close(self) -> None:
+        fd, self.fd = self.fd, -1
+        if fd >= 0:
+            os.close(fd)
+
+
+def _open_directory_path_equivalence_snapshot(
     path: pathlib.Path,
-) -> tuple[int, int, tuple[str, ...]]:
+) -> _DirectoryPathEquivalenceSnapshot:
     if not path.is_absolute():
         raise ValueError("directory path must be absolute")
     walk_path = canonical_directory_walk_path(path)
@@ -308,13 +327,49 @@ def _directory_path_equivalence_key(
                 remaining = tuple(
                     os.fsdecode(candidate).casefold() for candidate in raw_parts[index:]
                 )
-                return identity.device, identity.inode, remaining
+                return _DirectoryPathEquivalenceSnapshot(
+                    path=path,
+                    prefix=current.parent,
+                    fd=fd,
+                    identity=identity,
+                    remaining=remaining,
+                )
             os.close(fd)
             fd = next_fd
             identity = next_identity
-        return identity.device, identity.inode, ()
-    finally:
+        return _DirectoryPathEquivalenceSnapshot(
+            path=path,
+            prefix=current,
+            fd=fd,
+            identity=identity,
+            remaining=(),
+        )
+    except BaseException:
         os.close(fd)
+        raise
+
+
+def _revalidate_directory_path_equivalence_snapshot(
+    snapshot: _DirectoryPathEquivalenceSnapshot,
+) -> None:
+    refreshed = _open_directory_path_equivalence_snapshot(snapshot.path)
+    try:
+        held_identity = _validate_directory_fd(
+            snapshot.fd,
+            snapshot.prefix,
+            private=False,
+        )
+        if (
+            not directory_identities_match(snapshot.identity, held_identity)
+            or not directory_identities_match(snapshot.identity, refreshed.identity)
+            or snapshot.remaining != refreshed.remaining
+        ):
+            raise OSError(
+                errno.ESTALE,
+                "directory path changed while comparing account-local roots",
+            )
+    finally:
+        refreshed.close()
 
 
 def directory_paths_equivalent(
@@ -323,9 +378,18 @@ def directory_paths_equivalent(
 ) -> bool:
     """Bind existing prefixes by device/inode and case-fold only missing suffixes."""
 
-    return _directory_path_equivalence_key(left) == _directory_path_equivalence_key(
-        right
-    )
+    left_snapshot = _open_directory_path_equivalence_snapshot(left)
+    try:
+        right_snapshot = _open_directory_path_equivalence_snapshot(right)
+        try:
+            equivalent = left_snapshot.key == right_snapshot.key
+            _revalidate_directory_path_equivalence_snapshot(left_snapshot)
+            _revalidate_directory_path_equivalence_snapshot(right_snapshot)
+            return equivalent
+        finally:
+            right_snapshot.close()
+    finally:
+        left_snapshot.close()
 
 
 def open_absolute_directory_chain(

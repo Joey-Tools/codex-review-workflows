@@ -67,8 +67,12 @@ retained evidence survives release replacement. Non-default explicit
 task-scoped isolated runs. An explicitly supplied path that resolves through
 the secure descriptor walk to the account-local default still uses the default
 migration gate; existing prefixes are compared by object identity and missing
-suffixes use a conservative case-insensitive policy. Default lookup is lazy and
-any failure is returned through the CLI's single-line JSON failure contract.
+suffixes use a conservative case-insensitive policy. The comparison retains
+the existing-prefix descriptors and reopens both paths before returning, so
+object or access-policy replacement and missing-suffix creation observed
+between the initial snapshots and final revalidation fail closed instead of
+selecting custom-root behavior. Default lookup is lazy and any failure is
+returned through the CLI's single-line JSON failure contract.
 
 从使用 release-local `runtime/retention` 的旧版本升级时，新版本始终先扫描当前
 helper 根下的旧 retention root，因此 self-contained 或非标准安装布局不会绕过迁移

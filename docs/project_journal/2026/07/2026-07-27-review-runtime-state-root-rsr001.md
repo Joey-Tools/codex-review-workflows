@@ -54,7 +54,11 @@ superseded_by:
   walk's device/inode identity and use a conservative case-insensitive key for
   a missing suffix. Darwin root aliases, double-root spelling, and
   case-insensitive filesystem aliases therefore cannot select different
-  migration behavior. Existing distinct objects remain distinct. Migration
+  migration behavior. Existing distinct objects remain distinct. The held
+  prefix descriptors are revalidated for object identity and access policy
+  after both snapshots are opened; target replacement or missing-suffix
+  creation observed between the initial snapshots and final revalidation
+  raises `ESTALE` before the public command is entered. Migration
   setup/finalization errors remain fail closed, while `OSError` and
   `ValueError` raised by the public command retain their original type and
   diagnostic.
@@ -75,14 +79,14 @@ superseded_by:
   attempts in older installed releases and that the README still documented the
   obsolete release-local default. The explicit drain gate, cross-version
   regression, and corrected README close both findings.
-- The final deterministic independent-supervisor gate passed 574/574 in
-  184.358 seconds with the reviewed 583-test discovery identity and SHA-256
-  `9b7cdeb6398e321c8c13e476eb339818616344eeb6e724de5f7305f18eb92563`.
-- The final platform suite ran 2,819 tests with 6 skips in 1,114.304 seconds.
+- The final deterministic independent-supervisor gate passed 577/577 in
+  205.656 seconds with the reviewed 586-test discovery identity and SHA-256
+  `9df7a064b0cf5122ad7cc4612a82b8026979b36fd084694adbf4a787e81285ac`.
+- The final platform suite ran 2,819 tests with 6 skips in 1,055.703 seconds.
   Its only failure was the known parent-sandbox denial of nested
   `sandbox-exec`; that exact broker test passed 1/1 outside the parent sandbox
-  in 2.676 seconds.
-- The complete 99-test contract module passed in 6.998 seconds.
+  in 2.385 seconds.
+- The complete 99-test contract module passed in 7.696 seconds.
 - Focused installed-symlink immutability, default state-root, CI snapshot, and
   no-bytecode entrypoint regressions passed. The new cross-version tests also
   prove explicit old-root visibility and fail-closed release replacement.
@@ -107,7 +111,11 @@ superseded_by:
   still let equivalent aliases bypass the explicit-default gate. The current
   helper is now fenced unconditionally, while explicit-default classification
   uses descriptor/object identity plus the documented missing-suffix policy.
-- The focused post-fix CLI and secure-I/O modules passed 53/53 tests on Python
+- The following exact-head Fresh Codex review found that sequential path
+  snapshots could interpret a concurrent target creation or replacement as a
+  stable custom retention root. Held descriptor revalidation and deterministic
+  creation/replacement race tests close that bypass.
+- The focused post-fix CLI and secure-I/O modules passed 56/56 tests on Python
   3.13.
 - Ruff lint/format, actionlint for canonical and private CI profiles,
   source-only syntax checks, project-journal validation, `git diff --check`,

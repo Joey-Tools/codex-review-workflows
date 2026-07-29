@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import io
 import json
@@ -577,6 +578,56 @@ class CliLifecycleTests(unittest.TestCase):
                 "legacy release-local attempts require explicit draining",
                 payload["message"],
             )
+
+    def test_account_local_path_drift_fails_before_public_command(self) -> None:
+        with owned_temporary_directory("cli-retention-drift-") as root:
+            account_default = (
+                root
+                / "account"
+                / ".codex"
+                / "review-runtime"
+                / "independent-codex-pr-review"
+                / "retention"
+            )
+            output = io.StringIO()
+            with (
+                mock.patch.object(
+                    cli_module,
+                    "default_retention_root",
+                    return_value=account_default,
+                ),
+                mock.patch.object(
+                    cli_module,
+                    "directory_paths_equivalent",
+                    side_effect=OSError(
+                        errno.ESTALE,
+                        "directory path changed while comparing account-local roots",
+                    ),
+                ),
+                mock.patch.object(cli_module, "status") as status_mock,
+                mock.patch.object(
+                    cli_module,
+                    "installed_legacy_retention_fence",
+                ) as fence_mock,
+                contextlib.redirect_stdout(output),
+            ):
+                exit_code = cli_module.main(
+                    (
+                        "status",
+                        "--retention-root",
+                        str(account_default),
+                    ),
+                    entrypoint=ENTRYPOINT,
+                )
+
+            self.assertEqual(exit_code, 2)
+            payload = json.loads(output.getvalue())
+            self.assertIn(
+                "directory path changed while comparing account-local roots",
+                payload["message"],
+            )
+            status_mock.assert_not_called()
+            fence_mock.assert_not_called()
 
     def test_darwin_root_alias_still_identifies_explicit_account_default(
         self,
