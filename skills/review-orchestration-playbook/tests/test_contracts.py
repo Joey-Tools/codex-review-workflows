@@ -4369,9 +4369,37 @@ class RepositoryContractTest(unittest.TestCase):
             "items"
         ]
         self.assertIn("pagination", ci_observation["required"])
+        self.assertEqual(schema["properties"]["schema_version"]["const"], 8)
         self.assertEqual(
             ci_observation["properties"]["status_check_rollup"]["maxItems"],
             1_000,
+        )
+        ci_pagination = schema["$defs"]["ciPaginationEvidence"]
+        self.assertIn("stability", ci_pagination["required"])
+        ci_stability = schema["$defs"]["ciPaginationStability"]
+        self.assertEqual(
+            ci_stability["properties"]["strategy"]["const"],
+            "double-scan",
+        )
+        self.assertEqual(
+            ci_stability["properties"]["provider_call_count"]["maximum"],
+            22,
+        )
+        self.assertEqual(
+            ci_stability["properties"]["deadline_ms"]["maximum"],
+            60_000,
+        )
+        self.assertEqual(
+            ci_stability["properties"]["head_observations"]["minItems"],
+            2,
+        )
+        conversation_observation = schema["$defs"]["conversationStateEvidence"][
+            "properties"
+        ]["observed"]["items"]
+        self.assertIn("pagination", conversation_observation["required"])
+        self.assertIn(
+            "stability",
+            schema["$defs"]["reviewThreadPaginationEvidence"]["required"],
         )
 
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
@@ -4388,6 +4416,9 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("validate-delivery-handoff", content)
             self.assertIn("signature_verified_head_oid", content)
             self.assertIn("head_sha", content)
+            self.assertIn("double-scan", content)
+        self.assertIn("schema-v8 bytes", contracts)
+        self.assertIn("canonical bundle digest", contracts)
         self.assertNotIn(
             "../../change-delivery-workflow/references/delivery-result.schema.json",
             readiness,

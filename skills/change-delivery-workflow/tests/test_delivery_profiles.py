@@ -518,47 +518,88 @@ def bind_ci_pagination(
     rollup = observed["status_check_rollup"]
     if not isinstance(rollup, list):
         raise AssertionError("CI rollup must be an array")
-    chunks = [
-        rollup[offset : offset + page_size]
-        for offset in range(0, len(rollup), page_size)
-    ] or [[]]
-    pages = []
-    previous_cursor: str | None = None
-    for index, chunk in enumerate(chunks, start=1):
-        end_cursor = None if not chunk else f"CI_CURSOR_{index}"
-        page = {
-            "connection": dict(connection),
-            "snapshot_binding": snapshot_binding,
-            "snapshot_id": snapshot_id,
-            "page_index": index,
-            "request_after": previous_cursor,
-            "item_count": len(chunk),
-            "server_total_count": len(rollup),
-            "page_info": {
-                "end_cursor": end_cursor,
-                "has_next_page": index < len(chunks),
-            },
-        }
-        page["content_sha256"] = canonical_page_digest(
-            "ci-status",
-            {
-                "connection": connection,
+
+    def scan_pages(scan_role: str) -> list[dict[str, object]]:
+        chunks = [
+            rollup[offset : offset + page_size]
+            for offset in range(0, len(rollup), page_size)
+        ] or [[]]
+        pages = []
+        previous_cursor: str | None = None
+        for index, chunk in enumerate(chunks, start=1):
+            end_cursor = None if not chunk else f"CI_CURSOR_{index}"
+            page = {
+                "connection": dict(connection),
+                "scan_role": scan_role,
+                "observed_head_oid": head["oid"],
                 "snapshot_binding": snapshot_binding,
                 "snapshot_id": snapshot_id,
-                "server_total_count": len(rollup),
                 "page_index": index,
                 "request_after": previous_cursor,
                 "item_count": len(chunk),
-                "page_info": page["page_info"],
-                "items": chunk,
-            },
-        )
-        pages.append(page)
-        previous_cursor = end_cursor
+                "server_total_count": len(rollup),
+                "page_info": {
+                    "end_cursor": end_cursor,
+                    "has_next_page": index < len(chunks),
+                },
+            }
+            page["content_sha256"] = canonical_page_digest(
+                "ci-status",
+                {
+                    "connection": connection,
+                    "observed_head_oid": head["oid"],
+                    "snapshot_binding": snapshot_binding,
+                    "snapshot_id": snapshot_id,
+                    "server_total_count": len(rollup),
+                    "page_index": index,
+                    "request_after": previous_cursor,
+                    "item_count": len(chunk),
+                    "page_info": page["page_info"],
+                    "items": chunk,
+                },
+            )
+            pages.append(page)
+            previous_cursor = end_cursor
+        return pages
+
+    pages = scan_pages("primary")
+    verification_pages = scan_pages("verification")
+    head_connection = {
+        "provider": "github-graphql",
+        "field": "pullRequest.headRefOid",
+        "repository_node_id": repository["node_id"],
+        "pull_request_node_id": pull_request["node_id"],
+    }
     observed["pagination"] = {
         "connection": connection,
         "server_total_count": len(rollup),
         "pages": pages,
+        "stability": {
+            "strategy": "double-scan",
+            "cache_mode": "disabled",
+            "mutation_mode": "read-only",
+            "deadline_ms": 30_000,
+            "elapsed_ms": 100,
+            "provider_call_count": 2 + len(pages) + len(verification_pages),
+            "head_observations": [
+                {
+                    "phase": "before-primary",
+                    "connection": dict(head_connection),
+                    "head_oid": head["oid"],
+                },
+                {
+                    "phase": "after-verification",
+                    "connection": dict(head_connection),
+                    "head_oid": head["oid"],
+                },
+            ],
+            "verification": {
+                "connection": dict(connection),
+                "server_total_count": len(rollup),
+                "pages": verification_pages,
+                "status_check_rollup": copy.deepcopy(rollup),
+            },
+        },
     }
 
 
@@ -591,47 +632,88 @@ def bind_review_thread_pagination(
     threads = observed["review_threads"]
     if not isinstance(threads, list):
         raise AssertionError("review_threads must be an array")
-    chunks = [
-        threads[offset : offset + page_size]
-        for offset in range(0, len(threads), page_size)
-    ] or [[]]
-    pages = []
-    previous_cursor: str | None = None
-    for index, chunk in enumerate(chunks, start=1):
-        end_cursor = None if not chunk else f"THREAD_CURSOR_{index}"
-        page = {
-            "connection": dict(connection),
-            "snapshot_binding": snapshot_binding,
-            "snapshot_id": snapshot_id,
-            "page_index": index,
-            "request_after": previous_cursor,
-            "item_count": len(chunk),
-            "server_total_count": len(threads),
-            "page_info": {
-                "end_cursor": end_cursor,
-                "has_next_page": index < len(chunks),
-            },
-        }
-        page["content_sha256"] = canonical_page_digest(
-            "review-threads",
-            {
-                "connection": connection,
+
+    def scan_pages(scan_role: str) -> list[dict[str, object]]:
+        chunks = [
+            threads[offset : offset + page_size]
+            for offset in range(0, len(threads), page_size)
+        ] or [[]]
+        pages = []
+        previous_cursor: str | None = None
+        for index, chunk in enumerate(chunks, start=1):
+            end_cursor = None if not chunk else f"THREAD_CURSOR_{index}"
+            page = {
+                "connection": dict(connection),
+                "scan_role": scan_role,
+                "observed_head_oid": head["oid"],
                 "snapshot_binding": snapshot_binding,
                 "snapshot_id": snapshot_id,
-                "server_total_count": len(threads),
                 "page_index": index,
                 "request_after": previous_cursor,
                 "item_count": len(chunk),
-                "page_info": page["page_info"],
-                "items": chunk,
-            },
-        )
-        pages.append(page)
-        previous_cursor = end_cursor
+                "server_total_count": len(threads),
+                "page_info": {
+                    "end_cursor": end_cursor,
+                    "has_next_page": index < len(chunks),
+                },
+            }
+            page["content_sha256"] = canonical_page_digest(
+                "review-threads",
+                {
+                    "connection": connection,
+                    "observed_head_oid": head["oid"],
+                    "snapshot_binding": snapshot_binding,
+                    "snapshot_id": snapshot_id,
+                    "server_total_count": len(threads),
+                    "page_index": index,
+                    "request_after": previous_cursor,
+                    "item_count": len(chunk),
+                    "page_info": page["page_info"],
+                    "items": chunk,
+                },
+            )
+            pages.append(page)
+            previous_cursor = end_cursor
+        return pages
+
+    pages = scan_pages("primary")
+    verification_pages = scan_pages("verification")
+    head_connection = {
+        "provider": "github-graphql",
+        "field": "pullRequest.headRefOid",
+        "repository_node_id": repository["node_id"],
+        "pull_request_node_id": pull_request["node_id"],
+    }
     observed["pagination"] = {
         "connection": connection,
         "server_total_count": len(threads),
         "pages": pages,
+        "stability": {
+            "strategy": "double-scan",
+            "cache_mode": "disabled",
+            "mutation_mode": "read-only",
+            "deadline_ms": 30_000,
+            "elapsed_ms": 100,
+            "provider_call_count": 2 + len(pages) + len(verification_pages),
+            "head_observations": [
+                {
+                    "phase": "before-primary",
+                    "connection": dict(head_connection),
+                    "head_oid": head["oid"],
+                },
+                {
+                    "phase": "after-verification",
+                    "connection": dict(head_connection),
+                    "head_oid": head["oid"],
+                },
+            ],
+            "verification": {
+                "connection": dict(connection),
+                "server_total_count": len(threads),
+                "pages": verification_pages,
+                "review_threads": copy.deepcopy(threads),
+            },
+        },
     }
 
 
@@ -875,7 +957,7 @@ def assert_valid_result_contract(result: object) -> None:
 def assert_read_only_report_contract(report: object) -> None:
     if not isinstance(report, dict) or set(report) != READ_ONLY_REPORT_FIELDS:
         raise AssertionError("read-only PR report fields do not match the contract")
-    if report["schema_version"] != 7:
+    if report["schema_version"] != 8:
         raise AssertionError("unexpected read-only PR report schema version")
     if report["terminal"] != "pr-readiness-read-only-report":
         raise AssertionError("unexpected read-only PR report terminal")
@@ -1275,7 +1357,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
         self.assertEqual(set(schema["required"]), READ_ONLY_REPORT_FIELDS)
         self.assertEqual(set(schema["properties"]), READ_ONLY_REPORT_FIELDS)
         self.assertFalse(schema["additionalProperties"])
-        self.assertEqual(schema["properties"]["schema_version"]["const"], 7)
+        self.assertEqual(schema["properties"]["schema_version"]["const"], 8)
         self.assertEqual(
             set(schema["properties"]["terminal_state"]["enum"]),
             {
@@ -1835,6 +1917,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 "ci-status",
                 {
                     "connection": connection,
+                    "observed_head_oid": first_page["observed_head_oid"],
                     "snapshot_binding": first_page["snapshot_binding"],
                     "snapshot_id": first_page["snapshot_id"],
                     "server_total_count": 2,
@@ -1847,6 +1930,8 @@ class DeliveryProfileContractTest(unittest.TestCase):
             )
             second_page = {
                 "connection": copy.deepcopy(connection),
+                "scan_role": "primary",
+                "observed_head_oid": connection["head_oid"],
                 "snapshot_binding": candidate["snapshot"]["binding_id"],
                 "snapshot_id": candidate["snapshot"]["snapshot_id"],
                 "page_index": 2,
@@ -1862,6 +1947,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 "ci-status",
                 {
                     "connection": connection,
+                    "observed_head_oid": second_page["observed_head_oid"],
                     "snapshot_binding": second_page["snapshot_binding"],
                     "snapshot_id": second_page["snapshot_id"],
                     "server_total_count": 2,
@@ -1918,7 +2004,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
         observed = incomplete_final["evidence"]["ci_status"]["observed"][0]
         observed["pagination"]["pages"][-1]["page_info"]["has_next_page"] = True
         self.assertEqual(list(validator.iter_errors(incomplete_final)), [])
-        with self.assertRaisesRegex(ValueError, "final CI page"):
+        with self.assertRaisesRegex(ValueError, "final CI primary pagination page"):
             validate_read_only_report_semantics(incomplete_final)
 
         content_drift = copy.deepcopy(base)
@@ -1932,7 +2018,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
         observed = ordering_drift["evidence"]["ci_status"]["observed"][0]
         observed["status_check_rollup"].reverse()
         self.assertEqual(list(validator.iter_errors(ordering_drift)), [])
-        with self.assertRaisesRegex(ValueError, "ordered flat-rollup slice"):
+        with self.assertRaisesRegex(ValueError, "ordered flat-list slice"):
             validate_read_only_report_semantics(ordering_drift)
 
         page_total_drift = copy.deepcopy(base)
@@ -1954,6 +2040,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 "ci-status",
                 {
                     "connection": observed["pagination"]["connection"],
+                    "observed_head_oid": page["observed_head_oid"],
                     "snapshot_binding": page["snapshot_binding"],
                     "snapshot_id": page["snapshot_id"],
                     "server_total_count": observed["pagination"]["server_total_count"],
@@ -2003,7 +2090,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
         observed = over_cap["evidence"]["ci_status"]["observed"][0]
         observed["pagination"]["server_total_count"] = 1_001
         self.assertTrue(list(validator.iter_errors(over_cap)))
-        with self.assertRaisesRegex(ValueError, "bounded complete-rollup cap"):
+        with self.assertRaisesRegex(ValueError, "bounded complete cap"):
             validate_read_only_report_semantics(over_cap)
 
     def test_review_threads_require_complete_identity_bound_pagination(
@@ -2058,7 +2145,10 @@ class DeliveryProfileContractTest(unittest.TestCase):
             True
         )
         self.assertEqual(list(validator.iter_errors(incomplete)), [])
-        with self.assertRaisesRegex(ValueError, "final review-thread page"):
+        with self.assertRaisesRegex(
+            ValueError,
+            "final review-thread primary pagination page",
+        ):
             validate_read_only_report_semantics(incomplete)
 
         content_drift = copy.deepcopy(base)
@@ -2087,6 +2177,204 @@ class DeliveryProfileContractTest(unittest.TestCase):
         self.assertTrue(list(validator.iter_errors(duplicate)))
         with self.assertRaisesRegex(ValueError, "globally unique"):
             validate_read_only_report_semantics(duplicate)
+
+    def test_paginated_provider_evidence_requires_a_stable_double_scan(
+        self,
+    ) -> None:
+        base = copy.deepcopy(
+            next(
+                case["expected"]["terminal_result"]
+                for case in fixture_cases(
+                    READ_ONLY_PR_PROBE_CASES,
+                    "read-only-pr-probe",
+                )
+                if case["name"] == "selected-pr-base-head-blocked"
+            )
+        )
+        validator = read_only_report_validator()
+        self.assertEqual(list(validator.iter_errors(base)), [])
+        validate_read_only_report_semantics(base)
+
+        def rebind_verification_page(
+            observed: dict[str, object],
+            *,
+            digest_kind: str,
+            item_field: str,
+        ) -> None:
+            pagination = observed["pagination"]
+            if not isinstance(pagination, dict):
+                raise AssertionError("pagination must be an object")
+            stability = pagination["stability"]
+            if not isinstance(stability, dict):
+                raise AssertionError("stability must be an object")
+            verification = stability["verification"]
+            if not isinstance(verification, dict):
+                raise AssertionError("verification must be an object")
+            pages = verification["pages"]
+            items = verification[item_field]
+            if not isinstance(pages, list) or not isinstance(items, list):
+                raise AssertionError("verification scan is malformed")
+            page = pages[0]
+            if not isinstance(page, dict):
+                raise AssertionError("verification page must be an object")
+            count = page["item_count"]
+            if not isinstance(count, int):
+                raise AssertionError("verification page count must be an integer")
+            page["content_sha256"] = canonical_page_digest(
+                digest_kind,
+                {
+                    "connection": pagination["connection"],
+                    "observed_head_oid": page["observed_head_oid"],
+                    "snapshot_binding": page["snapshot_binding"],
+                    "snapshot_id": page["snapshot_id"],
+                    "server_total_count": verification["server_total_count"],
+                    "page_index": page["page_index"],
+                    "request_after": page["request_after"],
+                    "item_count": count,
+                    "page_info": page["page_info"],
+                    "items": items[:count],
+                },
+            )
+
+        for evidence_name, digest_kind, item_field in (
+            ("ci_status", "ci-status", "status_check_rollup"),
+            ("conversation_state", "review-threads", "review_threads"),
+        ):
+            with self.subTest(evidence=evidence_name, drift="head-after"):
+                candidate = copy.deepcopy(base)
+                observed = candidate["evidence"][evidence_name]["observed"][0]
+                observed["pagination"]["stability"]["head_observations"][1][
+                    "head_oid"
+                ] = ALTERNATE_HEAD_OID
+                self.assertEqual(list(validator.iter_errors(candidate)), [])
+                with self.assertRaisesRegex(ValueError, "provider head changed"):
+                    validate_read_only_report_semantics(candidate)
+
+            with self.subTest(evidence=evidence_name, drift="page-head"):
+                candidate = copy.deepcopy(base)
+                observed = candidate["evidence"][evidence_name]["observed"][0]
+                page = observed["pagination"]["stability"]["verification"]["pages"][0]
+                page["observed_head_oid"] = ALTERNATE_HEAD_OID
+                rebind_verification_page(
+                    observed,
+                    digest_kind=digest_kind,
+                    item_field=item_field,
+                )
+                self.assertEqual(list(validator.iter_errors(candidate)), [])
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "observed a different provider head",
+                ):
+                    validate_read_only_report_semantics(candidate)
+
+            with self.subTest(evidence=evidence_name, drift="same-count-replacement"):
+                candidate = copy.deepcopy(base)
+                observed = candidate["evidence"][evidence_name]["observed"][0]
+                verification_items = observed["pagination"]["stability"][
+                    "verification"
+                ][item_field]
+                if evidence_name == "ci_status":
+                    verification_items[0]["name"] = "same-count-replacement"
+                else:
+                    verification_items[0]["is_resolved"] = True
+                rebind_verification_page(
+                    observed,
+                    digest_kind=digest_kind,
+                    item_field=item_field,
+                )
+                self.assertEqual(list(validator.iter_errors(candidate)), [])
+                with self.assertRaisesRegex(ValueError, "ordered content changed"):
+                    validate_read_only_report_semantics(candidate)
+
+            with self.subTest(evidence=evidence_name, drift="verification-cursor"):
+                candidate = copy.deepcopy(base)
+                observed = candidate["evidence"][evidence_name]["observed"][0]
+                page = observed["pagination"]["stability"]["verification"]["pages"][0]
+                page["page_info"]["end_cursor"] = "SECOND_SCAN_CURSOR_DRIFT"
+                rebind_verification_page(
+                    observed,
+                    digest_kind=digest_kind,
+                    item_field=item_field,
+                )
+                self.assertEqual(list(validator.iter_errors(candidate)), [])
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "verification scan changed total, cursor, page slice",
+                ):
+                    validate_read_only_report_semantics(candidate)
+
+    def test_paginated_provider_evidence_enforces_call_deadline_and_failure_caps(
+        self,
+    ) -> None:
+        base = copy.deepcopy(
+            next(
+                case["expected"]["terminal_result"]
+                for case in fixture_cases(
+                    READ_ONLY_PR_PROBE_CASES,
+                    "read-only-pr-probe",
+                )
+                if case["name"] == "selected-pr-base-head-blocked"
+            )
+        )
+        validator = read_only_report_validator()
+
+        wrong_call_count = copy.deepcopy(base)
+        wrong_call_count["evidence"]["ci_status"]["observed"][0]["pagination"][
+            "stability"
+        ]["provider_call_count"] = 5
+        self.assertEqual(list(validator.iter_errors(wrong_call_count)), [])
+        with self.assertRaisesRegex(ValueError, "provider-call count"):
+            validate_read_only_report_semantics(wrong_call_count)
+
+        over_call_cap = copy.deepcopy(base)
+        over_call_cap["evidence"]["ci_status"]["observed"][0]["pagination"][
+            "stability"
+        ]["provider_call_count"] = 23
+        self.assertTrue(list(validator.iter_errors(over_call_cap)))
+        with self.assertRaisesRegex(ValueError, "provider-call count"):
+            validate_read_only_report_semantics(over_call_cap)
+
+        deadline_exceeded = copy.deepcopy(base)
+        stability = deadline_exceeded["evidence"]["conversation_state"]["observed"][0][
+            "pagination"
+        ]["stability"]
+        stability["deadline_ms"] = 100
+        stability["elapsed_ms"] = 101
+        self.assertEqual(list(validator.iter_errors(deadline_exceeded)), [])
+        with self.assertRaisesRegex(ValueError, "monotonic deadline"):
+            validate_read_only_report_semantics(deadline_exceeded)
+
+        for evidence_field, evidence_name in (
+            ("ci_status", "ci-status"),
+            ("conversation_state", "conversation-state"),
+        ):
+            with self.subTest(partial_failure=evidence_name):
+                partial = copy.deepcopy(base)
+                verification = partial["evidence"][evidence_field]["observed"][0][
+                    "pagination"
+                ]["stability"]["verification"]
+                verification["pages"] = []
+                self.assertTrue(list(validator.iter_errors(partial)))
+                with self.assertRaisesRegex(ValueError, "pages are missing"):
+                    validate_read_only_report_semantics(partial)
+
+                blocked = copy.deepcopy(base)
+                evidence = blocked["evidence"][evidence_field]
+                evidence["status"] = "blocked"
+                evidence["observed"] = []
+                blocked["unavailable_evidence"].append(evidence_name)
+                blocked["blockers"].append(
+                    {
+                        "evidence": evidence_name,
+                        "code": "pagination-stability-unavailable",
+                        "detail": (
+                            "The complete stable double scan did not finish "
+                            "within its bounded acquisition contract."
+                        ),
+                    }
+                )
+                self.assertEqual(list(validator.iter_errors(blocked)), [])
+                validate_read_only_report_semantics(blocked)
 
     def test_read_only_pr_report_preserves_and_maps_all_ci_provider_states(
         self,

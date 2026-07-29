@@ -21,7 +21,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": 7
+      "const": 8
     },
     "terminal": {
       "const": "pr-readiness-read-only-report"
@@ -2710,6 +2710,8 @@
       "type": "object",
       "required": [
         "connection",
+        "scan_role",
+        "observed_head_oid",
         "snapshot_binding",
         "snapshot_id",
         "page_index",
@@ -2722,6 +2724,15 @@
       "properties": {
         "connection": {
           "$ref": "#/$defs/ciPaginationConnection"
+        },
+        "scan_role": {
+          "enum": [
+            "primary",
+            "verification"
+          ]
+        },
+        "observed_head_oid": {
+          "$ref": "#/$defs/oid"
         },
         "snapshot_binding": {
           "$ref": "#/$defs/snapshotId"
@@ -2793,7 +2804,8 @@
       "required": [
         "connection",
         "server_total_count",
-        "pages"
+        "pages",
+        "stability"
       ],
       "properties": {
         "connection": {
@@ -2811,6 +2823,143 @@
           "items": {
             "$ref": "#/$defs/ciPaginationPage"
           }
+        },
+        "stability": {
+          "$ref": "#/$defs/ciPaginationStability"
+        }
+      },
+      "additionalProperties": false
+    },
+    "providerHeadObservationConnection": {
+      "type": "object",
+      "required": [
+        "provider",
+        "field",
+        "repository_node_id",
+        "pull_request_node_id"
+      ],
+      "properties": {
+        "provider": {
+          "const": "github-graphql"
+        },
+        "field": {
+          "const": "pullRequest.headRefOid"
+        },
+        "repository_node_id": {
+          "$ref": "#/$defs/githubNodeId"
+        },
+        "pull_request_node_id": {
+          "$ref": "#/$defs/githubNodeId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "providerHeadObservation": {
+      "type": "object",
+      "required": [
+        "phase",
+        "connection",
+        "head_oid"
+      ],
+      "properties": {
+        "phase": {
+          "enum": [
+            "before-primary",
+            "after-verification"
+          ]
+        },
+        "connection": {
+          "$ref": "#/$defs/providerHeadObservationConnection"
+        },
+        "head_oid": {
+          "$ref": "#/$defs/oid"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ciVerificationScan": {
+      "type": "object",
+      "required": [
+        "connection",
+        "server_total_count",
+        "pages",
+        "status_check_rollup"
+      ],
+      "properties": {
+        "connection": {
+          "$ref": "#/$defs/ciPaginationConnection"
+        },
+        "server_total_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000
+        },
+        "pages": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 10,
+          "items": {
+            "$ref": "#/$defs/ciPaginationPage"
+          }
+        },
+        "status_check_rollup": {
+          "type": "array",
+          "maxItems": 1000,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/statusCheckRollupEntry"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ciPaginationStability": {
+      "type": "object",
+      "required": [
+        "strategy",
+        "cache_mode",
+        "mutation_mode",
+        "deadline_ms",
+        "elapsed_ms",
+        "provider_call_count",
+        "head_observations",
+        "verification"
+      ],
+      "properties": {
+        "strategy": {
+          "const": "double-scan"
+        },
+        "cache_mode": {
+          "const": "disabled"
+        },
+        "mutation_mode": {
+          "const": "read-only"
+        },
+        "deadline_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60000
+        },
+        "elapsed_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60000
+        },
+        "provider_call_count": {
+          "type": "integer",
+          "minimum": 4,
+          "maximum": 22
+        },
+        "head_observations": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "$ref": "#/$defs/providerHeadObservation"
+          }
+        },
+        "verification": {
+          "$ref": "#/$defs/ciVerificationScan"
         }
       },
       "additionalProperties": false
@@ -2863,6 +3012,8 @@
       "type": "object",
       "required": [
         "connection",
+        "scan_role",
+        "observed_head_oid",
         "snapshot_binding",
         "snapshot_id",
         "page_index",
@@ -2875,6 +3026,15 @@
       "properties": {
         "connection": {
           "$ref": "#/$defs/reviewThreadPaginationConnection"
+        },
+        "scan_role": {
+          "enum": [
+            "primary",
+            "verification"
+          ]
+        },
+        "observed_head_oid": {
+          "$ref": "#/$defs/oid"
         },
         "snapshot_binding": {
           "$ref": "#/$defs/snapshotId"
@@ -2946,7 +3106,8 @@
       "required": [
         "connection",
         "server_total_count",
-        "pages"
+        "pages",
+        "stability"
       ],
       "properties": {
         "connection": {
@@ -2964,6 +3125,96 @@
           "items": {
             "$ref": "#/$defs/reviewThreadPaginationPage"
           }
+        },
+        "stability": {
+          "$ref": "#/$defs/reviewThreadPaginationStability"
+        }
+      },
+      "additionalProperties": false
+    },
+    "reviewThreadVerificationScan": {
+      "type": "object",
+      "required": [
+        "connection",
+        "server_total_count",
+        "pages",
+        "review_threads"
+      ],
+      "properties": {
+        "connection": {
+          "$ref": "#/$defs/reviewThreadPaginationConnection"
+        },
+        "server_total_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000
+        },
+        "pages": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 10,
+          "items": {
+            "$ref": "#/$defs/reviewThreadPaginationPage"
+          }
+        },
+        "review_threads": {
+          "type": "array",
+          "maxItems": 1000,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/reviewThread"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "reviewThreadPaginationStability": {
+      "type": "object",
+      "required": [
+        "strategy",
+        "cache_mode",
+        "mutation_mode",
+        "deadline_ms",
+        "elapsed_ms",
+        "provider_call_count",
+        "head_observations",
+        "verification"
+      ],
+      "properties": {
+        "strategy": {
+          "const": "double-scan"
+        },
+        "cache_mode": {
+          "const": "disabled"
+        },
+        "mutation_mode": {
+          "const": "read-only"
+        },
+        "deadline_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60000
+        },
+        "elapsed_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60000
+        },
+        "provider_call_count": {
+          "type": "integer",
+          "minimum": 4,
+          "maximum": 22
+        },
+        "head_observations": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "$ref": "#/$defs/providerHeadObservation"
+          }
+        },
+        "verification": {
+          "$ref": "#/$defs/reviewThreadVerificationScan"
         }
       },
       "additionalProperties": false

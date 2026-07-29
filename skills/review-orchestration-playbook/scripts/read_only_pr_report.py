@@ -21,7 +21,7 @@ MAX_ERROR_CHARS = 240
 MAX_INTEGER_DIGITS = 128
 MAX_NUMBER_CHARS = 256
 MAX_JSON_DEPTH = 64
-MAX_JSON_NODES = 16_384
+MAX_JSON_NODES = 32_768
 MAX_JSON_STRUCTURE_MARKERS = MAX_JSON_NODES * 2
 READ_CHUNK_BYTES = 64 * 1024
 MAX_CI_ROLLUP_ENTRIES = 1_000
@@ -30,6 +30,8 @@ MAX_CI_PAGE_ITEMS = 100
 MAX_REVIEW_THREADS = 1_000
 MAX_REVIEW_THREAD_PAGES = 10
 MAX_REVIEW_THREAD_PAGE_ITEMS = 100
+MAX_CONNECTION_PROVIDER_CALLS = 22
+MAX_CONNECTION_DEADLINE_MS = 60_000
 PAGE_DIGEST_DOMAIN = b"joey-tools:pr-readiness-page:v1\x00"
 IDENTIFIER_RE = re.compile(
     r"^(?P<kind>report|target|snapshot|observation):(?P<value>[0-9a-f]{32})$"
@@ -628,6 +630,242 @@ def _bind_observed_target_identity(
             )
 
 
+def _validate_paginated_scan(
+    errors: list[str],
+    *,
+    label: str,
+    digest_kind: str,
+    expected_connection: Mapping[str, Any],
+    expected_scan_role: str,
+    pages_value: object,
+    items: Sequence[Any],
+    server_total_count: object,
+    snapshot_binding: object,
+    snapshot_id: object,
+    max_pages: int,
+    max_page_items: int,
+    max_items: int,
+) -> tuple[Mapping[str, Any], ...] | None:
+    pages = _sequence(pages_value)
+    if pages is None or not 1 <= len(pages) <= max_pages:
+        errors.append(f"{label} pages are missing or exceed the bounded page cap")
+        return None
+
+    page_item_total = 0
+    item_offset = 0
+    previous_end_cursor: object = None
+    seen_end_cursors: set[str] = set()
+    projections: list[Mapping[str, Any]] = []
+    for offset, item in enumerate(pages, start=1):
+        page = _mapping(item)
+        if page is None:
+            errors.append(f"{label} page {offset} must be an object")
+            continue
+        if page.get("scan_role") != expected_scan_role:
+            errors.append(
+                f"{label} page {offset} is not bound to the {expected_scan_role} scan"
+            )
+        if page.get("connection") != expected_connection:
+            errors.append(f"{label} page {offset} changed connection identity")
+        page_head_oid = page.get("observed_head_oid")
+        if page_head_oid != expected_connection.get("head_oid"):
+            errors.append(
+                f"{label} page {offset} observed a different provider head; "
+                "evidence must be unavailable"
+            )
+        page_snapshot_binding = page.get("snapshot_binding")
+        page_snapshot_id = page.get("snapshot_id")
+        if page_snapshot_binding != snapshot_binding or page_snapshot_id != snapshot_id:
+            errors.append(f"{label} page {offset} changed report snapshot identity")
+        if page.get("page_index") != offset:
+            errors.append(f"{label} page indexes must be contiguous from one")
+        expected_after = None if offset == 1 else previous_end_cursor
+        if page.get("request_after") != expected_after:
+            errors.append(f"{label} page {offset} request cursor drifted")
+        item_count = page.get("item_count")
+        if not _is_nonnegative_int(item_count) or item_count > max_page_items:
+            errors.append(f"{label} page {offset} item count is invalid")
+            item_count = 0
+        if page.get("server_total_count") != server_total_count:
+            errors.append(
+                f"{label} observed mid-pagination total drift; "
+                "evidence must be unavailable"
+            )
+        page_item_total += item_count
+
+        page_info = _mapping(page.get("page_info"))
+        if page_info is None:
+            errors.append(f"{label} page {offset} pageInfo is missing")
+            previous_end_cursor = None
+            continue
+        end_cursor = page_info.get("end_cursor")
+        has_next_page = page_info.get("has_next_page")
+        if not isinstance(has_next_page, bool):
+            errors.append(f"{label} page {offset} hasNextPage is not boolean")
+        if item_count == 0:
+            if end_cursor is not None:
+                errors.append(f"an empty {label} page must have a null end cursor")
+        elif not isinstance(end_cursor, str) or not end_cursor:
+            errors.append(f"a non-empty {label} page must have a non-empty end cursor")
+        if isinstance(end_cursor, str):
+            if end_cursor in seen_end_cursors:
+                errors.append(f"{label} end cursors must not repeat")
+            seen_end_cursors.add(end_cursor)
+        if offset < len(pages):
+            if has_next_page is not True:
+                errors.append(
+                    f"every non-final {label} page must advertise a next page"
+                )
+            if not isinstance(end_cursor, str) or not end_cursor:
+                errors.append(
+                    f"every non-final {label} page needs a continuation cursor"
+                )
+        elif has_next_page is not False:
+            errors.append(f"the final {label} page must prove hasNextPage=false")
+
+        page_slice = list(items[item_offset : item_offset + item_count])
+        digest_payload = {
+            "connection": dict(expected_connection),
+            "observed_head_oid": page_head_oid,
+            "snapshot_binding": page_snapshot_binding,
+            "snapshot_id": page_snapshot_id,
+            "server_total_count": server_total_count,
+            "page_index": offset,
+            "request_after": expected_after,
+            "item_count": item_count,
+            "page_info": dict(page_info),
+            "items": page_slice,
+        }
+        content_sha256 = page.get("content_sha256")
+        if content_sha256 != _canonical_page_digest(digest_kind, digest_payload):
+            errors.append(
+                f"{label} page {offset} content digest does not bind "
+                "its ordered flat-list slice"
+            )
+        projections.append(
+            {
+                "connection": dict(expected_connection),
+                "observed_head_oid": page_head_oid,
+                "page_index": offset,
+                "request_after": expected_after,
+                "item_count": item_count,
+                "server_total_count": server_total_count,
+                "page_info": dict(page_info),
+                "content_sha256": content_sha256,
+            }
+        )
+        item_offset += item_count
+        previous_end_cursor = end_cursor
+
+    if _is_nonnegative_int(server_total_count):
+        if server_total_count > max_items:
+            errors.append(f"{label} server totalCount exceeds the bounded complete cap")
+        if page_item_total != server_total_count:
+            errors.append(f"{label} item counts do not match server totalCount")
+        if len(items) != server_total_count:
+            errors.append(f"{label} flat-list length does not match server totalCount")
+    if item_offset != len(items):
+        errors.append(f"{label} page concatenation does not equal the flat list")
+    if len(projections) != len(pages):
+        return None
+    return tuple(projections)
+
+
+def _validate_connection_stability(
+    errors: list[str],
+    *,
+    label: str,
+    stability_value: object,
+    expected_connection: Mapping[str, Any],
+    primary_pages: object,
+    primary_projection: tuple[Mapping[str, Any], ...] | None,
+    verification_pages: object,
+    verification_projection: tuple[Mapping[str, Any], ...] | None,
+) -> None:
+    stability = _mapping(stability_value)
+    if stability is None:
+        errors.append(f"{label} stability evidence must be an object")
+        return
+    if stability.get("strategy") != "double-scan":
+        errors.append(f"{label} stability strategy must be double-scan")
+    if stability.get("cache_mode") != "disabled":
+        errors.append(f"{label} acquisition must disable provider caches")
+    if stability.get("mutation_mode") != "read-only":
+        errors.append(f"{label} acquisition must remain read-only")
+
+    expected_head_connection = {
+        "provider": "github-graphql",
+        "field": "pullRequest.headRefOid",
+        "repository_node_id": expected_connection.get("repository_node_id"),
+        "pull_request_node_id": expected_connection.get("pull_request_node_id"),
+    }
+    head_observations = _sequence(stability.get("head_observations"))
+    expected_phases = ("before-primary", "after-verification")
+    if head_observations is None or len(head_observations) != 2:
+        errors.append(
+            f"{label} stability requires exactly two independent head observations"
+        )
+    else:
+        for phase, item in zip(expected_phases, head_observations):
+            observation = _mapping(item)
+            if observation is None:
+                errors.append(f"{label} {phase} head observation must be an object")
+                continue
+            if observation.get("phase") != phase:
+                errors.append(f"{label} head observations are out of acquisition order")
+            if observation.get("connection") != expected_head_connection:
+                errors.append(
+                    f"{label} {phase} head observation changed target identity"
+                )
+            if observation.get("head_oid") != expected_connection.get("head_oid"):
+                errors.append(
+                    f"{label} provider head changed during the stable double scan; "
+                    "evidence must be unavailable"
+                )
+
+    deadline_ms = stability.get("deadline_ms")
+    elapsed_ms = stability.get("elapsed_ms")
+    if not _is_positive_int(deadline_ms) or deadline_ms > MAX_CONNECTION_DEADLINE_MS:
+        errors.append(f"{label} deadline exceeds the bounded acquisition cap")
+    if (
+        not _is_nonnegative_int(elapsed_ms)
+        or not _is_positive_int(deadline_ms)
+        or elapsed_ms > deadline_ms
+    ):
+        errors.append(f"{label} acquisition exceeded or lacks its monotonic deadline")
+
+    primary_page_sequence = _sequence(primary_pages)
+    verification_page_sequence = _sequence(verification_pages)
+    expected_calls = (
+        2
+        + (len(primary_page_sequence) if primary_page_sequence is not None else 0)
+        + (
+            len(verification_page_sequence)
+            if verification_page_sequence is not None
+            else 0
+        )
+    )
+    provider_call_count = stability.get("provider_call_count")
+    if (
+        not _is_positive_int(provider_call_count)
+        or provider_call_count > MAX_CONNECTION_PROVIDER_CALLS
+        or provider_call_count != expected_calls
+    ):
+        errors.append(
+            f"{label} provider-call count does not match the bounded double scan"
+        )
+
+    if (
+        primary_projection is not None
+        and verification_projection is not None
+        and primary_projection != verification_projection
+    ):
+        errors.append(
+            f"{label} verification scan changed total, cursor, page slice, "
+            "or content digest; evidence must be unavailable"
+        )
+
+
 def _validate_ci_pagination(
     errors: list[str],
     record: Mapping[str, Any],
@@ -657,112 +895,72 @@ def _validate_ci_pagination(
         "pull_request_node_id": pull_request.get("node_id"),
         "head_oid": head.get("oid"),
     }
-    connection = _mapping(pagination.get("connection"))
-    if connection != expected_connection:
+    if pagination.get("connection") != expected_connection:
         errors.append("CI pagination connection does not match the exact PR head")
 
     server_total_count = pagination.get("server_total_count")
-    if (
-        not _is_nonnegative_int(server_total_count)
-        or server_total_count > MAX_CI_ROLLUP_ENTRIES
-    ):
-        errors.append("CI server totalCount exceeds the bounded complete-rollup cap")
+    primary_pages = pagination.get("pages")
+    primary_projection = _validate_paginated_scan(
+        errors,
+        label="CI primary pagination",
+        digest_kind="ci-status",
+        expected_connection=expected_connection,
+        expected_scan_role="primary",
+        pages_value=primary_pages,
+        items=rollup,
+        server_total_count=server_total_count,
+        snapshot_binding=snapshot_binding,
+        snapshot_id=snapshot_id,
+        max_pages=MAX_CI_ROLLUP_PAGES,
+        max_page_items=MAX_CI_PAGE_ITEMS,
+        max_items=MAX_CI_ROLLUP_ENTRIES,
+    )
 
-    pages = _sequence(pagination.get("pages"))
-    if pages is None or not 1 <= len(pages) <= MAX_CI_ROLLUP_PAGES:
-        errors.append("CI pagination pages are missing or exceed the bounded page cap")
+    stability = _mapping(pagination.get("stability"))
+    verification = (
+        _mapping(stability.get("verification")) if stability is not None else None
+    )
+    if verification is None:
+        errors.append("CI stability verification scan must be an object")
         return
-
-    page_item_total = 0
-    rollup_offset = 0
-    previous_end_cursor: object = None
-    seen_end_cursors: set[str] = set()
-    for offset, item in enumerate(pages, start=1):
-        page = _mapping(item)
-        if page is None:
-            errors.append(f"CI pagination page {offset} must be an object")
-            continue
-        if page.get("connection") != expected_connection:
-            errors.append(f"CI pagination page {offset} changed connection identity")
-        page_snapshot_binding = page.get("snapshot_binding")
-        page_snapshot_id = page.get("snapshot_id")
-        if page_snapshot_binding != snapshot_binding or page_snapshot_id != snapshot_id:
-            errors.append(
-                f"CI pagination page {offset} changed report snapshot identity"
-            )
-        if page.get("page_index") != offset:
-            errors.append("CI pagination page indexes must be contiguous from one")
-        expected_after = None if offset == 1 else previous_end_cursor
-        if page.get("request_after") != expected_after:
-            errors.append(f"CI pagination page {offset} request cursor drifted")
-        item_count = page.get("item_count")
-        if not _is_nonnegative_int(item_count) or item_count > MAX_CI_PAGE_ITEMS:
-            errors.append(f"CI pagination page {offset} item count is invalid")
-            item_count = 0
-        page_total_count = page.get("server_total_count")
-        if page_total_count != server_total_count:
-            errors.append(
-                "CI pagination observed mid-pagination total drift; "
-                "evidence must be unavailable"
-            )
-        page_item_total += item_count
-
-        page_info = _mapping(page.get("page_info"))
-        if page_info is None:
-            errors.append(f"CI pagination page {offset} pageInfo is missing")
-            previous_end_cursor = None
-            continue
-        end_cursor = page_info.get("end_cursor")
-        has_next_page = page_info.get("has_next_page")
-        if not isinstance(has_next_page, bool):
-            errors.append(f"CI pagination page {offset} hasNextPage is not boolean")
-        if item_count == 0:
-            if end_cursor is not None:
-                errors.append("an empty CI page must have a null end cursor")
-        elif not isinstance(end_cursor, str) or not end_cursor:
-            errors.append("a non-empty CI page must have a non-empty end cursor")
-        if isinstance(end_cursor, str):
-            if end_cursor in seen_end_cursors:
-                errors.append("CI pagination end cursors must not repeat")
-            seen_end_cursors.add(end_cursor)
-        if offset < len(pages):
-            if has_next_page is not True:
-                errors.append("every non-final CI page must advertise a next page")
-            if not isinstance(end_cursor, str) or not end_cursor:
-                errors.append("every non-final CI page needs a continuation cursor")
-        elif has_next_page is not False:
-            errors.append("the final CI page must prove hasNextPage=false")
-
-        page_slice = list(rollup[rollup_offset : rollup_offset + item_count])
-        digest_payload = {
-            "connection": expected_connection,
-            "snapshot_binding": page_snapshot_binding,
-            "snapshot_id": page_snapshot_id,
-            "server_total_count": server_total_count,
-            "page_index": offset,
-            "request_after": expected_after,
-            "item_count": item_count,
-            "page_info": dict(page_info) if page_info is not None else None,
-            "items": page_slice,
-        }
-        if page.get("content_sha256") != _canonical_page_digest(
-            "ci-status",
-            digest_payload,
-        ):
-            errors.append(
-                f"CI pagination page {offset} content digest does not bind "
-                "its ordered flat-rollup slice"
-            )
-        rollup_offset += item_count
-        previous_end_cursor = end_cursor
-
-    if _is_nonnegative_int(server_total_count):
-        if page_item_total != server_total_count:
-            errors.append("CI pagination item counts do not match server totalCount")
-        if len(rollup) != server_total_count:
-            errors.append("CI rollup length does not match server totalCount")
-    if rollup_offset != len(rollup):
-        errors.append("CI pagination page concatenation does not equal the flat rollup")
+    if verification.get("connection") != expected_connection:
+        errors.append("CI verification scan changed connection identity")
+    verification_rollup = _sequence(verification.get("status_check_rollup"))
+    if verification_rollup is None:
+        errors.append("CI verification statusCheckRollup must be an array")
+        verification_rollup = ()
+    verification_total_count = verification.get("server_total_count")
+    verification_pages = verification.get("pages")
+    verification_projection = _validate_paginated_scan(
+        errors,
+        label="CI verification pagination",
+        digest_kind="ci-status",
+        expected_connection=expected_connection,
+        expected_scan_role="verification",
+        pages_value=verification_pages,
+        items=verification_rollup,
+        server_total_count=verification_total_count,
+        snapshot_binding=snapshot_binding,
+        snapshot_id=snapshot_id,
+        max_pages=MAX_CI_ROLLUP_PAGES,
+        max_page_items=MAX_CI_PAGE_ITEMS,
+        max_items=MAX_CI_ROLLUP_ENTRIES,
+    )
+    if list(verification_rollup) != list(rollup):
+        errors.append(
+            "CI ordered content changed between primary and verification scans; "
+            "evidence must be unavailable"
+        )
+    _validate_connection_stability(
+        errors,
+        label="CI",
+        stability_value=stability,
+        expected_connection=expected_connection,
+        primary_pages=primary_pages,
+        primary_projection=primary_projection,
+        verification_pages=verification_pages,
+        verification_projection=verification_projection,
+    )
 
 
 def _validate_review_thread_pagination(
@@ -800,135 +998,68 @@ def _validate_review_thread_pagination(
         )
 
     server_total_count = pagination.get("server_total_count")
-    if (
-        not _is_nonnegative_int(server_total_count)
-        or server_total_count > MAX_REVIEW_THREADS
-    ):
-        errors.append(
-            "review-thread server totalCount exceeds the bounded complete-scan cap"
-        )
+    primary_pages = pagination.get("pages")
+    primary_projection = _validate_paginated_scan(
+        errors,
+        label="review-thread primary pagination",
+        digest_kind="review-threads",
+        expected_connection=expected_connection,
+        expected_scan_role="primary",
+        pages_value=primary_pages,
+        items=threads,
+        server_total_count=server_total_count,
+        snapshot_binding=snapshot_binding,
+        snapshot_id=snapshot_id,
+        max_pages=MAX_REVIEW_THREAD_PAGES,
+        max_page_items=MAX_REVIEW_THREAD_PAGE_ITEMS,
+        max_items=MAX_REVIEW_THREADS,
+    )
 
-    pages = _sequence(pagination.get("pages"))
-    if pages is None or not 1 <= len(pages) <= MAX_REVIEW_THREAD_PAGES:
-        errors.append(
-            "review-thread pagination pages are missing or exceed the bounded page cap"
-        )
+    stability = _mapping(pagination.get("stability"))
+    verification = (
+        _mapping(stability.get("verification")) if stability is not None else None
+    )
+    if verification is None:
+        errors.append("review-thread stability verification scan must be an object")
         return
-
-    page_item_total = 0
-    thread_offset = 0
-    previous_end_cursor: object = None
-    seen_end_cursors: set[str] = set()
-    for offset, item in enumerate(pages, start=1):
-        page = _mapping(item)
-        if page is None:
-            errors.append(f"review-thread pagination page {offset} must be an object")
-            continue
-        if page.get("connection") != expected_connection:
-            errors.append(
-                f"review-thread pagination page {offset} changed connection identity"
-            )
-        page_snapshot_binding = page.get("snapshot_binding")
-        page_snapshot_id = page.get("snapshot_id")
-        if page_snapshot_binding != snapshot_binding or page_snapshot_id != snapshot_id:
-            errors.append(
-                f"review-thread pagination page {offset} changed report snapshot identity"
-            )
-        if page.get("page_index") != offset:
-            errors.append(
-                "review-thread pagination page indexes must be contiguous from one"
-            )
-        expected_after = None if offset == 1 else previous_end_cursor
-        if page.get("request_after") != expected_after:
-            errors.append(
-                f"review-thread pagination page {offset} request cursor drifted"
-            )
-        item_count = page.get("item_count")
-        if (
-            not _is_nonnegative_int(item_count)
-            or item_count > MAX_REVIEW_THREAD_PAGE_ITEMS
-        ):
-            errors.append(
-                f"review-thread pagination page {offset} item count is invalid"
-            )
-            item_count = 0
-        if page.get("server_total_count") != server_total_count:
-            errors.append(
-                "review-thread pagination observed mid-pagination total drift; "
-                "evidence must be unavailable"
-            )
-        page_item_total += item_count
-
-        page_info = _mapping(page.get("page_info"))
-        if page_info is None:
-            errors.append(f"review-thread pagination page {offset} pageInfo is missing")
-            previous_end_cursor = None
-            continue
-        end_cursor = page_info.get("end_cursor")
-        has_next_page = page_info.get("has_next_page")
-        if not isinstance(has_next_page, bool):
-            errors.append(
-                f"review-thread pagination page {offset} hasNextPage is not boolean"
-            )
-        if item_count == 0:
-            if end_cursor is not None:
-                errors.append("an empty review-thread page must have a null end cursor")
-        elif not isinstance(end_cursor, str) or not end_cursor:
-            errors.append(
-                "a non-empty review-thread page must have a non-empty end cursor"
-            )
-        if isinstance(end_cursor, str):
-            if end_cursor in seen_end_cursors:
-                errors.append("review-thread pagination end cursors must not repeat")
-            seen_end_cursors.add(end_cursor)
-        if offset < len(pages):
-            if has_next_page is not True:
-                errors.append(
-                    "every non-final review-thread page must advertise a next page"
-                )
-            if not isinstance(end_cursor, str) or not end_cursor:
-                errors.append(
-                    "every non-final review-thread page needs a continuation cursor"
-                )
-        elif has_next_page is not False:
-            errors.append("the final review-thread page must prove hasNextPage=false")
-
-        page_slice = list(threads[thread_offset : thread_offset + item_count])
-        digest_payload = {
-            "connection": expected_connection,
-            "snapshot_binding": page_snapshot_binding,
-            "snapshot_id": page_snapshot_id,
-            "server_total_count": server_total_count,
-            "page_index": offset,
-            "request_after": expected_after,
-            "item_count": item_count,
-            "page_info": dict(page_info),
-            "items": page_slice,
-        }
-        if page.get("content_sha256") != _canonical_page_digest(
-            "review-threads",
-            digest_payload,
-        ):
-            errors.append(
-                f"review-thread pagination page {offset} content digest does not "
-                "bind its ordered flat-thread slice"
-            )
-        thread_offset += item_count
-        previous_end_cursor = end_cursor
-
-    if _is_nonnegative_int(server_total_count):
-        if page_item_total != server_total_count:
-            errors.append(
-                "review-thread pagination item counts do not match server totalCount"
-            )
-        if len(threads) != server_total_count:
-            errors.append(
-                "review-thread flat list length does not match server totalCount"
-            )
-    if thread_offset != len(threads):
+    if verification.get("connection") != expected_connection:
+        errors.append("review-thread verification scan changed connection identity")
+    verification_threads = _sequence(verification.get("review_threads"))
+    if verification_threads is None:
+        errors.append("review-thread verification list must be an array")
+        verification_threads = ()
+    verification_total_count = verification.get("server_total_count")
+    verification_pages = verification.get("pages")
+    verification_projection = _validate_paginated_scan(
+        errors,
+        label="review-thread verification pagination",
+        digest_kind="review-threads",
+        expected_connection=expected_connection,
+        expected_scan_role="verification",
+        pages_value=verification_pages,
+        items=verification_threads,
+        server_total_count=verification_total_count,
+        snapshot_binding=snapshot_binding,
+        snapshot_id=snapshot_id,
+        max_pages=MAX_REVIEW_THREAD_PAGES,
+        max_page_items=MAX_REVIEW_THREAD_PAGE_ITEMS,
+        max_items=MAX_REVIEW_THREADS,
+    )
+    if list(verification_threads) != list(threads):
         errors.append(
-            "review-thread page concatenation does not equal the flat thread list"
+            "review-thread ordered content changed between primary and "
+            "verification scans; evidence must be unavailable"
         )
+    _validate_connection_stability(
+        errors,
+        label="review-thread",
+        stability_value=stability,
+        expected_connection=expected_connection,
+        primary_pages=primary_pages,
+        primary_projection=primary_projection,
+        verification_pages=verification_pages,
+        verification_projection=verification_projection,
+    )
 
 
 def _ci_rollup_identity_and_bucket(
@@ -1204,6 +1335,18 @@ def semantic_errors(report: object) -> list[str]:
         and not sources
     ):
         errors.append("observed evidence requires at least one snapshot source")
+    if (
+        sources is not None
+        and (
+            evidence_records["ci_status"].get("status") == "observed"
+            or evidence_records["conversation_state"].get("status") == "observed"
+        )
+        and "github-graphql" not in sources
+    ):
+        errors.append(
+            "observed paginated provider evidence requires github-graphql "
+            "as a snapshot source"
+        )
 
     non_observed = {
         external

@@ -58,15 +58,21 @@ conversation, or endpoint evidence. The target binds provider, immutable
 repository and PR identities, base ref, current head repository/ref/OID, and
 every selection, lifecycle, CI, and conversation observation repeats the
 applicable target identity exactly. A stale green CI result or cross-PR record
-therefore cannot be spliced into the current report. Report schema v7
-additionally requires every CI and review-thread page to bind its exact
-connection, report snapshot binding and observation ID, server total, ordered
-flat-list slice, and canonical domain-separated SHA-256 digest. Conversation
-evidence
+therefore cannot be spliced into the current report. Report schema v8
+requires a no-cache, read-only stable double-scan for each CI and review-thread
+connection. Independently reread provider `headRefOid` before the primary scan
+and after the verification scan, return that head with every page, and bind
+each page to its exact connection, report snapshot binding and observation ID,
+server total, ordered flat-list slice, and canonical domain-separated SHA-256
+digest. The verification scan repeats the complete ordered content and must
+match the primary scan's total, page boundaries, cursors, and content digests
+under the same repository, PR, and head. Conversation evidence
 contains the complete paginated review-thread list with immutable Node IDs and
 raw `is_resolved` values; totals and unresolved counts are recomputed from that
 list. Any content, order, cursor, target, or mid-pagination total drift makes
-the evidence unavailable rather than observed. Delivery v2 and report v6 lack
+the evidence unavailable rather than observed. Each connection acquisition is
+also limited to 22 provider calls and a 60-second monotonic deadline; partial
+or over-budget scans are unavailable/blocked. Delivery v2 and report v7 lack
 these bindings and are diagnostic-only inputs that this receiver rejects.
 CI preserves the provider-authored `statusCheckRollup` union: each `CheckRun`
 binds its GitHub App and run

@@ -47,7 +47,7 @@ superseded_by:
   cache or state, fix, commit, push, release, or merge. The receiver is
   classified before every generic PR/review route and returns one closed
   terminal report whose action fields and merge-ready claim are fixed false.
-- Read-only report schema v7 represents selection and range failures directly.
+- Read-only report schema v8 represents selection and range failures directly.
   Every target state binds provider, immutable repository identity, and exact
   current query-head repository/ref/OID. `pre-target` and
   `pre-target-blocked` omit only PR/base, while `target-resolution-blocked`
@@ -70,24 +70,28 @@ superseded_by:
   binding.
   One explicit fail-closed mapping normalizes those provider values to success,
   failure, pending, or cancelled aggregates.
-  CI pagination now binds the GraphQL connection and every page to the exact
-  repository Node ID, PR Node ID, and observed head OID. Server `totalCount`,
-  page counts, the complete flat rollup, and aggregate total must agree. Every
-  page repeats the report snapshot binding, observation ID, and server total,
-  and binds those fields plus its exact ordered flat-list slice with the
-  domain-separated canonical JSON SHA-256; cursor chaining is
-  contiguous and the final page proves `hasNextPage=false`. The
-  bounded complete profile admits at most 1,000 entries across at most ten
-  100-item pages, subject to the tighter independent report-byte ceiling.
-  Over-cap, incomplete, hidden-later-page, count-mismatched, or
-  identity-drifted results are unavailable/blocked rather than truncated
-  observed evidence.
-  Conversation evidence independently exhausts
-  `pullRequest.reviewThreads`, preserves unique thread Node IDs and raw
-  `isResolved` values, binds every page with the same canonical digest
-  contract, and recomputes total and unresolved counts from the complete list.
-  A hidden later-page unresolved thread, incomplete cursor chain, content
-  drift, or mid-pagination total change fails closed.
+  CI pagination now uses a no-cache, read-only stable double scan. Separate
+  provider reads bind `pullRequest.headRefOid` before the primary scan and
+  after the verification scan; every page also returns that exact head. Both
+  scans bind the GraphQL connection and every page to the same repository Node
+  ID, PR Node ID, and target head OID. Server `totalCount`, page counts,
+  ordered flat content, page boundaries, cursor chains, canonical
+  domain-separated page digests, and aggregate total must agree across both
+  scans. The verification scan retains its own complete ordered items, so the
+  semantic receiver recomputes its page digests rather than trusting a second
+  self-reported summary. Each connection acquisition has one monotonic
+  deadline of at most 60 seconds and exactly two head reads plus one call per
+  page, capped at 22 provider calls. Each scan admits at most 1,000 entries
+  across at most ten 100-item pages, subject to the tighter independent
+  report-byte ceiling. Over-cap, timed-out, partial, same-count-replaced,
+  hidden-later-page, count-mismatched, cursor-drifted, or head-drifted results
+  are unavailable/blocked rather than truncated or mixed observed evidence.
+  Conversation evidence independently applies the same stable double-scan
+  contract to `pullRequest.reviewThreads`, preserves unique thread Node IDs
+  and raw `isResolved` values, and recomputes total and unresolved counts from
+  the complete primary list. A hidden later-page unresolved thread, partial
+  verification scan, ordered-content replacement, cursor drift, head drift,
+  or mid-pagination total change fails closed.
   Base/head evidence records the exact observed endpoint OIDs and must match
   the target byte-for-byte before object-existence or merge-base results count.
   The validator also rejects lifecycle, selector, CI-rollup,
@@ -95,7 +99,7 @@ superseded_by:
   express. The schema embeds its complete closed delivery-v3 receiver
   definition and has no external `$ref`. The schema and semantic helper remain
   direct records in the canonical control manifest, so the release digest
-  binds the complete v7 receiving closure without loading an external or
+  binds the complete v8 receiving closure without loading an external or
   candidate-head delivery schema. Its binding generator
   retries collisions, while file input uses no-follow/nonblocking/close-on-exec
   descriptor admission, regular-file and byte ceilings, exact identity/size
@@ -334,3 +338,19 @@ superseded_by:
   rejection path. The focused contract passed under Python 3.13 and 3.14; the
   reviewed CI snapshot, `actionlint`, the `99` review contracts, `47` delivery
   contracts, and `20` synthetic contracts (`1` Linux-only skip) pass locally.
+- A fresh whole-range review on `acb5742` found that the v7 receiver could
+  prove only one pagination traversal's internal consistency. Schema v8 now
+  requires independent provider head reads around a primary and verification
+  traversal, binds every page's returned head, retains the verification
+  traversal's complete ordered items, and rejects total, page-boundary,
+  cursor, digest, ordered-content, or head drift. Per-connection acquisition
+  remains read-only and no-cache, with an exact `2 + primary pages +
+  verification pages` provider-call count capped at 22 and a monotonic
+  deadline capped at 60 seconds. Same-count replacement, mid-scan head drift,
+  verification cursor/content drift, call/deadline overflow, partial failure,
+  and stable-success cases are covered for both CI and review threads.
+  Delivery contracts pass under Python 3.13 and isolated Python 3.14 (`49`
+  tests each); the combined isolated Python 3.10 delivery/review run passes
+  (`148` tests), and the Python 3.13/3.14 review contracts pass (`99` tests
+  each). Ruff check/format, Python compilation, `actionlint`, both modified
+  skill validators, project-journal validation, and `git diff --check` pass.

@@ -56,7 +56,7 @@
         ],
         "terminal": "pr-readiness-read-only-report",
         "terminal_result": {
-          "schema_version": 7,
+          "schema_version": 8,
           "terminal": "pr-readiness-read-only-report",
           "terminal_state": "target-snapshot",
           "report_id": "report:11111111111111111111111111111111",
@@ -287,7 +287,7 @@
       "name": "pre-target-no-match",
       "expected": {
         "terminal_result": {
-          "schema_version": 7,
+          "schema_version": 8,
           "terminal": "pr-readiness-read-only-report",
           "terminal_state": "pre-target",
           "report_id": "report:55555555555555555555555555555555",
@@ -469,7 +469,7 @@
       "name": "pre-target-selection-blocked",
       "expected": {
         "terminal_result": {
-          "schema_version": 7,
+          "schema_version": 8,
           "terminal": "pr-readiness-read-only-report",
           "terminal_state": "pre-target-blocked",
           "report_id": "report:99999999999999999999999999999999",
@@ -627,7 +627,7 @@
       "name": "selected-pr-base-head-blocked",
       "expected": {
         "terminal_result": {
-          "schema_version": 7,
+          "schema_version": 8,
           "terminal": "pr-readiness-read-only-report",
           "terminal_state": "target-resolution-blocked",
           "report_id": "report:dddddddddddddddddddddddddddddddd",
@@ -701,7 +701,8 @@
             "observed_at": "2026-07-24T06:03:00Z",
             "freshness": "current",
             "sources": [
-              "github-rest"
+              "github-rest",
+              "github-graphql"
             ]
           },
           "evidence": {
@@ -871,12 +872,14 @@
                           "provider": "github-graphql",
                           "field": "commit.statusCheckRollup.contexts",
                           "repository_node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
-                  "pull_request_node_id": "PR_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS_42",
-                  "head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                },
-                "snapshot_binding": "snapshot:ffffffffffffffffffffffffffffffff",
-                "snapshot_id": "observation:00000000000000000000000000000000",
-                "page_index": 1,
+                          "pull_request_node_id": "PR_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS_42",
+                          "head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        },
+                        "scan_role": "primary",
+                        "observed_head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "snapshot_binding": "snapshot:ffffffffffffffffffffffffffffffff",
+                        "snapshot_id": "observation:00000000000000000000000000000000",
+                        "page_index": 1,
                         "request_after": null,
                         "item_count": 2,
                         "server_total_count": 2,
@@ -884,9 +887,100 @@
                           "end_cursor": "CI-STATUS_CURSOR_1",
                           "has_next_page": false
                         },
-                "content_sha256": "b71c9681bbb2547e8d9fb0cd7ade7cdaaefc83a73ec22977fcf18f0bf727fca4"
+                        "content_sha256": "7b0e01cc96bd7e000eab12e81de3bc93542e6950e6b5d91ab75ca4ff224511c1"
                       }
-                    ]
+                    ],
+                    "stability": {
+                      "strategy": "double-scan",
+                      "cache_mode": "disabled",
+                      "mutation_mode": "read-only",
+                      "deadline_ms": 30000,
+                      "elapsed_ms": 100,
+                      "provider_call_count": 4,
+                      "head_observations": [
+                        {
+                          "phase": "before-primary",
+                          "connection": {
+                            "provider": "github-graphql",
+                            "field": "pullRequest.headRefOid",
+                            "repository_node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                            "pull_request_node_id": "PR_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS_42"
+                          },
+                          "head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        },
+                        {
+                          "phase": "after-verification",
+                          "connection": {
+                            "provider": "github-graphql",
+                            "field": "pullRequest.headRefOid",
+                            "repository_node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                            "pull_request_node_id": "PR_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS_42"
+                          },
+                          "head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        }
+                      ],
+                      "verification": {
+                        "connection": {
+                          "provider": "github-graphql",
+                          "field": "commit.statusCheckRollup.contexts",
+                          "repository_node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                          "pull_request_node_id": "PR_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS_42",
+                          "head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        },
+                        "server_total_count": 2,
+                        "pages": [
+                          {
+                            "connection": {
+                              "provider": "github-graphql",
+                              "field": "commit.statusCheckRollup.contexts",
+                              "repository_node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                              "pull_request_node_id": "PR_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS_42",
+                              "head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            },
+                            "scan_role": "verification",
+                            "observed_head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                            "snapshot_binding": "snapshot:ffffffffffffffffffffffffffffffff",
+                            "snapshot_id": "observation:00000000000000000000000000000000",
+                            "page_index": 1,
+                            "request_after": null,
+                            "item_count": 2,
+                            "server_total_count": 2,
+                            "page_info": {
+                              "end_cursor": "CI-STATUS_CURSOR_1",
+                              "has_next_page": false
+                            },
+                            "content_sha256": "7b0e01cc96bd7e000eab12e81de3bc93542e6950e6b5d91ab75ca4ff224511c1"
+                          }
+                        ],
+                        "status_check_rollup": [
+                          {
+                            "__typename": "CheckRun",
+                            "node_id": "CHECK_RUN_1001",
+                            "database_id": 1001,
+                            "name": "lint",
+                            "app": {
+                              "__typename": "App",
+                              "node_id": "APP_15368",
+                              "database_id": 15368,
+                              "slug": "github-actions"
+                            },
+                            "status": "COMPLETED",
+                            "conclusion": "SUCCESS"
+                          },
+                          {
+                            "__typename": "StatusContext",
+                            "node_id": "STATUS_CONTEXT_REQUIRED",
+                            "context": "required/legacy-tests",
+                            "creator": {
+                              "__typename": "Bot",
+                              "node_id": "MDM6Qm90MTIzNDU2",
+                              "login": "legacy-ci[bot]"
+                            },
+                            "state": "PENDING"
+                          }
+                        ]
+                      }
+                    }
                   }
                 }
               ]
@@ -957,12 +1051,14 @@
                           "provider": "github-graphql",
                           "field": "pullRequest.reviewThreads",
                           "repository_node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
-                  "pull_request_node_id": "PR_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS_42",
-                  "head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                },
-                "snapshot_binding": "snapshot:ffffffffffffffffffffffffffffffff",
-                "snapshot_id": "observation:00000000000000000000000000000000",
-                "page_index": 1,
+                          "pull_request_node_id": "PR_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS_42",
+                          "head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        },
+                        "scan_role": "primary",
+                        "observed_head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "snapshot_binding": "snapshot:ffffffffffffffffffffffffffffffff",
+                        "snapshot_id": "observation:00000000000000000000000000000000",
+                        "page_index": 1,
                         "request_after": null,
                         "item_count": 3,
                         "server_total_count": 3,
@@ -970,9 +1066,87 @@
                           "end_cursor": "REVIEW-THREADS_CURSOR_1",
                           "has_next_page": false
                         },
-                "content_sha256": "8e84a5bd556e5d9bfd54c8887ea79c61904f555f93cbf1e2d70d66e2fb35e9d9"
+                        "content_sha256": "c66ed68e0c1d654b4e238ea318579d5f216406826673539eaf25ebb22808c30c"
                       }
-                    ]
+                    ],
+                    "stability": {
+                      "strategy": "double-scan",
+                      "cache_mode": "disabled",
+                      "mutation_mode": "read-only",
+                      "deadline_ms": 30000,
+                      "elapsed_ms": 100,
+                      "provider_call_count": 4,
+                      "head_observations": [
+                        {
+                          "phase": "before-primary",
+                          "connection": {
+                            "provider": "github-graphql",
+                            "field": "pullRequest.headRefOid",
+                            "repository_node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                            "pull_request_node_id": "PR_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS_42"
+                          },
+                          "head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        },
+                        {
+                          "phase": "after-verification",
+                          "connection": {
+                            "provider": "github-graphql",
+                            "field": "pullRequest.headRefOid",
+                            "repository_node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                            "pull_request_node_id": "PR_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS_42"
+                          },
+                          "head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        }
+                      ],
+                      "verification": {
+                        "connection": {
+                          "provider": "github-graphql",
+                          "field": "pullRequest.reviewThreads",
+                          "repository_node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                          "pull_request_node_id": "PR_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS_42",
+                          "head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        },
+                        "server_total_count": 3,
+                        "pages": [
+                          {
+                            "connection": {
+                              "provider": "github-graphql",
+                              "field": "pullRequest.reviewThreads",
+                              "repository_node_id": "REPO_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS",
+                              "pull_request_node_id": "PR_JOEY_TOOLS_CODEX_REVIEW_WORKFLOWS_42",
+                              "head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            },
+                            "scan_role": "verification",
+                            "observed_head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                            "snapshot_binding": "snapshot:ffffffffffffffffffffffffffffffff",
+                            "snapshot_id": "observation:00000000000000000000000000000000",
+                            "page_index": 1,
+                            "request_after": null,
+                            "item_count": 3,
+                            "server_total_count": 3,
+                            "page_info": {
+                              "end_cursor": "REVIEW-THREADS_CURSOR_1",
+                              "has_next_page": false
+                            },
+                            "content_sha256": "c66ed68e0c1d654b4e238ea318579d5f216406826673539eaf25ebb22808c30c"
+                          }
+                        ],
+                        "review_threads": [
+                          {
+                            "node_id": "REVIEW_THREAD_1",
+                            "is_resolved": false
+                          },
+                          {
+                            "node_id": "REVIEW_THREAD_2",
+                            "is_resolved": true
+                          },
+                          {
+                            "node_id": "REVIEW_THREAD_3",
+                            "is_resolved": true
+                          }
+                        ]
+                      }
+                    }
                   }
                 }
               ]

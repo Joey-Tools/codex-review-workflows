@@ -56,28 +56,46 @@ The receiving sequence is closed:
    one-to-one mapping in both directions between every non-null GitHub App
    database ID and App Node ID, and between every non-null CheckRun database ID
    and CheckRun Node ID.
-   Fetch that GraphQL connection to exhaustion. Bind the outer connection and
-   every page to the exact repository Node ID, PR Node ID, and observed head
-   OID; record server `totalCount`, contiguous one-based page indexes, request
-   and end cursors, per-page item counts, and `pageInfo.hasNextPage`. Each page
-   repeats the report snapshot binding, observation ID, and server total, then
-   records the canonical SHA-256 of those fields and its exact ordered
-   flat-rollup slice using the schema's domain-separated canonical JSON
-   contract. The final
-   page must report `hasNextPage=false`, page-item totals, server `totalCount`,
-   the complete flat rollup length, and the CI aggregate `total` must all
-   agree. The bounded complete profile admits at most 1,000 entries in at most
-   ten pages of at most 100 items. A larger connection, an incomplete page
-   chain, cursor or connection drift, count mismatch, or a first page whose
-   later pages remain unread makes CI evidence `unavailable` or `blocked`;
-   never truncate it into an observed green result.
-   Fetch `pullRequest.reviewThreads` under the same complete pagination
-   contract. Preserve every thread's immutable Node ID and raw
-   `isResolved` value, require unique Node IDs and cursor exhaustion, and
-   recompute both total and unresolved counts from the complete ordered list.
-   A later-page unresolved thread must count as unresolved. Incomplete pages,
-   page digest mismatch, connection/target drift, or mid-pagination total
-   drift makes conversation evidence unavailable or blocked.
+   Fetch that GraphQL connection under the stable `double-scan` contract. Use
+   distinct no-cache provider reads in this exact order: read
+   `pullRequest.headRefOid`; exhaust the primary connection; restart from a
+   null cursor and exhaust the complete verification connection; then reread
+   `pullRequest.headRefOid`. Return the provider head alongside every page.
+   Bind both outer connections, all pages, and both head reads to the same
+   repository Node ID, PR Node ID, and target head OID. The initial head read,
+   every primary and verification page, and the final head read must all equal
+   the target head; a changed-then-restored head not observed by those reads is
+   an explicit limitation, not evidence that no intermediate event occurred.
+   Record server `totalCount`, contiguous one-based page indexes, request and
+   end cursors, per-page item counts, and `pageInfo.hasNextPage`. Each page
+   repeats its `primary` or `verification` scan role, returned provider head,
+   report snapshot binding, observation ID, and server total, then records the
+   canonical SHA-256 of those fields and its exact ordered flat-list slice
+   using the schema's domain-separated canonical JSON contract. The
+   verification scan retains its own complete ordered items so the receiver
+   recomputes every page digest instead of trusting a second self-reported
+   summary.
+   The final page in each scan must report `hasNextPage=false`. Primary and
+   verification page-item totals, server totals, complete ordered content,
+   page boundaries, cursors, page digests, the primary flat rollup length, and
+   the CI aggregate `total` must all agree. Each connection acquisition uses
+   one monotonic deadline of at most 60 seconds and exactly two head reads plus
+   one provider call per captured page, with at most 22 calls total. The
+   bounded complete profile admits at most 1,000 entries per scan in at most
+   ten pages of at most 100 items. A larger connection, timeout, retry,
+   partial primary or verification chain, cursor or connection drift,
+   same-count content replacement, head drift, count mismatch, or a first
+   page whose later pages remain unread makes CI evidence `unavailable` or
+   `blocked`; never truncate or mix it into an observed green result.
+   Fetch `pullRequest.reviewThreads` under the same stable double-scan,
+   head-revalidation, call-budget, deadline, and complete-pagination contract.
+   Preserve every thread's immutable Node ID and raw `isResolved` value,
+   require unique Node IDs and cursor exhaustion in both scans, require the
+   two complete ordered lists to match, and recompute both total and unresolved
+   counts from the primary list. A later-page unresolved thread must count as
+   unresolved. Incomplete scans, page digest mismatch, connection/target/head
+   drift, same-count replacement, or mid-pagination total drift makes
+   conversation evidence unavailable or blocked.
 3. Do not start any local Codex or Claude lane, `materialize-worktree`,
    `validate-worktree`, low-level helper mode, exact-secret admission,
    GitHub Codex request, check, workflow, comment, poll, monitor, or wait. Do
@@ -137,9 +155,11 @@ The receiving sequence is closed:
    delivery `head_sha` versus both its verified-signature OID and target head,
    target-identity mismatch, stable provider/object identity collisions,
    non-bijective database-ID/Node-ID mappings, aggregate CI counts versus the
-   complete rollup, incomplete or identity-drifted CI pagination, server and
-   page count mismatches, observed endpoint OIDs versus target OIDs, and
-   unresolved threads versus total threads. Its one fail-closed normalization
+   complete rollup, incomplete or identity-drifted CI pagination, mismatched
+   primary/verification ordered content, head-before/page/head-after drift,
+   provider-call or monotonic-deadline violations, server and page count
+   mismatches, observed endpoint OIDs versus target OIDs, and unresolved
+   threads versus total threads. Its one fail-closed normalization
    maps the complete raw `CheckRun` status/conclusion and `StatusContext` state
    enums to success, failure, pending, or cancelled. Report only evidence
    actually observed, unavailable evidence, and blockers. Then stop without
