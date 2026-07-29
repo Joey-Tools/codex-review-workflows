@@ -214,14 +214,16 @@ superseded_by:
   hosted runner's group/world-writable `/opt`, so the catalog binder correctly
   rejects that mutable parent chain instead of adding a CI-only trust bypass.
   On macOS, setup-python resolves through the fixed
-  `/Library/Frameworks/Python.framework/Versions` parent. The workflow first
-  proves that exact path is an ordinary directory and removes only its
-  group/world write bits; the catalog transaction still validates the full
-  interpreter parent chain, executable bytes, identity, access policy, and
-  terminal stability. A changed path, symlink, unsafe ACL, or other unsafe
-  ancestor still fails closed. Review-helper and delivery tests continue to
-  use the requested setup-python version. Both reviewed CI profile snapshots
-  carry the same macOS sealing step and Linux system-interpreter branch.
+  `/Library/Frameworks/Python.framework/Versions` parent. Immediately after
+  setup-python completes, and before the first workflow `run:` step, Python
+  invocation, or repository-code execution, the workflow proves that exact
+  path is an ordinary directory and removes only its group/world write bits;
+  the catalog transaction still validates the full interpreter parent chain,
+  executable bytes, identity, access policy, and terminal stability. A changed
+  path, symlink, unsafe ACL, or other unsafe ancestor still fails closed.
+  Review-helper and delivery tests continue to use the requested setup-python
+  version. Both reviewed CI profile snapshots carry the same macOS sealing
+  order and Linux system-interpreter branch.
 - `master` at `b3d593315b2b6e9310914bd8b2af8a41aa46e08b` (including PR #53)
   was integrated with the signed merge commit
   `bd9266dec9cae76de662795368c6080b8909b3c5`. Conflict resolution preserved
@@ -294,3 +296,13 @@ superseded_by:
   they do not copy the interpreter or relax catalog admission. The focused
   review contract passed (`99` tests), and the local macOS synthetic contract
   passed (`20` tests, `1` Linux-only skip) with a secure interpreter chain.
+- A fresh Codex finding on `0f09650` identified that the seal still followed
+  earlier Python and repository-code execution, including a complete review
+  suite in the private snapshot. The canonical workflow and both snapshots now
+  make the seal the first `run:` step after setup-python. The profile contract
+  slices each `platform_tests` job and asserts
+  `setup-python < seal < first Python/repository-code execution`; the focused
+  contract passed (`99` tests), the synthetic contract passed (`20` tests,
+  `1` Linux-only skip), `actionlint` accepted all three workflows, the
+  canonical snapshot remained byte-for-byte equal to the workflow, all three
+  related skills passed the installed validator, and Ruff check/format passed.

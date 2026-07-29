@@ -1565,6 +1565,26 @@ class RepositoryContractTest(unittest.TestCase):
                     "sudo /bin/chmod go-w /Library/Frameworks/Python.framework/Versions",
                 ):
                     self.assertIn(anchor, workflow)
+                platform_job_start = workflow.index("  platform_tests:")
+                platform_job_end = workflow.index(
+                    "\n  broker_reproducibility:",
+                    platform_job_start,
+                )
+                platform_job = workflow[platform_job_start:platform_job_end]
+                setup_python = platform_job.index("- uses: actions/setup-python@v5")
+                seal = platform_job.index(
+                    "- name: Seal hosted macOS Python framework parent"
+                )
+                first_python_or_repo_code = min(
+                    platform_job.index("python3", setup_python),
+                    platform_job.index(f"{skill_prefix}/", setup_python),
+                )
+                self.assertLess(setup_python, seal)
+                self.assertEqual(
+                    platform_job.index("\n        run:", setup_python),
+                    platform_job.index("\n        run:", seal),
+                )
+                self.assertLess(seal, first_python_or_repo_code)
                 self.assertIn('if [[ "$RUNNER_OS" == "Linux" ]]; then', workflow)
                 self.assertIn(
                     (
