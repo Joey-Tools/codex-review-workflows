@@ -11,6 +11,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 
 from .constants import tool_root
+from .errors import SECONDARY_ERROR_NOTE_PREFIX
 from .models import Identity
 from .secureio import (
     directory_identities_match,
@@ -162,6 +163,18 @@ class _LegacyRetentionProbe:
     uses_account_local_retention: bool
 
 
+def _record_secondary_error(
+    primary_error: BaseException,
+    *,
+    label: str,
+    secondary_error: BaseException,
+) -> None:
+    primary_error.add_note(
+        f"{SECONDARY_ERROR_NOTE_PREFIX}{label}: "
+        f"{type(secondary_error).__name__}: {secondary_error}"
+    )
+
+
 def _close_inspection_fd(fd: int, *, label: str) -> None:
     primary_error = sys.exception()
     try:
@@ -169,9 +182,10 @@ def _close_inspection_fd(fd: int, *, label: str) -> None:
     except OSError as cleanup_error:
         if primary_error is None:
             raise
-        primary_error.add_note(
-            f"{label} descriptor cleanup failed: "
-            f"{type(cleanup_error).__name__}: {cleanup_error}"
+        _record_secondary_error(
+            primary_error,
+            label=f"{label} descriptor cleanup failed",
+            secondary_error=cleanup_error,
         )
 
 
@@ -335,6 +349,48 @@ def _open_current_tool_legacy_retention_root(
         retention_fd=retention_fd,
         retention_binding=_identity_binding(identity),
     )
+
+
+def _validate_current_release_probe(
+    probe: _LegacyRetentionProbe,
+    *,
+    current_tool_path: pathlib.Path,
+    current_root: _LegacyRetentionRoot | None,
+) -> None:
+    try:
+        if probe.tool_path != current_tool_path:
+            raise RuntimeError(
+                "current installed helper path changed while being inspected"
+            )
+        if not probe.uses_account_local_retention:
+            raise RuntimeError(
+                "current installed helper lost its account-local retention policy"
+            )
+        if current_root is None:
+            if probe.root is not None:
+                raise RuntimeError(
+                    "current helper legacy retention path changed while being inspected"
+                )
+        elif (
+            probe.root is None
+            or probe.root.retention_binding != current_root.retention_binding
+        ):
+            raise RuntimeError(
+                "current helper legacy retention path changed while being inspected"
+            )
+    finally:
+        if probe.root is not None:
+            primary_error = sys.exception()
+            try:
+                probe.root.close()
+            except BaseException as cleanup_error:
+                if primary_error is None:
+                    raise
+                _record_secondary_error(
+                    primary_error,
+                    label="current installed release probe cleanup failed",
+                    secondary_error=cleanup_error,
+                )
 
 
 def _revalidate_current_tool_legacy_retention_root(
@@ -562,6 +618,7 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
     catalog = _installed_release_catalog(current_tool_path)
     releases_root: pathlib.Path | None = None
     current_release_name: bytes | None = None
+    current_release_binding: _DirectoryBinding | None = None
     releases_fd = -1
     releases_identity: Identity | None = None
     releases_entries: tuple[tuple[bytes, os.stat_result], ...] = ()
@@ -594,8 +651,6 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
                     label="installed release directory",
                 )
                 for name, release_metadata in releases_entries:
-                    if name == current_release_name:
-                        continue
                     if len(name) != _RELEASE_NAME_LENGTH or any(
                         character not in _LOWER_HEX for character in name
                     ):
@@ -609,6 +664,20 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
                             "installed release has unsafe identity or access policy"
                         )
                     release_binding = _binding(release_metadata)
+                    if name == current_release_name:
+                        current_release_binding = release_binding
+                        current_probe = _open_legacy_retention_root(
+                            releases_fd,
+                            releases_root,
+                            name,
+                            release_binding,
+                        )
+                        _validate_current_release_probe(
+                            current_probe,
+                            current_tool_path=current_tool_path,
+                            current_root=current_root,
+                        )
+                        continue
                     probe = _open_legacy_retention_root(
                         releases_fd,
                         releases_root,
@@ -636,6 +705,10 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
                         root,
                     )
 
+                if current_release_binding is None:
+                    raise RuntimeError(
+                        "current installed release is missing from its release catalog"
+                    )
                 _revalidate_releases_root(
                     releases_root,
                     releases_identity,
@@ -658,8 +731,12 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
                 "cannot inspect installed legacy retention safely"
             ) from error
 
+        body_error: BaseException | None = None
         try:
             yield tuple(unresolved)
+        except BaseException as error:
+            body_error = error
+            raise
         finally:
             try:
                 if current_root is not None:
@@ -683,6 +760,23 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
                         releases_fd,
                         releases_root,
                         root,
+                    )
+                if (
+                    releases_root is not None
+                    and current_release_name is not None
+                    and current_release_binding is not None
+                    and releases_fd >= 0
+                ):
+                    current_probe = _open_legacy_retention_root(
+                        releases_fd,
+                        releases_root,
+                        current_release_name,
+                        current_release_binding,
+                    )
+                    _validate_current_release_probe(
+                        current_probe,
+                        current_tool_path=current_tool_path,
+                        current_root=current_root,
                     )
                 if (
                     releases_root is not None
@@ -716,8 +810,32 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
                         releases_entries,
                     )
             except (OSError, ValueError) as error:
-                raise RuntimeError(
-                    "cannot inspect installed legacy retention safely"
-                ) from error
+                if body_error is None:
+                    raise RuntimeError(
+                        "cannot inspect installed legacy retention safely"
+                    ) from error
+                _record_secondary_error(
+                    body_error,
+                    label="legacy retention fence finalization failed",
+                    secondary_error=error,
+                )
+            except BaseException as error:
+                if body_error is None:
+                    raise
+                _record_secondary_error(
+                    body_error,
+                    label="legacy retention fence finalization failed",
+                    secondary_error=error,
+                )
     finally:
-        cleanup.close()
+        primary_error = sys.exception()
+        try:
+            cleanup.close()
+        except BaseException as cleanup_error:
+            if primary_error is None:
+                raise
+            _record_secondary_error(
+                primary_error,
+                label="legacy retention fence cleanup failed",
+                secondary_error=cleanup_error,
+            )

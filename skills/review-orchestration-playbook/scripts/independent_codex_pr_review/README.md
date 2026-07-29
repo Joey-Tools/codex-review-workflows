@@ -89,9 +89,15 @@ root。
 采用 account-local retention 的 release 必须携带经过内容、身份与访问策略校验的
 `ACCOUNT_LOCAL_RETENTION_V1` 标记。扫描先精确读取标记，再完成 held descriptor、
 reopened path、ACL/xattr 和对象身份复验，随后从原 descriptor 第二次完整读取；两次
-bytes 必须完全一致。时间戳变化不构成内容变化。若仍包含 helper 的未标记旧 release
-没有可获取的 legacy retention lock，新命令会在执行公共命令前失败关闭；需要先停用
-或移除该旧 release，不能用一次“路径暂时不存在”的探测推断它之后不会启动。
+bytes 必须完全一致。时间戳变化不构成内容变化。当前正在执行的 installed release
+也必须通过同一 marker、目录身份和 catalog 稳定性检查，但复用已经持有的 current-root
+fence，不重复加锁。若仍包含 helper 的未标记 release 没有可获取的 legacy retention
+lock，新命令会在执行公共命令前失败关闭；需要先停用或移除该 release，不能用一次
+“路径暂时不存在”的探测推断它之后不会启动。
+公共命令失败后仍执行完整 fence finalization 和 descriptor cleanup；若它们也失败，
+原命令异常的类型与结构化诊断保持主错误，后续故障只作为次级 exception evidence
+附加，并通过可选的 `secondary_errors` 数组输出；该数组最多 4 条、每条最多 512
+字符。命令成功时的 finalization 或 cleanup 故障仍会失败关闭。
 
 仅在 helper 已 terminal 后运行独立 preflight。它验证 exact repo/base/head、helper
 runner completion、primary-diff 双重 attestation、control directory 完整性、source

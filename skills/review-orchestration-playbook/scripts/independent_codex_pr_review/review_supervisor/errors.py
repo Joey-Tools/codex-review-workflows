@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+SECONDARY_ERROR_NOTE_PREFIX = "review-supervisor-secondary-error: "
+
+
 @dataclass(frozen=True)
 class Failure:
     status: str

@@ -34,17 +34,20 @@ superseded_by:
 - The scanner always fences the currently executing helper's own
   `runtime/retention` root before optionally enumerating a standard installed
   overlay catalog. Self-contained and other nonstandard layouts therefore
-  retain the same migration protection, while the current standard release is
-  skipped only in the sibling pass to avoid duplicate locking.
+  retain the same migration protection. The current standard release also
+  passes the catalog capability and directory-identity checks while reusing
+  the already-held current-root fence instead of acquiring its lock twice.
 - Releases that use account-local retention carry a source-controlled
   `ACCOUNT_LOCAL_RETENTION_V1` capability marker. The scanner validates its
   exact bytes, owner, mode, link count, ACL/xattr policy, and object identity,
   then rereads the held descriptor in full and requires identical bytes.
   Same-inode same-size writes are rejected even when the path is restored;
-  benign timestamp drift is ignored. An unmarked installed helper without an
-  existing legacy lock is blocked before the public command can run, rather
-  than treating one absent-path observation as proof that an old version
-  cannot start later.
+  benign timestamp drift is ignored. The currently executing installed release
+  receives the same capability, catalog, and directory-identity checks while
+  reusing its already-held current-root fence. An unmarked installed helper
+  without an existing legacy lock is blocked before the public command can
+  run, rather than treating one absent-path observation as proof that an old
+  version cannot start later.
 - The legacy scan walks from an ACL/xattr-validated releases-root descriptor
   through `O_NOFOLLOW` child descriptors. It binds object identity and access
   policy with device, inode, type, owner, and mode while deliberately ignoring
@@ -55,6 +58,12 @@ superseded_by:
   revalidation, including when the command itself fails. Active old writers,
   empty unfenced roots, newly appeared roots, ACL drift, and ancestor
   replacement all fail closed.
+- When a public command and fence finalization or resource cleanup both fail,
+  the command exception remains primary with its original type and structured
+  `SupervisorError` fields. Finalization and cleanup failures are attached as
+  secondary exception evidence and surfaced through an optional
+  `secondary_errors` field bounded to four 512-character entries. A secondary
+  failure remains fail closed when the command itself succeeded.
 - Explicit default paths bind every existing prefix to the secure descriptor
   walk's device/inode identity and use a conservative case-insensitive key for
   a missing suffix. Darwin root aliases, double-root spelling, and
@@ -84,14 +93,15 @@ superseded_by:
   attempts in older installed releases and that the README still documented the
   obsolete release-local default. The explicit drain gate, cross-version
   regression, and corrected README close both findings.
-- The final deterministic independent-supervisor gate passed 582/582 in
-  176.726 seconds with the reviewed 591-test discovery identity and SHA-256
-  `bf7a3f7476d7e08d51f2b20354bb074034ec92f5a97c6e81cf43e98abb1c4967`.
-- The final platform suite ran 2,819 tests with 6 skips in 1,041.337 seconds.
+- The final deterministic independent-supervisor gate passed 586/586 in
+  184.359 seconds with the reviewed 595-test discovery identity and SHA-256
+  `bcf936d99d2a2ce1d513789a5ffb8900ed28eac7db7277b276a85db07ee08ec9`.
+- The final platform suite ran 2,819 tests with 6 skips in 936.085 seconds.
   Its only failure was the known parent-sandbox denial of nested
   `sandbox-exec`; that exact broker test passed 1/1 outside the parent sandbox
-  in 2.363 seconds.
-- The complete 99-test contract module passed in 6.930 seconds.
+  in 2.059 seconds. The required live no-child/Seatbelt suite passed 9/9
+  outside the parent sandbox in 7.089 seconds.
+- The complete 99-test contract module passed in 6.596 seconds.
 - Focused installed-symlink immutability, default state-root, CI snapshot, and
   no-bytecode entrypoint regressions passed. The new cross-version tests also
   prove explicit old-root visibility and fail-closed release replacement.
@@ -127,7 +137,14 @@ superseded_by:
   path/access-policy revalidation, with primary and cleanup errors separated.
   Every explicit retention root now performs stable equivalence; unavailable
   proof fails closed and only a proven distinct root skips migration.
-- The focused post-fix CLI and secure-I/O modules passed 61/61 tests in 19.690
+- The replacement-head Fresh Codex review found that the current release
+  bypassed its own capability/catalog identity checks and that a simultaneous
+  fence finalization or cleanup failure could replace the public command's
+  primary diagnostic. Current-release probes now run before and after the
+  command without duplicating its lock, and dual-failure handling preserves
+  the exact primary exception while retaining secondary evidence in an
+  optional, bounded `secondary_errors` response field.
+- The focused post-fix CLI and secure-I/O modules passed 65/65 tests in 21.097
   seconds on Python 3.13.
 - Ruff lint/format, actionlint for canonical and private CI profiles,
   source-only syntax checks, project-journal validation, `git diff --check`,

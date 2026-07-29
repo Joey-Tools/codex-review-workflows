@@ -17,7 +17,7 @@ from .constants import (
     default_retention_root,
 )
 from .custody import custody_helper_main
-from .errors import SupervisorError
+from .errors import SECONDARY_ERROR_NOTE_PREFIX, SupervisorError
 from .final_transport import run_fifo_reader
 from .legacy_retention import installed_legacy_retention_fence
 from .runtime import (
@@ -319,10 +319,32 @@ def _emit(value: dict[str, Any]) -> None:
     sys.stdout.write(serialized)
 
 
+_MAX_SECONDARY_ERRORS = 4
+_MAX_SECONDARY_ERROR_CHARACTERS = 512
+
+
+def _secondary_errors(error: BaseException) -> list[str]:
+    notes = getattr(error, "__notes__", ())
+    if not isinstance(notes, list):
+        return []
+    secondary_errors: list[str] = []
+    for note in notes:
+        if not isinstance(note, str) or not note.startswith(
+            SECONDARY_ERROR_NOTE_PREFIX
+        ):
+            continue
+        detail = note.removeprefix(SECONDARY_ERROR_NOTE_PREFIX)
+        if detail:
+            secondary_errors.append(detail[:_MAX_SECONDARY_ERROR_CHARACTERS])
+        if len(secondary_errors) == _MAX_SECONDARY_ERRORS:
+            break
+    return secondary_errors
+
+
 def _failure_payload(error: BaseException) -> dict[str, Any]:
     if isinstance(error, SupervisorError):
         failure = error.failure
-        return {
+        payload = {
             "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
             "named_lane_eligible": NAMED_LANE_ELIGIBLE,
             "overall_status": failure.status,
@@ -331,15 +353,20 @@ def _failure_payload(error: BaseException) -> dict[str, Any]:
             "failure_code": failure.code,
             "message": failure.message,
         }
-    return {
-        "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
-        "named_lane_eligible": NAMED_LANE_ELIGIBLE,
-        "overall_status": "inconclusive",
-        "review_status": "not-run",
-        "failure_stage": "cli",
-        "failure_code": "cli-failed",
-        "message": f"{type(error).__name__}: {error}",
-    }
+    else:
+        payload = {
+            "review_contract": LOW_LEVEL_HELPER_REVIEW_CONTRACT,
+            "named_lane_eligible": NAMED_LANE_ELIGIBLE,
+            "overall_status": "inconclusive",
+            "review_status": "not-run",
+            "failure_stage": "cli",
+            "failure_code": "cli-failed",
+            "message": f"{type(error).__name__}: {error}",
+        }
+    secondary_errors = _secondary_errors(error)
+    if secondary_errors:
+        payload["secondary_errors"] = secondary_errors
+    return payload
 
 
 def main(

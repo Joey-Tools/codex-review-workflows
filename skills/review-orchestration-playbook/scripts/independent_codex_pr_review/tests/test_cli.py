@@ -26,6 +26,7 @@ from review_supervisor.constants import (
     default_retention_root,
     default_state_root,
 )
+from review_supervisor.errors import SupervisorError
 from review_supervisor.secureio import (
     allocated_bytes,
     boot_identifier,
@@ -1037,6 +1038,78 @@ class CliLifecycleTests(unittest.TestCase):
             )
             self.assertIn(str(old_tool), payload["message"])
 
+    def test_unmarked_current_release_fails_before_command(self) -> None:
+        with owned_temporary_directory("cli-unmarked-current-") as root:
+            releases = root / "overlays" / "private" / "releases"
+            current_tool = releases / ("b" * 40) / RELATIVE_TOOL
+            current_tool.mkdir(parents=True)
+            output = io.StringIO()
+            with (
+                mock.patch(
+                    "review_supervisor.legacy_retention.tool_root",
+                    return_value=current_tool,
+                ),
+                mock.patch.object(cli_module, "status") as status_mock,
+                contextlib.redirect_stdout(output),
+            ):
+                exit_code = cli_module.main(("status",), entrypoint=ENTRYPOINT)
+
+            self.assertEqual(exit_code, 2)
+            status_mock.assert_not_called()
+            payload = json.loads(output.getvalue())
+            self.assertIn(
+                "current installed helper lost its account-local retention policy",
+                payload["message"],
+            )
+
+    def test_current_release_replacement_after_catalog_snapshot_fails_closed(
+        self,
+    ) -> None:
+        with owned_temporary_directory("cli-current-replaced-") as root:
+            releases, current_tool, _, legacy_retention = _installed_upgrade_layout(
+                root
+            )
+            _write_retention_lock(legacy_retention)
+            current_release = releases / ("b" * 40)
+            removed_release = releases / ("c" * 40)
+            original_entries = legacy_retention_module._stable_directory_entries_fd
+            replaced = False
+
+            def replace_after_snapshot(*args: object, **kwargs: object) -> object:
+                nonlocal replaced
+                entries = original_entries(*args, **kwargs)
+                if not replaced:
+                    replaced = True
+                    current_release.rename(removed_release)
+                    current_tool.mkdir(parents=True)
+                    _write_account_local_marker(current_tool)
+                return entries
+
+            output = io.StringIO()
+            with (
+                mock.patch(
+                    "review_supervisor.legacy_retention.tool_root",
+                    return_value=current_tool,
+                ),
+                mock.patch.object(
+                    legacy_retention_module,
+                    "_stable_directory_entries_fd",
+                    side_effect=replace_after_snapshot,
+                ),
+                mock.patch.object(cli_module, "status") as status_mock,
+                contextlib.redirect_stdout(output),
+            ):
+                exit_code = cli_module.main(("status",), entrypoint=ENTRYPOINT)
+
+            self.assertEqual(exit_code, 2)
+            self.assertTrue(replaced)
+            status_mock.assert_not_called()
+            payload = json.loads(output.getvalue())
+            self.assertIn(
+                "installed release changed while being inspected",
+                payload["message"],
+            )
+
     def test_marked_account_local_sibling_without_legacy_root_is_allowed(
         self,
     ) -> None:
@@ -1395,6 +1468,145 @@ class CliLifecycleTests(unittest.TestCase):
                     "cannot inspect installed legacy retention safely",
                     payload["message"],
                 )
+
+    def test_legacy_fence_preserves_primary_during_finalization_failure(
+        self,
+    ) -> None:
+        failures = (
+            SupervisorError(
+                "synthetic structured command failure",
+                status="blocked",
+                stage="recovery",
+                code="synthetic-primary",
+            ),
+            OSError("synthetic command os failure"),
+            ValueError("synthetic command value failure"),
+        )
+        for failure in failures:
+            with (
+                self.subTest(failure=type(failure).__name__),
+                owned_temporary_directory("cli-legacy-dual-failure-") as root,
+            ):
+                _, current_tool, _, legacy_retention = _installed_upgrade_layout(root)
+                _write_retention_lock(legacy_retention)
+                original_revalidate = legacy_retention_module._revalidate_releases_root
+                revalidation_count = 0
+
+                def fail_final_revalidation(
+                    *args: object,
+                    **kwargs: object,
+                ) -> None:
+                    nonlocal revalidation_count
+                    revalidation_count += 1
+                    if revalidation_count == 1:
+                        original_revalidate(*args, **kwargs)
+                        return
+                    raise OSError(errno.ESTALE, "synthetic finalization drift")
+
+                with (
+                    mock.patch(
+                        "review_supervisor.legacy_retention.tool_root",
+                        return_value=current_tool,
+                    ),
+                    mock.patch.object(
+                        legacy_retention_module,
+                        "_revalidate_releases_root",
+                        side_effect=fail_final_revalidation,
+                    ),
+                    self.assertRaises(type(failure)) as raised,
+                ):
+                    with legacy_retention_module.installed_legacy_retention_fence():
+                        raise failure
+
+                self.assertIs(raised.exception, failure)
+                self.assertEqual(revalidation_count, 2)
+                self.assertIn(
+                    "legacy retention fence finalization failed",
+                    "\n".join(raised.exception.__notes__),
+                )
+                payload = cli_module._failure_payload(raised.exception)
+                self.assertIn(
+                    "legacy retention fence finalization failed",
+                    "\n".join(payload["secondary_errors"]),
+                )
+                if isinstance(failure, SupervisorError):
+                    self.assertEqual(failure.failure.status, "blocked")
+                    self.assertEqual(failure.failure.stage, "recovery")
+                    self.assertEqual(failure.failure.code, "synthetic-primary")
+                    self.assertEqual(
+                        failure.failure.message,
+                        "synthetic structured command failure",
+                    )
+                    failure.add_note("unrelated internal diagnostic")
+                    for index in range(5):
+                        legacy_retention_module._record_secondary_error(
+                            failure,
+                            label=f"bounded-secondary-{index}",
+                            secondary_error=RuntimeError("x" * 600),
+                        )
+                    bounded_payload = cli_module._failure_payload(failure)
+                    self.assertEqual(len(bounded_payload["secondary_errors"]), 4)
+                    self.assertNotIn(
+                        "unrelated internal diagnostic",
+                        "\n".join(bounded_payload["secondary_errors"]),
+                    )
+                    self.assertTrue(
+                        all(
+                            len(note) <= cli_module._MAX_SECONDARY_ERROR_CHARACTERS
+                            for note in bounded_payload["secondary_errors"]
+                        )
+                    )
+
+    def test_legacy_fence_preserves_primary_during_cleanup_failure(self) -> None:
+        with owned_temporary_directory("cli-legacy-cleanup-failure-") as root:
+            _, current_tool, _, legacy_retention = _installed_upgrade_layout(root)
+            _write_retention_lock(legacy_retention)
+            failure = SupervisorError(
+                "synthetic structured command failure",
+                status="blocked",
+                stage="recovery",
+                code="synthetic-primary",
+            )
+            original_close = contextlib.ExitStack.close
+
+            def close_then_fail(stack: contextlib.ExitStack) -> None:
+                original_close(stack)
+                raise OSError(errno.EIO, "synthetic cleanup failure")
+
+            with (
+                mock.patch(
+                    "review_supervisor.legacy_retention.tool_root",
+                    return_value=current_tool,
+                ),
+                mock.patch.object(
+                    legacy_retention_module.contextlib.ExitStack,
+                    "close",
+                    autospec=True,
+                    side_effect=close_then_fail,
+                ),
+                self.assertRaises(SupervisorError) as raised,
+            ):
+                with legacy_retention_module.installed_legacy_retention_fence():
+                    raise failure
+
+            self.assertIs(raised.exception, failure)
+            self.assertEqual(failure.failure.status, "blocked")
+            self.assertEqual(failure.failure.stage, "recovery")
+            self.assertEqual(failure.failure.code, "synthetic-primary")
+            self.assertEqual(
+                failure.failure.message,
+                "synthetic structured command failure",
+            )
+            self.assertIn(
+                "legacy retention fence cleanup failed",
+                "\n".join(raised.exception.__notes__),
+            )
+            payload = cli_module._failure_payload(raised.exception)
+            self.assertEqual(payload["failure_code"], "synthetic-primary")
+            self.assertIn(
+                "legacy retention fence cleanup failed",
+                "\n".join(payload["secondary_errors"]),
+            )
 
     def test_legacy_retention_acl_revalidation_fails_closed(self) -> None:
         with owned_temporary_directory("cli-legacy-acl-drift-") as root:
