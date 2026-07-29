@@ -471,6 +471,13 @@ commit, mutable no-commit existing-range, and read-only formal paths are
 separate rows: mutable phases use `satisfied`, read-only phases use
 `read-only-observed`, and only a mutable commit path may use a genuinely
 `succeeded` local gate before a downstream authorization or input blocker.
+Every row that supports `focused-checkpoint` keeps
+`local_gate: not-required`, because that profile never runs the full local
+gate. Twelve implementation, earliest-validation, journal, mutable
+formal-review, and mutable signing rows share one profile-bound rule:
+`focused-checkpoint` uses `not-required`, while `local-gate` and
+`pr-readiness-handoff` use `blocked`. The eight authorization/input or
+profile-restricted signing rows retain their single full-profile gate value.
 Within the six no-commit/read-only formal-review, missing-range, and findings
 rows, the schema branches again by profile. A policy-promoted
 `focused-checkpoint` uses `local_gate: not-required`, because that profile never

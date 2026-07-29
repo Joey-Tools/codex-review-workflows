@@ -3883,7 +3883,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
             branch["title"]: branch
             for branch in schema["$defs"]["blockedTerminalMatrix"]["oneOf"]
         }
-        focused_gate_ref = "#/$defs/focusedMutableCommitBlockerLocalGate"
+        focused_gate_ref = "#/$defs/focusedBlockedLocalGate"
 
         for title in (
             "formal-review-blocked:mutable-commit",
@@ -3933,6 +3933,148 @@ class DeliveryProfileContractTest(unittest.TestCase):
             relabeled["profile"] = "local-gate"
             with self.subTest(title=title, mutation="relabeled-focused"):
                 self.assertTrue(list(validator.iter_errors(relabeled)))
+
+    def test_every_blocker_profile_has_exact_local_gate_label(self) -> None:
+        schema = json.loads(DELIVERY_RESULT_SCHEMA.read_text(encoding="utf-8"))
+        validator = Draft202012Validator(schema)
+        branches = schema["$defs"]["blockedTerminalMatrix"]["oneOf"]
+        branches_by_title = {branch["title"]: branch for branch in branches}
+        profiles = (
+            "focused-checkpoint",
+            "local-gate",
+            "pr-readiness-handoff",
+        )
+        blocked_titles = {
+            "implementation-blocked:mutable-commit",
+            "validation-blocked:mutable-commit:build",
+            "validation-blocked:mutable-commit:tests",
+            "validation-blocked:mutable-commit:docs",
+            "journal-blocked:mutable-commit",
+            "implementation-blocked:existing-range-no-commit",
+            "validation-blocked:existing-range-no-commit:build",
+            "validation-blocked:existing-range-no-commit:tests",
+            "validation-blocked:existing-range-no-commit:docs",
+            "journal-blocked:existing-range-no-commit",
+            "formal-review-blocked:mutable-commit",
+            "signing-failed:mutable-commit",
+        }
+        checked_all_profile_titles = {
+            "formal-review-blocked:existing-range-no-commit",
+            "missing-committed-range:existing-range-no-commit",
+            "review-findings:existing-range-no-commit",
+        }
+        checked_focused_local_titles = {
+            "formal-review-blocked:read-only-formal",
+            "missing-committed-range:read-only-formal",
+            "review-findings:read-only-formal",
+        }
+        fixed_profile_gates = {
+            "signing-failed:existing-range-no-commit": {
+                "pr-readiness-handoff": "checked"
+            },
+            "signing-failed:read-only-formal": {"local-gate": "checked"},
+            "blocked-authorization:mutable-commit": {
+                "pr-readiness-handoff": "succeeded"
+            },
+            "blocked-authorization:existing-range-no-commit": {
+                "pr-readiness-handoff": "checked"
+            },
+            "blocked-authorization:read-only-formal": {"local-gate": "checked"},
+            "blocked-input:mutable-commit": {"pr-readiness-handoff": "succeeded"},
+            "blocked-input:existing-range-no-commit": {
+                "pr-readiness-handoff": "checked"
+            },
+            "blocked-input:read-only-formal": {"local-gate": "checked"},
+        }
+        expected_profile_gates = {
+            title: {
+                "focused-checkpoint": "not-required",
+                "local-gate": "blocked",
+                "pr-readiness-handoff": "blocked",
+            }
+            for title in blocked_titles
+        }
+        expected_profile_gates.update(
+            {
+                title: {
+                    "focused-checkpoint": "not-required",
+                    "local-gate": "checked",
+                    "pr-readiness-handoff": "checked",
+                }
+                for title in checked_all_profile_titles
+            }
+        )
+        expected_profile_gates.update(
+            {
+                title: {
+                    "focused-checkpoint": "not-required",
+                    "local-gate": "checked",
+                }
+                for title in checked_focused_local_titles
+            }
+        )
+        expected_profile_gates.update(fixed_profile_gates)
+
+        self.assertEqual(len(blocked_titles), 12)
+        self.assertEqual(
+            len(checked_all_profile_titles | checked_focused_local_titles),
+            6,
+        )
+        self.assertEqual(len(fixed_profile_gates), 8)
+        self.assertEqual(
+            set(branches_by_title),
+            set(expected_profile_gates),
+        )
+
+        ref_groups = (
+            (
+                blocked_titles,
+                "#/$defs/focusedBlockedLocalGate",
+                {"blocked", "not-required"},
+            ),
+            (
+                checked_all_profile_titles | checked_focused_local_titles,
+                "#/$defs/focusedFormalBlockerLocalGate",
+                {"checked", "not-required"},
+            ),
+        )
+        for titles, expected_ref, expected_enum in ref_groups:
+            self.assertIn(expected_ref.rsplit("/", 1)[-1], schema["$defs"])
+            for title in titles:
+                branch = branches_by_title[title]
+                local_gate_schema = branch["properties"]["terminal_evidence"][
+                    "properties"
+                ]["local_gate"]
+                self.assertEqual(branch.get("$ref"), expected_ref)
+                self.assertEqual(set(local_gate_schema["enum"]), expected_enum)
+
+        for title, profile_gates in fixed_profile_gates.items():
+            branch = branches_by_title[title]
+            local_gate_schema = branch["properties"]["terminal_evidence"]["properties"][
+                "local_gate"
+            ]
+            self.assertNotIn("$ref", branch)
+            self.assertEqual(
+                local_gate_schema["const"],
+                next(iter(profile_gates.values())),
+            )
+
+        for title, expected_gates in expected_profile_gates.items():
+            branch = branches_by_title[title]
+            for profile in profiles:
+                expected_labels = (
+                    {expected_gates[profile]} if profile in expected_gates else set()
+                )
+                baseline = blocker_result(branch, profile=profile)
+                accepted_labels = set()
+                for label in TERMINAL_EVIDENCE_VALUES["local_gate"]:
+                    candidate = copy.deepcopy(baseline)
+                    candidate["terminal_evidence"]["local_gate"] = label
+                    if not list(validator.iter_errors(candidate)):
+                        accepted_labels.add(label)
+
+                with self.subTest(title=title, profile=profile):
+                    self.assertEqual(accepted_labels, expected_labels)
 
     def test_read_only_receiver_rejects_non_ready_delivery_terminal(self) -> None:
         report = copy.deepcopy(

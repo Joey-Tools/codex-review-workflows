@@ -578,7 +578,7 @@
         }
       }
     },
-    "focusedMutableCommitBlockerLocalGate": {
+    "focusedBlockedLocalGate": {
       "if": {
         "properties": {
           "profile": {
@@ -1866,6 +1866,7 @@
       "oneOf": [
         {
           "title": "implementation-blocked:mutable-commit",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
           "properties": {
             "terminal_outcome": {
               "const": "blocked"
@@ -1882,7 +1883,10 @@
             "terminal_evidence": {
               "properties": {
                 "local_gate": {
-                  "const": "blocked"
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
                 },
                 "build": {
                   "const": "blocked"
@@ -1926,6 +1930,7 @@
         },
         {
           "title": "validation-blocked:mutable-commit:build",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
           "properties": {
             "terminal_outcome": {
               "const": "blocked"
@@ -1942,7 +1947,10 @@
             "terminal_evidence": {
               "properties": {
                 "local_gate": {
-                  "const": "blocked"
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
                 },
                 "build": {
                   "const": "failed"
@@ -1986,6 +1994,7 @@
         },
         {
           "title": "validation-blocked:mutable-commit:tests",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
           "properties": {
             "terminal_outcome": {
               "const": "blocked"
@@ -2002,7 +2011,10 @@
             "terminal_evidence": {
               "properties": {
                 "local_gate": {
-                  "const": "blocked"
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
                 },
                 "build": {
                   "const": "satisfied"
@@ -2046,6 +2058,7 @@
         },
         {
           "title": "validation-blocked:mutable-commit:docs",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
           "properties": {
             "terminal_outcome": {
               "const": "blocked"
@@ -2062,7 +2075,10 @@
             "terminal_evidence": {
               "properties": {
                 "local_gate": {
-                  "const": "blocked"
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
                 },
                 "build": {
                   "const": "satisfied"
@@ -2106,6 +2122,7 @@
         },
         {
           "title": "journal-blocked:mutable-commit",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
           "properties": {
             "terminal_outcome": {
               "const": "blocked"
@@ -2122,7 +2139,10 @@
             "terminal_evidence": {
               "properties": {
                 "local_gate": {
-                  "const": "blocked"
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
                 },
                 "build": {
                   "const": "satisfied"
@@ -2166,6 +2186,7 @@
         },
         {
           "title": "implementation-blocked:existing-range-no-commit",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
           "properties": {
             "terminal_outcome": {
               "const": "blocked"
@@ -2182,7 +2203,10 @@
             "terminal_evidence": {
               "properties": {
                 "local_gate": {
-                  "const": "blocked"
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
                 },
                 "build": {
                   "const": "blocked"
@@ -2226,6 +2250,7 @@
         },
         {
           "title": "validation-blocked:existing-range-no-commit:build",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
           "properties": {
             "terminal_outcome": {
               "const": "blocked"
@@ -2242,7 +2267,10 @@
             "terminal_evidence": {
               "properties": {
                 "local_gate": {
-                  "const": "blocked"
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
                 },
                 "build": {
                   "const": "failed"
@@ -2286,6 +2314,7 @@
         },
         {
           "title": "validation-blocked:existing-range-no-commit:tests",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
           "properties": {
             "terminal_outcome": {
               "const": "blocked"
@@ -2302,7 +2331,10 @@
             "terminal_evidence": {
               "properties": {
                 "local_gate": {
-                  "const": "blocked"
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
                 },
                 "build": {
                   "const": "satisfied"
@@ -2346,6 +2378,7 @@
         },
         {
           "title": "validation-blocked:existing-range-no-commit:docs",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
           "properties": {
             "terminal_outcome": {
               "const": "blocked"
@@ -2362,7 +2395,10 @@
             "terminal_evidence": {
               "properties": {
                 "local_gate": {
-                  "const": "blocked"
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
                 },
                 "build": {
                   "const": "satisfied"
@@ -2406,6 +2442,7 @@
         },
         {
           "title": "journal-blocked:existing-range-no-commit",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
           "properties": {
             "terminal_outcome": {
               "const": "blocked"
@@ -2422,7 +2459,10 @@
             "terminal_evidence": {
               "properties": {
                 "local_gate": {
-                  "const": "blocked"
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
                 },
                 "build": {
                   "const": "satisfied"
@@ -2466,7 +2506,7 @@
         },
         {
           "title": "formal-review-blocked:mutable-commit",
-          "$ref": "#/$defs/focusedMutableCommitBlockerLocalGate",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
           "properties": {
             "terminal_outcome": {
               "const": "blocked"
@@ -2962,7 +3002,7 @@
         },
         {
           "title": "signing-failed:mutable-commit",
-          "$ref": "#/$defs/focusedMutableCommitBlockerLocalGate",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
           "properties": {
             "terminal_outcome": {
               "const": "blocked"

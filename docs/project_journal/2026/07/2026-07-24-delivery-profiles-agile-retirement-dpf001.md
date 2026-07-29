@@ -315,3 +315,11 @@ superseded_by:
   reject relabeling focused evidence as a full gate. The complete delivery
   schema suite passed (`46` tests), and the review contract suite passed
   (`99` tests).
+- A third fresh whole-range review found ten earlier implementation, validation,
+  and journal blocker rows with the same unconditional full-gate label. The
+  schema now centralizes all profile-sensitive blockers into twelve
+  `blocked`/`not-required` rows and six `checked`/`not-required` rows, leaving
+  eight fixed-profile rows explicit. An independent oracle exhaustively checks
+  all 26 blocker reasons across three delivery profiles and four candidate
+  local-gate labels (`312` combinations). The complete delivery schema suite
+  passed (`47` tests), and the review contract suite passed (`99` tests).
