@@ -17,7 +17,11 @@ from .constants import (
     default_retention_root,
 )
 from .custody import custody_helper_main
-from .errors import SECONDARY_ERROR_NOTE_PREFIX, SupervisorError
+from .errors import (
+    SECONDARY_ERROR_NOTE_PREFIX,
+    SupervisorError,
+    record_secondary_error,
+)
 from .final_transport import run_fifo_reader
 from .legacy_retention import installed_legacy_retention_fence
 from .runtime import (
@@ -29,6 +33,7 @@ from .runtime import (
     prompt_verifier_main,
 )
 from .secureio import (
+    bind_directory_path_equivalence,
     canonical_json,
     directory_paths_equivalent,
     require_python_313,
@@ -153,20 +158,43 @@ def _uses_account_local_retention_root(arguments: argparse.Namespace) -> bool:
 def _resolve_public_default_roots(
     arguments: argparse.Namespace,
 ) -> Iterator[None]:
-    use_account_local_retention = _uses_account_local_retention_root(arguments)
+    account_local_retention = default_retention_root()
+    if arguments.retention_root is None:
+        arguments.retention_root = account_local_retention
     if hasattr(arguments, "checkout_parent") and arguments.checkout_parent is None:
         arguments.checkout_parent = default_checkout_parent()
-    if not use_account_local_retention:
-        yield
-        return
-    with installed_legacy_retention_fence() as legacy_roots:
-        if legacy_roots:
-            roots = ", ".join(str(root) for root in legacy_roots)
-            raise RuntimeError(
-                "legacy release-local attempts require explicit draining with "
-                f"--retention-root before using the account-local default: {roots}"
-            )
-        yield
+    with bind_directory_path_equivalence(
+        arguments.retention_root,
+        account_local_retention,
+    ) as retention_binding:
+        body_error: BaseException | None = None
+        try:
+            if not retention_binding.equivalent:
+                yield
+                return
+            with installed_legacy_retention_fence() as legacy_roots:
+                if legacy_roots:
+                    roots = ", ".join(str(root) for root in legacy_roots)
+                    raise RuntimeError(
+                        "legacy release-local attempts require explicit draining with "
+                        "--retention-root before using the account-local default: "
+                        f"{roots}"
+                    )
+                yield
+        except BaseException as error:
+            body_error = error
+            raise
+        finally:
+            try:
+                retention_binding.revalidate()
+            except BaseException as revalidation_error:
+                if body_error is None:
+                    raise
+                record_secondary_error(
+                    body_error,
+                    label="retention root binding finalization failed",
+                    secondary_error=revalidation_error,
+                )
 
 
 def _internal_parser(mode: str) -> argparse.ArgumentParser:

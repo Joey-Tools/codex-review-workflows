@@ -434,6 +434,95 @@ class CliLifecycleTests(unittest.TestCase):
         self.assertEqual(preflight_mock.call_args.kwargs["retention_root"], retention)
         self.assertEqual(preflight_mock.call_args.kwargs["checkout_parent"], checkout)
 
+    def test_selected_retention_replacement_fails_before_lock_creation(self) -> None:
+        with owned_temporary_directory("cli-selected-root-replaced-") as root:
+            selected = root / "selected"
+            selected.mkdir(mode=0o700)
+            account_default = root / "account-default"
+            account_default.mkdir(mode=0o700)
+            displaced = root / "displaced"
+            original_status = cli_module.status
+            replaced = False
+
+            def replace_then_status(**kwargs: object) -> dict[str, object]:
+                nonlocal replaced
+                selected.rename(displaced)
+                account_default.rename(selected)
+                replaced = True
+                return original_status(**kwargs)
+
+            output = io.StringIO()
+            with (
+                mock.patch.object(
+                    cli_module,
+                    "default_retention_root",
+                    return_value=account_default,
+                ),
+                mock.patch.object(
+                    cli_module,
+                    "installed_legacy_retention_fence",
+                    side_effect=AssertionError("distinct roots must skip the fence"),
+                ),
+                mock.patch.object(
+                    cli_module,
+                    "status",
+                    side_effect=replace_then_status,
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                exit_code = cli_module.main(
+                    (
+                        "status",
+                        "--retention-root",
+                        str(selected),
+                    ),
+                    entrypoint=ENTRYPOINT,
+                )
+
+            self.assertEqual(exit_code, 2)
+            self.assertTrue(replaced)
+            payload = json.loads(output.getvalue())
+            self.assertIn(
+                "directory path changed while comparing account-local roots",
+                payload["message"],
+            )
+            self.assertFalse((selected / "retention.lock").exists())
+            self.assertFalse((displaced / "retention.lock").exists())
+
+    def test_selected_retention_binding_allows_child_entry_churn(self) -> None:
+        with owned_temporary_directory("cli-selected-root-churn-") as root:
+            selected = root / "selected"
+            selected.mkdir(mode=0o700)
+            account_default = root / "account-default"
+            account_default.mkdir(mode=0o700)
+            output = io.StringIO()
+            with (
+                mock.patch.object(
+                    cli_module,
+                    "default_retention_root",
+                    return_value=account_default,
+                ),
+                mock.patch.object(
+                    cli_module,
+                    "installed_legacy_retention_fence",
+                    side_effect=AssertionError("distinct roots must skip the fence"),
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                exit_code = cli_module.main(
+                    (
+                        "status",
+                        "--retention-root",
+                        str(selected),
+                    ),
+                    entrypoint=ENTRYPOINT,
+                )
+
+            self.assertEqual(exit_code, 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["retention_root"], str(selected))
+            self.assertTrue((selected / "retention.lock").is_file())
+
     def test_installed_upgrade_blocks_until_legacy_attempt_is_drained(
         self,
     ) -> None:
@@ -493,6 +582,56 @@ class CliLifecycleTests(unittest.TestCase):
             _assert_low_level_contract(self, drain_payload)
             self.assertEqual(drain_payload["retention_root"], str(legacy_retention))
             self.assertEqual(drain_payload["attempt_count"], 1)
+
+    def test_installed_upgrade_rejects_attempt_created_during_command(
+        self,
+    ) -> None:
+        with owned_temporary_directory("cli-legacy-attempt-race-") as root:
+            _, current_tool, _, legacy_retention = _installed_upgrade_layout(root)
+            _write_retention_lock(legacy_retention)
+            account_default = root / "account-default"
+            original_status = cli_module.status
+            attempt_created = False
+
+            def create_attempt_then_return(**kwargs: object) -> dict[str, object]:
+                nonlocal attempt_created
+                result = original_status(**kwargs)
+                _write_attempt(
+                    legacy_retention,
+                    suffix="a" * 32,
+                    process_settlement="exact",
+                    retention_state="held",
+                )
+                attempt_created = True
+                return result
+
+            output = io.StringIO()
+            with (
+                mock.patch.object(
+                    cli_module,
+                    "default_retention_root",
+                    return_value=account_default,
+                ),
+                mock.patch(
+                    "review_supervisor.legacy_retention.tool_root",
+                    return_value=current_tool,
+                ),
+                mock.patch.object(
+                    cli_module,
+                    "status",
+                    side_effect=create_attempt_then_return,
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                exit_code = cli_module.main(("status",), entrypoint=ENTRYPOINT)
+
+            self.assertEqual(exit_code, 2)
+            self.assertTrue(attempt_created)
+            payload = json.loads(output.getvalue())
+            self.assertIn(
+                "legacy retention attempts appeared while migration fence was active",
+                payload["message"],
+            )
 
     def test_installed_upgrade_rejects_release_replacement_after_catalog(
         self,
@@ -618,7 +757,7 @@ class CliLifecycleTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     cli_module,
-                    "directory_paths_equivalent",
+                    "bind_directory_path_equivalence",
                     side_effect=OSError(
                         errno.ESTALE,
                         "directory path changed while comparing account-local roots",
@@ -655,6 +794,7 @@ class CliLifecycleTests(unittest.TestCase):
         explicit_alias = pathlib.Path("/opaque/account-state")
         account_default = pathlib.Path("/account/default-retention")
         arguments = argparse.Namespace(retention_root=explicit_alias)
+        binding = mock.Mock(equivalent=True)
         with (
             mock.patch.object(
                 cli_module,
@@ -663,9 +803,9 @@ class CliLifecycleTests(unittest.TestCase):
             ),
             mock.patch.object(
                 cli_module,
-                "directory_paths_equivalent",
-                return_value=True,
-            ) as equivalence_mock,
+                "bind_directory_path_equivalence",
+                return_value=contextlib.nullcontext(binding),
+            ) as binding_mock,
             mock.patch.object(
                 cli_module,
                 "installed_legacy_retention_fence",
@@ -675,7 +815,8 @@ class CliLifecycleTests(unittest.TestCase):
         ):
             pass
 
-        equivalence_mock.assert_called_once_with(explicit_alias, account_default)
+        binding_mock.assert_called_once_with(explicit_alias, account_default)
+        binding.revalidate.assert_called_once_with()
         fence_mock.assert_called_once()
 
     def test_darwin_root_alias_still_identifies_explicit_account_default(

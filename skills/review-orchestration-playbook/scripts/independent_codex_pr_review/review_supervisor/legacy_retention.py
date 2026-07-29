@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 
 from .constants import tool_root
-from .errors import SECONDARY_ERROR_NOTE_PREFIX
+from .errors import record_secondary_error
 from .models import Identity
 from .secureio import (
     directory_identities_match,
@@ -144,6 +144,7 @@ class _LegacyRetentionRoot:
     retention_binding: _DirectoryBinding
     lock_fd: int = -1
     lock_identity: Identity | None = None
+    initial_attempt_present: bool | None = None
 
     def close(self) -> None:
         lock_fd, self.lock_fd = self.lock_fd, -1
@@ -169,9 +170,10 @@ def _record_secondary_error(
     label: str,
     secondary_error: BaseException,
 ) -> None:
-    primary_error.add_note(
-        f"{SECONDARY_ERROR_NOTE_PREFIX}{label}: "
-        f"{type(secondary_error).__name__}: {secondary_error}"
+    record_secondary_error(
+        primary_error,
+        label=label,
+        secondary_error=secondary_error,
     )
 
 
@@ -584,6 +586,22 @@ def _retention_root_has_attempt(root: _LegacyRetentionRoot) -> bool:
     return retained_attempt
 
 
+def _record_initial_attempt_state(root: _LegacyRetentionRoot) -> bool:
+    retained_attempt = _retention_root_has_attempt(root)
+    root.initial_attempt_present = retained_attempt
+    return retained_attempt
+
+
+def _reject_new_attempt(root: _LegacyRetentionRoot) -> None:
+    if root.initial_attempt_present is None:
+        raise RuntimeError("legacy retention root has no initial attempt snapshot")
+    retained_attempt = _retention_root_has_attempt(root)
+    if retained_attempt and not root.initial_attempt_present:
+        raise RuntimeError(
+            "legacy retention attempts appeared while migration fence was active"
+        )
+
+
 def _revalidate_releases_root(
     releases_root: pathlib.Path,
     releases_identity: Identity,
@@ -635,7 +653,7 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
             else:
                 cleanup.callback(current_root.close)
                 _acquire_legacy_retention_lock(current_root)
-                if _retention_root_has_attempt(current_root):
+                if _record_initial_attempt_state(current_root):
                     unresolved.append(current_root.path)
                 _revalidate_legacy_retention_lock(current_root)
                 _revalidate_current_tool_legacy_retention_root(current_root)
@@ -696,7 +714,7 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
                     roots.append(root)
                     cleanup.callback(root.close)
                     _acquire_legacy_retention_lock(root)
-                    if _retention_root_has_attempt(root):
+                    if _record_initial_attempt_state(root):
                         unresolved.append(root.path)
                     _revalidate_legacy_retention_lock(root)
                     _revalidate_legacy_retention_root(
@@ -741,7 +759,7 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
             try:
                 if current_root is not None:
                     _revalidate_legacy_retention_lock(current_root)
-                    _retention_root_has_attempt(current_root)
+                    _reject_new_attempt(current_root)
                     _revalidate_current_tool_legacy_retention_root(current_root)
                 elif current_root_absent:
                     appeared_current = _open_current_tool_legacy_retention_root(
@@ -755,7 +773,7 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
                         )
                 for root in roots:
                     _revalidate_legacy_retention_lock(root)
-                    _retention_root_has_attempt(root)
+                    _reject_new_attempt(root)
                     _revalidate_legacy_retention_root(
                         releases_fd,
                         releases_root,

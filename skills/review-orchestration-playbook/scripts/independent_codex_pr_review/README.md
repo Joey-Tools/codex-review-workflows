@@ -86,6 +86,11 @@ helper 根下的旧 retention root，因此 self-contained 或非标准安装布
 `final`、`recover`、`release` 和 `cleanup`，直到旧 root drained；在此之前不得删除
 旧 release。扫描不会搬动活动 attempt，也不会把旧 attempt 并入新的 account-local
 root。
+CLI 会把显式或默认 retention root 与 account-local default 的等价性快照保持到公共
+命令结束，并让该命令对所选 root 的每次精确打开都验证同一 binding。binding 保护
+对象身份、访问策略和两条路径的等价关系；missing leaf 的预期创建和目录 child-entry
+churn 可以继续，现有前缀、所选 root、default root 或等价关系的替换会在写入
+`retention.lock` 或后续状态前失败关闭。命令结束后还会再次验证该 binding。
 采用 account-local retention 的 release 必须携带经过内容、身份与访问策略校验的
 `ACCOUNT_LOCAL_RETENTION_V1` 标记。扫描先精确读取标记，再完成 held descriptor、
 reopened path、ACL/xattr 和对象身份复验，随后从原 descriptor 第二次完整读取；两次
@@ -98,6 +103,9 @@ lock，新命令会在执行公共命令前失败关闭；需要先停用或移�
 原命令异常的类型与结构化诊断保持主错误，后续故障只作为次级 exception evidence
 附加，并通过可选的 `secondary_errors` 数组输出；该数组最多 4 条、每条最多 512
 字符。命令成功时的 finalization 或 cleanup 故障仍会失败关闭。
+每个 legacy root 的初始 attempt 状态也属于 fence 证据：起初为空且已加锁的 root
+若在公共命令期间出现 `attempt-*`，finalization 会失败关闭，不能把最终枚举到的新
+attempt 当作无关 child-entry churn。
 
 仅在 helper 已 terminal 后运行独立 preflight。它验证 exact repo/base/head、helper
 runner completion、primary-diff 双重 attestation、control directory 完整性、source

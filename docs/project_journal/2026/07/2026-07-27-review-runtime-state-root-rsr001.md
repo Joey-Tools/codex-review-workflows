@@ -28,6 +28,13 @@ superseded_by:
   roots skip the migration gate, equivalent aliases use it, and unavailable
   proof fails closed. Explicit checkout-parent lookup remains independent and
   lazy.
+- The CLI retains the selected/default path snapshots through command
+  completion. Every exact selected-root open binds the object identity and
+  private access policy to that classification before a retention lock or
+  durable state can be written, and finalization revalidates both paths plus
+  their equivalence. Expected missing-leaf materialization and directory
+  child-entry churn are accepted; selected/default object replacement or an
+  equivalence transition fails closed.
 - Installed overlays fail closed when any sibling release still has a
   release-local retained attempt. Operators must explicitly select that old
   retention root and drain it before using the account-local default.
@@ -56,8 +63,8 @@ superseded_by:
   nonblocking exclusive flock, enumerates attempts while holding that fence,
   and retains it through the default-root command plus final path/catalog
   revalidation, including when the command itself fails. Active old writers,
-  empty unfenced roots, newly appeared roots, ACL drift, and ancestor
-  replacement all fail closed.
+  empty unfenced roots, newly appeared roots, an initially empty root gaining
+  an attempt, ACL drift, and ancestor replacement all fail closed.
 - When a public command and fence finalization or resource cleanup both fail,
   the command exception remains primary with its original type and structured
   `SupervisorError` fields. Finalization and cleanup failures are attached as
@@ -93,15 +100,12 @@ superseded_by:
   attempts in older installed releases and that the README still documented the
   obsolete release-local default. The explicit drain gate, cross-version
   regression, and corrected README close both findings.
-- The final deterministic independent-supervisor gate passed 586/586 in
-  184.359 seconds with the reviewed 595-test discovery identity and SHA-256
-  `bcf936d99d2a2ce1d513789a5ffb8900ed28eac7db7277b276a85db07ee08ec9`.
-- The final platform suite ran 2,819 tests with 6 skips in 936.085 seconds.
+- The final platform suite ran 2,819 tests with 6 skips in 1,106.006 seconds.
   Its only failure was the known parent-sandbox denial of nested
   `sandbox-exec`; that exact broker test passed 1/1 outside the parent sandbox
-  in 2.059 seconds. The required live no-child/Seatbelt suite passed 9/9
-  outside the parent sandbox in 7.089 seconds.
-- The complete 99-test contract module passed in 6.596 seconds.
+  in 2.505 seconds. The required live no-child/Seatbelt suite passed 9/9
+  outside the parent sandbox in 7.504 seconds.
+- The complete 99-test contract module passed in 7.249 seconds.
 - Focused installed-symlink immutability, default state-root, CI snapshot, and
   no-bytecode entrypoint regressions passed. The new cross-version tests also
   prove explicit old-root visibility and fail-closed release replacement.
@@ -144,7 +148,15 @@ superseded_by:
   command without duplicating its lock, and dual-failure handling preserves
   the exact primary exception while retaining secondary evidence in an
   optional, bounded `secondary_errors` response field.
-- The focused post-fix CLI and secure-I/O modules passed 65/65 tests in 21.097
+- The next exact-head Fresh Codex review found that root equivalence snapshots
+  were closed before the public command opened its actual root and that final
+  legacy scans ignored an attempt appearing during the command. Command-scoped
+  root bindings now guard every exact selected-root open and finalization, while
+  each legacy fence records and enforces its initial attempt state.
+- The deterministic independent-supervisor gate passed 589/589 in 200.275
+  seconds with the reviewed 598-test discovery identity and SHA-256
+  `d491e88448c781104805214c67c0814ae39531d0a42180641ff67bd44414d3e9`.
+- The focused post-fix CLI and secure-I/O modules passed 68/68 tests in 33.171
   seconds on Python 3.13.
 - Ruff lint/format, actionlint for canonical and private CI profiles,
   source-only syntax checks, project-journal validation, `git diff --check`,

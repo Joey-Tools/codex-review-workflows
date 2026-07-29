@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import ctypes
 import errno
 import fcntl
@@ -13,11 +15,11 @@ import stat
 import sys
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
-from .errors import inconclusive
+from .errors import inconclusive, record_secondary_error
 from .models import FilesystemMeasure, Identity
 
 
@@ -286,6 +288,7 @@ def canonical_directory_walk_path(path: pathlib.Path) -> pathlib.Path:
 @dataclass(slots=True)
 class _DirectoryPathEquivalenceSnapshot:
     path: pathlib.Path
+    walk_path: pathlib.Path
     prefix: pathlib.Path
     fd: int
     identity: Identity
@@ -329,6 +332,7 @@ def _open_directory_path_equivalence_snapshot(
                 )
                 return _DirectoryPathEquivalenceSnapshot(
                     path=path,
+                    walk_path=walk_path,
                     prefix=current.parent,
                     fd=fd,
                     identity=identity,
@@ -339,6 +343,7 @@ def _open_directory_path_equivalence_snapshot(
             identity = next_identity
         return _DirectoryPathEquivalenceSnapshot(
             path=path,
+            walk_path=walk_path,
             prefix=current,
             fd=fd,
             identity=identity,
@@ -372,24 +377,220 @@ def _revalidate_directory_path_equivalence_snapshot(
         refreshed.close()
 
 
+@dataclass(slots=True)
+class DirectoryPathEquivalenceBinding:
+    left: _DirectoryPathEquivalenceSnapshot
+    right: _DirectoryPathEquivalenceSnapshot
+    equivalent: bool
+    selected_walk_path: pathlib.Path
+    selected_identity: Identity | None = None
+
+    def matches_selected_walk_path(self, walk_path: pathlib.Path) -> bool:
+        return walk_path == self.selected_walk_path
+
+    @staticmethod
+    def _revalidate_held_prefix(
+        snapshot: _DirectoryPathEquivalenceSnapshot,
+    ) -> None:
+        held_identity = _validate_directory_fd(
+            snapshot.fd,
+            snapshot.prefix,
+            private=False,
+        )
+        if not directory_identities_match(snapshot.identity, held_identity):
+            raise OSError(
+                errno.ESTALE,
+                "directory path prefix changed while comparing account-local roots",
+            )
+
+    @staticmethod
+    def _require_existing_snapshot_stable(
+        original: _DirectoryPathEquivalenceSnapshot,
+        current: _DirectoryPathEquivalenceSnapshot,
+    ) -> None:
+        if original.remaining:
+            return
+        if current.remaining or not directory_identities_match(
+            original.identity,
+            current.identity,
+        ):
+            raise OSError(
+                errno.ESTALE,
+                "directory path changed while comparing account-local roots",
+            )
+
+    def _revalidate_selected_identity(self, expected: Identity) -> None:
+        self._revalidate_held_prefix(self.left)
+        self._revalidate_held_prefix(self.right)
+        current_left = _open_directory_path_equivalence_snapshot(self.left.path)
+        try:
+            current_right = _open_directory_path_equivalence_snapshot(self.right.path)
+            try:
+                self._require_existing_snapshot_stable(self.left, current_left)
+                self._require_existing_snapshot_stable(self.right, current_right)
+                if current_left.remaining:
+                    raise OSError(
+                        errno.ESTALE,
+                        "selected retention root is unavailable after path binding",
+                    )
+                strict_left_identity = validate_private_directory_fd(
+                    current_left.fd,
+                    self.left.path,
+                )
+                if not directory_identities_match(
+                    current_left.identity,
+                    strict_left_identity,
+                ) or not directory_identities_match(expected, strict_left_identity):
+                    raise OSError(
+                        errno.ESTALE,
+                        "selected retention root changed after path binding",
+                    )
+                if (current_left.key == current_right.key) != self.equivalent:
+                    raise OSError(
+                        errno.ESTALE,
+                        "retention root equivalence changed after path binding",
+                    )
+            finally:
+                current_right.close()
+        finally:
+            current_left.close()
+
+    def validate_before_selected_open(self) -> None:
+        if self.selected_identity is None:
+            _revalidate_directory_path_equivalence_snapshot(self.left)
+            _revalidate_directory_path_equivalence_snapshot(self.right)
+            return
+        self._revalidate_selected_identity(self.selected_identity)
+
+    def bind_selected_open(self, fd: int, identity: Identity) -> None:
+        strict_identity = validate_private_directory_fd(fd, self.left.path)
+        if not directory_identities_match(identity, strict_identity):
+            raise OSError(
+                errno.ESTALE,
+                "selected retention root changed while being opened",
+            )
+        if self.selected_identity is not None and not directory_identities_match(
+            self.selected_identity,
+            strict_identity,
+        ):
+            raise OSError(
+                errno.ESTALE,
+                "selected retention root changed after path binding",
+            )
+        self._revalidate_selected_identity(strict_identity)
+        self.selected_identity = strict_identity
+
+    def revalidate(self) -> None:
+        if self.selected_identity is None:
+            _revalidate_directory_path_equivalence_snapshot(self.left)
+            _revalidate_directory_path_equivalence_snapshot(self.right)
+            return
+        self._revalidate_selected_identity(self.selected_identity)
+
+    def close(self) -> None:
+        cleanup_errors: list[OSError] = []
+        for snapshot in (self.right, self.left):
+            try:
+                snapshot.close()
+            except OSError as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            primary_error = cleanup_errors[0]
+            for secondary_error in cleanup_errors[1:]:
+                record_secondary_error(
+                    primary_error,
+                    label="directory path binding cleanup failed",
+                    secondary_error=secondary_error,
+                )
+            raise primary_error
+
+
+_ACTIVE_DIRECTORY_PATH_EQUIVALENCE_BINDING: contextvars.ContextVar[
+    DirectoryPathEquivalenceBinding | None
+] = contextvars.ContextVar(
+    "active_directory_path_equivalence_binding",
+    default=None,
+)
+
+
+def _open_directory_path_equivalence_binding(
+    left: pathlib.Path,
+    right: pathlib.Path,
+) -> DirectoryPathEquivalenceBinding:
+    left_snapshot = _open_directory_path_equivalence_snapshot(left)
+    try:
+        right_snapshot = _open_directory_path_equivalence_snapshot(right)
+    except BaseException as error:
+        try:
+            left_snapshot.close()
+        except BaseException as cleanup_error:
+            record_secondary_error(
+                error,
+                label="directory path binding setup cleanup failed",
+                secondary_error=cleanup_error,
+            )
+        raise
+    binding = DirectoryPathEquivalenceBinding(
+        left=left_snapshot,
+        right=right_snapshot,
+        equivalent=left_snapshot.key == right_snapshot.key,
+        selected_walk_path=left_snapshot.walk_path,
+    )
+    try:
+        binding.revalidate()
+        return binding
+    except BaseException as error:
+        try:
+            binding.close()
+        except BaseException as cleanup_error:
+            record_secondary_error(
+                error,
+                label="directory path binding setup cleanup failed",
+                secondary_error=cleanup_error,
+            )
+        raise
+
+
+@contextlib.contextmanager
+def bind_directory_path_equivalence(
+    left: pathlib.Path,
+    right: pathlib.Path,
+) -> Iterator[DirectoryPathEquivalenceBinding]:
+    if _ACTIVE_DIRECTORY_PATH_EQUIVALENCE_BINDING.get() is not None:
+        raise RuntimeError("directory path equivalence binding is already active")
+    binding = _open_directory_path_equivalence_binding(left, right)
+    token = _ACTIVE_DIRECTORY_PATH_EQUIVALENCE_BINDING.set(binding)
+    primary_error: BaseException | None = None
+    try:
+        yield binding
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        _ACTIVE_DIRECTORY_PATH_EQUIVALENCE_BINDING.reset(token)
+        try:
+            binding.close()
+        except BaseException as cleanup_error:
+            if primary_error is None:
+                raise
+            record_secondary_error(
+                primary_error,
+                label="directory path equivalence binding cleanup failed",
+                secondary_error=cleanup_error,
+            )
+
+
 def directory_paths_equivalent(
     left: pathlib.Path,
     right: pathlib.Path,
 ) -> bool:
     """Bind existing prefixes by device/inode and case-fold only missing suffixes."""
 
-    left_snapshot = _open_directory_path_equivalence_snapshot(left)
+    binding = _open_directory_path_equivalence_binding(left, right)
     try:
-        right_snapshot = _open_directory_path_equivalence_snapshot(right)
-        try:
-            equivalent = left_snapshot.key == right_snapshot.key
-            _revalidate_directory_path_equivalence_snapshot(left_snapshot)
-            _revalidate_directory_path_equivalence_snapshot(right_snapshot)
-            return equivalent
-        finally:
-            right_snapshot.close()
+        return binding.equivalent
     finally:
-        left_snapshot.close()
+        binding.close()
 
 
 def open_absolute_directory_chain(
@@ -404,6 +605,13 @@ def open_absolute_directory_chain(
     raw_parts = tuple(os.fsencode(part) for part in walk_path.parts[1:])
     if any(not part or part in {b".", b".."} or b"\0" in part for part in raw_parts):
         raise ValueError("directory path contains a dot component")
+    active_binding = _ACTIVE_DIRECTORY_PATH_EQUIVALENCE_BINDING.get()
+    selected_path = (
+        active_binding is not None
+        and active_binding.matches_selected_walk_path(walk_path)
+    )
+    if selected_path:
+        active_binding.validate_before_selected_open()
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
     fd = os.open(b"/", flags)
     current = pathlib.Path("/")
@@ -442,6 +650,8 @@ def open_absolute_directory_chain(
             os.close(fd)
             fd = next_fd
             identity = descriptor_identity
+        if selected_path:
+            active_binding.bind_selected_open(fd, identity)
         return fd, identity
     except BaseException:
         os.close(fd)
