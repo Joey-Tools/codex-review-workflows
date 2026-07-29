@@ -213,10 +213,15 @@ superseded_by:
   system `/usr/bin/python3`. The setup-python interpreter lives below the
   hosted runner's group/world-writable `/opt`, so the catalog binder correctly
   rejects that mutable parent chain instead of adding a CI-only trust bypass.
-  Review-helper and delivery tests continue to use the requested setup-python
-  version. Both reviewed CI profile snapshots carry the same branch, and the
-  contract suite asserts that the canonical and private profiles select the
-  system interpreter for this Linux-only command.
+  On macOS, setup-python resolves through the fixed
+  `/Library/Frameworks/Python.framework/Versions` parent. The workflow first
+  proves that exact path is an ordinary directory and removes only its
+  group/world write bits; the catalog transaction still validates the full
+  interpreter parent chain, executable bytes, identity, access policy, and
+  terminal stability. A changed path, symlink, unsafe ACL, or other unsafe
+  ancestor still fails closed. Review-helper and delivery tests continue to
+  use the requested setup-python version. Both reviewed CI profile snapshots
+  carry the same macOS sealing step and Linux system-interpreter branch.
 - `master` at `b3d593315b2b6e9310914bd8b2af8a41aa46e08b` (including PR #53)
   was integrated with the signed merge commit
   `bd9266dec9cae76de662795368c6080b8909b3c5`. Conflict resolution preserved
@@ -282,3 +287,10 @@ superseded_by:
   snapshots had not yet inherited that branch; both snapshots and the explicit
   profile contract are now updated. `actionlint`, the byte-for-byte canonical
   workflow comparison, and the focused profile contract passed locally.
+- PR #83's `93adea2` macOS run then failed closed because
+  `/Library/Frameworks/Python.framework/Versions` was group/world writable on
+  the hosted runner. The canonical workflow and both reviewed CI snapshots now
+  seal that exact non-symlink directory before the macOS synthetic contract;
+  they do not copy the interpreter or relax catalog admission. The focused
+  review contract passed (`99` tests), and the local macOS synthetic contract
+  passed (`20` tests, `1` Linux-only skip) with a secure interpreter chain.

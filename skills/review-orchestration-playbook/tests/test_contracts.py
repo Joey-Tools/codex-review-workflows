@@ -1554,14 +1554,15 @@ class RepositoryContractTest(unittest.TestCase):
         }
         for profile, (workflow, skill_prefix) in profiles.items():
             with self.subTest(profile=profile):
-                normalized_workflow = " ".join(
-                    workflow.replace("\\\n", "").split()
-                )
+                normalized_workflow = " ".join(workflow.replace("\\\n", "").split())
                 for anchor in (
                     "jsonschema==4.26.0",
                     f"{skill_prefix}/synthetic-token-fixtures/scripts/active_catalog_binding.py",
                     f"{skill_prefix}/change-delivery-workflow/tests",
                     f"{skill_prefix}/synthetic-token-fixtures/tests",
+                    "Seal hosted macOS Python framework parent",
+                    "test ! -L /Library/Frameworks/Python.framework/Versions",
+                    "sudo /bin/chmod go-w /Library/Frameworks/Python.framework/Versions",
                 ):
                     self.assertIn(anchor, workflow)
                 self.assertIn('if [[ "$RUNNER_OS" == "Linux" ]]; then', workflow)
@@ -1801,6 +1802,7 @@ class RepositoryContractTest(unittest.TestCase):
             "scripts/independent_codex_pr_review",
             workflow,
         )
+
     def test_helper_declares_and_tests_its_minimum_python_runtime(self) -> None:
         entrypoint = (SCRIPTS / "isolated_review").read_text(encoding="utf-8")
         workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")

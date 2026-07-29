@@ -48,6 +48,15 @@ jobs:
       - name: Check Linux launcher C syntax
         run: |
           cc -std=c11 -O2 -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -fsyntax-only skills/review-orchestration-playbook/scripts/review_runtime/claude_linux_launcher.c
+      - name: Seal hosted macOS Python framework parent
+        if: runner.os == 'macOS'
+        run: |
+          test -d /Library/Frameworks/Python.framework/Versions
+          test ! -L /Library/Frameworks/Python.framework/Versions
+          # setup-python resolves through this otherwise group/world-writable
+          # framework parent. Remove only those mutation grants; the catalog
+          # binding still validates the complete interpreter parent chain.
+          sudo /bin/chmod go-w /Library/Frameworks/Python.framework/Versions
       - name: Run tests
         run: |
           python3 -m unittest discover -s skills/review-orchestration-playbook/tests -p 'test_*.py' -v
