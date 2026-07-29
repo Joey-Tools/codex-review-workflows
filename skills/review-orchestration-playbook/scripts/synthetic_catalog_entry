@@ -4,8 +4,14 @@ import sys
 
 sys.dont_write_bytecode = True
 
-from review_runtime.cli import catalog_main as main  # noqa: E402
-
-
 if __name__ == "__main__":
-    raise SystemExit(main())
+    print(
+        "error: direct synthetic_catalog_entry execution is disabled; use the "
+        "active immutable release's synthetic-token-fixtures catalog-bootstrap "
+        "guard with the captured --expect-binding-sha256 value",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+
+from review_runtime.cli import catalog_main as main  # noqa: E402, F401

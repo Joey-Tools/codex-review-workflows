@@ -46,16 +46,18 @@ For an approval-gated external helper launch, use the wording that matches the v
 
 Do not use the clean-head wording for a WIP snapshot. See [egress-consent.md](egress-consent.md) for the full provider and trusted-processor disclosure.
 
-Synthetic-token catalog inspection is read-only:
+The helper has no synthetic-token authoring surface. Every
+`isolated_review synthetic-tokens ...` invocation is rejected before catalog
+loading, including `validate`, `list`, and `get`. The co-release
+`scripts/synthetic_catalog_entry` is a manifest companion for the active
+release resolver, not a public executable; direct script execution is rejected
+before it can emit metadata or a raw value.
 
-```bash
-isolated_review synthetic-tokens validate
-isolated_review synthetic-tokens list --json
-isolated_review synthetic-tokens get <id> --json
-```
-
-These are the complete supported authoring catalog operations. Historical
-catalog records participate automatically in exact-value counting; there is no
+Use the loaded active immutable release's `synthetic-token-fixtures` skill.
+Only its `named_lane_guard catalog-bootstrap` flow may execute the internal
+catalog entry from manifest-bound bytes, and every operation after `bind`
+requires the captured `--expect-binding-sha256`. Historical catalog records
+still participate automatically in exact-value counting; there is no
 selection, listing, or pinned-master audit surface. Read
 [synthetic-token-fixtures.md](synthetic-token-fixtures.md) before changing the
 catalog.

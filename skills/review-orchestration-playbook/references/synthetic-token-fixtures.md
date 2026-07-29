@@ -52,11 +52,12 @@ Existing version 1 catalogs may still contain `legacy_exemptions` records with `
 ## Authoring Pool
 
 The public catalog carries a finite versioned authoring pool. Neither its stable
-ID inventory nor its raw values are duplicated in documentation. Use
-`synthetic-tokens list --json` for the current metadata and
-`synthetic-tokens get <id> --json` for one explicitly selected authoring value.
-There is no allocator, reservation, release, counter, suffix generator, or bulk
-raw-value listing.
+ID inventory nor its raw values are duplicated in documentation. Use the
+active immutable release's manifest-bound `catalog-bootstrap` resolver action
+`list` for current metadata and action `get <id>` for one explicitly selected
+authoring value. Every action after `bind` requires the captured
+`--expect-binding-sha256`. There is no allocator, reservation, release, counter,
+suffix generator, or bulk raw-value listing.
 
 When authoring a fixture, reuse a project-recorded compatible ID. Otherwise select by role and state, sort compatible metadata by ID, and take the first entry. For `N` distinct credentials, take the first `N` distinct compatible IDs. Insert each selected value unchanged as the complete captured credential value.
 
@@ -109,19 +110,30 @@ A dynamic expression that cannot produce one stable exact byte value does not en
 
 A violation report lists only newly added locations for a candidate whose global count grows. Text additions use the one-based head line. New tracked paths and binary fallbacks use `line: null`; symlink targets use line `1`. Unchanged residual occurrences are omitted. If bounded diff evidence cannot map every detected local growth to an added location, `location_status` is `inconclusive` rather than inventing a line. In particular, endpoint Git trees do not record whether one of multiple identical head blobs was moved and another was copied; when local positive candidates exceed the authoritative global delta, the helper omits those ambiguous locations instead of trusting heuristic rename attribution. The secret-admission result controls only PR/master admission; a trusted Codex, Claude Code, or consent-gated Copilot reviewer still receives the original tracked diff and necessary context.
 
-## Read-Only CLI
+## Manifest-Bound Authoring Surface
 
-The helper exposes:
+The loaded active-release synthetic skill routes the three internal operations
+through `named_lane_guard catalog-bootstrap`:
 
 ```bash
-isolated_review synthetic-tokens validate
-isolated_review synthetic-tokens list --json
-isolated_review synthetic-tokens get <id> --json
+named_lane_guard catalog-bootstrap --loaded-skill-root <active-skill-root> bind
+named_lane_guard catalog-bootstrap --loaded-skill-root <active-skill-root> \
+  --expect-binding-sha256 <binding-sha256> validate
+named_lane_guard catalog-bootstrap --loaded-skill-root <active-skill-root> \
+  --expect-binding-sha256 <binding-sha256> list
+named_lane_guard catalog-bootstrap --loaded-skill-root <active-skill-root> \
+  --expect-binding-sha256 <binding-sha256> get <id>
 ```
 
-`list` returns authoring metadata only. `get` returns the raw value for exactly
-one selected authoring ID. These three operations are the complete supported
-authoring catalog surface.
+Invoke the guard with the absolute interpreter and mandatory `-I -B -S` flags
+specified by `synthetic-token-fixtures`; the shorthand above shows only the
+action contract. `list` returns authoring metadata only. `get` returns the raw
+value for exactly one selected authoring ID.
+
+`isolated_review synthetic-tokens ...` and direct
+`scripts/synthetic_catalog_entry` execution are unsupported and rejected before
+catalog loading or output. The entry remains an internal manifest companion
+whose bound snapshot is executed only by the resolver.
 
 ## Admission Evidence
 

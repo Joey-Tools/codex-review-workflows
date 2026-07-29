@@ -5825,6 +5825,14 @@ class RepositoryContractTest(unittest.TestCase):
             "Automation that needs machine-readable contract metadata must use `stateful status`",
             helper_contract,
         )
+        self.assertIn(
+            "`isolated_review synthetic-tokens ...` invocation is rejected before catalog",
+            helper_contract,
+        )
+        self.assertIn(
+            "direct script execution is rejected",
+            helper_contract,
+        )
         self.assertNotIn("render_success_envelope", cli_source)
 
     def test_installed_bundle_entrypoints_do_not_create_bytecode(self) -> None:
@@ -5845,7 +5853,7 @@ class RepositoryContractTest(unittest.TestCase):
             entrypoints = {
                 copied_scripts / "isolated_review": 0,
                 copied_scripts / "named_claude_preflight": 2,
-                copied_scripts / "synthetic_catalog_entry": 0,
+                copied_scripts / "synthetic_catalog_entry": 2,
                 copied_scripts / "validate_claude_stream.py": 3,
                 copied_scripts
                 / "independent_codex_pr_review"
@@ -5885,6 +5893,12 @@ class RepositoryContractTest(unittest.TestCase):
                             expected_returncode,
                             completed.stderr,
                         )
+                        if entrypoint.name == "synthetic_catalog_entry":
+                            self.assertEqual(completed.stdout, "")
+                            self.assertIn(
+                                "direct synthetic_catalog_entry execution is disabled",
+                                completed.stderr,
+                            )
                     bytecode = sorted(
                         path.relative_to(copied_skill)
                         for path in copied_skill.rglob("*")

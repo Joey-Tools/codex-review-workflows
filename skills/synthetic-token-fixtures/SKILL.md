@@ -114,6 +114,12 @@ manifest bytes never bootstrap their own activation.
 
 ## Authoring CLI Contract
 
+The catalog entry is resolver-internal. `isolated_review synthetic-tokens ...`
+and direct `scripts/synthetic_catalog_entry` execution are rejected before
+catalog loading or output. Only `catalog-bootstrap` may execute the internal
+entry from the already bound runtime snapshots, and only after it validates the
+expected binding digest for non-`bind` actions.
+
 The authoring surface has exactly three operations:
 
 - Resolver action `validate` runs the dedicated authoring-only catalog
@@ -163,6 +169,8 @@ Read [fixture-templates.md](references/fixture-templates.md) when creating a fix
 - Never pass the resolver path as Python's script argv or use candidate-head
   review control to activate its own catalog bootstrap.
 - Never create a project-local pool, catalog override, second token CLI, reservation, or fallback value.
+- Never invoke `isolated_review synthetic-tokens ...` or execute
+  `scripts/synthetic_catalog_entry` directly; both are fail-closed non-surfaces.
 - Never select the catalog through `CODEX_HOME`, `HOME`, `PATH`, a repository copy, or a caller-provided path.
 - Never invent IDs, suffixes, reservations, counters, or regex namespaces.
 - Never treat words such as `synthetic`, `test`, `fixture`, or `sentinel` as proof that a value is safe.

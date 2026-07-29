@@ -18,9 +18,10 @@ superseded_by:
   `focused-checkpoint`, `local-gate`, and `pr-readiness-handoff`.
 - `agile-delivery-workflow` is a compatibility alias that maps legacy
   MVP/agile/scout triggers to `focused-checkpoint`.
-- `synthetic-token-fixtures` routes authoring through the existing review
-  helper's authoritative catalog CLI through a trusted exact runtime manifest,
-  without defining a second pool or broad executable runtime.
+- `synthetic-token-fixtures` routes authoring only through the active immutable
+  release's manifest-bound `catalog-bootstrap` guard. The low-level helper and
+  repo-local catalog entry reject direct authoring, so no mutable checkout can
+  publish catalog metadata or a raw value.
 - The post-#53 integration removes the deprecated exemption flag and legacy
   list/audit commands. Historical catalog records remain automatic exact-value
   admission inputs, not caller-selectable authority.
@@ -185,6 +186,14 @@ superseded_by:
   mutable pathname is executed later.
   `CODEX_HOME`, `HOME`, repository shadows, caller-selected catalog paths, and
   same-byte inode replacement cannot select or release a result.
+- `isolated_review synthetic-tokens ...` now rejects every action before
+  catalog loading. Direct `scripts/synthetic_catalog_entry` execution also
+  rejects before output; the entry remains executable only as a retained
+  manifest-bound source snapshot inside the active-release resolver. Its
+  internal `catalog_main` additionally requires resolver-injected bound catalog
+  bytes. Repository tests exercise those internal bytes explicitly and use a
+  test-only catalog read for credential-shaped supervisor fixtures rather than
+  advertising a mutable authoring CLI.
 - The authoring catalog exposes only `validate`, metadata-only `list`, and
   exact single-ID `get`, with one shared result implementation. The deprecated
   exemption-selection flag, exemption-list command, pinned-master audit
@@ -215,13 +224,14 @@ superseded_by:
 - `python3 -B -m unittest discover -s skills/change-delivery-workflow/tests
   -p 'test_*.py' -q` passed (`45` tests).
 - `python3 -B -m unittest` over the synthetic skill contract, synthetic runtime,
-  and Claude Linux credential tests passed (`453` tests, `1` platform skip).
+  and Claude Linux credential tests passed (`455` tests, `1` platform skip).
   This includes the catalog-value non-duplication contract and exact
   metadata-bound fixture selection.
 - `python3 -B -m unittest tests/test_auth_carrier.py -q`, from the independent
-  supervisor root, passed (`37` tests). Its credential fixture is obtained
-  through the canonical catalog entrypoint and validates ID, role, state,
-  ASCII encoding, and digest without copying a raw value.
+  supervisor root, passed (`37` tests). Its test-only fixed catalog read
+  validates a unique ID, role, state, and nonempty ASCII value without exposing
+  a public authoring command; the full synthetic contract separately validates
+  the catalog digests and raw-value non-duplication.
 - Six directly affected provider authentication and egress tests passed.
 - `python3 -B -m unittest
   skills/review-orchestration-playbook/tests/test_contracts.py -q` passed
@@ -234,7 +244,8 @@ superseded_by:
   isolation before the full rerun.
 - Joey's installed `codex_skill_validate.py` accepted
   `change-delivery-workflow`, `synthetic-token-fixtures`, and
-  `review-orchestration-playbook`.
+  `review-orchestration-playbook`; the latter two were revalidated after direct
+  authoring dispatch was removed.
 - `jq empty` passed for the catalog and trusted runtime manifest.
 - `python3 -B /Users/hoteng/.codex/skills/project-journal/scripts/project_journal.py validate --repo .`
   passed.

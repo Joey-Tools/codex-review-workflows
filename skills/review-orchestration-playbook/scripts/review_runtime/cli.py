@@ -7,6 +7,7 @@ import pathlib
 import signal
 import sys
 
+from . import synthetic_tokens as synthetic_tokens_runtime
 from .common import (
     ForwardedSignal,
     ReviewError,
@@ -22,6 +23,11 @@ from .synthetic_tokens import (
 )
 
 FINAL_CLEANUP_TIMEOUT_SECONDS = 30.0
+DIRECT_SYNTHETIC_AUTHORING_ERROR = (
+    "direct synthetic-token authoring is disabled; use the active immutable "
+    "release's synthetic-token-fixtures catalog-bootstrap guard with the "
+    "captured --expect-binding-sha256 value"
+)
 
 
 def run_review(**kwargs):
@@ -52,14 +58,6 @@ def secret_admission(**kwargs):
     from .workspace import secret_admission as implementation
 
     return implementation(**kwargs)
-
-
-def validate_authoring_catalog_scanner_contract(catalog):
-    from .workspace import (
-        validate_authoring_catalog_scanner_contract as implementation,
-    )
-
-    return implementation(catalog)
 
 
 def start(**kwargs):
@@ -196,18 +194,6 @@ def _build_stateful_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _build_synthetic_tokens_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="isolated_review synthetic-tokens")
-    actions = parser.add_subparsers(dest="action", required=True)
-    actions.add_parser("validate")
-    list_parser = actions.add_parser("list")
-    list_parser.add_argument("--json", action="store_true")
-    get_parser = actions.add_parser("get")
-    get_parser.add_argument("id")
-    get_parser.add_argument("--json", action="store_true")
-    return parser
-
-
 def _build_secret_admission_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="isolated_review secret-admission")
     parser.add_argument("--repo", default=".", help="Source Git repository.")
@@ -225,17 +211,6 @@ def _run_secret_admission(argv: list[str]) -> int:
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return exit_code
-
-
-def _run_synthetic_tokens(argv: list[str]) -> int:
-    args = _build_synthetic_tokens_parser().parse_args(argv)
-    catalog = load_catalog()
-    validate_authoring_catalog_scanner_contract(catalog)
-    return _emit_authoring_catalog_action(
-        args,
-        catalog,
-        unknown_label="synthetic-tokens",
-    )
 
 
 def _emit_authoring_catalog_action(
@@ -303,8 +278,13 @@ def _build_catalog_parser() -> argparse.ArgumentParser:
 
 
 def catalog_main(argv: list[str] | None = None) -> int:
-    """Run the closed authoring-only catalog surface."""
+    """Run the resolver-only, manifest-bound authoring catalog surface."""
 
+    if synthetic_tokens_runtime.BOUND_CATALOG_BYTES is None:
+        raise ReviewError(
+            "catalog_main requires manifest-bound catalog bytes from the "
+            "active-release catalog-bootstrap resolver"
+        )
     args = _build_catalog_parser().parse_args(argv)
     catalog = load_catalog()
     return _emit_authoring_catalog_action(
@@ -482,7 +462,7 @@ def main(argv: list[str] | None = None) -> int:
         if arguments and arguments[0] == "stateful":
             return _run_stateful(arguments[1:], script_path=script_path)
         if arguments and arguments[0] == "synthetic-tokens":
-            return _run_synthetic_tokens(arguments[1:])
+            raise ReviewError(DIRECT_SYNTHETIC_AUTHORING_ERROR)
         if arguments and arguments[0] == "secret-admission":
             return _run_secret_admission(arguments[1:])
         return _run_foreground(_build_parser().parse_args(arguments))

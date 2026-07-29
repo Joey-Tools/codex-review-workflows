@@ -6819,7 +6819,26 @@ class CatalogValidationTest(unittest.TestCase):
 
 
 class SyntheticTokenCliTest(unittest.TestCase):
-    def run_cli(self, *args: str) -> tuple[int, str, str]:
+    def run_bound_catalog_cli(self, *args: str) -> tuple[int, str, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                synthetic_tokens,
+                "BOUND_CATALOG_BYTES",
+                synthetic_tokens.CATALOG_PATH.read_bytes(),
+            ),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            try:
+                returncode = cli.catalog_main(list(args))
+            except ReviewError as error:
+                print(f"error: {error}", file=sys.stderr)
+                returncode = 2
+        return returncode, stdout.getvalue(), stderr.getvalue()
+
+    def run_direct_helper_cli(self, *args: str) -> tuple[int, str, str]:
         stdout = io.StringIO()
         stderr = io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
@@ -6854,11 +6873,11 @@ class SyntheticTokenCliTest(unittest.TestCase):
             synthetic_tokens.load_catalog()
 
     def test_validate_and_list_return_metadata_without_raw_values(self) -> None:
-        returncode, output, error = self.run_cli("validate")
+        returncode, output, error = self.run_bound_catalog_cli("validate")
         self.assertEqual((returncode, error), (0, ""))
         self.assertEqual(json.loads(output)["status"], "valid")
 
-        returncode, output, error = self.run_cli("list", "--json")
+        returncode, output, error = self.run_bound_catalog_cli("list", "--json")
         self.assertEqual((returncode, error), (0, ""))
         payload = json.loads(output)
         catalog = synthetic_tokens.load_catalog()
@@ -6883,7 +6902,7 @@ class SyntheticTokenCliTest(unittest.TestCase):
         )
 
     def test_thin_skill_templates_resolve_through_stable_metadata(self) -> None:
-        returncode, output, error = self.run_cli("list", "--json")
+        returncode, output, error = self.run_bound_catalog_cli("list", "--json")
         self.assertEqual((returncode, error), (0, ""))
         tokens = json.loads(output)["tokens"]
         requirements = {
@@ -6933,7 +6952,7 @@ class SyntheticTokenCliTest(unittest.TestCase):
             )
         self.assertNotIn("SYNTHETIC_SECONDARY_API_KEY", template)
 
-    def test_validate_rejects_an_authoring_value_the_scanner_cannot_accept(
+    def test_bound_validate_stays_within_the_authoring_runtime_closure(
         self,
     ) -> None:
         payload = catalog_payload()
@@ -6942,18 +6961,16 @@ class SyntheticTokenCliTest(unittest.TestCase):
             json.dumps(payload, separators=(",", ":")).encode("utf-8")
         )
         with mock.patch.object(cli, "load_catalog", return_value=catalog):
-            returncode, output, error = self.run_cli("validate")
-        self.assertEqual(returncode, 2)
-        self.assertEqual(output, "")
-        self.assertIn("not captured exactly once", error)
-        self.assertNotIn("placeholder_test_token", error)
+            returncode, output, error = self.run_bound_catalog_cli("validate")
+        self.assertEqual((returncode, error), (0, ""))
+        self.assertEqual(json.loads(output)["status"], "valid")
 
     def test_get_returns_only_the_explicitly_selected_raw_value(self) -> None:
         catalog = synthetic_tokens.load_catalog()
         selected = sorted(catalog.authoring_tokens, key=lambda token: token.identifier)[
             0
         ]
-        returncode, output, error = self.run_cli(
+        returncode, output, error = self.run_bound_catalog_cli(
             "get",
             selected.identifier,
             "--json",
@@ -6974,8 +6991,62 @@ class SyntheticTokenCliTest(unittest.TestCase):
             )
         )
 
-    def test_removed_legacy_cli_surfaces_and_unknown_get(self) -> None:
-        synthetic_help = cli._build_synthetic_tokens_parser().format_help()
+    def test_direct_helper_and_repo_local_entrypoint_reject_authoring(self) -> None:
+        with mock.patch.object(
+            cli,
+            "load_catalog",
+            side_effect=AssertionError("direct helper must not load the catalog"),
+        ):
+            for args in (
+                ("validate",),
+                ("list", "--json"),
+                ("get", "refresh-a", "--json"),
+            ):
+                with self.subTest(args=args):
+                    returncode, output, error = self.run_direct_helper_cli(*args)
+                    self.assertEqual(returncode, 2)
+                    self.assertEqual(output, "")
+                    self.assertIn("direct synthetic-token authoring is disabled", error)
+                    self.assertIn("--expect-binding-sha256", error)
+
+        selected_raw_value = AUTHORING_VALUES_BY_ID["refresh-a"]
+        for script, args in (
+            (
+                SCRIPTS / "isolated_review",
+                ("synthetic-tokens", "get", "refresh-a", "--json"),
+            ),
+            (
+                SCRIPTS / "synthetic_catalog_entry",
+                ("get", "refresh-a", "--json"),
+            ),
+        ):
+            with self.subTest(script=script.name):
+                completed = subprocess.run(
+                    (sys.executable, "-B", str(script), *args),
+                    cwd=SCRIPTS,
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=30,
+                )
+                self.assertEqual(completed.returncode, 2)
+                self.assertEqual(completed.stdout, "")
+                self.assertIn("--expect-binding-sha256", completed.stderr)
+                self.assertNotIn(selected_raw_value, completed.stderr)
+
+    def test_catalog_main_requires_bound_bytes(self) -> None:
+        with mock.patch.object(
+            cli,
+            "load_catalog",
+            side_effect=AssertionError("unbound catalog_main must not load the catalog"),
+        ):
+            with self.assertRaisesRegex(ReviewError, "manifest-bound catalog bytes"):
+                cli.catalog_main(["validate"])
+
+    def test_removed_legacy_catalog_surfaces_and_unknown_get(self) -> None:
+        synthetic_help = cli._build_catalog_parser().format_help()
         self.assertNotIn("list-exemptions", synthetic_help)
         self.assertNotIn("audit-master", synthetic_help)
         self.assertNotIn(
@@ -6986,7 +7057,11 @@ class SyntheticTokenCliTest(unittest.TestCase):
             "--synthetic-secret-exemption",
             cli._build_stateful_parser().format_help(),
         )
-        returncode, output, error = self.run_cli("get", "missing", "--json")
+        returncode, output, error = self.run_bound_catalog_cli(
+            "get",
+            "missing",
+            "--json",
+        )
         self.assertEqual(returncode, 2)
         self.assertEqual(output, "")
         self.assertIn("unknown synthetic authoring token", error)

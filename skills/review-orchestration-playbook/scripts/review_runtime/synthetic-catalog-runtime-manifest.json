@@ -4,7 +4,7 @@
   "runtime_version": 1,
   "entrypoint": {
     "path": "scripts/synthetic_catalog_entry",
-    "sha256": "6ca76b98449ed89a41c5685cd07a97d6700a28d98b3c7877e4a94c0679ea62a8"
+    "sha256": "3b634a6343a4aacfdc1a6d5eb0ab0017223ac1c66bad4815827d63f576093a66"
   },
   "sources": [
     {
@@ -17,7 +17,7 @@
       "module": "review_runtime.cli",
       "path": "scripts/review_runtime/cli.py",
       "package": false,
-      "sha256": "1debb5830715c219457f40650e6fb8ff903c8eba8dc2d205d5600151b3461cb4"
+      "sha256": "56d5341d0bd3930360314407512d17bc29fe3871edbe5714b3185476c78670a3"
     },
     {
       "module": "review_runtime.common",
