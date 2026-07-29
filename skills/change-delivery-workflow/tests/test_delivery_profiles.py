@@ -398,14 +398,19 @@ def blocker_result(
             value = result["head_sha"]
         elif "const" in field_schema:
             value = field_schema["const"]
-        elif field == "local_gate" and set(field_schema.get("enum", [])) == {
-            "checked",
-            "not-required",
-        }:
+        elif field == "local_gate" and set(field_schema.get("enum", [])) in (
+            {"checked", "not-required"},
+            {"blocked", "not-required"},
+        ):
+            full_gate = next(
+                value
+                for value in ("checked", "blocked")
+                if value in field_schema["enum"]
+            )
             value = (
                 "not-required"
                 if result["profile"] == "focused-checkpoint"
-                else "checked"
+                else full_gate
             )
         else:
             raise AssertionError(f"unsupported blocker evidence schema for {field}")
@@ -3868,6 +3873,66 @@ class DeliveryProfileContractTest(unittest.TestCase):
                     cross_mode["constraints"] = ["no-commit"]
                 with self.subTest(title=title, mutation="cross-mode"):
                     self.assertTrue(list(validator.iter_errors(cross_mode)))
+
+    def test_focused_mutable_blockers_close_profile_gate_cross_combinations(
+        self,
+    ) -> None:
+        schema = json.loads(DELIVERY_RESULT_SCHEMA.read_text(encoding="utf-8"))
+        validator = Draft202012Validator(schema)
+        branches_by_title = {
+            branch["title"]: branch
+            for branch in schema["$defs"]["blockedTerminalMatrix"]["oneOf"]
+        }
+        focused_gate_ref = "#/$defs/focusedMutableCommitBlockerLocalGate"
+
+        for title in (
+            "formal-review-blocked:mutable-commit",
+            "signing-failed:mutable-commit",
+        ):
+            branch = branches_by_title[title]
+            self.assertEqual(branch.get("$ref"), focused_gate_ref)
+
+            focused = blocker_result(branch, profile="focused-checkpoint")
+            with self.subTest(title=title, profile="focused-checkpoint"):
+                self.assertEqual(list(validator.iter_errors(focused)), [])
+                assert_valid_result_contract(focused)
+                self.assertEqual(
+                    focused["terminal_evidence"]["local_gate"],
+                    "not-required",
+                )
+                self.assertEqual(focused["local_mutation"], "allowed")
+                self.assertEqual(focused["commit_mode"], "allowed")
+
+            focused_blocked = copy.deepcopy(focused)
+            focused_blocked["terminal_evidence"]["local_gate"] = "blocked"
+            with self.subTest(title=title, mutation="focused-blocked-gate"):
+                self.assertTrue(list(validator.iter_errors(focused_blocked)))
+
+            for profile in ("local-gate", "pr-readiness-handoff"):
+                full_gate = blocker_result(branch, profile=profile)
+                with self.subTest(title=title, profile=profile):
+                    self.assertEqual(list(validator.iter_errors(full_gate)), [])
+                    assert_valid_result_contract(full_gate)
+                    self.assertEqual(
+                        full_gate["terminal_evidence"]["local_gate"],
+                        "blocked",
+                    )
+
+                full_gate_not_required = copy.deepcopy(full_gate)
+                full_gate_not_required["terminal_evidence"]["local_gate"] = (
+                    "not-required"
+                )
+                with self.subTest(
+                    title=title,
+                    profile=profile,
+                    mutation="full-gate-not-required",
+                ):
+                    self.assertTrue(list(validator.iter_errors(full_gate_not_required)))
+
+            relabeled = copy.deepcopy(focused)
+            relabeled["profile"] = "local-gate"
+            with self.subTest(title=title, mutation="relabeled-focused"):
+                self.assertTrue(list(validator.iter_errors(relabeled)))
 
     def test_read_only_receiver_rejects_non_ready_delivery_terminal(self) -> None:
         report = copy.deepcopy(

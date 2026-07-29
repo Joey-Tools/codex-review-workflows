@@ -306,3 +306,12 @@ superseded_by:
   `1` Linux-only skip), `actionlint` accepted all three workflows, the
   canonical snapshot remained byte-for-byte equal to the workflow, all three
   related skills passed the installed validator, and Ruff check/format passed.
+- The subsequent whole-range review found that the mutable-commit
+  `formal-review-blocked` and `signing-failed` schema rows unconditionally
+  labeled the full local gate as blocked. Both rows now share a profile-bound
+  rule: a `focused-checkpoint` keeps `local_gate: not-required`, while
+  `local-gate` and `pr-readiness-handoff` retain `local_gate: blocked`.
+  Cross-combination tests reject either gate value under the wrong profile and
+  reject relabeling focused evidence as a full gate. The complete delivery
+  schema suite passed (`46` tests), and the review contract suite passed
+  (`99` tests).

@@ -578,6 +578,40 @@
         }
       }
     },
+    "focusedMutableCommitBlockerLocalGate": {
+      "if": {
+        "properties": {
+          "profile": {
+            "const": "focused-checkpoint"
+          }
+        },
+        "required": [
+          "profile"
+        ]
+      },
+      "then": {
+        "properties": {
+          "terminal_evidence": {
+            "properties": {
+              "local_gate": {
+                "const": "not-required"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "terminal_evidence": {
+            "properties": {
+              "local_gate": {
+                "const": "blocked"
+              }
+            }
+          }
+        }
+      }
+    },
     "successTerminalMatrix": {
       "oneOf": [
         {
@@ -2432,6 +2466,7 @@
         },
         {
           "title": "formal-review-blocked:mutable-commit",
+          "$ref": "#/$defs/focusedMutableCommitBlockerLocalGate",
           "properties": {
             "terminal_outcome": {
               "const": "blocked"
@@ -2448,7 +2483,10 @@
             "terminal_evidence": {
               "properties": {
                 "local_gate": {
-                  "const": "blocked"
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
                 },
                 "build": {
                   "const": "satisfied"
@@ -2924,6 +2962,7 @@
         },
         {
           "title": "signing-failed:mutable-commit",
+          "$ref": "#/$defs/focusedMutableCommitBlockerLocalGate",
           "properties": {
             "terminal_outcome": {
               "const": "blocked"
@@ -2940,7 +2979,10 @@
             "terminal_evidence": {
               "properties": {
                 "local_gate": {
-                  "const": "blocked"
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
                 },
                 "build": {
                   "const": "satisfied"
