@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "profile": "validate-read-only-pr-report",
+  "loader": {
+    "path": "scripts/named_lane_guard",
+    "profile_version": 1,
+    "python_flags": [
+      "-I",
+      "-B",
+      "-S"
+    ],
+    "runtime": "scripts/review_runtime/read_only_report_guard.py",
+    "runtime_version": 1,
+    "schema_evaluator": "closed-draft-2020-12-v1"
+  },
+  "artifacts": [
+    {
+      "path": "references/pr-readiness-read-only-report.schema.json",
+      "role": "schema",
+      "sha256": "cceaa974d37529033343861abd4aa6f675797c36b4e568f438804ccb11128d81"
+    },
+    {
+      "path": "scripts/read_only_pr_report.py",
+      "role": "receiver",
+      "sha256": "478340f171e4b3c501fa2ea429383970ae3c72af035b4ff67efc9e531fa66636"
+    }
+  ]
+}

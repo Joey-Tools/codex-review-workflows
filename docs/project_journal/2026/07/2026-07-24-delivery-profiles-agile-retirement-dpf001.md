@@ -25,6 +25,9 @@ superseded_by:
 - The post-#53 integration removes the deprecated exemption flag and legacy
   list/audit commands. Historical catalog records remain automatic exact-value
   admission inputs, not caller-selectable authority.
+- Read-only PR reports are accepted only by a prior-trusted
+  `named_lane_guard validate-read-only-pr-report` profile whose machine
+  manifest binds the exact receiver and schema bytes.
 
 ## Current State
 
@@ -56,11 +59,26 @@ superseded_by:
   Every selection, lifecycle, CI, and conversation observation repeats the
   applicable target identity exactly, including PR Node ID/base ref and current
   head, so cross-PR splicing, head races, and stale-green CI fail closed. The
-  manifest-bound receiver descriptor-safely loads its same-release closed
-  Draft 2020-12 schema-v8, applies that schema before semantics, and
-  equality-binds every evidence record to that instance. Missing, malformed,
-  cross-release, or dependency-unloadable schema state fails closed, and no
-  executable semantic-only report gate remains. The receiver also requires the
+  prior-trusted `named_lane_guard validate-read-only-pr-report` profile runs
+  with Python `-I -B -S`, raw-loads only its manifest-bound stdlib runtime,
+  and retains complete guard/runtime/bootstrap/manifest/receiver/schema
+  descriptors through validation. Its machine control manifest binds the
+  loader/runtime profile plus the exact receiver and schema SHA-256 values.
+  Only the retained receiver bytes are compiled, only the retained schema bytes
+  are injected, and the closed Draft 2020-12 evaluator applies schema-v8 before
+  semantics and equality-binds every evidence record to that instance.
+  Acceptance remains withheld until exact content, descriptor and parent-entry
+  identity, ancestor-chain, macOS ACL/BSD security flag or admitted Linux
+  POSIX-ACL filesystem, and non-owner-mutation policy revalidation completes.
+  Persistent replacement, byte drift, unsafe mode/ACL, missing or malformed
+  control, and unreadable terminal state fail closed. A temporary
+  replacement/restore cannot influence validation because the receiver and
+  schema paths are never reopened. Timestamps, link count, and directory child
+  churn alone remain outside those protected properties. Direct candidate
+  `validate-report` execution rejects without guard bindings. Candidate tests
+  do not bootstrap formal self-policy review: the prior trusted release remains
+  authoritative until merge, release, and canonical-manifest verification.
+  No executable semantic-only report gate remains. The receiver also requires the
   exact canonical URL derived from the structured
   repository and PR number. It preserves GitHub `statusCheckRollup` as an exact
   provider-discriminated union: `CheckRun` binds its Node/database IDs, name,
@@ -106,9 +124,11 @@ superseded_by:
   conversation-count, and endpoint contradictions that JSON Schema cannot
   express. The schema embeds its complete closed delivery-v3 receiver
   definition and has no external `$ref`. The schema and receiver runtime remain
-  direct records in the canonical control manifest, so the release digest
-  binds the complete v8 receiving closure without loading an external or
-  candidate-head delivery schema. The 1 MiB retained-input ceiling now also
+  direct records in the canonical control manifest, while the new machine
+  manifest binds their exact digests and the loader/runtime version. The
+  release digest therefore binds the complete v8 receiving closure without
+  loading an external or candidate-head delivery schema. The 1 MiB
+  retained-input ceiling now also
   supplies the conservative JSON node ceiling: every counted node consumes at
   least one retained JSON byte, so the declared 1,000-item CI profile and its
   complete verification copy fit without weakening the existing byte bound.
@@ -379,7 +399,34 @@ superseded_by:
   contracts pass under Python 3.13 (`52` tests), and the combined
   delivery/review matrix passes under isolated Python 3.10 and 3.14 (`151`
   tests each); Python 3.13 review contracts pass (`99` tests). The actual
-  `python -I -B ... validate-report -` entrypoint accepted a valid schema-v8
-  fixture. Ruff check/format, Python compilation, `actionlint`, both modified
+  then-current `python -I -B ... validate-report -` entrypoint accepted a
+  valid schema-v8 fixture. Ruff check/format, Python compilation, `actionlint`, both modified
   skill validators, project-journal validation, JSON parsing, and
   `git diff --check` pass.
+- A fresh review on `225ae5c` found that direct `validate-report` still looked
+  up a mutable adjacent schema and could accept a temporarily relaxed schema
+  before restoration. The receiver now rejects direct validation without
+  parent bindings. The trusted `named_lane_guard
+  validate-read-only-pr-report` profile runs under `-I -B -S`, raw-loads a
+  stdlib-only three-source guard closure, pins a machine control-manifest
+  digest, and retains the complete guard/runtime/bootstrap/manifest/receiver/
+  schema transaction until final identity, content, parent-entry, and
+  access-policy revalidation. Its exact bound receiver evaluates only the
+  supported closed Draft 2020-12 keyword set over the injected exact schema
+  bytes; a 400-case mutation corpus agrees with `jsonschema` and every valid
+  report fixture agrees. Seven focused guard tests prove valid stdin/file
+  acceptance, direct/missing/invalid-loader rejection, same-size/mode/mtime
+  relaxed-schema ABA safety, receiver ABA non-execution, receiver/schema
+  same-inode byte and mode drift rejection, and persistent same-content inode
+  replacement rejection. The focused Python 3.13 run passed `159` tests; the
+  guard tests separately passed all `7` cases under Python 3.10 and 3.14. The
+  complete review-helper suite ran `2,827` tests with `6` platform skips; its
+  only outer-sandbox failure was the known native macOS `sandbox-exec`
+  boundary, and that exact test passed outside the outer sandbox. Ruff
+  check/format, source compilation, `actionlint`, machine JSON parsing, both
+  changed skill validators, project-journal validation, and
+  `git diff --check` passed. An actual `-I -B -S` guard invocation accepted a
+  valid schema-v8 fixture with the expected manifest/receiver/schema digests,
+  while the direct candidate receiver returned a bounded machine rejection.
+  Joey waived the direct Claude review lane through 2026-08-01 because of
+  quota; no other reviewer is counted as that lane.

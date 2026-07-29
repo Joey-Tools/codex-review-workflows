@@ -4204,10 +4204,12 @@ class RepositoryContractTest(unittest.TestCase):
             "_CLAUDE_STREAM_RUNTIME_SOURCES",
             "_CLAUDE_STREAM_VALIDATOR_SOURCES",
             "_REVIEW_RESULT_SOURCES",
+            "_READ_ONLY_REPORT_SOURCES",
             "_load_default_entrypoint",
             "_load_claude_preflight_entrypoint",
             "_load_claude_stream_validator_entrypoint",
             "_load_review_result_entrypoint",
+            "_load_read_only_report_entrypoint",
             '"review_runtime.claude_refresh_lock"',
             '"claude_refresh_lock.py"',
             '"review_runtime.claude_linux"',
@@ -4222,6 +4224,7 @@ class RepositoryContractTest(unittest.TestCase):
             'argv[0] == "preflight-claude"',
             'argv[0] == "validate-claude-stream"',
             'argv[0] == "classify-review-result"',
+            'argv[0] == "validate-read-only-pr-report"',
         ):
             self.assertIn(anchor, entrypoint)
         self.assertNotIn("sys.path.insert", entrypoint)
@@ -4407,6 +4410,44 @@ class RepositoryContractTest(unittest.TestCase):
             "stability",
             schema["$defs"]["reviewThreadPaginationEvidence"]["required"],
         )
+        control_path = (
+            SKILL_ROOT / "references" / "read-only-pr-report-control-manifest.json"
+        )
+        control = json.loads(control_path.read_text(encoding="utf-8"))
+        self.assertEqual(control["schema_version"], 1)
+        self.assertEqual(control["profile"], "validate-read-only-pr-report")
+        self.assertEqual(
+            control["loader"],
+            {
+                "path": "scripts/named_lane_guard",
+                "profile_version": 1,
+                "python_flags": ["-I", "-B", "-S"],
+                "runtime": "scripts/review_runtime/read_only_report_guard.py",
+                "runtime_version": 1,
+                "schema_evaluator": "closed-draft-2020-12-v1",
+            },
+        )
+        self.assertEqual(
+            [(artifact["path"], artifact["role"]) for artifact in control["artifacts"]],
+            [
+                (
+                    "references/pr-readiness-read-only-report.schema.json",
+                    "schema",
+                ),
+                ("scripts/read_only_pr_report.py", "receiver"),
+            ],
+        )
+        for artifact in control["artifacts"]:
+            self.assertEqual(
+                artifact["sha256"],
+                hashlib.sha256(
+                    (SKILL_ROOT / artifact["path"]).read_bytes()
+                ).hexdigest(),
+            )
+        self.assertIn(
+            hashlib.sha256(control_path.read_bytes()).hexdigest(),
+            (SCRIPTS / "named_lane_guard").read_text(encoding="utf-8"),
+        )
 
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
@@ -4428,6 +4469,9 @@ class RepositoryContractTest(unittest.TestCase):
             self.assertIn("scan_role", content)
         self.assertIn("schema-v8 bytes", contracts)
         self.assertIn("canonical bundle digest", contracts)
+        self.assertIn("machine control manifest", contracts)
+        self.assertIn("previous trusted release", contracts)
+        self.assertIn("validate-read-only-pr-report", contracts)
         self.assertIn("applies it before semantics", contracts)
         self.assertIn("role-specific input includes `scan_role`", contracts)
         self.assertNotIn("validate-semantics", skill + readiness + contracts)
@@ -4483,6 +4527,7 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/references/github-pr-probes.md",
             "skills/review-orchestration-playbook/references/pr-readiness-read-only-report.schema.json",
             "skills/review-orchestration-playbook/references/pr-readiness.md",
+            "skills/review-orchestration-playbook/references/read-only-pr-report-control-manifest.json",
             "skills/review-orchestration-playbook/references/review-lane-contracts.md",
             "skills/review-orchestration-playbook/references/review-prompt-templates.md",
             "skills/review-orchestration-playbook/scripts/named_claude_preflight",
@@ -4501,6 +4546,7 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/scripts/review_runtime/fd_exec.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/named_claude_preflight.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/named_lane.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/read_only_report_guard.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/review_result.py",
             "skills/review-orchestration-playbook/scripts/validate_claude_stream.py",
             "skills/synthetic-token-fixtures/SKILL.md",
@@ -4526,7 +4572,11 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/references/github-pr-probes.md",
             "skills/review-orchestration-playbook/references/pr-readiness-read-only-report.schema.json",
             "skills/review-orchestration-playbook/references/pr-readiness.md",
+            "skills/review-orchestration-playbook/references/read-only-pr-report-control-manifest.json",
+            "skills/review-orchestration-playbook/scripts/named_lane_guard",
             "skills/review-orchestration-playbook/scripts/read_only_pr_report.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/catalog_bootstrap.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/read_only_report_guard.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/review_result.py",
             "skills/synthetic-token-fixtures/SKILL.md",
             "skills/synthetic-token-fixtures/scripts/active_catalog_binding.py",
@@ -4570,6 +4620,7 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/references/github-pr-probes.md",
             "skills/review-orchestration-playbook/references/pr-readiness-read-only-report.schema.json",
             "skills/review-orchestration-playbook/references/pr-readiness.md",
+            "skills/review-orchestration-playbook/references/read-only-pr-report-control-manifest.json",
             "skills/review-orchestration-playbook/references/review-lane-contracts.md",
             "skills/review-orchestration-playbook/references/review-prompt-templates.md",
             "skills/review-orchestration-playbook/references/canonical-claude-lane.md",
@@ -4588,6 +4639,7 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/scripts/review_runtime/claude_version_policy.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/named_claude_preflight.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/named_lane.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/read_only_report_guard.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/review_result.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/common.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/fd_exec.py",
@@ -4608,6 +4660,7 @@ class RepositoryContractTest(unittest.TestCase):
             "preflight-claude",
             "validate-claude-stream",
             "classify-review-result",
+            "validate-read-only-pr-report",
             "catalog-bootstrap",
         ):
             self.assertIn(anchor, contracts)

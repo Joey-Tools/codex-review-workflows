@@ -160,15 +160,30 @@ The receiving sequence is closed:
    `unavailable_evidence` and have exactly one blocker whose `evidence` field
    names that kind. An `observed` kind must appear in neither summary. Every
    action field remains `false`.
-8. Run the installed same-release
-   `read_only_pr_report.py validate-report -` receiver once over the exact
-   in-memory JSON through stdin with Python `-I -B`. The receiver derives and
-   descriptor-safely loads its co-release schema-v8 path, requires its exact
-   Draft 2020-12 identity/version and local-only `$ref` closure, checks the
-   schema itself, applies that closed schema first, and only then applies
-   runtime semantics. A missing, replaced, unreadable, cross-release, malformed,
-   unsupported, or dependency-unloadable schema fails closed; there is no
-   executable semantic-only report entrypoint. It must accept before emission.
+8. Run the parent-validated, previously trusted bundle's absolute
+   `named_lane_guard validate-read-only-pr-report -` profile once over the
+   exact in-memory JSON through stdin with the canonical Python `-I -B -S`
+   launcher and clean environment. The guard's machine control manifest binds
+   its loader/profile version plus the exact receiver and schema SHA-256
+   values. The profile raw-loads only the manifest-bound stdlib transaction
+   runtime, retains descriptor-bound guard/runtime/bootstrap/manifest/receiver/
+   schema bytes, compiles only the retained receiver, and injects only the
+   retained schema bytes. Its closed Draft 2020-12 evaluator requires the
+   exact schema identity/version, supported keyword set, and local-only
+   `$ref` closure, applies that schema first, and only then applies runtime
+   semantics. It writes no acceptance until complete descriptor content,
+   leaf/ancestor identity, parent-entry, and non-owner-mutation access-policy
+   revalidation succeeds. A persistent replacement, byte drift, unsafe ACL or
+   mode, missing trusted loader, malformed machine manifest, or unsupported
+   filesystem access model fails closed. A temporary replacement restored to
+   the originally bound object cannot affect validation because no consumer
+   reopens the path. `mtime`, `ctime`, `nlink`, and child-entry churn alone are
+   not content or access-policy evidence. Direct candidate
+   `read_only_pr_report.py validate-report` lacks guard bindings and rejects.
+   For a self-policy migration, use the prior trusted release under its prior
+   policy; candidate guard tests are implementation evidence only, and the new
+   profile becomes formal control only after merge, release, and
+   canonical-manifest verification. It must accept before emission.
    The semantic phase binds all instance IDs by equality
    and rejects contradictions that JSON Schema cannot express, including
    delivery `head_sha` versus both its verified-signature OID and target head,

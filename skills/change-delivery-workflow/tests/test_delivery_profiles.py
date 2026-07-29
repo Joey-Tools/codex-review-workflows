@@ -68,6 +68,9 @@ READ_ONLY_REPORT_MAX_INTEGER_DIGITS = READ_ONLY_PR_REPORT_RUNTIME_API[
     "MAX_INTEGER_DIGITS"
 ]
 READ_ONLY_REPORT_MAX_ERROR_CHARS = READ_ONLY_PR_REPORT_RUNTIME_API["MAX_ERROR_CHARS"]
+CLOSED_DRAFT_2020_12_VALIDATOR = READ_ONLY_PR_REPORT_RUNTIME_API[
+    "_ClosedDraft202012Validator"
+]
 
 RESULT_FIELDS = {
     "schema_version",
@@ -1645,6 +1648,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
                     READ_ONLY_PR_REPORT_GLOBALS,
                     {
                         "_read_payload": mock.Mock(return_value=candidate),
+                        "REPORT_SCHEMA_BYTES": READ_ONLY_PR_REPORT_SCHEMA.read_bytes(),
                         "validate_semantics": semantic_gate,
                     },
                 ),
@@ -1663,7 +1667,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
             READ_ONLY_PR_REPORT_GLOBALS,
             {
                 "_read_payload": mock.Mock(return_value=valid),
-                "REPORT_SCHEMA_PATH": "/definitely/missing/co-release-schema.json",
+                "REPORT_SCHEMA_BYTES": None,
                 "validate_semantics": mock.Mock(),
             },
         ):
@@ -1673,7 +1677,7 @@ class DeliveryProfileContractTest(unittest.TestCase):
         self.assertEqual(return_code, 2)
         rejection = json.loads(stdout.getvalue())
         self.assertEqual(rejection["classification"], "rejected")
-        self.assertIn("co-release report schema", rejection["error"])
+        self.assertIn("guard bindings are unavailable", rejection["error"])
 
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
@@ -1683,6 +1687,86 @@ class DeliveryProfileContractTest(unittest.TestCase):
             )
         self.assertIn("validate-report", stderr.getvalue())
         self.assertNotIn("validate-semantics", stderr.getvalue())
+
+    def test_manifest_bound_schema_evaluator_matches_draft_validator(self) -> None:
+        schema = json.loads(READ_ONLY_PR_REPORT_SCHEMA.read_text(encoding="utf-8"))
+        expected_validator = Draft202012Validator(schema)
+        bound_validator = CLOSED_DRAFT_2020_12_VALIDATOR(schema)
+        reports = [
+            case["expected"]["terminal_result"]
+            for case in fixture_cases(
+                READ_ONLY_PR_PROBE_CASES,
+                "read-only-pr-probe",
+            )
+        ]
+        for index, report in enumerate(reports):
+            with self.subTest(valid_fixture=index):
+                self.assertEqual(
+                    next(expected_validator.iter_errors(report), None) is None,
+                    next(bound_validator.iter_errors(report), None) is None,
+                )
+
+        representative = copy.deepcopy(reports[0])
+        mutation_paths: list[tuple[tuple[str | int, ...], str]] = []
+
+        def collect(value: object, path: tuple[str | int, ...]) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    mutation_paths.append(((*path, key), "delete"))
+                    collect(child, (*path, key))
+            elif isinstance(value, list):
+                if value:
+                    mutation_paths.append((path, "drop-last"))
+                    mutation_paths.append((path, "duplicate-last"))
+                for index, child in enumerate(value):
+                    collect(child, (*path, index))
+            else:
+                mutation_paths.append((path, "replace-leaf"))
+
+        def parent_at(
+            root: object,
+            path: tuple[str | int, ...],
+        ) -> tuple[object, str | int]:
+            current = root
+            for component in path[:-1]:
+                current = current[component]
+            return current, path[-1]
+
+        collect(representative, ())
+        for path, operation in mutation_paths[:400]:
+            candidate = copy.deepcopy(representative)
+            if operation == "drop-last":
+                target = candidate
+                for component in path:
+                    target = target[component]
+                target.pop()
+            elif operation == "duplicate-last":
+                target = candidate
+                for component in path:
+                    target = target[component]
+                target.append(copy.deepcopy(target[-1]))
+            else:
+                parent, component = parent_at(candidate, path)
+                if operation == "delete":
+                    del parent[component]
+                else:
+                    value = parent[component]
+                    if value is None:
+                        replacement: object = False
+                    elif isinstance(value, bool):
+                        replacement = not value
+                    elif isinstance(value, str):
+                        replacement = 0
+                    elif isinstance(value, (int, float)):
+                        replacement = "invalid"
+                    else:
+                        raise AssertionError("unexpected mutation leaf")
+                    parent[component] = replacement
+            with self.subTest(path=path, operation=operation):
+                self.assertEqual(
+                    next(expected_validator.iter_errors(candidate), None) is None,
+                    next(bound_validator.iter_errors(candidate), None) is None,
+                )
 
     def test_read_only_pr_report_schema_rejects_inconsistent_summaries(
         self,
@@ -3511,7 +3595,11 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 ),
                 1_000,
             )
-            validate_read_only_report(parsed)
+            with mock.patch.dict(
+                READ_ONLY_PR_REPORT_GLOBALS,
+                {"REPORT_SCHEMA_BYTES": READ_ONLY_PR_REPORT_SCHEMA.read_bytes()},
+            ):
+                validate_read_only_report(parsed)
 
             over_limit = report_with_ci_items(1_001)
             over_limit_path = root / "ci-1001.json"
@@ -3527,7 +3615,11 @@ class DeliveryProfileContractTest(unittest.TestCase):
                 ValueError,
                 "closed report schema rejected",
             ):
-                validate_read_only_report(parsed_over_limit)
+                with mock.patch.dict(
+                    READ_ONLY_PR_REPORT_GLOBALS,
+                    {"REPORT_SCHEMA_BYTES": (READ_ONLY_PR_REPORT_SCHEMA.read_bytes())},
+                ):
+                    validate_read_only_report(parsed_over_limit)
 
     def test_runtime_validator_rejects_splicing_and_cross_field_conflicts(
         self,

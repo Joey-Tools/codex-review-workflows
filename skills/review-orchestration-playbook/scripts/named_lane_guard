@@ -95,8 +95,20 @@ _CATALOG_BOOTSTRAP_SOURCES = (
     ("review_runtime", "__init__.py", True),
     ("review_runtime.catalog_bootstrap", "catalog_bootstrap.py", False),
 )
+_READ_ONLY_REPORT_SOURCES = (
+    ("review_runtime", "__init__.py", True),
+    ("review_runtime.catalog_bootstrap", "catalog_bootstrap.py", False),
+    (
+        "review_runtime.read_only_report_guard",
+        "read_only_report_guard.py",
+        False,
+    ),
+)
 _CATALOG_RUNTIME_MANIFEST_SHA256 = (
     "24536adf294ea90bece398a3fe9f8a5c045ddfbb6e2b9d2a74ef9efee954a67a"
+)
+_READ_ONLY_REPORT_CONTROL_MANIFEST_SHA256 = (
+    "dc12fd1fe0bb450190956a3e4220d6f46231471d6688bf38b59c30eae23e645b"
 )
 _SourceIdentity = tuple[int, int, int, int, int]
 _CompanionBinding = bytes
@@ -764,6 +776,76 @@ def _load_catalog_bootstrap_entrypoint(scripts_root: pathlib.Path) -> object:
     )
 
 
+def _load_read_only_report_entrypoint(scripts_root: pathlib.Path) -> object:
+    runtime_root = scripts_root / "review_runtime"
+    review_skill_root = scripts_root.parent
+    guard_path = scripts_root / "named_lane_guard"
+    runtime_path = runtime_root / "read_only_report_guard.py"
+    bootstrap_path = runtime_root / "catalog_bootstrap.py"
+    manifest_path = (
+        review_skill_root / "references" / "read-only-pr-report-control-manifest.json"
+    )
+    receiver_path = scripts_root / "read_only_pr_report.py"
+    schema_path = (
+        review_skill_root / "references" / "pr-readiness-read-only-report.schema.json"
+    )
+    guard_bytes = _validate_bound_companion(guard_path)
+    runtime_bytes = _validate_bound_companion(runtime_path)
+    bootstrap_bytes = _validate_bound_companion(bootstrap_path)
+    manifest_bytes = _validate_bound_companion(manifest_path)
+    receiver_bytes = _validate_bound_companion(receiver_path)
+    schema_bytes = _validate_bound_companion(schema_path)
+    if (
+        hashlib.sha256(manifest_bytes).hexdigest()
+        != _READ_ONLY_REPORT_CONTROL_MANIFEST_SHA256
+    ):
+        raise _fail(
+            "read-only report control manifest is not provisioned by this trusted guard"
+        )
+    entrypoint = _load_bound_sources(
+        runtime_root,
+        _READ_ONLY_REPORT_SOURCES,
+        namespace_root="review_runtime",
+        entry_module_name="review_runtime.read_only_report_guard",
+        source_byte_bindings=(
+            ("review_runtime.catalog_bootstrap", bootstrap_bytes),
+            ("review_runtime.read_only_report_guard", runtime_bytes),
+        ),
+    )
+    _remove_bound_namespace("review_runtime")
+
+    def guarded_read_only_report(argv: object = None) -> object:
+        return entrypoint(
+            argv,
+            trusted_review_skill_root=review_skill_root,
+            trusted_guard_path=guard_path,
+            trusted_guard_bytes=guard_bytes,
+            trusted_runtime_path=runtime_path,
+            trusted_runtime_bytes=runtime_bytes,
+            trusted_bootstrap_path=bootstrap_path,
+            trusted_bootstrap_bytes=bootstrap_bytes,
+            trusted_manifest_path=manifest_path,
+            trusted_manifest_bytes=manifest_bytes,
+            trusted_manifest_sha256=_READ_ONLY_REPORT_CONTROL_MANIFEST_SHA256,
+            trusted_receiver_path=receiver_path,
+            trusted_receiver_bytes=receiver_bytes,
+            trusted_schema_path=schema_path,
+            trusted_schema_bytes=schema_bytes,
+        )
+
+    return _guard_companions(
+        guarded_read_only_report,
+        (
+            (guard_path, guard_bytes),
+            (runtime_path, runtime_bytes),
+            (bootstrap_path, bootstrap_bytes),
+            (manifest_path, manifest_bytes),
+            (receiver_path, receiver_bytes),
+            (schema_path, schema_bytes),
+        ),
+    )
+
+
 def _select_entrypoint(
     scripts_root: pathlib.Path,
     argv: tuple[str, ...],
@@ -776,6 +858,8 @@ def _select_entrypoint(
         return _load_review_result_entrypoint(scripts_root), argv[1:]
     if argv and argv[0] == "catalog-bootstrap":
         return _load_catalog_bootstrap_entrypoint(scripts_root), argv[1:]
+    if argv and argv[0] == "validate-read-only-pr-report":
+        return _load_read_only_report_entrypoint(scripts_root), argv[1:]
     return _load_default_entrypoint(scripts_root), argv
 
 

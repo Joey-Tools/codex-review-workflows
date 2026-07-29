@@ -42,14 +42,8 @@ REPORT_SCHEMA_ID = (
     "https://joey-tools.invalid/review-orchestration-playbook/"
     "pr-readiness-read-only-report.schema.json"
 )
-REPORT_SCHEMA_PATH = os.path.abspath(
-    os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        "references",
-        "pr-readiness-read-only-report.schema.json",
-    )
-)
+REPORT_GUARD_PROFILE_VERSION = 1
+REPORT_SCHEMA_BYTES: bytes | None = None
 PAGE_DIGEST_ALGORITHM = "sha256-domain-json-v1"
 PAGE_DIGEST_DOMAIN = b"joey-tools:pr-readiness-page:v1\x00"
 PAGE_DIGEST_KINDS = frozenset({"ci-status", "review-threads"})
@@ -2044,21 +2038,393 @@ def _local_schema_references(schema: object) -> tuple[str, ...]:
     return tuple(references)
 
 
+class _ClosedSchemaError:
+    def __init__(self, path: tuple[str | int, ...], validator: str) -> None:
+        self.absolute_path = path
+        self.validator = validator
+
+
+def _schema_value_identity(value: object) -> object:
+    if value is None:
+        return ("null",)
+    if isinstance(value, bool):
+        return ("boolean", value)
+    if isinstance(value, int):
+        return ("number", value, 1)
+    if isinstance(value, float):
+        numerator, denominator = value.as_integer_ratio()
+        return ("number", numerator, denominator)
+    if isinstance(value, str):
+        return ("string", value)
+    if isinstance(value, list):
+        return ("array", tuple(_schema_value_identity(item) for item in value))
+    if isinstance(value, dict):
+        return (
+            "object",
+            tuple((key, _schema_value_identity(value[key])) for key in sorted(value)),
+        )
+    raise ValueError("closed schema received an unsupported instance type")
+
+
+def _schema_type_matches(value: object, expected: str) -> bool:
+    if expected == "null":
+        return value is None
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "integer":
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            or isinstance(value, float)
+            and math.isfinite(value)
+            and value.is_integer()
+        )
+    if expected == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "array":
+        return isinstance(value, list)
+    if expected == "object":
+        return isinstance(value, dict)
+    return False
+
+
+class _ClosedDraft202012Validator:
+    """Evaluate the exact, manifest-bound schema subset used by this profile."""
+
+    _KEYWORDS = frozenset(
+        {
+            "$defs",
+            "$id",
+            "$ref",
+            "$schema",
+            "additionalProperties",
+            "allOf",
+            "anyOf",
+            "const",
+            "contains",
+            "description",
+            "else",
+            "enum",
+            "if",
+            "items",
+            "maxContains",
+            "maxItems",
+            "maxLength",
+            "maximum",
+            "minContains",
+            "minItems",
+            "minLength",
+            "minimum",
+            "not",
+            "oneOf",
+            "pattern",
+            "properties",
+            "required",
+            "then",
+            "title",
+            "type",
+            "uniqueItems",
+        }
+    )
+    _TYPES = frozenset(
+        {"array", "boolean", "integer", "null", "number", "object", "string"}
+    )
+
+    def __init__(self, schema: object) -> None:
+        self.check_schema(schema)
+        self._schema = schema
+
+    @classmethod
+    def check_schema(cls, schema: object) -> None:
+        if not isinstance(schema, dict):
+            raise ValueError("closed schema root must be an object")
+        stack: list[object] = [schema]
+        references: list[str] = []
+        while stack:
+            node = stack.pop()
+            if isinstance(node, bool):
+                continue
+            if not isinstance(node, dict):
+                raise ValueError("closed schema node must be an object or boolean")
+            if set(node) - cls._KEYWORDS:
+                raise ValueError("closed schema uses an unsupported keyword")
+            reference = node.get("$ref")
+            if reference is not None:
+                if not isinstance(reference, str) or not reference.startswith("#/"):
+                    raise ValueError("closed schema reference is not local")
+                references.append(reference)
+            expected_type = node.get("type")
+            if expected_type is not None:
+                values = (
+                    [expected_type] if isinstance(expected_type, str) else expected_type
+                )
+                if (
+                    not isinstance(values, list)
+                    or not values
+                    or any(value not in cls._TYPES for value in values)
+                    or len(values) != len(set(values))
+                ):
+                    raise ValueError("closed schema type declaration is invalid")
+            for key in ("properties", "$defs"):
+                children = node.get(key)
+                if children is not None:
+                    if not isinstance(children, dict) or any(
+                        not isinstance(name, str) for name in children
+                    ):
+                        raise ValueError(f"closed schema {key} declaration is invalid")
+                    stack.extend(children.values())
+            required = node.get("required")
+            if required is not None and (
+                not isinstance(required, list)
+                or any(not isinstance(value, str) for value in required)
+                or len(required) != len(set(required))
+            ):
+                raise ValueError("closed schema required declaration is invalid")
+            if (
+                "additionalProperties" in node
+                and node["additionalProperties"] is not False
+            ):
+                raise ValueError(
+                    "closed schema additionalProperties must be false when present"
+                )
+            for key in ("allOf", "anyOf", "oneOf"):
+                branches = node.get(key)
+                if branches is not None:
+                    if not isinstance(branches, list) or not branches:
+                        raise ValueError(f"closed schema {key} declaration is invalid")
+                    stack.extend(branches)
+            for key in ("contains", "else", "if", "items", "not", "then"):
+                child = node.get(key)
+                if child is not None:
+                    stack.append(child)
+            enum = node.get("enum")
+            if enum is not None and (not isinstance(enum, list) or not enum):
+                raise ValueError("closed schema enum declaration is invalid")
+            for key in (
+                "maxContains",
+                "maxItems",
+                "maxLength",
+                "minContains",
+                "minItems",
+                "minLength",
+            ):
+                bound = node.get(key)
+                if bound is not None and (
+                    not isinstance(bound, int) or isinstance(bound, bool) or bound < 0
+                ):
+                    raise ValueError(f"closed schema {key} declaration is invalid")
+            for key in ("maximum", "minimum"):
+                bound = node.get(key)
+                if bound is not None and (
+                    not isinstance(bound, (int, float))
+                    or isinstance(bound, bool)
+                    or not math.isfinite(bound)
+                ):
+                    raise ValueError(f"closed schema {key} declaration is invalid")
+            pattern = node.get("pattern")
+            if pattern is not None:
+                if not isinstance(pattern, str):
+                    raise ValueError("closed schema pattern declaration is invalid")
+                re.compile(pattern)
+            unique = node.get("uniqueItems")
+            if unique is not None and unique is not True:
+                raise ValueError("closed schema uniqueItems declaration is invalid")
+        validator = cls.__new__(cls)
+        validator._schema = schema
+        for reference in references:
+            validator._resolve_reference(reference)
+
+    def _resolve_reference(self, reference: str) -> object:
+        current: object = self._schema
+        for encoded in reference[2:].split("/"):
+            component = encoded.replace("~1", "/").replace("~0", "~")
+            if not isinstance(current, dict) or component not in current:
+                raise ValueError("closed schema reference cannot be resolved")
+            current = current[component]
+        if not isinstance(current, (dict, bool)):
+            raise ValueError("closed schema reference target is invalid")
+        return current
+
+    @staticmethod
+    def _error(
+        path: tuple[str | int, ...],
+        keyword: str,
+    ) -> _ClosedSchemaError:
+        return _ClosedSchemaError(path, keyword)
+
+    def _first_error(
+        self,
+        value: object,
+        schema: object,
+        path: tuple[str | int, ...],
+    ) -> _ClosedSchemaError | None:
+        if schema is False:
+            return self._error(path, "false")
+        if schema is True:
+            return None
+        if not isinstance(schema, dict):
+            raise ValueError("closed schema node changed after compilation")
+
+        reference = schema.get("$ref")
+        if isinstance(reference, str):
+            error = self._first_error(
+                value,
+                self._resolve_reference(reference),
+                path,
+            )
+            if error is not None:
+                return error
+
+        expected = schema.get("type")
+        if expected is not None:
+            expected_types = [expected] if isinstance(expected, str) else expected
+            if not any(_schema_type_matches(value, item) for item in expected_types):
+                return self._error(path, "type")
+
+        if "const" in schema and _schema_value_identity(
+            value
+        ) != _schema_value_identity(schema["const"]):
+            return self._error(path, "const")
+        enum = schema.get("enum")
+        if isinstance(enum, list):
+            identity = _schema_value_identity(value)
+            if all(identity != _schema_value_identity(item) for item in enum):
+                return self._error(path, "enum")
+
+        all_of = schema.get("allOf")
+        if isinstance(all_of, list):
+            for branch in all_of:
+                error = self._first_error(value, branch, path)
+                if error is not None:
+                    return error
+        any_of = schema.get("anyOf")
+        if isinstance(any_of, list) and all(
+            self._first_error(value, branch, path) is not None for branch in any_of
+        ):
+            return self._error(path, "anyOf")
+        one_of = schema.get("oneOf")
+        if isinstance(one_of, list):
+            matches = sum(
+                self._first_error(value, branch, path) is None for branch in one_of
+            )
+            if matches != 1:
+                return self._error(path, "oneOf")
+        negated = schema.get("not")
+        if negated is not None and self._first_error(value, negated, path) is None:
+            return self._error(path, "not")
+        condition = schema.get("if")
+        if condition is not None:
+            selected = (
+                schema.get("then")
+                if self._first_error(value, condition, path) is None
+                else schema.get("else")
+            )
+            if selected is not None:
+                error = self._first_error(value, selected, path)
+                if error is not None:
+                    return error
+
+        if isinstance(value, dict):
+            required = schema.get("required")
+            if isinstance(required, list):
+                for key in required:
+                    if key not in value:
+                        return self._error(path, "required")
+            properties = schema.get("properties")
+            if isinstance(properties, dict):
+                for key, child in properties.items():
+                    if key in value:
+                        error = self._first_error(
+                            value[key],
+                            child,
+                            (*path, key),
+                        )
+                        if error is not None:
+                            return error
+                if schema.get("additionalProperties") is False and any(
+                    key not in properties for key in value
+                ):
+                    return self._error(path, "additionalProperties")
+
+        if isinstance(value, list):
+            minimum = schema.get("minItems")
+            maximum = schema.get("maxItems")
+            if isinstance(minimum, int) and len(value) < minimum:
+                return self._error(path, "minItems")
+            if isinstance(maximum, int) and len(value) > maximum:
+                return self._error(path, "maxItems")
+            if schema.get("uniqueItems") is True:
+                identities = [_schema_value_identity(item) for item in value]
+                if len(identities) != len(set(identities)):
+                    return self._error(path, "uniqueItems")
+            item_schema = schema.get("items")
+            if item_schema is not None:
+                for index, item in enumerate(value):
+                    error = self._first_error(
+                        item,
+                        item_schema,
+                        (*path, index),
+                    )
+                    if error is not None:
+                        return error
+            contains = schema.get("contains")
+            if contains is not None:
+                matches = sum(
+                    self._first_error(item, contains, (*path, index)) is None
+                    for index, item in enumerate(value)
+                )
+                minimum_contains = schema.get("minContains", 1)
+                maximum_contains = schema.get("maxContains")
+                if matches < minimum_contains or (
+                    isinstance(maximum_contains, int) and matches > maximum_contains
+                ):
+                    return self._error(path, "contains")
+
+        if isinstance(value, str):
+            minimum = schema.get("minLength")
+            maximum = schema.get("maxLength")
+            pattern = schema.get("pattern")
+            if isinstance(minimum, int) and len(value) < minimum:
+                return self._error(path, "minLength")
+            if isinstance(maximum, int) and len(value) > maximum:
+                return self._error(path, "maxLength")
+            if isinstance(pattern, str) and re.search(pattern, value) is None:
+                return self._error(path, "pattern")
+
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            minimum = schema.get("minimum")
+            maximum = schema.get("maximum")
+            if isinstance(minimum, (int, float)) and value < minimum:
+                return self._error(path, "minimum")
+            if isinstance(maximum, (int, float)) and value > maximum:
+                return self._error(path, "maximum")
+        return None
+
+    def iter_errors(self, value: object) -> object:
+        error = self._first_error(value, self._schema, ())
+        if error is not None:
+            yield error
+
+
 def _load_report_schema() -> tuple[object, object]:
-    """Load and compile the co-release closed Draft 2020-12 report schema."""
+    """Compile the exact schema bytes injected by the trusted parent guard."""
 
-    try:
-        from jsonschema import Draft202012Validator
-        from jsonschema.exceptions import SchemaError
-    except (ImportError, AttributeError) as exc:
+    bound_schema = REPORT_SCHEMA_BYTES
+    if (
+        REPORT_GUARD_PROFILE_VERSION != 1
+        or not isinstance(bound_schema, bytes)
+        or not bound_schema
+    ):
         raise ValueError(
-            "Draft 2020-12 schema validator dependency is unavailable"
-        ) from exc
-
+            "trusted read-only report guard bindings are unavailable; "
+            "invoke named_lane_guard validate-read-only-pr-report"
+        )
     try:
-        schema = _strict_json_object(_read_regular_path(REPORT_SCHEMA_PATH))
-    except (UnicodeDecodeError, json.JSONDecodeError, OSError, ValueError) as exc:
-        raise ValueError("co-release report schema could not be loaded") from exc
+        schema = _strict_json_object(bound_schema)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("guard-bound report schema could not be loaded") from exc
     if schema.get("$schema") != REPORT_SCHEMA_DRAFT:
         raise ValueError("co-release report schema uses an unexpected draft")
     if schema.get("$id") != REPORT_SCHEMA_ID:
@@ -2073,12 +2439,11 @@ def _load_report_schema() -> tuple[object, object]:
     if not references or any(
         not reference.startswith("#/") for reference in references
     ):
-        raise ValueError("co-release report schema is not self-contained")
+        raise ValueError("guard-bound report schema is not self-contained")
     try:
-        Draft202012Validator.check_schema(schema)
-        validator = Draft202012Validator(schema)
-    except (SchemaError, TypeError, ValueError) as exc:
-        raise ValueError("co-release report schema is invalid") from exc
+        validator = _ClosedDraft202012Validator(schema)
+    except Exception as exc:
+        raise ValueError("guard-bound report schema is invalid") from exc
     return schema, validator
 
 
