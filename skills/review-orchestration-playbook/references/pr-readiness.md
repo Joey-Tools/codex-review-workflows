@@ -1,6 +1,213 @@
 # PR Readiness
 
-Use this reference after the local delivery gate has produced a reviewable commit and the parent request owns PR creation/update, review/CI follow-up, merge-readiness reporting, or merge.
+First classify an inbound `pr-readiness-read-only-probe` delivery handoff through
+the closed receiving path below. Only when that profile is absent may the
+ordinary authorization, review, admission, wait, fix-loop, and merge-readiness
+rules in the rest of this reference apply.
+
+Otherwise, use this reference after the local delivery gate has produced a
+reviewable commit and the parent request owns PR creation/update, review/CI
+follow-up, merge-readiness reporting, or merge.
+
+An ordinary inbound delivery handoff is accepted only after the installed
+same-release `read_only_pr_report.py validate-delivery-handoff -` semantic
+validator accepts the exact in-memory record through stdin. That receiver
+admits only the two closed `pr-readiness` success rows, requires a full
+lowercase SHA-1 or SHA-256 `head_sha`, and requires
+`signature_verified_head_oid` to byte-for-byte equal `head_sha`. Preserve the
+record unchanged. Before any lane, admission, PR read, or PR mutation, require
+its `head_sha` to equal the frozen local range head; after selecting a PR,
+require the same value to equal current `pr_head_oid`. A missing binding or
+another syntactically valid 40- or 64-hex OID is terminal `blocked-input`, not
+authority to infer or substitute a head.
+
+## Read-Only Delivery Probe: Classify And Stop First
+
+This path receives only a complete
+`change-delivery-workflow` record whose exact fields validate against the
+read-only report schema's self-contained closed delivery-v3 definition and
+whose terminal is succeeded and ready for
+`pr-readiness-read-only-probe`. The installed receiver schema and semantic
+helper are both canonical-manifest records from one trusted release; the
+formal receiver does not resolve an external delivery-schema path or load
+candidate-head control bytes. Classify it before generic PR/full-workflow
+language, named single/double/triple review, or the ordinary gate sequence. A
+missing field, unknown field, lost constraint, blocked or non-ready terminal,
+non-forbidden remote-mutation mode, different handoff, or widened profile is
+terminal `blocked-input`; do not infer replacement authority from prose.
+
+The receiving sequence is closed:
+
+1. Preserve the inbound delivery record verbatim. Do not change its profile,
+   constraints, `local_mutation`, `commit_mode`, `remote_mutation`, handoff, or
+   handoff profile.
+2. Take only bounded, non-mutating snapshots of existing-PR selection,
+   lifecycle, CI status, unresolved-conversation state, and exact base/head
+   evidence. A read-only local object lookup may be used only with optional
+   locks, lazy fetching, credential prompts, generated commit graphs, and
+   persistent caches disabled. It must not create a checkout, worktree, log,
+   state directory, or result file.
+   Preserve GitHub GraphQL `statusCheckRollup` entries as their exact
+   provider-discriminated union. A `CheckRun` records its raw typename,
+   Node/database IDs, name, GitHub App Node/database IDs and slug, status, and
+   conclusion. A legacy `StatusContext` records its raw typename and Node ID,
+   context, creator type/node-ID/login, and state. Do not collapse provider
+   states early or use display-name uniqueness as object identity. Require a
+   one-to-one mapping in both directions between every non-null GitHub App
+   database ID and App Node ID, and between every non-null CheckRun database ID
+   and CheckRun Node ID.
+   Fetch that GraphQL connection under the stable `double-scan` contract. Use
+   distinct no-cache provider reads in this exact order: read
+   `pullRequest.headRefOid`; exhaust the primary connection; restart from a
+   null cursor and exhaust the complete verification connection; then reread
+   `pullRequest.headRefOid`. Return the provider head alongside every page.
+   Bind both outer connections, all pages, and both head reads to the same
+   repository Node ID, PR Node ID, and target head OID. The initial head read,
+   every primary and verification page, and the final head read must all equal
+   the target head; a changed-then-restored head not observed by those reads is
+   an explicit limitation, not evidence that no intermediate event occurred.
+   Record server `totalCount`, contiguous one-based page indexes, request and
+   end cursors, per-page item counts, and `pageInfo.hasNextPage`. Each page
+   repeats its `primary` or `verification` scan role, returned provider head,
+   report snapshot binding, observation ID, and server total, then records the
+   canonical SHA-256 of those fields and its exact ordered flat-list slice.
+   Generate it only with the co-release
+   `read_only_pr_report.py page-digest <ci-status|review-threads> -`
+   entrypoint through Python `-I -B -S`. Its complete
+   `sha256-domain-json-v1` input is the ASCII domain
+   `joey-tools:pr-readiness-page:v1`, one NUL byte, the exact ASCII kind, one
+   NUL byte, then UTF-8 JSON for an object containing exactly `connection`,
+   `scan_role`, `observed_head_oid`, `snapshot_binding`, `snapshot_id`,
+   `server_total_count`, `page_index`, `request_after`, `item_count`,
+   `page_info`, and `items`, serialized with recursively sorted keys, no
+   insignificant whitespace, literal non-ASCII characters, and finite JSON
+   numbers only. `scan_role` is included, so otherwise identical primary and
+   verification pages intentionally have different digests. Stability compares
+   their role-neutral page projections and complete ordered lists after each
+   role-specific digest has independently validated. The
+   verification scan retains its own complete ordered items so the receiver
+   recomputes every page digest instead of trusting a second self-reported
+   summary.
+   The final page in each scan must report `hasNextPage=false`. Primary and
+   verification page-item totals, server totals, complete ordered content,
+   page boundaries, cursors, page digests, the primary flat rollup length, and
+   the CI aggregate `total` must all agree. Each connection acquisition uses
+   one monotonic deadline of at most 60 seconds and exactly two head reads plus
+   one provider call per captured page, with at most 22 calls total. The
+   bounded complete profile admits at most 1,000 entries per scan in at most
+   ten pages of at most 100 items. A larger connection, timeout, retry,
+   partial primary or verification chain, cursor or connection drift,
+   same-count content replacement, head drift, count mismatch, or a first
+   page whose later pages remain unread makes CI evidence `unavailable` or
+   `blocked`; never truncate or mix it into an observed green result.
+   Fetch `pullRequest.reviewThreads` under the same stable double-scan,
+   head-revalidation, call-budget, deadline, and complete-pagination contract.
+   Preserve every thread's immutable Node ID and raw `isResolved` value,
+   require unique Node IDs and cursor exhaustion in both scans, require the
+   two complete ordered lists to match, and recompute both total and unresolved
+   counts from the primary list. A later-page unresolved thread must count as
+   unresolved. Incomplete scans, page digest mismatch, connection/target/head
+   drift, same-count replacement, or mid-pagination total drift makes
+   conversation evidence unavailable or blocked.
+3. Do not start any local Codex or Claude lane, `materialize-worktree`,
+   `validate-worktree`, low-level helper mode, exact-secret admission,
+   GitHub Codex request, check, workflow, comment, poll, monitor, or wait. Do
+   not fix code, write a journal, create or update a branch/PR/ref, commit,
+   push, release, merge, or perform another local or remote mutation.
+4. Use only a read mechanism proved not to persist authentication refreshes,
+   caches, tool state, or connector state. When that guarantee is unavailable,
+   do not attempt the read; mark its evidence `unavailable` or `blocked` and
+   record a blocker.
+5. Before the first read, create four independent fresh 128-bit in-memory
+   identifiers for the report, target binding, snapshot binding, and
+   observation. Resolve the helper from the same manifest-verified immutable
+   release as this schema, then invoke its absolute path with Python
+   `-I -B -S` and argument `new-bindings`. Do not execute a
+   repository-relative, caller-selected, or cross-release copy. Do not persist
+   the identifiers, derive them from PR metadata or time, or reuse an
+   identifier or target from an earlier report.
+6. Build the target only as far as current evidence permits:
+   - Every state binds the provider, immutable target-repository identity, and
+     exact current query-head repository/ref/OID.
+   - `pre-target` contains no PR/base. Use terminal `pre-target` for a
+     conclusive no-match or ambiguity, and `pre-target-blocked` when selection
+     is unavailable or blocked.
+   - `pr-selected` adds the selected PR's immutable Node ID, number, canonical
+     URL, and base ref but no resolved base. Use terminal
+     `target-resolution-blocked` when the base read is unavailable or blocked.
+   - `range-resolved` adds the current base and is the only target allowed by
+     terminal `target-snapshot`.
+   Never copy stale PR, base, head, or binding fields into a newer report to
+   make a blocked read appear complete.
+7. Emit exactly one terminal record conforming to
+   [pr-readiness-read-only-report.schema.json](pr-readiness-read-only-report.schema.json).
+   Every target and snapshot repeats the report binding, and every evidence
+   kind repeats the exact report, target, and snapshot binding identifiers.
+   An `observed` kind contains exactly one kind-specific, closed structured
+   record; an empty array, free-form summary, or record for another
+   report/target/snapshot is invalid.
+   Every selection record repeats the provider, target repository, and current
+   head; a selected record also repeats the exact PR identity. Every lifecycle,
+   CI, and conversation record repeats that complete selected-target identity.
+   Require dictionary equality with the enclosing target, including base ref,
+   head repository/ref/OID, and immutable Node IDs. Reject cross-PR splicing,
+   head races, and stale-green CI evidence.
+   A base/head observation repeats the exact base and head OIDs used for its
+   object lookups and merge-base invocation. Both must byte-for-byte equal the
+   resolved target OIDs; a matching merge-base result never makes stale,
+   swapped, or cross-report endpoint evidence current.
+   Each `unavailable` or `blocked` evidence kind must be listed in
+   `unavailable_evidence` and have exactly one blocker whose `evidence` field
+   names that kind. An `observed` kind must appear in neither summary. Every
+   action field remains `false`.
+8. Run the parent-validated, previously trusted bundle's absolute
+   `named_lane_guard validate-read-only-pr-report -` profile once over the
+   exact in-memory JSON through stdin with the canonical Python `-I -B -S`
+   launcher and clean environment. The guard's machine control manifest binds
+   its loader/profile version plus exact SHA-256 values for `review_runtime`,
+   the binding runtime, the report-guard runtime, the receiver, and the schema.
+   The prior-trusted canonical bundle manifest separately binds
+   `named_lane_guard` as the external trust root. The guard validates its fixed
+   machine-manifest digest and each source digest before compiling the profile.
+   The profile raw-loads only the manifest-bound stdlib transaction
+   runtime, retains descriptor-bound guard/runtime/bootstrap/manifest/receiver/
+   schema bytes, compiles only the retained receiver, and injects only the
+   retained schema bytes. Its closed Draft 2020-12 evaluator requires the
+   exact schema identity/version, supported keyword set, and local-only
+   `$ref` closure, applies that schema first, and only then applies runtime
+   semantics. It writes no acceptance until complete descriptor content,
+   leaf/ancestor identity, parent-entry, and non-owner-mutation access-policy
+   revalidation succeeds. A persistent replacement, byte drift, unsafe ACL or
+   mode, missing trusted loader, malformed machine manifest, or unsupported
+   filesystem access model fails closed. A temporary replacement restored to
+   the originally bound object cannot affect validation because no consumer
+   reopens the path. `mtime`, `ctime`, `nlink`, and child-entry churn alone are
+   not content or access-policy evidence. Direct candidate
+   `read_only_pr_report.py validate-report` lacks guard bindings and rejects.
+   For a self-policy migration, use the prior trusted release under its prior
+   policy; candidate guard tests are implementation evidence only, and the new
+   profile becomes formal control only after merge, release, and
+   canonical-manifest verification. It must accept before emission.
+   The semantic phase binds all instance IDs by equality
+   and rejects contradictions that JSON Schema cannot express, including
+   delivery `head_sha` versus both its verified-signature OID and target head,
+   target-identity mismatch, stable provider/object identity collisions,
+   non-bijective database-ID/Node-ID mappings, aggregate CI counts versus the
+   complete rollup, incomplete or identity-drifted CI pagination, mismatched
+   primary/verification ordered content, head-before/page/head-after drift,
+   provider-call or monotonic-deadline violations, server and page count
+   mismatches, observed endpoint OIDs versus target OIDs, and unresolved
+   threads versus total threads. Its one fail-closed normalization
+   maps the complete raw `CheckRun` status/conclusion and `StatusContext` state
+   enums to success, failure, pending, or cancelled. Report only evidence
+   actually observed, unavailable evidence, and blockers. Then stop without
+   another handoff.
+
+This report is never a named-review artifact, secret-admission result,
+PR-readiness completion, or merge-ready claim. Its schema fixes `merge_ready`
+to `false` and `next_handoff` to `none`. Even a snapshot in which every
+observed check is green cannot be promoted to ordinary readiness without a
+later explicit mutation-capable request and a new classification.
 
 ## Authorization
 
@@ -54,7 +261,12 @@ Reserve `blocked-authorization` for a different condition: the intended review i
    - Base-only local recovery: keep `requested: triple`, `effective: triple-inconclusive`, run only the recovered local lanes and required admission/readiness checks, and skip step 8. This is neither an eligible candidate nor effective-double unavailability.
 8. For an eligible candidate, first revalidate exact lifecycle `state == "open"`, `merged == false`, and `merged_at == null`, then establish request isolation for the unchanged current `pr_head_oid`. Require a parent-owned control-order record proving that both required local lanes had terminal artifacts before the GitHub request write. If an exact request exists before that point, or the ordering cannot be proved, report `requested: triple`, `effective: triple-inconclusive`, with reason `github-request-before-local-terminal`. Later local-lane completion does not cure that same-head request, its terminal payload cannot count, and no second request may be posted while `headRefOid` is unchanged. Eligibility returns only after a separately authorized ordinary change produces a new head; never manufacture an empty or anchor commit. At most one exact `@codex review` request may be accepted for one unchanged head. Never post a second exact request while `headRefOid` is unchanged: if the one recorded current-head request already exists and its order proof is valid, continue waiting for or validating it; if multiple current-head requests exist, or authenticated history plus the audit record cannot exclude an older request whose run/result could overlap, report `effective: triple-inconclusive`. Otherwise post the one exact `@codex review` comment only after both local lanes are terminal and the intended range is exactly the selected PR's current `pr_merge_base..pr_head_oid`, then re-read it and record its API ID, URL, server `created_at`, and the surrounding lifecycle/base/head observations. Re-read complete authenticated request history immediately before accepting a result; a second request that appeared after preflight is a race, not a new candidate, and makes the lane triple-inconclusive. Also revalidate the exact open lifecycle, re-read `baseRefName`, `baseRefOid`, and `headRefOid`, recompute the unique local `pr_merge_base`, and require the frozen range still to equal `pr_merge_base..pr_head_oid` immediately before accepting the terminal artifact. An observed non-open lifecycle at a mandated snapshot, a changed head, or a changed merge base invalidates the local whole-PR lanes and GitHub evidence. If this is a base-only retarget, stop through the already-prioritized `base-changed-same-head` branch; do not rewrite a caller-supplied range, demand an immediate local rerun from it, fall through to generic `scope-mismatch`, or post a second request. Server timestamps prove ordering, not request/run lineage. A review or issue comment exposes no request/run identifier, so do not attribute it to the current request when any possibly overlapping older request remains; it is triple-inconclusive even when its timestamp is later. Subject to those isolation rules, an authenticated provider rejection may prove no-start integration/service unavailability and reduce the shape to effective double only when it comes from the exact accepted provider identity below; acknowledgement or run/review activity proves start only when it comes from that provider or its exact accepted app/check identity; missing response, timeout, comment-write/generic HTTP failure, unknown author/app identity, or evidence proving neither state is `effective: triple-inconclusive`. The comment write alone is neither completion nor proof of service start. An exact-App check/run proves service start only when its `head_sha` equals the unchanged current `headRefOid` and its non-null `started_at` is strictly later than this request's `created_at`; its status, conclusion, and `completed_at` never make it completion or clean/no-findings evidence. A same-App check can be unrelated to the requested review, and a successful check can coexist with provider review findings. Accept triple only from a complete terminal provider-authored findings payload from the exact bot, bound to the same head, whole-PR range, and isolated request. For a review, fetch its body plus every fully paginated associated inline review comment and require exact case-sensitive state `COMMENTED`, `APPROVED`, or `CHANGES_REQUESTED`; `PENDING` continues bounded waiting, while `DISMISSED`, missing, or unknown state is `triple-inconclusive`. Alternatively, consume a terminal issue-comment body that unambiguously reports the completed findings/no-findings outcome rather than acknowledgement or progress. Missing or ambiguous payload, terminal nature, pagination completeness, or association is `triple-inconclusive`.
 For issue-comment-only terminal or no-start evidence, apply the request-ledger and correlation rule in [github-pr-probes.md](github-pr-probes.md#issue-comment-only-correlation); do not pair a response to a request by nearest timestamp, and never let correlation cure `github-request-before-local-terminal`. Missing or ambiguous correlation is `triple-inconclusive`.
-9. Read required CI/check state and unresolved PR conversations. Distinguish required checks from informational jobs and stale runs from current-head runs.
+9. Read required CI/check state and unresolved PR conversations. Distinguish
+   required checks from informational jobs and stale runs from current-head
+   runs. Exhaust every paginated CI connection and bind it to the selected
+   repository, PR, and current head before treating any aggregate as complete;
+   a first-page green result, over-cap connection, count mismatch, cursor drift,
+   or final `hasNextPage=true` is unavailable/blocked evidence, not readiness.
 10. Apply actionable findings in the implementation workspace, rerun affected tests, publish the new head, and invalidate every earlier named-lane artifact, optional low-level helper result, and direct admission result whose range/head changed.
 11. Repeat the affected local lanes, direct current-head admission, the supported GitHub Codex request, CI checks, and conversation scan until the effective shape and all delivery gates are clean or a crisp blocker remains. The `base-changed-same-head` and `github-request-before-local-terminal` branches are exceptions: never repeat their GitHub request while the head is unchanged. For a base-only retarget, rerun local lanes only in a later pass whose current range was explicitly supplied or validly rederived as described above. For an early request, finishing local lanes later does not restore same-head eligibility.
 12. Re-read the selected PR's base ref/SHA and head SHA, recompute the unique merge base, revalidate exact range equality, then recheck mergeability, direct current-head admission exit `0`, approval/ruleset requirements, and the repository's merge model immediately before reporting merge-ready or merging.

@@ -1,6 +1,16 @@
 # Placeholder-Only Fixture Templates
 
-Resolve every placeholder through `isolated_review synthetic-tokens get <id> --json`, then replace the complete placeholder with the returned value. Do not concatenate, transform, encode, or partially substitute a value.
+First capture the parent skill's skill-relative active-release binding. Require
+the same `binding_sha256` in each resolver transaction envelope and require the
+CLI result's `pool_version` to equal the binding. Use resolver actions
+`validate`, `list`, and single-ID `get <id>`; those actions execute the bound
+`synthetic-tokens validate`, metadata-only `synthetic-tokens list --json`, and
+single-ID `synthetic-tokens get <id> --json` surfaces from validated snapshots.
+Pass `--expect-binding-sha256` with the captured digest to every one of those
+three actions; the option may be omitted only for the initial `bind`.
+Never execute the returned interpreter or CLI pathname. Replace the complete
+placeholder with the returned value. Do not concatenate, transform, encode, or
+partially substitute a value.
 
 ## Single OAuth Session
 

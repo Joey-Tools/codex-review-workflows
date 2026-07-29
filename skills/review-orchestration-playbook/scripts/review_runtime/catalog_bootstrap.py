@@ -1,0 +1,1493 @@
+"""Execute the co-release synthetic catalog resolver from trusted bound bytes."""
+
+from __future__ import annotations
+
+import contextlib
+import errno
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+from typing import Any
+
+
+MAX_SOURCE_BYTES = 16 * 1024 * 1024
+MAX_SKILL_BYTES = 1024 * 1024
+MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+MAX_OUTPUT_BYTES = 2 * 1024 * 1024
+RELEASE_ID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+RESOLVER_LEAF = "active_catalog_binding.py"
+SYNTHETIC_SKILL_NAME = "synthetic-token-fixtures"
+REVIEW_SKILL_NAME = "review-orchestration-playbook"
+RUNTIME_MANIFEST_LEAF = "synthetic-catalog-runtime-manifest.json"
+RUNTIME_PROFILE = "synthetic-catalog-authoring-v1"
+RUNTIME_INIT_RELATIVE_PATH = "scripts/review_runtime/__init__.py"
+BOOTSTRAP_RELATIVE_PATH = "scripts/review_runtime/catalog_bootstrap.py"
+RESOLVER_RELATIVE_PATH = "scripts/active_catalog_binding.py"
+# These local filesystems expose either no ACL or Linux POSIX ACL semantics,
+# where the ACL mask is the inode's group mode class. Remote, programmable,
+# and unclassified stacked filesystems are deliberately absent because
+# fstatfs alone cannot prove that richer ACLs are constrained by those bits.
+_LINUX_POSIX_ACL_FILESYSTEMS = {
+    0x0000EF53: "ext2/ext3/ext4",
+    0x01021994: "tmpfs",
+    0x58465342: "XFS",
+    0x858458F6: "ramfs",
+    0x9123683E: "Btrfs",
+    0xF2F52010: "F2FS",
+}
+_LINUX_UNVERIFIED_ACL_FILESYSTEMS = {
+    0x01021997: "9P",
+    0x2FC12FC1: "ZFS",
+    0x5346414F: "AFS",
+    0x65735546: "FUSE",
+    0x00006969: "NFS/NFSv4",
+    0x73757245: "CODA",
+    0x794C7630: "overlayfs",
+    0xFF534D42: "CIFS/SMB",
+}
+_DARWIN_ACL_TYPE_EXTENDED = 0x00000100
+_DARWIN_ACL_FIRST_ENTRY = 0
+_DARWIN_ACL_NEXT_ENTRY = -1
+_DARWIN_ACL_EXTENDED_ALLOW = 1
+_DARWIN_ACL_EXTENDED_DENY = 2
+_DARWIN_MUTATING_ACL_PERMISSIONS = (
+    (1 << 2)  # WRITE_DATA / ADD_FILE
+    | (1 << 4)  # DELETE
+    | (1 << 5)  # APPEND_DATA / ADD_SUBDIRECTORY
+    | (1 << 6)  # DELETE_CHILD
+    | (1 << 8)  # WRITE_ATTRIBUTES
+    | (1 << 10)  # WRITE_EXTATTRIBUTES
+    | (1 << 12)  # WRITE_SECURITY
+    | (1 << 13)  # CHANGE_OWNER
+)
+# Bind only flags that change write, unlink, namespace, or protected-data
+# semantics. NODUMP, COMPRESSED, TRACKED, HIDDEN, and ARCHIVED are deliberately
+# excluded because their churn does not change the protected access property.
+_DARWIN_ACCESS_POLICY_FLAGS = (
+    0x00000002  # UF_IMMUTABLE
+    | 0x00000004  # UF_APPEND
+    | 0x00000008  # UF_OPAQUE
+    | 0x00000010  # UF_NOUNLINK
+    | 0x00000080  # UF_DATAVAULT
+    | 0x00020000  # SF_IMMUTABLE
+    | 0x00040000  # SF_APPEND
+    | 0x00080000  # SF_RESTRICTED
+    | 0x00100000  # SF_NOUNLINK
+    | 0x00200000  # SF_SNAPSHOT
+    | 0x00800000  # SF_FIRMLINK
+    | 0xC0000000  # SF_SYNTHETIC, including SF_DATALESS
+)
+_DARWIN_BENIGN_METADATA_FLAGS = (
+    0x00000001  # UF_NODUMP
+    | 0x00000020  # UF_COMPRESSED
+    | 0x00000040  # UF_TRACKED
+    | 0x00008000  # UF_HIDDEN
+    | 0x00010000  # SF_ARCHIVED
+)
+_DARWIN_KNOWN_STAT_FLAGS = _DARWIN_ACCESS_POLICY_FLAGS | _DARWIN_BENIGN_METADATA_FLAGS
+_LINUX_STATFS_API: tuple[Any, Any] | None = None
+_DARWIN_ACL_API: tuple[Any, Any] | None = None
+
+
+class CatalogBootstrapError(RuntimeError):
+    """Reject an unsafe or inconsistent catalog resolver launch."""
+
+
+def _linux_statfs_api() -> tuple[Any, Any]:
+    global _LINUX_STATFS_API
+    if not sys.platform.startswith("linux"):
+        raise CatalogBootstrapError(
+            "Linux filesystem inspection was requested on another platform"
+        )
+    if _LINUX_STATFS_API is not None:
+        return _LINUX_STATFS_API
+    try:
+        import ctypes
+
+        library = ctypes.CDLL(None, use_errno=True)
+        library.fstatfs.argtypes = (ctypes.c_int, ctypes.c_void_p)
+        library.fstatfs.restype = ctypes.c_int
+    except (AttributeError, ImportError, OSError) as error:
+        raise CatalogBootstrapError(
+            f"Linux filesystem inspection primitives are unavailable: {error}"
+        ) from error
+    _LINUX_STATFS_API = ctypes, library
+    return _LINUX_STATFS_API
+
+
+def _linux_filesystem_type(descriptor: int, *, label: str) -> int:
+    ctypes, library = _linux_statfs_api()
+    # Linux struct statfs is smaller than this aligned buffer on every
+    # supported libc ABI. Its first __fsword_t is the filesystem magic.
+    storage = (ctypes.c_long * 128)()
+    ctypes.set_errno(0)
+    if library.fstatfs(descriptor, ctypes.byref(storage)) != 0:
+        error_number = ctypes.get_errno()
+        detail = os.strerror(error_number) if error_number else "unknown error"
+        raise CatalogBootstrapError(
+            f"{label} filesystem ACL semantics cannot be inspected: "
+            f"fstatfs failed: {detail}"
+        )
+    return int(storage[0]) & 0xFFFFFFFF
+
+
+def _require_linux_posix_acl_filesystem(
+    filesystem_type: int,
+    *,
+    label: str,
+) -> None:
+    normalized = filesystem_type & 0xFFFFFFFF
+    if normalized in _LINUX_POSIX_ACL_FILESYSTEMS:
+        return
+    filesystem_name = _LINUX_UNVERIFIED_ACL_FILESYSTEMS.get(
+        normalized,
+        "unknown",
+    )
+    raise CatalogBootstrapError(
+        f"{label} filesystem {filesystem_name} (0x{normalized:08x}) "
+        "has unverified ACL semantics"
+    )
+
+
+def _darwin_acl_api() -> tuple[Any, Any]:
+    global _DARWIN_ACL_API
+    if sys.platform != "darwin":
+        raise CatalogBootstrapError(
+            "Darwin ACL inspection was requested on another platform"
+        )
+    if _DARWIN_ACL_API is not None:
+        return _DARWIN_ACL_API
+    try:
+        import ctypes
+
+        library = ctypes.CDLL(None, use_errno=True)
+        library.acl_get_fd_np.argtypes = (ctypes.c_int, ctypes.c_int)
+        library.acl_get_fd_np.restype = ctypes.c_void_p
+        library.acl_valid.argtypes = (ctypes.c_void_p,)
+        library.acl_valid.restype = ctypes.c_int
+        library.acl_get_entry.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_void_p),
+        )
+        library.acl_get_entry.restype = ctypes.c_int
+        library.acl_get_tag_type.argtypes = (
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int),
+        )
+        library.acl_get_tag_type.restype = ctypes.c_int
+        library.acl_get_permset_mask_np.argtypes = (
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint64),
+        )
+        library.acl_get_permset_mask_np.restype = ctypes.c_int
+        library.acl_get_qualifier.argtypes = (ctypes.c_void_p,)
+        library.acl_get_qualifier.restype = ctypes.c_void_p
+        library.acl_free.argtypes = (ctypes.c_void_p,)
+        library.acl_free.restype = ctypes.c_int
+        library.mbr_uid_to_uuid.argtypes = (
+            ctypes.c_uint,
+            ctypes.POINTER(ctypes.c_ubyte),
+        )
+        library.mbr_uid_to_uuid.restype = ctypes.c_int
+    except (AttributeError, ImportError, OSError) as error:
+        raise CatalogBootstrapError(
+            f"Darwin ACL inspection primitives are unavailable: {error}"
+        ) from error
+    _DARWIN_ACL_API = ctypes, library
+    return _DARWIN_ACL_API
+
+
+def _darwin_acl_error(operation: str) -> str:
+    ctypes, _library = _darwin_acl_api()
+    error_number = ctypes.get_errno()
+    detail = os.strerror(error_number) if error_number else "unknown error"
+    return f"{operation} failed: {detail}"
+
+
+def _darwin_owner_uuid(uid: int, *, label: str) -> bytes:
+    ctypes, library = _darwin_acl_api()
+    owner_uuid = (ctypes.c_ubyte * 16)()
+    result = library.mbr_uid_to_uuid(uid, owner_uuid)
+    if result != 0:
+        detail = os.strerror(result) if result > 0 else f"status {result}"
+        raise CatalogBootstrapError(f"{label} owner UUID cannot be resolved: {detail}")
+    return bytes(owner_uuid)
+
+
+def _validate_darwin_acl(
+    descriptor: int,
+    *,
+    owner_uid: int,
+    label: str,
+) -> None:
+    ctypes, library = _darwin_acl_api()
+    ctypes.set_errno(0)
+    acl = library.acl_get_fd_np(descriptor, _DARWIN_ACL_TYPE_EXTENDED)
+    if not acl:
+        if ctypes.get_errno() == errno.ENOENT:
+            return
+        raise CatalogBootstrapError(
+            f"{label} access policy cannot be inspected: "
+            f"{_darwin_acl_error('acl_get_fd_np')}"
+        )
+    try:
+        if library.acl_valid(acl) != 0:
+            raise CatalogBootstrapError(
+                f"{label} access policy is invalid: {_darwin_acl_error('acl_valid')}"
+            )
+        entry = ctypes.c_void_p()
+        entry_id = _DARWIN_ACL_FIRST_ENTRY
+        while True:
+            ctypes.set_errno(0)
+            result = library.acl_get_entry(acl, entry_id, ctypes.byref(entry))
+            if result == -1 and ctypes.get_errno() == errno.EINVAL:
+                break
+            if result != 0:
+                raise CatalogBootstrapError(
+                    f"{label} access policy cannot be enumerated: "
+                    f"{_darwin_acl_error('acl_get_entry')}"
+                )
+            tag = ctypes.c_int()
+            if library.acl_get_tag_type(entry, ctypes.byref(tag)) != 0:
+                raise CatalogBootstrapError(
+                    f"{label} access policy tag cannot be inspected: "
+                    f"{_darwin_acl_error('acl_get_tag_type')}"
+                )
+            if tag.value not in {
+                _DARWIN_ACL_EXTENDED_ALLOW,
+                _DARWIN_ACL_EXTENDED_DENY,
+            }:
+                raise CatalogBootstrapError(
+                    f"{label} access policy has an unknown ACL tag"
+                )
+            permissions = ctypes.c_uint64()
+            if (
+                library.acl_get_permset_mask_np(
+                    entry,
+                    ctypes.byref(permissions),
+                )
+                != 0
+            ):
+                raise CatalogBootstrapError(
+                    f"{label} access policy permissions cannot be inspected: "
+                    f"{_darwin_acl_error('acl_get_permset_mask_np')}"
+                )
+            if (
+                tag.value == _DARWIN_ACL_EXTENDED_ALLOW
+                and permissions.value & _DARWIN_MUTATING_ACL_PERMISSIONS
+            ):
+                ctypes.set_errno(0)
+                qualifier = library.acl_get_qualifier(entry)
+                if not qualifier:
+                    raise CatalogBootstrapError(
+                        f"{label} access policy qualifier cannot be inspected: "
+                        f"{_darwin_acl_error('acl_get_qualifier')}"
+                    )
+                try:
+                    subject_uuid = ctypes.string_at(qualifier, 16)
+                finally:
+                    library.acl_free(qualifier)
+                if subject_uuid != _darwin_owner_uuid(owner_uid, label=label):
+                    raise CatalogBootstrapError(
+                        f"{label} grants non-owner mutation through an extended ACL"
+                    )
+            entry_id = _DARWIN_ACL_NEXT_ENTRY
+    finally:
+        library.acl_free(acl)
+
+
+def _validate_access_policy(
+    metadata: os.stat_result,
+    descriptor: int,
+    *,
+    label: str,
+) -> int:
+    """Validate the non-owner mutation property and bind security flags."""
+    if sys.platform.startswith("linux"):
+        filesystem_type = _linux_filesystem_type(descriptor, label=label)
+        _require_linux_posix_acl_filesystem(filesystem_type, label=label)
+        # On the closed filesystem set, a POSIX ACL mutation grant is bounded
+        # by the group mode class already rejected by the mode-policy check.
+        return 0
+    if sys.platform != "darwin":
+        raise CatalogBootstrapError(
+            f"{label} access policy cannot be verified on {sys.platform}"
+        )
+    raw_flags = getattr(metadata, "st_flags", None)
+    if not isinstance(raw_flags, int) or isinstance(raw_flags, bool):
+        raise CatalogBootstrapError(f"{label} security flags cannot be inspected")
+    unknown_flags = raw_flags & ~_DARWIN_KNOWN_STAT_FLAGS
+    if unknown_flags:
+        raise CatalogBootstrapError(
+            f"{label} has unknown security-relevant flags 0x{unknown_flags:x}"
+        )
+    _validate_darwin_acl(
+        descriptor,
+        owner_uid=metadata.st_uid,
+        label=label,
+    )
+    return raw_flags & _DARWIN_ACCESS_POLICY_FLAGS
+
+
+def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_size,
+    )
+
+
+def _directory_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+    )
+
+
+def _require_safe_primitives() -> None:
+    if os.name != "posix" or not hasattr(os, "geteuid"):
+        raise CatalogBootstrapError("catalog bootstrap requires a POSIX runtime")
+    for name in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK"):
+        if not hasattr(os, name):
+            raise CatalogBootstrapError(f"catalog bootstrap requires {name}")
+
+
+def _validate_directory_policy(
+    metadata: os.stat_result,
+    *,
+    label: str,
+    require_current_user: bool = False,
+) -> None:
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise CatalogBootstrapError(f"{label} is not an ordinary non-symlink directory")
+    accepted_owners = {0, os.geteuid()}
+    if metadata.st_uid not in accepted_owners:
+        raise CatalogBootstrapError(f"{label} has an untrusted owner")
+    if require_current_user and metadata.st_uid != os.geteuid():
+        raise CatalogBootstrapError(f"{label} is not owned by the current user")
+    if metadata.st_mode & 0o022:
+        shared_sticky_root = (
+            metadata.st_uid == 0
+            and bool(metadata.st_mode & stat.S_ISVTX)
+            and bool(metadata.st_mode & 0o002)
+        )
+        if not shared_sticky_root:
+            raise CatalogBootstrapError(f"{label} is group/world writable")
+
+
+def _require_canonical_absolute(path: Path, *, label: str) -> None:
+    raw = str(path)
+    if not path.is_absolute():
+        raise CatalogBootstrapError(f"{label} must be absolute")
+    if raw != os.path.normpath(raw):
+        raise CatalogBootstrapError(f"{label} must be lexically canonical")
+
+
+def _read_descriptor(
+    descriptor: int,
+    *,
+    label: str,
+    limit: int,
+) -> bytes:
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+    except OSError as error:
+        raise CatalogBootstrapError(
+            f"{label} cannot be rewound safely: {error}"
+        ) from error
+    payload = bytearray()
+    while len(payload) <= limit:
+        try:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, limit + 1 - len(payload)),
+            )
+        except OSError as error:
+            raise CatalogBootstrapError(
+                f"{label} cannot be read safely: {error}"
+            ) from error
+        if not chunk:
+            break
+        payload.extend(chunk)
+    if len(payload) > limit:
+        raise CatalogBootstrapError(f"{label} exceeds its byte limit")
+    return bytes(payload)
+
+
+class _BoundDirectory:
+    def __init__(
+        self,
+        *,
+        path: Path,
+        descriptor: int,
+        identity: tuple[int, int, int, int],
+        access_policy_flags: int,
+        parent: _BoundDirectory | None,
+    ) -> None:
+        self.path = path
+        self.descriptor = descriptor
+        self.identity = identity
+        self.access_policy_flags = access_policy_flags
+        self.parent = parent
+
+    def close(self, *, revalidate: bool) -> None:
+        if self.descriptor < 0:
+            return
+        descriptor = self.descriptor
+        self.descriptor = -1
+        validation_error: CatalogBootstrapError | None = None
+        try:
+            if revalidate:
+                current = os.fstat(descriptor)
+                _validate_directory_policy(
+                    current,
+                    label=f"bound directory {self.path}",
+                )
+                if _directory_identity(current) != self.identity:
+                    raise CatalogBootstrapError(
+                        f"bound directory identity changed for {self.path}"
+                    )
+                if (
+                    _validate_access_policy(
+                        current,
+                        descriptor,
+                        label=f"bound directory {self.path}",
+                    )
+                    != self.access_policy_flags
+                ):
+                    raise CatalogBootstrapError(
+                        f"bound directory security flags changed for {self.path}"
+                    )
+                if self.parent is not None:
+                    lexical = os.stat(
+                        self.path.name,
+                        dir_fd=self.parent.descriptor,
+                        follow_symlinks=False,
+                    )
+                    _validate_directory_policy(
+                        lexical,
+                        label=f"bound directory entry {self.path}",
+                    )
+                    if _directory_identity(lexical) != self.identity:
+                        raise CatalogBootstrapError(
+                            f"bound directory entry changed for {self.path}"
+                        )
+                final = os.fstat(descriptor)
+                _validate_directory_policy(
+                    final,
+                    label=f"final bound directory {self.path}",
+                )
+                if _directory_identity(final) != self.identity:
+                    raise CatalogBootstrapError(
+                        f"bound directory identity changed for {self.path}"
+                    )
+                if (
+                    _validate_access_policy(
+                        final,
+                        descriptor,
+                        label=f"final bound directory {self.path}",
+                    )
+                    != self.access_policy_flags
+                ):
+                    raise CatalogBootstrapError(
+                        f"bound directory security flags changed for {self.path}"
+                    )
+        except (CatalogBootstrapError, OSError) as error:
+            validation_error = (
+                error
+                if isinstance(error, CatalogBootstrapError)
+                else CatalogBootstrapError(
+                    f"cannot revalidate bound directory {self.path}: {error}"
+                )
+            )
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise CatalogBootstrapError(
+                f"cannot close bound directory {self.path}: {error}"
+            ) from error
+        if validation_error is not None:
+            raise validation_error
+
+
+class _BoundFile:
+    def __init__(
+        self,
+        *,
+        path: Path,
+        descriptor: int,
+        identity: tuple[int, int, int, int, int],
+        access_policy_flags: int,
+        payload: bytes,
+        limit: int,
+        parent: _BoundDirectory,
+    ) -> None:
+        self.path = path
+        self.descriptor = descriptor
+        self.identity = identity
+        self.access_policy_flags = access_policy_flags
+        self.payload = payload
+        self.sha256 = hashlib.sha256(payload).hexdigest()
+        self.limit = limit
+        self.parent = parent
+
+    def close(self, *, revalidate: bool) -> None:
+        if self.descriptor < 0:
+            return
+        descriptor = self.descriptor
+        self.descriptor = -1
+        validation_error: CatalogBootstrapError | None = None
+        try:
+            if revalidate:
+                current = os.fstat(descriptor)
+                if _file_identity(current) != self.identity:
+                    raise CatalogBootstrapError(
+                        f"bound descriptor identity changed for {self.path}"
+                    )
+                if (
+                    _validate_access_policy(
+                        current,
+                        descriptor,
+                        label=f"bound descriptor {self.path}",
+                    )
+                    != self.access_policy_flags
+                ):
+                    raise CatalogBootstrapError(
+                        f"bound descriptor security flags changed for {self.path}"
+                    )
+                payload = _read_descriptor(
+                    descriptor,
+                    label=f"final bound read for {self.path}",
+                    limit=self.limit,
+                )
+                if payload != self.payload:
+                    raise CatalogBootstrapError(
+                        f"bound descriptor content changed for {self.path}"
+                    )
+                lexical = os.stat(
+                    self.path.name,
+                    dir_fd=self.parent.descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(lexical.st_mode)
+                    or stat.S_ISLNK(lexical.st_mode)
+                    or _file_identity(lexical) != self.identity
+                ):
+                    raise CatalogBootstrapError(
+                        f"bound parent entry identity changed for {self.path}"
+                    )
+                final = os.fstat(descriptor)
+                if _file_identity(final) != self.identity:
+                    raise CatalogBootstrapError(
+                        f"bound descriptor identity changed for {self.path}"
+                    )
+                if (
+                    _validate_access_policy(
+                        final,
+                        descriptor,
+                        label=f"final bound descriptor {self.path}",
+                    )
+                    != self.access_policy_flags
+                ):
+                    raise CatalogBootstrapError(
+                        f"bound descriptor security flags changed for {self.path}"
+                    )
+        except (CatalogBootstrapError, OSError) as error:
+            validation_error = (
+                error
+                if isinstance(error, CatalogBootstrapError)
+                else CatalogBootstrapError(
+                    f"cannot revalidate bound file {self.path}: {error}"
+                )
+            )
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise CatalogBootstrapError(
+                f"cannot close bound file {self.path}: {error}"
+            ) from error
+        if validation_error is not None:
+            raise validation_error
+
+
+class _BindingTransaction:
+    def __init__(self) -> None:
+        self._directories: list[_BoundDirectory] = []
+        self._directories_by_path: dict[Path, _BoundDirectory] = {}
+        self._files: list[_BoundFile] = []
+
+    def bind_parent_chain(self, path: Path, *, label: str) -> _BoundDirectory:
+        _require_canonical_absolute(path, label=label)
+        existing = self._directories_by_path.get(path)
+        if existing is not None:
+            return existing
+
+        root_path = Path("/")
+        root = self._directories_by_path.get(root_path)
+        if root is None:
+            descriptor = os.open(
+                root_path,
+                os.O_RDONLY
+                | os.O_CLOEXEC
+                | os.O_DIRECTORY
+                | os.O_NOFOLLOW
+                | os.O_NONBLOCK,
+            )
+            try:
+                metadata = os.fstat(descriptor)
+                _validate_directory_policy(metadata, label="absolute path root")
+                access_policy_flags = _validate_access_policy(
+                    metadata,
+                    descriptor,
+                    label="absolute path root",
+                )
+                root = _BoundDirectory(
+                    path=root_path,
+                    descriptor=descriptor,
+                    identity=_directory_identity(metadata),
+                    access_policy_flags=access_policy_flags,
+                    parent=None,
+                )
+            except BaseException:
+                os.close(descriptor)
+                raise
+            self._directories.append(root)
+            self._directories_by_path[root_path] = root
+
+        parent = root
+        current = root_path
+        for component in path.parts[1:]:
+            current = current / component
+            existing = self._directories_by_path.get(current)
+            if existing is not None:
+                if existing.parent is not parent:
+                    raise CatalogBootstrapError(
+                        f"{label} has an inconsistent parent chain"
+                    )
+                parent = existing
+                continue
+            try:
+                lexical = os.stat(
+                    component,
+                    dir_fd=parent.descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                raise CatalogBootstrapError(
+                    f"{label} component {current} cannot be inspected: {error}"
+                ) from error
+            _validate_directory_policy(
+                lexical,
+                label=f"{label} component {current}",
+            )
+            try:
+                descriptor = os.open(
+                    component,
+                    os.O_RDONLY
+                    | os.O_CLOEXEC
+                    | os.O_DIRECTORY
+                    | os.O_NOFOLLOW
+                    | os.O_NONBLOCK,
+                    dir_fd=parent.descriptor,
+                )
+            except OSError as error:
+                raise CatalogBootstrapError(
+                    f"{label} component {current} cannot be opened: {error}"
+                ) from error
+            try:
+                opened = os.fstat(descriptor)
+                if _directory_identity(opened) != _directory_identity(lexical):
+                    raise CatalogBootstrapError(
+                        f"{label} component {current} changed before binding"
+                    )
+                access_policy_flags = _validate_access_policy(
+                    opened,
+                    descriptor,
+                    label=f"{label} component {current}",
+                )
+                final = os.fstat(descriptor)
+                if _directory_identity(final) != _directory_identity(opened):
+                    raise CatalogBootstrapError(
+                        f"{label} component {current} changed during binding"
+                    )
+                if (
+                    _validate_access_policy(
+                        final,
+                        descriptor,
+                        label=f"final {label} component {current}",
+                    )
+                    != access_policy_flags
+                ):
+                    raise CatalogBootstrapError(
+                        f"{label} component {current} security flags changed "
+                        "during binding"
+                    )
+                bound = _BoundDirectory(
+                    path=current,
+                    descriptor=descriptor,
+                    identity=_directory_identity(opened),
+                    access_policy_flags=access_policy_flags,
+                    parent=parent,
+                )
+            except BaseException:
+                os.close(descriptor)
+                raise
+            self._directories.append(bound)
+            self._directories_by_path[current] = bound
+            parent = bound
+        return parent
+
+    def bind_child_directory(
+        self,
+        path: Path,
+        *,
+        label: str,
+        parent: _BoundDirectory,
+        require_current_user: bool = False,
+    ) -> _BoundDirectory:
+        if path.parent != parent.path:
+            raise CatalogBootstrapError(f"{label} parent binding is inconsistent")
+        existing = self._directories_by_path.get(path)
+        if existing is not None:
+            return existing
+        try:
+            lexical = os.stat(
+                path.name,
+                dir_fd=parent.descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise CatalogBootstrapError(
+                f"{label} cannot be inspected safely: {error}"
+            ) from error
+        _validate_directory_policy(
+            lexical,
+            label=label,
+            require_current_user=require_current_user,
+        )
+        try:
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY
+                | os.O_CLOEXEC
+                | os.O_DIRECTORY
+                | os.O_NOFOLLOW
+                | os.O_NONBLOCK,
+                dir_fd=parent.descriptor,
+            )
+        except OSError as error:
+            raise CatalogBootstrapError(
+                f"{label} cannot be opened safely: {error}"
+            ) from error
+        try:
+            opened = os.fstat(descriptor)
+            if _directory_identity(opened) != _directory_identity(lexical):
+                raise CatalogBootstrapError(f"{label} changed before binding")
+            access_policy_flags = _validate_access_policy(
+                opened,
+                descriptor,
+                label=label,
+            )
+            final = os.fstat(descriptor)
+            if _directory_identity(final) != _directory_identity(opened):
+                raise CatalogBootstrapError(f"{label} changed during binding")
+            if (
+                _validate_access_policy(
+                    final,
+                    descriptor,
+                    label=f"final {label}",
+                )
+                != access_policy_flags
+            ):
+                raise CatalogBootstrapError(
+                    f"{label} security flags changed during binding"
+                )
+            bound = _BoundDirectory(
+                path=path,
+                descriptor=descriptor,
+                identity=_directory_identity(opened),
+                access_policy_flags=access_policy_flags,
+                parent=parent,
+            )
+        except BaseException:
+            os.close(descriptor)
+            raise
+        self._directories.append(bound)
+        self._directories_by_path[path] = bound
+        return bound
+
+    def directory(self, path: Path) -> _BoundDirectory:
+        try:
+            return self._directories_by_path[path]
+        except KeyError as error:
+            raise CatalogBootstrapError(f"directory is not bound: {path}") from error
+
+    def bind_file(
+        self,
+        path: Path,
+        *,
+        label: str,
+        limit: int,
+        parent: _BoundDirectory,
+        expected_payload: bytes | None = None,
+    ) -> _BoundFile:
+        if path.parent != parent.path:
+            raise CatalogBootstrapError(f"{label} parent binding is inconsistent")
+        try:
+            lexical = os.stat(
+                path.name,
+                dir_fd=parent.descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise CatalogBootstrapError(
+                f"{label} cannot be inspected safely: {error}"
+            ) from error
+        if not stat.S_ISREG(lexical.st_mode) or stat.S_ISLNK(lexical.st_mode):
+            raise CatalogBootstrapError(
+                f"{label} is not an ordinary non-symlink regular file"
+            )
+        if lexical.st_uid != os.geteuid():
+            raise CatalogBootstrapError(f"{label} is not owned by the current user")
+        if lexical.st_mode & 0o022:
+            raise CatalogBootstrapError(f"{label} is group/world writable")
+        if lexical.st_size > limit:
+            raise CatalogBootstrapError(f"{label} exceeds its byte limit")
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+        try:
+            descriptor = os.open(path.name, flags, dir_fd=parent.descriptor)
+        except OSError as error:
+            raise CatalogBootstrapError(
+                f"{label} cannot be opened safely: {error}"
+            ) from error
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or _file_identity(
+                opened
+            ) != _file_identity(lexical):
+                raise CatalogBootstrapError(f"{label} identity changed before binding")
+            access_policy_flags = _validate_access_policy(
+                opened,
+                descriptor,
+                label=label,
+            )
+            first = _read_descriptor(descriptor, label=label, limit=limit)
+            second = _read_descriptor(descriptor, label=label, limit=limit)
+            final = os.fstat(descriptor)
+            if _file_identity(final) != _file_identity(opened):
+                raise CatalogBootstrapError(f"{label} identity changed during binding")
+            if (
+                _validate_access_policy(
+                    final,
+                    descriptor,
+                    label=f"final {label}",
+                )
+                != access_policy_flags
+            ):
+                raise CatalogBootstrapError(
+                    f"{label} security flags changed during binding"
+                )
+            if first != second or len(first) != opened.st_size:
+                raise CatalogBootstrapError(f"{label} content changed during binding")
+            if expected_payload is not None and first != expected_payload:
+                raise CatalogBootstrapError(
+                    f"{label} does not match the trusted control manifest"
+                )
+            bound = _BoundFile(
+                path=path,
+                descriptor=descriptor,
+                identity=_file_identity(opened),
+                access_policy_flags=access_policy_flags,
+                payload=first,
+                limit=limit,
+                parent=parent,
+            )
+            self._files.append(bound)
+            return bound
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def close(self, *, revalidate: bool) -> None:
+        errors: list[str] = []
+        while self._files:
+            bound = self._files.pop()
+            try:
+                bound.close(revalidate=revalidate)
+            except CatalogBootstrapError as error:
+                errors.append(str(error))
+        while self._directories:
+            bound = self._directories.pop()
+            try:
+                bound.close(revalidate=revalidate)
+            except CatalogBootstrapError as error:
+                errors.append(str(error))
+        self._directories_by_path.clear()
+        if errors:
+            raise CatalogBootstrapError("; ".join(errors))
+
+
+class _BoundTextSink:
+    encoding = "utf-8"
+
+    def __init__(self, *, label: str) -> None:
+        self._label = label
+        self._parts: list[str] = []
+        self._size = 0
+
+    def write(self, value: str) -> int:
+        if not isinstance(value, str):
+            raise TypeError("catalog bootstrap output accepts text only")
+        encoded = value.encode("utf-8")
+        self._size += len(encoded)
+        if self._size > MAX_OUTPUT_BYTES:
+            raise CatalogBootstrapError(f"{self._label} exceeds its byte limit")
+        self._parts.append(value)
+        return len(value)
+
+    def flush(self) -> None:
+        return None
+
+    def value(self) -> str:
+        return "".join(self._parts)
+
+
+def _load_json_object(content: bytes, *, label: str) -> dict[str, Any]:
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise CatalogBootstrapError(f"{label} contains duplicate key: {key}")
+            result[key] = value
+        return result
+
+    try:
+        payload = json.loads(content, object_pairs_hook=reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CatalogBootstrapError(f"{label} JSON is invalid: {error}") from error
+    if not isinstance(payload, dict):
+        raise CatalogBootstrapError(f"{label} root is not an object")
+    return payload
+
+
+def _validate_sync_manifest(content: bytes) -> None:
+    manifest = _load_json_object(content, label="release sync manifest")
+    if manifest.get("version") != 1:
+        raise CatalogBootstrapError("release sync manifest version is unsupported")
+    links = manifest.get("links")
+    if not isinstance(links, list):
+        raise CatalogBootstrapError("release sync manifest links are not a list")
+    required = {
+        (
+            "personal_codex/skills/review-orchestration-playbook",
+            "skills/review-orchestration-playbook",
+            "skill",
+        ),
+        (
+            "personal_codex/skills/synthetic-token-fixtures",
+            "skills/synthetic-token-fixtures",
+            "skill",
+        ),
+    }
+    authority_sources = {source for source, _, _ in required}
+    authority_targets = {target for _, target, _ in required}
+    observed: list[tuple[object, object, object]] = []
+    for entry in links:
+        if not isinstance(entry, dict):
+            raise CatalogBootstrapError(
+                "release sync manifest contains a non-object link"
+            )
+        candidate = (
+            entry.get("source"),
+            entry.get("target"),
+            entry.get("kind"),
+        )
+        if (
+            candidate[0] in authority_sources or candidate[1] in authority_targets
+        ) and candidate not in required:
+            raise CatalogBootstrapError(
+                "release sync manifest has an ambiguous authority link"
+            )
+        if candidate in required:
+            observed.append(candidate)
+    if len(observed) != len(set(observed)):
+        raise CatalogBootstrapError(
+            "release sync manifest duplicates an authority link"
+        )
+    if set(observed) != required:
+        raise CatalogBootstrapError(
+            "release sync manifest does not bind both co-release skill sources"
+        )
+
+
+def _manifest_control_digests(
+    manifest: dict[str, Any],
+) -> tuple[dict[str, str], str]:
+    if manifest.get("external_trust_root") != {
+        "path": "scripts/named_lane_guard",
+        "authority": "prior-trusted-canonical-bundle",
+    }:
+        raise CatalogBootstrapError("catalog runtime external trust root is invalid")
+    raw_control = manifest.get("control_sources")
+    expected_control = (
+        (RUNTIME_INIT_RELATIVE_PATH, "runtime-package"),
+        (BOOTSTRAP_RELATIVE_PATH, "binding-runtime"),
+    )
+    if not isinstance(raw_control, list) or len(raw_control) != len(expected_control):
+        raise CatalogBootstrapError(
+            "catalog runtime control source set is not the exact closure"
+        )
+    control: dict[str, str] = {}
+    for record, (expected_path, expected_role) in zip(
+        raw_control,
+        expected_control,
+        strict=True,
+    ):
+        if not isinstance(record, dict) or set(record) != {
+            "path",
+            "role",
+            "sha256",
+        }:
+            raise CatalogBootstrapError(
+                "catalog runtime control source record is invalid"
+            )
+        if record.get("path") != expected_path or record.get("role") != expected_role:
+            raise CatalogBootstrapError(
+                "catalog runtime control source ordering/role is invalid"
+            )
+        digest = record.get("sha256")
+        if not isinstance(digest, str) or SHA256.fullmatch(digest) is None:
+            raise CatalogBootstrapError(
+                "catalog runtime control source digest is invalid"
+            )
+        control[expected_path] = digest
+
+    co_release = manifest.get("co_release_sources")
+    if (
+        not isinstance(co_release, list)
+        or len(co_release) != 1
+        or not isinstance(co_release[0], dict)
+        or set(co_release[0]) != {"skill", "path", "role", "sha256"}
+        or co_release[0].get("skill") != SYNTHETIC_SKILL_NAME
+        or co_release[0].get("path") != RESOLVER_RELATIVE_PATH
+        or co_release[0].get("role") != "catalog-resolver"
+    ):
+        raise CatalogBootstrapError(
+            "catalog runtime co-release source set is not the exact closure"
+        )
+    resolver_digest = co_release[0].get("sha256")
+    if (
+        not isinstance(resolver_digest, str)
+        or SHA256.fullmatch(resolver_digest) is None
+    ):
+        raise CatalogBootstrapError("catalog runtime resolver digest is invalid")
+    return control, resolver_digest
+
+
+def _loaded_skill_root_from_argv(argv: tuple[str, ...]) -> Path:
+    values: list[str] = []
+    index = 0
+    while index < len(argv):
+        value = argv[index]
+        if value == "--loaded-skill-root":
+            if index + 1 >= len(argv):
+                raise CatalogBootstrapError("--loaded-skill-root is missing its value")
+            values.append(argv[index + 1])
+            index += 2
+            continue
+        if value.startswith("--loaded-skill-root="):
+            values.append(value.split("=", 1)[1])
+        index += 1
+    if len(values) != 1 or not values[0]:
+        raise CatalogBootstrapError(
+            "catalog bootstrap requires exactly one --loaded-skill-root"
+        )
+    path = Path(values[0])
+    _require_canonical_absolute(path, label="loaded synthetic skill root")
+    return path
+
+
+def _validate_release_layout(
+    *,
+    trusted_review_skill_root: Path,
+    trusted_synthetic_skill_root: Path,
+    resolver_path: Path,
+    loaded_skill_root: Path,
+) -> tuple[Path, Path, Path]:
+    for path, label in (
+        (trusted_review_skill_root, "trusted review skill root"),
+        (trusted_synthetic_skill_root, "trusted synthetic skill root"),
+        (resolver_path, "catalog resolver path"),
+    ):
+        _require_canonical_absolute(path, label=label)
+    if loaded_skill_root != trusted_synthetic_skill_root:
+        raise CatalogBootstrapError(
+            "loaded synthetic skill is outside the trusted catalog bundle"
+        )
+    skills_root = trusted_review_skill_root.parent
+    if (
+        trusted_review_skill_root.name != REVIEW_SKILL_NAME
+        or trusted_synthetic_skill_root.name != SYNTHETIC_SKILL_NAME
+        or trusted_synthetic_skill_root.parent != skills_root
+    ):
+        raise CatalogBootstrapError("trusted catalog skill layout is invalid")
+    expected_resolver = trusted_synthetic_skill_root / "scripts" / RESOLVER_LEAF
+    if resolver_path != expected_resolver:
+        raise CatalogBootstrapError("catalog resolver path is not the trusted leaf")
+    payload_root = skills_root.parent
+    release_root = payload_root.parent
+    if (
+        skills_root.name != "skills"
+        or payload_root.name != "personal_codex"
+        or release_root.parent.name != "releases"
+        or RELEASE_ID.fullmatch(release_root.name) is None
+    ):
+        raise CatalogBootstrapError(
+            "catalog bootstrap is not inside a versioned immutable release"
+        )
+    return release_root, payload_root, skills_root
+
+
+def _main(
+    argv: list[str] | tuple[str, ...] | None = None,
+    *,
+    trusted_review_skill_root: Path | None = None,
+    trusted_synthetic_skill_root: Path | None = None,
+    trusted_resolver_path: Path | None = None,
+    trusted_resolver_bytes: bytes | None = None,
+    trusted_skill_bytes: bytes | None = None,
+    trusted_runtime_init_path: Path | None = None,
+    trusted_runtime_init_bytes: bytes | None = None,
+    catalog_bootstrap_source_sha256: str | None = None,
+    trusted_runtime_manifest_path: Path | None = None,
+    trusted_runtime_manifest_bytes: bytes | None = None,
+    trusted_runtime_manifest_sha256: str | None = None,
+) -> int:
+    """Bind, execute, and revalidate the trusted co-release resolver."""
+    _require_safe_primitives()
+    if (
+        trusted_review_skill_root is None
+        or trusted_synthetic_skill_root is None
+        or trusted_resolver_path is None
+        or trusted_resolver_bytes is None
+        or trusted_skill_bytes is None
+        or trusted_runtime_init_path is None
+        or trusted_runtime_init_bytes is None
+        or catalog_bootstrap_source_sha256 is None
+        or trusted_runtime_manifest_path is None
+        or trusted_runtime_manifest_bytes is None
+        or trusted_runtime_manifest_sha256 is None
+    ):
+        raise CatalogBootstrapError(
+            "catalog bootstrap requires manifest-bound guard inputs"
+        )
+    arguments = tuple(sys.argv[1:] if argv is None else argv)
+    if not all(isinstance(value, str) for value in arguments):
+        raise CatalogBootstrapError("catalog bootstrap arguments must be text")
+    loaded_skill_root = _loaded_skill_root_from_argv(arguments)
+    release_root, payload_root, skills_root = _validate_release_layout(
+        trusted_review_skill_root=trusted_review_skill_root,
+        trusted_synthetic_skill_root=trusted_synthetic_skill_root,
+        resolver_path=trusted_resolver_path,
+        loaded_skill_root=loaded_skill_root,
+    )
+    expected_runtime_manifest = (
+        trusted_review_skill_root / "scripts" / "review_runtime" / RUNTIME_MANIFEST_LEAF
+    )
+    expected_runtime_init = trusted_review_skill_root / RUNTIME_INIT_RELATIVE_PATH
+    _require_canonical_absolute(
+        trusted_runtime_init_path,
+        label="trusted catalog runtime package",
+    )
+    if trusted_runtime_init_path != expected_runtime_init:
+        raise CatalogBootstrapError(
+            "trusted catalog runtime package path is not canonical"
+        )
+    if (
+        type(trusted_runtime_init_bytes) is not bytes
+        or not trusted_runtime_init_bytes
+        or len(trusted_runtime_init_bytes) > MAX_SOURCE_BYTES
+        or not isinstance(catalog_bootstrap_source_sha256, str)
+        or SHA256.fullmatch(catalog_bootstrap_source_sha256) is None
+    ):
+        raise CatalogBootstrapError(
+            "trusted catalog control source bytes are not guard-bound"
+        )
+    _require_canonical_absolute(
+        trusted_runtime_manifest_path,
+        label="trusted catalog runtime manifest",
+    )
+    if trusted_runtime_manifest_path != expected_runtime_manifest:
+        raise CatalogBootstrapError(
+            "trusted catalog runtime manifest path is not canonical"
+        )
+    if (
+        type(trusted_runtime_manifest_bytes) is not bytes
+        or len(trusted_runtime_manifest_bytes) > MAX_MANIFEST_BYTES
+        or not isinstance(trusted_runtime_manifest_sha256, str)
+        or SHA256.fullmatch(trusted_runtime_manifest_sha256) is None
+        or hashlib.sha256(trusted_runtime_manifest_bytes).hexdigest()
+        != trusted_runtime_manifest_sha256
+    ):
+        raise CatalogBootstrapError(
+            "trusted catalog runtime manifest bytes are not guard-bound"
+        )
+
+    transaction = _BindingTransaction()
+    stdout = _BoundTextSink(label="catalog resolver stdout")
+    stderr = _BoundTextSink(label="catalog resolver stderr")
+    returncode = 2
+    try:
+        resolver_parent = transaction.bind_parent_chain(
+            trusted_resolver_path.parent,
+            label="catalog resolver absolute parent chain",
+        )
+        for path, label in (
+            (release_root, "release root"),
+            (payload_root, "release payload root"),
+            (skills_root, "release skills root"),
+            (trusted_synthetic_skill_root, "loaded synthetic skill root"),
+            (trusted_resolver_path.parent, "loaded synthetic scripts root"),
+        ):
+            bound = transaction.directory(path)
+            current = os.fstat(bound.descriptor)
+            _validate_directory_policy(
+                current,
+                label=label,
+                require_current_user=True,
+            )
+        review_root = transaction.bind_child_directory(
+            trusted_review_skill_root,
+            label="trusted review skill root",
+            parent=transaction.directory(skills_root),
+            require_current_user=True,
+        )
+        if review_root.path != trusted_review_skill_root:
+            raise CatalogBootstrapError("trusted review skill binding changed")
+
+        runtime_init_parent = transaction.bind_parent_chain(
+            trusted_runtime_init_path.parent,
+            label="catalog runtime package absolute parent chain",
+        )
+        runtime_init_bound = transaction.bind_file(
+            trusted_runtime_init_path,
+            label="catalog runtime package",
+            limit=MAX_SOURCE_BYTES,
+            parent=runtime_init_parent,
+            expected_payload=trusted_runtime_init_bytes,
+        )
+        bootstrap_path = trusted_review_skill_root / BOOTSTRAP_RELATIVE_PATH
+        bootstrap_parent = transaction.bind_parent_chain(
+            bootstrap_path.parent,
+            label="catalog binding runtime absolute parent chain",
+        )
+        bootstrap_bound = transaction.bind_file(
+            bootstrap_path,
+            label="catalog binding runtime",
+            limit=MAX_SOURCE_BYTES,
+            parent=bootstrap_parent,
+        )
+        resolver_bound = transaction.bind_file(
+            trusted_resolver_path,
+            label="catalog resolver",
+            limit=MAX_SOURCE_BYTES,
+            parent=resolver_parent,
+            expected_payload=trusted_resolver_bytes,
+        )
+        skill_bound = transaction.bind_file(
+            trusted_synthetic_skill_root / "SKILL.md",
+            label="loaded synthetic skill",
+            limit=MAX_SKILL_BYTES,
+            parent=transaction.directory(trusted_synthetic_skill_root),
+            expected_payload=trusted_skill_bytes,
+        )
+        manifest_bound = transaction.bind_file(
+            payload_root / "sync-manifest.json",
+            label="release sync manifest",
+            limit=MAX_MANIFEST_BYTES,
+            parent=transaction.directory(payload_root),
+        )
+        _validate_sync_manifest(manifest_bound.payload)
+        runtime_manifest_parent = transaction.bind_parent_chain(
+            trusted_runtime_manifest_path.parent,
+            label="catalog runtime manifest absolute parent chain",
+        )
+        runtime_manifest_bound = transaction.bind_file(
+            trusted_runtime_manifest_path,
+            label="catalog runtime manifest",
+            limit=MAX_MANIFEST_BYTES,
+            parent=runtime_manifest_parent,
+            expected_payload=trusted_runtime_manifest_bytes,
+        )
+        if runtime_manifest_bound.sha256 != trusted_runtime_manifest_sha256:
+            raise CatalogBootstrapError(
+                "catalog runtime manifest digest changed after guard binding"
+            )
+        runtime_manifest = _load_json_object(
+            runtime_manifest_bound.payload,
+            label="catalog runtime manifest",
+        )
+        if (
+            type(runtime_manifest.get("schema_version")) is not int
+            or runtime_manifest.get("schema_version") != 1
+            or runtime_manifest.get("profile") != RUNTIME_PROFILE
+            or type(runtime_manifest.get("runtime_version")) is not int
+            or runtime_manifest.get("runtime_version") != 1
+        ):
+            raise CatalogBootstrapError(
+                "catalog runtime manifest profile or version is unsupported"
+            )
+        control_digests, resolver_digest = _manifest_control_digests(runtime_manifest)
+        if runtime_init_bound.sha256 != control_digests[RUNTIME_INIT_RELATIVE_PATH]:
+            raise CatalogBootstrapError(
+                "catalog runtime package digest does not match the runtime manifest"
+            )
+        if (
+            bootstrap_bound.sha256 != control_digests[BOOTSTRAP_RELATIVE_PATH]
+            or bootstrap_bound.sha256 != catalog_bootstrap_source_sha256
+        ):
+            raise CatalogBootstrapError(
+                "catalog binding runtime digest does not match the runtime manifest"
+            )
+        if resolver_bound.sha256 != resolver_digest:
+            raise CatalogBootstrapError(
+                "catalog resolver digest does not match the runtime manifest"
+            )
+
+        bootstrap_binding: dict[str, object] = {
+            "schema_version": 1,
+            "mode": "trusted-guard-manifest-bound-source",
+            "release_id": release_root.name,
+            "trusted_review_skill_root": str(trusted_review_skill_root),
+            "synthetic_skill_root": str(trusted_synthetic_skill_root),
+            "synthetic_skill_sha256": skill_bound.sha256,
+            "resolver_path": str(trusted_resolver_path),
+            "resolver_sha256": resolver_bound.sha256,
+            "resolver_identity": list(resolver_bound.identity),
+            "sync_manifest_path": str(manifest_bound.path),
+            "sync_manifest_sha256": manifest_bound.sha256,
+            "catalog_bootstrap_source_sha256": catalog_bootstrap_source_sha256,
+            "catalog_runtime_package_sha256": runtime_init_bound.sha256,
+            "runtime_manifest_path": str(runtime_manifest_bound.path),
+            "runtime_manifest_sha256": runtime_manifest_bound.sha256,
+            "runtime_manifest_identity": list(runtime_manifest_bound.identity),
+            "runtime_profile": RUNTIME_PROFILE,
+        }
+
+        try:
+            code = compile(
+                resolver_bound.payload,
+                str(trusted_resolver_path),
+                "exec",
+                dont_inherit=True,
+            )
+        except Exception as error:
+            raise CatalogBootstrapError(
+                f"catalog resolver source cannot compile: {error}"
+            ) from error
+        namespace = {
+            "__builtins__": __builtins__,
+            "__file__": str(trusted_resolver_path),
+            "__name__": "_trusted_catalog_bound_resolver",
+            "__package__": None,
+        }
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            exec(code, namespace)
+            if namespace.get("BOOTSTRAP_CONTRACT_VERSION") != 1:
+                raise CatalogBootstrapError(
+                    "catalog resolver bootstrap contract is unsupported"
+                )
+            entrypoint = namespace.get("main")
+            if not callable(entrypoint):
+                raise CatalogBootstrapError("catalog resolver entrypoint is missing")
+            result = entrypoint(
+                list(arguments),
+                bootstrap_binding=bootstrap_binding,
+                runtime_manifest_bytes=runtime_manifest_bound.payload,
+            )
+        if not isinstance(result, int) or isinstance(result, bool):
+            raise CatalogBootstrapError(
+                "catalog resolver returned a non-integer status"
+            )
+        returncode = result
+        transaction.close(revalidate=True)
+    except (CatalogBootstrapError, OSError) as error:
+        try:
+            transaction.close(revalidate=True)
+        except CatalogBootstrapError as cleanup_error:
+            print(
+                f"trusted catalog bootstrap cleanup failed: {cleanup_error}",
+                file=sys.stderr,
+            )
+        print(f"trusted catalog bootstrap failed: {error}", file=sys.stderr)
+        return 2
+    except BaseException as error:
+        try:
+            transaction.close(revalidate=True)
+        except CatalogBootstrapError as cleanup_error:
+            print(
+                f"trusted catalog bootstrap cleanup failed: {cleanup_error}",
+                file=sys.stderr,
+            )
+        print(
+            "trusted catalog bootstrap failed: resolver execution failed: "
+            f"{type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+        return 2
+
+    sys.stdout.write(stdout.value())
+    sys.stdout.flush()
+    sys.stderr.write(stderr.value())
+    sys.stderr.flush()
+    return returncode
+
+
+def main(
+    argv: list[str] | tuple[str, ...] | None = None,
+    *,
+    trusted_review_skill_root: Path | None = None,
+    trusted_synthetic_skill_root: Path | None = None,
+    trusted_resolver_path: Path | None = None,
+    trusted_resolver_bytes: bytes | None = None,
+    trusted_skill_bytes: bytes | None = None,
+    trusted_runtime_init_path: Path | None = None,
+    trusted_runtime_init_bytes: bytes | None = None,
+    catalog_bootstrap_source_sha256: str | None = None,
+    trusted_runtime_manifest_path: Path | None = None,
+    trusted_runtime_manifest_bytes: bytes | None = None,
+    trusted_runtime_manifest_sha256: str | None = None,
+) -> int:
+    """Return a closed CLI failure for pre-transaction binding errors."""
+    try:
+        return _main(
+            argv,
+            trusted_review_skill_root=trusted_review_skill_root,
+            trusted_synthetic_skill_root=trusted_synthetic_skill_root,
+            trusted_resolver_path=trusted_resolver_path,
+            trusted_resolver_bytes=trusted_resolver_bytes,
+            trusted_skill_bytes=trusted_skill_bytes,
+            trusted_runtime_init_path=trusted_runtime_init_path,
+            trusted_runtime_init_bytes=trusted_runtime_init_bytes,
+            catalog_bootstrap_source_sha256=catalog_bootstrap_source_sha256,
+            trusted_runtime_manifest_path=trusted_runtime_manifest_path,
+            trusted_runtime_manifest_bytes=trusted_runtime_manifest_bytes,
+            trusted_runtime_manifest_sha256=trusted_runtime_manifest_sha256,
+        )
+    except (CatalogBootstrapError, OSError) as error:
+        print(f"trusted catalog bootstrap failed: {error}", file=sys.stderr)
+        return 2
+
+
+__all__ = ["CatalogBootstrapError", "main"]

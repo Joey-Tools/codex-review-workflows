@@ -1,4 +1,4 @@
 interface:
   display_name: "Synthetic Token Fixtures"
-  short_description: "Choose exact review-safe synthetic credential fixtures"
-  default_prompt: "Use $synthetic-token-fixtures to choose exact helper-approved values for credential-like test fixtures."
+  short_description: "Choose fixtures from the bound active review release"
+  default_prompt: "Use $synthetic-token-fixtures to bind the active immutable review-skill release and select exact values through its authoritative synthetic-token catalog CLI."

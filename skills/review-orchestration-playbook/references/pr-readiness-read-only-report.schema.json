@@ -1,0 +1,3225 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://joey-tools.invalid/review-orchestration-playbook/pr-readiness-read-only-report.schema.json",
+  "title": "PR Readiness Read-Only Probe Terminal Report",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "terminal",
+    "terminal_state",
+    "report_id",
+    "handoff_profile",
+    "delivery_record",
+    "target",
+    "snapshot",
+    "evidence",
+    "unavailable_evidence",
+    "blockers",
+    "actions",
+    "merge_ready",
+    "next_handoff"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 8
+    },
+    "terminal": {
+      "const": "pr-readiness-read-only-report"
+    },
+    "terminal_state": {
+      "enum": [
+        "pre-target",
+        "pre-target-blocked",
+        "target-resolution-blocked",
+        "target-snapshot"
+      ]
+    },
+    "report_id": {
+      "$ref": "#/$defs/reportId"
+    },
+    "handoff_profile": {
+      "const": "pr-readiness-read-only-probe"
+    },
+    "delivery_record": {
+      "$ref": "#/$defs/readOnlyProbeDeliveryRecord"
+    },
+    "target": {
+      "$ref": "#/$defs/target"
+    },
+    "snapshot": {
+      "$ref": "#/$defs/snapshot"
+    },
+    "evidence": {
+      "type": "object",
+      "required": [
+        "pr_selection",
+        "pr_lifecycle",
+        "ci_status",
+        "conversation_state",
+        "base_and_head"
+      ],
+      "properties": {
+        "pr_selection": {
+          "$ref": "#/$defs/prSelectionEvidence"
+        },
+        "pr_lifecycle": {
+          "$ref": "#/$defs/prLifecycleEvidence"
+        },
+        "ci_status": {
+          "$ref": "#/$defs/ciStatusEvidence"
+        },
+        "conversation_state": {
+          "$ref": "#/$defs/conversationStateEvidence"
+        },
+        "base_and_head": {
+          "$ref": "#/$defs/baseAndHeadEvidence"
+        }
+      },
+      "additionalProperties": false
+    },
+    "unavailable_evidence": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/evidenceName"
+      },
+      "uniqueItems": true,
+      "maxItems": 5
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "evidence",
+          "code",
+          "detail"
+        ],
+        "properties": {
+          "evidence": {
+            "$ref": "#/$defs/evidenceName"
+          },
+          "code": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[a-z0-9]+(?:[a-z0-9-]*[a-z0-9])?$"
+          },
+          "detail": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          }
+        },
+        "additionalProperties": false
+      },
+      "uniqueItems": true,
+      "maxItems": 5
+    },
+    "actions": {
+      "type": "object",
+      "required": [
+        "local_lanes_started",
+        "secret_admission_started",
+        "comments_posted",
+        "waits_started",
+        "cache_or_state_written",
+        "local_mutation_performed",
+        "remote_mutation_performed"
+      ],
+      "properties": {
+        "local_lanes_started": {
+          "const": false
+        },
+        "secret_admission_started": {
+          "const": false
+        },
+        "comments_posted": {
+          "const": false
+        },
+        "waits_started": {
+          "const": false
+        },
+        "cache_or_state_written": {
+          "const": false
+        },
+        "local_mutation_performed": {
+          "const": false
+        },
+        "remote_mutation_performed": {
+          "const": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "merge_ready": {
+      "const": false
+    },
+    "next_handoff": {
+      "const": "none"
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "$ref": "#/$defs/terminalStateConsistency"
+    },
+    {
+      "$ref": "#/$defs/observedSourceConsistency"
+    },
+    {
+      "$ref": "#/$defs/prSelectionConsistency"
+    },
+    {
+      "$ref": "#/$defs/prLifecycleConsistency"
+    },
+    {
+      "$ref": "#/$defs/ciStatusConsistency"
+    },
+    {
+      "$ref": "#/$defs/conversationStateConsistency"
+    },
+    {
+      "$ref": "#/$defs/baseAndHeadConsistency"
+    }
+  ],
+  "$defs": {
+    "readOnlyProbeDeliveryRecord": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "profile",
+        "constraints",
+        "head_sha",
+        "local_mutation",
+        "commit_mode",
+        "formal_review_required",
+        "remote_mutation",
+        "terminal_outcome",
+        "terminal_reason",
+        "terminal_evidence",
+        "handoff",
+        "handoff_profile"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 3
+        },
+        "profile": {
+          "const": "local-gate"
+        },
+        "constraints": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "local-only",
+              "report-only",
+              "probe-only",
+              "read-only",
+              "no-remote",
+              "no-commit"
+            ]
+          },
+          "uniqueItems": true,
+          "contains": {
+            "enum": [
+              "report-only",
+              "probe-only",
+              "read-only",
+              "no-remote"
+            ]
+          }
+        },
+        "head_sha": {
+          "$ref": "#/$defs/oid"
+        },
+        "local_mutation": {
+          "enum": [
+            "allowed",
+            "forbidden"
+          ]
+        },
+        "commit_mode": {
+          "enum": [
+            "allowed",
+            "forbidden"
+          ]
+        },
+        "formal_review_required": {
+          "type": "boolean"
+        },
+        "remote_mutation": {
+          "const": "forbidden"
+        },
+        "terminal_outcome": {
+          "const": "succeeded"
+        },
+        "terminal_reason": {
+          "enum": [
+            "pr-readiness-read-only-probe-ready",
+            "pr-readiness-read-only-reviewed-probe-ready",
+            "pr-readiness-read-only-gate-ready",
+            "pr-readiness-read-only-uncommitted-probe-ready",
+            "pr-readiness-read-only-existing-range-probe-ready"
+          ]
+        },
+        "terminal_evidence": {
+          "type": "object",
+          "required": [
+            "local_gate",
+            "build",
+            "tests",
+            "docs",
+            "journal",
+            "committed_range",
+            "formal_review",
+            "signature",
+            "signature_verified_head_oid",
+            "authorization",
+            "input"
+          ],
+          "properties": {
+            "local_gate": {
+              "enum": [
+                "succeeded",
+                "checked"
+              ]
+            },
+            "build": {
+              "enum": [
+                "satisfied",
+                "read-only-observed"
+              ]
+            },
+            "tests": {
+              "enum": [
+                "satisfied",
+                "read-only-observed"
+              ]
+            },
+            "docs": {
+              "enum": [
+                "satisfied",
+                "read-only-observed"
+              ]
+            },
+            "journal": {
+              "enum": [
+                "satisfied",
+                "read-only-observed"
+              ]
+            },
+            "committed_range": {
+              "enum": [
+                "present",
+                "missing"
+              ]
+            },
+            "formal_review": {
+              "enum": [
+                "clean",
+                "not-required"
+              ]
+            },
+            "signature": {
+              "enum": [
+                "verified",
+                "not-required"
+              ]
+            },
+            "signature_verified_head_oid": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/oid"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "authorization": {
+              "const": "not-required"
+            },
+            "input": {
+              "const": "satisfied"
+            }
+          },
+          "additionalProperties": false
+        },
+        "handoff": {
+          "const": "review-orchestration-playbook"
+        },
+        "handoff_profile": {
+          "const": "pr-readiness-read-only-probe"
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "constraints": {
+                "contains": {
+                  "const": "local-only"
+                }
+              }
+            },
+            "required": [
+              "constraints"
+            ]
+          },
+          "then": false
+        },
+        {
+          "if": {
+            "properties": {
+              "constraints": {
+                "contains": {
+                  "enum": [
+                    "report-only",
+                    "probe-only",
+                    "read-only"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "constraints"
+            ]
+          },
+          "then": {
+            "properties": {
+              "local_mutation": {
+                "const": "forbidden"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "local_mutation": {
+                "const": "allowed"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "constraints": {
+                "contains": {
+                  "enum": [
+                    "report-only",
+                    "probe-only",
+                    "read-only",
+                    "no-commit"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "constraints"
+            ]
+          },
+          "then": {
+            "properties": {
+              "commit_mode": {
+                "const": "forbidden"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "commit_mode": {
+                "const": "allowed"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "terminal_evidence": {
+                "properties": {
+                  "signature": {
+                    "const": "verified"
+                  }
+                },
+                "required": [
+                  "signature"
+                ]
+              }
+            },
+            "required": [
+              "terminal_evidence"
+            ]
+          },
+          "then": {
+            "properties": {
+              "terminal_evidence": {
+                "properties": {
+                  "signature_verified_head_oid": {
+                    "$ref": "#/$defs/oid"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "terminal_evidence": {
+                "properties": {
+                  "signature_verified_head_oid": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "oneOf": [
+            {
+              "title": "pr-readiness-read-only-probe-ready",
+              "properties": {
+                "profile": {
+                  "const": "local-gate"
+                },
+                "local_mutation": {
+                  "const": "forbidden"
+                },
+                "commit_mode": {
+                  "const": "forbidden"
+                },
+                "formal_review_required": {
+                  "const": false
+                },
+                "remote_mutation": {
+                  "const": "forbidden"
+                },
+                "terminal_outcome": {
+                  "const": "succeeded"
+                },
+                "terminal_reason": {
+                  "const": "pr-readiness-read-only-probe-ready"
+                },
+                "terminal_evidence": {
+                  "properties": {
+                    "local_gate": {
+                      "const": "checked"
+                    },
+                    "build": {
+                      "const": "read-only-observed"
+                    },
+                    "tests": {
+                      "const": "read-only-observed"
+                    },
+                    "docs": {
+                      "const": "read-only-observed"
+                    },
+                    "journal": {
+                      "const": "read-only-observed"
+                    },
+                    "committed_range": {
+                      "const": "missing"
+                    },
+                    "formal_review": {
+                      "const": "not-required"
+                    },
+                    "signature": {
+                      "const": "not-required"
+                    },
+                    "signature_verified_head_oid": {
+                      "const": null
+                    },
+                    "authorization": {
+                      "const": "not-required"
+                    },
+                    "input": {
+                      "const": "satisfied"
+                    }
+                  }
+                },
+                "handoff": {
+                  "const": "review-orchestration-playbook"
+                },
+                "handoff_profile": {
+                  "const": "pr-readiness-read-only-probe"
+                }
+              }
+            },
+            {
+              "title": "pr-readiness-read-only-reviewed-probe-ready",
+              "properties": {
+                "profile": {
+                  "const": "local-gate"
+                },
+                "local_mutation": {
+                  "const": "forbidden"
+                },
+                "commit_mode": {
+                  "const": "forbidden"
+                },
+                "formal_review_required": {
+                  "const": true
+                },
+                "remote_mutation": {
+                  "const": "forbidden"
+                },
+                "terminal_outcome": {
+                  "const": "succeeded"
+                },
+                "terminal_reason": {
+                  "const": "pr-readiness-read-only-reviewed-probe-ready"
+                },
+                "terminal_evidence": {
+                  "properties": {
+                    "local_gate": {
+                      "const": "checked"
+                    },
+                    "build": {
+                      "const": "read-only-observed"
+                    },
+                    "tests": {
+                      "const": "read-only-observed"
+                    },
+                    "docs": {
+                      "const": "read-only-observed"
+                    },
+                    "journal": {
+                      "const": "read-only-observed"
+                    },
+                    "committed_range": {
+                      "const": "present"
+                    },
+                    "formal_review": {
+                      "const": "clean"
+                    },
+                    "signature": {
+                      "const": "verified"
+                    },
+                    "signature_verified_head_oid": {
+                      "$ref": "#/$defs/oid"
+                    },
+                    "authorization": {
+                      "const": "not-required"
+                    },
+                    "input": {
+                      "const": "satisfied"
+                    }
+                  }
+                },
+                "handoff": {
+                  "const": "review-orchestration-playbook"
+                },
+                "handoff_profile": {
+                  "const": "pr-readiness-read-only-probe"
+                }
+              }
+            },
+            {
+              "title": "pr-readiness-read-only-gate-ready",
+              "properties": {
+                "profile": {
+                  "const": "local-gate"
+                },
+                "local_mutation": {
+                  "const": "allowed"
+                },
+                "commit_mode": {
+                  "const": "allowed"
+                },
+                "formal_review_required": {
+                  "const": true
+                },
+                "remote_mutation": {
+                  "const": "forbidden"
+                },
+                "terminal_outcome": {
+                  "const": "succeeded"
+                },
+                "terminal_reason": {
+                  "const": "pr-readiness-read-only-gate-ready"
+                },
+                "terminal_evidence": {
+                  "properties": {
+                    "local_gate": {
+                      "const": "succeeded"
+                    },
+                    "build": {
+                      "const": "satisfied"
+                    },
+                    "tests": {
+                      "const": "satisfied"
+                    },
+                    "docs": {
+                      "const": "satisfied"
+                    },
+                    "journal": {
+                      "const": "satisfied"
+                    },
+                    "committed_range": {
+                      "const": "present"
+                    },
+                    "formal_review": {
+                      "const": "clean"
+                    },
+                    "signature": {
+                      "const": "verified"
+                    },
+                    "authorization": {
+                      "const": "not-required"
+                    },
+                    "input": {
+                      "const": "satisfied"
+                    },
+                    "signature_verified_head_oid": {
+                      "$ref": "#/$defs/oid"
+                    }
+                  }
+                },
+                "handoff": {
+                  "const": "review-orchestration-playbook"
+                },
+                "handoff_profile": {
+                  "const": "pr-readiness-read-only-probe"
+                }
+              }
+            },
+            {
+              "title": "pr-readiness-read-only-uncommitted-probe-ready",
+              "properties": {
+                "profile": {
+                  "const": "local-gate"
+                },
+                "local_mutation": {
+                  "const": "allowed"
+                },
+                "commit_mode": {
+                  "const": "forbidden"
+                },
+                "formal_review_required": {
+                  "const": false
+                },
+                "remote_mutation": {
+                  "const": "forbidden"
+                },
+                "terminal_outcome": {
+                  "const": "succeeded"
+                },
+                "terminal_reason": {
+                  "const": "pr-readiness-read-only-uncommitted-probe-ready"
+                },
+                "terminal_evidence": {
+                  "properties": {
+                    "local_gate": {
+                      "const": "checked"
+                    },
+                    "build": {
+                      "const": "satisfied"
+                    },
+                    "tests": {
+                      "const": "satisfied"
+                    },
+                    "docs": {
+                      "const": "satisfied"
+                    },
+                    "journal": {
+                      "const": "satisfied"
+                    },
+                    "committed_range": {
+                      "const": "missing"
+                    },
+                    "formal_review": {
+                      "const": "not-required"
+                    },
+                    "signature": {
+                      "const": "not-required"
+                    },
+                    "signature_verified_head_oid": {
+                      "const": null
+                    },
+                    "authorization": {
+                      "const": "not-required"
+                    },
+                    "input": {
+                      "const": "satisfied"
+                    }
+                  }
+                },
+                "handoff": {
+                  "const": "review-orchestration-playbook"
+                },
+                "handoff_profile": {
+                  "const": "pr-readiness-read-only-probe"
+                }
+              }
+            },
+            {
+              "title": "pr-readiness-read-only-existing-range-probe-ready",
+              "properties": {
+                "profile": {
+                  "const": "local-gate"
+                },
+                "local_mutation": {
+                  "const": "allowed"
+                },
+                "commit_mode": {
+                  "const": "forbidden"
+                },
+                "formal_review_required": {
+                  "const": true
+                },
+                "remote_mutation": {
+                  "const": "forbidden"
+                },
+                "terminal_outcome": {
+                  "const": "succeeded"
+                },
+                "terminal_reason": {
+                  "const": "pr-readiness-read-only-existing-range-probe-ready"
+                },
+                "terminal_evidence": {
+                  "properties": {
+                    "local_gate": {
+                      "const": "checked"
+                    },
+                    "build": {
+                      "const": "satisfied"
+                    },
+                    "tests": {
+                      "const": "satisfied"
+                    },
+                    "docs": {
+                      "const": "satisfied"
+                    },
+                    "journal": {
+                      "const": "satisfied"
+                    },
+                    "committed_range": {
+                      "const": "present"
+                    },
+                    "formal_review": {
+                      "const": "clean"
+                    },
+                    "signature": {
+                      "const": "verified"
+                    },
+                    "signature_verified_head_oid": {
+                      "$ref": "#/$defs/oid"
+                    },
+                    "authorization": {
+                      "const": "not-required"
+                    },
+                    "input": {
+                      "const": "satisfied"
+                    }
+                  }
+                },
+                "handoff": {
+                  "const": "review-orchestration-playbook"
+                },
+                "handoff_profile": {
+                  "const": "pr-readiness-read-only-probe"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "reportId": {
+      "type": "string",
+      "pattern": "^report:[0-9a-f]{32}$"
+    },
+    "targetId": {
+      "type": "string",
+      "pattern": "^target:[0-9a-f]{32}$"
+    },
+    "snapshotId": {
+      "type": "string",
+      "pattern": "^snapshot:[0-9a-f]{32}$"
+    },
+    "observationId": {
+      "type": "string",
+      "pattern": "^observation:[0-9a-f]{32}$"
+    },
+    "oid": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z$"
+    },
+    "evidenceName": {
+      "enum": [
+        "pr-selection",
+        "pr-lifecycle",
+        "ci-status",
+        "conversation-state",
+        "base-and-head"
+      ]
+    },
+    "evidenceStatus": {
+      "enum": [
+        "observed",
+        "unavailable",
+        "blocked"
+      ]
+    },
+    "githubAppIdentity": {
+      "type": "object",
+      "required": [
+        "__typename",
+        "node_id",
+        "database_id",
+        "slug"
+      ],
+      "properties": {
+        "__typename": {
+          "const": "App"
+        },
+        "node_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9_:+/=-]+$"
+        },
+        "database_id": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "slug": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "githubActorIdentity": {
+      "type": "object",
+      "required": [
+        "__typename",
+        "node_id",
+        "login"
+      ],
+      "properties": {
+        "__typename": {
+          "enum": [
+            "Bot",
+            "EnterpriseUserAccount",
+            "Mannequin",
+            "Organization",
+            "User"
+          ]
+        },
+        "node_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9_:+/=-]+$"
+        },
+        "login": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "checkRunRollupEntry": {
+      "type": "object",
+      "required": [
+        "__typename",
+        "node_id",
+        "database_id",
+        "name",
+        "app",
+        "status",
+        "conclusion"
+      ],
+      "properties": {
+        "__typename": {
+          "const": "CheckRun"
+        },
+        "node_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9_:+/=-]+$"
+        },
+        "database_id": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "app": {
+          "$ref": "#/$defs/githubAppIdentity"
+        },
+        "status": {
+          "enum": [
+            "COMPLETED",
+            "IN_PROGRESS",
+            "PENDING",
+            "QUEUED",
+            "REQUESTED",
+            "WAITING"
+          ]
+        },
+        "conclusion": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "status": {
+              "const": "COMPLETED"
+            },
+            "conclusion": {
+              "enum": [
+                "ACTION_REQUIRED",
+                "CANCELLED",
+                "FAILURE",
+                "NEUTRAL",
+                "SKIPPED",
+                "STALE",
+                "STARTUP_FAILURE",
+                "SUCCESS",
+                "TIMED_OUT"
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "status": {
+              "enum": [
+                "IN_PROGRESS",
+                "PENDING",
+                "QUEUED",
+                "REQUESTED",
+                "WAITING"
+              ]
+            },
+            "conclusion": {
+              "type": "null"
+            }
+          }
+        }
+      ]
+    },
+    "statusContextRollupEntry": {
+      "type": "object",
+      "required": [
+        "__typename",
+        "node_id",
+        "context",
+        "creator",
+        "state"
+      ],
+      "properties": {
+        "__typename": {
+          "const": "StatusContext"
+        },
+        "node_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9_:+/=-]+$"
+        },
+        "context": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "creator": {
+          "$ref": "#/$defs/githubActorIdentity"
+        },
+        "state": {
+          "enum": [
+            "ERROR",
+            "EXPECTED",
+            "FAILURE",
+            "PENDING",
+            "SUCCESS"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "statusCheckRollupEntry": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/checkRunRollupEntry"
+        },
+        {
+          "$ref": "#/$defs/statusContextRollupEntry"
+        }
+      ]
+    },
+    "nonObservedStatus": {
+      "enum": [
+        "unavailable",
+        "blocked"
+      ]
+    },
+    "githubProvider": {
+      "type": "object",
+      "required": [
+        "service",
+        "host"
+      ],
+      "properties": {
+        "service": {
+          "const": "github"
+        },
+        "host": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253,
+          "pattern": "^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "repository": {
+      "type": "object",
+      "required": [
+        "node_id",
+        "host",
+        "owner",
+        "name"
+      ],
+      "properties": {
+        "node_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9_:+/=-]+$"
+        },
+        "host": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253,
+          "pattern": "^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$"
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 39,
+          "pattern": "^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "pattern": "^[A-Za-z0-9._-]*[A-Za-z0-9_][A-Za-z0-9._-]*$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "pullRequest": {
+      "type": "object",
+      "required": [
+        "node_id",
+        "number",
+        "url",
+        "base_ref"
+      ],
+      "properties": {
+        "node_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9_:+/=-]+$"
+        },
+        "number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "pattern": "^https://(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*/[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*/[A-Za-z0-9._-]*[A-Za-z0-9_][A-Za-z0-9._-]*/pull/[1-9][0-9]*$"
+        },
+        "base_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        }
+      },
+      "additionalProperties": false
+    },
+    "base": {
+      "type": "object",
+      "required": [
+        "ref",
+        "oid"
+      ],
+      "properties": {
+        "ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "oid": {
+          "$ref": "#/$defs/oid"
+        }
+      },
+      "additionalProperties": false
+    },
+    "head": {
+      "type": "object",
+      "required": [
+        "repository",
+        "ref",
+        "oid"
+      ],
+      "properties": {
+        "repository": {
+          "$ref": "#/$defs/repository"
+        },
+        "ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "oid": {
+          "$ref": "#/$defs/oid"
+        }
+      },
+      "additionalProperties": false
+    },
+    "selectionTargetIdentity": {
+      "type": "object",
+      "required": [
+        "provider",
+        "repository",
+        "head"
+      ],
+      "properties": {
+        "provider": {
+          "$ref": "#/$defs/githubProvider"
+        },
+        "repository": {
+          "$ref": "#/$defs/repository"
+        },
+        "pull_request": {
+          "$ref": "#/$defs/pullRequest"
+        },
+        "head": {
+          "$ref": "#/$defs/head"
+        }
+      },
+      "additionalProperties": false
+    },
+    "selectedTargetIdentity": {
+      "type": "object",
+      "required": [
+        "provider",
+        "repository",
+        "pull_request",
+        "head"
+      ],
+      "properties": {
+        "provider": {
+          "$ref": "#/$defs/githubProvider"
+        },
+        "repository": {
+          "$ref": "#/$defs/repository"
+        },
+        "pull_request": {
+          "$ref": "#/$defs/pullRequest"
+        },
+        "head": {
+          "$ref": "#/$defs/head"
+        }
+      },
+      "additionalProperties": false
+    },
+    "target": {
+      "type": "object",
+      "required": [
+        "report_binding",
+        "binding_id",
+        "state",
+        "provider",
+        "repository",
+        "head"
+      ],
+      "properties": {
+        "report_binding": {
+          "$ref": "#/$defs/reportId"
+        },
+        "binding_id": {
+          "$ref": "#/$defs/targetId"
+        },
+        "state": {
+          "enum": [
+            "pre-target",
+            "pr-selected",
+            "range-resolved"
+          ]
+        },
+        "provider": {
+          "$ref": "#/$defs/githubProvider"
+        },
+        "repository": {
+          "$ref": "#/$defs/repository"
+        },
+        "pull_request": {
+          "$ref": "#/$defs/pullRequest"
+        },
+        "base": {
+          "$ref": "#/$defs/base"
+        },
+        "head": {
+          "$ref": "#/$defs/head"
+        }
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "state": {
+              "const": "pre-target"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "pull_request"
+                ]
+              },
+              {
+                "required": [
+                  "base"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "state": {
+              "const": "pr-selected"
+            }
+          },
+          "required": [
+            "state",
+            "pull_request"
+          ],
+          "not": {
+            "required": [
+              "base"
+            ]
+          }
+        },
+        {
+          "properties": {
+            "state": {
+              "const": "range-resolved"
+            }
+          },
+          "required": [
+            "state",
+            "pull_request",
+            "base",
+            "head"
+          ]
+        }
+      ]
+    },
+    "snapshot": {
+      "type": "object",
+      "required": [
+        "report_binding",
+        "target_binding",
+        "binding_id",
+        "snapshot_id",
+        "observed_at",
+        "freshness",
+        "sources"
+      ],
+      "properties": {
+        "report_binding": {
+          "$ref": "#/$defs/reportId"
+        },
+        "target_binding": {
+          "$ref": "#/$defs/targetId"
+        },
+        "binding_id": {
+          "$ref": "#/$defs/snapshotId"
+        },
+        "snapshot_id": {
+          "$ref": "#/$defs/observationId"
+        },
+        "observed_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "freshness": {
+          "const": "current"
+        },
+        "sources": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "github-rest",
+              "github-graphql",
+              "gh-cli-read-only",
+              "local-git-read-only"
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "prSelectionEvidence": {
+      "type": "object",
+      "required": [
+        "status",
+        "report_binding",
+        "target_binding",
+        "snapshot_binding",
+        "observed"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/evidenceStatus"
+        },
+        "report_binding": {
+          "$ref": "#/$defs/reportId"
+        },
+        "target_binding": {
+          "$ref": "#/$defs/targetId"
+        },
+        "snapshot_binding": {
+          "$ref": "#/$defs/snapshotId"
+        },
+        "observed": {
+          "type": "array",
+          "maxItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "target_identity",
+              "selection_method",
+              "outcome",
+              "candidate_count"
+            ],
+            "properties": {
+              "target_identity": {
+                "$ref": "#/$defs/selectionTargetIdentity"
+              },
+              "selection_method": {
+                "enum": [
+                  "explicit",
+                  "unique-open-head"
+                ]
+              },
+              "outcome": {
+                "enum": [
+                  "selected",
+                  "no-match",
+                  "ambiguous"
+                ]
+              },
+              "candidate_count": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "additionalProperties": false,
+            "oneOf": [
+              {
+                "properties": {
+                  "outcome": {
+                    "const": "selected"
+                  },
+                  "candidate_count": {
+                    "const": 1
+                  },
+                  "target_identity": {
+                    "required": [
+                      "pull_request"
+                    ]
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "outcome": {
+                    "const": "no-match"
+                  },
+                  "candidate_count": {
+                    "const": 0
+                  },
+                  "target_identity": {
+                    "not": {
+                      "required": [
+                        "pull_request"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "selection_method": {
+                    "const": "unique-open-head"
+                  },
+                  "outcome": {
+                    "const": "ambiguous"
+                  },
+                  "candidate_count": {
+                    "minimum": 2
+                  },
+                  "target_identity": {
+                    "not": {
+                      "required": [
+                        "pull_request"
+                      ]
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/nonemptyObservedEvidence"
+        }
+      ]
+    },
+    "prLifecycleEvidence": {
+      "type": "object",
+      "required": [
+        "status",
+        "report_binding",
+        "target_binding",
+        "snapshot_binding",
+        "observed"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/evidenceStatus"
+        },
+        "report_binding": {
+          "$ref": "#/$defs/reportId"
+        },
+        "target_binding": {
+          "$ref": "#/$defs/targetId"
+        },
+        "snapshot_binding": {
+          "$ref": "#/$defs/snapshotId"
+        },
+        "observed": {
+          "type": "array",
+          "maxItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "target_identity",
+              "state",
+              "merged",
+              "merged_at",
+              "draft"
+            ],
+            "properties": {
+              "target_identity": {
+                "$ref": "#/$defs/selectedTargetIdentity"
+              },
+              "state": {
+                "enum": [
+                  "open",
+                  "closed"
+                ]
+              },
+              "merged": {
+                "type": "boolean"
+              },
+              "merged_at": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/$defs/timestamp"
+                  }
+                ]
+              },
+              "draft": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": false,
+            "oneOf": [
+              {
+                "properties": {
+                  "state": {
+                    "const": "open"
+                  },
+                  "merged": {
+                    "const": false
+                  },
+                  "merged_at": {
+                    "type": "null"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "state": {
+                    "const": "closed"
+                  },
+                  "merged": {
+                    "const": false
+                  },
+                  "merged_at": {
+                    "type": "null"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "state": {
+                    "const": "closed"
+                  },
+                  "merged": {
+                    "const": true
+                  },
+                  "merged_at": {
+                    "$ref": "#/$defs/timestamp"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/nonemptyObservedEvidence"
+        }
+      ]
+    },
+    "ciStatusEvidence": {
+      "type": "object",
+      "required": [
+        "status",
+        "report_binding",
+        "target_binding",
+        "snapshot_binding",
+        "observed"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/evidenceStatus"
+        },
+        "report_binding": {
+          "$ref": "#/$defs/reportId"
+        },
+        "target_binding": {
+          "$ref": "#/$defs/targetId"
+        },
+        "snapshot_binding": {
+          "$ref": "#/$defs/snapshotId"
+        },
+        "observed": {
+          "type": "array",
+          "maxItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "target_identity",
+              "state",
+              "total",
+              "successful",
+              "failed",
+              "pending",
+              "cancelled",
+              "pagination",
+              "status_check_rollup"
+            ],
+            "properties": {
+              "target_identity": {
+                "$ref": "#/$defs/selectedTargetIdentity"
+              },
+              "state": {
+                "enum": [
+                  "success",
+                  "failure",
+                  "pending",
+                  "cancelled",
+                  "no-checks"
+                ]
+              },
+              "total": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "successful": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "failed": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "pending": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "cancelled": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "status_check_rollup": {
+                "type": "array",
+                "maxItems": 1000,
+                "uniqueItems": true,
+                "items": {
+                  "$ref": "#/$defs/statusCheckRollupEntry"
+                }
+              },
+              "pagination": {
+                "$ref": "#/$defs/ciPaginationEvidence"
+              }
+            },
+            "additionalProperties": false,
+            "oneOf": [
+              {
+                "properties": {
+                  "state": {
+                    "const": "no-checks"
+                  },
+                  "total": {
+                    "const": 0
+                  },
+                  "successful": {
+                    "const": 0
+                  },
+                  "failed": {
+                    "const": 0
+                  },
+                  "pending": {
+                    "const": 0
+                  },
+                  "cancelled": {
+                    "const": 0
+                  },
+                  "status_check_rollup": {
+                    "maxItems": 0
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "state": {
+                    "const": "success"
+                  },
+                  "successful": {
+                    "minimum": 1
+                  },
+                  "failed": {
+                    "const": 0
+                  },
+                  "pending": {
+                    "const": 0
+                  },
+                  "cancelled": {
+                    "const": 0
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "state": {
+                    "const": "failure"
+                  },
+                  "failed": {
+                    "minimum": 1
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "state": {
+                    "const": "pending"
+                  },
+                  "failed": {
+                    "const": 0
+                  },
+                  "pending": {
+                    "minimum": 1
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "state": {
+                    "const": "cancelled"
+                  },
+                  "failed": {
+                    "const": 0
+                  },
+                  "pending": {
+                    "const": 0
+                  },
+                  "cancelled": {
+                    "minimum": 1
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/nonemptyObservedEvidence"
+        }
+      ]
+    },
+    "conversationStateEvidence": {
+      "type": "object",
+      "required": [
+        "status",
+        "report_binding",
+        "target_binding",
+        "snapshot_binding",
+        "observed"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/evidenceStatus"
+        },
+        "report_binding": {
+          "$ref": "#/$defs/reportId"
+        },
+        "target_binding": {
+          "$ref": "#/$defs/targetId"
+        },
+        "snapshot_binding": {
+          "$ref": "#/$defs/snapshotId"
+        },
+        "observed": {
+          "type": "array",
+          "maxItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "target_identity",
+              "total_threads",
+              "unresolved_threads",
+              "review_threads",
+              "pagination"
+            ],
+            "properties": {
+              "target_identity": {
+                "$ref": "#/$defs/selectedTargetIdentity"
+              },
+              "total_threads": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "unresolved_threads": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "review_threads": {
+                "type": "array",
+                "maxItems": 1000,
+                "uniqueItems": true,
+                "items": {
+                  "$ref": "#/$defs/reviewThread"
+                }
+              },
+              "pagination": {
+                "$ref": "#/$defs/reviewThreadPaginationEvidence"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/nonemptyObservedEvidence"
+        }
+      ]
+    },
+    "baseAndHeadEvidence": {
+      "type": "object",
+      "required": [
+        "status",
+        "report_binding",
+        "target_binding",
+        "snapshot_binding",
+        "observed"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/evidenceStatus"
+        },
+        "report_binding": {
+          "$ref": "#/$defs/reportId"
+        },
+        "target_binding": {
+          "$ref": "#/$defs/targetId"
+        },
+        "snapshot_binding": {
+          "$ref": "#/$defs/snapshotId"
+        },
+        "observed": {
+          "type": "array",
+          "maxItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "observed_base_oid",
+              "observed_head_oid",
+              "base_object_present",
+              "head_object_present",
+              "merge_base_count",
+              "merge_base_oid"
+            ],
+            "properties": {
+              "observed_base_oid": {
+                "$ref": "#/$defs/oid"
+              },
+              "observed_head_oid": {
+                "$ref": "#/$defs/oid"
+              },
+              "base_object_present": {
+                "type": "boolean"
+              },
+              "head_object_present": {
+                "type": "boolean"
+              },
+              "merge_base_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "merge_base_oid": {
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/oid"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "additionalProperties": false,
+            "oneOf": [
+              {
+                "properties": {
+                  "base_object_present": {
+                    "const": false
+                  },
+                  "merge_base_count": {
+                    "const": 0
+                  },
+                  "merge_base_oid": {
+                    "type": "null"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "base_object_present": {
+                    "const": true
+                  },
+                  "head_object_present": {
+                    "const": false
+                  },
+                  "merge_base_count": {
+                    "const": 0
+                  },
+                  "merge_base_oid": {
+                    "type": "null"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "base_object_present": {
+                    "const": true
+                  },
+                  "head_object_present": {
+                    "const": true
+                  },
+                  "merge_base_count": {
+                    "const": 0
+                  },
+                  "merge_base_oid": {
+                    "type": "null"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "base_object_present": {
+                    "const": true
+                  },
+                  "head_object_present": {
+                    "const": true
+                  },
+                  "merge_base_count": {
+                    "const": 1
+                  },
+                  "merge_base_oid": {
+                    "$ref": "#/$defs/oid"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "base_object_present": {
+                    "const": true
+                  },
+                  "head_object_present": {
+                    "const": true
+                  },
+                  "merge_base_count": {
+                    "minimum": 2
+                  },
+                  "merge_base_oid": {
+                    "type": "null"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "$ref": "#/$defs/nonemptyObservedEvidence"
+        }
+      ]
+    },
+    "nonemptyObservedEvidence": {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "observed"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "observed": {
+            "minItems": 1
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "observed": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    "observedSourceConsistency": {
+      "if": {
+        "properties": {
+          "evidence": {
+            "anyOf": [
+              {
+                "properties": {
+                  "pr_selection": {
+                    "properties": {
+                      "status": {
+                        "const": "observed"
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "pr_lifecycle": {
+                    "properties": {
+                      "status": {
+                        "const": "observed"
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "ci_status": {
+                    "properties": {
+                      "status": {
+                        "const": "observed"
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "conversation_state": {
+                    "properties": {
+                      "status": {
+                        "const": "observed"
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "base_and_head": {
+                    "properties": {
+                      "status": {
+                        "const": "observed"
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "snapshot": {
+            "properties": {
+              "sources": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    "terminalStateConsistency": {
+      "oneOf": [
+        {
+          "properties": {
+            "terminal_state": {
+              "const": "pre-target"
+            },
+            "target": {
+              "properties": {
+                "state": {
+                  "const": "pre-target"
+                }
+              }
+            },
+            "evidence": {
+              "properties": {
+                "pr_selection": {
+                  "properties": {
+                    "status": {
+                      "const": "observed"
+                    },
+                    "observed": {
+                      "items": {
+                        "properties": {
+                          "outcome": {
+                            "enum": [
+                              "no-match",
+                              "ambiguous"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "pr_lifecycle": {
+                  "properties": {
+                    "status": {
+                      "$ref": "#/$defs/nonObservedStatus"
+                    }
+                  }
+                },
+                "ci_status": {
+                  "properties": {
+                    "status": {
+                      "$ref": "#/$defs/nonObservedStatus"
+                    }
+                  }
+                },
+                "conversation_state": {
+                  "properties": {
+                    "status": {
+                      "$ref": "#/$defs/nonObservedStatus"
+                    }
+                  }
+                },
+                "base_and_head": {
+                  "properties": {
+                    "status": {
+                      "$ref": "#/$defs/nonObservedStatus"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "terminal_state": {
+              "const": "pre-target-blocked"
+            },
+            "target": {
+              "properties": {
+                "state": {
+                  "const": "pre-target"
+                }
+              }
+            },
+            "evidence": {
+              "properties": {
+                "pr_selection": {
+                  "properties": {
+                    "status": {
+                      "$ref": "#/$defs/nonObservedStatus"
+                    }
+                  }
+                },
+                "pr_lifecycle": {
+                  "properties": {
+                    "status": {
+                      "$ref": "#/$defs/nonObservedStatus"
+                    }
+                  }
+                },
+                "ci_status": {
+                  "properties": {
+                    "status": {
+                      "$ref": "#/$defs/nonObservedStatus"
+                    }
+                  }
+                },
+                "conversation_state": {
+                  "properties": {
+                    "status": {
+                      "$ref": "#/$defs/nonObservedStatus"
+                    }
+                  }
+                },
+                "base_and_head": {
+                  "properties": {
+                    "status": {
+                      "$ref": "#/$defs/nonObservedStatus"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "terminal_state": {
+              "const": "target-resolution-blocked"
+            },
+            "target": {
+              "properties": {
+                "state": {
+                  "const": "pr-selected"
+                }
+              }
+            },
+            "evidence": {
+              "properties": {
+                "pr_selection": {
+                  "properties": {
+                    "status": {
+                      "const": "observed"
+                    },
+                    "observed": {
+                      "items": {
+                        "properties": {
+                          "outcome": {
+                            "const": "selected"
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "base_and_head": {
+                  "properties": {
+                    "status": {
+                      "$ref": "#/$defs/nonObservedStatus"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "terminal_state": {
+              "const": "target-snapshot"
+            },
+            "target": {
+              "properties": {
+                "state": {
+                  "const": "range-resolved"
+                }
+              }
+            },
+            "evidence": {
+              "properties": {
+                "pr_selection": {
+                  "properties": {
+                    "status": {
+                      "const": "observed"
+                    },
+                    "observed": {
+                      "items": {
+                        "properties": {
+                          "outcome": {
+                            "const": "selected"
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "base_and_head": {
+                  "properties": {
+                    "status": {
+                      "const": "observed"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "prSelectionConsistency": {
+      "$ref": "#/$defs/prSelectionStatusConsistency"
+    },
+    "prLifecycleConsistency": {
+      "$ref": "#/$defs/prLifecycleStatusConsistency"
+    },
+    "ciStatusConsistency": {
+      "$ref": "#/$defs/ciStatusStatusConsistency"
+    },
+    "conversationStateConsistency": {
+      "$ref": "#/$defs/conversationStateStatusConsistency"
+    },
+    "baseAndHeadConsistency": {
+      "$ref": "#/$defs/baseAndHeadStatusConsistency"
+    },
+    "prSelectionStatusConsistency": {
+      "if": {
+        "properties": {
+          "evidence": {
+            "properties": {
+              "pr_selection": {
+                "properties": {
+                  "status": {
+                    "const": "observed"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "unavailable_evidence": {
+            "not": {
+              "contains": {
+                "const": "pr-selection"
+              }
+            }
+          },
+          "blockers": {
+            "not": {
+              "contains": {
+                "$ref": "#/$defs/prSelectionBlocker"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "unavailable_evidence": {
+            "contains": {
+              "const": "pr-selection"
+            }
+          },
+          "blockers": {
+            "contains": {
+              "$ref": "#/$defs/prSelectionBlocker"
+            },
+            "minContains": 1,
+            "maxContains": 1
+          }
+        }
+      }
+    },
+    "prLifecycleStatusConsistency": {
+      "if": {
+        "properties": {
+          "evidence": {
+            "properties": {
+              "pr_lifecycle": {
+                "properties": {
+                  "status": {
+                    "const": "observed"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "unavailable_evidence": {
+            "not": {
+              "contains": {
+                "const": "pr-lifecycle"
+              }
+            }
+          },
+          "blockers": {
+            "not": {
+              "contains": {
+                "$ref": "#/$defs/prLifecycleBlocker"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "unavailable_evidence": {
+            "contains": {
+              "const": "pr-lifecycle"
+            }
+          },
+          "blockers": {
+            "contains": {
+              "$ref": "#/$defs/prLifecycleBlocker"
+            },
+            "minContains": 1,
+            "maxContains": 1
+          }
+        }
+      }
+    },
+    "ciStatusStatusConsistency": {
+      "if": {
+        "properties": {
+          "evidence": {
+            "properties": {
+              "ci_status": {
+                "properties": {
+                  "status": {
+                    "const": "observed"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "unavailable_evidence": {
+            "not": {
+              "contains": {
+                "const": "ci-status"
+              }
+            }
+          },
+          "blockers": {
+            "not": {
+              "contains": {
+                "$ref": "#/$defs/ciStatusBlocker"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "unavailable_evidence": {
+            "contains": {
+              "const": "ci-status"
+            }
+          },
+          "blockers": {
+            "contains": {
+              "$ref": "#/$defs/ciStatusBlocker"
+            },
+            "minContains": 1,
+            "maxContains": 1
+          }
+        }
+      }
+    },
+    "conversationStateStatusConsistency": {
+      "if": {
+        "properties": {
+          "evidence": {
+            "properties": {
+              "conversation_state": {
+                "properties": {
+                  "status": {
+                    "const": "observed"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "unavailable_evidence": {
+            "not": {
+              "contains": {
+                "const": "conversation-state"
+              }
+            }
+          },
+          "blockers": {
+            "not": {
+              "contains": {
+                "$ref": "#/$defs/conversationStateBlocker"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "unavailable_evidence": {
+            "contains": {
+              "const": "conversation-state"
+            }
+          },
+          "blockers": {
+            "contains": {
+              "$ref": "#/$defs/conversationStateBlocker"
+            },
+            "minContains": 1,
+            "maxContains": 1
+          }
+        }
+      }
+    },
+    "baseAndHeadStatusConsistency": {
+      "if": {
+        "properties": {
+          "evidence": {
+            "properties": {
+              "base_and_head": {
+                "properties": {
+                  "status": {
+                    "const": "observed"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "unavailable_evidence": {
+            "not": {
+              "contains": {
+                "const": "base-and-head"
+              }
+            }
+          },
+          "blockers": {
+            "not": {
+              "contains": {
+                "$ref": "#/$defs/baseAndHeadBlocker"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "unavailable_evidence": {
+            "contains": {
+              "const": "base-and-head"
+            }
+          },
+          "blockers": {
+            "contains": {
+              "$ref": "#/$defs/baseAndHeadBlocker"
+            },
+            "minContains": 1,
+            "maxContains": 1
+          }
+        }
+      }
+    },
+    "prSelectionBlocker": {
+      "type": "object",
+      "properties": {
+        "evidence": {
+          "const": "pr-selection"
+        }
+      },
+      "required": [
+        "evidence"
+      ]
+    },
+    "prLifecycleBlocker": {
+      "type": "object",
+      "properties": {
+        "evidence": {
+          "const": "pr-lifecycle"
+        }
+      },
+      "required": [
+        "evidence"
+      ]
+    },
+    "ciStatusBlocker": {
+      "type": "object",
+      "properties": {
+        "evidence": {
+          "const": "ci-status"
+        }
+      },
+      "required": [
+        "evidence"
+      ]
+    },
+    "conversationStateBlocker": {
+      "type": "object",
+      "properties": {
+        "evidence": {
+          "const": "conversation-state"
+        }
+      },
+      "required": [
+        "evidence"
+      ]
+    },
+    "baseAndHeadBlocker": {
+      "type": "object",
+      "properties": {
+        "evidence": {
+          "const": "base-and-head"
+        }
+      },
+      "required": [
+        "evidence"
+      ]
+    },
+    "githubNodeId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9_:+/=-]+$"
+    },
+    "ciPaginationConnection": {
+      "type": "object",
+      "required": [
+        "provider",
+        "field",
+        "repository_node_id",
+        "pull_request_node_id",
+        "head_oid"
+      ],
+      "properties": {
+        "provider": {
+          "const": "github-graphql"
+        },
+        "field": {
+          "const": "commit.statusCheckRollup.contexts"
+        },
+        "repository_node_id": {
+          "$ref": "#/$defs/githubNodeId"
+        },
+        "pull_request_node_id": {
+          "$ref": "#/$defs/githubNodeId"
+        },
+        "head_oid": {
+          "$ref": "#/$defs/oid"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ciPaginationPage": {
+      "type": "object",
+      "required": [
+        "connection",
+        "scan_role",
+        "observed_head_oid",
+        "snapshot_binding",
+        "snapshot_id",
+        "page_index",
+        "request_after",
+        "item_count",
+        "server_total_count",
+        "content_sha256",
+        "page_info"
+      ],
+      "properties": {
+        "connection": {
+          "$ref": "#/$defs/ciPaginationConnection"
+        },
+        "scan_role": {
+          "enum": [
+            "primary",
+            "verification"
+          ]
+        },
+        "observed_head_oid": {
+          "$ref": "#/$defs/oid"
+        },
+        "snapshot_binding": {
+          "$ref": "#/$defs/snapshotId"
+        },
+        "snapshot_id": {
+          "$ref": "#/$defs/observationId"
+        },
+        "page_index": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10
+        },
+        "request_after": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "item_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "page_info": {
+          "type": "object",
+          "required": [
+            "end_cursor",
+            "has_next_page"
+          ],
+          "properties": {
+            "end_cursor": {
+              "oneOf": [
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 1024
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "has_next_page": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        "server_total_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000
+        },
+        "content_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256 from the co-release page-digest entrypoint over the v1 domain prefix, kind, NUL separator, and canonical JSON payload. The payload includes scan_role, so primary and verification digests intentionally differ."
+        }
+      },
+      "additionalProperties": false
+    },
+    "ciPaginationEvidence": {
+      "type": "object",
+      "required": [
+        "connection",
+        "server_total_count",
+        "pages",
+        "stability"
+      ],
+      "properties": {
+        "connection": {
+          "$ref": "#/$defs/ciPaginationConnection"
+        },
+        "server_total_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000
+        },
+        "pages": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 10,
+          "items": {
+            "$ref": "#/$defs/ciPaginationPage"
+          }
+        },
+        "stability": {
+          "$ref": "#/$defs/ciPaginationStability"
+        }
+      },
+      "additionalProperties": false
+    },
+    "providerHeadObservationConnection": {
+      "type": "object",
+      "required": [
+        "provider",
+        "field",
+        "repository_node_id",
+        "pull_request_node_id"
+      ],
+      "properties": {
+        "provider": {
+          "const": "github-graphql"
+        },
+        "field": {
+          "const": "pullRequest.headRefOid"
+        },
+        "repository_node_id": {
+          "$ref": "#/$defs/githubNodeId"
+        },
+        "pull_request_node_id": {
+          "$ref": "#/$defs/githubNodeId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "providerHeadObservation": {
+      "type": "object",
+      "required": [
+        "phase",
+        "connection",
+        "head_oid"
+      ],
+      "properties": {
+        "phase": {
+          "enum": [
+            "before-primary",
+            "after-verification"
+          ]
+        },
+        "connection": {
+          "$ref": "#/$defs/providerHeadObservationConnection"
+        },
+        "head_oid": {
+          "$ref": "#/$defs/oid"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ciVerificationScan": {
+      "type": "object",
+      "required": [
+        "connection",
+        "server_total_count",
+        "pages",
+        "status_check_rollup"
+      ],
+      "properties": {
+        "connection": {
+          "$ref": "#/$defs/ciPaginationConnection"
+        },
+        "server_total_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000
+        },
+        "pages": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 10,
+          "items": {
+            "$ref": "#/$defs/ciPaginationPage"
+          }
+        },
+        "status_check_rollup": {
+          "type": "array",
+          "maxItems": 1000,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/statusCheckRollupEntry"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ciPaginationStability": {
+      "type": "object",
+      "required": [
+        "strategy",
+        "cache_mode",
+        "mutation_mode",
+        "deadline_ms",
+        "elapsed_ms",
+        "provider_call_count",
+        "head_observations",
+        "verification"
+      ],
+      "properties": {
+        "strategy": {
+          "const": "double-scan"
+        },
+        "cache_mode": {
+          "const": "disabled"
+        },
+        "mutation_mode": {
+          "const": "read-only"
+        },
+        "deadline_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60000
+        },
+        "elapsed_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60000
+        },
+        "provider_call_count": {
+          "type": "integer",
+          "minimum": 4,
+          "maximum": 22
+        },
+        "head_observations": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "$ref": "#/$defs/providerHeadObservation"
+          }
+        },
+        "verification": {
+          "$ref": "#/$defs/ciVerificationScan"
+        }
+      },
+      "additionalProperties": false
+    },
+    "reviewThread": {
+      "type": "object",
+      "required": [
+        "node_id",
+        "is_resolved"
+      ],
+      "properties": {
+        "node_id": {
+          "$ref": "#/$defs/githubNodeId"
+        },
+        "is_resolved": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "reviewThreadPaginationConnection": {
+      "type": "object",
+      "required": [
+        "provider",
+        "field",
+        "repository_node_id",
+        "pull_request_node_id",
+        "head_oid"
+      ],
+      "properties": {
+        "provider": {
+          "const": "github-graphql"
+        },
+        "field": {
+          "const": "pullRequest.reviewThreads"
+        },
+        "repository_node_id": {
+          "$ref": "#/$defs/githubNodeId"
+        },
+        "pull_request_node_id": {
+          "$ref": "#/$defs/githubNodeId"
+        },
+        "head_oid": {
+          "$ref": "#/$defs/oid"
+        }
+      },
+      "additionalProperties": false
+    },
+    "reviewThreadPaginationPage": {
+      "type": "object",
+      "required": [
+        "connection",
+        "scan_role",
+        "observed_head_oid",
+        "snapshot_binding",
+        "snapshot_id",
+        "page_index",
+        "request_after",
+        "item_count",
+        "server_total_count",
+        "content_sha256",
+        "page_info"
+      ],
+      "properties": {
+        "connection": {
+          "$ref": "#/$defs/reviewThreadPaginationConnection"
+        },
+        "scan_role": {
+          "enum": [
+            "primary",
+            "verification"
+          ]
+        },
+        "observed_head_oid": {
+          "$ref": "#/$defs/oid"
+        },
+        "snapshot_binding": {
+          "$ref": "#/$defs/snapshotId"
+        },
+        "snapshot_id": {
+          "$ref": "#/$defs/observationId"
+        },
+        "page_index": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10
+        },
+        "request_after": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "item_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "server_total_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000
+        },
+        "content_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256 from the co-release page-digest entrypoint over the v1 domain prefix, kind, NUL separator, and canonical JSON payload. The payload includes scan_role, so primary and verification digests intentionally differ."
+        },
+        "page_info": {
+          "type": "object",
+          "required": [
+            "end_cursor",
+            "has_next_page"
+          ],
+          "properties": {
+            "end_cursor": {
+              "oneOf": [
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 1024
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "has_next_page": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "reviewThreadPaginationEvidence": {
+      "type": "object",
+      "required": [
+        "connection",
+        "server_total_count",
+        "pages",
+        "stability"
+      ],
+      "properties": {
+        "connection": {
+          "$ref": "#/$defs/reviewThreadPaginationConnection"
+        },
+        "server_total_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000
+        },
+        "pages": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 10,
+          "items": {
+            "$ref": "#/$defs/reviewThreadPaginationPage"
+          }
+        },
+        "stability": {
+          "$ref": "#/$defs/reviewThreadPaginationStability"
+        }
+      },
+      "additionalProperties": false
+    },
+    "reviewThreadVerificationScan": {
+      "type": "object",
+      "required": [
+        "connection",
+        "server_total_count",
+        "pages",
+        "review_threads"
+      ],
+      "properties": {
+        "connection": {
+          "$ref": "#/$defs/reviewThreadPaginationConnection"
+        },
+        "server_total_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000
+        },
+        "pages": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 10,
+          "items": {
+            "$ref": "#/$defs/reviewThreadPaginationPage"
+          }
+        },
+        "review_threads": {
+          "type": "array",
+          "maxItems": 1000,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/reviewThread"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "reviewThreadPaginationStability": {
+      "type": "object",
+      "required": [
+        "strategy",
+        "cache_mode",
+        "mutation_mode",
+        "deadline_ms",
+        "elapsed_ms",
+        "provider_call_count",
+        "head_observations",
+        "verification"
+      ],
+      "properties": {
+        "strategy": {
+          "const": "double-scan"
+        },
+        "cache_mode": {
+          "const": "disabled"
+        },
+        "mutation_mode": {
+          "const": "read-only"
+        },
+        "deadline_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60000
+        },
+        "elapsed_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60000
+        },
+        "provider_call_count": {
+          "type": "integer",
+          "minimum": 4,
+          "maximum": 22
+        },
+        "head_observations": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "$ref": "#/$defs/providerHeadObservation"
+          }
+        },
+        "verification": {
+          "$ref": "#/$defs/reviewThreadVerificationScan"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

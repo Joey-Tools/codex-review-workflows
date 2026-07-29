@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "prompt": "Run the full workflow locally, report-only.",
+      "expected": {
+        "local_mutation": "forbidden",
+        "enter_implementation": false,
+        "write_journal": false,
+        "create_commit": false,
+        "generate_working_result_artifacts": false,
+        "run_mutating_or_cache_writing_validation": false,
+        "validation_mode": "read-only-subset"
+      }
+    },
+    {
+      "prompt": "Probe local gate readiness, but do not commit.",
+      "expected": {
+        "local_mutation": "forbidden",
+        "enter_implementation": false,
+        "write_journal": false,
+        "create_commit": false,
+        "generate_working_result_artifacts": false,
+        "run_mutating_or_cache_writing_validation": false,
+        "validation_mode": "read-only-subset"
+      }
+    },
+    {
+      "prompt": "Review full-workflow readiness read-only.",
+      "expected": {
+        "local_mutation": "forbidden",
+        "enter_implementation": false,
+        "write_journal": false,
+        "create_commit": false,
+        "generate_working_result_artifacts": false,
+        "run_mutating_or_cache_writing_validation": false,
+        "validation_mode": "read-only-subset"
+      }
+    }
+  ]
+}

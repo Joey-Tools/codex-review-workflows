@@ -1,0 +1,3622 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://joey-tools.invalid/change-delivery-workflow/v3/delivery-result.schema.json",
+  "title": "Change Delivery Result And Handoff Record",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "profile",
+    "constraints",
+    "head_sha",
+    "local_mutation",
+    "commit_mode",
+    "formal_review_required",
+    "remote_mutation",
+    "terminal_outcome",
+    "terminal_reason",
+    "terminal_evidence",
+    "handoff",
+    "handoff_profile"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 3
+    },
+    "profile": {
+      "enum": [
+        "focused-checkpoint",
+        "local-gate",
+        "pr-readiness-handoff"
+      ]
+    },
+    "constraints": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "local-only",
+          "report-only",
+          "probe-only",
+          "read-only",
+          "no-remote",
+          "no-commit"
+        ]
+      },
+      "uniqueItems": true
+    },
+    "head_sha": {
+      "$ref": "#/$defs/oid"
+    },
+    "commit_mode": {
+      "enum": [
+        "allowed",
+        "forbidden"
+      ]
+    },
+    "local_mutation": {
+      "enum": [
+        "allowed",
+        "forbidden"
+      ]
+    },
+    "formal_review_required": {
+      "type": "boolean"
+    },
+    "remote_mutation": {
+      "enum": [
+        "forbidden",
+        "review-authorization-required"
+      ]
+    },
+    "terminal_outcome": {
+      "enum": [
+        "succeeded",
+        "blocked"
+      ]
+    },
+    "terminal_reason": {
+      "enum": [
+        "focused-checkpoint-complete",
+        "focused-checkpoint-reviewed-complete",
+        "focused-checkpoint-report",
+        "focused-checkpoint-read-only-report",
+        "focused-checkpoint-clean-range-report",
+        "focused-checkpoint-read-only-clean-range-report",
+        "local-gate-complete",
+        "uncommitted-checked-result",
+        "read-only-checked-result",
+        "clean-range-report",
+        "read-only-clean-range-report",
+        "pr-readiness-handoff-ready",
+        "pr-readiness-existing-range-handoff-ready",
+        "pr-readiness-read-only-probe-ready",
+        "pr-readiness-read-only-reviewed-probe-ready",
+        "pr-readiness-read-only-gate-ready",
+        "pr-readiness-read-only-uncommitted-probe-ready",
+        "pr-readiness-read-only-existing-range-probe-ready",
+        "implementation-blocked",
+        "validation-blocked",
+        "journal-blocked",
+        "formal-review-blocked",
+        "missing-committed-range",
+        "review-findings",
+        "signing-failed",
+        "blocked-authorization",
+        "blocked-input"
+      ]
+    },
+    "terminal_evidence": {
+      "type": "object",
+      "required": [
+        "local_gate",
+        "build",
+        "tests",
+        "docs",
+        "journal",
+        "committed_range",
+        "formal_review",
+        "signature",
+        "signature_verified_head_oid",
+        "authorization",
+        "input"
+      ],
+      "properties": {
+        "local_gate": {
+          "enum": [
+            "succeeded",
+            "checked",
+            "blocked",
+            "not-required"
+          ]
+        },
+        "build": {
+          "enum": [
+            "satisfied",
+            "read-only-observed",
+            "failed",
+            "blocked"
+          ]
+        },
+        "tests": {
+          "enum": [
+            "satisfied",
+            "read-only-observed",
+            "failed",
+            "blocked"
+          ]
+        },
+        "docs": {
+          "enum": [
+            "satisfied",
+            "read-only-observed",
+            "blocked"
+          ]
+        },
+        "journal": {
+          "enum": [
+            "satisfied",
+            "read-only-observed",
+            "blocked"
+          ]
+        },
+        "committed_range": {
+          "enum": [
+            "present",
+            "missing",
+            "not-required"
+          ]
+        },
+        "formal_review": {
+          "enum": [
+            "clean",
+            "findings",
+            "blocked",
+            "not-started",
+            "not-required"
+          ]
+        },
+        "signature": {
+          "enum": [
+            "verified",
+            "failed",
+            "not-required"
+          ]
+        },
+        "signature_verified_head_oid": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/oid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "authorization": {
+          "enum": [
+            "satisfied",
+            "blocked",
+            "not-required"
+          ]
+        },
+        "input": {
+          "enum": [
+            "satisfied",
+            "blocked",
+            "not-required"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "handoff": {
+      "enum": [
+        "none",
+        "review-orchestration-playbook"
+      ]
+    },
+    "handoff_profile": {
+      "enum": [
+        "none",
+        "pr-readiness",
+        "pr-readiness-read-only-probe"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "constraints": {
+            "contains": {
+              "enum": [
+                "report-only",
+                "probe-only",
+                "read-only"
+              ]
+            }
+          }
+        },
+        "required": [
+          "constraints"
+        ]
+      },
+      "then": {
+        "properties": {
+          "local_mutation": {
+            "const": "forbidden"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "local_mutation": {
+            "const": "allowed"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "profile": {
+            "const": "local-gate"
+          },
+          "commit_mode": {
+            "const": "allowed"
+          }
+        },
+        "required": [
+          "profile",
+          "commit_mode"
+        ]
+      },
+      "then": {
+        "properties": {
+          "formal_review_required": {
+            "const": true
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "constraints": {
+            "contains": {
+              "enum": [
+                "report-only",
+                "probe-only",
+                "read-only",
+                "no-commit"
+              ]
+            }
+          }
+        },
+        "required": [
+          "constraints"
+        ]
+      },
+      "then": {
+        "properties": {
+          "commit_mode": {
+            "const": "forbidden"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "commit_mode": {
+            "const": "allowed"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "profile": {
+            "const": "pr-readiness-handoff"
+          }
+        },
+        "required": [
+          "profile"
+        ]
+      },
+      "then": {
+        "properties": {
+          "remote_mutation": {
+            "const": "review-authorization-required"
+          },
+          "formal_review_required": {
+            "const": true
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "remote_mutation": {
+            "const": "forbidden"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "constraints": {
+            "contains": {
+              "enum": [
+                "local-only",
+                "report-only",
+                "probe-only",
+                "read-only",
+                "no-remote"
+              ]
+            }
+          }
+        },
+        "required": [
+          "constraints"
+        ]
+      },
+      "then": {
+        "properties": {
+          "remote_mutation": {
+            "const": "forbidden"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "constraints": {
+            "contains": {
+              "const": "local-only"
+            }
+          }
+        },
+        "required": [
+          "constraints"
+        ]
+      },
+      "then": {
+        "properties": {
+          "profile": {
+            "enum": [
+              "focused-checkpoint",
+              "local-gate"
+            ]
+          },
+          "handoff": {
+            "const": "none"
+          },
+          "handoff_profile": {
+            "const": "none"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "handoff_profile": {
+            "const": "pr-readiness-read-only-probe"
+          }
+        },
+        "required": [
+          "handoff_profile"
+        ]
+      },
+      "then": {
+        "properties": {
+          "constraints": {
+            "contains": {
+              "enum": [
+                "report-only",
+                "probe-only",
+                "read-only",
+                "no-remote"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "terminal_outcome": {
+            "const": "blocked"
+          }
+        },
+        "required": [
+          "terminal_outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "terminal_reason": {
+            "enum": [
+              "implementation-blocked",
+              "validation-blocked",
+              "journal-blocked",
+              "formal-review-blocked",
+              "missing-committed-range",
+              "review-findings",
+              "signing-failed",
+              "blocked-authorization",
+              "blocked-input"
+            ]
+          },
+          "handoff": {
+            "const": "none"
+          },
+          "handoff_profile": {
+            "const": "none"
+          }
+        },
+        "$ref": "#/$defs/blockedTerminalMatrix"
+      },
+      "else": {
+        "properties": {
+          "terminal_reason": {
+            "enum": [
+              "focused-checkpoint-complete",
+              "focused-checkpoint-reviewed-complete",
+              "focused-checkpoint-report",
+              "focused-checkpoint-read-only-report",
+              "focused-checkpoint-clean-range-report",
+              "focused-checkpoint-read-only-clean-range-report",
+              "local-gate-complete",
+              "uncommitted-checked-result",
+              "read-only-checked-result",
+              "clean-range-report",
+              "read-only-clean-range-report",
+              "pr-readiness-handoff-ready",
+              "pr-readiness-existing-range-handoff-ready",
+              "pr-readiness-read-only-probe-ready",
+              "pr-readiness-read-only-reviewed-probe-ready",
+              "pr-readiness-read-only-gate-ready",
+              "pr-readiness-read-only-uncommitted-probe-ready",
+              "pr-readiness-read-only-existing-range-probe-ready"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "terminal_evidence": {
+            "properties": {
+              "signature": {
+                "const": "verified"
+              }
+            },
+            "required": [
+              "signature"
+            ]
+          }
+        },
+        "required": [
+          "terminal_evidence"
+        ]
+      },
+      "then": {
+        "properties": {
+          "terminal_evidence": {
+            "properties": {
+              "signature_verified_head_oid": {
+                "$ref": "#/$defs/oid"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "terminal_evidence": {
+            "properties": {
+              "signature_verified_head_oid": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "terminal_outcome": {
+            "const": "succeeded"
+          }
+        },
+        "required": [
+          "terminal_outcome"
+        ]
+      },
+      "then": {
+        "$ref": "#/$defs/successTerminalMatrix"
+      }
+    }
+  ],
+  "$defs": {
+    "focusedFormalBlockerLocalGate": {
+      "if": {
+        "properties": {
+          "profile": {
+            "const": "focused-checkpoint"
+          }
+        },
+        "required": [
+          "profile"
+        ]
+      },
+      "then": {
+        "properties": {
+          "terminal_evidence": {
+            "properties": {
+              "local_gate": {
+                "const": "not-required"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "terminal_evidence": {
+            "properties": {
+              "local_gate": {
+                "const": "checked"
+              }
+            }
+          }
+        }
+      }
+    },
+    "focusedBlockedLocalGate": {
+      "if": {
+        "properties": {
+          "profile": {
+            "const": "focused-checkpoint"
+          }
+        },
+        "required": [
+          "profile"
+        ]
+      },
+      "then": {
+        "properties": {
+          "terminal_evidence": {
+            "properties": {
+              "local_gate": {
+                "const": "not-required"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "terminal_evidence": {
+            "properties": {
+              "local_gate": {
+                "const": "blocked"
+              }
+            }
+          }
+        }
+      }
+    },
+    "successTerminalMatrix": {
+      "oneOf": [
+        {
+          "title": "focused-checkpoint-complete",
+          "properties": {
+            "profile": {
+              "const": "focused-checkpoint"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "allowed"
+            },
+            "formal_review_required": {
+              "const": false
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "focused-checkpoint-complete"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "not-required"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "not-required"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "focused-checkpoint-reviewed-complete",
+          "properties": {
+            "profile": {
+              "const": "focused-checkpoint"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "allowed"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "focused-checkpoint-reviewed-complete"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "not-required"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "focused-checkpoint-report",
+          "properties": {
+            "profile": {
+              "const": "focused-checkpoint"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": false
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "focused-checkpoint-report"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "not-required"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-required"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "focused-checkpoint-read-only-report",
+          "properties": {
+            "profile": {
+              "const": "focused-checkpoint"
+            },
+            "local_mutation": {
+              "const": "forbidden"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": false
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "focused-checkpoint-read-only-report"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "not-required"
+                },
+                "build": {
+                  "const": "read-only-observed"
+                },
+                "tests": {
+                  "const": "read-only-observed"
+                },
+                "docs": {
+                  "const": "read-only-observed"
+                },
+                "journal": {
+                  "const": "read-only-observed"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-required"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "focused-checkpoint-clean-range-report",
+          "properties": {
+            "profile": {
+              "const": "focused-checkpoint"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "focused-checkpoint-clean-range-report"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "not-required"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "focused-checkpoint-read-only-clean-range-report",
+          "properties": {
+            "profile": {
+              "const": "focused-checkpoint"
+            },
+            "local_mutation": {
+              "const": "forbidden"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "focused-checkpoint-read-only-clean-range-report"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "not-required"
+                },
+                "build": {
+                  "const": "read-only-observed"
+                },
+                "tests": {
+                  "const": "read-only-observed"
+                },
+                "docs": {
+                  "const": "read-only-observed"
+                },
+                "journal": {
+                  "const": "read-only-observed"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "local-gate-complete",
+          "properties": {
+            "profile": {
+              "const": "local-gate"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "allowed"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "local-gate-complete"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "succeeded"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "uncommitted-checked-result",
+          "properties": {
+            "profile": {
+              "const": "local-gate"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": false
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "uncommitted-checked-result"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-required"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "read-only-checked-result",
+          "properties": {
+            "profile": {
+              "const": "local-gate"
+            },
+            "local_mutation": {
+              "const": "forbidden"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": false
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "read-only-checked-result"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "read-only-observed"
+                },
+                "tests": {
+                  "const": "read-only-observed"
+                },
+                "docs": {
+                  "const": "read-only-observed"
+                },
+                "journal": {
+                  "const": "read-only-observed"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-required"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "clean-range-report",
+          "properties": {
+            "profile": {
+              "const": "local-gate"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "clean-range-report"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "read-only-clean-range-report",
+          "properties": {
+            "profile": {
+              "const": "local-gate"
+            },
+            "local_mutation": {
+              "const": "forbidden"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "read-only-clean-range-report"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "read-only-observed"
+                },
+                "tests": {
+                  "const": "read-only-observed"
+                },
+                "docs": {
+                  "const": "read-only-observed"
+                },
+                "journal": {
+                  "const": "read-only-observed"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "pr-readiness-handoff-ready",
+          "properties": {
+            "profile": {
+              "const": "pr-readiness-handoff"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "allowed"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "remote_mutation": {
+              "const": "review-authorization-required"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "pr-readiness-handoff-ready"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "succeeded"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "authorization": {
+                  "const": "satisfied"
+                },
+                "input": {
+                  "const": "satisfied"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                }
+              }
+            },
+            "handoff": {
+              "const": "review-orchestration-playbook"
+            },
+            "handoff_profile": {
+              "const": "pr-readiness"
+            }
+          }
+        },
+        {
+          "title": "pr-readiness-existing-range-handoff-ready",
+          "properties": {
+            "profile": {
+              "const": "pr-readiness-handoff"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "remote_mutation": {
+              "const": "review-authorization-required"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "pr-readiness-existing-range-handoff-ready"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                },
+                "authorization": {
+                  "const": "satisfied"
+                },
+                "input": {
+                  "const": "satisfied"
+                }
+              }
+            },
+            "handoff": {
+              "const": "review-orchestration-playbook"
+            },
+            "handoff_profile": {
+              "const": "pr-readiness"
+            }
+          }
+        },
+        {
+          "title": "pr-readiness-read-only-probe-ready",
+          "properties": {
+            "profile": {
+              "const": "local-gate"
+            },
+            "local_mutation": {
+              "const": "forbidden"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": false
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "pr-readiness-read-only-probe-ready"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "read-only-observed"
+                },
+                "tests": {
+                  "const": "read-only-observed"
+                },
+                "docs": {
+                  "const": "read-only-observed"
+                },
+                "journal": {
+                  "const": "read-only-observed"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-required"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "satisfied"
+                }
+              }
+            },
+            "handoff": {
+              "const": "review-orchestration-playbook"
+            },
+            "handoff_profile": {
+              "const": "pr-readiness-read-only-probe"
+            }
+          }
+        },
+        {
+          "title": "pr-readiness-read-only-reviewed-probe-ready",
+          "properties": {
+            "profile": {
+              "const": "local-gate"
+            },
+            "local_mutation": {
+              "const": "forbidden"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "pr-readiness-read-only-reviewed-probe-ready"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "read-only-observed"
+                },
+                "tests": {
+                  "const": "read-only-observed"
+                },
+                "docs": {
+                  "const": "read-only-observed"
+                },
+                "journal": {
+                  "const": "read-only-observed"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "satisfied"
+                }
+              }
+            },
+            "handoff": {
+              "const": "review-orchestration-playbook"
+            },
+            "handoff_profile": {
+              "const": "pr-readiness-read-only-probe"
+            }
+          }
+        },
+        {
+          "title": "pr-readiness-read-only-gate-ready",
+          "properties": {
+            "profile": {
+              "const": "local-gate"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "allowed"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "pr-readiness-read-only-gate-ready"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "succeeded"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "satisfied"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                }
+              }
+            },
+            "handoff": {
+              "const": "review-orchestration-playbook"
+            },
+            "handoff_profile": {
+              "const": "pr-readiness-read-only-probe"
+            }
+          }
+        },
+        {
+          "title": "pr-readiness-read-only-uncommitted-probe-ready",
+          "properties": {
+            "profile": {
+              "const": "local-gate"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": false
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "pr-readiness-read-only-uncommitted-probe-ready"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-required"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "satisfied"
+                }
+              }
+            },
+            "handoff": {
+              "const": "review-orchestration-playbook"
+            },
+            "handoff_profile": {
+              "const": "pr-readiness-read-only-probe"
+            }
+          }
+        },
+        {
+          "title": "pr-readiness-read-only-existing-range-probe-ready",
+          "properties": {
+            "profile": {
+              "const": "local-gate"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            },
+            "terminal_outcome": {
+              "const": "succeeded"
+            },
+            "terminal_reason": {
+              "const": "pr-readiness-read-only-existing-range-probe-ready"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "satisfied"
+                }
+              }
+            },
+            "handoff": {
+              "const": "review-orchestration-playbook"
+            },
+            "handoff_profile": {
+              "const": "pr-readiness-read-only-probe"
+            }
+          }
+        }
+      ]
+    },
+    "oid": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "blockedTerminalMatrix": {
+      "oneOf": [
+        {
+          "title": "implementation-blocked:mutable-commit",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "implementation-blocked"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "allowed"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
+                },
+                "build": {
+                  "const": "blocked"
+                },
+                "tests": {
+                  "const": "blocked"
+                },
+                "docs": {
+                  "const": "blocked"
+                },
+                "journal": {
+                  "const": "blocked"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-started"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "validation-blocked:mutable-commit:build",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "validation-blocked"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "allowed"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
+                },
+                "build": {
+                  "const": "failed"
+                },
+                "tests": {
+                  "const": "blocked"
+                },
+                "docs": {
+                  "const": "blocked"
+                },
+                "journal": {
+                  "const": "blocked"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-started"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "validation-blocked:mutable-commit:tests",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "validation-blocked"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "allowed"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "failed"
+                },
+                "docs": {
+                  "const": "blocked"
+                },
+                "journal": {
+                  "const": "blocked"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-started"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "validation-blocked:mutable-commit:docs",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "validation-blocked"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "allowed"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "blocked"
+                },
+                "journal": {
+                  "const": "blocked"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-started"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "journal-blocked:mutable-commit",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "journal-blocked"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "allowed"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "blocked"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-started"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "implementation-blocked:existing-range-no-commit",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "implementation-blocked"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
+                },
+                "build": {
+                  "const": "blocked"
+                },
+                "tests": {
+                  "const": "blocked"
+                },
+                "docs": {
+                  "const": "blocked"
+                },
+                "journal": {
+                  "const": "blocked"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-started"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "validation-blocked:existing-range-no-commit:build",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "validation-blocked"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
+                },
+                "build": {
+                  "const": "failed"
+                },
+                "tests": {
+                  "const": "blocked"
+                },
+                "docs": {
+                  "const": "blocked"
+                },
+                "journal": {
+                  "const": "blocked"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-started"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "validation-blocked:existing-range-no-commit:tests",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "validation-blocked"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "failed"
+                },
+                "docs": {
+                  "const": "blocked"
+                },
+                "journal": {
+                  "const": "blocked"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-started"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "validation-blocked:existing-range-no-commit:docs",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "validation-blocked"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "blocked"
+                },
+                "journal": {
+                  "const": "blocked"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-started"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "journal-blocked:existing-range-no-commit",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "journal-blocked"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "blocked"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-started"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "formal-review-blocked:mutable-commit",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "formal-review-blocked"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "allowed"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "blocked"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            },
+            "formal_review_required": {
+              "const": true
+            }
+          }
+        },
+        {
+          "title": "formal-review-blocked:existing-range-no-commit",
+          "$ref": "#/$defs/focusedFormalBlockerLocalGate",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "formal-review-blocked"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "enum": [
+                    "checked",
+                    "not-required"
+                  ]
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "blocked"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            },
+            "formal_review_required": {
+              "const": true
+            }
+          }
+        },
+        {
+          "title": "formal-review-blocked:read-only-formal",
+          "$ref": "#/$defs/focusedFormalBlockerLocalGate",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "formal-review-blocked"
+            },
+            "local_mutation": {
+              "const": "forbidden"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "enum": [
+                    "checked",
+                    "not-required"
+                  ]
+                },
+                "build": {
+                  "const": "read-only-observed"
+                },
+                "tests": {
+                  "const": "read-only-observed"
+                },
+                "docs": {
+                  "const": "read-only-observed"
+                },
+                "journal": {
+                  "const": "read-only-observed"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "blocked"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "profile": {
+              "enum": [
+                "focused-checkpoint",
+                "local-gate"
+              ]
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            }
+          }
+        },
+        {
+          "title": "missing-committed-range:existing-range-no-commit",
+          "$ref": "#/$defs/focusedFormalBlockerLocalGate",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "missing-committed-range"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "enum": [
+                    "checked",
+                    "not-required"
+                  ]
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-started"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            },
+            "formal_review_required": {
+              "const": true
+            }
+          }
+        },
+        {
+          "title": "review-findings:existing-range-no-commit",
+          "$ref": "#/$defs/focusedFormalBlockerLocalGate",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "review-findings"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "enum": [
+                    "checked",
+                    "not-required"
+                  ]
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "findings"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            },
+            "formal_review_required": {
+              "const": true
+            }
+          }
+        },
+        {
+          "title": "missing-committed-range:read-only-formal",
+          "$ref": "#/$defs/focusedFormalBlockerLocalGate",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "missing-committed-range"
+            },
+            "local_mutation": {
+              "const": "forbidden"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "enum": [
+                    "checked",
+                    "not-required"
+                  ]
+                },
+                "build": {
+                  "const": "read-only-observed"
+                },
+                "tests": {
+                  "const": "read-only-observed"
+                },
+                "docs": {
+                  "const": "read-only-observed"
+                },
+                "journal": {
+                  "const": "read-only-observed"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-started"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "profile": {
+              "enum": [
+                "focused-checkpoint",
+                "local-gate"
+              ]
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            }
+          }
+        },
+        {
+          "title": "review-findings:read-only-formal",
+          "$ref": "#/$defs/focusedFormalBlockerLocalGate",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "review-findings"
+            },
+            "local_mutation": {
+              "const": "forbidden"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "enum": [
+                    "checked",
+                    "not-required"
+                  ]
+                },
+                "build": {
+                  "const": "read-only-observed"
+                },
+                "tests": {
+                  "const": "read-only-observed"
+                },
+                "docs": {
+                  "const": "read-only-observed"
+                },
+                "journal": {
+                  "const": "read-only-observed"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "findings"
+                },
+                "signature": {
+                  "const": "not-required"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "profile": {
+              "enum": [
+                "focused-checkpoint",
+                "local-gate"
+              ]
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            }
+          }
+        },
+        {
+          "title": "signing-failed:mutable-commit",
+          "$ref": "#/$defs/focusedBlockedLocalGate",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "signing-failed"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "allowed"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "enum": [
+                    "blocked",
+                    "not-required"
+                  ]
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "missing"
+                },
+                "formal_review": {
+                  "const": "not-started"
+                },
+                "signature": {
+                  "const": "failed"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "not-required"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            }
+          }
+        },
+        {
+          "title": "signing-failed:existing-range-no-commit",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "signing-failed"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "failed"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "satisfied"
+                },
+                "input": {
+                  "const": "satisfied"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "profile": {
+              "const": "pr-readiness-handoff"
+            },
+            "remote_mutation": {
+              "const": "review-authorization-required"
+            }
+          }
+        },
+        {
+          "title": "signing-failed:read-only-formal",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "signing-failed"
+            },
+            "local_mutation": {
+              "const": "forbidden"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "read-only-observed"
+                },
+                "tests": {
+                  "const": "read-only-observed"
+                },
+                "docs": {
+                  "const": "read-only-observed"
+                },
+                "journal": {
+                  "const": "read-only-observed"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "failed"
+                },
+                "signature_verified_head_oid": {
+                  "const": null
+                },
+                "authorization": {
+                  "const": "not-required"
+                },
+                "input": {
+                  "const": "satisfied"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "profile": {
+              "const": "local-gate"
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            }
+          }
+        },
+        {
+          "title": "blocked-authorization:mutable-commit",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "blocked-authorization"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "allowed"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "succeeded"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                },
+                "authorization": {
+                  "const": "blocked"
+                },
+                "input": {
+                  "const": "satisfied"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "profile": {
+              "const": "pr-readiness-handoff"
+            },
+            "remote_mutation": {
+              "const": "review-authorization-required"
+            }
+          }
+        },
+        {
+          "title": "blocked-authorization:existing-range-no-commit",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "blocked-authorization"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                },
+                "authorization": {
+                  "const": "blocked"
+                },
+                "input": {
+                  "const": "satisfied"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "profile": {
+              "const": "pr-readiness-handoff"
+            },
+            "remote_mutation": {
+              "const": "review-authorization-required"
+            }
+          }
+        },
+        {
+          "title": "blocked-authorization:read-only-formal",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "blocked-authorization"
+            },
+            "local_mutation": {
+              "const": "forbidden"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "read-only-observed"
+                },
+                "tests": {
+                  "const": "read-only-observed"
+                },
+                "docs": {
+                  "const": "read-only-observed"
+                },
+                "journal": {
+                  "const": "read-only-observed"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                },
+                "authorization": {
+                  "const": "blocked"
+                },
+                "input": {
+                  "const": "satisfied"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "profile": {
+              "const": "local-gate"
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            }
+          }
+        },
+        {
+          "title": "blocked-input:mutable-commit",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "blocked-input"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "allowed"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "succeeded"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                },
+                "authorization": {
+                  "const": "satisfied"
+                },
+                "input": {
+                  "const": "blocked"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "profile": {
+              "const": "pr-readiness-handoff"
+            },
+            "remote_mutation": {
+              "const": "review-authorization-required"
+            }
+          }
+        },
+        {
+          "title": "blocked-input:existing-range-no-commit",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "blocked-input"
+            },
+            "local_mutation": {
+              "const": "allowed"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "satisfied"
+                },
+                "tests": {
+                  "const": "satisfied"
+                },
+                "docs": {
+                  "const": "satisfied"
+                },
+                "journal": {
+                  "const": "satisfied"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                },
+                "authorization": {
+                  "const": "satisfied"
+                },
+                "input": {
+                  "const": "blocked"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "profile": {
+              "const": "pr-readiness-handoff"
+            },
+            "remote_mutation": {
+              "const": "review-authorization-required"
+            }
+          }
+        },
+        {
+          "title": "blocked-input:read-only-formal",
+          "properties": {
+            "terminal_outcome": {
+              "const": "blocked"
+            },
+            "terminal_reason": {
+              "const": "blocked-input"
+            },
+            "local_mutation": {
+              "const": "forbidden"
+            },
+            "commit_mode": {
+              "const": "forbidden"
+            },
+            "terminal_evidence": {
+              "properties": {
+                "local_gate": {
+                  "const": "checked"
+                },
+                "build": {
+                  "const": "read-only-observed"
+                },
+                "tests": {
+                  "const": "read-only-observed"
+                },
+                "docs": {
+                  "const": "read-only-observed"
+                },
+                "journal": {
+                  "const": "read-only-observed"
+                },
+                "committed_range": {
+                  "const": "present"
+                },
+                "formal_review": {
+                  "const": "clean"
+                },
+                "signature": {
+                  "const": "verified"
+                },
+                "signature_verified_head_oid": {
+                  "$ref": "#/$defs/oid"
+                },
+                "authorization": {
+                  "const": "satisfied"
+                },
+                "input": {
+                  "const": "blocked"
+                }
+              }
+            },
+            "handoff": {
+              "const": "none"
+            },
+            "handoff_profile": {
+              "const": "none"
+            },
+            "formal_review_required": {
+              "const": true
+            },
+            "profile": {
+              "const": "local-gate"
+            },
+            "remote_mutation": {
+              "const": "forbidden"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -7,6 +7,7 @@ import pathlib
 import signal
 import sys
 
+from . import synthetic_tokens as synthetic_tokens_runtime
 from .common import (
     ForwardedSignal,
     ReviewError,
@@ -15,26 +16,95 @@ from .common import (
     forwarded_signals,
     restore_signal_mask,
 )
-from .providers import CLAUDE_EGRESS_CONSENTS, run_review
-from .state import FINAL_CLEANUP_TIMEOUT_SECONDS, ReviewPreparationGuard
-from .state import cleanup as cleanup_state
-from .state import admission, final, run_state, start, status, wait
 from .synthetic_tokens import (
+    SyntheticTokenCatalog,
     authoring_metadata,
-    legacy_metadata,
     load_catalog,
 )
-from .workspace import (
-    ReviewWorkspace,
-    cleanup_workspace,
-    prepare_workspace,
-    remove_private_review_artifacts,
-    secret_admission,
-    validate_authoring_catalog_scanner_contract,
+
+FINAL_CLEANUP_TIMEOUT_SECONDS = 30.0
+DIRECT_SYNTHETIC_AUTHORING_ERROR = (
+    "direct synthetic-token authoring is disabled; use the active immutable "
+    "release's synthetic-token-fixtures catalog-bootstrap guard with the "
+    "captured --expect-binding-sha256 value"
 )
+
+
+def run_review(**kwargs):
+    from .providers import run_review as implementation
+
+    return implementation(**kwargs)
+
+
+def prepare_workspace(**kwargs):
+    from .workspace import prepare_workspace as implementation
+
+    return implementation(**kwargs)
+
+
+def cleanup_workspace(*args, **kwargs):
+    from .workspace import cleanup_workspace as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def remove_private_review_artifacts(*args, **kwargs):
+    from .workspace import remove_private_review_artifacts as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def secret_admission(**kwargs):
+    from .workspace import secret_admission as implementation
+
+    return implementation(**kwargs)
+
+
+def start(**kwargs):
+    from .state import start as implementation
+
+    return implementation(**kwargs)
+
+
+def status(*args, **kwargs):
+    from .state import status as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def admission(*args, **kwargs):
+    from .state import admission as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def wait(*args, **kwargs):
+    from .state import wait as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def final(*args, **kwargs):
+    from .state import final as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def cleanup_state(*args, **kwargs):
+    from .state import cleanup as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def run_state(**kwargs):
+    from .state import run_state as implementation
+
+    return implementation(**kwargs)
 
 
 def _add_review_arguments(parser: argparse.ArgumentParser) -> None:
+    from .providers import CLAUDE_EGRESS_CONSENTS
+
     parser.add_argument("--repo", default=".", help="Source Git repository.")
     parser.add_argument(
         "--reviewer",
@@ -75,15 +145,6 @@ def _add_review_arguments(parser: argparse.ArgumentParser) -> None:
             "Required for the low-level Claude helper; records explicit "
             "Anthropic-only consent or separately requested Anthropic-plus-Copilot "
             "compatibility-fallback consent."
-        ),
-    )
-    parser.add_argument(
-        "--synthetic-secret-exemption",
-        action="append",
-        default=[],
-        help=(
-            "Deprecated compatibility option. Known legacy IDs are validated, "
-            "but selection no longer changes secret-delta admission."
         ),
     )
 
@@ -133,24 +194,6 @@ def _build_stateful_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _build_synthetic_tokens_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="isolated_review synthetic-tokens")
-    actions = parser.add_subparsers(dest="action", required=True)
-    actions.add_parser("validate")
-    list_parser = actions.add_parser("list")
-    list_parser.add_argument("--json", action="store_true")
-    get_parser = actions.add_parser("get")
-    get_parser.add_argument("id")
-    get_parser.add_argument("--json", action="store_true")
-    exemptions_parser = actions.add_parser("list-exemptions")
-    exemptions_parser.add_argument("--json", action="store_true")
-    audit_parser = actions.add_parser("audit-master")
-    audit_parser.add_argument("--repo", required=True)
-    audit_parser.add_argument("--ref", required=True)
-    audit_parser.add_argument("--exemption", required=True)
-    return parser
-
-
 def _build_secret_admission_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="isolated_review secret-admission")
     parser.add_argument("--repo", default=".", help="Source Git repository.")
@@ -170,10 +213,12 @@ def _run_secret_admission(argv: list[str]) -> int:
     return exit_code
 
 
-def _run_synthetic_tokens(argv: list[str]) -> int:
-    args = _build_synthetic_tokens_parser().parse_args(argv)
-    catalog = load_catalog()
-    validate_authoring_catalog_scanner_contract(catalog)
+def _emit_authoring_catalog_action(
+    args: argparse.Namespace,
+    catalog: SyntheticTokenCatalog,
+    *,
+    unknown_label: str,
+) -> int:
     if args.action == "validate":
         print(
             json.dumps(
@@ -217,34 +262,42 @@ def _run_synthetic_tokens(argv: list[str]) -> int:
         else:
             print(payload["token"]["value"])
         return 0
-    if args.action == "list-exemptions":
-        payload = {
-            "exemptions": legacy_metadata(catalog),
-            "pool_version": catalog.pool_version,
-        }
-        if args.json:
-            print(json.dumps(payload, indent=2, sort_keys=True))
-        else:
-            for exemption in payload["exemptions"]:
-                print(
-                    f"{exemption['id']}\t{exemption['repository']}\t"
-                    f"{len(exemption['values'])}"
-                )
-        return 0
-    if args.action == "audit-master":
-        from .workspace import audit_legacy_exemption
+    raise ReviewError(f"unknown {unknown_label} action: {args.action}")
 
-        evidence = audit_legacy_exemption(
-            repo=pathlib.Path(args.repo),
-            ref=args.ref,
-            exemption=catalog.legacy_exemption(args.exemption),
+
+def _build_catalog_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="synthetic_catalog_entry")
+    actions = parser.add_subparsers(dest="action", required=True)
+    actions.add_parser("validate")
+    list_parser = actions.add_parser("list")
+    list_parser.add_argument("--json", action="store_true")
+    get_parser = actions.add_parser("get")
+    get_parser.add_argument("id")
+    get_parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def catalog_main(argv: list[str] | None = None) -> int:
+    """Run the resolver-only, manifest-bound authoring catalog surface."""
+
+    if synthetic_tokens_runtime.BOUND_CATALOG_BYTES is None:
+        raise ReviewError(
+            "catalog_main requires manifest-bound catalog bytes from the "
+            "active-release catalog-bootstrap resolver"
         )
-        print(json.dumps(evidence, indent=2, sort_keys=True))
-        return 0
-    raise ReviewError(f"unknown synthetic-tokens action: {args.action}")
+    args = _build_catalog_parser().parse_args(argv)
+    catalog = load_catalog()
+    return _emit_authoring_catalog_action(
+        args,
+        catalog,
+        unknown_label="catalog",
+    )
 
 
 def _run_foreground(args: argparse.Namespace) -> int:
+    from .state import ReviewPreparationGuard
+    from .workspace import ReviewWorkspace
+
     preparation_guard = ReviewPreparationGuard()
     _validate_review_arguments(args)
     review = None
@@ -270,9 +323,6 @@ def _run_foreground(args: argparse.Namespace) -> int:
             head_ref=args.head_ref,
             ownership_handoff=accept_workspace,
             preparation_cleanup_handoff=(preparation_guard.accept_preparation_cleanup),
-            synthetic_secret_exemptions=tuple(
-                getattr(args, "synthetic_secret_exemption", ())
-            ),
             prompt_override=(
                 pathlib.Path(args.prompt_file) if args.prompt_file else None
             ),
@@ -354,9 +404,6 @@ def _run_stateful(argv: list[str], *, script_path: pathlib.Path) -> int:
             prompt_file=pathlib.Path(args.prompt_file) if args.prompt_file else None,
             keep_workspace=args.keep_workspace,
             egress_consent=args.egress_consent,
-            synthetic_secret_exemptions=tuple(
-                getattr(args, "synthetic_secret_exemption", ())
-            ),
             include_source_wip=bool(getattr(args, "include_source_wip", False)),
             publisher=lambda created: print(created, flush=True),
         )
@@ -387,6 +434,8 @@ def main(argv: list[str] | None = None) -> int:
     script_path = pathlib.Path(sys.argv[0]).resolve()
     try:
         if arguments and arguments[0] == "_run-state":
+            from .providers import CLAUDE_EGRESS_CONSENTS
+
             internal = argparse.ArgumentParser(add_help=False)
             internal.add_argument("action")
             internal.add_argument("--state-dir", required=True)
@@ -413,7 +462,7 @@ def main(argv: list[str] | None = None) -> int:
         if arguments and arguments[0] == "stateful":
             return _run_stateful(arguments[1:], script_path=script_path)
         if arguments and arguments[0] == "synthetic-tokens":
-            return _run_synthetic_tokens(arguments[1:])
+            raise ReviewError(DIRECT_SYNTHETIC_AUTHORING_ERROR)
         if arguments and arguments[0] == "secret-admission":
             return _run_secret_admission(arguments[1:])
         return _run_foreground(_build_parser().parse_args(arguments))

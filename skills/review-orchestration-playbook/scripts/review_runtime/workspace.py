@@ -968,8 +968,7 @@ class _UnextractableContainerBudget:
             path_identity_bytes = len(identity)
         elif (
             surface == "blob"
-            and re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", identity)
-            is not None
+            and re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", identity) is not None
         ):
             path_identity_bytes = 0
         else:
@@ -6936,9 +6935,10 @@ def _unextractable_container_nonincrease(
             raise ReviewError(
                 "an unextractable exact secret candidate lost its container identity"
             )
-        for (surface, identity), count in (
-            discovery.unextractable_container_counts.items()
-        ):
+        for (
+            surface,
+            identity,
+        ), count in discovery.unextractable_container_counts.items():
             if not identity or count <= 0:
                 raise ReviewError(
                     "an unextractable exact secret container identity is invalid"
@@ -7024,15 +7024,12 @@ def _secret_count_manifests(
             _continue_after_blocking=True,
             _unextractable_container_budget=unextractable_container_budget,
         )
-        source_opaque_containers_nonincreasing = (
-            _unextractable_container_nonincrease(
-                base_discovery=base_discovery,
-                head_discovery=source_head_discovery,
-            )
+        source_opaque_containers_nonincreasing = _unextractable_container_nonincrease(
+            base_discovery=base_discovery,
+            head_discovery=source_head_discovery,
         )
         opaque_containers_nonincreasing = (
-            opaque_containers_nonincreasing
-            and source_opaque_containers_nonincreasing
+            opaque_containers_nonincreasing and source_opaque_containers_nonincreasing
         )
         source_head_discovery.discard_unextractable_container_evidence()
     base_discovery.discard_unextractable_container_evidence()
@@ -7281,9 +7278,7 @@ def _secret_count_manifests(
             evidence_head_ref=evidence_head_ref,
         )
     if not opaque_containers_nonincreasing and not violation_entries:
-        raise ReviewError(
-            "an exact secret candidate could not be extracted completely"
-        )
+        raise ReviewError("an exact secret candidate could not be extracted completely")
     return public_manifest, private_manifest, reduction_descriptors
 
 
@@ -15822,144 +15817,6 @@ def _review_scope_identity(
     ).hexdigest()
 
 
-def _canonical_github_repository(remote_url: str) -> str | None:
-    patterns = (
-        r"https://github\.com/([^/]+/[^/]+?)(?:\.git)?/?$",
-        r"git@github\.com:([^/]+/[^/]+?)(?:\.git)?$",
-        r"ssh://git@github\.com/([^/]+/[^/]+?)(?:\.git)?/?$",
-    )
-    for pattern in patterns:
-        match = re.fullmatch(pattern, remote_url.strip())
-        if match:
-            return match.group(1)
-    return None
-
-
-def audit_legacy_exemption(
-    *,
-    repo: pathlib.Path,
-    ref: str,
-    exemption: LegacyExemption,
-) -> dict[str, Any]:
-    source_root = resolve_repo_root(repo)
-    tip = resolve_commit(source_root, ref, label="audited master ref")
-    if tip != exemption.verified_master_tip:
-        raise ReviewError(
-            "audited master ref does not match the catalog's verified master tip"
-        )
-    origin_result = _git(
-        source_root,
-        "config",
-        "--get",
-        "remote.origin.url",
-        check=False,
-    )
-    if origin_result.returncode != 0:
-        raise ReviewError("cannot verify the audited repository origin")
-    try:
-        origin_url = origin_result.stdout.decode("utf-8", errors="strict")
-    except UnicodeDecodeError as error:
-        raise ReviewError("audited repository origin is not valid UTF-8") from error
-    origin = _canonical_github_repository(origin_url)
-    if origin != exemption.repository:
-        raise ReviewError(
-            "audited repository origin does not match the catalog provenance"
-        )
-
-    catalog = load_catalog()
-    validate_authoring_catalog_scanner_contract(catalog)
-    if catalog.legacy_exemption(exemption.identifier) != exemption:
-        raise ReviewError("legacy exemption changed while the audit was prepared")
-    accepted = accepted_legacy_values(catalog, (exemption,))
-    authoring_accepted = accepted_authoring_values(catalog)
-    scan_accepted = authoring_accepted + accepted
-    descriptors = {item.identifier: item for item in accepted}
-    evidence: list[dict[str, Any]] = []
-
-    with _temporary_sanitized_git_view(
-        source_root=source_root,
-    ) as (git_view, object_directory):
-        by_commit: dict[str, list[AcceptedSyntheticValue]] = {}
-        for token in exemption.values:
-            ancestry_error = (
-                "legacy provenance commit is not an ancestor of the verified "
-                f"master tip: {token.identifier}"
-            )
-            is_ancestor = _is_ancestor_in_sanitized_view(
-                git_view=git_view,
-                object_directory=object_directory,
-                ancestor=token.containing_commit,
-                descendant=tip,
-                failure_message=ancestry_error,
-            )
-            if not is_ancestor:
-                raise ReviewError(ancestry_error)
-            by_commit.setdefault(token.containing_commit, []).append(
-                descriptors[token.identifier]
-            )
-        for commit, commit_descriptors in sorted(by_commit.items()):
-            scan = _scan_frozen_tree_values(
-                git_view=git_view,
-                object_directory=object_directory,
-                commit=commit,
-                accepted_values=scan_accepted,
-                raw_occurrence_values=commit_descriptors,
-                capture_accepted_candidates=True,
-                _continue_after_blocking=True,
-            )
-            for descriptor in sorted(
-                commit_descriptors,
-                key=lambda item: item.identifier,
-            ):
-                token = next(
-                    item
-                    for item in exemption.values
-                    if item.identifier == descriptor.identifier
-                )
-                count = scan.raw_occurrence_counts[descriptor]
-                captured = scan.accepted_candidates.get(descriptor, set())
-                if (
-                    count != token.source_occurrences
-                    or scan.accepted_counts[descriptor] <= 0
-                    or captured != {descriptor.value}
-                ):
-                    raise ReviewError(
-                        "legacy master provenance occurrence evidence does not match "
-                        f"the catalog for {token.identifier}"
-                    )
-                evidence.append(
-                    {
-                        "containing_commit": commit,
-                        "rule": token.rule,
-                        "source_occurrences": count,
-                        "token_id": token.identifier,
-                        "value_length": token.value_length,
-                        "value_sha256": token.value_sha256,
-                    }
-                )
-    if len(evidence) > MAX_SYNTHETIC_EVIDENCE_ENTRIES:
-        raise ReviewError("legacy master audit evidence has too many entries")
-    result = {
-        "exemption_id": exemption.identifier,
-        "match": exemption.match,
-        "repository": exemption.repository,
-        "status": "verified",
-        "values": sorted(evidence, key=lambda item: item["token_id"]),
-        "verified_master_tip": tip,
-    }
-    if (
-        len(json.dumps(result, separators=(",", ":"), sort_keys=True).encode("utf-8"))
-        > MAX_SYNTHETIC_EVIDENCE_BYTES
-    ):
-        raise ReviewError("legacy master audit evidence exceeds the size limit")
-    _reject_raw_values_in_evidence(
-        result,
-        accepted_values=_all_catalog_sensitive_values(catalog),
-        label="legacy master audit evidence",
-    )
-    return result
-
-
 def prepare_workspace(
     *,
     repo: pathlib.Path,
@@ -15969,7 +15826,6 @@ def prepare_workspace(
     preparation_cleanup_handoff: (
         Callable[[pathlib.Path, PrivateCleanupEvidence], None] | None
     ) = None,
-    synthetic_secret_exemptions: tuple[str, ...] = (),
     prompt_override: pathlib.Path | None = None,
     include_source_wip: bool = False,
 ) -> ReviewWorkspace:
@@ -16099,12 +15955,6 @@ def prepare_workspace(
             source_wip_capture_budget = None
         catalog = load_catalog()
         validate_authoring_catalog_scanner_contract(catalog)
-        # Keep validating the deprecated option for typo detection, but every
-        # catalog legacy value participates automatically.
-        resolve_legacy_exemptions(
-            catalog,
-            synthetic_secret_exemptions,
-        )
         selected_exemptions = catalog.legacy_exemptions
         authoring_values = accepted_authoring_values(catalog)
         accepted_values = authoring_values + accepted_legacy_values(

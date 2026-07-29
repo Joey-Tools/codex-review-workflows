@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "profile": "validate-read-only-pr-report",
+  "external_trust_root": {
+    "path": "scripts/named_lane_guard",
+    "authority": "prior-trusted-canonical-bundle"
+  },
+  "loader": {
+    "path": "scripts/named_lane_guard",
+    "profile_version": 1,
+    "python_flags": [
+      "-I",
+      "-B",
+      "-S"
+    ],
+    "runtime": "scripts/review_runtime/read_only_report_guard.py",
+    "runtime_version": 1,
+    "schema_evaluator": "closed-draft-2020-12-v1"
+  },
+  "control_sources": [
+    {
+      "path": "scripts/review_runtime/__init__.py",
+      "role": "runtime-package",
+      "sha256": "ee5b564d67a63b53ba44532ea95416407700f66651699705be1cc5f9305a3ba0"
+    },
+    {
+      "path": "scripts/review_runtime/catalog_bootstrap.py",
+      "role": "binding-runtime",
+      "sha256": "71a22341899557fbccffb3ae0c0f17a2247eb2a02e0b73a3188ba5e593204194"
+    },
+    {
+      "path": "scripts/review_runtime/read_only_report_guard.py",
+      "role": "report-guard-runtime",
+      "sha256": "1d72d4d6080f54a495ab9cbd0136b70e6e95dd33299cc40c8de5dab88ed5ff43"
+    }
+  ],
+  "artifacts": [
+    {
+      "path": "references/pr-readiness-read-only-report.schema.json",
+      "role": "schema",
+      "sha256": "cceaa974d37529033343861abd4aa6f675797c36b4e568f438804ccb11128d81"
+    },
+    {
+      "path": "scripts/read_only_pr_report.py",
+      "role": "receiver",
+      "sha256": "478340f171e4b3c501fa2ea429383970ae3c72af035b4ff67efc9e531fa66636"
+    }
+  ]
+}

@@ -52,18 +52,27 @@ from review_runtime import (  # noqa: E402
     claude_refresh_lock,
     common,
     providers,
+    synthetic_tokens,
     workspace as workspace_runtime,
 )
 from review_runtime.common import Completed, ReviewError  # noqa: E402
 from review_runtime.workspace import ReviewWorkspace  # noqa: E402
 
 
+_SYNTHETIC_CATALOG = synthetic_tokens.load_catalog()
+
+
+def _catalog_fixture(token_id: str, *, role: str, state: str) -> str:
+    token = _SYNTHETIC_CATALOG.authoring_token(token_id)
+    if (token.role, token.state) != (role, state):
+        raise RuntimeError(f"synthetic catalog metadata changed for {token_id}")
+    return token.value.decode("ascii")
+
+
 FIXTURES = {
-    item.identifier: item.value.decode("ascii")
-    for item in workspace_runtime.accepted_authoring_values(
-        workspace_runtime.load_catalog()
-    )
-    if item.identifier in {"access-a", "api-key-a"} and item.value is not None
+    "access-a": _catalog_fixture("access-a", role="access", state="active"),
+    "api-key-a": _catalog_fixture("api-key-a", role="api-key", state="active"),
+    "bearer-a": _catalog_fixture("bearer-a", role="bearer", state="active"),
 }
 
 
@@ -125,8 +134,6 @@ EMPTY_CLAUDE_EXECUTABLE_EVIDENCE = providers.ClaudeExecutableTrustEvidence(
     bundled_root_certificates=b"",
     bundled_root_sha256_fingerprints=frozenset(),
 )
-# Synthetic catalog ID: api-key-a (joey-private-v3).
-SYNTHETIC_API_KEY_A = "codex_synth_v1_api_key_a"
 
 
 def publish_thread_start_fixture(
@@ -36330,7 +36337,7 @@ class ProviderPolicyTest(unittest.TestCase):
     @mock.patch.object(
         providers,
         "_review_environment",
-        return_value={"ANTHROPIC_API_KEY": SYNTHETIC_API_KEY_A},
+        return_value={"ANTHROPIC_API_KEY": FIXTURES["api-key-a"]},
     )
     @mock.patch.object(
         providers,
@@ -36432,7 +36439,7 @@ class ProviderPolicyTest(unittest.TestCase):
     @mock.patch.object(
         providers,
         "_review_environment",
-        return_value={"ANTHROPIC_API_KEY": SYNTHETIC_API_KEY_A},
+        return_value={"ANTHROPIC_API_KEY": FIXTURES["api-key-a"]},
     )
     @mock.patch.object(
         providers,
@@ -37431,7 +37438,7 @@ class ProviderPolicyTest(unittest.TestCase):
     @mock.patch.object(
         providers,
         "_review_environment",
-        return_value={"ANTHROPIC_API_KEY": SYNTHETIC_API_KEY_A},
+        return_value={"ANTHROPIC_API_KEY": FIXTURES["api-key-a"]},
     )
     @mock.patch.object(
         providers,
@@ -37483,7 +37490,7 @@ class ProviderPolicyTest(unittest.TestCase):
     @mock.patch.object(
         providers,
         "_review_environment",
-        return_value={"ANTHROPIC_API_KEY": SYNTHETIC_API_KEY_A},
+        return_value={"ANTHROPIC_API_KEY": FIXTURES["api-key-a"]},
     )
     @mock.patch.object(
         providers,
@@ -53024,9 +53031,8 @@ class ProviderPolicyTest(unittest.TestCase):
     def test_claude_explicit_authentication_selects_one_immutable_winner(
         self,
     ) -> None:
-        # Synthetic catalog IDs: api-key-a and bearer-a (joey-private-v3).
-        api_key = "codex_synth_v1_api_key_a"
-        oauth_token = "codex_synth_v1_bearer_a"
+        api_key = FIXTURES["api-key-a"]
+        oauth_token = FIXTURES["bearer-a"]
 
         selected = providers._select_claude_authentication(
             {
@@ -53072,9 +53078,8 @@ class ProviderPolicyTest(unittest.TestCase):
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", selected)
 
     def test_claude_oauth_bypasses_macos_local_login_transaction(self) -> None:
-        # Synthetic catalog ID: bearer-a (joey-private-v3).
         env = {
-            "CLAUDE_CODE_OAUTH_TOKEN": "codex_synth_v1_bearer_a",
+            "CLAUDE_CODE_OAUTH_TOKEN": FIXTURES["bearer-a"],
             "PATH": "/usr/bin",
         }
         self.assertEqual(

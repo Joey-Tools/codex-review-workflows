@@ -16,6 +16,9 @@ from .common import ReviewError
 
 
 CATALOG_PATH = pathlib.Path(__file__).with_name("synthetic-token-catalog.json")
+# A manifest-bound loader may set this only on its private raw-source module
+# instance. Ordinary CLI execution leaves it unset and reads CATALOG_PATH.
+BOUND_CATALOG_BYTES: bytes | None = None
 CATALOG_SCHEMA_VERSION = 1
 MAX_CATALOG_BYTES = 64 * 1024
 MAX_AUTHORING_TOKENS = 128
@@ -592,6 +595,10 @@ def _read_catalog_file(path: pathlib.Path) -> bytes:
 
 
 def load_catalog() -> SyntheticTokenCatalog:
+    if BOUND_CATALOG_BYTES is not None:
+        if type(BOUND_CATALOG_BYTES) is not bytes:
+            raise ReviewError("bound synthetic token catalog must use exact bytes")
+        return parse_catalog_bytes(BOUND_CATALOG_BYTES)
     return parse_catalog_bytes(_read_catalog_file(CATALOG_PATH))
 
 
@@ -658,29 +665,4 @@ def authoring_metadata(catalog: SyntheticTokenCatalog) -> list[dict[str, Any]]:
             "value_sha256": token.value_sha256,
         }
         for token in sorted(catalog.authoring_tokens, key=lambda item: item.identifier)
-    ]
-
-
-def legacy_metadata(catalog: SyntheticTokenCatalog) -> list[dict[str, Any]]:
-    return [
-        {
-            "id": exemption.identifier,
-            "match": exemption.match,
-            "repository": exemption.repository,
-            "values": [
-                {
-                    "containing_commit": token.containing_commit,
-                    "id": token.identifier,
-                    "rule": token.rule,
-                    "source_occurrences": token.source_occurrences,
-                    "value_sha256": token.value_sha256,
-                    "value_length": token.value_length,
-                }
-                for token in sorted(exemption.values, key=lambda item: item.identifier)
-            ],
-            "verified_master_tip": exemption.verified_master_tip,
-        }
-        for exemption in sorted(
-            catalog.legacy_exemptions, key=lambda item: item.identifier
-        )
     ]

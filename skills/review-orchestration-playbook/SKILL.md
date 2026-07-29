@@ -17,6 +17,117 @@ These are the only meanings of the named review shapes. Count completed logical 
 
 PR readiness means the effective review shape plus CI, unresolved-conversation, base/head, and merge-policy checks. It does not add a hidden reviewer lane.
 
+### Delivery read-only probe receiver
+
+An inbound delivery record whose exact `handoff_profile` is
+`pr-readiness-read-only-probe` is a terminal evidence probe, not PR readiness,
+a named review, or a generic PR/full-workflow request. Classify this structured
+handoff before every prose-based PR/review rule below. Validate the complete
+record against the receiver schema's self-contained closed delivery-v3
+definition, preserve its constraints and mutation ceilings, and fail closed
+rather than falling through when the record is missing, unknown,
+non-ready, or contradictory. The formal receiver never resolves an external
+delivery-schema path or loads candidate-head control bytes.
+
+The receiver may take read-only snapshots only of existing-PR selection,
+lifecycle, CI status, conversation state, and exact base/head evidence. It must
+not start a Codex or Claude local lane, materialize a lane workspace, run
+secret admission or the low-level helper, request GitHub Codex, post a comment,
+wait or poll, write authentication/cache/state, mutate local or remote state,
+or enter the ordinary readiness/fix loop. If an evidence read cannot be proved
+non-mutating, record that evidence as unavailable or blocked.
+
+Return the closed terminal
+[`pr-readiness-read-only-report`](references/pr-readiness-read-only-report.schema.json)
+record and stop. Before the first read, generate fresh in-memory report,
+target, snapshot, and observation identifiers; never reuse identifiers or
+target metadata from an earlier report. A report whose selection is
+unavailable uses the real `pre-target-blocked` terminal with provider,
+repository, and exact current query-head identity but no invented PR/base. A
+selected PR whose base read is unavailable uses `target-resolution-blocked`,
+retains that PR and current head, and omits only the unresolved base. Only
+`target-snapshot` carries the complete repository/PR/base/head target.
+
+Each observed evidence kind contains exactly one closed kind-specific record
+whose report, target, and snapshot bindings equal the enclosing instance;
+unavailable or blocked kinds contain none. Invoke the parent-validated,
+previously trusted bundle's absolute
+`named_lane_guard validate-read-only-pr-report -` profile once through the
+canonical Python `-I -B -S` launcher. Its machine control manifest binds the
+loader/profile version and exact SHA-256 of the three-source runtime closure,
+[`read_only_pr_report.py`](scripts/read_only_pr_report.py), and the closed
+schema-v8. The prior-trusted canonical bundle manifest is the external trust
+root for `named_lane_guard` itself; the guard validates its fixed machine
+manifest digest and every listed source digest before compiling any profile
+runtime. The profile retains descriptor-bound control/receiver/schema bytes,
+raw-compiles only the retained receiver, injects only the retained schema,
+applies its stdlib-only closed Draft 2020-12 evaluator first, and then runs
+cross-field semantics. It withholds acceptance until terminal content,
+object-identity, ancestor-entry, and non-owner-mutation access-policy
+revalidation succeeds. A direct receiver `validate-report` call lacks trusted
+bindings and fails closed; no executable semantic-only report entrypoint
+exists. Candidate copies may run ordinary implementation tests, but a
+self-policy migration uses the previous trusted release and activates this
+profile only after merge, release, and canonical-manifest verification. It rejects
+cross-report splicing and contradictory selection, lifecycle, CI,
+conversation, or endpoint evidence. The target binds provider, immutable
+repository and PR identities, base ref, current head repository/ref/OID, and
+every selection, lifecycle, CI, and conversation observation repeats the
+applicable target identity exactly. A stale green CI result or cross-PR record
+therefore cannot be spliced into the current report. Report schema v8
+requires a no-cache, read-only stable double-scan for each CI and review-thread
+connection. Independently reread provider `headRefOid` before the primary scan
+and after the verification scan, return that head with every page, and bind
+each page to its exact connection, report snapshot binding and observation ID,
+scan role, server total, page boundary, and ordered flat-list slice. Generate
+page digests only through the same-release
+`page-digest` entrypoint; `scan_role` is part of the canonical bytes, so the
+two roles intentionally have different digests while their role-neutral
+projections and complete ordered lists must match.
+The verification scan repeats the complete ordered content, and each
+role-specific digest must validate before its total, page boundaries, cursors,
+role-neutral projection, and ordered list can match under the same repository,
+PR, and head. Conversation evidence
+contains the complete paginated review-thread list with immutable Node IDs and
+raw `is_resolved` values; totals and unresolved counts are recomputed from that
+list. Any content, order, cursor, target, or mid-pagination total drift makes
+the evidence unavailable rather than observed. Each connection acquisition is
+also limited to 22 provider calls and a 60-second monotonic deadline; partial
+or over-budget scans are unavailable/blocked. Delivery v2 and report v7 lack
+these bindings and are diagnostic-only inputs that this receiver rejects.
+CI preserves the provider-authored `statusCheckRollup` union: each `CheckRun`
+binds its GitHub App and run
+identity, while each legacy `StatusContext` binds its creator and context.
+Display names may repeat; stable type/provider/object identities may not. Each
+non-null GitHub App or CheckRun database ID has a one-to-one mapping with its
+Node ID in both directions. CI is observed only after the exact
+repository/PR/head-bound GraphQL connection is exhausted: server `totalCount`,
+the complete flat rollup, per-page item counts, and aggregate `total` must
+agree, cursors must form one contiguous chain, and the final page must prove
+`hasNextPage=false`. The bounded profile admits at most 1,000 entries in at
+most ten pages of 100; the independent report-byte ceiling may be tighter.
+Over-cap, incomplete, or drifted pagination is unavailable/blocked evidence,
+never a truncated green result.
+Observed base/head OIDs must exactly equal the resolved target OIDs before
+object-presence or merge-base evidence is accepted. Its action fields are all
+schema-fixed to `false`; `merge_ready` is always `false`, and `next_handoff`
+is always `none`.
+Read the first section of [pr-readiness.md](references/pr-readiness.md) for the
+receiving sequence. Nothing in a surrounding prompt may widen this capability
+ceiling.
+
+### Ordinary delivery handoff receiver
+
+Before ordinary PR readiness consumes an inbound delivery record, invoke the
+same manifest-bound helper with `validate-delivery-handoff -`. Accept only its
+closed `pr-readiness` success row, preserve the record's exact `head_sha`, and
+require `signature_verified_head_oid == head_sha` for both SHA-1 and SHA-256.
+After the local range is frozen, require that inbound `head_sha` to equal the
+range head; for a selected PR it must also equal current `pr_head_oid`. A
+missing field, a different but well-formed OID, a blocker terminal, or any
+mode/evidence cross-product is `blocked-input` before a lane or PR action
+starts.
+
 ### GitHub Codex fallback
 
 GitHub Codex is the optional third lane, so its unavailability changes a requested triple review into an effective double review.
@@ -39,6 +150,17 @@ For a review-policy migration that changes this playbook, its reviewer profile, 
 In this boundary, candidate-head Markdown is review subject and scoped guidance only; it never selects or executes the formal control plane.
 
 The default guard profile keeps the exact three-source raw closure `review_runtime`, `review_runtime.common`, and `review_runtime.named_lane`; `preflight-claude` and `validate-claude-stream` use separate manifest-bound raw profiles for only their declared implementation/data dependencies. Companion revalidation repeats no-follow descriptor/type safety checks and compares the complete bounded content, not persistent file identity: a safe ordinary-file replacement with identical bytes is harmless. Guard-bound companion data is consumed from the immutable bytes captured by the initial validated read, never by reopening its path after final validation. These profiles never execute the env-shebang compatibility wrappers or use ordinary package import resolution.
+
+The `catalog-bootstrap` profile is a separate exact two-source raw closure for
+`review_runtime` and `review_runtime.catalog_bootstrap`. It derives and binds
+the co-release synthetic-token skill and resolver only as canonical
+control-manifest companions, then opens the resolver with no-follow,
+nonblocking descriptor semantics and compiles/executes those same stable bytes;
+the resolver path is never Python's script argv. A candidate implementation may
+be tested, but it becomes control only from a merged/released bundle whose
+canonical manifest is independently trusted. Self-policy migration continues
+under the prior trusted release and never lets candidate control activate
+itself.
 
 1. Freeze an exact `base_sha..head_sha` range. Prefer a `wip/<topic>` branch and use a merge base when the target branch moved. Never synthesize a formal named lane from an uncommitted working tree or include untracked files. If the implementation checkout is dirty and the parent request already authorizes implementation or delivery mutations, create an intentional review-anchor commit on that review branch first. For a standalone report-only named review, do not create a branch or commit. When the intended review scope includes dirty or untracked state that no committed range represents, report review preparation as `blocked-authorization` and ask for an existing committed range or explicit authorization to create the anchor; use `blocked-input` instead for a clean checkout whose required range/PR/target selector is absent.
 2. Materialize a separate lane-private Git workspace at `head_sha` only through the parent-recorded trusted guard's `materialize-worktree` subcommand. The resolved fixed-path Git executable is a declared parent trust root; before any safe `-c` override, the guard requires it to report version 2.45.0 or newer, without claiming to validate its publisher or on-disk identity. Older or unverified versions are `blocked-safety`. Before import, the guard requires the source worktree root, exact `.git` marker, and resolved admin/common/object directories to agree, then binds the marker by device, inode, file type, and owner and retains the resolved control-directory identities; a linked-worktree gitfile must keep both its forward `gitdir:` target and the admin directory's back-pointer bound to that exact marker. Control-file reads use no-follow, nonblocking descriptor opens followed by regular-file, owner, and stable-identity checks, and every storage revalidation rereads both linked directions. Marker `mtime`, `ctime`, and `nlink` are not identity or content checks, so benign churn in those fields is accepted while identity, type, owner, and forward/back targets remain exact. It rejects sibling `.bundle` / `.git` suffix discovery, initializes an empty owner-private destination, and exposes only the validated source object directory as a temporary read-only alternate under the destination's isolated configuration. The guard enumerates the exact frozen base/head reachable closure, hard-bounds object count, reachable logical bytes, head entry/blob/path bytes, and compressed pack bytes, imports only that manifest through bounded `pack-objects --no-use-bitmap-index` plus strict `index-pack`, removes the alternate environment, and proves the destination object inventory equals the frozen closure. The materializer and validator share one path-bearing Git raw-output envelope derived from 100,000 entries, 64 MiB of aggregate path bytes, and the 40-byte SHA-1 or 64-byte SHA-256 object-ID width; that derived ceiling bounds materializer `ls-tree` and validator `ls-tree`/`ls-files`/`status` output. Source configuration, hooks, and refs are never loaded into the destination; source/target ancestor discovery is fenced, ambient system/global config and attributes are disabled, no hardlinked or persistent alternate/promisor dependency or remote transport is allowed, and hooks, fsmonitor, submodule recursion, executable filters, and external diff commands stay disabled before repository initialization or checkout. It forces and persists Git-false commit-graph/multi-pack-index consumption, rejects source pack `.bitmap` before object traversal and target pack `.bitmap` at each private-storage audit, runs a bounded full object-validity `fsck` over the frozen endpoints, and rejects shallow, partial, incomplete, unexpectedly configured, or unsafe repositories before detached no-submodule checkout under the same sanitized direct argv. `git worktree add`, any clone/fetch/upload-pack path, a copied source config/hooks directory, and every pre-guard `git status`, `diff-files`, or `diff-index` are forbidden. If the trusted prior bundle lacks this subcommand during a self-policy migration, use that bundle's prior policy only for the bootstrap review, merge and release the migration, and activate `materialize-worktree` only from the resulting trusted release.
@@ -110,6 +232,14 @@ The shipped guard supplies only pre-status isolated workspace materialization, t
 ## Workflow
 
 1. Classify the request.
+   - First inspect any structured delivery handoff. Exact
+     `handoff_profile: pr-readiness-read-only-probe` takes precedence over
+     generic PR/full-workflow language and every named-review classification.
+     Validate it through the delivery and terminal-report schemas, execute only
+     the read-only receiving path above, emit its terminal report, and do not
+     continue to steps 2-9. An invalid or widened record is a terminal
+     `blocked-input`, not permission to reinterpret the prose and start an
+     ordinary PR/readiness or review flow.
    - A review-only child that explicitly forbids orchestration inspects its assigned range and returns findings only. It must not start other reviewers, edit code, wait for CI, or mutate the PR.
    - Resolve a standalone named review deterministically: preserve an explicit frozen range for local lanes; independently select an explicitly named PR or exactly one open PR associated with the exact current head repository/branch when PR-specific/triple work needs one. An explicit-range-only single/double is fully scoped locally and requires no PR probe. More than one required PR candidate leaves the GitHub/PR-specific lane `blocked-input` until the caller names a PR; a frozen range does not select among them, although fully scoped local lanes may run. An authenticated complete zero-candidate lookup proves the no-PR path, but does not supply a local review range: require an explicit committed range or explicitly named target/base from which to freeze `<merge_base>..HEAD`; never guess the target/base. For triple, detached HEAD or unknown head ownership without an explicit PR cannot prove no PR: run the scoped local lanes, but report the GitHub lane `blocked-input` and `effective: triple-inconclusive`, not effective double. Once a PR is selected, independently validate its current base/head metadata and unique merge base; a caller-provided range does not become whole-PR scope merely because its head matches.
    - A standalone named review request is report-only unless the user also asks to fix or deliver the change. It does not authorize branch creation, an anchor commit, push, PR creation, or PR branch/metadata changes. A clean checkout with a missing selector is `blocked-input`; reserve `blocked-authorization` for intended dirty/untracked state that would require an unauthorized anchor commit. Bare triple additionally authorizes only the scoped `@codex review` request on an already-existing supported PR. If no PR exists and an explicit committed local range is available, run the requested local lanes and reduce requested triple to effective double. If a PR exists but its host, identity, integration, or service is directly known unavailable, retain the existing-PR head-alignment preflight before running the effective double. The parent prepares the requested lanes and returns findings; it does not edit code, start delivery gates, or enter a fix loop on its own.
@@ -155,6 +285,12 @@ The `isolated_review` helper retains a frozen supplied-diff runtime backed by a 
 - Do not use its Codex path to satisfy single review.
 - Do not count a supplied-diff helper run as the Claude Code lane of a named double/triple review.
 - Do not add helper preflight, fallback, or retry attempts to the review count.
+- The helper has no synthetic-token authoring surface:
+  `isolated_review synthetic-tokens ...` and direct
+  `scripts/synthetic_catalog_entry` execution are rejected before catalog
+  loading or output. Authoring is available only through the loaded active
+  release's manifest-bound `synthetic-token-fixtures` `catalog-bootstrap`
+  flow with the captured expected binding digest.
 - The independent Codex supervisor never hands a child a naked retention-lock descriptor. Every handoff transfers the locked file, retention-root, and attempt-directory descriptors together with the root/path, lock identity/token, and durable `attempt_directory_binding`; the receiver revalidates the complete binding before reading or committing state. Phase and settlement helpers remain descriptor-relative to that attempt binding, and quarantine cleanup succeeds only after the original attempt name is rechecked absent.
 - Its filesystem race checks are property-scoped. Directory `device`/`inode` protect object identity and type/owner/mode plus a fresh ACL/xattr read protect access policy; directory size, link count, and timestamps are ignored because ordinary child-entry churn can change them. A permitted ACL-bearing directory may therefore change ctime while child entries change, but replacement, owner/mode drift, or a different ACL/xattr policy fails. Single-link regular-file device/inode/mode/owner protect object identity and access policy, while bounded exact reread or digest protects content stability; timestamps alone are never content evidence. Exact absence, identity/policy mismatch, and unreadable or failed revalidation remain separate outcomes.
 - Before the raw checkout invokes Git, it no-follow reads the source common config and the selected linked worktree's `config.worktree`, rejects every direct `include`/`includeIf`, and rejects same-inode byte drift by exact reread. Git never consumes those mutable source configs afterward. Every source query uses a fresh private generated bare control view, while linked-worktree creation, index initialization, cleanup, and recovery use one attempt-private control view whose root identity, exact read-only config identity/bytes, and access policy are durably bound before `git worktree add --lock`. System/global config is fixed to `/dev/null`, command-scope config is fixed, the generated config omits `extensions.worktreeConfig`, and no Git command uses the source common Git directory or linked registration as its config-discovery `GIT_DIR`. The source object directory retains a device/inode/type/owner/mode binding before each Git launch; child-object churn is allowed, while object-directory replacement or access-policy drift fails. Raw object IDs and blob digests, not directory metadata, protect selected content. Missing, unreadable, policy mismatch, and revalidation mismatch remain distinct config outcomes. Every fresh query control is a canonical direct child of its owner-private recovery root: the retention root before an attempt exists and the attempt directory afterward. A closure failure carries its private-control cleanup owner and retained path into one bounded retry; successful closure runs that cleanup and releases deferred signal ownership only after closure is proved. If retry remains incomplete, the process owner no-replace publishes an owner-only canonical recovery receipt before IPC completion and deferred-signal release. The receipt binds the phase token, exact owner PID/start identity, exact Git PID/PGID/start identity when anchored, and a bounded list containing only direct-child `codex-git-control-*` paths; the list is empty when the already bound attempt-private control is the only recovery locator. A pre-attempt receipt is stored inside the retained control root and returned as structured recovery metadata. Checkout, prequiescence-abort cleanup, and final-cleanup receipts use the fixed attempt-private receipt path. After closure/receipt handling, the outer path first completes custody and child-supervisor quiescence, then forces the deferred-signal checkpoint before any prequiescence state or worktree mutation; a closure created inside prequiescence cleanup checkpoints immediately after its fixed receipt. The worker failure record and the attempt supervisor's non-success terminal summary use closed schemas. The parent reaps the worker before validating either the IPC record or durable receipt; malformed, missing, conflicting, or publication-failed evidence remains an explicit closure gap and disables later worktree mutation or cleanup. After the exact attempt supervisor is reaped with exit 2, the outer supervisor derives the result only from the current nonterminal durable attempt state and fixed receipt even when terminal IPC is missing or malformed; damaged IPC never supplies authority. Exit-0/1 still requires an exact terminal envelope whose summary equals durable terminal state. The per-attempt lock-reason token lets recovery adopt only the exact locked private registration after a crash.
@@ -196,7 +332,11 @@ The `isolated_review` helper retains a frozen supplied-diff runtime backed by a 
 - [validate_claude_stream.py](scripts/validate_claude_stream.py): required bounded strict preflight-bound raw-JSONL validator loaded by the formal guard `validate-claude-stream` profile; its direct CLI is compatibility-only.
 - [review_result.py](scripts/review_runtime/review_result.py): canonical post-acceptance review-result disposition helper, executed only through the manifest-bound `classify-review-result` guard profile; it preserves the raw result and separates semantic outcome from presentation.
 - [named_claude_preflight](scripts/named_claude_preflight): compatibility wrapper for the required publisher-first compatible-version and advertised-capability selector loaded by the formal guard `preflight-claude` profile.
+- [read_only_pr_report.py](scripts/read_only_pr_report.py): closed delivery-handoff validator plus fresh instance-binding generator and manifest-bound schema/semantic receiver for terminal read-only PR probe reports.
+- [read_only_report_guard.py](scripts/review_runtime/read_only_report_guard.py): `-S`-compatible transaction runtime behind the trusted `validate-read-only-pr-report` guard profile.
+- [read-only-pr-report-control-manifest.json](references/read-only-pr-report-control-manifest.json): machine binding for the report guard profile, complete runtime-source closure, receiver, and schema digests; the prior-trusted canonical bundle remains the external guard trust root.
 - [pr-readiness.md](references/pr-readiness.md): PR authorization, current-head GitHub Codex, CI/comments, fix loop, and merge-ready reporting.
+- [pr-readiness-read-only-report.schema.json](references/pr-readiness-read-only-report.schema.json): closed terminal result for the delivery read-only PR evidence probe.
 - [review-prompt-templates.md](references/review-prompt-templates.md): fresh-context prompt templates.
 - [github-pr-probes.md](references/github-pr-probes.md): bounded `gh` probes.
 - [egress-consent.md](references/egress-consent.md): scoped review egress authorization.

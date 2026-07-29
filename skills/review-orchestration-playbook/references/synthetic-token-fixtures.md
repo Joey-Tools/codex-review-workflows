@@ -5,7 +5,7 @@
 - [Authority And Threat Model](#authority-and-threat-model)
 - [Catalog Schema](#catalog-schema)
 - [Authoring Pool](#authoring-pool)
-- [Legacy Compatibility](#legacy-compatibility)
+- [Historical Exact Values](#historical-exact-values)
 - [Unified Exact-Secret Admission](#unified-exact-secret-admission)
 - [Read-Only CLI](#read-only-cli)
 - [Admission Evidence](#admission-evidence)
@@ -47,32 +47,27 @@ The version 1 root retains this compatibility shape:
 
 Authoring roles are `access`, `refresh`, `id`, `api-key`, and `bearer`. States are `active`, `expired`, and `consumed`. IDs and values must be unique; values may not be equal, prefix-related, or substring-related. An authoring value may not occur inside public catalog metadata. Values use only the scanner-compatible ASCII byte set `A-Z`, `a-z`, `0-9`, and `-_./+=!@#$%^&*?~:;`. On every load, the helper runs each entry through the real scanner in canonical quoted and unquoted assignments and requires exactly one acceptance under its declared rule.
 
-Existing version 1 catalogs may still contain `legacy_exemptions` records with `value_base64`, provenance, and source-count metadata. Those fields are retained only for file-format and CLI compatibility. The helper automatically decodes every valid legacy `value_base64` solely to recover its historical exact raw candidate; no CLI selection is required. It must not derive or search for that Base64 storage text, another encoding, or any transformed variant. No new admission policy depends on an envelope, selected ID, containing commit, unembedded count, or provenance record.
+Existing version 1 catalogs may still contain `legacy_exemptions` records with `value_base64`, provenance, and source-count metadata. Those fields are retained only for file-format compatibility. The helper automatically decodes every valid legacy `value_base64` solely to recover its historical exact raw candidate. It must not derive or search for that Base64 storage text, another encoding, or any transformed variant. No selection or provenance-audit surface exists, and no new admission policy depends on an envelope, selected ID, containing commit, unembedded count, or provenance record.
 
 ## Authoring Pool
 
-The public catalog activates a versioned example pool covering:
-
-| Stable ID | Role | State |
-| --- | --- | --- |
-| `access-a` | access | active |
-| `access-b` | access | active |
-| `access-expired` | access | expired |
-| `refresh-a` | refresh | active |
-| `refresh-b` | refresh | active |
-| `refresh-consumed` | refresh | consumed |
-| `id-a` | id | active |
-| `id-b` | id | active |
-| `api-key-a` | api-key | active |
-| `bearer-a` | bearer | active |
-
-Raw values are intentionally not duplicated in documentation. Use `synthetic-tokens list --json` for metadata and `synthetic-tokens get <id> --json` for one explicitly selected authoring value. There is no allocator, reservation, release, counter, suffix generator, or bulk raw-value listing.
+The public catalog carries a finite versioned authoring pool. Neither its stable
+ID inventory nor its raw values are duplicated in documentation. Use the
+active immutable release's manifest-bound `catalog-bootstrap` resolver action
+`list` for current metadata and action `get <id>` for one explicitly selected
+authoring value. Every action after `bind` requires the captured
+`--expect-binding-sha256`. There is no allocator, reservation, release, counter,
+suffix generator, or bulk raw-value listing.
 
 When authoring a fixture, reuse a project-recorded compatible ID. Otherwise select by role and state, sort compatible metadata by ID, and take the first entry. For `N` distinct credentials, take the first `N` distinct compatible IDs. Insert each selected value unchanged as the complete captured credential value.
 
-## Legacy Compatibility
+## Historical Exact Values
 
-`--synthetic-secret-exemption <id>` remains accepted only so old automation does not fail at argument parsing. It is deprecated, no longer required, and must not select a different scanner, counter, path rule, or admission outcome. `list-exemptions` and `audit-master` may continue to expose or verify historical compatibility metadata, but they do not create authority that an ordinary exact baseline lacks.
+Historical catalog records are file-format compatibility data only. Their exact
+decoded raw values automatically participate in the same complete-tree global
+count as other historical secrets. The helper exposes no legacy selection,
+listing, or pinned-master audit operation, and provenance metadata cannot
+authorize an admission outcome.
 
 Historical catalog values and unregistered exact secrets now use the same rule. A formerly selected legacy value does not retain:
 
@@ -115,22 +110,54 @@ A dynamic expression that cannot produce one stable exact byte value does not en
 
 A violation report lists only newly added locations for a candidate whose global count grows. Text additions use the one-based head line. New tracked paths and binary fallbacks use `line: null`; symlink targets use line `1`. Unchanged residual occurrences are omitted. If bounded diff evidence cannot map every detected local growth to an added location, `location_status` is `inconclusive` rather than inventing a line. In particular, endpoint Git trees do not record whether one of multiple identical head blobs was moved and another was copied; when local positive candidates exceed the authoritative global delta, the helper omits those ambiguous locations instead of trusting heuristic rename attribution. The secret-admission result controls only PR/master admission; a trusted Codex, Claude Code, or consent-gated Copilot reviewer still receives the original tracked diff and necessary context.
 
-## Read-Only CLI
+## Manifest-Bound Authoring Surface
 
-The helper exposes:
+The loaded active-release synthetic skill routes the three internal operations
+through `named_lane_guard catalog-bootstrap`:
 
 ```bash
-isolated_review synthetic-tokens validate
-isolated_review synthetic-tokens list --json
-isolated_review synthetic-tokens get <id> --json
-isolated_review synthetic-tokens list-exemptions --json
-isolated_review synthetic-tokens audit-master \
-  --repo <path> \
-  --ref <full-master-tip> \
-  --exemption <id>
+named_lane_guard catalog-bootstrap --loaded-skill-root <active-skill-root> bind
+named_lane_guard catalog-bootstrap --loaded-skill-root <active-skill-root> \
+  --expect-binding-sha256 <binding-sha256> validate
+named_lane_guard catalog-bootstrap --loaded-skill-root <active-skill-root> \
+  --expect-binding-sha256 <binding-sha256> list
+named_lane_guard catalog-bootstrap --loaded-skill-root <active-skill-root> \
+  --expect-binding-sha256 <binding-sha256> get <id>
 ```
 
-`list` returns authoring metadata only. `get` returns the raw value for exactly one selected authoring ID. `list-exemptions`, `audit-master`, and `--synthetic-secret-exemption` are deprecated compatibility surfaces. They may report historical IDs, provenance, digests, lengths, and counts without raw legacy values, but they must not alter the unified admission result.
+Invoke the guard with the absolute interpreter and mandatory `-I -B -S` flags
+specified by `synthetic-token-fixtures`; the shorthand above shows only the
+action contract. `list` returns authoring metadata only. `get` returns the raw
+value for exactly one selected authoring ID.
+
+Before the bootstrap compiles co-release resolver bytes, and before that
+resolver compiles catalog-runtime bytes, the responsible layer binds the full
+absolute ancestor chain and every release leaf through no-follow descriptors.
+The protected access property is narrow: no non-owner may write, append,
+delete, replace, add a child, change security, or take ownership. On macOS,
+descriptor-scoped extended ACLs are decoded against the owner UUID and any
+non-owner allow entry with a mutation right is rejected even when mode remains
+`0755` or `0644`; read-only, deny, and owner-only mutation entries remain
+valid. On Linux, descriptor-scoped `fstatfs` admits only ext2/3/4, XFS,
+Btrfs, F2FS, tmpfs, and ramfs, whose mode-only or POSIX ACL model reflects the
+effective ACL mask in group mode. NFS/NFSv4, CIFS/SMB, FUSE, ZFS, 9P,
+overlayfs, and unknown filesystem types fail closed because mode alone does
+not prove their ACL semantics or a stacked lower layer's access model.
+Access-policy inspection failures are neither missing-object nor
+identity-mismatch results and fail closed.
+
+BSD flags that alter write, unlink, namespace, or protected-data semantics are
+bound and must remain stable. Hidden, archived, tracked, compressed, and
+no-dump flags are ordinary metadata for this property and are not compared.
+Every retained leaf and ancestor descriptor is checked again after catalog
+execution and before buffered output is released; harmless timestamp,
+child-entry, read-only ACL, or deny-ACL churn does not masquerade as object or
+content replacement.
+
+`isolated_review synthetic-tokens ...` and direct
+`scripts/synthetic_catalog_entry` execution are unsupported and rejected before
+catalog loading or output. The entry remains an internal manifest companion
+whose bound snapshot is executed only by the resolver.
 
 ## Admission Evidence
 
@@ -146,15 +173,15 @@ Downstream users may replace the fixed authoring pool as part of a trusted insta
 
 Do not read a replacement from the reviewed repository, caller arguments, environment variables, or project instructions. A release overlay should copy the complete public skill first, replace only the predeclared catalog target with a regular file, reject symlinks and path traversal, validate the generated skill, and verify that generated catalog bytes equal the trusted replacement source.
 
-Existing legacy records may be retained temporarily for compatibility, but new historical baselines do not require catalog entries or envelopes.
+Existing historical records may be retained for file-format compatibility, but
+new historical baselines do not require catalog entries or envelopes.
 
 ## Migration Procedure
 
 1. New and pull-request-only fixtures must use the approved authoring pool.
 2. Stop adding legacy envelopes for ordinary historical secrets; the complete base tree is their baseline.
-3. Remove explicit `--synthetic-secret-exemption` selection from automation when compatibility permits.
-4. Keep old `list-exemptions` / `audit-master` consumers read-only while they migrate, and do not treat their metadata as admission authority.
-5. Delete obsolete legacy records once no supported compatibility consumer needs them.
-6. Run scanner, catalog, admission-counter, evidence, and CLI compatibility tests.
+3. Remove unsupported legacy-selection, exemption-listing, and pinned-master-audit calls from automation.
+4. Delete obsolete historical records once file-format recovery no longer needs them.
+5. Run scanner, catalog, admission-counter, evidence, and authoring-CLI tests.
 
 If a branch-only secret has already been published and increases the exact global count, replace it in the repository task. Clean published branch history only after explicit user authorization; never broaden reviewer-input or admission policy to avoid that repository-local repair.

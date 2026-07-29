@@ -187,92 +187,40 @@ def _secret_admission_repository_policy_files(
 
 
 class RepositoryContractTest(unittest.TestCase):
-    def test_change_delivery_resolves_one_version_per_toolchain(self) -> None:
+    def test_change_delivery_delegates_version_selection_and_isolation(self) -> None:
         skill = (
             SKILL_SCOPE_ROOT / "skills/change-delivery-workflow/SKILL.md"
         ).read_text(encoding="utf-8")
+        validation_environments = (
+            SKILL_SCOPE_ROOT
+            / "skills/change-delivery-workflow/references/"
+            / "validation-environments.md"
+        ).read_text(encoding="utf-8")
 
-        anchors = (
-            "每个 runtime/toolchain",
-            "采用单版本还是多版本形态",
-            "明确要求本地多版本验证",
-            "本次改动目标就是跨版本兼容性",
-            "才选择多版本形态",
-            "否则使用单版本形态",
-        )
-        cursor = 0
-        for anchor in anchors:
-            cursor = skill.index(anchor, cursor) + len(anchor)
-
-        single_version_anchors = (
-            "只按 authority/instruction/config 是否存在选择最高优先级来源",
-            "不预先判断其能否解析或是否兼容",
-            "the user 对本地验证版本的 instruction",
-            "repo-local policy 对本地验证版本的 instruction",
-            "version-selection config 或 pin",
-            "兼容性范围本身不算 version-selection pin",
-            "可用的 repo 常规 runner 或项目工具默认解析",
-            "本机已安装版本 inventory",
-            "只有当前 authority/config/runner/inventory 来源完全不存在时才检查下一个来源",
-            "选中来源后再解析并验证",
-            "选定 instruction 显式委托给一个具名 repo 机制",
-            "该机制属于选中来源的解析过程",
-            "若选中 installed inventory",
-            "canonical version ordering",
-            "满足项目约束的最高已安装版本",
-            "明确允许 prerelease",
-            "才把 prerelease 纳入候选",
-            "最终必须得到唯一且与项目约束兼容的版本",
-            "若选中来源内部冲突、无法唯一解析或不兼容",
-            "停止并报告 blocker，不得静默降级",
-            "将所选 version 及其来源固定用于同一轮验证并记录",
-        )
-        cursor = skill.index("单版本形态下")
-        for anchor in single_version_anchors:
-            cursor = skill.index(anchor, cursor) + len(anchor)
+        normalized = " ".join(skill.split())
+        for anchor in (
+            "user's instruction",
+            "repository policy",
+            "authoritative repository runner or version pin",
+            "internally contradictory",
+            "ambiguous",
+            "incompatible",
+            "fail closed instead of guessing or silently falling back",
+        ):
+            self.assertIn(anchor, normalized)
         self.assertIn(
-            "同一 runtime/toolchain 的最低支持版本和 CI matrix 本身不构成本地多版本门禁",
+            "[validation-environments.md](references/validation-environments.md)",
             skill,
         )
-        self.assertLess(skill.index("否则使用单版本形态"), skill.index("单版本形态下"))
-        self.assertIn("在多版本形态下", skill)
-        self.assertLess(skill.index("单版本形态下"), skill.index("在多版本形态下"))
-        multi_version_anchors = (
-            "只按 authority/instruction/declaration 是否存在选择最高优先级来源",
-            "不预先判断其是否能解析为有效集合",
-            "the user 或本次任务对本地多版本验证的 instruction",
-            "repo-local policy 对本地多版本验证的 instruction",
-            "repo 明确声明的 supported-version set",
-            "repo 的 CI matrix",
-            "只有当前 authority/instruction/declaration 完全不存在时才检查下一个来源",
-            "选中来源后再解析并验证",
-            "选定 instruction 显式委托给具名 repo 声明",
-            "该声明属于选中来源的解析过程",
-            "最终集合必须有限、非空、无重复且每个版本都与项目兼容",
-            "选定来源后不比较或合并其他较低优先级来源",
-            "较低优先级来源的不同集合不构成冲突",
-            "来源冲突仅指选中来源及其显式委托的解析过程内部",
-            "若选中来源内部冲突、只能得到开放范围或无法确定有限集合",
-            "停止并报告 blocker",
-            "不得根据本机已安装版本任意扩张集合",
-            "记录最终版本集合及其来源",
-        )
-        cursor = skill.index("在多版本形态下")
-        for anchor in multi_version_anchors:
-            cursor = skill.index(anchor, cursor) + len(anchor)
-        self.assertIn("只有 suite 已证明顺序复用安全时", skill)
-        self.assertIn("才可在同一 checkout 串行执行", skill)
-        self.assertIn("版本敏感的 checkout 产物、缓存或状态", skill)
-        self.assertIn("独立 worktree/cache/state", skill)
-        self.assertIn("或在版本间显式清理并重建", skill)
-        self.assertIn("无论使用一个还是多个 worktree", skill)
-        self.assertIn("为每次运行分配唯一值或命名空间", skill)
-        self.assertIn("否则必须跨所有 worktree 串行执行", skill)
-        self.assertIn("已证明为当前任务专属且可丢弃", skill)
-        self.assertIn("才可在版本间显式 clean/reset", skill)
-        self.assertIn("若状态为共享、所有权不清或不可安全丢弃", skill)
-        self.assertIn("需要额外权限时请求明确授权", skill)
-        self.assertIn("只有 checkout-local 与机器级资源都已证明隔离时才可并发", skill)
+        normalized_environments = " ".join(validation_environments.split())
+        for delegated_detail in (
+            "CI matrix",
+            "supported-version set",
+            "canonical version ordering",
+            "installed inventory",
+            "independent worktree, cache, and state roots",
+        ):
+            self.assertIn(delegated_detail, normalized_environments)
 
     def test_cleanup_only_legacy_0664_lock_migration_is_private_and_ordered(
         self,
@@ -1591,6 +1539,72 @@ class RepositoryContractTest(unittest.TestCase):
             private,
         )
 
+    def test_release_ci_profiles_cover_all_active_skill_helpers_and_suites(
+        self,
+    ) -> None:
+        profiles = {
+            "canonical": (
+                (CI_FIXTURE_ROOT / "canonical.yml").read_text(encoding="utf-8"),
+                "skills",
+            ),
+            "private": (
+                (CI_FIXTURE_ROOT / "private.yml").read_text(encoding="utf-8"),
+                "personal_codex/skills",
+            ),
+        }
+        for profile, (workflow, skill_prefix) in profiles.items():
+            with self.subTest(profile=profile):
+                normalized_workflow = " ".join(workflow.replace("\\\n", "").split())
+                for anchor in (
+                    "jsonschema==4.26.0",
+                    f"{skill_prefix}/synthetic-token-fixtures/scripts/active_catalog_binding.py",
+                    f"{skill_prefix}/change-delivery-workflow/tests",
+                    f"{skill_prefix}/synthetic-token-fixtures/tests",
+                    "Seal hosted macOS Python framework parent",
+                    "test ! -L /Library/Frameworks/Python.framework/Versions",
+                    "test ! -L /Library/Frameworks/Python.framework/Versions/3.10",
+                    "test ! -L /Library/Frameworks/Python.framework/Versions/3.10/bin",
+                    "sudo /bin/chmod go-w /Library/Frameworks/Python.framework/Versions",
+                    "sudo /bin/chmod go-w /Library/Frameworks/Python.framework/Versions/3.10",
+                    "sudo /bin/chmod go-w /Library/Frameworks/Python.framework/Versions/3.10/bin",
+                ):
+                    self.assertIn(anchor, workflow)
+                platform_job_start = workflow.index("  platform_tests:")
+                platform_job_end = workflow.index(
+                    "\n  broker_reproducibility:",
+                    platform_job_start,
+                )
+                platform_job = workflow[platform_job_start:platform_job_end]
+                setup_python = platform_job.index("- uses: actions/setup-python@v5")
+                seal = platform_job.index(
+                    "- name: Seal hosted macOS Python framework parent"
+                )
+                first_python_or_repo_code = min(
+                    platform_job.index("python3", setup_python),
+                    platform_job.index(f"{skill_prefix}/", setup_python),
+                )
+                self.assertLess(setup_python, seal)
+                self.assertEqual(
+                    platform_job.index("\n        run:", setup_python),
+                    platform_job.index("\n        run:", seal),
+                )
+                self.assertLess(seal, first_python_or_repo_code)
+                self.assertIn('if [[ "$RUNNER_OS" == "Linux" ]]; then', workflow)
+                self.assertIn(
+                    (
+                        "/usr/bin/python3 -m unittest discover "
+                        f"-s {skill_prefix}/synthetic-token-fixtures/tests"
+                    ),
+                    normalized_workflow,
+                )
+                self.assertIn(
+                    "setup-python is rooted under the hosted runner's writable /opt.",
+                    workflow,
+                )
+
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertEqual(workflow, profiles[CI_PROFILE][0])
+
     def test_completed_trust_port_journal_uses_current_claude_range(self) -> None:
         if CI_PROFILE != "canonical":
             self.skipTest("completed canonical project journal is not mirrored")
@@ -2221,10 +2235,6 @@ class RepositoryContractTest(unittest.TestCase):
         repository_policy = _repository_agents_path(REPO_ROOT, CI_PROFILE).read_text(
             encoding="utf-8"
         )
-        delivery = (
-            policy_scope_root / "skills/change-delivery-workflow/SKILL.md"
-        ).read_text(encoding="utf-8")
-
         documents = {
             "skill": skill,
             "lane contracts": contracts,
@@ -2233,7 +2243,6 @@ class RepositoryContractTest(unittest.TestCase):
             "PR readiness": readiness,
             "reviewer profile": reviewer,
             "repository policy": repository_policy,
-            "delivery entrypoint": delivery,
         }
         if CI_PROFILE == "canonical":
             documents["README"] = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
@@ -2475,7 +2484,6 @@ class RepositoryContractTest(unittest.TestCase):
             egress,
             agents_policy,
             interface,
-            delivery,
         )
         for content in identity_documents:
             self.assertIn("github.com", content)
@@ -2511,7 +2519,6 @@ class RepositoryContractTest(unittest.TestCase):
                 egress,
                 agents_policy,
                 interface,
-                delivery,
             ):
                 with self.subTest(payload_anchor=anchor):
                     self.assertIn(anchor, content)
@@ -2523,13 +2530,24 @@ class RepositoryContractTest(unittest.TestCase):
             egress,
             agents_policy,
             interface,
-            delivery,
         ):
             with self.subTest(payload_failure_contract=content[:40]):
                 lowered = content.lower()
                 self.assertIn("missing", lowered)
                 self.assertIn("ambiguous", lowered)
                 self.assertIn("triple-inconclusive", lowered)
+        self.assertIn("$review-orchestration-playbook", delivery)
+        self.assertIn(
+            "The review skill owns target authorization, PR selection and lifecycle",
+            delivery,
+        )
+        for provider_detail in (
+            "chatgpt-codex-connector",
+            "complete terminal provider-authored",
+            "triple-inconclusive",
+            "headRefOid",
+        ):
+            self.assertNotIn(provider_detail, delivery)
         if CI_PROFILE == "canonical":
             for content in (
                 (REPO_ROOT / "README.md").read_text(encoding="utf-8"),
@@ -3573,29 +3591,34 @@ class RepositoryContractTest(unittest.TestCase):
         change_delivery = (
             SKILL_ROOT.parent / "change-delivery-workflow/SKILL.md"
         ).read_text(encoding="utf-8")
+        normalized_change_delivery = " ".join(change_delivery.split())
 
-        for content in (skill, contracts, reviewer, change_delivery):
+        for content in (skill, contracts, reviewer):
             normalized = content.lower()
             self.assertRegex(
                 normalized,
                 r"normally(?: this is)? the active installed copy",
             )
             self.assertIn("missing or mismatched", normalized)
-        for content in (skill, contracts, reviewer, agents_policy, change_delivery):
+        for content in (skill, contracts, reviewer, agents_policy):
             normalized = content.lower()
             self.assertIn("candidate-head markdown", normalized)
             self.assertIn("review subject", normalized)
             self.assertIn("independently trusted", normalized)
         self.assertIn("pinned outside", contracts)
-        self.assertNotIn(
-            "must be the frozen repo-local copy at the review head",
-            change_delivery,
-        )
         self.assertIn(
-            "exact parent-selected authoritative playbook path/version or digest",
-            change_delivery,
+            "hand the exact frozen range to the authoritative `$review-orchestration-playbook`",
+            normalized_change_delivery,
         )
-        for content in (skill, contracts, reviewer, change_delivery):
+        for duplicated_detail in (
+            "candidate-head Markdown",
+            "independently trusted",
+            "exact parent-selected authoritative playbook path/version or digest",
+            "materialize-worktree",
+            "validate-worktree",
+        ):
+            self.assertNotIn(duplicated_detail, change_delivery)
+        for content in (skill, contracts, reviewer):
             self.assertNotIn("from its normal skill environment", content)
         for anchor in (
             "Authoritative review skill path: {review_skill_path}",
@@ -4181,10 +4204,12 @@ class RepositoryContractTest(unittest.TestCase):
             "_CLAUDE_STREAM_RUNTIME_SOURCES",
             "_CLAUDE_STREAM_VALIDATOR_SOURCES",
             "_REVIEW_RESULT_SOURCES",
+            "_READ_ONLY_REPORT_SOURCES",
             "_load_default_entrypoint",
             "_load_claude_preflight_entrypoint",
             "_load_claude_stream_validator_entrypoint",
             "_load_review_result_entrypoint",
+            "_load_read_only_report_entrypoint",
             '"review_runtime.claude_refresh_lock"',
             '"claude_refresh_lock.py"',
             '"review_runtime.claude_linux"',
@@ -4199,6 +4224,7 @@ class RepositoryContractTest(unittest.TestCase):
             'argv[0] == "preflight-claude"',
             'argv[0] == "validate-claude-stream"',
             'argv[0] == "classify-review-result"',
+            'argv[0] == "validate-read-only-pr-report"',
         ):
             self.assertIn(anchor, entrypoint)
         self.assertNotIn("sys.path.insert", entrypoint)
@@ -4293,6 +4319,191 @@ class RepositoryContractTest(unittest.TestCase):
         ):
             self.assertIn(anchor, contracts)
 
+    def test_read_only_pr_receiver_is_self_contained_and_manifest_bound(
+        self,
+    ) -> None:
+        schema_path = (
+            SKILL_ROOT / "references/pr-readiness-read-only-report.schema.json"
+        )
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        references: list[str] = []
+
+        def collect_references(value: object) -> None:
+            if isinstance(value, dict):
+                reference = value.get("$ref")
+                if isinstance(reference, str):
+                    references.append(reference)
+                for child in value.values():
+                    collect_references(child)
+            elif isinstance(value, list):
+                for child in value:
+                    collect_references(child)
+
+        collect_references(schema)
+        self.assertTrue(references)
+        self.assertTrue(all(reference.startswith("#/") for reference in references))
+        self.assertEqual(
+            schema["properties"]["delivery_record"]["$ref"],
+            "#/$defs/readOnlyProbeDeliveryRecord",
+        )
+        delivery = schema["$defs"]["readOnlyProbeDeliveryRecord"]
+        self.assertEqual(delivery["properties"]["schema_version"]["const"], 3)
+        self.assertIn("head_sha", delivery["required"])
+        self.assertEqual(delivery["properties"]["head_sha"]["$ref"], "#/$defs/oid")
+        self.assertEqual(
+            delivery["properties"]["terminal_outcome"]["const"],
+            "succeeded",
+        )
+        self.assertEqual(
+            set(delivery["properties"]["terminal_reason"]["enum"]),
+            {
+                "pr-readiness-read-only-probe-ready",
+                "pr-readiness-read-only-reviewed-probe-ready",
+                "pr-readiness-read-only-gate-ready",
+                "pr-readiness-read-only-uncommitted-probe-ready",
+                "pr-readiness-read-only-existing-range-probe-ready",
+            },
+        )
+        self.assertTrue(
+            {"build", "tests", "docs", "journal"}
+            <= set(delivery["properties"]["terminal_evidence"]["required"])
+        )
+        ci_observation = schema["$defs"]["ciStatusEvidence"]["properties"]["observed"][
+            "items"
+        ]
+        self.assertIn("pagination", ci_observation["required"])
+        self.assertEqual(schema["properties"]["schema_version"]["const"], 8)
+        self.assertEqual(
+            ci_observation["properties"]["status_check_rollup"]["maxItems"],
+            1_000,
+        )
+        ci_pagination = schema["$defs"]["ciPaginationEvidence"]
+        self.assertIn("stability", ci_pagination["required"])
+        self.assertIn(
+            "scan_role",
+            schema["$defs"]["ciPaginationPage"]["properties"]["content_sha256"][
+                "description"
+            ],
+        )
+        ci_stability = schema["$defs"]["ciPaginationStability"]
+        self.assertEqual(
+            ci_stability["properties"]["strategy"]["const"],
+            "double-scan",
+        )
+        self.assertEqual(
+            ci_stability["properties"]["provider_call_count"]["maximum"],
+            22,
+        )
+        self.assertEqual(
+            ci_stability["properties"]["deadline_ms"]["maximum"],
+            60_000,
+        )
+        self.assertEqual(
+            ci_stability["properties"]["head_observations"]["minItems"],
+            2,
+        )
+        conversation_observation = schema["$defs"]["conversationStateEvidence"][
+            "properties"
+        ]["observed"]["items"]
+        self.assertIn("pagination", conversation_observation["required"])
+        self.assertIn(
+            "stability",
+            schema["$defs"]["reviewThreadPaginationEvidence"]["required"],
+        )
+        control_path = (
+            SKILL_ROOT / "references" / "read-only-pr-report-control-manifest.json"
+        )
+        control = json.loads(control_path.read_text(encoding="utf-8"))
+        self.assertEqual(control["schema_version"], 1)
+        self.assertEqual(control["profile"], "validate-read-only-pr-report")
+        self.assertEqual(
+            control["external_trust_root"],
+            {
+                "path": "scripts/named_lane_guard",
+                "authority": "prior-trusted-canonical-bundle",
+            },
+        )
+        self.assertEqual(
+            control["loader"],
+            {
+                "path": "scripts/named_lane_guard",
+                "profile_version": 1,
+                "python_flags": ["-I", "-B", "-S"],
+                "runtime": "scripts/review_runtime/read_only_report_guard.py",
+                "runtime_version": 1,
+                "schema_evaluator": "closed-draft-2020-12-v1",
+            },
+        )
+        self.assertEqual(
+            [(source["path"], source["role"]) for source in control["control_sources"]],
+            [
+                ("scripts/review_runtime/__init__.py", "runtime-package"),
+                (
+                    "scripts/review_runtime/catalog_bootstrap.py",
+                    "binding-runtime",
+                ),
+                (
+                    "scripts/review_runtime/read_only_report_guard.py",
+                    "report-guard-runtime",
+                ),
+            ],
+        )
+        self.assertEqual(
+            [(artifact["path"], artifact["role"]) for artifact in control["artifacts"]],
+            [
+                (
+                    "references/pr-readiness-read-only-report.schema.json",
+                    "schema",
+                ),
+                ("scripts/read_only_pr_report.py", "receiver"),
+            ],
+        )
+        for artifact in (*control["control_sources"], *control["artifacts"]):
+            self.assertEqual(
+                artifact["sha256"],
+                hashlib.sha256(
+                    (SKILL_ROOT / artifact["path"]).read_bytes()
+                ).hexdigest(),
+            )
+        self.assertIn(
+            hashlib.sha256(control_path.read_bytes()).hexdigest(),
+            (SCRIPTS / "named_lane_guard").read_text(encoding="utf-8"),
+        )
+
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        readiness = (SKILL_ROOT / "references/pr-readiness.md").read_text(
+            encoding="utf-8"
+        )
+        contracts = (SKILL_ROOT / "references/review-lane-contracts.md").read_text(
+            encoding="utf-8"
+        )
+        for content in (skill, readiness, contracts):
+            self.assertIn("self-contained", content)
+            self.assertIn("candidate-head", content)
+        for content in (skill, readiness):
+            self.assertIn("validate-delivery-handoff", content)
+            self.assertIn("signature_verified_head_oid", content)
+            self.assertIn("head_sha", content)
+            self.assertIn("double-scan", content)
+            self.assertIn("validate-report", content)
+            self.assertIn("page-digest", content)
+            self.assertIn("scan_role", content)
+        self.assertIn("schema-v8 bytes", contracts)
+        self.assertIn("canonical bundle digest", contracts)
+        self.assertIn("machine control manifest", contracts)
+        self.assertIn("external trust root", contracts)
+        self.assertIn("before compiling", contracts)
+        self.assertIn("previous trusted release", contracts)
+        self.assertIn("validate-read-only-pr-report", contracts)
+        self.assertIn("applies it before semantics", contracts)
+        self.assertIn("role-specific input includes `scan_role`", contracts)
+        self.assertNotIn("validate-semantics", skill + readiness + contracts)
+        self.assertNotIn(
+            "../../change-delivery-workflow/references/delivery-result.schema.json",
+            readiness,
+        )
+        self.assertIn("has no external `$ref`", contracts)
+
     def test_self_policy_migration_uses_an_external_trusted_control_plane(
         self,
     ) -> None:
@@ -4337,12 +4548,16 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/references/claude-stream-schema.json",
             "skills/review-orchestration-playbook/references/egress-consent.md",
             "skills/review-orchestration-playbook/references/github-pr-probes.md",
+            "skills/review-orchestration-playbook/references/pr-readiness-read-only-report.schema.json",
             "skills/review-orchestration-playbook/references/pr-readiness.md",
+            "skills/review-orchestration-playbook/references/read-only-pr-report-control-manifest.json",
             "skills/review-orchestration-playbook/references/review-lane-contracts.md",
             "skills/review-orchestration-playbook/references/review-prompt-templates.md",
             "skills/review-orchestration-playbook/scripts/named_claude_preflight",
             "skills/review-orchestration-playbook/scripts/named_lane_guard",
+            "skills/review-orchestration-playbook/scripts/read_only_pr_report.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/__init__.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/catalog_bootstrap.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/claude_capabilities.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/claude_code_release.asc",
             "skills/review-orchestration-playbook/scripts/review_runtime/claude_linux.py",
@@ -4354,8 +4569,11 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/scripts/review_runtime/fd_exec.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/named_claude_preflight.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/named_lane.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/read_only_report_guard.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/review_result.py",
             "skills/review-orchestration-playbook/scripts/validate_claude_stream.py",
+            "skills/synthetic-token-fixtures/SKILL.md",
+            "skills/synthetic-token-fixtures/scripts/active_catalog_binding.py",
         )
         self.assertEqual(
             manifest_paths,
@@ -4375,8 +4593,16 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/references/base-only-retarget-state-machine.json",
             "skills/review-orchestration-playbook/references/egress-consent.md",
             "skills/review-orchestration-playbook/references/github-pr-probes.md",
+            "skills/review-orchestration-playbook/references/pr-readiness-read-only-report.schema.json",
             "skills/review-orchestration-playbook/references/pr-readiness.md",
+            "skills/review-orchestration-playbook/references/read-only-pr-report-control-manifest.json",
+            "skills/review-orchestration-playbook/scripts/named_lane_guard",
+            "skills/review-orchestration-playbook/scripts/read_only_pr_report.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/catalog_bootstrap.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/read_only_report_guard.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/review_result.py",
+            "skills/synthetic-token-fixtures/SKILL.md",
+            "skills/synthetic-token-fixtures/scripts/active_catalog_binding.py",
         )
 
         def manifest_digest(overrides: dict[str, bytes] | None = None) -> str:
@@ -4415,14 +4641,18 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/references/base-only-retarget-state-machine.json",
             "skills/review-orchestration-playbook/references/egress-consent.md",
             "skills/review-orchestration-playbook/references/github-pr-probes.md",
+            "skills/review-orchestration-playbook/references/pr-readiness-read-only-report.schema.json",
             "skills/review-orchestration-playbook/references/pr-readiness.md",
+            "skills/review-orchestration-playbook/references/read-only-pr-report-control-manifest.json",
             "skills/review-orchestration-playbook/references/review-lane-contracts.md",
             "skills/review-orchestration-playbook/references/review-prompt-templates.md",
             "skills/review-orchestration-playbook/references/canonical-claude-lane.md",
             "skills/review-orchestration-playbook/references/claude-runtime-trust.md",
             "skills/review-orchestration-playbook/scripts/named_claude_preflight",
             "skills/review-orchestration-playbook/scripts/named_lane_guard",
+            "skills/review-orchestration-playbook/scripts/read_only_pr_report.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/__init__.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/catalog_bootstrap.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/claude_capabilities.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/claude_code_release.asc",
             "skills/review-orchestration-playbook/scripts/review_runtime/claude_linux.py",
@@ -4432,6 +4662,7 @@ class RepositoryContractTest(unittest.TestCase):
             "skills/review-orchestration-playbook/scripts/review_runtime/claude_version_policy.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/named_claude_preflight.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/named_lane.py",
+            "skills/review-orchestration-playbook/scripts/review_runtime/read_only_report_guard.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/review_result.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/common.py",
             "skills/review-orchestration-playbook/scripts/review_runtime/fd_exec.py",
@@ -4439,6 +4670,8 @@ class RepositoryContractTest(unittest.TestCase):
             "isolated `-I -B -S -c` bootstrap",
             "never reopen the `review_runtime/fd_exec.py` path",
             "skills/review-orchestration-playbook/scripts/validate_claude_stream.py",
+            "skills/synthetic-token-fixtures/SKILL.md",
+            "skills/synthetic-token-fixtures/scripts/active_catalog_binding.py",
             "immediately before each guard, Claude preflight, stream-validator, Claude-launch, and Codex-spawn use",
             "Recompute it after each lane",
             "exact bytes must match the manifest entry",
@@ -4450,6 +4683,8 @@ class RepositoryContractTest(unittest.TestCase):
             "preflight-claude",
             "validate-claude-stream",
             "classify-review-result",
+            "validate-read-only-pr-report",
+            "catalog-bootstrap",
         ):
             self.assertIn(anchor, contracts)
         self.assertNotIn(
@@ -5735,6 +5970,14 @@ class RepositoryContractTest(unittest.TestCase):
             "Automation that needs machine-readable contract metadata must use `stateful status`",
             helper_contract,
         )
+        self.assertIn(
+            "`isolated_review synthetic-tokens ...` invocation is rejected before catalog",
+            helper_contract,
+        )
+        self.assertIn(
+            "direct script execution is rejected",
+            helper_contract,
+        )
         self.assertNotIn("render_success_envelope", cli_source)
 
     def test_installed_bundle_entrypoints_do_not_create_bytecode(self) -> None:
@@ -5755,6 +5998,7 @@ class RepositoryContractTest(unittest.TestCase):
             entrypoints = {
                 copied_scripts / "isolated_review": 0,
                 copied_scripts / "named_claude_preflight": 2,
+                copied_scripts / "synthetic_catalog_entry": 2,
                 copied_scripts / "validate_claude_stream.py": 3,
                 copied_scripts
                 / "independent_codex_pr_review"
@@ -5782,7 +6026,7 @@ class RepositoryContractTest(unittest.TestCase):
                     requires_python_313 = (
                         entrypoint.name == "independent-codex-pr-review"
                     )
-                    if requires_python_313 and sys.version_info < (3, 13):
+                    if requires_python_313 and sys.version_info[:2] != (3, 13):
                         self.assertNotEqual(completed.returncode, 0)
                         self.assertIn(
                             "Python 3.13 is required; running",
@@ -5794,6 +6038,12 @@ class RepositoryContractTest(unittest.TestCase):
                             expected_returncode,
                             completed.stderr,
                         )
+                        if entrypoint.name == "synthetic_catalog_entry":
+                            self.assertEqual(completed.stdout, "")
+                            self.assertIn(
+                                "direct synthetic_catalog_entry execution is disabled",
+                                completed.stderr,
+                            )
                     bytecode = sorted(
                         path.relative_to(copied_skill)
                         for path in copied_skill.rglob("*")

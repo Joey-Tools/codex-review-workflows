@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "profile": "synthetic-catalog-authoring-v1",
+  "runtime_version": 1,
+  "external_trust_root": {
+    "path": "scripts/named_lane_guard",
+    "authority": "prior-trusted-canonical-bundle"
+  },
+  "control_sources": [
+    {
+      "path": "scripts/review_runtime/__init__.py",
+      "role": "runtime-package",
+      "sha256": "ee5b564d67a63b53ba44532ea95416407700f66651699705be1cc5f9305a3ba0"
+    },
+    {
+      "path": "scripts/review_runtime/catalog_bootstrap.py",
+      "role": "binding-runtime",
+      "sha256": "71a22341899557fbccffb3ae0c0f17a2247eb2a02e0b73a3188ba5e593204194"
+    }
+  ],
+  "co_release_sources": [
+    {
+      "skill": "synthetic-token-fixtures",
+      "path": "scripts/active_catalog_binding.py",
+      "role": "catalog-resolver",
+      "sha256": "2956ae70bb1a507a0eab6c4bcda6c9e81f7c38a5629a91db53250a6f359c961a"
+    }
+  ],
+  "entrypoint": {
+    "path": "scripts/synthetic_catalog_entry",
+    "sha256": "3b634a6343a4aacfdc1a6d5eb0ab0017223ac1c66bad4815827d63f576093a66"
+  },
+  "sources": [
+    {
+      "module": "review_runtime",
+      "path": "scripts/review_runtime/__init__.py",
+      "package": true,
+      "sha256": "ee5b564d67a63b53ba44532ea95416407700f66651699705be1cc5f9305a3ba0"
+    },
+    {
+      "module": "review_runtime.cli",
+      "path": "scripts/review_runtime/cli.py",
+      "package": false,
+      "sha256": "56d5341d0bd3930360314407512d17bc29fe3871edbe5714b3185476c78670a3"
+    },
+    {
+      "module": "review_runtime.common",
+      "path": "scripts/review_runtime/common.py",
+      "package": false,
+      "sha256": "f4fe519b5fc90ad3c7fa7cdccb922e99c8f82c7275e9d73c85d9bdc02d50df03"
+    },
+    {
+      "module": "review_runtime.synthetic_tokens",
+      "path": "scripts/review_runtime/synthetic_tokens.py",
+      "package": false,
+      "sha256": "d7b2b0d0c6c7a9f26cfe3376facd7c7d5173a6ee812b455c8f7949c31ec7144d"
+    }
+  ],
+  "data": [
+    {
+      "id": "synthetic-token-catalog",
+      "path": "scripts/review_runtime/synthetic-token-catalog.json",
+      "sha256": "cd571de36f325ac68418e1e9142f8e4fcf3c74bf9c6e904cbc750eb90ee5f93e"
+    }
+  ],
+  "allowed_modules": [
+    "review_runtime",
+    "review_runtime.cli",
+    "review_runtime.common",
+    "review_runtime.synthetic_tokens"
+  ]
+}

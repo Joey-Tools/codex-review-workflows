@@ -1,0 +1,160 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "existing-committed-range-commit-allowed-review-findings",
+      "input": {
+        "profile": "local-gate",
+        "commit_mode": "allowed",
+        "existing_committed_range": "base_sha..old_head_sha",
+        "formal_review_required": true,
+        "review_outcome": "findings"
+      },
+      "expected": {
+        "apply_fixes": true,
+        "rerun_validation": true,
+        "rerun_journal_gate": true,
+        "create_new_signed_head": true,
+        "invalidate_reviewed_range": "base_sha..old_head_sha",
+        "review_new_exact_range": true,
+        "terminal": null
+      }
+    },
+    {
+      "name": "existing-committed-range-no-commit-review-findings",
+      "input": {
+        "profile": "local-gate",
+        "commit_mode": "forbidden",
+        "existing_committed_range": "base_sha..head_sha",
+        "formal_review_required": true,
+        "review_outcome": "findings"
+      },
+      "expected": {
+        "apply_fixes": false,
+        "create_new_head": false,
+        "create_signed_review_checkpoint": false,
+        "create_profile_commit": false,
+        "preserve_committed_range": "base_sha..head_sha",
+        "handoff": false,
+        "terminal": "review-findings-blocker"
+      }
+    },
+    {
+      "name": "existing-committed-range-no-commit-review-clean",
+      "input": {
+        "profile": "local-gate",
+        "commit_mode": "forbidden",
+        "existing_committed_range": "base_sha..head_sha",
+        "formal_review_required": true,
+        "review_outcome": "clean"
+      },
+      "expected": {
+        "create_new_head": false,
+        "create_signed_review_checkpoint": false,
+        "create_profile_commit": false,
+        "preserve_committed_range": "base_sha..head_sha",
+        "next_step": "profile-terminal",
+        "terminal": "clean-range-report"
+      }
+    },
+    {
+      "name": "missing-committed-range-no-commit-formal-review-required",
+      "input": {
+        "profile": "local-gate",
+        "commit_mode": "forbidden",
+        "existing_committed_range": null,
+        "formal_review_required": true,
+        "review_outcome": "not-started"
+      },
+      "expected": {
+        "start_formal_review": false,
+        "create_new_head": false,
+        "create_signed_review_checkpoint": false,
+        "create_profile_commit": false,
+        "handoff": false,
+        "terminal": "missing-committed-range-blocker"
+      }
+    },
+    {
+      "name": "uncommitted-no-commit-formal-review-not-required",
+      "input": {
+        "profile": "local-gate",
+        "commit_mode": "forbidden",
+        "existing_committed_range": null,
+        "formal_review_required": false,
+        "review_outcome": "not-required"
+      },
+      "expected": {
+        "start_formal_review": false,
+        "create_new_head": false,
+        "create_signed_review_checkpoint": false,
+        "create_profile_commit": false,
+        "report_exact_validations": true,
+        "missing_committed_range_blocker": false,
+        "handoff": false,
+        "terminal": "uncommitted-checked-result"
+      }
+    },
+    {
+      "name": "existing-range-pr-handoff-no-commit-verified-signature",
+      "input": {
+        "profile": "pr-readiness-handoff",
+        "commit_mode": "forbidden",
+        "existing_committed_range": "base_sha..head_sha",
+        "formal_review_required": true,
+        "review_outcome": "clean",
+        "head_signature": "verified",
+        "signature_verified_head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "frozen_head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "expected": {
+        "create_new_head": false,
+        "read_only_signature_verification": true,
+        "signature": "verified",
+        "signature_verified_head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "handoff": true,
+        "terminal": "pr-readiness-existing-range-handoff-ready"
+      }
+    },
+    {
+      "name": "existing-range-pr-handoff-no-commit-unsigned",
+      "input": {
+        "profile": "pr-readiness-handoff",
+        "commit_mode": "forbidden",
+        "existing_committed_range": "base_sha..head_sha",
+        "formal_review_required": true,
+        "review_outcome": "clean",
+        "head_signature": "unsigned",
+        "signature_verified_head_oid": null,
+        "frozen_head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "expected": {
+        "create_new_head": false,
+        "read_only_signature_verification": true,
+        "signature": "failed",
+        "handoff": false,
+        "terminal": "signing-failed"
+      }
+    },
+    {
+      "name": "existing-range-pr-handoff-no-commit-unverifiable",
+      "input": {
+        "profile": "pr-readiness-handoff",
+        "commit_mode": "forbidden",
+        "existing_committed_range": "base_sha..head_sha",
+        "formal_review_required": true,
+        "review_outcome": "clean",
+        "head_signature": "unverifiable",
+        "signature_verified_head_oid": null,
+        "frozen_head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "expected": {
+        "create_new_head": false,
+        "read_only_signature_verification": true,
+        "signature": "failed",
+        "handoff": false,
+        "terminal": "signing-failed"
+      }
+    }
+  ]
+}
