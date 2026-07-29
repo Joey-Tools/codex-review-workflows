@@ -4,6 +4,7 @@ import errno
 import fcntl
 import os
 import pathlib
+import signal
 import stat
 import unittest
 from unittest import mock
@@ -26,6 +27,7 @@ from review_supervisor.secureio import (
     directory_paths_equivalent,
     open_absolute_directory_chain,
     open_directory_at,
+    open_regular_at,
     open_regular_nofollow,
     require_private_directory,
 )
@@ -80,6 +82,72 @@ class StrictJsonTests(unittest.TestCase):
 
 
 class PrivateDirectoryAnchorTests(unittest.TestCase):
+    def test_regular_openers_reject_fifo_without_blocking(self) -> None:
+        if not hasattr(signal, "setitimer"):
+            self.skipTest("requires POSIX interval timers")
+
+        class BlockingOpenTimeout(RuntimeError):
+            pass
+
+        def reject_blocking_open(_signum: int, _frame: object) -> None:
+            raise BlockingOpenTimeout("regular-file opener blocked on a FIFO")
+
+        previous_handler = signal.signal(signal.SIGALRM, reject_blocking_open)
+        try:
+            with owned_temporary_directory("secureio-fifo-") as root:
+                parent_fd, _ = open_absolute_directory_chain(
+                    root,
+                    private_leaf=True,
+                )
+                try:
+                    for name, opener in (
+                        (
+                            "descriptor-relative",
+                            lambda: open_regular_at(
+                                parent_fd,
+                                b"control.fifo",
+                                expected_uid=os.getuid(),
+                            ),
+                        ),
+                        (
+                            "absolute",
+                            lambda: open_regular_nofollow(
+                                root / "control.fifo",
+                                expected_uid=os.getuid(),
+                            ),
+                        ),
+                    ):
+                        with self.subTest(opener=name):
+                            fifo = root / "control.fifo"
+                            if fifo.exists():
+                                fifo.unlink()
+                            os.mkfifo(fifo, 0o600)
+                            signal.setitimer(signal.ITIMER_REAL, 1.0)
+                            try:
+                                with self.assertRaises(OSError) as caught:
+                                    opener()
+                            finally:
+                                signal.setitimer(signal.ITIMER_REAL, 0.0)
+                            self.assertEqual(caught.exception.errno, errno.EINVAL)
+                finally:
+                    os.close(parent_fd)
+
+            device = pathlib.Path("/dev/null")
+            if device.exists():
+                with self.subTest(opener="character-device"):
+                    signal.setitimer(signal.ITIMER_REAL, 1.0)
+                    try:
+                        with self.assertRaises(OSError) as caught:
+                            open_regular_nofollow(
+                                device,
+                                require_link_one=False,
+                            )
+                    finally:
+                        signal.setitimer(signal.ITIMER_REAL, 0.0)
+                    self.assertEqual(caught.exception.errno, errno.EINVAL)
+        finally:
+            signal.signal(signal.SIGALRM, previous_handler)
+
     def test_creates_missing_private_chain_descriptor_relatively(self) -> None:
         with owned_temporary_directory("secureio-create-") as root:
             target = root / "one" / "two"

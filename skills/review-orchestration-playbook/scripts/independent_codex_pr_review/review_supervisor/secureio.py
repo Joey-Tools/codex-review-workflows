@@ -669,7 +669,12 @@ def open_regular_at(
 ) -> tuple[int, Identity]:
     if not name or b"/" in name or name in {b".", b".."} or b"\0" in name:
         raise ValueError("invalid leaf name")
-    flags = (os.O_RDWR if writable else os.O_RDONLY) | os.O_CLOEXEC | os.O_NOFOLLOW
+    flags = (
+        (os.O_RDWR if writable else os.O_RDONLY)
+        | os.O_CLOEXEC
+        | os.O_NOFOLLOW
+        | os.O_NONBLOCK
+    )
     fd = os.open(name, flags, dir_fd=parent_fd)
     try:
         path_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -696,7 +701,12 @@ def open_regular_nofollow(
     require_link_one: bool = True,
     private_metadata: bool = False,
 ) -> tuple[int, Identity]:
-    flags = (os.O_RDWR if writable else os.O_RDONLY) | os.O_CLOEXEC | os.O_NOFOLLOW
+    flags = (
+        (os.O_RDWR if writable else os.O_RDONLY)
+        | os.O_CLOEXEC
+        | os.O_NOFOLLOW
+        | os.O_NONBLOCK
+    )
     fd = os.open(path, flags)
     try:
         path_metadata = os.lstat(path)

@@ -55,6 +55,10 @@ superseded_by:
   without an existing legacy lock is blocked before the public command can
   run, rather than treating one absent-path observation as proof that an old
   version cannot start later.
+- Shared descriptor-relative and absolute regular-file openers request
+  nonblocking, no-follow descriptors before regular-file validation. FIFO or
+  device substitutions therefore fail closed without hanging capability,
+  marker, lock, or other control-file reads.
 - The legacy scan walks from an ACL/xattr-validated releases-root descriptor
   through `O_NOFOLLOW` child descriptors. It binds object identity and access
   policy with device, inode, type, owner, and mode while deliberately ignoring
@@ -100,12 +104,12 @@ superseded_by:
   attempts in older installed releases and that the README still documented the
   obsolete release-local default. The explicit drain gate, cross-version
   regression, and corrected README close both findings.
-- The final platform suite ran 2,819 tests with 6 skips in 1,106.006 seconds.
+- The final platform suite ran 2,819 tests with 6 skips in 952.739 seconds.
   Its only failure was the known parent-sandbox denial of nested
   `sandbox-exec`; that exact broker test passed 1/1 outside the parent sandbox
-  in 2.505 seconds. The required live no-child/Seatbelt suite passed 9/9
-  outside the parent sandbox in 7.504 seconds.
-- The complete 99-test contract module passed in 7.249 seconds.
+  in 2.116 seconds. The required live no-child/Seatbelt suite passed 9/9
+  outside the parent sandbox in 7.009 seconds.
+- The complete 99-test contract module passed in 7.790 seconds.
 - Focused installed-symlink immutability, default state-root, CI snapshot, and
   no-bytecode entrypoint regressions passed. The new cross-version tests also
   prove explicit old-root visibility and fail-closed release replacement.
@@ -153,10 +157,14 @@ superseded_by:
   legacy scans ignored an attempt appearing during the command. Command-scoped
   root bindings now guard every exact selected-root open and finalization, while
   each legacy fence records and enforces its initial attempt state.
-- The deterministic independent-supervisor gate passed 589/589 in 200.275
-  seconds with the reviewed 598-test discovery identity and SHA-256
-  `d491e88448c781104805214c67c0814ae39531d0a42180641ff67bd44414d3e9`.
-- The focused post-fix CLI and secure-I/O modules passed 68/68 tests in 33.171
+- The following exact-head Fresh Codex review found that regular-file opens
+  could block on a FIFO or device before validating the file type. The shared
+  openers now add `O_NONBLOCK`, and a bounded descriptor-relative plus absolute
+  FIFO regression proves immediate rejection.
+- The deterministic independent-supervisor gate passed 590/590 in 225.996
+  seconds with the reviewed 599-test discovery identity and SHA-256
+  `f76ac9d5020304794f18cd72a6c70a5930b611d4f9fa892135ba550340a2e4b9`.
+- The focused post-fix CLI and secure-I/O modules passed 69/69 tests in 33.754
   seconds on Python 3.13.
 - Ruff lint/format, actionlint for canonical and private CI profiles,
   source-only syntax checks, project-journal validation, `git diff --check`,
