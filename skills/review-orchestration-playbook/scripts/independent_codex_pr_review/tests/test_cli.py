@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 from review_supervisor import cli as cli_module
+from review_supervisor import constants as constants_module
 from review_supervisor.cli import _emit
 from review_supervisor.constants import (
     LOW_LEVEL_HELPER_REVIEW_CONTRACT,
@@ -334,6 +335,11 @@ class CliLifecycleTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     cli_module,
+                    "unresolved_installed_legacy_retention_roots",
+                    side_effect=AssertionError("legacy scan must stay lazy"),
+                ),
+                mock.patch.object(
+                    cli_module,
                     "preflight",
                     return_value={"status": "admitted"},
                 ) as preflight_mock,
@@ -365,6 +371,141 @@ class CliLifecycleTests(unittest.TestCase):
         preflight_mock.assert_called_once()
         self.assertEqual(preflight_mock.call_args.kwargs["retention_root"], retention)
         self.assertEqual(preflight_mock.call_args.kwargs["checkout_parent"], checkout)
+
+    def test_installed_upgrade_blocks_until_legacy_attempt_is_drained(
+        self,
+    ) -> None:
+        with owned_temporary_directory("cli-legacy-upgrade-") as root:
+            releases = root / "overlays" / "private" / "releases"
+            current_release = releases / ("b" * 40)
+            old_release = releases / ("a" * 40)
+            relative_tool = pathlib.Path(
+                "personal_codex/skills/review-orchestration-playbook/"
+                "scripts/independent_codex_pr_review"
+            )
+            current_tool = current_release / relative_tool
+            current_tool.mkdir(parents=True)
+            legacy_retention = old_release / relative_tool / "runtime" / "retention"
+            legacy_retention.mkdir(parents=True, mode=0o700)
+            _write_attempt(
+                legacy_retention,
+                suffix="a" * 32,
+                process_settlement="exact",
+                retention_state="held",
+            )
+
+            blocked_output = io.StringIO()
+            with (
+                mock.patch(
+                    "review_supervisor.constants.tool_root",
+                    return_value=current_tool,
+                ),
+                contextlib.redirect_stdout(blocked_output),
+            ):
+                blocked_code = cli_module.main(("status",), entrypoint=ENTRYPOINT)
+
+            self.assertEqual(blocked_code, 2)
+            blocked_lines = blocked_output.getvalue().splitlines()
+            self.assertEqual(len(blocked_lines), 1)
+            blocked_payload = json.loads(blocked_lines[0])
+            _assert_low_level_contract(self, blocked_payload)
+            self.assertEqual(blocked_payload["failure_stage"], "cli")
+            self.assertIn(
+                "legacy release-local attempts require explicit draining",
+                blocked_payload["message"],
+            )
+            self.assertIn(str(legacy_retention), blocked_payload["message"])
+
+            drain_output = io.StringIO()
+            with (
+                mock.patch(
+                    "review_supervisor.constants.tool_root",
+                    return_value=current_tool,
+                ),
+                contextlib.redirect_stdout(drain_output),
+            ):
+                drain_code = cli_module.main(
+                    (
+                        "status",
+                        "--retention-root",
+                        str(legacy_retention),
+                    ),
+                    entrypoint=ENTRYPOINT,
+                )
+
+            self.assertEqual(drain_code, 0)
+            drain_lines = drain_output.getvalue().splitlines()
+            self.assertEqual(len(drain_lines), 1)
+            drain_payload = json.loads(drain_lines[0])
+            _assert_low_level_contract(self, drain_payload)
+            self.assertEqual(drain_payload["retention_root"], str(legacy_retention))
+            self.assertEqual(drain_payload["attempt_count"], 1)
+
+    def test_installed_upgrade_rejects_release_replacement_after_catalog(
+        self,
+    ) -> None:
+        with owned_temporary_directory("cli-legacy-replacement-") as root:
+            releases = root / "overlays" / "private" / "releases"
+            current_release = releases / ("b" * 40)
+            old_release = releases / ("a" * 40)
+            relative_tool = pathlib.Path(
+                "personal_codex/skills/review-orchestration-playbook/"
+                "scripts/independent_codex_pr_review"
+            )
+            current_tool = current_release / relative_tool
+            current_tool.mkdir(parents=True)
+            legacy_retention = old_release / relative_tool / "runtime" / "retention"
+            legacy_retention.mkdir(parents=True, mode=0o700)
+            _write_attempt(
+                legacy_retention,
+                suffix="a" * 32,
+                process_settlement="exact",
+                retention_state="held",
+            )
+            original_scan = constants_module._stable_directory_entries
+            replacement_done = False
+
+            def replace_after_catalog(
+                path: pathlib.Path,
+                *,
+                label: str,
+                expected_binding: constants_module._DirectoryBinding | None = None,
+            ) -> tuple[tuple[str, os.stat_result], ...]:
+                nonlocal replacement_done
+                entries = original_scan(
+                    path,
+                    label=label,
+                    expected_binding=expected_binding,
+                )
+                if label == "installed release directory" and not replacement_done:
+                    replacement_done = True
+                    old_release.rename(releases / "displaced-release")
+                    old_release.mkdir(mode=0o700)
+                return entries
+
+            output = io.StringIO()
+            with (
+                mock.patch(
+                    "review_supervisor.constants.tool_root",
+                    return_value=current_tool,
+                ),
+                mock.patch.object(
+                    constants_module,
+                    "_stable_directory_entries",
+                    side_effect=replace_after_catalog,
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                exit_code = cli_module.main(("status",), entrypoint=ENTRYPOINT)
+
+            self.assertEqual(exit_code, 2)
+            payload = json.loads(output.getvalue())
+            _assert_low_level_contract(self, payload)
+            self.assertEqual(payload["failure_stage"], "cli")
+            self.assertIn(
+                "installed release changed while being inspected",
+                payload["message"],
+            )
 
     def test_emit_overrides_conflicting_contract_metadata(self) -> None:
         output = io.StringIO()

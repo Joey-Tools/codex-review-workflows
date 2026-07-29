@@ -1,11 +1,12 @@
 # Independent Codex Low-Level Review Supervisor v2
 
 这是 `independent-codex-pr-review` 低层工具的任务级实现。它不满足 named single、
-double、triple review，也不是 canonical PR-readiness 的隐式门禁。它只在本目录的默认
-`runtime/` 下创建 supervisor 状态、独立 checkout 和测试临时文件，不修改目标仓库
-源码、文档、refs、当前 checkout 或 helper 状态。只有现有 access token 无法覆盖有界
-review deadline 时，`run` 才允许经过同一受限 Codex snapshot 执行 no-model managed-auth
-refresh；该步骤可能由 Codex 原子更新正常账户的 `~/.codex/auth.json`。
+double、triple review，也不是 canonical PR-readiness 的隐式门禁。它默认在当前 POSIX
+账户的 `~/.codex/review-runtime/independent-codex-pr-review/` 下创建 supervisor
+状态和独立 checkout，不修改目标仓库源码、文档、refs、当前 checkout 或 helper
+状态。只有现有 access token 无法覆盖有界 review deadline 时，`run` 才允许经过同一
+受限 Codex snapshot 执行 no-model managed-auth refresh；该步骤可能由 Codex 原子更新
+正常账户的 `~/.codex/auth.json`。
 
 `preflight` 不启动 Codex。`run` 是唯一会启动实际 reviewer 的公共命令。
 supervisor 只把验证过的 external ChatGPT auth generation 通过内存协议交给 reviewer。
@@ -68,6 +69,13 @@ retained evidence survives release replacement. Explicit `--retention-root` and
 `--checkout-parent` values remain available for task-scoped isolated runs and
 bypass the account lookup. Default lookup is lazy and any failure is returned
 through the CLI's single-line JSON failure contract.
+
+从使用 release-local `runtime/retention` 的旧版本升级时，新版本会在 installed
+overlay 的 sibling releases 中只读扫描旧 retention roots。只要任一旧 root 仍有
+attempt，所有省略 `--retention-root` 的公共命令都会失败关闭并报告精确旧 root。使用
+该路径显式运行 `status`、`final`、`recover`、`release` 和 `cleanup`，直到旧 root
+drained；在此之前不得删除旧 release。扫描不会搬动活动 attempt，也不会把旧 attempt
+并入新的 account-local root。
 
 仅在 helper 已 terminal 后运行独立 preflight。它验证 exact repo/base/head、helper
 runner completion、primary-diff 双重 attestation、control directory 完整性、source

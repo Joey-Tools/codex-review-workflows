@@ -13,6 +13,7 @@ from .constants import (
     VERSION,
     default_checkout_parent,
     default_retention_root,
+    unresolved_installed_legacy_retention_roots,
 )
 from .custody import custody_helper_main
 from .errors import SupervisorError
@@ -134,6 +135,13 @@ def _public_parser() -> argparse.ArgumentParser:
 
 def _resolve_public_default_roots(arguments: argparse.Namespace) -> None:
     if arguments.retention_root is None:
+        legacy_roots = unresolved_installed_legacy_retention_roots()
+        if legacy_roots:
+            roots = ", ".join(str(root) for root in legacy_roots)
+            raise RuntimeError(
+                "legacy release-local attempts require explicit draining with "
+                f"--retention-root before using the account-local default: {roots}"
+            )
         arguments.retention_root = default_retention_root()
     if hasattr(arguments, "checkout_parent") and arguments.checkout_parent is None:
         arguments.checkout_parent = default_checkout_parent()
