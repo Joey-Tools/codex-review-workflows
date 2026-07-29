@@ -582,10 +582,11 @@ class CliLifecycleTests(unittest.TestCase):
         self,
     ) -> None:
         default_root = pathlib.Path(
-            "/var/root/.codex/review-runtime/independent-codex-pr-review/retention"
+            "/var/tmp/codex-review-alias/.codex/review-runtime/"
+            "independent-codex-pr-review/retention"
         )
         explicit_root = pathlib.Path(
-            "/private/var/root/.codex/review-runtime/"
+            "/private/var/tmp/codex-review-alias/.codex/review-runtime/"
             "independent-codex-pr-review/retention"
         )
         arguments = argparse.Namespace(retention_root=explicit_root)
@@ -614,6 +615,64 @@ class CliLifecycleTests(unittest.TestCase):
         ):
             self.assertTrue(cli_module._uses_account_local_retention_root(arguments))
 
+    def test_double_leading_slash_still_identifies_explicit_account_default(
+        self,
+    ) -> None:
+        with owned_temporary_directory("cli-double-root-alias-") as root:
+            parent = (
+                root
+                / "account"
+                / ".codex"
+                / "review-runtime"
+                / "independent-codex-pr-review"
+            )
+            parent.mkdir(parents=True)
+            default_root = parent / "retention"
+            explicit_root = pathlib.Path(f"//{default_root.as_posix().lstrip('/')}")
+            arguments = argparse.Namespace(retention_root=explicit_root)
+            with mock.patch.object(
+                cli_module,
+                "default_retention_root",
+                return_value=default_root,
+            ):
+                self.assertTrue(
+                    cli_module._uses_account_local_retention_root(arguments)
+                )
+
+    def test_case_alias_uses_existing_object_identity_or_missing_leaf_policy(
+        self,
+    ) -> None:
+        with owned_temporary_directory("cli-case-root-alias-") as root:
+            parent = (
+                root
+                / "account"
+                / ".codex"
+                / "review-runtime"
+                / "independent-codex-pr-review"
+            )
+            parent.mkdir(parents=True)
+            default_root = parent / "retention"
+            explicit_root = parent / "RETENTION"
+            arguments = argparse.Namespace(retention_root=explicit_root)
+            with mock.patch.object(
+                cli_module,
+                "default_retention_root",
+                return_value=default_root,
+            ):
+                self.assertTrue(
+                    cli_module._uses_account_local_retention_root(arguments)
+                )
+                default_root.mkdir(mode=0o700)
+                if explicit_root.exists():
+                    self.assertTrue(
+                        cli_module._uses_account_local_retention_root(arguments)
+                    )
+                else:
+                    explicit_root.mkdir(mode=0o700)
+                    self.assertFalse(
+                        cli_module._uses_account_local_retention_root(arguments)
+                    )
+
     def test_installed_upgrade_rejects_active_legacy_writer(self) -> None:
         with owned_temporary_directory("cli-active-legacy-writer-") as root:
             _, current_tool, _, legacy_retention = _installed_upgrade_layout(root)
@@ -638,6 +697,38 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertIn(
                 "legacy retention root has an active writer", payload["message"]
             )
+
+    def test_non_overlay_upgrade_blocks_current_tool_legacy_attempt(
+        self,
+    ) -> None:
+        with owned_temporary_directory("cli-non-overlay-upgrade-") as root:
+            current_tool = root / "self-contained" / "independent-review"
+            legacy_retention = current_tool / "runtime" / "retention"
+            legacy_retention.mkdir(parents=True, mode=0o700)
+            _write_retention_lock(legacy_retention)
+            _write_attempt(
+                legacy_retention,
+                suffix="a" * 32,
+                process_settlement="exact",
+                retention_state="held",
+            )
+            output = io.StringIO()
+            with (
+                mock.patch(
+                    "review_supervisor.legacy_retention.tool_root",
+                    return_value=current_tool,
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                exit_code = cli_module.main(("status",), entrypoint=ENTRYPOINT)
+
+            self.assertEqual(exit_code, 2)
+            payload = json.loads(output.getvalue())
+            self.assertIn(
+                "legacy release-local attempts require explicit draining",
+                payload["message"],
+            )
+            self.assertIn(str(legacy_retention), payload["message"])
 
     def test_empty_legacy_retention_without_lock_fails_closed(self) -> None:
         with owned_temporary_directory("cli-legacy-no-lock-") as root:
@@ -759,6 +850,47 @@ class CliLifecycleTests(unittest.TestCase):
             payload = json.loads(output.getvalue())
             self.assertIn(
                 "legacy retention path appeared while migration fence was active",
+                payload["message"],
+            )
+
+    def test_current_tool_legacy_retention_appearing_fails_closed(self) -> None:
+        with owned_temporary_directory("cli-current-legacy-appears-") as root:
+            current_tool = root / "self-contained" / "independent-review"
+            current_tool.mkdir(parents=True)
+            legacy_retention = current_tool / "runtime" / "retention"
+
+            def create_legacy_root(
+                *,
+                retention_root: pathlib.Path,
+                attempt_dir: pathlib.Path | None,
+            ) -> dict[str, object]:
+                self.assertIsNone(attempt_dir)
+                legacy_retention.mkdir(parents=True, mode=0o700)
+                _write_retention_lock(legacy_retention)
+                return {
+                    "retention_root": str(retention_root),
+                    "attempt_count": 0,
+                }
+
+            output = io.StringIO()
+            with (
+                mock.patch(
+                    "review_supervisor.legacy_retention.tool_root",
+                    return_value=current_tool,
+                ),
+                mock.patch.object(
+                    cli_module,
+                    "status",
+                    side_effect=create_legacy_root,
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                exit_code = cli_module.main(("status",), entrypoint=ENTRYPOINT)
+
+            self.assertEqual(exit_code, 2)
+            payload = json.loads(output.getvalue())
+            self.assertIn(
+                "current helper legacy retention path appeared",
                 payload["message"],
             )
 

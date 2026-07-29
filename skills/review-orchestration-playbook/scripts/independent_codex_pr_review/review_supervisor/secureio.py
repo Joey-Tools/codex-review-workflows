@@ -282,6 +282,52 @@ def canonical_directory_walk_path(path: pathlib.Path) -> pathlib.Path:
     return pathlib.Path("/") / target / pathlib.Path(*path.parts[2:])
 
 
+def _directory_path_equivalence_key(
+    path: pathlib.Path,
+) -> tuple[int, int, tuple[str, ...]]:
+    if not path.is_absolute():
+        raise ValueError("directory path must be absolute")
+    walk_path = canonical_directory_walk_path(path)
+    raw_parts = tuple(os.fsencode(part) for part in walk_path.parts[1:])
+    if any(not part or part in {b".", b".."} or b"\0" in part for part in raw_parts):
+        raise ValueError("directory path contains a dot component")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    fd = os.open(b"/", flags)
+    current = pathlib.Path("/")
+    try:
+        identity = _validate_directory_fd(fd, current, private=False)
+        for index, part in enumerate(raw_parts):
+            current /= os.fsdecode(part)
+            try:
+                next_fd, next_identity = open_directory_at(
+                    fd,
+                    part,
+                    path_hint=current,
+                )
+            except FileNotFoundError:
+                remaining = tuple(
+                    os.fsdecode(candidate).casefold() for candidate in raw_parts[index:]
+                )
+                return identity.device, identity.inode, remaining
+            os.close(fd)
+            fd = next_fd
+            identity = next_identity
+        return identity.device, identity.inode, ()
+    finally:
+        os.close(fd)
+
+
+def directory_paths_equivalent(
+    left: pathlib.Path,
+    right: pathlib.Path,
+) -> bool:
+    """Bind existing prefixes by device/inode and case-fold only missing suffixes."""
+
+    return _directory_path_equivalence_key(left) == _directory_path_equivalence_key(
+        right
+    )
+
+
 def open_absolute_directory_chain(
     path: pathlib.Path,
     *,

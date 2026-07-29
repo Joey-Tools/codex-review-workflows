@@ -64,19 +64,22 @@ The CLI resolves the same default state root from the current POSIX account
 database, not from `$HOME`, so installed release trees remain immutable and
 retained evidence survives release replacement. Non-default explicit
 `--retention-root` and `--checkout-parent` values remain available for
-task-scoped isolated runs. An explicitly supplied path that is exactly the
-account-local default still uses the default migration gate. Default lookup is
-lazy and any failure is returned through the CLI's single-line JSON failure
-contract.
+task-scoped isolated runs. An explicitly supplied path that resolves through
+the secure descriptor walk to the account-local default still uses the default
+migration gate; existing prefixes are compared by object identity and missing
+suffixes use a conservative case-insensitive policy. Default lookup is lazy and
+any failure is returned through the CLI's single-line JSON failure contract.
 
-从使用 release-local `runtime/retention` 的旧版本升级时，新版本会在 installed
-overlay 的 sibling releases 中只读扫描旧 retention roots。只要任一旧 root 仍有
-attempt，所有使用 account-local default 的公共命令都会失败关闭并报告精确旧 root。
-扫描逐级持有 no-follow descriptors，复用 ACL/xattr access-policy 检查，并对旧
-`retention.lock` 获取非阻塞 migration fence；活动旧 writer 会失败关闭，该 fence
-保持到本次默认-root 命令完成。使用报告的旧路径显式运行 `status`、`final`、
-`recover`、`release` 和 `cleanup`，直到旧 root drained；在此之前不得删除旧
-release。扫描不会搬动活动 attempt，也不会把旧 attempt 并入新的 account-local root。
+从使用 release-local `runtime/retention` 的旧版本升级时，新版本始终先扫描当前
+helper 根下的旧 retention root，因此 self-contained 或非标准安装布局不会绕过迁移
+门禁；若当前 helper 位于标准 installed overlay，还会扫描 sibling releases。只要任一
+旧 root 仍有 attempt，所有使用 account-local default 的公共命令都会失败关闭并报告
+精确旧 root。扫描逐级持有 no-follow descriptors，复用 ACL/xattr access-policy
+检查，并对旧 `retention.lock` 获取非阻塞 migration fence；活动旧 writer 会失败
+关闭，该 fence 保持到本次默认-root 命令完成。使用报告的旧路径显式运行 `status`、
+`final`、`recover`、`release` 和 `cleanup`，直到旧 root drained；在此之前不得删除
+旧 release。扫描不会搬动活动 attempt，也不会把旧 attempt 并入新的 account-local
+root。
 采用 account-local retention 的 release 必须携带经过内容、身份与访问策略校验的
 `ACCOUNT_LOCAL_RETENTION_V1` 标记。若仍包含 helper 的未标记旧 release 没有可获取的
 legacy retention lock，新命令会在执行公共命令前失败关闭；需要先停用或移除该旧

@@ -29,8 +29,8 @@ from .runtime import (
     prompt_verifier_main,
 )
 from .secureio import (
-    canonical_directory_walk_path,
     canonical_json,
+    directory_paths_equivalent,
     require_python_313,
 )
 from .supervisor import cleanup, final_result, preflight, recover, release, run, status
@@ -151,13 +151,20 @@ def _uses_account_local_retention_root(arguments: argparse.Namespace) -> bool:
     if arguments.retention_root is None:
         arguments.retention_root = default_retention_root()
         return True
-    requested_root = canonical_directory_walk_path(arguments.retention_root)
-    if (
-        requested_root.parts[-len(_ACCOUNT_LOCAL_RETENTION_SUFFIX) :]
-        != _ACCOUNT_LOCAL_RETENTION_SUFFIX
+    requested_suffix = tuple(
+        part.casefold()
+        for part in arguments.retention_root.parts[
+            -len(_ACCOUNT_LOCAL_RETENTION_SUFFIX) :
+        ]
+    )
+    if requested_suffix != tuple(
+        part.casefold() for part in _ACCOUNT_LOCAL_RETENTION_SUFFIX
     ):
         return False
-    return requested_root == canonical_directory_walk_path(default_retention_root())
+    return directory_paths_equivalent(
+        arguments.retention_root,
+        default_retention_root(),
+    )
 
 
 @contextlib.contextmanager
