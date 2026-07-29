@@ -771,6 +771,12 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
             current_root = _open_current_tool_legacy_retention_root(current_tool_path)
             if current_root is None:
                 current_root_absent = True
+                if catalog is None:
+                    raise RuntimeError(
+                        "non-catalog helper has no stable migration fence for an "
+                        "absent legacy retention path; select a proven distinct "
+                        "retention root"
+                    )
             else:
                 cleanup.callback(current_root.close)
                 _acquire_legacy_retention_lock(current_root)

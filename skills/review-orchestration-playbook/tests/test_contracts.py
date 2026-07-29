@@ -1653,6 +1653,9 @@ class RepositoryContractTest(unittest.TestCase):
             / "docs/project_journal/2026/07/"
             / "2026-07-27-review-runtime-state-root-rsr001.md"
         ).read_text(encoding="utf-8")
+        project_state = (REPO_ROOT / "docs/PROJECT_STATE.md").read_text(
+            encoding="utf-8"
+        )
         self.assertIn(
             f"passed {expected_count}/{expected_count}",
             journal,
@@ -1662,6 +1665,12 @@ class RepositoryContractTest(unittest.TestCase):
             journal,
         )
         self.assertIn(f"`{expected_sha256}`", journal)
+        self.assertIn(
+            "Latest workstream: "
+            "`docs/project_journal/2026/07/"
+            "2026-07-27-review-runtime-state-root-rsr001.md`",
+            project_state,
+        )
 
     def test_broker_reproducibility_never_runs_checkout_code_as_root(self) -> None:
         script = (SCRIPTS / "build_claude_keychain_broker_macos.sh").read_text(
@@ -5900,7 +5909,12 @@ class RepositoryContractTest(unittest.TestCase):
         ) as temporary:
             root = pathlib.Path(temporary)
             release_skill = (
-                root / "releases/release-id" / "review-orchestration-playbook"
+                root
+                / "releases"
+                / ("b" * 40)
+                / "personal_codex"
+                / "skills"
+                / "review-orchestration-playbook"
             )
             shutil.copytree(
                 SKILL_ROOT,

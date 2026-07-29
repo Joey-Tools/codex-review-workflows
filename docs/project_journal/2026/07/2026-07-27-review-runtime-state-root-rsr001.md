@@ -40,10 +40,13 @@ superseded_by:
   retention root and drain it before using the account-local default.
 - The scanner always fences the currently executing helper's own
   `runtime/retention` root before optionally enumerating a standard installed
-  overlay catalog. Self-contained and other nonstandard layouts therefore
-  retain the same migration protection. The current standard release also
-  passes the catalog capability and directory-identity checks while reusing
-  the already-held current-root fence instead of acquiring its lock twice.
+  overlay catalog. Self-contained and other nonstandard layouts with an
+  existing root retain the same migration protection; if that root is absent,
+  they fail closed before the public command because no immutable catalog
+  marker can prove that an older writer will not create it after a final
+  pathname check. The current standard release also passes the catalog
+  capability and directory-identity checks while reusing the already-held
+  current-root fence instead of acquiring its lock twice.
 - Releases that use account-local retention carry a source-controlled
   `ACCOUNT_LOCAL_RETENTION_V1` capability marker. The scanner validates its
   exact bytes, owner, mode, link count, ACL/xattr policy, and object identity,
@@ -104,12 +107,12 @@ superseded_by:
   attempts in older installed releases and that the README still documented the
   obsolete release-local default. The explicit drain gate, cross-version
   regression, and corrected README close both findings.
-- The final platform suite ran 2,820 tests with 6 skips in 908.159 seconds.
+- The final platform suite ran 2,820 tests with 6 skips in 926.636 seconds.
   Its only failure was the known parent-sandbox denial of nested
   `sandbox-exec`; that exact broker test passed 1/1 outside the parent sandbox
-  in 2.307 seconds. The required live no-child/Seatbelt suite passed 9/9
-  outside the parent sandbox in 7.413 seconds.
-- The complete 100-test contract module passed in 7.347 seconds.
+  in 2.113 seconds. The required live no-child/Seatbelt suite passed 9/9
+  outside the parent sandbox in 7.504 seconds.
+- The complete 100-test contract module passed in 6.862 seconds.
 - Focused installed-symlink immutability, default state-root, CI snapshot, and
   no-bytecode entrypoint regressions passed. The new cross-version tests also
   prove explicit old-root visibility and fail-closed release replacement.
@@ -167,10 +170,15 @@ superseded_by:
   detection now proves directory-object equivalence and resolves the release
   name from the held catalog, while a canonical contract test binds the
   journal count and digest to the runner's reviewed constants.
-- The deterministic independent-supervisor gate passed 591/591 in 182.274
+- The following exact-head Fresh Codex review found a final absent-path
+  check-to-return race for non-catalog helpers and a stale repo recovery
+  pointer. Non-catalog helpers without an existing legacy root now block before
+  the public command, and the contract-bound recovery pointer names this
+  workstream journal.
+- The deterministic independent-supervisor gate passed 591/591 in 190.480
   seconds with the reviewed 591-test selected identity and SHA-256
   `766f68ff0c2ad1f5bad894ff45dfe33c00dd493c2847e3e0c7526b9a21a9f543`.
-- The focused post-fix CLI and secure-I/O modules passed 70/70 tests in 31.776
+- The focused post-fix CLI and secure-I/O modules passed 70/70 tests in 35.093
   seconds on Python 3.13.
 - Ruff lint/format, actionlint for canonical and private CI profiles,
   source-only syntax checks, project-journal validation, `git diff --check`,

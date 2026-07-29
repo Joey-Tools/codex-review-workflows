@@ -1158,19 +1158,22 @@ class CliLifecycleTests(unittest.TestCase):
             current_tool = root / "self-contained" / "independent-review"
             current_tool.mkdir(parents=True)
             legacy_retention = current_tool / "runtime" / "retention"
+            original_open = (
+                legacy_retention_module._open_current_tool_legacy_retention_root
+            )
+            absence_checks = 0
 
-            def create_legacy_root(
-                *,
-                retention_root: pathlib.Path,
-                attempt_dir: pathlib.Path | None,
-            ) -> dict[str, object]:
-                self.assertIsNone(attempt_dir)
-                legacy_retention.mkdir(parents=True, mode=0o700)
-                _write_retention_lock(legacy_retention)
-                return {
-                    "retention_root": str(retention_root),
-                    "attempt_count": 0,
-                }
+            def create_after_final_absence(
+                path: pathlib.Path,
+            ) -> legacy_retention_module._LegacyRetentionRoot | None:
+                nonlocal absence_checks
+                result = original_open(path)
+                if result is None:
+                    absence_checks += 1
+                    if absence_checks == 2:
+                        legacy_retention.mkdir(parents=True, mode=0o700)
+                        _write_retention_lock(legacy_retention)
+                return result
 
             output = io.StringIO()
             with (
@@ -1179,18 +1182,22 @@ class CliLifecycleTests(unittest.TestCase):
                     return_value=current_tool,
                 ),
                 mock.patch.object(
-                    cli_module,
-                    "status",
-                    side_effect=create_legacy_root,
+                    legacy_retention_module,
+                    "_open_current_tool_legacy_retention_root",
+                    side_effect=create_after_final_absence,
                 ),
+                mock.patch.object(cli_module, "status") as status_mock,
                 contextlib.redirect_stdout(output),
             ):
                 exit_code = cli_module.main(("status",), entrypoint=ENTRYPOINT)
 
             self.assertEqual(exit_code, 2)
+            status_mock.assert_not_called()
+            self.assertEqual(absence_checks, 1)
+            self.assertFalse(legacy_retention.exists())
             payload = json.loads(output.getvalue())
             self.assertIn(
-                "current helper legacy retention path appeared",
+                "non-catalog helper has no stable migration fence",
                 payload["message"],
             )
 
