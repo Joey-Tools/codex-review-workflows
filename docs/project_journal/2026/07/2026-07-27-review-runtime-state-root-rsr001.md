@@ -104,12 +104,12 @@ superseded_by:
   attempts in older installed releases and that the README still documented the
   obsolete release-local default. The explicit drain gate, cross-version
   regression, and corrected README close both findings.
-- The final platform suite ran 2,819 tests with 6 skips in 952.739 seconds.
+- The final platform suite ran 2,820 tests with 6 skips in 908.159 seconds.
   Its only failure was the known parent-sandbox denial of nested
   `sandbox-exec`; that exact broker test passed 1/1 outside the parent sandbox
-  in 2.116 seconds. The required live no-child/Seatbelt suite passed 9/9
-  outside the parent sandbox in 7.009 seconds.
-- The complete 99-test contract module passed in 7.790 seconds.
+  in 2.307 seconds. The required live no-child/Seatbelt suite passed 9/9
+  outside the parent sandbox in 7.413 seconds.
+- The complete 100-test contract module passed in 7.347 seconds.
 - Focused installed-symlink immutability, default state-root, CI snapshot, and
   no-bytecode entrypoint regressions passed. The new cross-version tests also
   prove explicit old-root visibility and fail-closed release replacement.
@@ -161,10 +161,16 @@ superseded_by:
   could block on a FIFO or device before validating the file type. The shared
   openers now add `O_NONBLOCK`, and a bounded descriptor-relative plus absolute
   FIFO regression proves immediate rejection.
-- The deterministic independent-supervisor gate passed 590/590 in 225.996
-  seconds with the reviewed 599-test discovery identity and SHA-256
-  `f76ac9d5020304794f18cd72a6c70a5930b611d4f9fa892135ba550340a2e4b9`.
-- The focused post-fix CLI and secure-I/O modules passed 69/69 tests in 33.754
+- The next exact-head Fresh Codex review found that differently cased aliases
+  of the same installed helper could bypass the sibling-release catalog and
+  that the journal's deterministic count was not bound to the runner. Catalog
+  detection now proves directory-object equivalence and resolves the release
+  name from the held catalog, while a canonical contract test binds the
+  journal count and digest to the runner's reviewed constants.
+- The deterministic independent-supervisor gate passed 591/591 in 182.274
+  seconds with the reviewed 591-test selected identity and SHA-256
+  `766f68ff0c2ad1f5bad894ff45dfe33c00dd493c2847e3e0c7526b9a21a9f543`.
+- The focused post-fix CLI and secure-I/O modules passed 70/70 tests in 31.776
   seconds on Python 3.13.
 - Ruff lint/format, actionlint for canonical and private CI profiles,
   source-only syntax checks, project-journal validation, `git diff --check`,

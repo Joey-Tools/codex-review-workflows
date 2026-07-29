@@ -14,6 +14,7 @@ from .constants import tool_root
 from .errors import record_secondary_error
 from .models import Identity
 from .secureio import (
+    directory_paths_equivalent,
     directory_identities_match,
     identity_from_stat,
     open_absolute_directory_chain,
@@ -122,15 +123,78 @@ def _stable_directory_entries_fd(
 def _installed_release_catalog(
     root: pathlib.Path,
 ) -> tuple[pathlib.Path, bytes] | None:
-    if root.parts[-len(_INSTALLED_TOOL_SUFFIX) :] != _INSTALLED_TOOL_SUFFIX:
+    if not root.is_absolute() or len(root.parents) < len(_INSTALLED_TOOL_SUFFIX):
         return None
     release_root = root.parents[len(_INSTALLED_TOOL_SUFFIX) - 1]
-    releases_root = release_root.parent
-    release_name = os.fsencode(release_root.name)
-    if (
-        releases_root.name != "releases"
-        or len(release_name) != _RELEASE_NAME_LENGTH
-        or any(character not in _LOWER_HEX for character in release_name)
+    spelled_releases_root = release_root.parent
+    releases_root = spelled_releases_root.parent / "releases"
+    expected_tool_root = release_root.joinpath(*_INSTALLED_TOOL_SUFFIX)
+    releases_fd = -1
+    release_fd = -1
+    refreshed_release_fd = -1
+    try:
+        if not directory_paths_equivalent(spelled_releases_root, releases_root):
+            return None
+        if not directory_paths_equivalent(root, expected_tool_root):
+            return None
+
+        releases_fd, releases_identity = open_absolute_directory_chain(releases_root)
+        release_fd, release_identity = open_absolute_directory_chain(release_root)
+        release_binding = _identity_binding(release_identity)
+        releases_entries = _stable_directory_entries_fd(
+            releases_fd,
+            label="installed release directory",
+        )
+        matching_names = tuple(
+            name
+            for name, metadata in releases_entries
+            if _binding(metadata) == release_binding
+        )
+        if len(matching_names) != 1:
+            raise RuntimeError(
+                "current installed release has no unique catalog identity"
+            )
+
+        held_release_identity = identity_from_stat(os.fstat(release_fd))
+        refreshed_release_fd, refreshed_release_identity = (
+            open_absolute_directory_chain(release_root)
+        )
+        if not directory_identities_match(
+            release_identity, held_release_identity
+        ) or not directory_identities_match(
+            release_identity,
+            refreshed_release_identity,
+        ):
+            raise RuntimeError("installed release changed while being inspected")
+        _revalidate_installed_release_catalog(
+            releases_root,
+            releases_identity,
+            releases_entries,
+        )
+    except (OSError, ValueError) as error:
+        raise RuntimeError(
+            "cannot identify installed release catalog safely"
+        ) from error
+    finally:
+        if refreshed_release_fd >= 0:
+            _close_inspection_fd(
+                refreshed_release_fd,
+                label="refreshed installed release",
+            )
+        if release_fd >= 0:
+            _close_inspection_fd(
+                release_fd,
+                label="installed release",
+            )
+        if releases_fd >= 0:
+            _close_inspection_fd(
+                releases_fd,
+                label="installed release catalog",
+            )
+
+    release_name = matching_names[0]
+    if len(release_name) != _RELEASE_NAME_LENGTH or any(
+        character not in _LOWER_HEX for character in release_name
     ):
         return None
     return releases_root, release_name
@@ -161,6 +225,7 @@ class _LegacyRetentionRoot:
 class _LegacyRetentionProbe:
     root: _LegacyRetentionRoot | None
     tool_path: pathlib.Path | None
+    tool_binding: _DirectoryBinding | None
     uses_account_local_retention: bool
 
 
@@ -189,6 +254,36 @@ def _close_inspection_fd(fd: int, *, label: str) -> None:
             label=f"{label} descriptor cleanup failed",
             secondary_error=cleanup_error,
         )
+
+
+def _revalidate_installed_release_catalog(
+    releases_root: pathlib.Path,
+    releases_identity: Identity,
+    releases_entries: tuple[tuple[bytes, os.stat_result], ...],
+) -> None:
+    refreshed_fd = -1
+    try:
+        refreshed_fd, refreshed_identity = open_absolute_directory_chain(releases_root)
+        if not directory_identities_match(releases_identity, refreshed_identity):
+            raise RuntimeError("installed release changed while being inspected")
+        refreshed_entries = _stable_directory_entries_fd(
+            refreshed_fd,
+            label="installed release directory",
+        )
+        if tuple(
+            (name, _binding(metadata)) for name, metadata in releases_entries
+        ) != tuple((name, _binding(metadata)) for name, metadata in refreshed_entries):
+            raise RuntimeError("installed release changed while being inspected")
+    except (OSError, ValueError) as error:
+        raise RuntimeError(
+            "cannot revalidate installed release catalog safely"
+        ) from error
+    finally:
+        if refreshed_fd >= 0:
+            _close_inspection_fd(
+                refreshed_fd,
+                label="revalidated installed release catalog",
+            )
 
 
 def _release_uses_account_local_retention(
@@ -280,6 +375,7 @@ def _open_legacy_retention_root(
     components: list[tuple[bytes, _DirectoryBinding, bool]] = []
     opened_fd = -1
     tool_path: pathlib.Path | None = None
+    tool_binding: _DirectoryBinding | None = None
     uses_account_local_retention = False
     try:
         for index, part in enumerate((release_name, *_LEGACY_RETENTION_SUFFIX)):
@@ -296,6 +392,7 @@ def _open_legacy_retention_root(
                 return _LegacyRetentionProbe(
                     root=None,
                     tool_path=tool_path,
+                    tool_binding=tool_binding,
                     uses_account_local_retention=uses_account_local_retention,
                 )
             if index == 0 and _identity_binding(identity) != expected_release_binding:
@@ -308,6 +405,7 @@ def _open_legacy_retention_root(
             components.append((part, _identity_binding(identity), private))
             if index == len(_INSTALLED_TOOL_SUFFIX):
                 tool_path = current_path
+                tool_binding = _identity_binding(identity)
                 uses_account_local_retention = _release_uses_account_local_retention(
                     current_fd, current_path
                 )
@@ -321,6 +419,7 @@ def _open_legacy_retention_root(
                 retention_binding=components[-1][1],
             ),
             tool_path=tool_path,
+            tool_binding=tool_binding,
             uses_account_local_retention=uses_account_local_retention,
         )
     except (OSError, ValueError) as error:
@@ -360,7 +459,29 @@ def _validate_current_release_probe(
     current_root: _LegacyRetentionRoot | None,
 ) -> None:
     try:
-        if probe.tool_path != current_tool_path:
+        if probe.tool_path is None or probe.tool_binding is None:
+            raise RuntimeError(
+                "current installed helper is missing from its release catalog"
+            )
+        try:
+            current_tool_fd, current_tool_identity = open_absolute_directory_chain(
+                current_tool_path
+            )
+            try:
+                held_tool_identity = identity_from_stat(os.fstat(current_tool_fd))
+            finally:
+                _close_inspection_fd(
+                    current_tool_fd,
+                    label="current installed helper",
+                )
+        except (OSError, ValueError) as error:
+            raise RuntimeError(
+                "cannot revalidate current installed helper safely"
+            ) from error
+        if (
+            _identity_binding(current_tool_identity) != probe.tool_binding
+            or _identity_binding(held_tool_identity) != probe.tool_binding
+        ):
             raise RuntimeError(
                 "current installed helper path changed while being inspected"
             )

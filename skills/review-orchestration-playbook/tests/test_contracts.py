@@ -1626,6 +1626,43 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertIn("`>=2.1.211,<3.0.0`", journal)
         self.assertNotIn(">=2.1.187", journal)
 
+    def test_runtime_state_journal_matches_deterministic_identity(self) -> None:
+        if CI_PROFILE != "canonical":
+            self.skipTest("canonical project journal is not mirrored")
+        runner_path = (
+            SCRIPTS / "independent_codex_pr_review/tests/"
+            "run_required_deterministic_supervisor.py"
+        )
+        assignments: dict[str, object] = {}
+        for statement in ast.parse(runner_path.read_text(encoding="utf-8")).body:
+            if (
+                isinstance(statement, ast.Assign)
+                and len(statement.targets) == 1
+                and isinstance(statement.targets[0], ast.Name)
+                and statement.targets[0].id
+                in {"EXPECTED_TEST_COUNT", "EXPECTED_TEST_ID_SHA256"}
+            ):
+                assignments[statement.targets[0].id] = ast.literal_eval(statement.value)
+
+        expected_count = assignments["EXPECTED_TEST_COUNT"]
+        expected_sha256 = assignments["EXPECTED_TEST_ID_SHA256"]
+        self.assertIsInstance(expected_count, int)
+        self.assertIsInstance(expected_sha256, str)
+        journal = (
+            REPO_ROOT
+            / "docs/project_journal/2026/07/"
+            / "2026-07-27-review-runtime-state-root-rsr001.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            f"passed {expected_count}/{expected_count}",
+            journal,
+        )
+        self.assertIn(
+            f"reviewed {expected_count}-test selected identity",
+            journal,
+        )
+        self.assertIn(f"`{expected_sha256}`", journal)
+
     def test_broker_reproducibility_never_runs_checkout_code_as_root(self) -> None:
         script = (SCRIPTS / "build_claude_keychain_broker_macos.sh").read_text(
             encoding="utf-8"
@@ -1690,7 +1727,7 @@ class RepositoryContractTest(unittest.TestCase):
         self.assertNotIn("GITHUB_HOSTED_RUNTIME_PIN", live_runner)
         self.assertIn("expected_count != 9", live_runner)
         self.assertIn("len(REQUIRED_TEST_KEYS) != expected_count", live_runner)
-        self.assertIn("EXPECTED_TEST_COUNT = 590", deterministic_runner)
+        self.assertIn("EXPECTED_TEST_COUNT = 591", deterministic_runner)
         self.assertIn("EXPECTED_TEST_ID_SHA256 =", deterministic_runner)
         self.assertIn("selected_identity_sha256 !=", deterministic_runner)
         self.assertIn("excluded_keys != REQUIRED_TEST_KEYS", deterministic_runner)

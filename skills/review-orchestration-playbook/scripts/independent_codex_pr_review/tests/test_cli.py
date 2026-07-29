@@ -583,6 +583,65 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertEqual(drain_payload["retention_root"], str(legacy_retention))
             self.assertEqual(drain_payload["attempt_count"], 1)
 
+    def test_installed_upgrade_case_alias_still_scans_sibling_releases(
+        self,
+    ) -> None:
+        with owned_temporary_directory("cli-legacy-case-alias-") as root:
+            releases, current_tool, _, legacy_retention = _installed_upgrade_layout(
+                root
+            )
+            _write_retention_lock(legacy_retention)
+            _write_attempt(
+                legacy_retention,
+                suffix="a" * 32,
+                process_settlement="exact",
+                retention_state="held",
+            )
+            alias_tool = (
+                root
+                / "OVERLAYS"
+                / "PRIVATE"
+                / "RELEASES"
+                / ("B" * 40)
+                / pathlib.Path(
+                    "PERSONAL_CODEX/SKILLS/REVIEW-ORCHESTRATION-PLAYBOOK/"
+                    "SCRIPTS/INDEPENDENT_CODEX_PR_REVIEW"
+                )
+            )
+            try:
+                alias_is_same_object = alias_tool.is_dir() and os.path.samefile(
+                    alias_tool,
+                    current_tool,
+                )
+            except OSError:
+                alias_is_same_object = False
+            if not alias_is_same_object:
+                self.skipTest("requires a case-insensitive filesystem")
+
+            catalog = legacy_retention_module._installed_release_catalog(alias_tool)
+            self.assertIsNotNone(catalog)
+            catalog_root, release_name = catalog
+            self.assertTrue(os.path.samefile(catalog_root, releases))
+            self.assertEqual(release_name, os.fsencode("b" * 40))
+
+            output = io.StringIO()
+            with (
+                mock.patch(
+                    "review_supervisor.legacy_retention.tool_root",
+                    return_value=alias_tool,
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                exit_code = cli_module.main(("status",), entrypoint=ENTRYPOINT)
+
+            self.assertEqual(exit_code, 2)
+            payload = json.loads(output.getvalue())
+            _assert_low_level_contract(self, payload)
+            self.assertIn(
+                "legacy release-local attempts require explicit draining",
+                payload["message"],
+            )
+
     def test_installed_upgrade_rejects_attempt_created_during_command(
         self,
     ) -> None:
