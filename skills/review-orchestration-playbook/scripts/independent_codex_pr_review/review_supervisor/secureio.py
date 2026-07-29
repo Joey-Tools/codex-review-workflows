@@ -264,7 +264,7 @@ def open_directory_at(
         raise
 
 
-def _canonical_directory_walk_path(path: pathlib.Path) -> pathlib.Path:
+def canonical_directory_walk_path(path: pathlib.Path) -> pathlib.Path:
     if sys.platform != "darwin" or len(path.parts) < 2:
         return path
     alias = path.parts[1]
@@ -290,7 +290,7 @@ def open_absolute_directory_chain(
 ) -> tuple[int, Identity]:
     if not path.is_absolute():
         raise ValueError("directory path must be absolute")
-    walk_path = _canonical_directory_walk_path(path)
+    walk_path = canonical_directory_walk_path(path)
     raw_parts = tuple(os.fsencode(part) for part in walk_path.parts[1:])
     if any(not part or part in {b".", b".."} or b"\0" in part for part in raw_parts):
         raise ValueError("directory path contains a dot component")

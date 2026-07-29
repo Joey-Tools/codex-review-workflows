@@ -17,6 +17,7 @@ from .secureio import (
     open_absolute_directory_chain,
     open_directory_at,
     open_regular_at,
+    read_fd_exact,
     validate_private_directory_fd,
     validate_private_regular_fd,
 )
@@ -32,7 +33,10 @@ _INSTALLED_TOOL_SUFFIX = (
 _LEGACY_RETENTION_SUFFIX = tuple(
     os.fsencode(part) for part in (*_INSTALLED_TOOL_SUFFIX, "runtime", "retention")
 )
+_ACCOUNT_LOCAL_RETENTION_MARKER = b"ACCOUNT_LOCAL_RETENTION_V1"
+_ACCOUNT_LOCAL_RETENTION_MARKER_CONTENT = b"account-local-retention-v1\n"
 _MAX_INSTALLED_RELEASE_ENTRIES = 512
+_MAX_REPORTED_UNFENCED_RELEASES = 8
 _RELEASE_NAME_LENGTH = 40
 _LOWER_HEX = frozenset(b"0123456789abcdef")
 _ATTEMPT_NAME = re.compile(rb"attempt-[0-9]+-[0-9a-f]{32}\Z")
@@ -149,16 +153,88 @@ class _LegacyRetentionRoot:
                 cleanup.callback(fcntl.flock, lock_fd, fcntl.LOCK_UN)
 
 
+@dataclass(frozen=True, slots=True)
+class _LegacyRetentionProbe:
+    root: _LegacyRetentionRoot | None
+    tool_path: pathlib.Path | None
+    uses_account_local_retention: bool
+
+
+def _release_uses_account_local_retention(
+    tool_fd: int,
+    tool_path: pathlib.Path,
+) -> bool:
+    marker_path = tool_path / os.fsdecode(_ACCOUNT_LOCAL_RETENTION_MARKER)
+    try:
+        marker_fd, opened_identity = open_regular_at(
+            tool_fd,
+            _ACCOUNT_LOCAL_RETENTION_MARKER,
+            expected_uid=os.getuid(),
+            private_metadata=True,
+        )
+    except FileNotFoundError:
+        return False
+    try:
+        strict_identity = validate_private_regular_fd(
+            marker_fd,
+            marker_path,
+            mode=0o644,
+        )
+        if strict_identity != opened_identity:
+            raise RuntimeError(
+                "installed retention policy marker changed while being inspected"
+            )
+        content = read_fd_exact(
+            marker_fd,
+            max_bytes=len(_ACCOUNT_LOCAL_RETENTION_MARKER_CONTENT),
+            expected_size=strict_identity.size,
+        )
+        held_identity = validate_private_regular_fd(
+            marker_fd,
+            marker_path,
+            mode=0o644,
+        )
+        probe_fd, path_identity = open_regular_at(
+            tool_fd,
+            _ACCOUNT_LOCAL_RETENTION_MARKER,
+            expected_uid=os.getuid(),
+            private_metadata=True,
+        )
+        try:
+            strict_path_identity = validate_private_regular_fd(
+                probe_fd,
+                marker_path,
+                mode=0o644,
+            )
+            if (
+                held_identity != strict_identity
+                or path_identity != strict_identity
+                or strict_path_identity != strict_identity
+            ):
+                raise RuntimeError(
+                    "installed retention policy marker changed while being inspected"
+                )
+        finally:
+            os.close(probe_fd)
+        if content != _ACCOUNT_LOCAL_RETENTION_MARKER_CONTENT:
+            raise RuntimeError("installed retention policy marker is invalid")
+        return True
+    finally:
+        os.close(marker_fd)
+
+
 def _open_legacy_retention_root(
     releases_fd: int,
     releases_root: pathlib.Path,
     release_name: bytes,
     expected_release_binding: _DirectoryBinding,
-) -> _LegacyRetentionRoot | None:
+) -> _LegacyRetentionProbe:
     current_fd = releases_fd
     current_path = releases_root
     components: list[tuple[bytes, _DirectoryBinding, bool]] = []
     opened_fd = -1
+    tool_path: pathlib.Path | None = None
+    uses_account_local_retention = False
     try:
         for index, part in enumerate((release_name, *_LEGACY_RETENTION_SUFFIX)):
             current_path /= os.fsdecode(part)
@@ -171,7 +247,11 @@ def _open_legacy_retention_root(
                     private=private,
                 )
             except FileNotFoundError:
-                return None
+                return _LegacyRetentionProbe(
+                    root=None,
+                    tool_path=tool_path,
+                    uses_account_local_retention=uses_account_local_retention,
+                )
             if index == 0 and _identity_binding(identity) != expected_release_binding:
                 os.close(next_fd)
                 raise RuntimeError("installed release changed while being inspected")
@@ -180,13 +260,22 @@ def _open_legacy_retention_root(
             opened_fd = next_fd
             current_fd = opened_fd
             components.append((part, _identity_binding(identity), private))
+            if index == len(_INSTALLED_TOOL_SUFFIX):
+                tool_path = current_path
+                uses_account_local_retention = _release_uses_account_local_retention(
+                    current_fd, current_path
+                )
         retention_fd = opened_fd
         opened_fd = -1
-        return _LegacyRetentionRoot(
-            path=current_path,
-            components=tuple(components),
-            retention_fd=retention_fd,
-            retention_binding=components[-1][1],
+        return _LegacyRetentionProbe(
+            root=_LegacyRetentionRoot(
+                path=current_path,
+                components=tuple(components),
+                retention_fd=retention_fd,
+                retention_binding=components[-1][1],
+            ),
+            tool_path=tool_path,
+            uses_account_local_retention=uses_account_local_retention,
         )
     except (OSError, ValueError) as error:
         raise RuntimeError("cannot inspect legacy retention path safely") from error
@@ -397,79 +486,115 @@ def installed_legacy_retention_fence() -> Iterator[tuple[pathlib.Path, ...]]:
     cleanup.callback(os.close, releases_fd)
     roots: list[_LegacyRetentionRoot] = []
     absent_roots: list[tuple[bytes, _DirectoryBinding]] = []
+    releases_entries: tuple[tuple[bytes, os.stat_result], ...]
     try:
-        releases_entries = _stable_directory_entries_fd(
-            releases_fd,
-            label="installed release directory",
-        )
-    except BaseException:
-        cleanup.close()
-        raise
-    try:
-        unresolved: list[pathlib.Path] = []
-        for name, release_metadata in releases_entries:
-            if len(name) != _RELEASE_NAME_LENGTH or any(
-                character not in _LOWER_HEX for character in name
-            ):
-                continue
-            if (
-                not stat.S_ISDIR(release_metadata.st_mode)
-                or release_metadata.st_uid != os.getuid()
-                or stat.S_IMODE(release_metadata.st_mode) & 0o022
-            ):
-                raise RuntimeError(
-                    "installed release has unsafe identity or access policy"
-                )
-            release_binding = _binding(release_metadata)
-            root = _open_legacy_retention_root(
-                releases_fd,
-                releases_root,
-                name,
-                release_binding,
-            )
-            if root is None:
-                absent_roots.append((name, release_binding))
-                continue
-            roots.append(root)
-            cleanup.callback(root.close)
-            _acquire_legacy_retention_lock(root)
-            if _retention_root_has_attempt(root):
-                unresolved.append(root.path)
-            _revalidate_legacy_retention_lock(root)
-            _revalidate_legacy_retention_root(releases_fd, releases_root, root)
-
-        _revalidate_releases_root(
-            releases_root,
-            releases_identity,
-            releases_entries,
-        )
         try:
-            yield tuple(unresolved)
-        finally:
-            for root in roots:
-                _revalidate_legacy_retention_lock(root)
-                _retention_root_has_attempt(root)
-                _revalidate_legacy_retention_root(releases_fd, releases_root, root)
-            for name, release_binding in absent_roots:
-                appeared = _open_legacy_retention_root(
+            releases_entries = _stable_directory_entries_fd(
+                releases_fd,
+                label="installed release directory",
+            )
+            unresolved: list[pathlib.Path] = []
+            unfenced_tools: list[pathlib.Path] = []
+            for name, release_metadata in releases_entries:
+                if len(name) != _RELEASE_NAME_LENGTH or any(
+                    character not in _LOWER_HEX for character in name
+                ):
+                    continue
+                if (
+                    not stat.S_ISDIR(release_metadata.st_mode)
+                    or release_metadata.st_uid != os.getuid()
+                    or stat.S_IMODE(release_metadata.st_mode) & 0o022
+                ):
+                    raise RuntimeError(
+                        "installed release has unsafe identity or access policy"
+                    )
+                release_binding = _binding(release_metadata)
+                probe = _open_legacy_retention_root(
                     releases_fd,
                     releases_root,
                     name,
                     release_binding,
                 )
-                if appeared is not None:
-                    appeared.close()
-                    raise RuntimeError(
-                        "legacy retention path appeared while migration fence was active"
-                    )
+                if probe.root is None:
+                    absent_roots.append((name, release_binding))
+                    if (
+                        probe.tool_path is not None
+                        and not probe.uses_account_local_retention
+                    ):
+                        unfenced_tools.append(probe.tool_path)
+                    continue
+                root = probe.root
+                roots.append(root)
+                cleanup.callback(root.close)
+                _acquire_legacy_retention_lock(root)
+                if _retention_root_has_attempt(root):
+                    unresolved.append(root.path)
+                _revalidate_legacy_retention_lock(root)
+                _revalidate_legacy_retention_root(releases_fd, releases_root, root)
+
             _revalidate_releases_root(
                 releases_root,
                 releases_identity,
                 releases_entries,
             )
-    except (OSError, ValueError) as error:
-        raise RuntimeError(
-            "cannot inspect installed legacy retention safely"
-        ) from error
+            if unfenced_tools:
+                reported = ", ".join(
+                    str(path)
+                    for path in unfenced_tools[:_MAX_REPORTED_UNFENCED_RELEASES]
+                )
+                omitted = len(unfenced_tools) - _MAX_REPORTED_UNFENCED_RELEASES
+                suffix = f" (+{omitted} more)" if omitted > 0 else ""
+                raise RuntimeError(
+                    "installed legacy helper has no stable retention fence; "
+                    "retire or disable it before using the account-local default: "
+                    f"{reported}{suffix}"
+                )
+        except (OSError, ValueError) as error:
+            raise RuntimeError(
+                "cannot inspect installed legacy retention safely"
+            ) from error
+
+        try:
+            yield tuple(unresolved)
+        finally:
+            try:
+                for root in roots:
+                    _revalidate_legacy_retention_lock(root)
+                    _retention_root_has_attempt(root)
+                    _revalidate_legacy_retention_root(
+                        releases_fd,
+                        releases_root,
+                        root,
+                    )
+                for name, release_binding in absent_roots:
+                    appeared = _open_legacy_retention_root(
+                        releases_fd,
+                        releases_root,
+                        name,
+                        release_binding,
+                    )
+                    if appeared.root is not None:
+                        appeared.root.close()
+                        raise RuntimeError(
+                            "legacy retention path appeared while migration fence "
+                            "was active"
+                        )
+                    if (
+                        appeared.tool_path is not None
+                        and not appeared.uses_account_local_retention
+                    ):
+                        raise RuntimeError(
+                            "installed legacy helper lost its account-local retention "
+                            "policy while migration fence was active"
+                        )
+                _revalidate_releases_root(
+                    releases_root,
+                    releases_identity,
+                    releases_entries,
+                )
+            except (OSError, ValueError) as error:
+                raise RuntimeError(
+                    "cannot inspect installed legacy retention safely"
+                ) from error
     finally:
         cleanup.close()

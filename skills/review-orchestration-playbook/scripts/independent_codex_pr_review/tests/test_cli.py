@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import contextlib
 import fcntl
 import io
@@ -7,6 +8,7 @@ import json
 import os
 import pathlib
 import pwd
+import stat
 import subprocess
 import sys
 import unittest
@@ -133,6 +135,13 @@ def _write_retention_lock(retention: pathlib.Path) -> pathlib.Path:
     return lock
 
 
+def _write_account_local_marker(tool: pathlib.Path) -> pathlib.Path:
+    marker = tool / "ACCOUNT_LOCAL_RETENTION_V1"
+    marker.write_bytes(b"account-local-retention-v1\n")
+    marker.chmod(0o644)
+    return marker
+
+
 def _installed_upgrade_layout(
     root: pathlib.Path,
 ) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path, pathlib.Path]:
@@ -141,6 +150,7 @@ def _installed_upgrade_layout(
     old_release = releases / ("a" * 40)
     current_tool = current_release / RELATIVE_TOOL
     current_tool.mkdir(parents=True)
+    _write_account_local_marker(current_tool)
     legacy_retention = old_release / RELATIVE_TOOL / "runtime" / "retention"
     legacy_retention.mkdir(parents=True, mode=0o700)
     return releases, current_tool, old_release, legacy_retention
@@ -568,6 +578,42 @@ class CliLifecycleTests(unittest.TestCase):
                 payload["message"],
             )
 
+    def test_darwin_root_alias_still_identifies_explicit_account_default(
+        self,
+    ) -> None:
+        default_root = pathlib.Path(
+            "/var/root/.codex/review-runtime/independent-codex-pr-review/retention"
+        )
+        explicit_root = pathlib.Path(
+            "/private/var/root/.codex/review-runtime/"
+            "independent-codex-pr-review/retention"
+        )
+        arguments = argparse.Namespace(retention_root=explicit_root)
+        alias_metadata = mock.Mock(
+            st_mode=stat.S_IFLNK | 0o777,
+            st_uid=0,
+        )
+        with (
+            mock.patch.object(
+                cli_module,
+                "default_retention_root",
+                return_value=default_root,
+            ),
+            mock.patch(
+                "review_supervisor.secureio.sys.platform",
+                "darwin",
+            ),
+            mock.patch(
+                "review_supervisor.secureio.os.lstat",
+                return_value=alias_metadata,
+            ),
+            mock.patch(
+                "review_supervisor.secureio.os.readlink",
+                return_value="private/var",
+            ),
+        ):
+            self.assertTrue(cli_module._uses_account_local_retention_root(arguments))
+
     def test_installed_upgrade_rejects_active_legacy_writer(self) -> None:
         with owned_temporary_directory("cli-active-legacy-writer-") as root:
             _, current_tool, _, legacy_retention = _installed_upgrade_layout(root)
@@ -677,6 +723,7 @@ class CliLifecycleTests(unittest.TestCase):
             old_release = releases / ("a" * 40)
             current_tool = current_release / RELATIVE_TOOL
             current_tool.mkdir(parents=True)
+            _write_account_local_marker(current_tool)
             old_release.mkdir(mode=0o700)
             legacy_retention = old_release / RELATIVE_TOOL / "runtime" / "retention"
 
@@ -712,6 +759,125 @@ class CliLifecycleTests(unittest.TestCase):
             payload = json.loads(output.getvalue())
             self.assertIn(
                 "legacy retention path appeared while migration fence was active",
+                payload["message"],
+            )
+
+    def test_unmarked_legacy_helper_without_root_fails_before_command(
+        self,
+    ) -> None:
+        with owned_temporary_directory("cli-unfenced-legacy-") as root:
+            releases = root / "overlays" / "private" / "releases"
+            current_release = releases / ("b" * 40)
+            old_release = releases / ("a" * 40)
+            current_tool = current_release / RELATIVE_TOOL
+            old_tool = old_release / RELATIVE_TOOL
+            current_tool.mkdir(parents=True)
+            old_tool.mkdir(parents=True)
+            _write_account_local_marker(current_tool)
+            legacy_retention = old_tool / "runtime" / "retention"
+
+            def late_legacy_start(**_: object) -> dict[str, object]:
+                legacy_retention.mkdir(parents=True, mode=0o700)
+                _write_retention_lock(legacy_retention)
+                return {"attempt_count": 0}
+
+            output = io.StringIO()
+            with (
+                mock.patch(
+                    "review_supervisor.legacy_retention.tool_root",
+                    return_value=current_tool,
+                ),
+                mock.patch.object(
+                    cli_module,
+                    "status",
+                    side_effect=late_legacy_start,
+                ) as status_mock,
+                contextlib.redirect_stdout(output),
+            ):
+                exit_code = cli_module.main(("status",), entrypoint=ENTRYPOINT)
+
+            self.assertEqual(exit_code, 2)
+            status_mock.assert_not_called()
+            self.assertFalse(legacy_retention.exists())
+            payload = json.loads(output.getvalue())
+            self.assertIn(
+                "installed legacy helper has no stable retention fence",
+                payload["message"],
+            )
+            self.assertIn(str(old_tool), payload["message"])
+
+    def test_marked_account_local_sibling_without_legacy_root_is_allowed(
+        self,
+    ) -> None:
+        with owned_temporary_directory("cli-marked-sibling-") as root:
+            releases = root / "overlays" / "private" / "releases"
+            current_tool = releases / ("b" * 40) / RELATIVE_TOOL
+            sibling_tool = releases / ("a" * 40) / RELATIVE_TOOL
+            current_tool.mkdir(parents=True)
+            sibling_tool.mkdir(parents=True)
+            _write_account_local_marker(current_tool)
+            _write_account_local_marker(sibling_tool)
+            account_default = (
+                root
+                / "account"
+                / ".codex"
+                / "review-runtime"
+                / "independent-codex-pr-review"
+                / "retention"
+            )
+            output = io.StringIO()
+            with (
+                mock.patch.object(
+                    cli_module,
+                    "default_retention_root",
+                    return_value=account_default,
+                ),
+                mock.patch(
+                    "review_supervisor.legacy_retention.tool_root",
+                    return_value=current_tool,
+                ),
+                mock.patch.object(
+                    cli_module,
+                    "status",
+                    return_value={
+                        "retention_root": str(account_default),
+                        "attempt_count": 0,
+                    },
+                ) as status_mock,
+                contextlib.redirect_stdout(output),
+            ):
+                exit_code = cli_module.main(("status",), entrypoint=ENTRYPOINT)
+
+            self.assertEqual(exit_code, 0)
+            status_mock.assert_called_once()
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["attempt_count"], 0)
+
+    def test_invalid_account_local_policy_marker_fails_closed(self) -> None:
+        with owned_temporary_directory("cli-invalid-policy-marker-") as root:
+            releases = root / "overlays" / "private" / "releases"
+            current_tool = releases / ("b" * 40) / RELATIVE_TOOL
+            sibling_tool = releases / ("a" * 40) / RELATIVE_TOOL
+            current_tool.mkdir(parents=True)
+            sibling_tool.mkdir(parents=True)
+            _write_account_local_marker(current_tool)
+            marker = _write_account_local_marker(sibling_tool)
+            marker.write_bytes(b"account-local-retention-v2\n")
+
+            output = io.StringIO()
+            with (
+                mock.patch(
+                    "review_supervisor.legacy_retention.tool_root",
+                    return_value=current_tool,
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                exit_code = cli_module.main(("status",), entrypoint=ENTRYPOINT)
+
+            self.assertEqual(exit_code, 2)
+            payload = json.loads(output.getvalue())
+            self.assertIn(
+                "installed retention policy marker is invalid",
                 payload["message"],
             )
 
@@ -751,6 +917,46 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertEqual(revalidation_count, 2)
             payload = json.loads(output.getvalue())
             self.assertIn("synthetic command failure", payload["message"])
+
+    def test_legacy_migration_fence_preserves_command_os_and_value_errors(
+        self,
+    ) -> None:
+        failures = (
+            OSError("synthetic command os failure"),
+            ValueError("synthetic command value failure"),
+        )
+        for failure in failures:
+            with (
+                self.subTest(failure=type(failure).__name__),
+                owned_temporary_directory("cli-legacy-command-error-") as root,
+            ):
+                _, current_tool, _, legacy_retention = _installed_upgrade_layout(root)
+                _write_retention_lock(legacy_retention)
+                output = io.StringIO()
+                with (
+                    mock.patch(
+                        "review_supervisor.legacy_retention.tool_root",
+                        return_value=current_tool,
+                    ),
+                    mock.patch.object(
+                        cli_module,
+                        "status",
+                        side_effect=failure,
+                    ),
+                    contextlib.redirect_stdout(output),
+                ):
+                    exit_code = cli_module.main(("status",), entrypoint=ENTRYPOINT)
+
+                self.assertEqual(exit_code, 2)
+                payload = json.loads(output.getvalue())
+                self.assertEqual(
+                    payload["message"],
+                    f"{type(failure).__name__}: {failure}",
+                )
+                self.assertNotIn(
+                    "cannot inspect installed legacy retention safely",
+                    payload["message"],
+                )
 
     def test_legacy_retention_acl_revalidation_fails_closed(self) -> None:
         with owned_temporary_directory("cli-legacy-acl-drift-") as root:

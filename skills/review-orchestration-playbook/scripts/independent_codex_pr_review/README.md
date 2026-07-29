@@ -77,6 +77,10 @@ attempt，所有使用 account-local default 的公共命令都会失败关闭�
 保持到本次默认-root 命令完成。使用报告的旧路径显式运行 `status`、`final`、
 `recover`、`release` 和 `cleanup`，直到旧 root drained；在此之前不得删除旧
 release。扫描不会搬动活动 attempt，也不会把旧 attempt 并入新的 account-local root。
+采用 account-local retention 的 release 必须携带经过内容、身份与访问策略校验的
+`ACCOUNT_LOCAL_RETENTION_V1` 标记。若仍包含 helper 的未标记旧 release 没有可获取的
+legacy retention lock，新命令会在执行公共命令前失败关闭；需要先停用或移除该旧
+release，不能用一次“路径暂时不存在”的探测推断它之后不会启动。
 
 仅在 helper 已 terminal 后运行独立 preflight。它验证 exact repo/base/head、helper
 runner completion、primary-diff 双重 attestation、control directory 完整性、source
